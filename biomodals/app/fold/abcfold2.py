@@ -413,8 +413,7 @@ def run_abcfold2_chai(
     return str(chai_run_dir)
 
 
-@app.local_entrypoint()
-def main(
+def run_abcfold2(
     input_yaml: str,
     run_name: str | None = None,
     download_models: bool = False,
@@ -475,3 +474,6 @@ def main(
         out_path.write_bytes(chai_data)
 
     print(f"🧬 ABCFold2 run complete! Results saved to {local_out_dir}")
+
+
+main = app.local_entrypoint()(run_abcfold2)

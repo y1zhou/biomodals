@@ -3,17 +3,17 @@
 Ephemeral usage example:
 
     ```bash
-    modal run scripts/fold/abcfold2.py --input-yaml path/to/example.yaml
+    modal run app/fold/abcfold2_app.py --input-yaml path/to/example.yaml
     ```
 
 Deployment usage example:
     https://modal.com/docs/guide/managing-deployments
 
     ```bash
-    modal deploy scripts/fold/abcfold2.py --name ABCFold2
+    modal deploy app/fold/abcfold2_app.py --name ABCFold2
     ```
 
-    See `clients/fold/abcfold2.py` for example client code to call the deployed app.
+    See `client/fold/abcfold2.py` for example client code to call the deployed app.
 """
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
@@ -48,7 +48,7 @@ OUTPUTS_DIR = "/abcfold2-outputs"
 # Repositories and commit hashes
 ABCFOLD_DIR = "/opt/ABCFold"
 ABCFOLD_REPO = "https://github.com/y1zhou/ABCFold"
-ABCFOLD_COMMIT = "6b8c50ac5e3d38809e3f7b0c55a95397cfd15927"
+ABCFOLD_COMMIT = "9c3b5fe9d19598c83f46875e846eb7c9930fc3cb"
 
 CHAI_DIR = "/opt/chai-lab"
 CHAI_REPO = "https://github.com/y1zhou/chai-lab"
@@ -235,34 +235,49 @@ def load_params_from_run_yaml(yaml_path: Path) -> dict:
     }
 
 
+@app.function(image=runtime_image, timeout=TIMEOUT)
+def get_run_id(yaml_str: bytes) -> str:
+    """Get content-based run ID from ABCFold2 config."""
+    import tempfile
+
+    from abcfold.schema import load_abcfold_config
+
+    # Determine content-based run ID
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_yaml_path = Path(tmpdir) / "abcfold-config.yaml"
+        tmp_yaml_path.write_bytes(yaml_str)
+        conf = load_abcfold_config(tmp_yaml_path)
+
+    return conf.hash
+
+
 @app.function(
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
 )
 def prepare_abcfold2(
-    yaml_str: bytes, run_id: str
+    yaml_str: bytes,
 ) -> dict[str, str | list[int] | int | list[str] | None]:
     """Prepare inputs to Boltz and Chai using ABCFold2 config."""
     import tempfile
+    from pathlib import Path
 
     from abcfold.cli.prepare import prepare_boltz, prepare_chai, search_msa
 
+    run_id: str = get_run_id.local(yaml_str=yaml_str)
     out_dir_full: Path = Path(OUTPUTS_DIR) / run_id[:2] / run_id
     out_dir_full.mkdir(parents=True, exist_ok=True)
-    yaml_path = Path(out_dir_full) / f"{run_id}.yaml"
 
-    if yaml_path.exists():
-        conf = load_params_from_run_yaml(yaml_path)
-        conf["workdir"] = str(out_dir_full)
-        return conf
+    # Check if MSA and templates were already generated for a previous run with same ID
+    yaml_path = out_dir_full / f"{run_id}.yaml"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_yaml_path = Path(tmpdir) / f"{run_id}.yaml"
-        tmp_yaml_path.write_bytes(yaml_str)
+    if not yaml_path.exists():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_yaml_path = Path(tmpdir) / f"{run_id}.yaml"
+            tmp_yaml_path.write_bytes(yaml_str)
 
-        # Run MSA and template search
-        if not yaml_path.exists():
+            # Run MSA and template search
             search_msa(
                 conf_file=tmp_yaml_path,
                 out_dir=out_dir_full,
@@ -272,15 +287,18 @@ def prepare_abcfold2(
             OUTPUTS_VOLUME.commit()
 
     # Generate inputs for Boltz and Chai
-    _ = prepare_boltz(conf_file=yaml_path, out_dir=out_dir_full)
-    _ = prepare_chai(
-        conf_file=yaml_path,
-        out_dir=out_dir_full,
-        ccd_lib_dir=Path(BOLTZ_MODEL_DIR) / "mols",
-    )
+    if not (out_dir_full / "boltz_models" / f"{run_id}.yaml").exists():
+        _ = prepare_boltz(conf_file=yaml_path, out_dir=out_dir_full)
+    if not (out_dir_full / "chai_models" / f"{run_id}.yaml").exists():
+        _ = prepare_chai(
+            conf_file=yaml_path,
+            out_dir=out_dir_full,
+            ccd_lib_dir=Path(BOLTZ_MODEL_DIR) / "mols",
+        )
 
     # Pull run parameters from YAML
     conf = load_params_from_run_yaml(yaml_path)
+    conf["run_id"] = run_id
     conf["workdir"] = str(out_dir_full)
     return conf
 
@@ -298,8 +316,8 @@ def collect_abcfold2_boltz_data(
     from pathlib import Path
 
     work_path = Path(run_conf["workdir"]).expanduser().resolve()
-    run_id = work_path.stem
-    work_path = work_path / f"boltz_{run_id}"
+    run_id = run_conf["run_id"]
+    work_path = work_path / "boltz_models"
     boltz_conf_path = work_path / f"{run_id}.yaml"
     OUTPUTS_VOLUME.reload()
 
@@ -309,7 +327,7 @@ def collect_abcfold2_boltz_data(
     random_seeds = run_conf.get("seeds", [])
     seeds_to_run = []
     for seed in random_seeds:
-        boltz_run_dir = work_path / f"boltz_results_{run_id}_seed-{seed}"
+        boltz_run_dir = work_path / f"boltz_results_seed-{seed}"
         if not boltz_run_dir.exists():
             seeds_to_run.append(seed)
 
@@ -319,6 +337,7 @@ def collect_abcfold2_boltz_data(
             print(f"Boltz run complete: {boltz_run_dir}")
 
     OUTPUTS_VOLUME.reload()
+    print("Packaging Boltz results...")
     return package_outputs(
         str(work_path),
         [
@@ -344,6 +363,7 @@ def collect_abcfold2_boltz_data(
 def run_abcfold2_boltz(
     seed: int,
     workdir: str | Path,
+    run_id: str,
     num_trunk_recycles: int,  # recycling_steps
     num_diffn_timesteps: int,  # sampling_steps
     num_diffn_samples: int,  # diffusion_samples
@@ -353,9 +373,9 @@ def run_abcfold2_boltz(
     """Run Boltz with the given ABCFold2 configuration."""
     from abcfold.boltz.run_boltz_abcfold import run_boltz
 
+    OUTPUTS_VOLUME.reload()
     work_path = Path(workdir).expanduser().resolve()
-    run_id = work_path.stem
-    work_path = work_path / f"boltz_{run_id}"
+    work_path = work_path / "boltz_models"
     boltz_conf_path = work_path / f"{run_id}.yaml"
     if not boltz_conf_path.exists():
         raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
@@ -363,7 +383,6 @@ def run_abcfold2_boltz(
     boltz_run_dir = run_boltz(
         output_dir=work_path,
         boltz_yaml_file=boltz_conf_path,
-        run_id=run_id,
         seed=seed,
         num_trunk_recycles=num_trunk_recycles,
         num_diffn_timesteps=num_diffn_timesteps,
@@ -387,8 +406,8 @@ def collect_abcfold2_chai_data(
     from pathlib import Path
 
     work_path = Path(run_conf["workdir"]).expanduser().resolve()
-    run_id = work_path.stem
-    work_path = work_path / f"chai_{run_id}"
+    run_id = run_conf["run_id"]
+    work_path = work_path / "chai_models"
     chai_conf_path = work_path / f"{run_id}.yaml"
     OUTPUTS_VOLUME.reload()
 
@@ -398,7 +417,7 @@ def collect_abcfold2_chai_data(
     random_seeds = run_conf.get("seeds", [])
     seeds_to_run = []
     for seed in random_seeds:
-        chai_run_dir = work_path / f"chai_{run_id}_seed-{seed}"
+        chai_run_dir = work_path / f"chai_seed-{seed}"
         if not chai_run_dir.exists():
             seeds_to_run.append(seed)
 
@@ -408,6 +427,7 @@ def collect_abcfold2_chai_data(
             print(f"Chai run complete: {chai_run_dir}")
 
     OUTPUTS_VOLUME.reload()
+    print("Packaging Chai results...")
     return package_outputs(str(work_path))
 
 
@@ -421,6 +441,7 @@ def collect_abcfold2_chai_data(
 def run_abcfold2_chai(
     seed: int,
     workdir: str | Path,
+    run_id: str,
     num_trunk_recycles: int,
     num_diffn_timesteps: int,
     num_diffn_samples: int,
@@ -430,9 +451,9 @@ def run_abcfold2_chai(
     """Run Chai with the given ABCFold2 configuration."""
     from abcfold.chai1.run_chai1_abcfold import run_chai
 
+    OUTPUTS_VOLUME.reload()
     work_path = Path(workdir).expanduser().resolve()
-    run_id = work_path.stem
-    chai_work_path = work_path / f"chai_{run_id}"
+    chai_work_path = work_path / "chai_models"
     chai_conf_path = chai_work_path / f"{run_id}.yaml"
     if not chai_conf_path.exists():
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
@@ -465,20 +486,38 @@ def submit_abcfold2_task(
     run_boltz: bool = True,
     run_chai: bool = True,
 ) -> None:
-    """Run ABCFold2 on modal and fetch results to $CWD.
+    """Run ABCFold2 on modal and fetch results to `out_dir`.
 
     Args:
         input_yaml: Path to YAML design specification file
         out_dir: Optional output directory (defaults to $CWD)
-        run_name: Optional run name (defaults to timestamp-{input file hash})
+        run_name: Optional run name (defaults to {input filename stem})
         download_models: Whether to download model weights before running
         force_redownload: Whether to force re-download of model weights
         run_boltz: Whether to run Boltz inference
         run_chai: Whether to run Chai inference
     """
-    import hashlib
-    from datetime import UTC, datetime
+    import json
     from pathlib import Path
+
+    # Load input and find its hash
+    yaml_path = Path(input_yaml).expanduser().resolve()
+    yaml_str = yaml_path.read_bytes()
+
+    if run_name is None:
+        run_name = yaml_path.stem
+
+    if out_dir is None:
+        out_dir = Path.cwd()
+    local_out_dir = Path(out_dir) / run_name
+    if local_out_dir.exists():
+        raise FileExistsError(f"Output directory already exists: {local_out_dir}")
+
+    print("🧬 Starting ABCFold2 run...")
+    run_conf = prepare_abcfold2.remote(yaml_str=yaml_str)
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+    with open(local_out_dir / "run-config.json", "w") as f:
+        json.dump(run_conf, f, indent=2)
 
     if download_models:
         print("🧬 Checking Boltz inference dependencies...")
@@ -487,27 +526,9 @@ def submit_abcfold2_task(
         print("🧬 Checking Chai inference dependencies...")
         download_chai_models.remote(force=force_redownload)
 
-    # Load input and find its hash
-    yaml_path = Path(input_yaml).expanduser().resolve()
-    yaml_str = yaml_path.read_bytes()
-
-    run_id = hashlib.sha256(yaml_str).hexdigest()  # content-based id
-    today: str = datetime.now(UTC).strftime("%Y%m%d%H%M")
-    if run_name is None:
-        run_name = run_id[:8]  # short id
-
-    if out_dir is None:
-        out_dir = Path.cwd()
-    local_out_dir = Path(out_dir) / f"{today}-{run_name}"
-    if local_out_dir.exists():
-        raise FileExistsError(f"Output directory already exists: {local_out_dir}")
-
-    print(f"🧬 Starting ABCFold2 run {run_id}...")
-    run_conf = prepare_abcfold2.remote(yaml_str=yaml_str, run_id=run_id)
-
     # Run Boltz for each seed
     if run_boltz:
-        out_path = local_out_dir / f"boltz_{run_id}.tar.zst"
+        out_path = local_out_dir / "boltz_models.tar.zst"
         print(f"🧬 Running Boltz and collecting results to {out_path}")
         boltz_data = collect_abcfold2_boltz_data.remote(run_conf=run_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,7 +536,7 @@ def submit_abcfold2_task(
 
     # Run Chai for each seed
     if run_chai:
-        out_path = local_out_dir / f"chai_{run_id}.tar.zst"
+        out_path = local_out_dir / "chai_models.tar.zst"
         print(f"🧬 Running Chai and collecting results to {out_path}")
         chai_data = collect_abcfold2_chai_data.remote(run_conf=run_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)

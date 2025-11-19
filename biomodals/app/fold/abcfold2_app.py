@@ -43,7 +43,9 @@ BOLTZ_MODEL_DIR = "/boltz-models"
 
 # Volume for outputs
 OUTPUTS_VOLUME_NAME = "abcfold2-outputs"
-OUTPUTS_VOLUME = Volume.from_name(OUTPUTS_VOLUME_NAME, create_if_missing=True)
+OUTPUTS_VOLUME = Volume.from_name(
+    OUTPUTS_VOLUME_NAME, create_if_missing=True, version=2
+)
 OUTPUTS_DIR = "/abcfold2-outputs"
 
 # Repositories and commit hashes
@@ -293,12 +295,14 @@ def prepare_abcfold2(
     # Generate inputs for Boltz and Chai
     if not (out_dir_full / "boltz_models" / f"{run_id}.yaml").exists():
         _ = prepare_boltz(conf_file=yaml_path, out_dir=out_dir_full)
+        OUTPUTS_VOLUME.commit()
     if not (out_dir_full / "chai_models" / f"{run_id}.yaml").exists():
         _ = prepare_chai(
             conf_file=yaml_path,
             out_dir=out_dir_full,
             ccd_lib_dir=Path(BOLTZ_MODEL_DIR) / "mols",
         )
+        OUTPUTS_VOLUME.commit()
 
     # Pull run parameters from YAML
     conf = load_params_from_run_yaml(yaml_path)
@@ -359,10 +363,10 @@ def collect_abcfold2_boltz_data(
 
 @app.function(
     gpu=GPU,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
-    max_containers=10,
 )
 def run_abcfold2_boltz(
     seed: int,
@@ -437,10 +441,10 @@ def collect_abcfold2_chai_data(
 
 @app.function(
     gpu=GPU,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
-    max_containers=10,
 )
 def run_abcfold2_chai(
     seed: int,

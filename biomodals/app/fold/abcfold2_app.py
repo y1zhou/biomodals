@@ -346,7 +346,7 @@ def collect_abcfold2_boltz_data(
 
     OUTPUTS_VOLUME.reload()
     print("Packaging Boltz results...")
-    return package_outputs(
+    boltz_tarball_bytes = package_outputs(
         str(work_path),
         [
             "--exclude",
@@ -359,6 +359,8 @@ def collect_abcfold2_boltz_data(
             "msa",
         ],
     )
+    print("Packaging complete.")
+    return boltz_tarball_bytes
 
 
 @app.function(
@@ -436,7 +438,9 @@ def collect_abcfold2_chai_data(
 
     OUTPUTS_VOLUME.reload()
     print("Packaging Chai results...")
-    return package_outputs(str(work_path))
+    chai_tarball_bytes = package_outputs(str(work_path))
+    print("Packaging complete.")
+    return chai_tarball_bytes
 
 
 @app.function(

@@ -69,6 +69,13 @@ app = App(APP_NAME, image=runtime_image)
 ##########################################
 # Helper functions
 ##########################################
+@app.function(
+    cpu=16.125,  # burst for tar compression
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=86400,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    image=runtime_image,
+)
 def package_outputs(
     root: str | Path,
     paths_to_bundle: Iterable[str | Path],
@@ -91,7 +98,7 @@ def package_outputs(
     from pathlib import Path
 
     root_path = Path(root)  # don't resolve, as the mapped location could be a soft link
-    cmd = ["tar", "--zstd"]
+    cmd = ["tar", "-I", f"'zstd -T{num_threads}'"]
     if tar_args is not None:
         cmd.extend(tar_args)
     cmd.extend(["-cf", "-"])
@@ -105,9 +112,7 @@ def package_outputs(
         else:
             print(f"Warning: path {out_path} does not exist and will be skipped.")
 
-    return sp.check_output(
-        cmd, cwd=root_path.parent, env=os.environ | {"ZSTD_NBTHREADS": str(num_threads)}
-    )  # noqa: S603
+    return sp.check_output(cmd, cwd=root_path.parent)  # noqa: S603
 
 
 def run_command(cmd: list[str], **kwargs) -> None:
@@ -302,7 +307,7 @@ def collect_boltzgen_data(
 
     OUTPUTS_VOLUME.reload()
     print("Packaging BoltzGen outputs...")
-    tarball_bytes = package_outputs(outdir, run_ids)
+    tarball_bytes = package_outputs.remote(outdir, run_ids)
     print("Packaging complete.")
     return tarball_bytes
 

@@ -30,7 +30,7 @@ OUTPUTS_DIR = "/boltzgen-outputs"
 
 # Repositories and commit hashes
 BOLTZGEN_REPO = "https://github.com/HannesStark/boltzgen"
-BOLTZGEN_COMMIT = "8deda18e6f29f1505e00a9cdc2e0847c2be52ffa"
+BOLTZGEN_COMMIT = "a941e4eb3d4457ac6a9b636d7bfdd024df8063cf"
 BOLTZGEN_REPO_DIR = "/opt/boltzgen"
 
 ##########################################
@@ -93,7 +93,6 @@ def package_outputs(
         tar_args: Additional arguments to pass to `tar`.
         num_threads: Number of threads to use for compression.
     """
-    import os
     import subprocess as sp
     from pathlib import Path
 
@@ -324,8 +323,8 @@ def collect_boltzgen_data(
     image=runtime_image,
 )
 def boltzgen_run(
-    out_dir: str | Path,
-    input_yaml_path: str | Path,
+    out_dir: str,
+    input_yaml_path: str,
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
     steps: str | None = None,
@@ -370,6 +369,10 @@ def boltzgen_run(
         cmd.extend(extra_args.split())
 
     out_path = Path(out_dir)
+    # Handle preempted runs by continuing from existing output
+    if out_path.exists():
+        cmd.append("--reuse")
+
     out_path.mkdir(parents=True, exist_ok=True)
     log_path = out_path / "boltzgen-run.log"
     print(f"Running BoltzGen, saving logs to {log_path}")
@@ -382,17 +385,18 @@ def boltzgen_run(
             encoding="utf-8",
             cwd=BOLTZGEN_REPO_DIR,
         ) as p,
-        open(log_path, "w", buffering=1) as log_file,
+        open(log_path, "a", buffering=1) as log_file,
     ):
         now = time.time()
-        log_file.write(f"Time: {str(datetime.now(UTC))}\n")
-        log_file.write(f"Running command: {' '.join(cmd)}\n\n")
+        banner = "=" * 100
+        log_file.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
+        log_file.write(f"Running command: {' '.join(cmd)}\n{banner}\n")
 
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
             log_file.write(buffered_output)  # not realtime without volume commit
             print(buffered_output)
 
-        log_file.write(f"\nFinished at: {str(datetime.now(UTC))}\n")
+        log_file.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
         log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
 
         if p.returncode != 0:

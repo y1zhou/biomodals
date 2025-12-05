@@ -288,6 +288,7 @@ def collect_boltzgen_data(
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
+    package_results: bool = True,
 ) -> bytes:
     """Collect BoltzGen output data from multiple runs."""
     from datetime import UTC, datetime
@@ -332,21 +333,27 @@ def collect_boltzgen_data(
             print(f"BoltzGen run completed: {boltzgen_dir}")
 
     OUTPUTS_VOLUME.reload()
-    print("Packaging BoltzGen outputs...")
-    tarball_bytes = package_outputs.remote(
-        outdir,
-        run_ids,
-        tar_args=[
-            "--exclude",
-            "intermediate_designs",  # intermediate_designs_inverse_folded is enough
-            "--exclude",
-            "lightning_logs",
-            "--exclude",
-            "metrics_tmp",  # design_seq, ca_coords, ca_coords_refolded
-        ],
-    )
-    print("Packaging complete.")
-    return tarball_bytes
+    if package_results:
+        print("Packaging BoltzGen outputs...")
+        tarball_bytes = package_outputs.remote(
+            outdir,
+            run_ids,
+            tar_args=[
+                "--exclude",
+                "intermediate_designs",  # intermediate_designs_inverse_folded is enough
+                "--exclude",
+                "lightning_logs",
+                "--exclude",
+                "metrics_tmp",  # design_seq, ca_coords, ca_coords_refolded
+            ],
+        )
+        print("Packaging complete.")
+        return tarball_bytes
+    else:
+        print("Skipping packaging of BoltzGen outputs.")
+        print(
+            f"Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
+        )
 
 
 @app.function(
@@ -525,11 +532,11 @@ def submit_boltzgen_task(
         steps=steps,
         extra_args=extra_args,
         salvage_mode=salvage_mode,
+        package_results=out_dir is not None,
     )
-    if out_dir is None:
-        out_dir = Path.cwd()
-    local_out_dir = Path(out_dir).expanduser().resolve()
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
+    if out_dir is not None:
+        local_out_dir = Path(out_dir).expanduser().resolve()
+        local_out_dir.mkdir(parents=True, exist_ok=True)
+        (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
 
-    print(f"Results saved to: {local_out_dir}")
+        print(f"Results saved to: {local_out_dir}")

@@ -1,4 +1,40 @@
-"""AntiFold source repo: <https://github.com/oxpig/AntiFold>."""
+"""AntiFold source repo: <https://github.com/oxpig/AntiFold>.
+
+## Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--run-name` | **Required** | Prefix used to name the output directory and files. |
+| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved to the current working directory. |
+| `--struct-file` | **Required** | Path to input PDB or mmCIF file containing the antibody structure. **The antibody chains in the file must be IMGT-numbered.** |
+| `--heavy-chain` | 1st chain in structure file | Chain ID of the heavy chain. |
+| `--light-chain` | 2nd chain in structure file | Chain ID of the light chain. |
+| `--antigen-chain` | None | Chain ID of the antigen, if present. |
+| `--nanobody-chain` | None | Chain ID of the nanobody, if applicable. |
+| `--regions` | `CDR1 CDR2 CDR3` | Space-separated string specifying the regions to design. See <https://github.com/oxpig/AntiFold/blob/789d46786624c01eb44f177ef4c0deeeb6e77469/antifold/antiscripts.py#L738> for options. |
+| `--num-seq-per-target` | `0` | Number of sequences to generate. |
+| `--sampling-temp` | `0.2` | Sampling temperature controls generated sequence diversity, by scaling the inverse folding probabilities before sampling. Temperature = 1 means no change, while temperature ~ 0 only samples the most likely amino-acid at each position (acts as argmax). |
+| `--limit-variation` | `False` | If set, limits variation to as many mutations as expected from temperature sampling. |
+| `--extract-embeddings` | `False` | If set, extracts and saves per-residue embeddings and return them in an NumPy array. |
+| `--num-threads` | `0` | Number of CPU threads to use. Defaults to all available. |
+| `--seed` | `42` | Random seed for reproducibility. |
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MODAL_APP` | `AntiFold` | Name of the Modal app to use. |
+| `GPU` | `A10G` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
+| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
+
+## Notes
+
+* By default there would be two files in the output archive file:
+  * `log.txt`: Log file for the AntiFold run.
+  * `<run_name>_<vh_chain><vl_chain>.csv`: table of the residue indices and scores.
+* If `--extract-embeddings` is set, there would be an additional file:
+  * `<run_name>_<vh_chain><vl_chain>_embeddings.npy`: NumPy array of per-residue embeddings.
+* The model does not like large antigens in the input structure. In our benchmarks antigens don't seem to affect results much, so for performance you may want to remove the antigen chains from the input structure and only provide the antibody chain(s).
+* Make sure *all* antibody chains are IMGT-numbered!
+"""
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
 
@@ -147,6 +183,7 @@ def antifold_inference(
     )
     cache_model_path = Path(ANTIFOLD_MODEL_DIR) / "model.pt"
     if cache_model_path.exists():
+        model_path.parent.mkdir(parents=True, exist_ok=True)
         model_path.symlink_to(cache_model_path)
 
     with TemporaryDirectory() as tmpdir:
@@ -214,11 +251,11 @@ def submit_antifold_task(
     struct_file: str,
     out_dir: str | None = None,
     # AntiFold parameters
-    heavy_chain: str | None = None,  # 1st chain from PDB if not specified
-    light_chain: str | None = None,  # 2nd chain from PDB if not specified
+    heavy_chain: str | None = None,
+    light_chain: str | None = None,
     antigen_chain: str | None = None,
     nanobody_chain: str | None = None,
-    regions: str = "CDR1 CDR2 CDR3",  # https://github.com/oxpig/AntiFold/blob/789d46786624c01eb44f177ef4c0deeeb6e77469/antifold/antiscripts.py#L738
+    regions: str = "CDR1 CDR2 CDR3",
     num_seq_per_target: int = 0,
     sampling_temp: float = 0.2,
     limit_variation: bool = False,

@@ -25,17 +25,10 @@ def callback():
     """
 
 
-@app.command(name="list")
-def list_available_apps(
-    use_absolute_paths: Annotated[
-        bool,
-        typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
-    ] = False,
-):
-    """Show a list of all available biomodals applications."""
-    table = Table("App name", "App path", "Category")
+def get_all_apps(use_absolute_paths: bool = False) -> dict[str, Path]:
+    """Retrieve all available biomodals applications."""
+    available_apps: dict[str, Path] = {}
     cwd = Path.cwd()
-
     for app_file in APP_HOME.glob("*/*_app.py"):
         app_path = (
             app_file.resolve()
@@ -43,8 +36,23 @@ def list_available_apps(
             else app_file.relative_to(cwd, walk_up=True)
         )
         app_name = app_file.stem.replace("_app", "")
-        app_category = app_file.parent.name
+        available_apps[app_name] = app_path
+    return available_apps
 
+
+@app.command(name="list")
+def list_available_apps(
+    use_absolute_paths: Annotated[
+        bool,
+        typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
+    ] = False,
+) -> dict[str, Path]:
+    """Show a list of all available biomodals applications."""
+    table = Table("App name", "App path", "Category")
+
+    available_apps = get_all_apps(use_absolute_paths)
+    for app_name, app_path in available_apps.items():
+        app_category = app_path.parent.name
         table.add_row(f"[green]{app_name}[/green]", str(app_path), app_category)
 
     console.print(
@@ -58,6 +66,7 @@ def list_available_apps(
     )
     console.print("\n:dna: [bold]Available biomodals applications:[/bold]")
     console.print(table)
+    return available_apps
 
 
 @app.command(name="help")
@@ -103,6 +112,63 @@ def show_app_help(
     except ImportError as e:
         console.print(f"[bold red]Error:[/bold red] Failed to import '{module_path}'")
         raise typer.Exit(code=1) from e
+
+
+def _run_command(cmd: list[str], **kwargs) -> None:
+    """Run a shell command and stream output to stdout."""
+    import subprocess as sp
+
+    print(f"Running command: {' '.join(cmd)}")
+    # Set default kwargs for sp.Popen
+    kwargs.setdefault("stdout", sp.PIPE)
+    kwargs.setdefault("stderr", sp.STDOUT)
+    kwargs.setdefault("bufsize", 1)
+    kwargs.setdefault("encoding", "utf-8")
+
+    with sp.Popen(cmd, **kwargs) as p:
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        buffered_output = None
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+            print(buffered_output, end="", flush=True)
+
+        if p.returncode != 0:
+            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+
+
+@app.command(name="run")
+def run_command(
+    app_name_or_path: Annotated[
+        str, typer.Argument(help="Name or path of the app to generate run command for.")
+    ],
+    flags: Annotated[
+        list[str] | None,
+        typer.Argument(help="Additional flags to pass to the modal run command."),
+    ] = None,
+):
+    """Generate the modal run command for a specific biomodals application.
+
+    Use with: `biomodals run <app-name> -- [OPTIONS]`, where `[OPTIONS]` are
+    additional flags to pass to the `modal run <app-name>` command.
+    """
+    all_apps = get_all_apps(use_absolute_paths=True)
+    if app_name_or_path in all_apps:
+        app_path = all_apps[app_name_or_path]
+    else:
+        app_path = Path(app_name_or_path).resolve()
+        if not app_path.exists():
+            console.print(
+                f"[bold red]Error:[/bold red] Application '{app_name_or_path}' not found."
+            )
+            raise typer.Exit(code=1)
+
+    cmd = ["modal", "run", str(app_path)]
+    if flags:
+        cmd.extend(flags)
+        _run_command(cmd)
+    else:
+        _run_command(["biomodals", "help", str(app_path)])
 
 
 if __name__ == "__main__":

@@ -158,13 +158,15 @@ def run_command(cmd: list[str], **kwargs) -> None:
     kwargs.setdefault("encoding", "utf-8")
 
     with sp.Popen(cmd, **kwargs) as p:
-        while (buffered_output := p.stdout.readline()) != "" or (
-            return_code := p.poll()
-        ) is None:
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        buffered_output = None
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
             print(buffered_output, end="", flush=True)
 
-        if return_code != 0:
-            raise sp.CalledProcessError(return_code, cmd, buffered_output)
+        if p.returncode != 0:
+            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
 class YAMLReferenceLoader:

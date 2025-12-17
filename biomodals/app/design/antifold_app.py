@@ -134,6 +134,10 @@ def run_command(cmd: list[str], **kwargs) -> None:
     kwargs.setdefault("encoding", "utf-8")
 
     with sp.Popen(cmd, **kwargs) as p:
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        buffered_output = None
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
             print(buffered_output, end="", flush=True)
 

@@ -1,8 +1,9 @@
 """Helper script for constructing actual modal run commands."""
 
 import importlib
+import inspect
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, get_args, get_origin
 
 import typer
 from rich.console import Console
@@ -76,6 +77,85 @@ def _run_command(cmd: list[str], **kwargs) -> None:
 
         if p.returncode != 0:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+
+
+def parse_flags_to_kwargs(flags: list[str], sig: inspect.Signature) -> dict:
+    """Parse command-line flags into a dictionary of keyword arguments.
+
+    Args:
+        flags: List of command-line flags (e.g., ["--input-yaml", "file.yaml", "--num-designs", "5"])
+        sig: Function signature to match parameter types against
+
+    Returns:
+        Dictionary of parsed keyword arguments ready to pass to the function
+
+    """
+    kwargs = {}
+    i = 0
+
+    while i < len(flags):
+        flag = flags[i]
+
+        if not flag.startswith("--"):
+            raise ValueError(f"Expected flag starting with '--', got: {flag}")
+
+        # Handle --no-flag pattern (boolean False)
+        if flag.startswith("--no-"):
+            param_name = flag[5:].replace("-", "_")
+            kwargs[param_name] = False
+            i += 1
+            continue
+
+        # Handle regular --flag pattern
+        param_name = flag[2:].replace("-", "_")
+
+        # Find the parameter in the signature
+        if param_name not in sig.parameters:
+            raise ValueError(f"Unknown parameter: {param_name}")
+
+        param = sig.parameters[param_name]
+        param_type = param.annotation
+
+        # Handle union types (e.g., str | None)
+        origin = get_origin(param_type)
+        if origin is not None:
+            type_args = get_args(param_type)
+            # Filter out None from union types
+            non_none_types = [t for t in type_args if t is not type(None)]
+            if non_none_types:
+                param_type = non_none_types[0]
+
+        # Determine if this is a boolean flag or requires a value
+        if param_type is bool or param_type == "bool":
+            # Boolean flag without value means True
+            kwargs[param_name] = True
+            i += 1
+        else:
+            # Get the next item as the value
+            if i + 1 >= len(flags):
+                raise ValueError(f"Flag {flag} requires a value")
+
+            value_str = flags[i + 1]
+
+            # Convert the value to the appropriate type
+            try:
+                if param_type is int or param_type == "int":
+                    kwargs[param_name] = int(value_str)
+                elif param_type is float or param_type == "float":
+                    kwargs[param_name] = float(value_str)
+                elif param_type is str or param_type == "str":
+                    kwargs[param_name] = value_str
+                else:
+                    # Default to string for unknown types
+                    kwargs[param_name] = value_str
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Failed to convert value '{value_str}' for parameter '{param_name}' to type {param_type}"
+                ) from e
+
+            i += 2
+
+    return kwargs
 
 
 ##########################################
@@ -177,12 +257,36 @@ def run_command(
         module_path = app_path_to_module_path(app_path)
         mod = importlib.import_module(module_path)
         # find the local entrypoint function
+        entrypoint_func = None
         for obj in dir(mod):
             f = getattr(mod, obj)
             if callable(f) and isinstance(f, modal.app.LocalEntrypoint):
-                # Parse the flags into a dict that can be passed to the function
-
+                entrypoint_func = f
                 break
+
+        if entrypoint_func is None:
+            console.print(
+                f"[bold red]Error:[/bold red] No local entrypoint found in '{app_path}'"
+            )
+            raise typer.Exit(code=1)
+
+        # Get the function signature from the wrapped function
+        sig = inspect.signature(entrypoint_func.info.raw_f)
+
+        # Parse the flags into a dict that can be passed to the function
+        try:
+            kwargs = parse_flags_to_kwargs(flags, sig)
+            console.print(
+                f"[bold green]Running {app_name_or_path} with arguments:[/bold green]"
+            )
+            for key, value in kwargs.items():
+                console.print(f"  {key}: {value}")
+
+            # Call the function with parsed arguments
+            entrypoint_func(**kwargs)
+        except ValueError as e:
+            console.print(f"[bold red]Error parsing flags:[/bold red] {e}")
+            raise typer.Exit(code=1) from e
     else:
         _run_command(["biomodals", "help", str(app_path)])
 

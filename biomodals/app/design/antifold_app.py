@@ -4,9 +4,9 @@
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--run-name` | **Required** | Prefix used to name the output directory and files. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved to the current working directory. |
 | `--struct-file` | **Required** | Path to input PDB or mmCIF file containing the antibody structure. **The antibody chains in the file must be IMGT-numbered.** |
+| `--run-name` | None | Prefix used to name the output directory and files. |
+| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved to the current working directory. |
 | `--heavy-chain` | 1st chain in structure file | Chain ID of the heavy chain. |
 | `--light-chain` | 2nd chain in structure file | Chain ID of the light chain. |
 | `--antigen-chain` | None | Chain ID of the antigen, if present. |
@@ -251,8 +251,8 @@ def antifold_inference(
 @app.local_entrypoint()
 def submit_antifold_task(
     # Input and output
-    run_name: str,
     struct_file: str,
+    run_name: str | None = None,
     out_dir: str | None = None,
     # AntiFold parameters
     heavy_chain: str | None = None,
@@ -292,16 +292,6 @@ def submit_antifold_task(
     """
     # Set up output paths
     print("🧬 Starting AntiFold run...")
-    local_out_dir = (
-        (Path(out_dir) if out_dir is not None else Path.cwd()).expanduser().resolve()
-    )
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_zst_file = local_out_dir / f"{run_name}_antifold.tar.zst"
-    if out_zst_file.exists():
-        raise FileExistsError(f"Output file already exists: {out_zst_file}")
-
-    # Submit scoring job based on model type
-    print("🧬 Running AntiFold inverse folding...")
     struct_file_path = Path(struct_file).expanduser().resolve()
     if not struct_file_path.exists():
         raise FileNotFoundError(f"Structure file not found: {struct_file_path}")
@@ -310,6 +300,19 @@ def submit_antifold_task(
         raise ValueError(
             f"Unsupported structure file type: {struct_file_type}. Must be 'pdb' or 'cif'."
         )
+
+    if run_name is None:
+        run_name = struct_file_path.stem
+
+    local_out_dir = (
+        (Path(out_dir) if out_dir is not None else Path.cwd()).expanduser().resolve()
+    )
+    out_zst_file = local_out_dir / f"{run_name}_antifold.tar.zst"
+    if out_zst_file.exists():
+        raise FileExistsError(f"Output file already exists: {out_zst_file}")
+
+    # Submit scoring job based on model type
+    print("🧬 Running AntiFold inverse folding...")
     with open(struct_file, "rb") as f:
         struct_bytes = f.read()
     antifold_outputs: bytes = (
@@ -330,7 +333,7 @@ def submit_antifold_task(
             seed,
         )
     )
-
+    local_out_dir.mkdir(parents=True, exist_ok=True)
     out_zst_file.write_bytes(antifold_outputs)
     print(
         f"🧬 AntiFold run complete! Results saved to {local_out_dir} in {out_zst_file.name}"

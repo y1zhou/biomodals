@@ -5,7 +5,7 @@ description = "Run biomodelling tasks with Modal"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "modal>=1.2.1",
+    "modal>=1.2.1,<=2.0.0",
     "pyyaml>=6.0.3",
     "rich>=14.2.0",
     "typer>=0.20.0",

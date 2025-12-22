@@ -182,6 +182,10 @@ def run_command(
         str,
         typer.Option("--mode", "-m", help="Modal command to use ('run' or 'shell')."),
     ] = "run",
+    detach: Annotated[
+        bool,
+        typer.Option("--detach", "-d", help="Run the modal command in detached mode."),
+    ] = False,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the modal run command."),
@@ -212,6 +216,8 @@ def run_command(
         str(app_path) if entrypoint_name is None else f"{app_path}::{entrypoint_name}"
     )
     cmd = ["modal", modal_mode, full_app]
+    if detach:
+        cmd.append("-d")
 
     if flags:
         _run_command([*cmd, *flags], console_kwargs={"markup": False})

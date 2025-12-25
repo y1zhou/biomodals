@@ -1,0 +1,46 @@
+# author: ziwei pang (Jeffery) @biomap
+
+#source ff parameters
+source leaprc.protein.ff19SB
+source leaprc.gaff
+loadamberparams frcmod.ionsjc_tip3p
+
+############# only-for-non-amino-acid ################
+#load .lib file if necessary
+#loadoff bad.lib
+
+#load .frcmod file if necessary
+#loadamberparams bad.frcmod
+
+
+#loadamberprep bad.mol2
+
+
+#check BAD
+
+
+protein = loadpdb input.pdb
+
+
+check protein
+
+#bond bad.150.C bad.151.N1
+#bond bad.151.C2 bad.152.N
+
+
+check protein
+
+
+saveoff protein test.protein.lib
+
+
+
+
+saveamberparm protein prmtop inpcrd
+
+set default oldprmtopformat on #
+
+
+saveamberparm protein protein.atop protein.rst # writes topology file .atop and coordinate-file .rst
+
+quit

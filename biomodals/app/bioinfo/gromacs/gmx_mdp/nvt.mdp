@@ -1,0 +1,57 @@
+; https://manual.gromacs.org/documentation/current/user-guide/mdp-options.html
+title                = NVT equilibration
+define               = -DPOSRES ; position restrain the protein
+
+; Run parameters
+integrator           = md     ; leap-frog integrator
+nsteps               = 500000 ; 0.002 * 500000 = 1000 ps
+dt                   = 0.002  ; 2 fs
+ld-seed              = -1     ; use a pseudo random seed
+
+; Output control
+nstxout              = 0     ; don't write coordinates to trr
+nstvout              = 0     ; don't write velocities to trr
+nstfout              = 0     ; don't write forces to trr
+nstxout-compressed   = 10000 ; compressed trajectory *.xtc, only coordinates
+nstenergy            = 10000 ; save energies every 20 ps
+nstlog               = 10000 ; save energies to log file every 20 ps
+
+; Bond parameters
+constraint-algorithm = LINCS     ; holonomic constraints
+constraints          = all-bonds ; convert all bonds to constraints
+lincs-iter           = 1         ; accuracy of LINCS
+lincs-order          = 4         ; also related to accuracy
+
+; Neighbor searching
+cutoff-scheme        = Verlet ; replace the ns-type=grid option
+nstlist              = 20     ; frequency to update the neighbor list
+rlist                = 1.0    ; short-range neighbor list cutoff distance (in nm)
+pbc                  = xyz    ; periodic boundary conditions in all directions
+
+; Electrostatics
+coulombtype          = PME ; Particle Mesh Ewald for long-range electrostatics
+rcoulomb             = 1.0 ; short-range electrostatic cutoff (in nm)
+
+; Van der Waals
+rvdw                 = 1.0      ; short-range van der Waals cutoff (in nm)
+DispCorr             = EnerPres ; apply long range dispersion corrections for Energy and Pressure
+
+; Temperature coupling
+tcoupl               = V-rescale           ; modified Berendsen thermostat
+tc-grps              = Protein non-Protein ; two coupling groups - more accurate
+tau-t                = 0.1     0.1         ; time constant, in ps
+ref-t                = 298     298         ; reference temperature, one for each group, in K
+
+; Pressure coupling is off
+pcoupl               = no ; no pressure coupling in NVT
+
+; Velocity generation
+gen-vel              = yes ; assign velocities from Maxwell distribution
+gen-temp             = 10. ; temperature for Maxwell distribution
+gen-seed             = -1  ; initialize random generator for velocities
+
+; Simulated annealing
+annealing            = single single
+annealing-npoints    = 5      5
+annealing-time       = 0. 250. 500. 750. 1000. 0. 250. 500. 750. 1000.
+annealing-temp       = 10. 100. 200. 250. 298. 10. 100. 200. 250. 298.

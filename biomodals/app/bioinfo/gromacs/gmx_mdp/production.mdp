@@ -1,0 +1,58 @@
+; https://manual.gromacs.org/documentation/current/user-guide/mdp-options.html
+; https://gromacs.bioexcel.eu/t/what-vdw-and-electrostatic-parameters-to-use-with-amber-ff19sb/8474
+; https://gromacs.bioexcel.eu/t/mdp-parameters-for-non-bonded-interaction-using-the-amber-force-field/6458
+title                = Production equilibration
+
+; Run parameters
+integrator           = md       ; leap-frog integrator
+nsteps               = 50000000 ; 2 * 50000000 = 100 ns
+dt                   = 0.002    ; 2 fs
+ld-seed              = -1       ; use a pseudo random seed
+
+; Output control
+nstxout              = 0      ; don't write coordinates to trr
+nstvout              = 0      ; don't write velocities to trr
+nstfout              = 0      ; don't write forces to trr
+nstxout-compressed   = 5000   ; compressed trajectory *.xtc, only coordinates
+nstenergy            = 100000 ; save energies every 0.2 ns
+nstlog               = 100000 ; save energies to log file every 0.2 ns
+
+; Bond parameters
+continuation         = yes     ; Restarting after NPT
+constraint-algorithm = LINCS   ; holonomic constraints
+constraints          = h-bonds ; convert bonds with H-atoms to constraints
+lincs-iter           = 1       ; accuracy of LINCS
+lincs-order          = 4       ; also related to accuracy
+
+; Neighbor searching
+cutoff-scheme        = Verlet ; replace the ns-type=grid option
+nstlist              = 20     ; frequency to update the neighbor list
+rlist                = 1.4    ; short-range neighbor list cutoff distance (in nm)
+pbc                  = xyz    ; periodic boundary conditions in all directions
+
+; Electrostatics
+coulombtype          = PME  ; Particle Mesh Ewald for long-range electrostatics
+rcoulomb             = 1.0  ; short-range Coulomb cutoff (in nm)
+fourierspacing       = 0.125;
+
+; Van der Waals
+rvdw                 = 1.0      ; short-range Van der Waals cutoff (in nm)
+DispCorr             = EnerPres ; apply long range dispersion corrections for Energy and Pressure
+vdw-modifier         = Potential-shift-Verlet ; Amber specific
+
+; Temperature coupling
+tcoupl               = v-rescale           ; use nose-hoover if -update gpu is not required
+tc-grps              = Protein non-Protein ; two coupling groups - more accurate
+tau-t                = 0.5     0.5         ; time constant, in ps
+ref-t                = 298     298         ; reference temperature, one for each group, in K
+
+; Pressure coupling
+pcoupl               = Parrinello-Rahman ; Pressure coupling on in NPT
+pcoupltype           = isotropic         ; uniform scaling of box vectors
+tau-p                = 2.0               ; time constant, in ps
+ref-p                = 1.0               ; reference pressure, in bar
+compressibility      = 4.5e-5            ; isothermal compressibility of water, bar^-1
+refcoord-scaling     = com               ; scale center of mass of reference coordinates
+
+; Velocity generation
+gen-vel              = no ; Velocity generation is off

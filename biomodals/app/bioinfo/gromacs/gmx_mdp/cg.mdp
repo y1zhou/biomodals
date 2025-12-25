@@ -1,0 +1,18 @@
+; cg.mdp - used as input into grompp to generate cg.tpr
+
+; Run parameters
+integrator    = cg    ; Algorithm (cg = conjugate gradient)
+nsteps        = 50000 ; Maximum number of (minimization) steps to perform
+ld-seed       = -1    ; use a pseudo random seed
+
+; Energy minimization
+emtol         = 500.0 ; Stop minimization when the maximum force < 1000.0 kJ/mol/nm
+emstep        = 0.01  ; Energy step size
+
+; Parameters describing how to find the neighbors of each atom and how to calculate the interactions
+cutoff-scheme = Verlet
+nstlist       = 1   ; Frequency to update the neighbor list
+pbc           = xyz ; periodic boundary conditions in all directions
+coulombtype   = PME ; Particle Mesh Ewald for long-range electrostatics
+rcoulomb      = 1.0 ; Short-range Coulomb cut-off (nm)
+rvdw          = 1.0 ; Short-range Van der Waals cut-off (nm)

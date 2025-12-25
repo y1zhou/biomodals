@@ -46,11 +46,13 @@ GROMACS_TAG = "2024.5"
 # Image and app definitions
 ##########################################
 runtime_image = (
-    Image.micromamba(python_version="3.13")
+    Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.13")
+    .entrypoint([])  # remove verbose logging by base image on entry
     .apt_install(
         "git",
         "build-essential",
         "cmake",
+        "curl",
         "wget",
         "libboost-dev",
         "zlib1g",
@@ -66,65 +68,74 @@ runtime_image = (
             # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
             # https://modal.com/docs/guide/cuda
             "UV_TORCH_BACKEND": "cu128",  # find best torch and CUDA versions
+            "PATH": "/root/.local/bin:$PATH",
         }
     )
-    # Download dependencies
-    .workdir("/opt")
-    .run_commands(
-        f"wget https://github.com/openucx/ucx/releases/download/v{UCX_TAG}/ucx-{UCX_TAG}.tar.gz"
+    .run_commands("curl -L micro.mamba.pm/install.sh | bash")
+    .micromamba_install(
+        "ambertools=23", "pdbfixer", channels=["conda-forge", "bioconda"]
     )
-    .run_commands(
-        f"wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-{OPENMPI_TAG}.tar.bz2"
-    )
-    .run_commands(f"wget http://www.fftw.org/fftw-{FFTW_TAG}.tar.gz")
-    .run_commands("wget https://ftp.gromacs.org/gromacs/gromacs-2024.5.tar.gz")
     # Follow https://manual.gromacs.org/2024.5/install-guide/index.html#gpu-aware-mpi-support
+    .workdir("/opt")
     # Build UCX
     .run_commands(
         " && ".join(
             (
                 "cd /opt",
+                f"wget https://github.com/openucx/ucx/releases/download/v{UCX_TAG}/ucx-{UCX_TAG}.tar.gz",
                 f"tar -xzf ucx-{UCX_TAG}.tar.gz",
+                f"rm ucx-{UCX_TAG}.tar.gz",
                 f"cd ucx-{UCX_TAG}/",
                 "./contrib/configure-release --with-cuda=/usr/local/cuda prefix=/usr/local",
                 "make -j install",
             ),
         ),
-        gpu=GPU,
     )
     # Build OpenMPI
     .run_commands(
         " && ".join(
             (
                 "cd /opt",
+                f"wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-{OPENMPI_TAG}.tar.bz2",
                 f"tar -xf openmpi-{OPENMPI_TAG}.tar.bz2",
+                f"rm openmpi-{OPENMPI_TAG}.tar.bz2",
                 f"cd openmpi-{OPENMPI_TAG}/",
                 "./configure --with-cuda=/usr/local/cuda --with-ucx=/usr/local/ prefix=/usr/local",
                 "make -j install",
             ),
         ),
-        gpu=GPU,
     )
     # Build FFTW
     .run_commands(
         " && ".join(
             (
                 "cd /opt",
+                f"wget http://www.fftw.org/fftw-{FFTW_TAG}.tar.gz",
                 f"tar -xzf fftw-{FFTW_TAG}.tar.gz",
+                f"rm fftw-{FFTW_TAG}.tar.gz",
                 f"cd fftw-{FFTW_TAG}/",
                 "./configure --disable-fortran --disable-shared --enable-static "
-                "--with-pic --enable-avx512 --enable-avx2 --enable --enable-sse2 "
+                "--with-pic --enable-avx512 --enable-avx2 --enable-avx --enable-sse2 "
                 "--enable-float --prefix=/usr/local",
                 "make -j install",
             ),
         )
     )
     # Build GROMACS
+    .env(
+        {
+            "PATH": "/usr/local/gromacs/bin:/root/micromamba/bin:$PATH",
+            "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib:${LD_LIBRARY_PATH}",
+        }
+    )
     .run_commands(
         " && ".join(
             (
+                # gmx binaries
                 "cd /opt",
+                "wget https://ftp.gromacs.org/gromacs/gromacs-2024.5.tar.gz",
                 f"tar -xzf gromacs-{GROMACS_TAG}.tar.gz",
+                f"rm gromacs-{GROMACS_TAG}.tar.gz",
                 f"cd gromacs-{GROMACS_TAG}/",
                 "mkdir build",
                 "cd build",
@@ -135,14 +146,7 @@ runtime_image = (
                 "-DGMX_BUILD_OWN_FFTW=OFF -DGMX_FFT_LIBRARY=fftw3 "
                 "-DGMX_SIMD=AVX_512",
                 "make -j install",
-            ),
-        ),
-        gpu=GPU,
-    )
-    # Build GROMACS with OpenMPI
-    .run_commands(
-        " && ".join(
-            (
+                # Build GROMACS with OpenMPI
                 f"cd /opt/gromacs-{GROMACS_TAG}/",
                 "mkdir build_mpi",
                 "cd build_mpi",
@@ -158,17 +162,10 @@ runtime_image = (
                 "make -j install",
             ),
         ),
-        gpu=GPU,
     )
-    .env(
-        {
-            "PATH": "/usr/local/gromacs/bin:$PATH",
-            "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib:${LD_LIBRARY_PATH}",
-        }
-    )
-    .run_commands("echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile")
-    .micromamba_install(
-        "ambertools=23", "pdbfixer", channels=["conda-forge", "bioconda"]
+    .run_commands(
+        "echo 'micromamba activate base' >> /etc/profile",
+        "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
     .add_local_dir(Path(__file__).parent / "gromacs", GMX_SCRIPTS, copy=True)
 )

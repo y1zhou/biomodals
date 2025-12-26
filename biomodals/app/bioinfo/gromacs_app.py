@@ -5,10 +5,20 @@
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--input-pdb` | **Required** | Path to the input PDB file. |
+| `--run-name` | PDB filename stem | Name for this simulation run. Note that if the name exists in the remote volume, files in the remote will be preferred over the local one. Make sure to use unique names if you want to start a new run! |
+| `--simulation-time-ns` | 5 | Length of the production MD simulation in nanoseconds. |
+| `--run-pdbfixer` | False | Whether to run PDBFixer to clean the input PDB file before preparation. |
+| `--cpu-only` | False | Whether to run GROMACS on CPU only. If False, GROMACS will use GPU acceleration. |
+| `--num-threads` | 32 | Number of CPU threads to use for GROMACS. |
+| `--use-openmp-threads` | False | Whether to use OpenMP threading in GROMACS. If False, GROMACS will use its own internal threading. |
+| `--ld-seed` | -1 | Random seed for the Langevin dynamics thermostat during equilibration. If -1, a random seed will be chosen. |
+| `--gen-seed` | -1 | Random seed for initial velocity generation during equilibration. If -1, a random seed will be chosen. |
+| `--genion-seed` | 0 | Random seed for ion placement during system neutralization. |
 
 ## Outputs
 
-* TODO
+* All output files are saved to a Modal volume named `gromacs-outputs`.
+* The production trajectory should be under the name `production_{run_name}.xtc`.
 """
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
@@ -230,7 +240,19 @@ def prepare_tpr_gpu(
 
     work_path = Path(OUTPUTS_DIR) / run_name
     work_path.mkdir(parents=True, exist_ok=True)
-    input_pdb_path = work_path / f"{run_name}_input.pdb"
+
+    # Skip prep if production tpr already exists
+    if all(
+        f.exists()
+        for f in (
+            work_path / f"production_{run_name}.tpr",
+            work_path / "production.mdp",
+        )
+    ):
+        print("✅ Preparation already completed, skipping.")
+        return work_path
+
+    input_pdb_path = work_path / f"{run_name}.pdb"
     input_pdb_path.write_bytes(pdb_content)
     OUTPUTS_VOLUME.commit()
 
@@ -295,7 +317,19 @@ def prepare_tpr_cpu(
 
     work_path = Path(OUTPUTS_DIR) / run_name
     work_path.mkdir(parents=True, exist_ok=True)
-    input_pdb_path = work_path / f"{run_name}_input.pdb"
+
+    # Skip prep if production tpr already exists
+    if all(
+        f.exists()
+        for f in (
+            work_path / f"production_{run_name}.tpr",
+            work_path / "production.mdp",
+        )
+    ):
+        print("✅ Preparation already completed, skipping.")
+        return work_path
+
+    input_pdb_path = work_path / f"{run_name}.pdb"
     input_pdb_path.write_bytes(pdb_content)
     OUTPUTS_VOLUME.commit()
 
@@ -324,6 +358,115 @@ def prepare_tpr_cpu(
     if use_openmp_threads:
         cmd.append("--use-openmp-threads")
 
+    OUTPUTS_VOLUME.commit()
+    return work_path
+
+
+@app.function(
+    gpu=GPU,
+    cpu=N_GMX_THREADS + 0.125,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+)
+def production_run_gpu(
+    run_name: str, num_threads: int = N_GMX_THREADS, use_openmp_threads: bool = False
+) -> Path:
+    """Production Gromacs run."""
+    import shutil
+    from pathlib import Path
+
+    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
+    if gmx is None:
+        raise FileNotFoundError("Gromacs binary not found in PATH.")
+
+    work_path = Path(OUTPUTS_DIR) / run_name
+    tpr_file_path = work_path / f"production_{run_name}.tpr"
+    if not tpr_file_path.exists():
+        raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
+
+    cmd = [
+        gmx,
+        "mdrun",
+        "-deffnm",
+        tpr_file_path.stem,
+        "-gpu_id",
+        "0",
+        "-nb",
+        "gpu",
+        "-pmefft",
+        "gpu",
+        "-pme",
+        "gpu",
+        "-bonded",
+        "gpu",
+        "-update",
+        "gpu",
+    ]
+    if use_openmp_threads:
+        cmd.extend(["-ntmpi", "1", "-ntomp", str(num_threads)])
+    else:
+        cmd.extend(["-nt", str(num_threads)])
+
+    # Modal adds this automatically but we want Gromacs to handle threading
+    env = os.environ.copy()
+    if "OMP_NUM_THREADS" in env:
+        del env["OMP_NUM_THREADS"]
+
+    _ = run_command(cmd, cwd=str(work_path), env=env)
+    OUTPUTS_VOLUME.commit()
+    return work_path
+
+
+@app.function(
+    cpu=N_GMX_THREADS + 0.125,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+)
+def production_run_cpu(
+    run_name: str, num_threads: int = N_GMX_THREADS, use_openmp_threads: bool = False
+) -> Path:
+    """Production Gromacs run."""
+    import shutil
+    from pathlib import Path
+
+    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
+    if gmx is None:
+        raise FileNotFoundError("Gromacs binary not found in PATH.")
+
+    work_path = Path(OUTPUTS_DIR) / run_name
+    tpr_file_path = work_path / f"production_{run_name}.tpr"
+    if not tpr_file_path.exists():
+        raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
+
+    cmd = [
+        gmx,
+        "mdrun",
+        "-deffnm",
+        tpr_file_path.stem,
+        "-nb",
+        "cpu",
+        "-pmefft",
+        "cpu",
+        "-pme",
+        "cpu",
+        "-bonded",
+        "cpu",
+        "-update",
+        "cpu",
+    ]
+    if use_openmp_threads:
+        cmd.extend(["-ntmpi", "1", "-ntomp", str(num_threads)])
+    else:
+        cmd.extend(["-nt", str(num_threads)])
+
+    # Modal adds this automatically but we want Gromacs to handle threading
+    env = os.environ.copy()
+    if "OMP_NUM_THREADS" in env:
+        del env["OMP_NUM_THREADS"]
+
+    _ = run_command(cmd, cwd=str(work_path), env=env)
     OUTPUTS_VOLUME.commit()
     return work_path
 
@@ -369,6 +512,20 @@ def submit_gromacs_task(
         remote_workdir = prepare_tpr_cpu.remote(**prepare_tpr_conf)
     else:
         remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
+
+    print("🧬 Starting Gromacs production MD simulation...")
+    if cpu_only:
+        _ = production_run_cpu.remote(
+            run_name=run_name,
+            num_threads=num_threads,
+            use_openmp_threads=use_openmp_threads,
+        )
+    else:
+        _ = production_run_gpu.remote(
+            run_name=run_name,
+            num_threads=num_threads,
+            use_openmp_threads=use_openmp_threads,
+        )
 
     remote_volume_dir = remote_workdir.relative_to(OUTPUTS_DIR)
     print("🧬 Gromacs preparation complete! Check data with: \n")

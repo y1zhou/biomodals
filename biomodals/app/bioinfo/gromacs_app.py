@@ -26,6 +26,7 @@
 import os
 from pathlib import Path
 
+import modal
 from modal import App, Image, Volume
 
 ##########################################
@@ -178,6 +179,12 @@ runtime_image = (
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
     .add_local_dir(Path(__file__).parent / "gromacs", GMX_SCRIPTS, copy=True)
+)
+
+biotite_image = (
+    Image.debian_slim()
+    .apt_install("git", "build-essential")
+    .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
 )
 
 app = App(APP_NAME, image=runtime_image)
@@ -376,14 +383,19 @@ def production_run_gpu(
     import shutil
     from pathlib import Path
 
-    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
-    if gmx is None:
-        raise FileNotFoundError("Gromacs binary not found in PATH.")
-
     work_path = Path(OUTPUTS_DIR) / run_name
     tpr_file_path = work_path / f"production_{run_name}.tpr"
     if not tpr_file_path.exists():
         raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
+
+    # TODO: pick up exisiting trajectory and continue simulation
+    traj_file_path = work_path / f"production_{run_name}.xtc"
+    if traj_file_path.exists():
+        return work_path
+
+    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
+    if gmx is None:
+        raise FileNotFoundError("Gromacs binary not found in PATH.")
 
     cmd = [
         gmx,
@@ -431,14 +443,19 @@ def production_run_cpu(
     import shutil
     from pathlib import Path
 
-    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
-    if gmx is None:
-        raise FileNotFoundError("Gromacs binary not found in PATH.")
-
     work_path = Path(OUTPUTS_DIR) / run_name
     tpr_file_path = work_path / f"production_{run_name}.tpr"
     if not tpr_file_path.exists():
         raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
+
+    # TODO: pick up exisiting trajectory and continue simulation
+    traj_file_path = work_path / f"production_{run_name}.xtc"
+    if traj_file_path.exists():
+        return work_path
+
+    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
+    if gmx is None:
+        raise FileNotFoundError("Gromacs binary not found in PATH.")
 
     cmd = [
         gmx,
@@ -471,6 +488,170 @@ def production_run_cpu(
     return work_path
 
 
+@app.function(
+    image=biotite_image,
+    cpu=1,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=TIMEOUT,
+    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+)
+def postprocess_traj(
+    traj_prefix: str,
+    run_name: str,
+    save_processed_traj: bool = False,
+    make_figures: bool = True,
+) -> Path:
+    """Process Gromacs trajectory and generate analysis plots.
+
+    Ref: https://www.biotite-python.org/latest/examples/gallery/structure/modeling/md_analysis.html
+    """
+    from pathlib import Path
+
+    import biotite
+    import biotite.structure as struc
+    import biotite.structure.io as strucio
+    import biotite.structure.io.xtc as xtc
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    work_path = Path(OUTPUTS_DIR) / run_name
+    input_pdb_path = work_path / f"{run_name}.pdb"
+    if not input_pdb_path.exists():
+        raise FileNotFoundError(f"Input PDB file not found: {input_pdb_path}")
+    traj_path = work_path / f"{traj_prefix}{run_name}.xtc"
+    if not traj_path.exists():
+        raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
+
+    # Gromacs does not set the element symbol in its PDB files,
+    # but Biotite guesses the element names from the atom names,
+    # emitting a warning
+    template = strucio.load_structure(input_pdb_path)
+    # The structure still has water and ions, that are not needed for our
+    # calculations, we are only interested in the protein itself
+    # These are removed for the sake of computational speed using a boolean
+    # mask
+    protein_mask = struc.filter_amino_acids(template)
+    template = template[protein_mask]
+
+    # We could have loaded the trajectory also with
+    # 'strucio.load_structure()', but in this case we only want to load
+    # those coordinates that belong to the already selected atoms of the
+    # template structure.
+    # Hence, we use the 'XTCFile' class directly to load the trajectory
+    # This gives us the additional option that allows us to select the
+    # coordinates belonging to the amino acids.
+    xtc_file = xtc.XTCFile.read(traj_path, atom_i=np.where(protein_mask)[0])
+    trajectory = xtc_file.get_structure(template)
+
+    # Get simulation time (ns) for plotting purposes
+    time = xtc_file.get_time() / 1000.0
+    print(f"Simulated {time[-1]:.1f} ns")
+
+    # Remove PBC (gmx trjconv)
+    trajectory = struc.remove_pbc(trajectory)
+    trajectory, _ = struc.superimpose(trajectory[0], trajectory)
+
+    # Save the processed trajectory
+    processed_traj_path = work_path / f"{traj_prefix}{run_name}_nopbc.xtc"
+    if not processed_traj_path.exists() and save_processed_traj:
+        new_traj_file = xtc.XTCFile()
+        new_traj_file.set_structure(trajectory, time=time * 1000.0)  # time in ps
+        new_traj_file.write(processed_traj_path)
+        OUTPUTS_VOLUME.commit()
+
+    # Dump the last frame of the processed trajectory as PDB
+    last_frame_path = work_path / f"{traj_prefix}{run_name}.pdb"
+    if not last_frame_path.exists():
+        strucio.save_structure(last_frame_path, trajectory[-1])
+        OUTPUTS_VOLUME.commit()
+
+    # RMSD vs. the initial frame
+    rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{run_name}.png"
+    rmsd_csv_path = rmsd_fig_path.with_suffix(".csv")
+    if not rmsd_csv_path.exists():
+        rmsd = struc.rmsd(trajectory[0], trajectory)
+        np.savetxt(
+            rmsd_csv_path,
+            np.column_stack((time, rmsd)),
+            fmt="%.5f",
+            delimiter=",",
+            header="time_ns,rmsd",
+            comments="",
+        )
+        OUTPUTS_VOLUME.commit()
+
+        if not rmsd_fig_path.exists() and make_figures:
+            figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
+            ax.plot(time, rmsd, color=biotite.colors["dimorange"])
+            ax.set_xlim(time[0], time[-1])
+            ax.set_title(run_name)
+            ax.set_xlabel("Time (ns)")
+            ax.set_ylabel("RMSD (Å)")
+            figure.savefig(rmsd_fig_path)
+            plt.close(figure)
+
+            OUTPUTS_VOLUME.commit()
+
+    # Radius of gyration
+    rg_fig_path = work_path / f"rg_{traj_prefix}{run_name}.png"
+    rg_csv_path = rg_fig_path.with_suffix(".csv")
+    if not rg_csv_path.exists():
+        rg = struc.gyration_radius(trajectory)
+        np.savetxt(
+            rg_csv_path,
+            np.column_stack((time, rg)),
+            fmt="%.5f",
+            delimiter=",",
+            header="time_ns,rg",
+            comments="",
+        )
+        OUTPUTS_VOLUME.commit()
+        if not rg_fig_path.exists() and make_figures:
+            figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
+            ax.plot(time, rg, color=biotite.colors["dimgreen"])
+            ax.set_xlim(time[0], time[-1])
+            ax.set_title(run_name)
+            ax.set_xlabel("Time (ns)")
+            ax.set_ylabel("Radius of Gyration (Å)")
+            figure.savefig(rg_fig_path)
+            plt.close(figure)
+
+            OUTPUTS_VOLUME.commit()
+
+    # RMSF of each residue
+    rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{run_name}.png"
+    rmsf_csv_path = rmsf_fig_path.with_suffix(".csv")
+    if not rmsf_csv_path.exists():
+        # Sidechain atoms fluctuate too much, so we only consider CA atoms
+        ca_trajectory = trajectory[:, trajectory.atom_name == "CA"]
+        rmsf = struc.rmsf(struc.average(ca_trajectory), ca_trajectory)
+        res_count = struc.get_residue_count(trajectory)
+        res_idx = np.arange(1, res_count + 1)
+        np.savetxt(
+            rmsf_csv_path,
+            np.column_stack((res_idx, rmsf)),
+            fmt="%.5f",
+            delimiter=",",
+            header="residue_index,rmsf",
+            comments="",
+        )
+        OUTPUTS_VOLUME.commit()
+        if not rmsf_fig_path.exists() and make_figures:
+            # Sidechain atoms fluctuate too much, so we only consider CA atoms
+            figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
+            ax.plot(res_idx, rmsf, color=biotite.colors["dimorange"])
+            ax.set_xlim(1, res_count)
+            ax.set_title(run_name)
+            ax.set_xlabel("Residue Index")
+            ax.set_ylabel("RMSF (Å)")
+            figure.savefig(rmsf_fig_path)
+            plt.close(figure)
+
+            OUTPUTS_VOLUME.commit()
+
+    return work_path
+
+
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
@@ -490,7 +671,7 @@ def submit_gromacs_task(
     """Run GROMACS MD simulations on Modal and save results to a volume."""
     from pathlib import Path
 
-    # Load input and find its hash
+    # Load input PDB
     pdb_path = Path(input_pdb).expanduser().resolve()
     pdb_str = pdb_path.read_bytes()
     if run_name is None:
@@ -513,6 +694,10 @@ def submit_gromacs_task(
     else:
         remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
 
+    process_traj_tasks = [
+        postprocess_traj.spawn(prefix, run_name=run_name) for prefix in ["nvt_", "npt_"]
+    ]
+
     print("🧬 Starting Gromacs production MD simulation...")
     if cpu_only:
         _ = production_run_cpu.remote(
@@ -526,6 +711,13 @@ def submit_gromacs_task(
             num_threads=num_threads,
             use_openmp_threads=use_openmp_threads,
         )
+
+    print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
+    prod_traj_task = postprocess_traj.spawn(
+        run_name=run_name, traj_prefix="production_", save_processed_traj=True
+    )
+
+    _ = modal.FunctionCall.gather(*process_traj_tasks, prod_traj_task)
 
     remote_volume_dir = remote_workdir.relative_to(OUTPUTS_DIR)
     print("🧬 Gromacs preparation complete! Check data with: \n")

@@ -68,7 +68,7 @@ OUTPUTS_DIR = "/abcfold2-outputs"
 # Repositories and commit hashes
 ABCFOLD_DIR = "/opt/ABCFold"
 ABCFOLD_REPO = "https://github.com/y1zhou/ABCFold"
-ABCFOLD_COMMIT = "259235c3fe5773bab7a1a806ed2ca18c4f8ff121"
+ABCFOLD_COMMIT = "96394445583ab0eb681d0bece6cf406ccfa2c112"
 
 CHAI_DIR = "/opt/chai-lab"
 CHAI_REPO = "https://github.com/y1zhou/chai-lab"

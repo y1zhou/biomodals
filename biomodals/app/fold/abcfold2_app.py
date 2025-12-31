@@ -8,7 +8,7 @@
 | `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in the current working directory. |
 | `--run-name` | stem name of `--input-yaml` | Optional run name used to name output directory. |
 | `--msa-chains` | None (all chains) | Optional comma-separated list of chains to search MSAs for. If not specified, MSAs will be searched for all chains. To skip MSA searches entirely, pass 'empty'. |
-| `--search-templates`/`--no-search-templates` | `--search-templates` | Whether to search for templates and add to input YAML. |
+| `--search-templates`/`--no-search-templates` | `--no-search-templates` | Whether to search for templates and add to input YAML. |
 | `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and skip running. |
 | `--force-redownload` | `--no-force-redownload` | Whether to force re-download of model weights even if they exist. |
 | `--run-boltz`/`--no-run-boltz` | `--run-boltz` | Whether to run Boltz inference. |
@@ -68,7 +68,7 @@ OUTPUTS_DIR = "/abcfold2-outputs"
 # Repositories and commit hashes
 ABCFOLD_DIR = "/opt/ABCFold"
 ABCFOLD_REPO = "https://github.com/y1zhou/ABCFold"
-ABCFOLD_COMMIT = "96394445583ab0eb681d0bece6cf406ccfa2c112"
+ABCFOLD_COMMIT = "fcfdd49fbec0db73eb38dfad49f9649e81147337"
 
 CHAI_DIR = "/opt/chai-lab"
 CHAI_REPO = "https://github.com/y1zhou/chai-lab"
@@ -520,7 +520,7 @@ def submit_abcfold2_task(
     out_dir: str | None = None,
     run_name: str | None = None,
     msa_chains: str | None = None,
-    search_templates: bool = True,
+    search_templates: bool = False,
     download_models: bool = False,
     force_redownload: bool = False,
     run_boltz: bool = True,

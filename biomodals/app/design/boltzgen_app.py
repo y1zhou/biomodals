@@ -363,13 +363,15 @@ def collect_boltzgen_data(
                 and (d_final_dir / "results_overview.pdf").exists()
             )
         ]
+        run_ids = [d.name for d in all_run_dirs]
         if focus_run_ids is not None:
             focus_set = set(focus_run_ids.split(","))
             run_dirs = [d for d in run_dirs if d.name in focus_set]
+            run_ids = [d for d in run_ids if d in focus_set]
         if ignore_run_ids is not None:
             ignore_set = set(ignore_run_ids.split(","))
             run_dirs = [d for d in run_dirs if d.name not in ignore_set]
-        run_ids = [d.name for d in all_run_dirs]
+            run_ids = [d for d in run_ids if d not in ignore_set]
 
     else:
         today: str = datetime.now(UTC).strftime("%Y%m%d")
@@ -535,7 +537,7 @@ def boltzgen_run(
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )
-def combine_multiple_runs(run_name: str):
+def combine_multiple_runs(run_name: str, run_ids: list[str]):
     """Combine outputs from multiple BoltzGen runs into a single table."""
     import gzip
     import pickle
@@ -546,7 +548,7 @@ def combine_multiple_runs(run_name: str):
     workdir = Path(OUTPUTS_DIR) / run_name / "outputs"
     out_dir = Path(OUTPUTS_DIR) / run_name / "combined-outputs"
     (out_dir / "refold_cif").mkdir(parents=True, exist_ok=True)
-    run_ids = sorted(d.name for d in workdir.iterdir() if d.is_dir())
+    OUTPUTS_VOLUME.reload()
 
     metrics_dfs: list[pl.DataFrame] = []
     ca_coords_seqs_dfs: list[pl.DataFrame] = []
@@ -555,7 +557,7 @@ def combine_multiple_runs(run_name: str):
         run_design_dir = workdir / run_id / "intermediate_designs_inverse_folded"
 
         # Metrics table required for downstream filtering
-        metrics_df = pl.read_csv(next(run_design_dir.glob("aggregate_metrics_*.csv")))
+        metrics_df = pl.read_csv(run_design_dir / "aggregate_metrics_analyze.csv")
 
         # ID, seqs, and coords required for diversity
         with gzip.open(run_design_dir / "ca_coords_sequences.pkl.gz", "rb") as f:
@@ -623,6 +625,7 @@ def refilter_designs(
 
     workdir = Path(OUTPUTS_DIR) / run_name
     warmup_directory(workdir / "combined-outputs")
+    OUTPUTS_VOLUME.reload()
 
     filter_task = Filter(
         design_dir=workdir / "combined-outputs",

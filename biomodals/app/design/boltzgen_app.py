@@ -322,6 +322,8 @@ def collect_boltzgen_data(
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
+    focus_run_ids: str | None = None,
+    ignore_run_ids: str | None = None,
     filter_results: bool = True,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
@@ -339,7 +341,14 @@ def collect_boltzgen_data(
                 and (d_final_dir / "results_overview.pdf").exists()
             )
         ]
+        if focus_run_ids is not None:
+            focus_set = set(focus_run_ids.split(","))
+            run_dirs = [d for d in run_dirs if d.name in focus_set]
+        if ignore_run_ids is not None:
+            ignore_set = set(ignore_run_ids.split(","))
+            run_dirs = [d for d in run_dirs if d.name not in ignore_set]
         run_ids = [d.name for d in all_run_dirs]
+
     else:
         today: str = datetime.now(UTC).strftime("%Y%m%d")
         run_dirs = [outdir / f"{today}-{uuid4().hex}" for _ in range(num_parallel_runs)]
@@ -674,6 +683,8 @@ def submit_boltzgen_task(
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
+    focus_run_ids: str | None = None,
+    ignore_run_ids: str | None = None,
     filter_results: bool = False,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
@@ -693,6 +704,9 @@ def submit_boltzgen_task(
         steps: Specific pipeline steps to run (e.g. "design inverse_folding")
         extra_args: Additional CLI arguments as string
         salvage_mode: Whether to only try to finish incomplete runs
+        focus_run_ids: Comma-separated run IDs to focus on (only used in salvage mode)
+        ignore_run_ids: Comma-separated run IDs to ignore (only used in salvage mode).
+            Note that `ignore_run_ids` takes precedence over `focus_run_ids`.
         filter_results: If true, bundle top `'budget` results into a tarball and download to `out_dir`.
             Otherwise, use subprocesses to call `modal volume get` for downloads.
             This flag is useless if `out_dir` is None.
@@ -745,6 +759,8 @@ def submit_boltzgen_task(
         steps=steps,
         extra_args=extra_args,
         salvage_mode=salvage_mode,
+        focus_run_ids=focus_run_ids,
+        ignore_run_ids=ignore_run_ids,
         filter_results=filter_results and out_dir is not None,
     )
     if out_dir is None:

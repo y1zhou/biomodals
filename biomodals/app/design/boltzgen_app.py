@@ -60,8 +60,8 @@ OUTPUTS_VOLUME = Volume.from_name(
 OUTPUTS_DIR = "/boltzgen-outputs"
 
 # Repositories and commit hashes
-BOLTZGEN_REPO = "https://github.com/HannesStark/boltzgen"
-BOLTZGEN_COMMIT = "a941e4eb3d4457ac6a9b636d7bfdd024df8063cf"
+BOLTZGEN_REPO = "https://github.com/y1zhou/boltzgen"
+BOLTZGEN_COMMIT = "fd502a7587ffa073846c7c9f6d5b487a10eaa79f"
 BOLTZGEN_REPO_DIR = "/opt/boltzgen"
 
 ##########################################
@@ -87,12 +87,12 @@ runtime_image = (
                 f"git checkout {BOLTZGEN_COMMIT}",
                 "uv venv --python 3.12",
                 "uv pip install .",
+                "uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm",
             ),
         )
     )
     .env({"PATH": f"{BOLTZGEN_REPO_DIR}/.venv/bin:$PATH"})
-    .run_commands("uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm")
-    .apt_install("fd-find")
+    .apt_install("fd-find")  # for warming up disk cache when downloading outputs
     .workdir(BOLTZGEN_REPO_DIR)
 )
 
@@ -142,7 +142,7 @@ def package_outputs(
         if out_path.exists():
             cmd.append(str(out_path.relative_to(root_path.parent)))
         else:
-            print(f"Warning: path {out_path} does not exist and will be skipped.")
+            print(f"💊 Warning: path {out_path} does not exist and will be skipped.")
 
     return sp.check_output(cmd, cwd=root_path.parent)
 
@@ -151,7 +151,7 @@ def run_command(cmd: list[str], **kwargs) -> None:
     """Run a shell command and stream output to stdout."""
     import subprocess as sp
 
-    print(f"Running command: {' '.join(cmd)}")
+    print(f"💊 Running command: {' '.join(cmd)}")
     # Set default kwargs for sp.Popen
     kwargs.setdefault("stdout", sp.PIPE)
     kwargs.setdefault("stderr", sp.STDOUT)
@@ -168,6 +168,24 @@ def run_command(cmd: list[str], **kwargs) -> None:
 
         if p.returncode != 0:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+
+
+def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
+    """Warm up the disk cache for all files in a directory matching a pattern."""
+    cmd = [
+        "fdfind",
+        "-tf",
+        file_pattern,
+        str(dir_path),
+        "-j256",
+        "-x",
+        "dd",
+        "if={}",
+        "of=/dev/null",
+        "bs=1M",
+        "status=none",
+    ]
+    run_command(cmd)
 
 
 class YAMLReferenceLoader:
@@ -269,14 +287,14 @@ class YAMLReferenceLoader:
 def boltzgen_download(force: bool = False) -> None:
     """Download BoltzGen models into the mounted volume."""
     # Download all artifacts (~/.cache overridden to volume mount)
-    print("Downloading boltzgen models...")
+    print("💊 Downloading boltzgen models...")
     cmd = ["boltzgen", "download", "all", "--cache", BOLTZGEN_MODEL_DIR]
     if force:
         cmd.append("--force_download")
     run_command(cmd, cwd=BOLTZGEN_REPO_DIR)
 
     BOLTZGEN_VOLUME.commit()
-    print("Model download complete")
+    print("💊 Model download complete")
 
 
 ##########################################
@@ -322,6 +340,8 @@ def collect_boltzgen_data(
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
+    focus_run_ids: str | None = None,
+    ignore_run_ids: str | None = None,
     filter_results: bool = True,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
@@ -331,6 +351,10 @@ def collect_boltzgen_data(
     outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
     if salvage_mode:
         all_run_dirs = [d for d in outdir.iterdir() if d.is_dir()]
+        if not all_run_dirs:
+            raise RuntimeError(
+                f"💊 No existing run directories found for run name '{run_name}'."
+            )
         run_dirs = [
             d
             for d in all_run_dirs
@@ -340,6 +364,15 @@ def collect_boltzgen_data(
             )
         ]
         run_ids = [d.name for d in all_run_dirs]
+        if focus_run_ids is not None:
+            focus_set = set(focus_run_ids.split(","))
+            run_dirs = [d for d in run_dirs if d.name in focus_set]
+            run_ids = [d for d in run_ids if d in focus_set]
+        if ignore_run_ids is not None:
+            ignore_set = set(ignore_run_ids.split(","))
+            run_dirs = [d for d in run_dirs if d.name not in ignore_set]
+            run_ids = [d for d in run_ids if d not in ignore_set]
+
     else:
         today: str = datetime.now(UTC).strftime("%Y%m%d")
         run_dirs = [outdir / f"{today}-{uuid4().hex}" for _ in range(num_parallel_runs)]
@@ -364,19 +397,19 @@ def collect_boltzgen_data(
 
     if run_dirs:
         for boltzgen_dir in boltzgen_run.map(run_dirs, kwargs=kwargs):
-            print(f"BoltzGen run completed: {boltzgen_dir}")
+            print(f"💊 BoltzGen run completed: {boltzgen_dir}")
 
     OUTPUTS_VOLUME.reload()
     if filter_results:
         # Rerun BoltzGen filters on all run IDs, and only download the designs
         # that passed all filters (also limited by the `budget`)
-        print("Collecting BoltzGen outputs...")
-        combine_multiple_runs.remote(run_name)
-        print("Filtering combined BoltzGen designs...")
+        print("💊 Collecting BoltzGen outputs...")
+        combine_multiple_runs.remote(run_name, run_ids)
+        print("💊 Filtering combined BoltzGen designs...")
         refilter_designs.remote(run_name, budget)
         OUTPUTS_VOLUME.reload()
 
-        print("Packaging filtered BoltzGen outputs...")
+        print("💊 Packaging filtered BoltzGen outputs...")
         tarball_bytes = package_outputs.remote(
             outdir.parent / "pass-filter-designs",
             [
@@ -386,12 +419,12 @@ def collect_boltzgen_data(
                 "refold-cif/",
             ],
         )
-        print("Packaging complete.")
+        print("💊 Packaging complete.")
         return tarball_bytes
     else:
-        print("Skipping refiltering of BoltzGen outputs.")
+        print("💊 Skipping refiltering of BoltzGen outputs.")
         print(
-            f"Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
+            f"💊 Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
         )
         return run_ids
 
@@ -462,10 +495,11 @@ def boltzgen_run(
     # Handle preempted runs by continuing from existing output
     if out_path.exists():
         cmd.append("--reuse")
+        warmup_directory(out_path)
 
     out_path.mkdir(parents=True, exist_ok=True)
     log_path = out_path / "boltzgen-run.log"
-    print(f"Running BoltzGen, saving logs to {log_path}")
+    print(f"💊 Running BoltzGen, saving logs to {log_path}")
     with (
         sp.Popen(
             cmd,
@@ -490,7 +524,7 @@ def boltzgen_run(
         log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
 
         if p.returncode != 0:
-            print(f"BoltzGen run failed. Error log is in {log_path}")
+            print(f"💊 BoltzGen run failed. Error log is in {log_path}")
             raise sp.CalledProcessError(p.returncode, cmd)
 
     OUTPUTS_VOLUME.commit()
@@ -503,7 +537,7 @@ def boltzgen_run(
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )
-def combine_multiple_runs(run_name: str):
+def combine_multiple_runs(run_name: str, run_ids: list[str]):
     """Combine outputs from multiple BoltzGen runs into a single table."""
     import gzip
     import pickle
@@ -514,15 +548,16 @@ def combine_multiple_runs(run_name: str):
     workdir = Path(OUTPUTS_DIR) / run_name / "outputs"
     out_dir = Path(OUTPUTS_DIR) / run_name / "combined-outputs"
     (out_dir / "refold_cif").mkdir(parents=True, exist_ok=True)
-    run_ids = sorted(d.name for d in workdir.iterdir() if d.is_dir())
+    OUTPUTS_VOLUME.reload()
 
     metrics_dfs: list[pl.DataFrame] = []
     ca_coords_seqs_dfs: list[pl.DataFrame] = []
+    print(f"💊 Combining outputs from runs: {run_ids}")
     for run_id in run_ids:
         run_design_dir = workdir / run_id / "intermediate_designs_inverse_folded"
 
         # Metrics table required for downstream filtering
-        metrics_df = pl.read_csv(next(run_design_dir.glob("aggregate_metrics_*.csv")))
+        metrics_df = pl.read_csv(run_design_dir / "aggregate_metrics_analyze.csv")
 
         # ID, seqs, and coords required for diversity
         with gzip.open(run_design_dir / "ca_coords_sequences.pkl.gz", "rb") as f:
@@ -589,6 +624,8 @@ def refilter_designs(
     from boltzgen.task.filter.filter import Filter
 
     workdir = Path(OUTPUTS_DIR) / run_name
+    warmup_directory(workdir / "combined-outputs")
+    OUTPUTS_VOLUME.reload()
 
     filter_task = Filter(
         design_dir=workdir / "combined-outputs",
@@ -674,6 +711,8 @@ def submit_boltzgen_task(
     steps: str | None = None,
     extra_args: str | None = None,
     salvage_mode: bool = False,
+    focus_run_ids: str | None = None,
+    ignore_run_ids: str | None = None,
     filter_results: bool = False,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
@@ -693,6 +732,9 @@ def submit_boltzgen_task(
         steps: Specific pipeline steps to run (e.g. "design inverse_folding")
         extra_args: Additional CLI arguments as string
         salvage_mode: Whether to only try to finish incomplete runs
+        focus_run_ids: Comma-separated run IDs to focus on (only used in salvage mode)
+        ignore_run_ids: Comma-separated run IDs to ignore (only used in salvage mode).
+            Note that `ignore_run_ids` takes precedence over `focus_run_ids`.
         filter_results: If true, bundle top `'budget` results into a tarball and download to `out_dir`.
             Otherwise, use subprocesses to call `modal volume get` for downloads.
             This flag is useless if `out_dir` is None.
@@ -713,17 +755,17 @@ def submit_boltzgen_task(
     if not salvage_mode:
         # Find any file references in the yaml (path: something.cif)
         # File paths in yaml are relative to the yaml file location
-        print("Checking if input yaml references additional files...")
+        print("🧬 Checking if input yaml references additional files...")
         if input_yaml is None:
             raise ValueError("input_yaml must be provided for new BoltzGen runs.")
         yaml_path = Path(input_yaml)
         yml_parser = YAMLReferenceLoader(yaml_path)
         if yml_parser.additional_files:
             print(
-                f"Including additional referenced files: {list(yml_parser.additional_files.keys())}"
+                f"🧬 Including additional referenced files: {list(yml_parser.additional_files.keys())}"
             )
 
-        print(f"Submitting BoltzGen run for yaml: {input_yaml}")
+        print(f"🧬 Submitting BoltzGen run for yaml: {input_yaml}")
         yaml_str = yaml_path.read_bytes()
 
         prepare_boltzgen_run.remote(
@@ -732,9 +774,9 @@ def submit_boltzgen_task(
             additional_files=yml_parser.additional_files,
         )
     else:
-        print(f"Salvage mode enabled; skipping input preparation for {run_name}.")
+        print(f"🧬 Salvage mode enabled; skipping input preparation for {run_name}.")
 
-    print("Running BoltzGen...")
+    print("🧬 Running BoltzGen...")
     budget = min(budget, num_designs)
     outputs = collect_boltzgen_data.remote(
         run_name=run_name,
@@ -745,6 +787,8 @@ def submit_boltzgen_task(
         steps=steps,
         extra_args=extra_args,
         salvage_mode=salvage_mode,
+        focus_run_ids=focus_run_ids,
+        ignore_run_ids=ignore_run_ids,
         filter_results=filter_results and out_dir is not None,
     )
     if out_dir is None:
@@ -760,7 +804,7 @@ def submit_boltzgen_task(
             run_out_dir: Path = local_out_dir / "outputs" / run_id
             run_out_dir.mkdir(parents=True, exist_ok=True)
             remote_root_dir = f"{run_name}/outputs/{run_id}"
-            print(f"Downloading results for run ID {run_id}...")
+            print(f"🧬 Downloading results for run ID {run_id}...")
             for subdir in (
                 "boltzgen-run.log",
                 f"{run_name}.cif",
@@ -781,4 +825,4 @@ def submit_boltzgen_task(
                     cwd=run_out_dir,
                 )
 
-    print(f"Results saved to: {local_out_dir}")
+    print(f"🧬 Results saved to: {local_out_dir}")

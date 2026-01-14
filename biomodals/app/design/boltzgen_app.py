@@ -170,6 +170,24 @@ def run_command(cmd: list[str], **kwargs) -> None:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
+def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
+    """Warm up the disk cache for all files in a directory matching a pattern."""
+    cmd = [
+        "fdfind",
+        "-tf",
+        file_pattern,
+        str(dir_path),
+        "-j256",
+        "-x",
+        "dd",
+        "if={}",
+        "of=/dev/null",
+        "bs=1M",
+        "status=none",
+    ]
+    run_command(cmd)
+
+
 class YAMLReferenceLoader:
     """Class to load referenced files from YAML files.
 
@@ -471,6 +489,7 @@ def boltzgen_run(
     # Handle preempted runs by continuing from existing output
     if out_path.exists():
         cmd.append("--reuse")
+        warmup_directory(out_path)
 
     out_path.mkdir(parents=True, exist_ok=True)
     log_path = out_path / "boltzgen-run.log"
@@ -598,6 +617,7 @@ def refilter_designs(
     from boltzgen.task.filter.filter import Filter
 
     workdir = Path(OUTPUTS_DIR) / run_name
+    warmup_directory(workdir / "combined-outputs")
 
     filter_task = Filter(
         design_dir=workdir / "combined-outputs",

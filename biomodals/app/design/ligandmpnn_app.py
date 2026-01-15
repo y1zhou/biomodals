@@ -15,6 +15,10 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 ## Outputs
 
 * Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
+
+## TODO
+
+* Add support for transforming `.pt` outputs into more user-friendly formats (json, npy)
 """
 
 # Ignore ruff warnings about import location and unsafe subprocess usage
@@ -426,7 +430,11 @@ def submit_ligandmpnn_task(
     if chains_to_design is not None:
         cli_args["--chains_to_design"] = chains_to_design
     if parse_these_chains_only is not None:
-        cli_args["--parse_these_chains_only"] = parse_these_chains_only
+        cli_args["--parse_these_chains_only"] = (
+            "".join(parse_these_chains_only.split(","))
+            if score_mode
+            else parse_these_chains_only
+        )
     if transmembrane_buried is not None:
         if model_type != "per_residue_label_membrane_mpnn":
             print(

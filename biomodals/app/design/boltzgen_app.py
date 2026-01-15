@@ -61,7 +61,7 @@ OUTPUTS_DIR = "/boltzgen-outputs"
 
 # Repositories and commit hashes
 BOLTZGEN_REPO = "https://github.com/y1zhou/boltzgen"
-BOLTZGEN_COMMIT = "fd502a7587ffa073846c7c9f6d5b487a10eaa79f"
+BOLTZGEN_COMMIT = "fd24c656257dc780882b91c0bbad61e13a15fc6b"
 BOLTZGEN_REPO_DIR = "/opt/boltzgen"
 
 ##########################################
@@ -70,6 +70,7 @@ BOLTZGEN_REPO_DIR = "/opt/boltzgen"
 runtime_image = (
     Image.debian_slim()
     .apt_install("git", "build-essential", "zstd")
+    .apt_install("fd-find")  # for warming up disk cache when downloading outputs
     .env(
         {
             # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
@@ -92,7 +93,6 @@ runtime_image = (
         )
     )
     .env({"PATH": f"{BOLTZGEN_REPO_DIR}/.venv/bin:$PATH"})
-    .apt_install("fd-find")  # for warming up disk cache when downloading outputs
     .workdir(BOLTZGEN_REPO_DIR)
 )
 

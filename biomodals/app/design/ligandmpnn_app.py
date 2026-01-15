@@ -20,6 +20,7 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from modal import App, Image, Volume
@@ -35,13 +36,6 @@ APP_NAME = os.environ.get("MODAL_APP", "LigandMPNN")
 # Volume for model cache
 LIGANDMPNN_VOLUME_NAME = "ligandmpnn-models"
 LIGANDMPNN_VOLUME = Volume.from_name(LIGANDMPNN_VOLUME_NAME, create_if_missing=True)
-
-# Volume for outputs
-OUTPUTS_VOLUME_NAME = "ligandmpnn-outputs"
-OUTPUTS_VOLUME = Volume.from_name(
-    OUTPUTS_VOLUME_NAME, create_if_missing=True, version=2
-)
-OUTPUTS_DIR = "/ligandmpnn-outputs"
 
 # Repositories and commit hashes
 REPO_URL = "https://github.com/dauparas/LigandMPNN"
@@ -107,6 +101,44 @@ def run_command(cmd: list[str], **kwargs) -> None:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
+def package_outputs(
+    root: str | Path,
+    paths_to_bundle: Iterable[str | Path],
+    tar_args: list[str] | None = None,
+    num_threads: int = 16,
+) -> bytes:
+    """Package directories into a tar.zst archive and return as bytes.
+
+    We make an assumption here that all paths to bundle are under the same root.
+    This should be safe for `collect_boltzgen_data` usage.
+
+    Args:
+        root: Root directory in the archive. All paths will be relative to this.
+        paths_to_bundle: Specific paths (relative to root) to include in the archive.
+        tar_args: Additional arguments to pass to `tar`.
+        num_threads: Number of threads to use for compression.
+    """
+    import subprocess as sp
+    from pathlib import Path
+
+    root_path = Path(root)  # don't resolve, as the mapped location could be a soft link
+    cmd = ["tar", "-I", f"zstd -T{num_threads}"]  # ZSTD_NBTHREADS
+    if tar_args is not None:
+        cmd.extend(tar_args)
+    cmd.extend(["-c"])
+
+    # Our volume file structure is: outputs/[run_id]/...
+    # We want to preserve the relative paths
+    for p in paths_to_bundle:
+        out_path = root_path.joinpath(p)
+        if out_path.exists():
+            cmd.append(str(out_path.relative_to(root_path.parent)))
+        else:
+            print(f"💊 Warning: path {out_path} does not exist and will be skipped.")
+
+    return sp.check_output(cmd, cwd=root_path.parent)
+
+
 ##########################################
 # Fetch model weights
 ##########################################
@@ -132,37 +164,32 @@ def download_weights() -> None:
     gpu=GPU,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=86400,
-    volumes={
-        f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME.read_only(),
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-    },
+    volumes={f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME.read_only()},
     image=runtime_image,
 )
 def ligandmpnn_run(
     run_name: str,
+    script_mode: str,
     struct_bytes: bytes,
     cli_args: dict[str, str | int | float | bool],
     bias_aa_per_residue_bytes: bytes | None = None,
     omit_aa_per_residue_bytes: bytes | None = None,
-) -> str:
+) -> bytes:
     """Run LigandMPNN with the specifi ed CLI arguments.
 
     Returns:
-        Path to output directory as a string.
+        Outputs bundled into a `.tar.zst` file.
     """
     import subprocess as sp
+    import tempfile
     import time
     from datetime import UTC, datetime
 
-    # Build command
-    workdir = Path(str(cli_args["--out_folder"]))
-    if workdir.exists():
-        print(f"💊 Output path {workdir} already exists, skipping run.")
-        return str(workdir.relative_to(OUTPUTS_DIR))
-
+    workdir = Path(tempfile.gettempdir()) / f"{run_name}-{script_mode}"
     for d in ("inputs", "outputs"):
         (workdir / d).mkdir(parents=True, exist_ok=True)
 
+    # Build command
     cli_args["--out_folder"] = str(workdir / "outputs")
     input_pdb_file = workdir / "inputs" / f"{run_name}.pdb"
     with open(input_pdb_file, "wb") as f:
@@ -180,7 +207,7 @@ def ligandmpnn_run(
             f.write(omit_aa_per_residue_bytes)
             cli_args["--omit_AA_per_residue"] = str(omit_aa_per_res_file)
 
-    cmd = ["python", f"{REPO_DIR}/run.py"]
+    cmd = ["python", f"{REPO_DIR}/{script_mode}.py"]
     for arg, val in cli_args.items():
         if isinstance(val, bool):
             cmd.extend([str(arg), str(int(val))])
@@ -219,17 +246,19 @@ def ligandmpnn_run(
             print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
             raise sp.CalledProcessError(p.returncode, cmd)
 
-    OUTPUTS_VOLUME.commit()
-    return str(workdir.relative_to(OUTPUTS_DIR))
+    tar_bytes = package_outputs(workdir, ["outputs", log_path.name])
+    return tar_bytes
 
 
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
+# https://github.com/copilot/share/423a1120-4ba0-8023-9113-00096484408d
 @app.local_entrypoint()
 def submit_ligandmpnn_task(
     # Input and output
     input_pdb: str,
+    script_mode: str,
     out_dir: str | None = None,
     run_name: str | None = None,
     download_models: bool = False,
@@ -264,11 +293,16 @@ def submit_ligandmpnn_task(
     parse_these_chains_only: str | None = None,
     transmembrane_buried: str | None = None,
     transmembrane_interface: str | None = None,
+    # Score mode arguments
+    use_sequence: bool = True,
+    autoregressive_score: bool = False,
+    single_aa_score: bool = True,
 ) -> None:
     """Run a variant of the ProteinMPNN models with results saved to `out_dir`.
 
     Args:
         input_pdb: Path to the input PDB structure file
+        script_mode: One of `run` or `score`
         out_dir: Local output directory; defaults to $PWD
         run_name: Name for this run; defaults to input structure stem
         download_models: Whether to download model weights and skip running
@@ -321,6 +355,14 @@ def submit_ligandmpnn_task(
             `checkpoint_per_residue_label_membrane_mpnn`, e.g. "A12 A13 A14 B2 B25"
         transmembrane_interface: Provide interface residues when using the model
             `checkpoint_per_residue_label_membrane_mpnn`, e.g. "A12 A13 A14 B2 B25"
+
+        use_sequence: This only applies when using `script_mode` "score"!
+            1 - get scores using amino acid sequence info;
+            0 - get scores using backbone info only
+        autoregressive_score: This only applies when using `script_mode` "score"!
+            Run autoregressive scoring function: p(AA_1|backbone); p(AA_2|backbone, AA_1) etc.
+        single_aa_score: This only applies when using `script_mode` "score"!
+            Run single amino acid scoring function: p(AA_i|backbone, AA_{all except ith one})
     """
     from pathlib import Path
 
@@ -332,41 +374,51 @@ def submit_ligandmpnn_task(
     input_path = Path(input_pdb).expanduser()
     if not input_path.exists():
         raise FileNotFoundError(f"Input structure file not found: {input_path}")
+    if script_mode not in {"run", "score"}:
+        raise ValueError(
+            f"Invalid script_mode: {script_mode}. Must be 'run' or 'score'."
+        )
     if run_name is None:
         run_name = input_path.stem
 
-    struct_bytes = input_path.read_bytes()
+    score_mode = script_mode == "score"
     cli_args = {
-        "--out_folder": f"{OUTPUTS_DIR}/{run_name}-seed{seed}",
         "--model_type": model_type,
         "--seed": str(seed),
         "--batch_size": str(batch_size),
         "--number_of_batches": str(number_of_batches),
-        "--temperature": str(temperature),
-        "--save_stats": "1",
         # 0/1 flags
         "--ligand_mpnn_use_atom_context": ligand_mpnn_use_atom_context,
         "--ligand_mpnn_cutoff_for_score": str(ligand_mpnn_cutoff_for_score),
         "--ligand_mpnn_use_side_chain_context": ligand_mpnn_use_side_chain_context,
         "--global_transmembrane_label": global_transmembrane_label,
         "--parse_atoms_with_zero_occupancy": parse_atoms_with_zero_occupancy,
-        "--pack_side_chains": pack_side_chains,
-        "--number_of_packs_per_design": str(number_of_packs_per_design),
-        "--sc_num_denoising_steps": str(sc_num_denoising_steps),
-        "--sc_num_samples": str(sc_num_samples),
-        "--repack_everything": repack_everything,
-        "--pack_with_ligand_context": pack_with_ligand_context,
     }
+    # Mode-specific args
+    if score_mode:
+        cli_args |= {
+            "--use_sequence": use_sequence,
+            "--autoregressive_score": autoregressive_score,
+            "--single_aa_score": single_aa_score,
+        }
+    else:
+        cli_args |= {
+            "--temperature": str(temperature),
+            "--save_stats": "1",
+            "--pack_side_chains": pack_side_chains,
+            "--number_of_packs_per_design": str(number_of_packs_per_design),
+            "--sc_num_denoising_steps": str(sc_num_denoising_steps),
+            "--sc_num_samples": str(sc_num_samples),
+            "--repack_everything": repack_everything,
+            "--pack_with_ligand_context": pack_with_ligand_context,
+        }
+    # Non-default args
     if checkpoint is not None:
         cli_args[f"--checkpoint_{model_type}"] = checkpoint
     if fixed_residues is not None:
         cli_args["--fixed_residues"] = fixed_residues
     if redesigned_residues is not None:
         cli_args["--redesigned_residues"] = redesigned_residues
-    if bias_aa is not None:
-        cli_args["--bias_AA"] = bias_aa
-    if omit_aa is not None:
-        cli_args["--omit_AA"] = omit_aa
     if symmetry_residues is not None:
         cli_args["--symmetry_residues"] = symmetry_residues
     if is_homo_oligomer:
@@ -390,8 +442,14 @@ def submit_ligandmpnn_task(
         else:
             cli_args["--transmembrane_interface"] = transmembrane_interface
 
+    # Run-mode only args
+    if bias_aa is not None and not score_mode:
+        cli_args["--bias_AA"] = bias_aa
+    if omit_aa is not None and not score_mode:
+        cli_args["--omit_AA"] = omit_aa
+
     bias_AA_per_residue_bytes = None
-    if bias_aa_per_residue is not None:
+    if bias_aa_per_residue is not None and not score_mode:
         bias_AA_per_res_path = Path(bias_aa_per_residue).expanduser()
         if not bias_AA_per_res_path.exists():
             raise FileNotFoundError(
@@ -400,7 +458,7 @@ def submit_ligandmpnn_task(
         bias_AA_per_residue_bytes = bias_AA_per_res_path.read_bytes()
 
     omit_AA_per_residue_bytes = None
-    if omit_aa_per_residue is not None:
+    if omit_aa_per_residue is not None and not score_mode:
         omit_AA_per_res_path = Path(omit_aa_per_residue).expanduser()
         if not omit_AA_per_res_path.exists():
             raise FileNotFoundError(
@@ -409,19 +467,26 @@ def submit_ligandmpnn_task(
         omit_AA_per_residue_bytes = omit_AA_per_res_path.read_bytes()
 
     print("🧬 Running LigandMPNN...")
-    remote_results_dir = ligandmpnn_run.remote(
+    struct_bytes = input_path.read_bytes()
+    res_bytes = ligandmpnn_run.remote(
         run_name,
+        script_mode,
         struct_bytes,
         cli_args,
         bias_AA_per_residue_bytes,
         omit_AA_per_residue_bytes,
     )
-    local_out_dir = Path(out_dir).expanduser()
+    local_out_dir = (
+        Path(out_dir).expanduser()
+        if out_dir is not None
+        else Path.cwd() / f"{run_name}-{script_mode}"
+    )
     local_out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"🧬 Downloading results for {run_name}...")
-    run_command(
-        ["modal", "volume", "get", OUTPUTS_VOLUME_NAME, str(remote_results_dir)],
-        cwd=local_out_dir,
-    )
+    (local_out_dir / f"{run_name}-{script_mode}.tar.zst").write_bytes(res_bytes)
+    # run_command(
+    #     ["modal", "volume", "get", OUTPUTS_VOLUME_NAME, str(remote_results_dir)],
+    #     cwd=local_out_dir,
+    # )
     print(f"🧬 Results saved to: {local_out_dir.resolve()}")

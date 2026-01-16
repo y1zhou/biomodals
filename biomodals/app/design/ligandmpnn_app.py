@@ -26,6 +26,7 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 import os
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from modal import App, Image, Volume
 
@@ -143,6 +144,29 @@ def package_outputs(
     return sp.check_output(cmd, cwd=root_path.parent)
 
 
+def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
+    """Convert a PyTorch .pt file to a dictionary of numpy arrays.
+
+    Args:
+        pt_file: Path to the .pt file.
+
+    Returns:
+        A dictionary where keys are tensor names and values are lists of floats.
+    """
+    import torch
+
+    pt_path = Path(pt_file)
+    if not pt_path.exists():
+        raise FileNotFoundError(f".pt file not found: {pt_path}")
+
+    tensor_dict = torch.load(pt_path, map_location="cpu", weights_only=False)
+    np_dict = {
+        key: v.cpu().numpy().flatten() if isinstance(v, torch.Tensor) else v
+        for key, v in tensor_dict.items()
+    }
+    return np_dict
+
+
 ##########################################
 # Fetch model weights
 ##########################################
@@ -188,6 +212,8 @@ def ligandmpnn_run(
     import tempfile
     import time
     from datetime import UTC, datetime
+
+    import numpy as np
 
     workdir = Path(tempfile.gettempdir()) / f"{run_name}-{script_mode}"
     for d in ("inputs", "outputs"):
@@ -249,6 +275,16 @@ def ligandmpnn_run(
         if p.returncode != 0:
             print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
             raise sp.CalledProcessError(p.returncode, cmd)
+
+    # Convert .pt outputs to numpy
+    print("💊 Converting .pt outputs to numpy...")
+    for f in (workdir / "outputs").glob("**/*.pt"):
+        np_dict = torch_to_numpy(f)
+        npz_path = f.with_suffix(".npz")
+
+        np.savez(npz_path, **np_dict)
+        print(f"💊 Saved numpy output: {npz_path}")
+        f.unlink()  # remove .pt file
 
     tar_bytes = package_outputs(workdir, ["outputs", log_path.name])
     return tar_bytes

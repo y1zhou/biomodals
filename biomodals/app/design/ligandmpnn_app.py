@@ -15,10 +15,6 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 ## Outputs
 
 * Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
-
-## TODO
-
-* Add support for transforming `.pt` outputs into more user-friendly formats (json, npy)
 """
 
 # Ignore ruff warnings about import location and unsafe subprocess usage
@@ -188,39 +184,25 @@ def download_weights() -> None:
 ##########################################
 # Inference functions
 ##########################################
-@app.function(
-    gpu=GPU,
-    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
-    volumes={f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME.read_only()},
-    image=runtime_image,
-)
-def ligandmpnn_run(
+def build_base_command(
     run_name: str,
     script_mode: str,
     struct_bytes: bytes,
+    seeds: list[int],
     cli_args: dict[str, str | int | float | bool],
     bias_aa_per_residue_bytes: bytes | None = None,
     omit_aa_per_residue_bytes: bytes | None = None,
-) -> bytes:
-    """Run LigandMPNN with the specifi ed CLI arguments.
-
-    Returns:
-        Outputs bundled into a `.tar.zst` file.
-    """
-    import subprocess as sp
+) -> tuple[list[str], Path]:
+    """Build base command for LigandMPNN execution."""
     import tempfile
-    import time
-    from datetime import UTC, datetime
-
-    import numpy as np
+    from pathlib import Path
 
     workdir = Path(tempfile.gettempdir()) / f"{run_name}-{script_mode}"
     for d in ("inputs", "outputs"):
         (workdir / d).mkdir(parents=True, exist_ok=True)
 
     # Build command
-    cli_args["--out_folder"] = str(workdir / "outputs")
+    # cli_args["--out_folder"] = str(workdir / "outputs")
     input_pdb_file = workdir / "inputs" / f"{run_name}.pdb"
     with open(input_pdb_file, "wb") as f:
         f.write(struct_bytes)
@@ -244,37 +226,85 @@ def ligandmpnn_run(
         else:
             cmd.extend([str(arg), str(val)])
 
+    return cmd, workdir
+
+
+@app.function(
+    gpu=GPU,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=86400,
+    volumes={f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME.read_only()},
+    image=runtime_image,
+)
+def ligandmpnn_run(
+    run_name: str,
+    script_mode: str,
+    struct_bytes: bytes,
+    seeds: list[int],
+    cli_args: dict[str, str | int | float | bool],
+    bias_aa_per_residue_bytes: bytes | None = None,
+    omit_aa_per_residue_bytes: bytes | None = None,
+) -> bytes:
+    """Run LigandMPNN with the specifi ed CLI arguments.
+
+    Returns:
+        Outputs bundled into a `.tar.zst` file.
+    """
+    import subprocess as sp
+    import time
+    from datetime import UTC, datetime
+
+    import numpy as np
+    from tqdm import tqdm
+
+    base_cmd, workdir = build_base_command(
+        run_name,
+        script_mode,
+        struct_bytes,
+        seeds,
+        cli_args,
+        bias_aa_per_residue_bytes,
+        omit_aa_per_residue_bytes,
+    )
+
     log_path = workdir / "ligandmpnn-run.log"
     print(f"💊 Running LigandMPNN, saving logs to {log_path}")
-    with (
-        sp.Popen(
-            cmd,
-            bufsize=1,
-            stdout=sp.PIPE,
-            stderr=sp.STDOUT,
-            encoding="utf-8",
-            cwd=REPO_DIR,
-        ) as p,
-        open(log_path, "a", buffering=1) as log_file,
-    ):
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
+    for seed in tqdm(seeds, desc="Inference seeds"):
+        cmd = base_cmd + [
+            "--seed",
+            str(seed),
+            "--out_folder",
+            str(workdir / "outputs" / f"seed-{seed}"),
+        ]
+        with (
+            sp.Popen(
+                cmd,
+                bufsize=1,
+                stdout=sp.PIPE,
+                stderr=sp.STDOUT,
+                encoding="utf-8",
+                cwd=REPO_DIR,
+            ) as p,
+            open(log_path, "a", buffering=1) as log_file,
+        ):
+            if p.stdout is None:
+                raise RuntimeError("Failed to capture stdout from the command.")
 
-        now = time.time()
-        banner = "=" * 100
-        log_file.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
-        log_file.write(f"Running command: {' '.join(cmd)}\n{banner}\n")
+            now = time.time()
+            banner = "=" * 100
+            log_file.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
+            log_file.write(f"Running command: {' '.join(cmd)}\n{banner}\n")
 
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            log_file.write(buffered_output)  # not realtime without volume commit
-            print(buffered_output)
+            while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+                log_file.write(buffered_output)  # not realtime without volume commit
+                print(buffered_output, end="", flush=True)
 
-        log_file.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
-        log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
+            log_file.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
+            log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
 
-        if p.returncode != 0:
-            print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
-            raise sp.CalledProcessError(p.returncode, cmd)
+            if p.returncode != 0:
+                print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
+                raise sp.CalledProcessError(p.returncode, cmd)
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")
@@ -305,7 +335,7 @@ def submit_ligandmpnn_task(
     # Model configuration
     model_type: str = "soluble_mpnn",
     checkpoint: str | None = None,
-    seed: int = 0,
+    seeds: str = "0",
     batch_size: int = 1,
     number_of_batches: int = 1,
     temperature: float = 0.1,
@@ -351,7 +381,7 @@ def submit_ligandmpnn_task(
             global_label_membrane_mpnn, soluble_mpnn
         checkpoint: Optional path to model weights. Note that the name should match
             the `model_type` specified.
-        seed: Random seed for design generation
+        seeds: Comma-separated random seeds for design generation
         batch_size: Number of sequence to generate per one pass
         number_of_batches: Number of times to design sequence using a chosen batch size
         temperature: Sampling temperature for design generation
@@ -422,9 +452,11 @@ def submit_ligandmpnn_task(
         run_name = input_path.stem
 
     score_mode = script_mode == "score"
+    seeds: list[int] = [
+        int(s_num) for s in seeds.split(",") if (s_num := s.strip()).isdigit()
+    ]
     cli_args = {
         "--model_type": model_type,
-        "--seed": str(seed),
         "--batch_size": str(batch_size),
         "--number_of_batches": str(number_of_batches),
         # 0/1 flags
@@ -516,6 +548,7 @@ def submit_ligandmpnn_task(
         run_name,
         script_mode,
         struct_bytes,
+        seeds,
         cli_args,
         bias_AA_per_residue_bytes,
         omit_AA_per_residue_bytes,

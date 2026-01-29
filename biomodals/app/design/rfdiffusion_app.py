@@ -1,17 +1,26 @@
 """
-RFdiffusion on Modal - minimal runnable scaffold (fixed).
+RFdiffusion on Modal - minimal runnable scaffold (reviewed + cleaned).
 
 Typical usage:
 
-  # 1) download models into the Modal Volume (run once)
+  # 1) Download checkpoints into the persistent models volume (run once)
   modal run rfdiffusion_app.py --download-models --force-redownload
 
-  # 2) run inference (binder design / scaffold etc.)
+  # 2) Run inference (binder design / scaffold etc.)
   modal run rfdiffusion_app.py \
     --run-name test1 \
     --input-pdb ~/outputs/RFdiffusion/RBD_wt.pdb \
-    --rfd-args "contigmap.contigs='[100-150/0 E333-526]' inference.num_designs=2 ppi.hotspot_res=[E405,E408]"
+    --contigs "100-150/0 E333-526" \
+    --num-designs 2 \
+    --hotspot-res "E405,E408"
+
+Notes:
+- Checkpoint URLs are hardcoded from:
+  https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
+- Outputs are written to a persistent output volume (cache) AND returned as a .tar.zst.
 """
+
+from __future__ import annotations
 
 import os
 import shlex

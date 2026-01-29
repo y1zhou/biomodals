@@ -7,7 +7,7 @@ Typical usage:
   modal run rfdiffusion_modal_fixed.py --download-models --force-redownload
 
   # 2) run inference (binder design / scaffold etc.)
-  modal run RFdiffusion.py \
+  modal run rfdiffusion_app.py \
     --run-name test1 \
     --input-pdb ~/outputs/RFdiffusion/RBD_wt.pdb \
     --rfd-args "contigmap.contigs='[100-150/0 E333-526]' inference.num_designs=2 ppi.hotspot_res=[E405,E408]"

@@ -219,7 +219,6 @@ def package_files_to_tar_zst(files: list[Path], base_dir: str) -> bytes:
 # Step 1: download model weights into the Volume
 # -------------------------
 @app.function(
-    cpu=(2, 8),
     timeout=TIMEOUT * 2,
     volumes={RFD_MODELS_DIR: RFD_VOLUME},
 )

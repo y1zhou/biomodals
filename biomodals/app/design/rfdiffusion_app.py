@@ -295,8 +295,7 @@ def rfdiffusion_infer(
     """
     from tempfile import TemporaryDirectory
 
-    env = build_runtime_env()  # ### CHANGED
-    rfd_debug = os.environ.get("RFD_DEBUG", "0") == "1"
+    env = build_runtime_env()  
   
     with TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -304,44 +303,25 @@ def rfdiffusion_infer(
         input_pdb = tmp / input_pdb_name
         input_pdb.write_bytes(input_pdb_bytes)
 
-        out_dir = tmp / f"{run_name}_outputs"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        local_out_dir = tmp / f"{run_name}_outputs"
+        local_out_dir.mkdir(parents=True, exist_ok=True)
 
-        # =====================================================
-        # ✅ Runtime GPU / DGL CUDA sanity check (runs inside GPU job)
-        # =====================================================
-        run_command(
-            [
-                "bash",
-                "-lc",
-                "python -c \""
-                "import torch, dgl; "
-                "print('torch', torch.__version__); "
-                "print('torch cuda', torch.cuda.is_available()); "
-                "print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'); "
-                "print('dgl', dgl.__version__); "
-                "import sys; "
-                "sys.exit(0) if torch.cuda.is_available() else sys.exit(2)\"",
-            ],
-            env=env,
-        )
-
-        # Only test DGL->CUDA if CUDA is available
-        run_command(
-            [
-                "bash",
-                "-lc",
-                "python -c \""
-                "import torch, dgl; "
-                "assert torch.cuda.is_available(); "
-                "g=dgl.graph(([0],[1])); "
-                "g=g.to('cuda'); "
-                "print('dgl graph device', g.device)\"",
-            ],
-            env=env,
-        )
+        cached_run_dir = Path(RFD_OUT_DIR) / run_name
+        cached_run_dir.mkdir(parents=True, exist_ok=True)
 
         run_infer_py = f"{RFD_REPO_DIR}/scripts/run_inference.py"
+      
+        # hydra overrides are passed as a single string, split safely.
+        extra_tokens = shlex.split(hydra_overrides) if hydra_overrides else []
+
+        cmd = [
+            "python",
+            run_infer_py,
+            f"inference.input_pdb={input_pdb}",
+            f"inference.output_prefix={local_out_dir}/rfout",
+            *extra_tokens,
+        ]
+
 
         # ### CHANGED (关键): 用 shlex.split 正确切分参数，避免空格/[] 引号问题
         # 例如：contigmap.contigs=[10-50/0 E333-526] 这种带空格的 token，

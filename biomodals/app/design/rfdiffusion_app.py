@@ -216,52 +216,53 @@ def package_files_to_tar_zst(files: list[Path], base_dir: str) -> bytes:
 
 
 # -------------------------
-# Step 1: download model weights into the Volume
+# Step 1: download model weights into the models Volume
 # -------------------------
+async def _download_file(session, url: str, local_path: Path) -> None:
+    """Download a file asynchronously via aiohttp streaming."""
+    async with session.get(url) as response:
+        response.raise_for_status()
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "wb") as f:
+            while True:
+                chunk = await response.content.read(8192)
+                if not chunk:
+                    break
+                f.write(chunk)
+
 @app.function(
     timeout=TIMEOUT * 2,
     volumes={RFD_MODELS_DIR: RFD_VOLUME},
 )
-def download_rfdiffusion_models(force: bool = False) -> None:
+async def download_rfdiffusion_models(force: bool = False) -> None:
     """
-    Download RFdiffusion model weights into the mounted Volume.
+    Download RFdiffusion checkpoints into the persistent models Volume.
 
-    你必须根据你们团队使用的 RFdiffusion 版本，落实“权重下载”方式：
-    - 有的仓库带 scripts/download_models.sh
-    - 有的需要手工下载 ckpt
+    URLs are copied verbatim from:
+    https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
     """
-    env = build_runtime_env()
+    import asyncio
+    import aiohttp
 
-    # Ensure target dir exists
-    run_command(["bash", "-lc", f"mkdir -p {RFD_MODELS_DIR}"], env=env)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    model_dir = Path(RFD_MODELS_DIR)
 
-    download_script = f"{RFD_REPO_DIR}/scripts/download_models.sh"
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = []
+        for fname, url in RFD_CHECKPOINT_URLS.items():
+            dst = model_dir / fname
+            if force or not dst.exists():
+                print(f"downloading {fname} -> {dst}")
+                tasks.append(_download_file(session, url, dst))
 
-    # ### CHANGED: 不再拼长 bash 字符串做复杂逻辑，尽量简洁可控
-    if force:
-        print("force=True: you may want to delete old weights first (optional).")
+        if tasks:
+            await asyncio.gather(*tasks)
+        else:
+            print("All RFdiffusion checkpoints already present; nothing to download.")
 
-    # 这个逻辑保留：如果仓库有脚本就跑，没有就直接失败并提示你补齐下载方式
-    bash = [
-        "bash",
-        "-lc",
-        f"""
-set -e
-if [ -f "{download_script}" ]; then
-  echo "Found download script: {download_script}"
-  bash "{download_script}" "{RFD_MODELS_DIR}"
-else
-  echo "No download_models.sh found in this RFdiffusion repo."
-  echo "You must implement weights download for your RFdiffusion version."
-  echo "Expected weights under: {RFD_MODELS_DIR}"
-  exit 1
-fi
-""",
-    ]
-    run_command(bash, env=env)
-
+    # Commit so checkpoints are visible immediately for remote inference jobs.
     RFD_VOLUME.commit()
-    print("RFdiffusion model download complete and committed.")
+    print("RFdiffusion checkpoints downloaded and committed.")
 
 
 # -------------------------

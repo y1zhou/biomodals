@@ -23,7 +23,7 @@ from modal import App, Image, Volume
 # Modal configs
 # -------------------------
 GPU = os.environ.get("GPU", "A10G")
-TIMEOUT = int(os.environ.get("TIMEOUT", "3600"))
+TIMEOUT = int(os.environ.get("TIMEOUT", "36000"))
 APP_NAME = os.environ.get("MODAL_APP", "RFdiffusion")
 
 RFD_VOLUME = Volume.from_name("rfdiffusion-models", create_if_missing=True)

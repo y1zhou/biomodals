@@ -148,6 +148,16 @@ def run_command(
         if rc != 0:
             raise sp.CalledProcessError(rc, cmd)
 
+def build_runtime_env() -> dict[str, str]:
+    """
+     Build a consistent runtime environment.
+    - Keep the env dict explicit so subprocesses inherit expected settings.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = RFD_REPO_DIR
+    # (Optional) quiet DGL backend warning
+    env.setdefault("DGLBACKEND", "pytorch")
+    return env
 
 def package_dir_to_tar_zst(dir_path: str) -> bytes:
     """Package a directory into tar.zst and return bytes."""
@@ -159,28 +169,6 @@ def package_dir_to_tar_zst(dir_path: str) -> bytes:
     name = dp.name
     cmd = ["tar", "--zstd", "-cf", "-", name]
     return sp.check_output(cmd, cwd=parent)
-
-
-def build_runtime_env() -> dict[str, str]:
-    """
-    ### CHANGED: 统一构造运行时环境变量
-    关键：把 RFdiffusion repo 加入 PYTHONPATH，解决 `import rfdiffusion` 找不到的问题
-    """
-    env = dict(os.environ)
-    # 让 Python 能 import /root/RFdiffusion/rfdiffusion
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{RFD_REPO_DIR}:{existing}" if existing else RFD_REPO_DIR
-
-    # 明确告诉程序权重在哪（Volume 会挂载到这个目录）
-    env["MODELS_PATH"] = RFD_MODELS_DIR
-
-    # ✅ Force torch.load default behavior (PyTorch 2.6+)
-    env["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
-
-    # (Optional) quiet DGL backend warning
-    env["DGLBACKEND"] = "pytorch"
-
-    return env
 
 
 # -------------------------

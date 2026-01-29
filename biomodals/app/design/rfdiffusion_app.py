@@ -353,14 +353,41 @@ def rfdiffusion_infer(
 # Local entrypoint (CLI)
 # -------------------------
 @app.local_entrypoint()
-def main(
+def submit_rfdiffusion_task(
     run_name: str | None = None,
     input_pdb: str | None = None,
+    contigs: str | None = None,
+    num_designs: int = 1,
+    hotspot_res: str | None = None,
+    # Backwards-compatible "raw overrides" input (deprecated, but kept for convenience).
     rfd_args: str = "",
     download_models: bool = False,
     force_redownload: bool = False,
     out_dir: str | None = None,
 ):
+    """
+    Submit an RFdiffusion inference job to Modal.
+
+    Parameters
+    ----------
+    run_name:
+        A unique name for this run; used for local output filename and output-volume cache key.
+    input_pdb:
+        Local path to the input PDB file (uploaded to the Modal function).
+    contigs:
+        Convenience wrapper for contigmap.contigs. Example: "100-150/0 E333-526"
+    num_designs:
+        Convenience wrapper for inference.num_designs.
+    hotspot_res:
+        Convenience wrapper for ppi.hotspot_res. Example: "E405,E408"
+
+    Notes
+    -----
+    - For longer jobs, increase TIMEOUT via environment variable:
+        TIMEOUT=14400 modal run rfdiffusion_app.py ...
+    - To enable runtime diagnostics:
+        RFD_DEBUG=1 modal run rfdiffusion_app.py ...
+    """
     if download_models:
         download_rfdiffusion_models.remote(force=force_redownload)
         return
@@ -369,10 +396,28 @@ def main(
         raise ValueError("Missing required --run-name")
     if input_pdb is None:
         raise ValueError("Missing required --input-pdb (path to local .pdb)")
-
+      
     input_path = Path(input_pdb)
     if not input_path.exists():
         raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
+
+    # Build Hydra overrides string from structured arguments.
+    overrides: list[str] = []
+
+    if contigs:
+        overrides.append(f'contigmap.contigs="[{contigs}]"')  # keep as a single token
+    if num_designs:
+        overrides.append(f"inference.num_designs={int(num_designs)}")
+    if hotspot_res:
+        # Accept "E405,E408" or "E405 E408"
+        hs = hotspot_res.replace(" ", ",")
+        overrides.append(f"ppi.hotspot_res=[{hs}]")
+
+    # Prefer extra_overrides; keep rfd_args as a deprecated escape hatch.
+    if rfd_args.strip():
+        overrides.extend(shlex.split(rfd_args))
+
+    hydra_overrides = " ".join(overrides)
 
     pdb_bytes = input_path.read_bytes()
 
@@ -386,7 +431,8 @@ def main(
         input_pdb_bytes=pdb_bytes,
         input_pdb_name=input_path.name,
         run_name=run_name,
-        rfd_args=rfd_args,
+        hydra_overrides=hydra_overrides,
     )
     out_file.write_bytes(tar_bytes)
     print(f"Done. Saved: {out_file}")
+

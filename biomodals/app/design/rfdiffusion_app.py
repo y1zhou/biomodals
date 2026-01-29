@@ -54,19 +54,21 @@ runtime_image = (
     )
      .run_commands(
         f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"
-       
     .env(
         {
-            "UV_TORCH_BACKEND": "cu128",
+            "PYTHONPATH": RFD_REPO_DIR,
             "PYTHONUNBUFFERED": "1",
-            "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1",  # 关键：切回 weights_only=False（当调用方未显式传参时）
         }
     )
-
+    .run_commands(
+        # install CUDA-enabled PyTorch from official index (avoid accidental CPU-only wheels).
+        # Pin torch < 2.6 to avoid the torch.load(weights_only=...) default behavior change.
+        "python -m pip install --no-cache-dir -U pip && "
+        "python -m pip install --no-cache-dir "
+        "--index-url https://download.pytorch.org/whl/cu121 "
+        "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
     )
     .uv_pip_install(
-        "torch",
-        "torchdata>=0.7",     # ✅ NEW：给 dgl 用的 datapipes
         "numpy",
         "scipy",
         "tqdm",
@@ -76,9 +78,10 @@ runtime_image = (
         "biopython",
         "pandas",
         "einops",
-        "opt_einsum",   # ✅ CHANGED: 修复当前报错
-        "dm-tree",      # （可选但推荐）
-        "pyrsistent",   # ✅ NEW: RFdiffusion symmetry 依赖     
+        "opt_einsum",
+        "dm-tree",
+        "pyrsistent",   # RFdiffusion symmetry 依赖    
+        "torchdata>=0.7",
     )
     .run_commands(
     # 进入 RFdiffusion 自带的 NVIDIA SE3Transformer 目录安装

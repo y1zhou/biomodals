@@ -89,15 +89,13 @@ runtime_image = (
        f"cd {RFD_REPO_DIR}/env/SE3Transformer && "
         "python -m pip install --no-cache-dir -r requirements.txt && "
         "python setup.py install"
+    )
+    .run_commands(
+        # ensure DGL CUDA wheel. Uninstall any CPU build first.
+        "python -m pip uninstall -y dgl || true && "
+        'python -m pip install --no-cache-dir "dgl==1.1.3" -f https://data.dgl.ai/wheels/cu121/repo.html'
+    )
 
-    # 先卸载可能已经装上的 CPU dgl
-    "bash -lc 'python -m pip uninstall -y dgl || true'",
-
-    # 从 DGL 官方 wheel 仓库安装 CUDA 12.1 版本（最常用、最稳定）
-    # 注意：这里安装的包名仍然是 dgl，但会拿到带 +cu121 的 wheel
-    "bash -lc 'python -m pip install --no-cache-dir \"dgl==1.1.3\" -f https://data.dgl.ai/wheels/cu121/repo.html'",
-
-)
     # ### CHANGED: 在镜像层就设置 MODELS_PATH（等下会被 Volume 挂载覆盖目录内容）
     .env({"MODELS_PATH": RFD_MODELS_DIR})
 )

@@ -198,6 +198,22 @@ def collect_outputs_for_bundle(root_dir: str) -> list[Path]:
     files = [root / p.lstrip("./") for p in out if p.strip()]
     return files
 
+def package_files_to_tar_zst(files: list[Path], base_dir: str) -> bytes:
+    """Create a tar.zst containing only selected files, preserving relative paths."""
+    import subprocess as sp
+    import tempfile
+
+    base = Path(base_dir)
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        for p in files:
+            rel = p.relative_to(base)
+            f.write(str(rel) + "\n")
+        filelist = f.name
+
+    cmd = ["bash", "-lc", f"tar --zstd -cf - -C {base} -T {filelist}"]
+    return sp.check_output(cmd)
+
 
 # -------------------------
 # Step 1: download model weights into the Volume

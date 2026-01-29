@@ -96,9 +96,6 @@ runtime_image = (
         'python -m pip install --no-cache-dir "dgl==1.1.3" -f https://data.dgl.ai/wheels/cu121/repo.html'
     )
 
-    # ### CHANGED: 在镜像层就设置 MODELS_PATH（等下会被 Volume 挂载覆盖目录内容）
-    .env({"MODELS_PATH": RFD_MODELS_DIR})
-)
 
 app = App(APP_NAME, image=runtime_image)
 

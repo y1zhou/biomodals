@@ -25,12 +25,13 @@ from modal import App, Image, Volume
 GPU = os.environ.get("GPU", "A100")
 TIMEOUT = int(os.environ.get("TIMEOUT", "36000"))
 APP_NAME = os.environ.get("MODAL_APP", "RFdiffusion")
+
 RFD_VOLUME = Volume.from_name("rfdiffusion-models", create_if_missing=True)
 RFD_OUT_VOLUME = Volume.from_name("rfdiffusion-outputs", create_if_missing=True)
 
-RFD_MODELS_DIR = "/root/rfdiffusion_models"
 RFD_REPO_DIR = "/root/RFdiffusion"
-
+RFD_MODELS_DIR = f"{RFD_REPO_DIR}/models"
+RFD_OUT_DIR = "/root/rfdiffusion_outputs"
 
 # -------------------------
 # Image definition

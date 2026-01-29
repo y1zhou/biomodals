@@ -322,62 +322,31 @@ def rfdiffusion_infer(
             *extra_tokens,
         ]
 
-
-        # ### CHANGED (关键): 用 shlex.split 正确切分参数，避免空格/[] 引号问题
-        # 例如：contigmap.contigs=[10-50/0 E333-526] 这种带空格的 token，
-        # 以前在 bash 里很容易被拆开导致报错；现在不会。
-        extra_tokens = shlex.split(rfd_args) if rfd_args else []
-
-        # =====================================================
-        # ✅ Check model weights in Volume and copy to repo default path
-        # =====================================================
-        default_models_dir = f"{RFD_REPO_DIR}/models"
-        ckpt_src = f"{RFD_MODELS_DIR}/Complex_base_ckpt.pt"      # Volume mount
-        ckpt_dst = f"{default_models_dir}/Complex_base_ckpt.pt"  # RFdiffusion default
-
-        # 1) list what we have in the mounted Volume
-        run_command(
-            ["bash", "-lc", f"echo '=== MODELS VOLUME ({RFD_MODELS_DIR}) ==='; ls -lah {RFD_MODELS_DIR}"],
-            env=env,
-        )
-
-        # 2) fail fast if checkpoint missing
-        run_command(
-            ["bash", "-lc", f"test -f {ckpt_src} && ls -lh {ckpt_src} || (echo 'MISSING ckpt: {ckpt_src}'; exit 1)"],
-            env=env,
-        )
-
-        # 3) copy into repo default models dir (what RFdiffusion actually uses)
-        run_command(["bash", "-lc", f"mkdir -p {default_models_dir}"], env=env)
-        run_command(
-            ["bash", "-lc", f"cp -f {ckpt_src} {ckpt_dst} && echo '=== COPIED CKPT ===' && ls -lh {ckpt_dst}"],
-            env=env,
-        )
-
-        # ===============================
-        # 正式运行 RFdiffusion
-        # ===============================
-
-        # ### CHANGED: 直接用 subprocess 列表参数调用 python（不再用 bash -lc 拼字符串）
         cmd = [
             "python",
             run_infer_py,
             f"inference.input_pdb={input_pdb}",
-            f"inference.output_prefix={out_dir}/rfout",
+            f"inference.output_prefix={local_out_dir}/rfout",
             *extra_tokens,
         ]
 
-        # 在 repo 目录下运行（让相对路径/配置更稳定）
         run_command(cmd, cwd=RFD_REPO_DIR, env=env)
 
-        # optional: list outputs
-        run_command(
-            ["bash", "-lc", f'echo "=== outputs ==="; find "{out_dir}" -maxdepth 3 -type f | head -n 200'],
-            env=env,
-        )
+        # cache outputs to the output Volume for later reuse/inspection.
+        run_command(["bash", "-lc", f"cp -a '{local_out_dir}/.' '{cached_run_dir}/'"], env=env)
+        RFD_OUT_VOLUME.commit()
 
-        tar_bytes = package_dir_to_tar_zst(str(out_dir))
+        # bundle only the interesting artifacts (smaller/faster downloads).
+        selected = collect_outputs_for_bundle(str(local_out_dir))
+        if selected:
+            tar_bytes = package_files_to_tar_zst(selected, base_dir=str(local_out_dir))
+        else:
+            # Fallback: if matching fails for some reason, bundle everything.
+            tar_bytes = package_dir_to_tar_zst(str(local_out_dir))
+
         return tar_bytes
+
+
 
 
 # -------------------------

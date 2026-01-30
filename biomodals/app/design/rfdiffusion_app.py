@@ -1,24 +1,60 @@
 """
-RFdiffusion on Modal - minimal runnable scaffold (reviewed + cleaned).
+RFdiffusion source repo: <https://github.com/RosettaCommons/RFdiffusion>.
 
-Typical usage:
+## Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--run-name` | **Required** | Unique name used for output tarball name and output-volume cache key. |
+| `--input-pdb` | **Required** | Local path to the input PDB file (uploaded to the Modal worker). |
+| `--out-dir` | `$CWD` | Optional local output directory for the returned `.tar.zst` bundle. |
+| `--contigs` | `None` | Convenience wrapper for `contigmap.contigs` (Hydra override). Example: `"100-150/0 E333-526"`. |
+| `--num-designs` | `1` | Convenience wrapper for `inference.num_designs` (Hydra override). |
+| `--hotspot-res` | `None` | Convenience wrapper for `ppi.hotspot_res` (Hydra override). Example: `"E405,E408"`. |
+| `--rfd-args` | `""` | Additional Hydra overrides as a raw string (escape hatch / backward-compatible). |
+| `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download checkpoint weights and skip running inference. |
+| `--force-redownload`/`--no-force-redownload` | `--no-force-redownload` | Force re-download checkpoints even if they already exist in the models volume. |
+
+For a complete set of RFdiffusion Hydra override keys, see RFdiffusion docs and `scripts/run_inference.py`.
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MODAL_APP` | `RFdiffusion` | Name of the Modal app to use. |
+| `GPU` | `A100` | Type of GPU to use. See https://modal.com/pricing for details. |
+| `TIMEOUT` | `36000` | Timeout for the inference Modal function in seconds. |
+
+## Notes
+
+- Checkpoint URLs are hardcoded from the upstream script:
+  https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
+- Checkpoints are stored in a persistent Modal volume (`rfdiffusion-models`).
+- Outputs are cached in a persistent Modal volume (`rfdiffusion-outputs`) under:
+  `/root/rfdiffusion_outputs/<run-name>/`
+- The returned tarball bundles only “useful” artifacts by default (e.g. `.pdb`, `.trb`, `.log`, `.json`, `.yaml/.yml`, `.csv`).
+  If the selection step yields nothing, it falls back to bundling the entire local output directory.
+
+## Outputs
+
+* A `.tar.zst` archive will be written to `--out-dir` (or `$CWD`) named:
+  `<run-name>_rfdiffusion_outputs.tar.zst`.
+* The same run outputs are cached on the output volume for later inspection/reuse
+  under the run name key.
+
+## Typical usage:
 
   # 1) Download checkpoints into the persistent models volume (run once)
   modal run rfdiffusion_app.py --download-models --force-redownload
 
   # 2) Run inference (binder design / scaffold etc.)
   modal run rfdiffusion_app.py \
-    --run-name test1 \
-    --input-pdb ~/outputs/RFdiffusion/RBD_wt.pdb \
+    --run-name demo1 \
+    --input-pdb ~/outputs/rfdiffusion_app/RBD_wt.pdb \
     --contigs "100-150/0 E333-526" \
     --num-designs 2 \
     --hotspot-res "E405,E408"
-
-Notes:
-- Checkpoint URLs are hardcoded from:
-  https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
-- Outputs are written to a persistent output volume (cache) AND returned as a .tar.zst.
 """
+
+
 
 from __future__ import annotations
 
@@ -57,7 +93,6 @@ RFD_CHECKPOINT_URLS: dict[str, str] = {
     "Base_epoch8_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/12fc204edeae5b57713c5ad7dcb97d39/Base_epoch8_ckpt.pt",
 }
 
-
 # -------------------------
 # Image definition
 # -------------------------
@@ -66,7 +101,7 @@ RFD_CHECKPOINT_URLS: dict[str, str] = {
 # (https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile) 
 
 runtime_image = (
-    Image.micromamba(python_version="3.10")
+    Image.debian_slim(python_version="3.10")
     .apt_install(
         "git",
         "wget",
@@ -77,10 +112,8 @@ runtime_image = (
         "tar",
         "fd-find",  # prefer fd over find
     )
-    .run_commands(
-        # CHANGED: ensure the 'fd' binary is available (Ubuntu often exposes it as 'fdfind').
-        "bash -lc 'command -v fd >/dev/null 2>&1 || (command -v fdfind >/dev/null 2>&1 && ln -sf $(command -v fdfind) /usr/local/bin/fd) || true'"
-    )
+    .run_commands("ln -s /usr/bin/fdfind /usr/local/bin/fd",)
+
     .run_commands(
        f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"
     )
@@ -88,16 +121,19 @@ runtime_image = (
         {
             "PYTHONPATH": RFD_REPO_DIR,
             "PYTHONUNBUFFERED": "1",
+            "DGLBACKEND": "pytorch",
         }
     )
-    .run_commands(
-        # install CUDA-enabled PyTorch from official index (avoid accidental CPU-only wheels).
-        # Pin torch < 2.6 to avoid the torch.load(weights_only=...) default behavior change.
-        "python -m pip install --no-cache-dir -U pip && "
-        "python -m pip install --no-cache-dir "
-        "--index-url https://download.pytorch.org/whl/cu121 "
-        "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
+
+    # install CUDA-enabled PyTorch from official index (avoid accidental CPU-only wheels).
+    # Pin torch < 2.6 to avoid the torch.load(weights_only=...) default behavior change.
+    .uv_pip_install(
+        "torch==2.5.1",
+        "torchvision==0.20.1",
+        "torchaudio==2.5.1",
+        index_url="https://download.pytorch.org/whl/cu121",
     )
+
     .uv_pip_install(
         "numpy",
         "scipy",
@@ -113,18 +149,19 @@ runtime_image = (
         "pyrsistent",   # RFdiffusion symmetry 
         "aiohttp",  # async checkpoint download
         "torchdata>=0.7",  # DGL / datapipes support
+        "dgl==1.1.3",  # DGL CUDA wheel
+
+        # Where to find the CUDA wheels for DGL
+        find_links="https://data.dgl.ai/wheels/cu121/repo.html",
     )
+
     .run_commands(
     # build/install NVIDIA SE3Transformer in one chained step.
        f"cd {RFD_REPO_DIR}/env/SE3Transformer && "
         "python -m pip install --no-cache-dir -r requirements.txt && "
         "python setup.py install"
     )
-    .run_commands(
-        # ensure DGL CUDA wheel. Uninstall any CPU build first.
-        "python -m pip uninstall -y dgl || true && "
-        'python -m pip install --no-cache-dir "dgl==1.1.3" -f https://data.dgl.ai/wheels/cu121/repo.html'
-    )
+  
 )
 
 
@@ -134,24 +171,40 @@ app = App(APP_NAME, image=runtime_image)
 # -------------------------
 # Helpers
 # -------------------------
-def run_command(
-    cmd: list[str],
-    cwd: str | None = None,
-    env: dict[str, str] | None = None,
-) -> None:
-    """Run a command and stream stdout/stderr."""
-    import subprocess as sp
 
-    print("Running:", " ".join(cmd))
-    with sp.Popen(
-        cmd,
-        cwd=cwd,
-        env=env,
-        stdout=sp.PIPE,
-        stderr=sp.STDOUT,
-        bufsize=1,
-        encoding="utf-8",
-    ) as p:
+from pathlib import Path
+import shutil
+import subprocess as sp
+import tempfile
+
+
+def run_command(cmd: list[str], cwd: str | Path | None = None, **kwargs) -> None:
+    """Run a command and stream stdout/stderr.
+
+    This is intentionally a thin wrapper around `subprocess.Popen` to:
+    - avoid shell invocation (argv list only)
+    - surface live logs in Modal
+    - raise on non-zero exit
+
+    Args:
+        cmd: Command argv list (no shell).
+        cwd: Optional working directory.
+        **kwargs: Passed through to `subprocess.Popen` (e.g., env=...).
+    """
+    import subprocess as sp
+    import shlex
+
+    cwd_str = str(cwd) if cwd is not None else None
+    print("Running:", shlex.join(cmd), f"(cwd={cwd_str})" if cwd_str else "")
+
+    # Default streaming settings; callers may override via kwargs.
+    kwargs.setdefault("stdout", sp.PIPE)
+    kwargs.setdefault("stderr", sp.STDOUT)
+    kwargs.setdefault("bufsize", 1)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+
+    with sp.Popen(cmd, cwd=cwd_str, **kwargs) as p:
         assert p.stdout is not None
         for line in p.stdout:
             print(line, end="")
@@ -159,72 +212,94 @@ def run_command(
         if rc != 0:
             raise sp.CalledProcessError(rc, cmd)
 
-def build_runtime_env() -> dict[str, str]:
-    """
-     Build a consistent runtime environment.
-    - Keep the env dict explicit so subprocesses inherit expected settings.
-    """
-    env = dict(os.environ)
-    env["PYTHONPATH"] = RFD_REPO_DIR
-    # (Optional) quiet DGL backend warning
-    env.setdefault("DGLBACKEND", "pytorch")
-    return env
 
-def package_dir_to_tar_zst(dir_path: str) -> bytes:
-    """Package a directory into tar.zst and return bytes."""
+def _require_fd() -> None:
+    """Fail fast if `fd` is not available (required in the runtime image)."""
+    import shutil
+
+    if shutil.which("fd") is None:
+        raise RuntimeError(
+            "fd (fd-find) is required but was not found on PATH. "
+            "Install fd-find in the runtime image and expose it as `fd`."
+        )
+
+
+def warmup_directory(dir_path: str | Path, file_pattern: str = ".", jobs: int = 256) -> None:
+    """Warm up the disk cache for files in a directory using `fd`.
+
+    This is optional, and mostly useful when subsequent steps will re-read many
+    files (e.g., large tarballs or model weights).
+    """
+    _require_fd()
+    dir_path = Path(dir_path)
+
+    cmd = [
+        "fd",
+        "-t",
+        "f",
+        file_pattern,
+        str(dir_path),
+        "-j",
+        str(jobs),
+        "-x",
+        "dd",
+        "if={}",
+        "of=/dev/null",
+        "bs=1M",
+        "status=none",
+    ]
+    run_command(cmd)
+
+
+def collect_outputs_for_bundle(root_dir: str | Path) -> list[Path]:
+    """Collect the output artifacts we typically want to download.
+
+    Uses `fd` only (no shell). Returns absolute Paths under `root_dir`, sorted for
+    reproducible bundling.
+    """
+    _require_fd()
+    import subprocess as sp
+
+    root = Path(root_dir)
+    pattern = r"\.(pdb|trb|json|ya?ml|log|txt|csv)$"
+    cmd = ["fd", "-t", "f", "--regex", pattern, "."]
+
+    out = sp.check_output(cmd, cwd=str(root), text=True).splitlines()
+    files = [root / p for p in out if p.strip()]
+    return sorted(files, key=lambda p: str(p))
+
+
+def package_dir_to_tar_zst(dir_path: str | Path) -> bytes:
+    """Package an entire directory into a tar.zst and return bytes."""
     import subprocess as sp
 
     dp = Path(dir_path)
-    parent = str(dp.parent)
-    name = dp.name
-    cmd = ["tar", "--zstd", "-cf", "-", name]
-    return sp.check_output(cmd, cwd=parent)
+    cmd = ["tar", "--zstd", "-cf", "-", dp.name]
+    return sp.check_output(cmd, cwd=str(dp.parent))
 
-def collect_outputs_for_bundle(root_dir: str) -> list[Path]:
-    """
-    Collect the subset of output files that are typically useful to download.
-    This avoids bundling unnecessary large intermediate files.
-    """
-    import subprocess as sp
-    root = Path(root_dir)
-    # Prefer fd (multi-threaded); fallback to find.
-    has_fd = sp.run(["bash", "-lc", "command -v fd >/dev/null 2>&1"]).returncode == 0
 
-    if has_fd:
-        cmd = (
-            f"cd {root} && "
-            r"fd -t f '\.(pdb|trb|json|yaml|yml|log|txt|csv)$' ."
-        )
-    else:
-        cmd = (
-            f"cd {root} && "
-            r"find . -type f \( "
-            r"-name '*.pdb' -o -name '*.trb' -o -name '*.json' -o "
-            r"-name '*.yaml' -o -name '*.yml' -o -name '*.log' -o "
-            r"-name '*.txt' -o -name '*.csv' "
-            r"\)"
-        )
-
-    out = sp.check_output(["bash", "-lc", cmd], text=True).strip().splitlines()
-    files = [root / p.lstrip("./") for p in out if p.strip()]
-    return files
-
-def package_files_to_tar_zst(files: list[Path], base_dir: str) -> bytes:
-    """Create a tar.zst containing only selected files, preserving relative paths."""
+def package_files_to_tar_zst(files: list[Path], base_dir: str | Path) -> bytes:
+    """Create a tar.zst containing only selected files (relative to base_dir)."""
     import subprocess as sp
     import tempfile
 
     base = Path(base_dir)
 
+    # Ensure all files are under base (avoid tar errors + path traversal).
+    rel_paths: list[str] = []
+    for p in files:
+        rel_paths.append(str(Path(p).relative_to(base)))
+
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-        for p in files:
-            rel = p.relative_to(base)
-            f.write(str(rel) + "\n")
+        for rel in rel_paths:
+            f.write(rel + "\n")
         filelist = f.name
 
-    cmd = ["bash", "-lc", f"tar --zstd -cf - -C {base} -T {filelist}"]
-    return sp.check_output(cmd)
-
+    try:
+        cmd = ["tar", "--zstd", "-cf", "-", "-C", str(base), "-T", filelist]
+        return sp.check_output(cmd)
+    finally:
+        Path(filelist).unlink(missing_ok=True)
 
 # -------------------------
 # Step 1: download model weights into the models Volume
@@ -286,9 +361,9 @@ async def download_rfdiffusion_models(force: bool = False) -> None:
     timeout=TIMEOUT,
     image=runtime_image,
     volumes={
-      RFD_MODELS_DIR: RFD_VOLUME.read_only(),
-      # output cache volume.
-      RFD_OUT_DIR: RFD_OUT_VOLUME,
+        RFD_MODELS_DIR: RFD_VOLUME.read_only(),
+        # output cache volume.
+        RFD_OUT_DIR: RFD_OUT_VOLUME,
     },
 )
 def rfdiffusion_infer(
@@ -300,56 +375,62 @@ def rfdiffusion_infer(
     """
     Run RFdiffusion inference inside the container and return a .tar.zst bundle.
 
-    - Outputs are cached under /root/rfdiffusion_outputs/<run_name> on a persistent Volume.
-    - The returned archive contains the most useful artifacts (PDB/TRB/log/JSON/YAML by default).
+    - Outputs are written directly to /root/rfdiffusion_outputs/<run_name> on a persistent Volume.
+      Partial results are preserved if the run is interrupted.
+    - A SUCCESS marker file is written only after successful completion.
     """
+    import shlex
+    from pathlib import Path
     from tempfile import TemporaryDirectory
 
-    env = build_runtime_env()  
-  
     with TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
+        # ---- input pdb (tmp is fine) ----
         input_pdb = tmp / input_pdb_name
         input_pdb.write_bytes(input_pdb_bytes)
 
-        local_out_dir = tmp / f"{run_name}_outputs"
-        local_out_dir.mkdir(parents=True, exist_ok=True)
-
+        # ---- cached output dir (persistent volume) ----
         cached_run_dir = Path(RFD_OUT_DIR) / run_name
         cached_run_dir.mkdir(parents=True, exist_ok=True)
 
+        # optional: keep actual RFdiffusion outputs in a subdir
+        run_dir = cached_run_dir / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
         run_infer_py = f"{RFD_REPO_DIR}/scripts/run_inference.py"
-      
+
         # hydra overrides are passed as a single string, split safely.
         extra_tokens = shlex.split(hydra_overrides) if hydra_overrides else []
+
+        out_prefix = run_dir / "rfout"
 
         cmd = [
             "python",
             run_infer_py,
             f"inference.input_pdb={input_pdb}",
-            f"inference.output_prefix={local_out_dir}/rfout",
+            f"inference.output_prefix={out_prefix}",
             *extra_tokens,
         ]
 
-        run_command(cmd, cwd=RFD_REPO_DIR, env=env)
+        # ---- run inference (writes directly into cache volume) ----
+        run_command(cmd, cwd=RFD_REPO_DIR)
 
-        # cache outputs to the output Volume for later reuse/inspection.
-        run_command(["bash", "-lc", f"cp -a '{local_out_dir}/.' '{cached_run_dir}/'"], env=env)
+        # ---- mark success (only reached if inference didn't error) ----
+        success_marker = cached_run_dir / "SUCCESS"
+        success_marker.write_text("ok\n", encoding="utf-8")
+
+        # ---- commit cached outputs ----
         RFD_OUT_VOLUME.commit()
 
-        # bundle only the interesting artifacts (smaller/faster downloads).
-        selected = collect_outputs_for_bundle(str(local_out_dir))
+        # ---- bundle outputs for return ----
+        selected = collect_outputs_for_bundle(str(run_dir))
         if selected:
-            tar_bytes = package_files_to_tar_zst(selected, base_dir=str(local_out_dir))
+            tar_bytes = package_files_to_tar_zst(selected, base_dir=str(run_dir))
         else:
-            # Fallback: if matching fails for some reason, bundle everything.
-            tar_bytes = package_dir_to_tar_zst(str(local_out_dir))
+            tar_bytes = package_dir_to_tar_zst(str(run_dir))
 
         return tar_bytes
-
-
-
 
 # -------------------------
 # Local entrypoint (CLI)
@@ -372,23 +453,37 @@ def submit_rfdiffusion_task(
 
     Parameters
     ----------
-    run_name:
-        A unique name for this run; used for local output filename and output-volume cache key.
-    input_pdb:
-        Local path to the input PDB file (uploaded to the Modal function).
-    contigs:
-        Convenience wrapper for contigmap.contigs. Example: "100-150/0 E333-526"
-    num_designs:
-        Convenience wrapper for inference.num_designs.
-    hotspot_res:
-        Convenience wrapper for ppi.hotspot_res. Example: "E405,E408"
+    run_name : str
+        Unique name for this run. Used as the output-volume cache key and as part
+        of the returned output archive filename.
+    input_pdb : str
+        Path to the input PDB file on the local machine. The file will be uploaded
+        to the Modal worker before inference starts.
+    contigs : str | None
+        Convenience wrapper for `contigmap.contigs` (Hydra override). This argument
+        simplifies common RFdiffusion use cases such as binder or scaffold design.
+    num_designs : int
+        Convenience wrapper for `inference.num_designs` (Hydra override).
+    hotspot_res : str | None
+        Convenience wrapper for `ppi.hotspot_res` (Hydra override), typically used
+        for binder design.
+    rfd_args : str
+        Raw RFdiffusion Hydra overrides passed directly to the inference script.
+        This acts as an escape hatch for advanced or unsupported options.
+    download_models : bool
+        If set, download RFdiffusion checkpoint weights into the persistent models
+        volume and exit without running inference.
+    force_redownload : bool
+        Force re-download checkpoint weights even if they already exist in the
+        models volume.
+    out_dir : str | None
+        Optional local directory where the output `.tar.zst` archive will be written.
+        Defaults to the current working directory.
 
     Notes
     -----
     - For longer jobs, increase TIMEOUT via environment variable:
-        TIMEOUT=14400 modal run rfdiffusion_app.py ...
-    - To enable runtime diagnostics:
-        RFD_DEBUG=1 modal run rfdiffusion_app.py ...
+        TIMEOUT=360000 modal run rfdiffusion_app.py ...
     """
     if download_models:
         download_rfdiffusion_models.remote(force=force_redownload)

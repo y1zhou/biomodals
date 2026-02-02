@@ -174,7 +174,27 @@ app = App(APP_NAME, image=runtime_image)
 
 from pathlib import Path
 import shutil
+import re
 
+_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+def validate_run_name(run_name: str) -> str:
+    """
+    Validate run_name to prevent path traversal and keep filenames predictable.
+
+    Allowed: [A-Za-z0-9][A-Za-z0-9._-]{0,63}
+    - must start with alnum
+    - max length 64
+    - no slashes, whitespace, or ".."
+    """
+    if not _RUN_NAME_RE.match(run_name):
+        raise ValueError(
+            "Invalid --run-name. Use 1-64 chars of letters/digits plus . _ - "
+            "(must start with a letter/digit)."
+        )
+    if ".." in run_name:
+        raise ValueError("Invalid --run-name: '..' is not allowed.")
+    return run_name
 
 
 def run_command(cmd: list[str], cwd: str | Path | None = None, **kwargs) -> None:
@@ -490,6 +510,9 @@ def submit_rfdiffusion_task(
 
     if run_name is None:
         raise ValueError("Missing required --run-name")
+
+        run_name = validate_run_name(run_name)
+  
     if input_pdb is None:
         raise ValueError("Missing required --input-pdb (path to local .pdb)")
       

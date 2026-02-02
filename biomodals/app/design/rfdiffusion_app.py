@@ -112,7 +112,7 @@ runtime_image = (
         "tar",
         "fd-find",  # prefer fd over find
     )
-    .run_commands("ln -s /usr/bin/fdfind /usr/local/bin/fd",)
+    .run_commands("ln -s /usr/bin/fdfind /usr/local/bin/fd")
 
     .run_commands(
        f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"

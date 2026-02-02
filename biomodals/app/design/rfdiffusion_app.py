@@ -97,9 +97,9 @@ RFD_CHECKPOINT_URLS: dict[str, str] = {
 # Image definition
 # -------------------------
 # NOTE:
-# A newer, modern CUDA/PyTorch-style environment 
-# (https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile) 
-
+# For an example of a newer, modern CUDA/PyTorch-style Docker environment, see:
+# https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile
+# The runtime image below is defined directly with Modal and is not built from that Dockerfile.
 runtime_image = (
     Image.debian_slim(python_version="3.10")
     .apt_install(

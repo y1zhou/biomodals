@@ -281,10 +281,15 @@ def collect_outputs_for_bundle(root_dir: str | Path) -> list[Path]:
 
     root = Path(root_dir)
     pattern = r"\.(pdb|trb|json|ya?ml|log|txt|csv)$"
-    cmd = ["fd", "-t", "f", "--regex", pattern, "."]
 
-    out = sp.check_output(cmd, cwd=str(root), text=True).splitlines()
-    files = [root / p for p in out if p.strip()]
+    root = Path(root_dir)
+    exts = (".pdb", ".trb", ".json", ".yaml", ".yml", ".log", ".txt", ".csv")
+    files = [
+    p
+    for p in root.rglob("*")
+    if p.is_file() and p.suffix.lower() in exts
+    ]
+
     return sorted(files, key=lambda p: str(p))
 
 

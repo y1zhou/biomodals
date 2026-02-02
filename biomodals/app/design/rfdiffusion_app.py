@@ -122,6 +122,7 @@ runtime_image = (
             "PYTHONPATH": RFD_REPO_DIR,
             "PYTHONUNBUFFERED": "1",
             "DGLBACKEND": "pytorch",
+            "UV_TORCH_BACKEND": "cu121",
         }
     )
 
@@ -131,7 +132,6 @@ runtime_image = (
         "torch==2.5.1",
         "torchvision==0.20.1",
         "torchaudio==2.5.1",
-        index_url="https://download.pytorch.org/whl/cu121",
     )
 
     .uv_pip_install(

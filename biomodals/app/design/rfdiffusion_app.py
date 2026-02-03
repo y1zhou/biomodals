@@ -1,5 +1,4 @@
-"""
-RFdiffusion source repo: <https://github.com/RosettaCommons/RFdiffusion>.
+r"""RFdiffusion source repo: <https://github.com/RosettaCommons/RFdiffusion>.
 
 ## Configuration
 
@@ -25,12 +24,12 @@ For a complete set of RFdiffusion Hydra override keys, see RFdiffusion docs and 
 
 ## Notes
 
-- Checkpoint URLs are hardcoded from the upstream script:
+* Checkpoint URLs are hardcoded from the upstream script:
   https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
-- Checkpoints are stored in a persistent Modal volume (`rfdiffusion-models`).
-- Outputs are cached in a persistent Modal volume (`rfdiffusion-outputs`) under:
+* Checkpoints are stored in a persistent Modal volume (`rfdiffusion-models`).
+* Outputs are cached in a persistent Modal volume (`rfdiffusion-outputs`) under:
   `/root/rfdiffusion_outputs/<run-name>/`
-- The returned tarball bundles only “useful” artifacts by default (e.g. `.pdb`, `.trb`, `.log`, `.json`, `.yaml/.yml`, `.csv`).
+* The returned tarball bundles only “useful” artifacts by default (e.g. `.pdb`, `.trb`, `.log`, `.json`, `.yaml/.yml`, `.csv`).
   If the selection step yields nothing, it falls back to bundling the entire local output directory.
 
 ## Outputs
@@ -42,28 +41,29 @@ For a complete set of RFdiffusion Hydra override keys, see RFdiffusion docs and 
 
 ## Typical usage:
 
-  # 1) Download checkpoints into the persistent models volume (run once)
-  modal run rfdiffusion_app.py --download-models --force-redownload
+```bash
+# 1) Download checkpoints into the persistent models volume (run once)
+modal run rfdiffusion_app.py --download-models --force-redownload
 
-  # 2) Run inference (binder design / scaffold etc.)
-  modal run rfdiffusion_app.py \
+# 2) Run inference (binder design / scaffold etc.)
+modal run rfdiffusion_app.py \
     --run-name demo1 \
     --input-pdb ~/outputs/rfdiffusion_app/RBD_wt.pdb \
     --contigs "100-150/0 E333-526" \
     --num-designs 2 \
     --hotspot-res "E405,E408"
+```
 """
-
-
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
+import shutil
 from pathlib import Path
 
 from modal import App, Image, Volume
-
 
 # -------------------------
 # Modal configs
@@ -113,9 +113,8 @@ runtime_image = (
         "fd-find",  # prefer fd over find
     )
     .run_commands("ln -s /usr/bin/fdfind /usr/local/bin/fd")
-
     .run_commands(
-       f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"
+        f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"
     )
     .env(
         {
@@ -125,7 +124,6 @@ runtime_image = (
             "UV_TORCH_BACKEND": "cu121",
         }
     )
-
     # install CUDA-enabled PyTorch from official index (avoid accidental CPU-only wheels).
     # Pin torch < 2.6 to avoid the torch.load(weights_only=...) default behavior change.
     .uv_pip_install(
@@ -133,7 +131,6 @@ runtime_image = (
         "torchvision==0.20.1",
         "torchaudio==2.5.1",
     )
-
     .uv_pip_install(
         "numpy",
         "scipy",
@@ -146,22 +143,19 @@ runtime_image = (
         "einops",
         "opt_einsum",
         "dm-tree",
-        "pyrsistent",   # RFdiffusion symmetry 
+        "pyrsistent",  # RFdiffusion symmetry
         "aiohttp",  # async checkpoint download
         "torchdata>=0.7",  # DGL / datapipes support
         "dgl==1.1.3",  # DGL CUDA wheel
-
         # Where to find the CUDA wheels for DGL
         find_links="https://data.dgl.ai/wheels/cu121/repo.html",
     )
-
     .run_commands(
-    # build/install NVIDIA SE3Transformer in one chained step.
-       f"cd {RFD_REPO_DIR}/env/SE3Transformer && "
+        # build/install NVIDIA SE3Transformer in one chained step.
+        f"cd {RFD_REPO_DIR}/env/SE3Transformer && "
         "python -m pip install --no-cache-dir -r requirements.txt && "
         "python setup.py install"
     )
-  
 )
 
 
@@ -171,16 +165,11 @@ app = App(APP_NAME, image=runtime_image)
 # -------------------------
 # Helpers
 # -------------------------
-
-from pathlib import Path
-import shutil
-import re
-
 _RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+
 def validate_run_name(run_name: str) -> str:
-    """
-    Validate run_name to prevent path traversal and keep filenames predictable.
+    """Validate run_name to prevent path traversal and keep filenames predictable.
 
     Allowed: [A-Za-z0-9][A-Za-z0-9._-]{0,63}
     - must start with alnum
@@ -210,8 +199,8 @@ def run_command(cmd: list[str], cwd: str | Path | None = None, **kwargs) -> None
         cwd: Optional working directory.
         **kwargs: Passed through to `subprocess.Popen` (e.g., env=...).
     """
-    import subprocess as sp
     import shlex
+    import subprocess as sp
 
     cwd_str = str(cwd) if cwd is not None else None
     print("Running:", shlex.join(cmd), f"(cwd={cwd_str})" if cwd_str else "")
@@ -223,19 +212,18 @@ def run_command(cmd: list[str], cwd: str | Path | None = None, **kwargs) -> None
     kwargs.setdefault("text", True)
     kwargs.setdefault("encoding", "utf-8")
 
-    with sp.Popen(cmd, cwd=cwd_str, **kwargs) as p:
-        assert p.stdout is not None
-        for line in p.stdout:
-            print(line, end="")
+    with sp.Popen(cmd, cwd=cwd_str, **kwargs) as p:  # noqa: S603
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+            print(buffered_output, end="", flush=True)
         rc = p.wait()
         if rc != 0:
-            raise sp.CalledProcessError(rc, cmd)
+            raise sp.CalledProcessError(rc, cmd, buffered_output)
 
 
 def _require_fd() -> None:
     """Fail fast if `fd` is not available (required in the runtime image)."""
-    
-
     if shutil.which("fd") is None:
         raise RuntimeError(
             "fd (fd-find) is required but was not found on PATH. "
@@ -243,7 +231,9 @@ def _require_fd() -> None:
         )
 
 
-def warmup_directory(dir_path: str | Path, file_pattern: str = ".", jobs: int = 256) -> None:
+def warmup_directory(
+    dir_path: str | Path, file_pattern: str = ".", jobs: int = 256
+) -> None:
     """Warm up the disk cache for files in a directory using `fd`.
 
     This is optional, and mostly useful when subsequent steps will re-read many
@@ -277,18 +267,10 @@ def collect_outputs_for_bundle(root_dir: str | Path) -> list[Path]:
     reproducible bundling.
     """
     _require_fd()
-    import subprocess as sp
-
-    root = Path(root_dir)
-    pattern = r"\.(pdb|trb|json|ya?ml|log|txt|csv)$"
 
     root = Path(root_dir)
     exts = (".pdb", ".trb", ".json", ".yaml", ".yml", ".log", ".txt", ".csv")
-    files = [
-    p
-    for p in root.rglob("*")
-    if p.is_file() and p.suffix.lower() in exts
-    ]
+    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
 
     return sorted(files, key=lambda p: str(p))
 
@@ -299,7 +281,7 @@ def package_dir_to_tar_zst(dir_path: str | Path) -> bytes:
 
     dp = Path(dir_path)
     cmd = ["tar", "--zstd", "-cf", "-", dp.name]
-    return sp.check_output(cmd, cwd=str(dp.parent))
+    return sp.check_output(cmd, cwd=str(dp.parent))  # noqa: S603
 
 
 def package_files_to_tar_zst(files: list[Path], base_dir: str | Path) -> bytes:
@@ -321,9 +303,10 @@ def package_files_to_tar_zst(files: list[Path], base_dir: str | Path) -> bytes:
 
     try:
         cmd = ["tar", "--zstd", "-cf", "-", "-C", str(base), "-T", filelist]
-        return sp.check_output(cmd)
+        return sp.check_output(cmd)  # noqa: S603
     finally:
         Path(filelist).unlink(missing_ok=True)
+
 
 # -------------------------
 # Step 1: download model weights into the models Volume
@@ -340,18 +323,19 @@ async def _download_file(session, url: str, local_path: Path) -> None:
                     break
                 f.write(chunk)
 
+
 @app.function(
     timeout=TIMEOUT * 2,
     volumes={RFD_MODELS_DIR: RFD_VOLUME},
 )
 async def download_rfdiffusion_models(force: bool = False) -> None:
-    """
-    Download RFdiffusion checkpoints into the persistent models Volume.
+    """Download RFdiffusion checkpoints into the persistent models Volume.
 
     URLs are copied verbatim from:
     https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
     """
     import asyncio
+
     import aiohttp
 
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -396,15 +380,13 @@ def rfdiffusion_infer(
     run_name: str,
     hydra_overrides: str,
 ) -> bytes:
-    """
-    Run RFdiffusion inference inside the container and return a .tar.zst bundle.
+    """Run RFdiffusion inference inside the container and return a .tar.zst bundle.
 
     - Outputs are written directly to /root/rfdiffusion_outputs/<run_name> on a persistent Volume.
       Partial results are preserved if the run is interrupted.
     - A SUCCESS marker file is written only after successful completion.
     """
     import shlex
-    
     from tempfile import TemporaryDirectory
 
     with TemporaryDirectory() as tmpdir:
@@ -461,6 +443,7 @@ def rfdiffusion_infer(
 
         return tar_bytes
 
+
 # -------------------------
 # Local entrypoint (CLI)
 # -------------------------
@@ -477,8 +460,7 @@ def submit_rfdiffusion_task(
     force_redownload: bool = False,
     out_dir: str | None = None,
 ):
-    """
-    Submit an RFdiffusion inference job to Modal.
+    """Submit an RFdiffusion inference job to Modal.
 
     Parameters
     ----------
@@ -509,7 +491,7 @@ def submit_rfdiffusion_task(
         Optional local directory where the output `.tar.zst` archive will be written.
         Defaults to the current working directory.
 
-    Notes
+    Notes:
     -----
     - For longer jobs, increase TIMEOUT via environment variable:
         TIMEOUT=360000 modal run rfdiffusion_app.py ...
@@ -522,10 +504,10 @@ def submit_rfdiffusion_task(
         raise ValueError("Missing required --run-name")
 
         run_name = validate_run_name(run_name)
-  
+
     if input_pdb is None:
         raise ValueError("Missing required --input-pdb (path to local .pdb)")
-      
+
     input_path = Path(input_pdb)
     if not input_path.exists():
         raise FileNotFoundError(f"Input PDB not found: {input_pdb}")

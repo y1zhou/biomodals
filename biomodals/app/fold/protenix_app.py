@@ -7,7 +7,7 @@
 | `--input-json` | **Required** | Path to input JSON file. For a description of the JSON schema, see https://github.com/bytedance/Protenix/blob/main/docs/infer_json_format.md. |
 | `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in the current working directory. |
 | `--run-name` | stem name of `--input-json` | Optional run name used to name output files. |
-| `--model-name` | `protenix_base_default_v1.0.0` | Model checkpoint name. Supported models: `protenix_base_default_v1.0.0`, `protenix_base_20250630_v1.0.0`, `protenix_base_constraint_v0.5.0`. |
+| `--model-name` | `protenix_base_default_v1.0.0` | Model checkpoint name. Supported models: `protenix_base_default_v1.0.0`, `protenix_base_20250630_v1.0.0`. |
 | `--seeds` | `"101"` | Comma-separated random seeds for inference. |
 | `--cycle` | `10` | Pairformer cycle number. |
 | `--step` | `200` | Number of diffusion steps. |
@@ -72,11 +72,7 @@ DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
 DATA_DIR = "/protenix-data"
 
 # Supported model checkpoints
-SUPPORTED_MODELS = (
-    "protenix_base_default_v1.0.0",
-    "protenix_base_20250630_v1.0.0",
-    "protenix_base_constraint_v0.5.0",
-)
+SUPPORTED_MODELS = ("protenix_base_default_v1.0.0", "protenix_base_20250630_v1.0.0")
 
 # Base URL for downloading checkpoints and data caches
 PROTENIX_DOWNLOAD_BASE = "https://protenix.tos-cn-beijing.volces.com"
@@ -98,14 +94,19 @@ TEMPLATE_CACHE_FILES = (
 # Repository and commit hash
 REPO_URL = "https://github.com/bytedance/Protenix"
 REPO_COMMIT = "a0ff3fe5e6395f19e6134b8c40eab5a298bba30d"
-REPO_DIR = "/opt/Protenix"
-CUTLASS_DIR = "/opt/cutlass"
 
 ##########################################
 # Image and app definitions
 ##########################################
+
+# https://modal.com/docs/guide/cuda#for-more-complex-setups-use-an-officially-supported-cuda-image
+cuda_version = "12.8.1"  # should be no greater than host CUDA version
+flavor = "devel"  # includes full CUDA toolkit
+operating_sys = "ubuntu24.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
 runtime_image = (
-    Image.debian_slim()
+    Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
     .apt_install(
         "git",
         "build-essential",
@@ -116,29 +117,17 @@ runtime_image = (
     )
     .env(
         {
-            "CUTLASS_PATH": CUTLASS_DIR,
-            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
             # https://modal.com/docs/guide/cuda
             "UV_TORCH_BACKEND": "cu126",
         }
     )
+    .uv_pip_install(f"git+{REPO_URL}.git@{REPO_COMMIT}")
+    # Trigger kernel compilation
     .run_commands(
-        " && ".join(
-            (
-                # Clone CUTLASS (required for cuequivariance triangle kernels)
-                f"git clone -b v3.5.1 --depth 1 https://github.com/NVIDIA/cutlass.git {CUTLASS_DIR}",
-                # Clone and install Protenix
-                f"git clone {REPO_URL} {REPO_DIR}",
-                f"cd {REPO_DIR}",
-                f"git checkout {REPO_COMMIT}",
-                "uv venv --python 3.11",
-                "uv pip install .",
-            ),
-        )
+        "python /usr/local/lib/python3.11/site-packages/protenix/model/layer_norm/layer_norm.py",
+        gpu=GPU,
     )
-    .env({"PATH": f"{REPO_DIR}/.venv/bin:$PATH"})
-    .workdir(REPO_DIR)
 )
 
 app = App(APP_NAME, image=runtime_image)
@@ -338,14 +327,13 @@ def run_protenix(
         # Set PROTENIX_ROOT_DIR so protenix finds cached data and checkpoints
         env_override = {
             "PROTENIX_ROOT_DIR": DATA_DIR,
-            "CUTLASS_PATH": CUTLASS_DIR,
         }
         import os as _os
 
         run_env = _os.environ.copy()
         run_env.update(env_override)
 
-        run_command(cmd, env=run_env, cwd=REPO_DIR)
+        run_command(cmd, env=run_env, cwd=out_dir)
 
         # Package outputs
         print("💊 Packaging Protenix results...")

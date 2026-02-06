@@ -28,6 +28,7 @@ Example:
 ```
 modal run modal_afdesign.py --target-chain C --pdb in/afdesign/1igy.pdb
 ```
+
 """
 
 import os
@@ -39,7 +40,7 @@ from pathlib import Path
 from subprocess import run
 from tempfile import NamedTemporaryFile
 
-from modal import Image, App
+from modal import App, Image
 
 GPU = os.environ.get("GPU", "A100")
 TIMEOUT = int(os.environ.get("TIMEOUT", 120))
@@ -69,10 +70,9 @@ image = (
 
 with image.imports():
     import numpy as np
-
-    from Bio.PDB import PDBParser, PDBIO, Select
-    from Bio.PDB.Polypeptide import is_aa
+    from Bio.PDB import PDBIO, PDBParser, Select
     from Bio.PDB.NeighborSearch import NeighborSearch
+    from Bio.PDB.Polypeptide import is_aa
     from scipy.special import softmax
 
 
@@ -93,6 +93,7 @@ def add_cyclic_offset(self):
 
     Returns:
         None
+
     """
 
     def _cyclic_offset(L):
@@ -103,6 +104,7 @@ def add_cyclic_offset(self):
 
         Returns:
             np.ndarray: The cyclic offset matrix.
+
         """
         i = np.arange(L)
         ij = np.stack([i, i + L], -1)
@@ -131,6 +133,7 @@ def add_cyclic_offset(self):
 #
 class ResidueRangeSelect(Select):
     """Bio.PDB.Select class to accept residues within a specific range and chain."""
+
     def __init__(self, chain_ids, start, end):
         """Initializes the ResidueRangeSelect class.
 
@@ -138,6 +141,7 @@ class ResidueRangeSelect(Select):
             chain_ids (list[str]): List of chain IDs to accept.
             start (int): Starting residue number to accept.
             end (int): Ending residue number to accept.
+
         """
         self.chain_ids = chain_ids
         self.start = start
@@ -151,6 +155,7 @@ class ResidueRangeSelect(Select):
 
         Returns:
             bool: True if the residue is accepted, False otherwise.
+
         """
         within_range = self.start <= residue.get_id()[1] <= self.end
         correct_chain = residue.parent.id in self.chain_ids
@@ -168,6 +173,7 @@ def extract_residues_from_pdb(pdb_file, chain_ids, start_residue, end_residue):
 
     Returns:
         str: Path to a temporary PDB file containing the extracted residues.
+
     """
     # create a PDBParser object
     parser = PDBParser()
@@ -205,6 +211,7 @@ def join_chains(pdb_file, target_chain, merge_chains):
 
     Returns:
         str: Path to a temporary PDB file with merged chains.
+
     """
     with NamedTemporaryFile(suffix=".pdb", delete=False) as tf:
         subprocess.run(
@@ -229,6 +236,7 @@ def get_nearby_residues(pdb_file, ligand_id, distance=8.0):
 
     Returns:
         set[Bio.PDB.Residue.Residue]: A set of Biopython Residue objects that are near the ligand.
+
     """
     parser = PDBParser()
     structure = parser.get_structure("protein", pdb_file)
@@ -281,6 +289,7 @@ def get_pdb(pdb_code_or_file, biological_assembly=False, pdb_redo=False, out_dir
         AssertionError: If `biological_assembly` and `pdb_redo` are both True, or if the
                         downloaded PDB file is too small (likely indicating an issue).
         FileNotFoundError: If the PDB file does not exist after attempting to fetch it.
+
     """
     ALPHAFOLD_VERSION = "v4"
 
@@ -295,9 +304,9 @@ def get_pdb(pdb_code_or_file, biological_assembly=False, pdb_redo=False, out_dir
             out_path = Path(out_dir) / Path(pdb_name)
             try:
                 run(
-                f"wget -qnc https://pdb-redo.eu/db/{pdb_code_or_file}/{pdb_name} -O {out_path}",
-                shell=True,
-                check=True,
+                    f"wget -qnc https://pdb-redo.eu/db/{pdb_code_or_file}/{pdb_name} -O {out_path}",
+                    shell=True,
+                    check=True,
                 )
             except subprocess.CalledProcessError as e:
                 print("Failed to find pdb-redo version. Using RSCB pdb.")
@@ -400,12 +409,12 @@ def afdesign(
         list[tuple[str, bytes]]: A list of tuples, where each tuple contains an output filename
                                  (e.g., for the log, HTML animation, PDB structure, sequence profile image)
                                  and its byte content.
-    """
 
-    from colabdesign import mk_afdesign_model, clear_mem
-    from colabdesign.shared.utils import copy_dict
-    from colabdesign.af.alphafold.common import residue_constants
+    """
     import plotly.express as px
+    from colabdesign import clear_mem, mk_afdesign_model
+    from colabdesign.af.alphafold.common import residue_constants
+    from colabdesign.shared.utils import copy_dict
 
     merge_chains = None
     if len(target_chain) > 1:
@@ -458,9 +467,9 @@ def afdesign(
         _bias = None
         if set_fixed_aas is not None:
             aa_order = residue_constants.restype_order
-            assert (
-                len(set_fixed_aas) == binder_len
-            ), f"add_fixed_aas: {len(set_fixed_aas)} must be same length as binder_len: {binder_len}"
+            assert len(set_fixed_aas) == binder_len, (
+                f"add_fixed_aas: {len(set_fixed_aas)} must be same length as binder_len: {binder_len}"
+            )
             assert len(aa_order.keys()) == 20, "restype_order has changed"
             _bias = np.zeros((binder_len, len(residue_constants.restype_order)))
             for n, aa in enumerate(set_fixed_aas):
@@ -522,7 +531,9 @@ def afdesign(
             model.restart(seq=binder_seq)
 
         model.set_optimizer(
-            optimizer=GD_method, learning_rate=learning_rate, norm_seq_grad=norm_seq_grad
+            optimizer=GD_method,
+            learning_rate=learning_rate,
+            norm_seq_grad=norm_seq_grad,
         )
         models = model._model_names[:num_models]
 
@@ -543,7 +554,9 @@ def afdesign(
             pssm = None
 
         if optimizer == "pssm":
-            model.design_logits(120, e_soft=1.0, num_models=1, ramp_recycles=True, **flags)
+            model.design_logits(
+                120, e_soft=1.0, num_models=1, ramp_recycles=True, **flags
+            )
             model.design_soft(32, num_models=1, **flags)
             flags.update({"dropout": False, "save_best": True})
             model.design_soft(10, num_models=num_models, **flags)
@@ -595,7 +608,7 @@ def afdesign(
         with open(f"{out_name}.pdb", "w") as out:
             for n, (k, v) in enumerate(model._tmp["best"]["aux"]["log"].items()):
                 remark_text = f"{k}: {v}"
-                remark_line = f"REMARK {n+1:<3} {remark_text:<69}\n"
+                remark_line = f"REMARK {n + 1:<3} {remark_text:<69}\n"
                 out.write(remark_line)
             out.write(pdb_txt)
 
@@ -679,8 +692,8 @@ def main(
 
     Returns:
         None
-    """
 
+    """
     assert hard_iters >= 2, "fails on hard_iters=1"
 
     from datetime import datetime
@@ -698,7 +711,9 @@ def main(
         pdb_name = pdb
         is_pdb_id = True
     else:
-        raise FileNotFoundError(f"PDB file not found and '{pdb}' doesn't look like a valid PDB/UniProt ID: {pdb}")
+        raise FileNotFoundError(
+            f"PDB file not found and '{pdb}' doesn't look like a valid PDB/UniProt ID: {pdb}"
+        )
 
     # I can't figure out how to use kwargs with map so order is important
     pdb_redo = not use_rcsb_pdb

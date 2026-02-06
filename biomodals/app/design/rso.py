@@ -1,16 +1,17 @@
-"""
-adapted from https://github.com/coreyhowe999/RSO
+"""adapted from https://github.com/coreyhowe999/RSO
 
 Example:
 ```
 modal run modal_rso.py --input-pdb ABC1.pdb --run-name ABC1 --binder-len 60
 ```
+
 """
 
-import modal
 import os
 from datetime import datetime  # Add this import
 from pathlib import Path
+
+import modal
 
 GPU = os.environ.get("MODAL_GPU", "A100")
 TIMEOUT = int(os.environ.get("TIMEOUT", 180))
@@ -43,15 +44,16 @@ app = modal.App("rso", image=image)
     gpu=GPU,
     timeout=TIMEOUT * 60,
 )
-def rso(pdb_name, pdb_str, traj_iters, binder_len, chain, hotspot=None, thresholds=None):
+def rso(
+    pdb_name, pdb_str, traj_iters, binder_len, chain, hotspot=None, thresholds=None
+):
     # Import colabdesign modules here
-    from colabdesign import mk_afdesign_model, clear_mem
-    from colabdesign.mpnn import mk_mpnn_model
     import jax
     import jax.numpy as jnp
-    from colabdesign.af.alphafold.common import residue_constants
-
     import pandas as pd
+    from colabdesign import clear_mem, mk_afdesign_model
+    from colabdesign.af.alphafold.common import residue_constants
+    from colabdesign.mpnn import mk_mpnn_model
 
     pdb_path = str(Path("/tmp/in_rso") / pdb_name)
     Path(pdb_path).parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +67,7 @@ def rso(pdb_name, pdb_str, traj_iters, binder_len, chain, hotspot=None, threshol
         f.write(pdb_str)
 
     def add_rg_loss(self, weight=0.1):
-        """add radius of gyration loss"""
+        """Add radius of gyration loss"""
 
         def loss_fn(inputs, outputs):
             xyz = outputs["structure_module"]
@@ -91,7 +93,9 @@ def rso(pdb_name, pdb_str, traj_iters, binder_len, chain, hotspot=None, threshol
     clear_mem()
     af_model = mk_afdesign_model(protocol="binder")
     add_rg_loss(af_model)
-    af_model.prep_inputs(pdb_filename=pdb_path, chain=chain, hotspot=hotspot, binder_len=binder_len)
+    af_model.prep_inputs(
+        pdb_filename=pdb_path, chain=chain, hotspot=hotspot, binder_len=binder_len
+    )
 
     #
     # Adjust as needed
@@ -103,13 +107,17 @@ def rso(pdb_name, pdb_str, traj_iters, binder_len, chain, hotspot=None, threshol
 
     ### SEQ DESIGN AND FILTER ####
 
-    binder_model = mk_afdesign_model(protocol="binder", use_multimer=True, use_initial_guess=True)
+    binder_model = mk_afdesign_model(
+        protocol="binder", use_multimer=True, use_initial_guess=True
+    )
     monomer_model = mk_afdesign_model(protocol="fixbb")
 
     # binder_model.set_weights(i_pae=1.0)
 
     mpnn_model = mk_mpnn_model(weights="soluble")
-    mpnn_model.prep_inputs(pdb_filename="backbone.pdb", chain="A,B", fix_pos="A", rm_aa="C")
+    mpnn_model.prep_inputs(
+        pdb_filename="backbone.pdb", chain="A,B", fix_pos="A", rm_aa="C"
+    )
 
     samples = mpnn_model.sample_parallel(8, temperature=0.01)
     monomer_model.prep_inputs(pdb_filename="backbone.pdb", chain="B")
@@ -131,9 +139,14 @@ def rso(pdb_name, pdb_str, traj_iters, binder_len, chain, hotspot=None, threshol
         if monomer_model.aux["losses"]["rmsd"] < thresholds["rmsd"]:
             print("Passed! Predicting binder with receptor using AF Multimer")
             binder_model.predict(seq=seq[-binder_len:], num_recycles=3)
-            if monomer_model.aux["losses"]["plddt"] < thresholds["plddt"] and monomer_model.aux["losses"]["pae"] < thresholds["pae"]:
+            if (
+                monomer_model.aux["losses"]["plddt"] < thresholds["plddt"]
+                and monomer_model.aux["losses"]["pae"] < thresholds["pae"]
+            ):
                 binder_model.save_pdb(f"{Path(pdb_name).stem}_binder_design_{j}.pdb")
-                results_df.loc[j, "pdb_id"] = f"{Path(pdb_name).stem}_binder_design_{j}.pdb"
+                results_df.loc[j, "pdb_id"] = (
+                    f"{Path(pdb_name).stem}_binder_design_{j}.pdb"
+                )
                 results_df.loc[j, "seq"] = seq[-binder_len:]
                 for key in binder_model.aux["log"]:
                     results_df.loc[j, key] = binder_model.aux["log"][key]
@@ -159,8 +172,8 @@ def main(
     traj_iters: int = 100,
     binder_len: int = 80,
     chain: str = "A",
-    hotspot: str|None = None,
-    thresholds: str|None = None,
+    hotspot: str | None = None,
+    thresholds: str | None = None,
     out_dir="./out/rso",
     run_name=None,
 ):
@@ -169,8 +182,18 @@ def main(
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     all_outputs = rso.starmap(
-        [(Path(input_pdb).name, pdb_str, traj_iters, binder_len, chain, hotspot, thresholds)
-         for _ in range(num_designs)]
+        [
+            (
+                Path(input_pdb).name,
+                pdb_str,
+                traj_iters,
+                binder_len,
+                chain,
+                hotspot,
+                thresholds,
+            )
+            for _ in range(num_designs)
+        ]
     )
 
     for bb_num, outputs in enumerate(all_outputs):

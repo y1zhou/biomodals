@@ -1,5 +1,4 @@
-"""
-Germinal: Efficient generation of epitope-targeted de novo antibodies
+r"""Germinal: Efficient generation of epitope-targeted de novo antibodies
 https://github.com/SantiagoMille/germinal/
 
 Germinal is a pipeline for designing de novo antibodies against specified epitopes on target proteins.
@@ -278,8 +277,7 @@ def run_germinal_design(
     experiment_name: str = "germinal_design",
     original_pdb_path: str = "pdbs/target.pdb",
 ) -> dict:
-    """
-    Run Germinal antibody design pipeline
+    """Run Germinal antibody design pipeline
 
     Args:
         target_yaml_content: Target YAML file content as string
@@ -292,12 +290,14 @@ def run_germinal_design(
 
     Returns:
         Dictionary containing design results and metrics
+
     """
-    import tempfile
-    import subprocess
     import shutil
-    import yaml
+    import subprocess
+    import tempfile
     from pathlib import Path
+
+    import yaml
 
     # Setup temporary working directory
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -342,7 +342,7 @@ def run_germinal_design(
         shutil.copy2(original_config_path, main_config_path)
 
         # Read and modify the config to update paths and parameters
-        with open(main_config_path, "r") as f:
+        with open(main_config_path) as f:
             content = f.read()
 
         # Update the config with our parameters
@@ -405,8 +405,8 @@ def run_germinal_design(
 
         # Run Germinal using subprocess (the proper way)
         try:
-            import subprocess
             import os
+            import subprocess
 
             # Change to temp directory
             original_dir = os.getcwd()
@@ -505,8 +505,10 @@ def run_germinal_design(
                         relative_path = file_path.relative_to(results_dir)
                         try:
                             # Read all files as text
-                            with open(file_path, "r") as f:
-                                results_data["output_files"][str(relative_path)] = f.read()
+                            with open(file_path) as f:
+                                results_data["output_files"][str(relative_path)] = (
+                                    f.read()
+                                )
                         except Exception as e:
                             results_data["output_files"][str(relative_path)] = (
                                 f"<error reading file: {e}>"
@@ -580,8 +582,7 @@ def main(
     run_name: str | None = None,
     out_dir: str = "./out/germinal",
 ):
-    """
-    Run Germinal antibody design locally
+    """Run Germinal antibody design locally
 
     Args:
         target_yaml: Path to target configuration YAML file
@@ -591,11 +592,13 @@ def main(
         experiment_name: Name for the experiment
         run_name: Optional name for the run directory
         out_dir: Output directory base path
+
     """
     import json
-    import yaml
-    from pathlib import Path
     from datetime import datetime
+    from pathlib import Path
+
+    import yaml
 
     # Load target configuration
     target_yaml_path = Path(target_yaml)
@@ -671,7 +674,7 @@ def main(
         print(f"Design failed: {results['error']}")
         return
 
-    print(f"Design completed successfully!")
+    print("Design completed successfully!")
     print(f"Total trajectories: {results['total_trajectories']}")
     print(f"Passing designs: {results['passing_designs']}")
     if "success_rate" in results:
@@ -682,4 +685,4 @@ def main(
         if total > 0:
             print(f"Success rate: {passing / total:.2%}")
         else:
-            print(f"Success rate: N/A (no trajectories completed)")
+            print("Success rate: N/A (no trajectories completed)")

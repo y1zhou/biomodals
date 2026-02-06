@@ -34,8 +34,8 @@ from modal import App, Image, Volume
 # Modal configs
 # -------------------------
 APP_NAME = os.environ.get("MODAL_APP", "ppiflow")
-GPU = os.environ.get("GPU", "L40S")  # e.g. A10G, A100
-TIMEOUT = int(os.environ.get("TIMEOUT", "36000"))
+GPU = os.environ.get("GPU", "A10G")  # e.g. A10G, A100
+TIMEOUT = int(os.environ.get("TIMEOUT", "7200"))
 
 # Persistent Volumes
 MODELS_VOL = Volume.from_name("ppiflow-models", create_if_missing=True)
@@ -48,123 +48,64 @@ RUNS_DIR = Path("/runs")
 # Image definition
 # -------------------------
 # TODO: pin versions according to your repo requirements (cuda/torch/etc.)
-
-from modal import Image
-
-PPIFLOW_REPO = "https://github.com/Mingchenchen/PPIFlow.git"
-PPIFLOW_DIR = "/ppiflow"
-
-PYTORCH_CU121_INDEX = "https://download.pytorch.org/whl/cu121"
-PYG_WHL = "https://data.pyg.org/whl/torch-2.3.0+cu121.html"
-
-TORCH_PKGS = [
-    "torch==2.3.1+cu121",
-    "torchvision==0.18.1+cu121",
-    "torchaudio==2.3.1+cu121",
-]
-
-PYG_PKGS = [
-    "pyg-lib==0.4.0+pt23cu121",
-    "torch-scatter==2.1.2+pt23cu121",
-    "torch-sparse==0.6.18+pt23cu121",
-    "torch-cluster==1.6.3+pt23cu121",
-    "torch-spline-conv==1.2.2+pt23cu121",
-    "torch-geometric==2.6.1",
-]
-
-# Inference-safe superset for binder/nanobody/monomer pipelines
-INFER_PKGS = [
-    # config/runtime
-    "numpy==1.26.3",
-    "scipy==1.15.2",
-    "pandas==2.2.3",
-    "scikit-learn==1.2.2",
-    "pyyaml==6.0.2",
-    "omegaconf==2.3.0",
-    "hydra-core==1.3.2",
-    "hydra-submitit-launcher==1.2.0",
-    "submitit==1.5.3",
-    "tqdm==4.67.1",
-
-    # lightning stack (often imported by model code even for inference)
-    "lightning==2.5.0.post0",
-    "pytorch-lightning==2.5.0.post0",
-    "torchmetrics==1.6.2",
-    "lightning-utilities==0.14.0",
-
-    # geometry / embeddings frequently used in protein models
-    "einops==0.8.1",
-    "dm-tree==0.1.6",
-    "optree==0.14.1",
-    "opt-einsum==3.4.0",
-    "opt-einsum-fx==0.1.4",
-    "e3nn==0.5.6",
-    "fair-esm==2.0.0",
-
-    # bio/structure IO
-    "biopython==1.83",
-    "biotite==1.0.1",
-    "biotraj==1.2.2",
-    "gemmi==0.6.5",
-    "ihm==2.2",
-    "modelcif==0.7",
-    "tmtools==0.2.0",
-    "freesasa==2.2.1",
-    "mdtraj==1.10.3",
-
-    # misc util commonly present in repos
-    "requests==2.32.3",
-    "packaging==24.2",
-    "typing-extensions==4.12.2",
-
-    # keep these pins aligned with env.yml (reduces drift)
-    "protobuf==3.20.2",
-    "tensorboard==2.19.0",
-    "tensorboard-data-server==0.7.2",
-    "grpcio==1.72.1",
-
-    # optional but harmless (and env.yml had them)
-    "gputil==1.4.0",
-    "gpustat==1.1.1",
-    "deepspeed==0.16.4",
-    "hjson==3.1.0",
-    "ninja==1.11.1.3",
-    
-]
-
 runtime_image = (
-    Image.debian_slim(python_version="3.10")
+    Image.debian_slim(python_version="3.11")
     .apt_install(
-        "git", "curl", "ca-certificates",
-
-        # build toolchain (freesasa / possible wheels fallback)
-        "build-essential", "python3-dev", "pkg-config",
-
-        # mdtraj / netcdf/hdf5 related stack (keeps mdtraj/netcdf robust)
-        "gfortran",
-        "libopenblas-dev", "liblapack-dev",
-        "libhdf5-dev",
-        "libnetcdf-dev",
-
-        # compression libs for various wheels/extensions
-        "zlib1g-dev", "libbz2-dev", "liblzma-dev",
+        "git", 
+        "curl", 
+        "ca-certificates",
+        "build-essential",
+        "python3-dev",
     )
-    .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": PPIFLOW_DIR})
-    .run_commands(f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}")
+    .uv_pip_install(
+        # TODO: replace with your real deps
+        "torch",
+        "pyyaml",
+        "numpy",
+        "pandas",
+        "omegaconf", 
+        "hydra-core",
+        "lightning",      # ← 必加（这是 PyTorch Lightning 新名字）
+        "torchmetrics",
+        "scipy",
+        "tqdm",
+        "einops",
+        "biopython",
+        "scikit-learn",
+        "dm-tree",   # ← 关键：提供 import tree   
+        "gputil",
+        "tmtools",
+        "optree",
+    )
+    .run_commands(
+    "rm -rf /ppiflow && git clone --depth 1 https://github.com/Mingchenchen/PPIFlow.git /ppiflow",
+    )    
+    .run_commands(
+        "pip install -U pip",
 
-    # torch/cu121 via pip extra index (fixes your uv unsatisfiable)
-    .pip_install(*TORCH_PKGS, extra_index_url=PYTORCH_CU121_INDEX)
+        # 1) 明确安装 CUDA 版 PyTorch（示例：cu121）
+        "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121",
 
-    # pyg via find-links
-    .uv_pip_install(*PYG_PKGS, find_links=PYG_WHL)
+        # 2) 你之前已经补过的通用依赖
+        "pip install pyyaml numpy pandas omegaconf hydra-core lightning torchmetrics dm-tree scipy tqdm einops biopython scikit-learn",
 
-    # rest
-    .uv_pip_install(*INFER_PKGS)
+        # 3) 安装匹配 torch+cuda 的 torch_scatter wheel（关键）
+        #    这里的 torch-2.4.0+cu121 要与你实际 torch 版本一致
+        "pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.0+cu121.html",
+
+        "pip install mdtraj",
+        "pip install freesasa",
+
+    )
+
+    # TODO: if you need your ppiflow repo code, choose ONE approach:
+    # (A) bake into image at build time by git clone (good for stable repo)
+    # .run_commands("git clone --depth 1 https://github.com/<org>/PPIFlow.git /ppiflow")
 )
 
-
-# -------------------------
 app = App(APP_NAME)
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -184,6 +125,8 @@ def _run(cmd: str, cwd: str | None = None) -> None:
     print(p.stdout)
     if p.returncode != 0:
         raise RuntimeError(f"Command failed with exit code {p.returncode}")
+
+    subprocess.run(cmd, shell=True, check=True, cwd=cwd)
 
 
 def _tar_dir(src_dir: Path, out_tar_gz: Path) -> None:

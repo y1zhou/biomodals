@@ -125,6 +125,7 @@ def package_outputs(
         paths_to_bundle: Specific paths (relative to root) to include in the archive.
         tar_args: Additional arguments to pass to `tar`.
         num_threads: Number of threads to use for compression.
+
     """
     import subprocess as sp
     from pathlib import Path
@@ -464,6 +465,7 @@ def boltzgen_run(
     Returns:
     -------
         Path to output directory as string.
+
     """
     import subprocess as sp
     import time
@@ -738,6 +740,7 @@ def submit_boltzgen_task(
         filter_results: If true, bundle top `'budget` results into a tarball and download to `out_dir`.
             Otherwise, use subprocesses to call `modal volume get` for downloads.
             This flag is useless if `out_dir` is None.
+
     """
     from pathlib import Path
 

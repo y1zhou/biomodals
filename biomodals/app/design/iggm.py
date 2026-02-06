@@ -126,24 +126,25 @@ app = App("iggm", image=image)
 
 
 def merge_pdb_chains(pdb_str: str, chains_to_merge: list) -> str:
-    """
-    Merge multiple chains in a PDB structure into the first chain in the list.
+    """Merge multiple chains in a PDB structure into the first chain in the list.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     pdb_str : str
         PDB structure as a string
     chains_to_merge : list
         List of chain IDs to combine (e.g., ['B', 'C']).
         All chains will be merged into the first chain ID in the list.
 
-    Returns:
-    --------
+    Returns
+    -------
     str
         Modified PDB structure as a string with chains combined
+
     """
-    import prody as pr
     from io import StringIO
+
+    import prody as pr
 
     if not chains_to_merge or len(chains_to_merge) < 2:
         raise ValueError("Need at least 2 chains to combine")
@@ -220,10 +221,12 @@ def iggm(
         num_samples: Number of samples to generate (optional)
         relax: Whether to perform structure relaxation
         max_antigen_size: Maximum antigen length to consider
+
     """
     from io import StringIO
     from subprocess import run
     from tempfile import TemporaryDirectory
+
     import prody as pr
 
     assert task in VALID_TASKS, f"Task must be one of {VALID_TASKS}"

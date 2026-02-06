@@ -289,6 +289,7 @@ def submit_antifold_task(
         extract_embeddings: If True, extracts and saves per-residue embeddings.
         num_threads: Number of CPU threads to use.
         seed: Random seed for reproducibility.
+
     """
     # Set up output paths
     print("🧬 Starting AntiFold run...")

@@ -118,6 +118,7 @@ def package_outputs(
         paths_to_bundle: Specific paths (relative to root) to include in the archive.
         tar_args: Additional arguments to pass to `tar`.
         num_threads: Number of threads to use for compression.
+
     """
     import subprocess as sp
     from pathlib import Path
@@ -148,6 +149,7 @@ def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
 
     Returns:
         A dictionary where keys are tensor names and values are lists of floats.
+
     """
     import torch
 
@@ -249,6 +251,7 @@ def ligandmpnn_run(
 
     Returns:
         Outputs bundled into a `.tar.zst` file.
+
     """
     import subprocess as sp
     import time
@@ -433,6 +436,7 @@ def submit_ligandmpnn_task(
             Run autoregressive scoring function: p(AA_1|backbone); p(AA_2|backbone, AA_1) etc.
         single_aa_score: This only applies when using `script_mode` "score"!
             Run single amino acid scoring function: p(AA_i|backbone, AA_{all except ith one})
+
     """
     from pathlib import Path
 

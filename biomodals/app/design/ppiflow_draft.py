@@ -49,7 +49,6 @@ RUNS_DIR = Path("/runs")
 # -------------------------
 # TODO: pin versions according to your repo requirements (cuda/torch/etc.)
 
-from modal import Image
 
 PPIFLOW_REPO = "https://github.com/Mingchenchen/PPIFlow.git"
 PPIFLOW_DIR = "/ppiflow"
@@ -85,13 +84,11 @@ INFER_PKGS = [
     "hydra-submitit-launcher==1.2.0",
     "submitit==1.5.3",
     "tqdm==4.67.1",
-
     # lightning stack (often imported by model code even for inference)
     "lightning==2.5.0.post0",
     "pytorch-lightning==2.5.0.post0",
     "torchmetrics==1.6.2",
     "lightning-utilities==0.14.0",
-
     # geometry / embeddings frequently used in protein models
     "einops==0.8.1",
     "dm-tree==0.1.6",
@@ -100,7 +97,6 @@ INFER_PKGS = [
     "opt-einsum-fx==0.1.4",
     "e3nn==0.5.6",
     "fair-esm==2.0.0",
-
     # bio/structure IO
     "biopython==1.83",
     "biotite==1.0.1",
@@ -111,53 +107,52 @@ INFER_PKGS = [
     "tmtools==0.2.0",
     "freesasa==2.2.1",
     "mdtraj==1.10.3",
-
     # misc util commonly present in repos
     "requests==2.32.3",
     "packaging==24.2",
     "typing-extensions==4.12.2",
-
     # keep these pins aligned with env.yml (reduces drift)
     "protobuf==3.20.2",
     "tensorboard==2.19.0",
     "tensorboard-data-server==0.7.2",
     "grpcio==1.72.1",
-
     # optional but harmless (and env.yml had them)
     "gputil==1.4.0",
     "gpustat==1.1.1",
     "deepspeed==0.16.4",
     "hjson==3.1.0",
     "ninja==1.11.1.3",
-    
 ]
 
 runtime_image = (
     Image.debian_slim(python_version="3.10")
     .apt_install(
-        "git", "curl", "ca-certificates",
-
+        "git",
+        "curl",
+        "ca-certificates",
         # build toolchain (freesasa / possible wheels fallback)
-        "build-essential", "python3-dev", "pkg-config",
-
+        "build-essential",
+        "python3-dev",
+        "pkg-config",
         # mdtraj / netcdf/hdf5 related stack (keeps mdtraj/netcdf robust)
         "gfortran",
-        "libopenblas-dev", "liblapack-dev",
+        "libopenblas-dev",
+        "liblapack-dev",
         "libhdf5-dev",
         "libnetcdf-dev",
-
         # compression libs for various wheels/extensions
-        "zlib1g-dev", "libbz2-dev", "liblzma-dev",
+        "zlib1g-dev",
+        "libbz2-dev",
+        "liblzma-dev",
     )
     .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": PPIFLOW_DIR})
-    .run_commands(f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}")
-
+    .run_commands(
+        f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}"
+    )
     # torch/cu121 via pip extra index (fixes your uv unsatisfiable)
     .pip_install(*TORCH_PKGS, extra_index_url=PYTORCH_CU121_INDEX)
-
     # pyg via find-links
     .uv_pip_install(*PYG_PKGS, find_links=PYG_WHL)
-
     # rest
     .uv_pip_install(*INFER_PKGS)
 )
@@ -165,6 +160,8 @@ runtime_image = (
 
 # -------------------------
 app = App(APP_NAME)
+
+
 # -------------------------
 # Helpers
 # -------------------------

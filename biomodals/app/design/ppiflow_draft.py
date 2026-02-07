@@ -2,8 +2,11 @@
 
 Usage
 =====
-# 1) (Optional) download model weights into persistent Volume (run once)
-modal run ppiflow_app.py --download-models --force-redownload
+# 1) Upload weights (one-time):
+# modal volume put ppiflow-models /path/to/binder.ckpt antibody.ckpt
+# modal volume put ppiflow-models /path/to/binder.ckpt binder.ckpt
+# modal volume put ppiflow-models /path/to/binder.ckpt monomer.ckpt
+# modal volume put ppiflow-models /path/to/binder.ckpt nanobody.ckpt
 
 # 2) Run inference (binder design)
 modal run ppiflow_app.py \
@@ -50,7 +53,7 @@ RUNS_DIR = Path("/runs")
 # TODO: pin versions according to your repo requirements (cuda/torch/etc.)
 
 
-PPIFLOW_REPO = "https://github.com/Mingchenchen/PPIFlow.git"
+PPIFLOW_REPO = "https://github.com/zhuqianhui2-hash/PPIFlow.git"
 PPIFLOW_DIR = "/ppiflow"
 
 PYTORCH_CU121_INDEX = "https://download.pytorch.org/whl/cu121"
@@ -119,7 +122,7 @@ INFER_PKGS = [
     # optional but harmless (and env.yml had them)
     "gputil==1.4.0",
     "gpustat==1.1.1",
-    "deepspeed==0.16.4",
+    
     "hjson==3.1.0",
     "ninja==1.11.1.3",
 ]
@@ -146,9 +149,11 @@ runtime_image = (
         "liblzma-dev",
     )
     .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": PPIFLOW_DIR})
+
     .run_commands(
-        f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}"
-    )
+    f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}")
+
+
     # torch/cu121 via pip extra index (fixes your uv unsatisfiable)
     .pip_install(*TORCH_PKGS, extra_index_url=PYTORCH_CU121_INDEX)
     # pyg via find-links
@@ -189,44 +194,6 @@ def _tar_dir(src_dir: Path, out_tar_gz: Path) -> None:
         tf.add(src_dir, arcname=src_dir.name)
 
 
-# -------------------------
-# Step 1: download weights into Volume (run once)
-# -------------------------
-@app.function(
-    timeout=TIMEOUT,
-    image=runtime_image,
-    volumes={str(MODELS_DIR): MODELS_VOL},
-)
-def download_models_task(force_redownload: bool = False) -> str:
-    """Download model checkpoints into MODELS_DIR (persistent).
-    Return a short summary string.
-    """
-    # TODO: replace with your real model URLs / filenames
-    # Example:
-    #   binder.ckpt, backbone.ckpt, etc.
-    CHECKPOINT_URLS = {
-        "binder.ckpt": "https://example.com/path/to/binder.ckpt",
-    }
-
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-    downloaded = []
-    skipped = []
-
-    for fname, url in CHECKPOINT_URLS.items():
-        dst = MODELS_DIR / fname
-        if dst.exists() and not force_redownload:
-            skipped.append(fname)
-            continue
-
-        # Use curl for simplicity; switch to aria2c/aiohttp if you need concurrency
-        _run(f'curl -L "{url}" -o "{dst}"')
-        downloaded.append(fname)
-
-    # Persist changes to Volume
-    MODELS_VOL.commit()
-
-    return f"downloaded={downloaded}, skipped={skipped}, models_dir={MODELS_DIR}"
 
 
 # -------------------------
@@ -242,6 +209,7 @@ def download_models_task(force_redownload: bool = False) -> str:
         str(RUNS_DIR): RUNS_VOL,
     },
 )
+
 def run_ppiflow(
     run_name: str,
     input_pdb_bytes: bytes,
@@ -286,6 +254,46 @@ def run_ppiflow(
 
     if not config.exists():
         raise FileNotFoundError(f"Config not found: {config_path} (tried {config})")
+
+    # -------------------------
+    # Safety override: force-disable DeepSpeed evo attention at runtime
+    # (ensures "runs anywhere" even if someone edits the YAML later)
+    # -------------------------
+    runtime_cfg = run_dir / "inference_binder.runtime.yaml"
+    _run(
+        "python -c "
+        + shlex.quote(
+            "import yaml; "
+            f"cfg=yaml.safe_load(open('{config}','r')); "
+            "cfg = cfg or {}; "
+            "cfg.setdefault('model', {}); "
+            "cfg['model']['use_deepspeed_evo_attention'] = False; "
+            f"yaml.safe_dump(cfg, open('{runtime_cfg}','w')); "
+            "print('[ok] wrote runtime config:', r'" + str(runtime_cfg) + "')"
+        )
+    )
+    config = runtime_cfg
+
+    # -------------------------
+    # Optional runtime diagnostics (GPU + CUDA sanity check)
+    # Enable by setting env: PPIFLOW_DIAG=1
+    # -------------------------
+    if os.environ.get("PPIFLOW_DIAG", "0") == "1":
+        _run("nvidia-smi || true")
+        _run(
+            "python -c "
+            + shlex.quote(
+                "import torch; "
+                "print('torch', torch.__version__); "
+                "print('cuda available', torch.cuda.is_available()); "
+                "print('torch cuda', torch.version.cuda); "
+                "print('gpu', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None); "
+                "x=torch.randn(1024,1024, device='cuda'); "
+                "y=x@x; "
+                "print('matmul mean', float(y.mean().item()))"
+            )
+        )
+
 
     # -------------------------
     # TODO: Replace THIS with your real PPIFlow inference command
@@ -368,10 +376,8 @@ def main(
     force_redownload: bool = False,
     out_dir: str = "./ppiflow_outputs",
 ) -> None:
-    if download_models:
-        msg = download_models_task.remote(force_redownload=force_redownload)
-        print(msg)
-        return
+
+    
 
     if input_pdb is None:
         raise ValueError("--input-pdb is required for inference")

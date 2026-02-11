@@ -1,19 +1,171 @@
-"""
-PPIFlow source repo: <https://github.com/zhuqianhui2-hash/PPIFlow>.
+"""PPIFlow source repo: <https://github.com/zhuqianhui2-hash/PPIFlow>.
 
-This file (ppiflow_app.py) is a single Modal entrypoint that routes to multiple upstream
+This file (`ppiflow_app.py`) is a **single Modal entrypoint** that routes to multiple upstream
 PPIFlow sampling scripts (binder / antibody / nanobody / monomer / partial-flow variants),
-plus ABMPNN/ProteinMPNN stages (mpnn_stage1 / mpnn_stage2) that operate on an existing run.
+while enforcing a **stable output layout** and **inference-safe config override**.
 
-Key guarantees:
-- One CLI (--task) for multiple PPIFlow scripts in /ppiflow/sample_*.py
-- Role-based uploads with stable filenames under <run>/inputs/
-- Forced outputs: <run>/outputs/
-- Effective config override: model.use_deepspeed_evo_attention = False (portable inference)
-- MPNN stages read existing <source_run>/outputs/*.pdb and write into <source_run>/mpnn_stage{1,2}/...
+## What this wrapper guarantees
 
-Runs volume: ppiflow-runs mounted at /ppiflow-runs
-Models volume: ppiflow-models mounted at /models
+- **One CLI** (`--task`) for multiple PPIFlow scripts in `/ppiflow/sample_*.py`.
+- **Role-based uploads**: local input files are uploaded with stable filenames (e.g. `binder_input.pdb`,
+  `antigen.pdb`, `framework.pdb`, `complex.pdb`, `motif.csv`) so the remote worker never guesses ordering.
+- **Forced outputs** (remote side):
+  - `--output_dir` is forced to `/runs/<task>/<run_name>/outputs`
+  - `--name` is forced to `<run_name>`
+- **Effective config** (remote side):
+  - If a `--config` is provided, an `effective_config.yaml` is written under the run directory with:
+    `model.use_deepspeed_evo_attention = False`
+  - This makes inference **portable** (does not require deepspeed/nvcc kernels).
+
+## Configuration
+
+### Primary flags (local entrypoint)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--task` | `binder` | Task router. One of: `binder`, `antibody`, `nanobody`, `monomer`, `scaffolding`, `ab_partial_flow`, `nb_partial_flow`, `binder_partial_flow`. |
+| `--run-name` | `test1` | Unique run identifier. Controls output directory name and tarball name (`<task>.<run-name>.tar.gz`). |
+| `--out-dir` | `./ppiflow_outputs` | Local directory to write the returned run bundle (`.tar.gz`). |
+| `--model-weights` | **Required** | Local/remote path to a checkpoint. Remote resolves to `/models/<basename>` unless already under `/models/`. |
+| `--config` | `None` | YAML config path (absolute in container or repo-relative). If provided, it will be rewritten to `effective_config.yaml` with deepspeed evo attention disabled. |
+
+### Input file flags (local -> uploaded to Modal)
+
+| Task | Required local file flags | Uploaded filename on worker |
+|------|---------------------------|-----------------------------|
+| `binder` | `--binder-input-pdb` | `binder_input.pdb` |
+| `binder_partial_flow` | `--binder-input-pdb` | `binder_input.pdb` |
+| `antibody` / `nanobody` | `--ab-antigen-pdb`, `--ab-framework-pdb` | `antigen.pdb`, `framework.pdb` |
+| `ab_partial_flow` / `nb_partial_flow` | `--pf-complex-pdb` | `complex.pdb` |
+| `scaffolding` | `--scaffold-motif-csv` | `motif.csv` |
+| `monomer` | *(no file upload required)* | *(none)* |
+
+### Binder args (sample_binder.py)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--binder-target-chain` | `B` | Target chain ID passed to `--target_chain`. |
+| `--binder-binder-chain` | `A` | Binder chain ID passed to `--binder_chain`. |
+| `--binder-specified-hotspots` | `None` | Hotspots string, e.g. `"B119,B141,B200"`. |
+| `--binder-samples-min-length` | `75` | Minimum binder length. |
+| `--binder-samples-max-length` | `76` | Maximum binder length. |
+| `--binder-samples-per-target` | `5` | Number of samples per target. |
+
+### Antibody / Nanobody args (sample_antibody_nanobody.py)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ab-antigen-chain` | `None` | **Required** for `antibody/nanobody`. Passed to `--antigen_chain`. |
+| `--ab-heavy-chain` | `None` | **Required** for `antibody/nanobody`. Passed to `--heavy_chain`. |
+| `--ab-light-chain` | `None` | Optional light chain. Passed to `--light_chain` when provided. |
+| `--ab-specified-hotspots` | `None` | Optional hotspot residues on antigen, e.g. `"A56,A58"`. |
+| `--ab-cdr-length` | `None` | Optional CDR length override (string format per upstream script). |
+| `--ab-samples-per-target` | `5` | Samples per target for antibody/nanobody. |
+
+### Monomer unconditional args (sample_monomer.py)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mono-length-subset` | `None` | **Required** for `monomer`. String list, e.g. `"[60, 80, 100]"`. |
+| `--mono-samples-num` | `5` | Number of unconditional samples. |
+
+### Scaffolding args (sample_monomer.py motif mode)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--scaffold-motif-names` | `None` | Optional motif name filter passed as `--motif_names`. |
+| `--scaffold-samples-num` | `5` | Number of scaffolding samples. |
+
+### Partial flow antibody / nanobody args (sample_antibody_nanobody_partial.py)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pf-fixed-positions` | `None` | **Required**. Fixed positions string, e.g. `"H26,H27,H28,L50-63"`. |
+| `--pf-cdr-position` | `None` | **Required**. CDR ranges string, e.g. `"H26-32,H45-56,H97-113"`. |
+| `--pf-start-t` | `None` | **Required**. Partial flow start time (float). |
+| `--pf-samples-per-target` | `None` | **Required**. Samples per target. |
+| `--pf-retry-limit` | `10` | Passed as `--retry_Limit` (upstream spelling). |
+| `--pf-specified-hotspots` | `None` | Optional hotspots for partial flow. |
+| `--pf-antigen-chain` | `None` | **Required**. Passed to `--antigen_chain`. |
+| `--pf-heavy-chain` | `None` | **Required**. Passed to `--heavy_chain`. |
+| `--pf-light-chain` | `None` | Optional. Passed to `--light_chain` when provided. |
+
+### Partial flow binder args (sample_binder_partial.py)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bpf-target-chain` | `B` | Target chain passed to `--target_chain`. |
+| `--bpf-binder-chain` | `A` | Binder chain passed to `--binder_chain`. |
+| `--bpf-start-t` | `0.7` | Partial flow start time passed to `--start_t`. |
+
+## Environment variables (Modal)
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `MODAL_APP` | `ppiflow` | Name of the Modal app. |
+| `GPU` | `L40S` | GPU type for the worker (e.g. `A10G`, `A100`, `L40S`). |
+| `TIMEOUT` | `36000` | Modal function timeout (seconds). |
+
+## Persistent volumes & paths
+
+- Models volume: `ppiflow-models` mounted at `/models`
+- Runs volume: `ppiflow-runs` mounted at `/ppiflow-runs`
+
+Expected checkpoint layout (one-time upload examples):
+  1) ppiflow
+  modal volume put ppiflow-models /models/antibody.ckpt antibody.ckpt
+  modal volume put ppiflow-models /models/binder.ckpt   binder.ckpt
+  modal volume put ppiflow-models /models/monomer.ckpt  monomer.ckpt
+  modal volume put ppiflow-models /models/nanobody.ckpt nanobody.ckpt
+  2) proteinmpnn
+  # Upload ProteinMPNN weights to persistent Volume (one-time)
+  modal volume put ppiflow-models /models/proteinmpnn_v_48_002.pt proteinmpnn_v_48_002.pt
+  modal volume put ppiflow-models /models/proteinmpnn_v_48_010.pt proteinmpnn_v_48_010.pt
+  modal volume put ppiflow-models /models/proteinmpnn_v_48_020.pt proteinmpnn_v_48_020.pt
+
+## Outputs
+
+- Each run is stored under the runs volume at:
+  `/runs/<task>/<run_name>/`
+  with:
+  - `inputs/`  (uploaded inputs)
+  - `outputs/` (upstream script outputs; forced `--output_dir`)
+  - `effective_config.yaml` (if `--config` provided)
+  - `cmd.txt` (exact executed command)
+  - `stdout.log` (combined stdout/stderr)
+  - `artifacts/` (best-effort collected: metrics/config + any `.csv`)
+
+- The local CLI saves a `.tar.gz` bundle to:
+  `<out-dir>/<task>.<run-name>.tar.gz`
+
+## Typical usage
+
+  # Binder (de novo)
+  modal run ppiflow_app.py --task binder -- \
+    --binder-input-pdb ~/target.pdb \
+    --binder-target-chain B \
+    --binder-binder-chain A \
+    --binder-specified-hotspots "B119,B141,B200" \
+    --binder-samples-min-length 75 \
+    --binder-samples-max-length 76 \
+    --binder-samples-per-target 5 \
+    --config /ppiflow/configs/inference_binder.yaml \
+    --model-weights /models/binder.ckpt \
+    --run-name test1 \
+    --out-dir ./ppiflow_outputs
+
+  # Antibody partial flow
+  modal run ppiflow_app.py --task ab_partial_flow -- \
+    --pf-complex-pdb ~/complex.pdb \
+    --pf-fixed-positions "H26,H27,H28,L50-63" \
+    --pf-cdr-position "H26-32,H45-56,H97-113" \
+    --pf-start-t 0.8 \
+    --pf-samples-per-target 5 \
+    --pf-antigen-chain A \
+    --pf-heavy-chain H \
+    --pf-light-chain L \
+    --model-weights /models/antibody.ckpt \
+    --run-name abp1
 """
 
 from __future__ import annotations

@@ -259,10 +259,11 @@ def prepare_protenix_inputs(
     DATA_VOLUME.reload()
     PREP_VOLUME.reload()
 
-    cache_key = sha256(
-        json_str
-        + f"|{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode("utf-8")
-    ).hexdigest()
+    h = sha256()
+    h.update(json_str)
+    h.update(b"\x00")
+    h.update(f"{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode("utf-8"))
+    cache_key = h.hexdigest()
     cache_dir = Path(PREP_DIR) / cache_key
     prepared_json_path = cache_dir / "prepared.json"
     if prepared_json_path.exists():
@@ -287,23 +288,33 @@ def prepare_protenix_inputs(
         env_override = {
             "PROTENIX_ROOT_DIR": DATA_DIR,
         }
-        import os as _os
-
-        run_env = _os.environ.copy()
+        run_env = os.environ.copy()
         run_env.update(env_override)
         run_command(cmd, env=run_env, cwd=cache_dir)
 
+        # `protenix prep` writes one updated JSON in out_dir; use it as inference input.
         candidates = sorted(
             p
             for p in cache_dir.glob("*.json")
             if p.name not in {"input.json", "prepared.json"}
         )
-        if candidates:
-            candidates[0].replace(prepared_json_path)
+        if len(candidates) == 1:
+            import shutil
+
+            shutil.copy2(candidates[0], prepared_json_path)
+        elif len(candidates) > 1:
+            raise RuntimeError(
+                f"Unexpected multiple prepared JSON outputs for cache key {cache_key}: "
+                f"{[p.name for p in candidates]}"
+            )
         else:
-            input_json_path.replace(prepared_json_path)
+            import shutil
+
+            shutil.copy2(input_json_path, prepared_json_path)
     else:
-        input_json_path.replace(prepared_json_path)
+        import shutil
+
+        shutil.copy2(input_json_path, prepared_json_path)
 
     PREP_VOLUME.commit()
     print(f"💊 Cached preprocessed inputs: {cache_key}")
@@ -369,7 +380,7 @@ def run_protenix(
                 )
         else:
             if json_str is None:
-                raise ValueError("json_str cannot be None when prep_cache_key is not set")
+                raise ValueError("Either prep_cache_key or json_str must be provided")
             input_json_path = tmpdir_path / f"{run_name}.json"
             input_json_path.write_bytes(json_str)
 

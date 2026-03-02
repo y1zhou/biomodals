@@ -32,6 +32,8 @@
 * The default `--msa-server-mode protenix` uses the Protenix remote MSA server,
   so no local MSA databases are required. Switch to `colabfold` if you have a
   pre-populated database volume.
+* MSA/template preprocessing is run in a CPU-only Modal function and cached in a
+  persistent Modal volume (`protenix-prep-cache`) before GPU inference.
 * Templates are only used when `--use-template` is passed. Template support
   requires the v1.0.0 model checkpoints.
 * RNA MSA is only supported by v1.0.0 model checkpoints.
@@ -53,6 +55,7 @@
 
 import os
 import shlex
+from hashlib import sha256
 from pathlib import Path
 
 from modal import App, Image, Volume
@@ -70,6 +73,11 @@ APP_NAME = os.environ.get("MODAL_APP", "Protenix")
 DATA_VOLUME_NAME = "protenix-data"
 DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
 DATA_DIR = "/protenix-data"
+
+# Volume for preprocessed MSA/template intermediates
+PREP_VOLUME_NAME = "protenix-prep-cache"
+PREP_VOLUME = Volume.from_name(PREP_VOLUME_NAME, create_if_missing=True)
+PREP_DIR = "/protenix-prep-cache"
 
 # Supported model checkpoints
 SUPPORTED_MODELS = ("protenix_base_default_v1.0.0", "protenix_base_20250630_v1.0.0")
@@ -237,15 +245,82 @@ def download_protenix_data(
 # Inference functions
 ##########################################
 @app.function(
+    timeout=TIMEOUT,
+    volumes={DATA_DIR: DATA_VOLUME, PREP_DIR: PREP_VOLUME},
+)
+def prepare_protenix_inputs(
+    json_str: bytes,
+    use_msa: bool = True,
+    msa_server_mode: str = "protenix",
+    use_template: bool = False,
+    use_rna_msa: bool = False,
+) -> str:
+    """Run CPU preprocessing and cache prepared JSON + search outputs in a volume."""
+    DATA_VOLUME.reload()
+    PREP_VOLUME.reload()
+
+    cache_key = sha256(
+        json_str
+        + f"|{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode("utf-8")
+    ).hexdigest()
+    cache_dir = Path(PREP_DIR) / cache_key
+    prepared_json_path = cache_dir / "prepared.json"
+    if prepared_json_path.exists():
+        print(f"💊 Reusing cached preprocessed inputs: {cache_key}")
+        return cache_key
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    input_json_path = cache_dir / "input.json"
+    input_json_path.write_bytes(json_str)
+
+    if use_msa or use_template or use_rna_msa:
+        cmd = [
+            "protenix",
+            "prep",
+            "--input",
+            str(input_json_path),
+            "--out_dir",
+            str(cache_dir),
+            "--msa_server_mode",
+            msa_server_mode,
+        ]
+        env_override = {
+            "PROTENIX_ROOT_DIR": DATA_DIR,
+        }
+        import os as _os
+
+        run_env = _os.environ.copy()
+        run_env.update(env_override)
+        run_command(cmd, env=run_env, cwd=cache_dir)
+
+        candidates = sorted(
+            p
+            for p in cache_dir.glob("*.json")
+            if p.name not in {"input.json", "prepared.json"}
+        )
+        if candidates:
+            candidates[0].replace(prepared_json_path)
+        else:
+            input_json_path.replace(prepared_json_path)
+    else:
+        input_json_path.replace(prepared_json_path)
+
+    PREP_VOLUME.commit()
+    print(f"💊 Cached preprocessed inputs: {cache_key}")
+    return cache_key
+
+
+@app.function(
     gpu=GPU,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=TIMEOUT,
-    volumes={DATA_DIR: DATA_VOLUME},
+    volumes={DATA_DIR: DATA_VOLUME, PREP_DIR: PREP_VOLUME},
 )
 def run_protenix(
-    json_str: bytes,
+    json_str: bytes | None,
     run_name: str,
+    prep_cache_key: str | None = None,
     model_name: str = "protenix_base_default_v1.0.0",
     seeds: str = "101",
     cycle: int = 10,
@@ -281,12 +356,22 @@ def run_protenix(
     import tempfile
 
     DATA_VOLUME.reload()
+    PREP_VOLUME.reload()
 
     # Write input JSON to a temporary file
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
-        input_json_path = tmpdir_path / f"{run_name}.json"
-        input_json_path.write_bytes(json_str)
+        if prep_cache_key is not None:
+            input_json_path = Path(PREP_DIR) / prep_cache_key / "prepared.json"
+            if not input_json_path.exists():
+                raise FileNotFoundError(
+                    f"Prepared input not found for cache key: {prep_cache_key}"
+                )
+        else:
+            if json_str is None:
+                raise ValueError("json_str cannot be None when prep_cache_key is not set")
+            input_json_path = tmpdir_path / f"{run_name}.json"
+            input_json_path.write_bytes(json_str)
 
         out_dir = tmpdir_path / "output"
         out_dir.mkdir()
@@ -430,11 +515,24 @@ def submit_protenix_task(
         include_templates=use_template,
     )
 
+    # Preprocess (MSA/template) on CPU and cache in volume for reuse
+    prep_cache_key: str | None = None
+    if use_msa or use_template or use_rna_msa:
+        print("🧬 Running Protenix preprocessing (CPU-only) and caching intermediates...")
+        prep_cache_key = prepare_protenix_inputs.remote(
+            json_str=json_str,
+            use_msa=use_msa,
+            msa_server_mode=msa_server_mode,
+            use_template=use_template,
+            use_rna_msa=use_rna_msa,
+        )
+
     # Run inference
     print(f"🧬 Running Protenix inference with {model_name}...")
     tarball_bytes = run_protenix.remote(
-        json_str=json_str,
+        json_str=None if prep_cache_key is not None else json_str,
         run_name=run_name,
+        prep_cache_key=prep_cache_key,
         model_name=model_name,
         seeds=seeds,
         cycle=cycle,

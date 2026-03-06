@@ -23,7 +23,7 @@ while enforcing a **stable output layout** and **inference-safe config override*
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--task` | `binder` | Task router. One of: `binder`, `antibody`, `nanobody`, `monomer`, `scaffolding`, `ab_partial_flow`, `nb_partial_flow`, `binder_partial_flow`. |
+| `--task` | `binder` | Task router. One of: `binder`, `antibody`, `nanobody`, `monomer`, `scaffolding`, `ab_partial_flow`, `nb_partial_flow`, `binder_partial_flow`, `mpnn_stage1`, `mpnn_stage2`. |
 | `--run-name` | `test1` | Unique run identifier. Controls output directory name and tarball name (`<task>.<run-name>.tar.gz`). |
 | `--out-dir` | `./ppiflow_outputs` | Local directory to write the returned run bundle (`.tar.gz`). |
 | `--model-weights` | **Required** | Local/remote path to a checkpoint. Remote resolves to `/models/<basename>` unless already under `/models/`. |
@@ -39,6 +39,8 @@ while enforcing a **stable output layout** and **inference-safe config override*
 | `ab_partial_flow` / `nb_partial_flow` | `--pf-complex-pdb` | `complex.pdb` |
 | `scaffolding` | `--scaffold-motif-csv` | `motif.csv` |
 | `monomer` | *(no file upload required)* | *(none)* |
+| `mpnn_stage1` | *(no local upload; uses existing run)* | *(none; reads `/runs/<mpnn_source_task>/<mpnn_source_run>/outputs/*.pdb`)* |
+| `mpnn_stage2` | *(no local upload; uses existing run)* | *(none; reads `/runs/<mpnn_source_task>/<mpnn_source_run>/outputs/*.pdb`)* |
 
 ### Binder args (sample_binder.py)
 
@@ -98,6 +100,31 @@ while enforcing a **stable output layout** and **inference-safe config override*
 | `--bpf-binder-chain` | `A` | Binder chain passed to `--binder_chain`. |
 | `--bpf-start-t` | `0.7` | Partial flow start time passed to `--start_t`. |
 
+### MPNN / ABMPNN tasks
+For a complete set of protein_mpnn CLI options that can be used, see <https://github.com/Mingchenchen/PPIFlow/blob/main/ProteinMPNN/README.md>.
+
+
+`mpnn_stage1` and `mpnn_stage2` both run sequence design on an existing backbone run:
+
+- Required source run flags: `--mpnn-source-task`, `--mpnn-source-run`
+- Input backbones come from: `/runs/<mpnn_source_task>/<mpnn_source_run>/outputs/*.pdb`
+- Model choice: `--mpnn-model-name` (use `abmpnn` to run ABMPNN weights from `/models/abmpnn.pt`)
+- Runtime controls: `--mpnn-batch-size` (default `1`), `--mpnn-seed` (default `0`)
+- Optional design constraints:
+  - `--mpnn-chain-list` (chains to design)
+  - `--mpnn-position-list` (CSV path for fixed positions; if omitted, design is unconstrained/full-chain)
+  - `--mpnn-omit-aas` (optional amino acids to omit, e.g. `C`)
+  - `--mpnn-use-soluble-model` (optional flag for ProteinMPNN soluble weights mode)
+
+Stage semantics in this wrapper:
+
+- `mpnn_stage1` (exploration): default `--mpnn-num-seq-per-target-stage1 8`, `--mpnn-temp-stage1 0.5`
+- `mpnn_stage2` (conservative refinement): default `--mpnn-num-seq-per-target-stage2 4`, `--mpnn-temp-stage2 0.1`
+
+Current behavior note:
+
+- `mpnn_stage2` currently does not consume AF3-filtered outputs automatically; it is a second MPNN pass with different sampling settings.
+
 ## Environment variables (Modal)
 
 | Environment variable | Default | Description |
@@ -113,15 +140,16 @@ while enforcing a **stable output layout** and **inference-safe config override*
 
 Expected checkpoint layout (one-time upload examples):
   1) ppiflow
-  modal volume put ppiflow-models /models/antibody.ckpt antibody.ckpt
-  modal volume put ppiflow-models /models/binder.ckpt   binder.ckpt
-  modal volume put ppiflow-models /models/monomer.ckpt  monomer.ckpt
-  modal volume put ppiflow-models /models/nanobody.ckpt nanobody.ckpt
-  2) proteinmpnn
-  # Upload ProteinMPNN weights to persistent Volume (one-time)
-  modal volume put ppiflow-models /models/proteinmpnn_v_48_002.pt proteinmpnn_v_48_002.pt
-  modal volume put ppiflow-models /models/proteinmpnn_v_48_010.pt proteinmpnn_v_48_010.pt
-  modal volume put ppiflow-models /models/proteinmpnn_v_48_020.pt proteinmpnn_v_48_020.pt
+  modal volume put ppiflow-models antibody.ckpt /antibody.ckpt
+  modal volume put ppiflow-models binder.ckpt /binder.ckpt
+  modal volume put ppiflow-models monomer.ckpt /monomer.ckpt
+  modal volume put ppiflow-models nanobody.ckpt /nanobody.ckpt  2) proteinmpnn
+  2) Upload ProteinMPNN weights to persistent Volume (one-time)
+  modal volume put ppiflow-models v_48_002.pt /proteinmpnn_v_48_002.pt 
+  modal volume put ppiflow-models v_48_010.pt /proteinmpnn_v_48_010.pt 
+  modal volume put ppiflow-models v_48_020.pt /proteinmpnn_v_48_020.pt 
+  3) abmpnn weights
+  modal volume put ppiflow-models abmpnn.pt /abmpnn.pt 
 
 ## Outputs
 
@@ -166,6 +194,48 @@ Expected checkpoint layout (one-time upload examples):
     --pf-light-chain L \
     --model-weights /models/antibody.ckpt \
     --run-name abp1
+
+  # MPNN stage1 (exploration) on an existing binder run
+  modal run ppiflow_app.py --task mpnn_stage1 -- \
+    --mpnn-source-task binder \
+    --mpnn-source-run test1 \
+    --mpnn-model-name v_48_020 \
+    --mpnn-num-seq-per-target-stage1 8 \
+    --mpnn-temp-stage1 0.5 \
+    --run-name mpnn_test1\
+    --mpnn-batch-size 1 \
+    --mpnn-seed 0
+
+
+  # MPNN stage2 (conservative refinement) on the same source run
+  modal run ppiflow_app.py --task mpnn_stage2 -- \
+    --mpnn-source-task binder \
+    --mpnn-source-run test1 \
+    --mpnn-model-name v_48_020 \
+    --mpnn-num-seq-per-target-stage2 4 \
+    --mpnn-temp-stage2 0.1 \
+    --run-name test1 \
+    --mpnn-batch-size 1 \
+    --mpnn-seed 0
+
+  # ABMPNN with fixed framework positions (design only selected residues/chains)
+  modal run ppiflow_app.py --task mpnn_stage1 -- \
+    --mpnn-source-task nanobody \
+    --mpnn-source-run nb1 \
+    --mpnn-model-name abmpnn \
+    --mpnn-chain-list A \
+    --mpnn-position-list ./fixed_positions.csv \
+    --mpnn-num-seq-per-target-stage1 8 \
+    --mpnn-temp-stage1 0.5
+
+  # ABMPNN full design (no fixed positions file provided)
+  modal run ppiflow_app.py --task mpnn_stage1 -- \
+    --mpnn-source-task nanobody \
+    --mpnn-source-run nb1 \
+    --mpnn-model-name abmpnn \
+    --mpnn-num-seq-per-target-stage1 8 \
+    --mpnn-temp-stage1 0.5
+
 """
 
 from __future__ import annotations
@@ -410,6 +480,163 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) ->
     path.write_text(buf.getvalue())
 
 
+def _expand_position_token(token: str) -> list[int]:
+    token = token.strip()
+    if not token:
+        return []
+    if "-" in token:
+        a, b = token.split("-", 1)
+        start = int(a.strip())
+        end = int(b.strip())
+        if end < start:
+            raise ValueError(f"Invalid range: {token}")
+        return list(range(start, end + 1))
+    return [int(token)]
+
+
+def _normalize_fixed_positions_csv_bytes(raw_csv: bytes) -> bytes:
+    """
+    Accept user-friendly fixed-position syntax and convert to ProteinMPNN style.
+
+    Supported input for the second column (e.g. motif_index / fixed_positions):
+    - "1 2 3 10 11"
+    - "1-25,34-50,59-96,118-127"
+
+    Output second column is normalized to:
+    - "1 2 3 ... 127"
+    """
+    text = raw_csv.decode("utf-8-sig")
+    reader = csv.DictReader(StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("mpnn position CSV has no header")
+
+    fns = list(reader.fieldnames)
+    lower_map = {f.lower(): f for f in fns}
+    name_col = lower_map.get("pdb_name") or lower_map.get("pdb_id")
+    pos_col = lower_map.get("motif_index") or lower_map.get("fixed_positions")
+    if not name_col or not pos_col:
+        raise ValueError(
+            "mpnn position CSV must contain (pdb_name or pdb_id) and "
+            "(motif_index or fixed_positions) columns"
+        )
+
+    rows = list(reader)
+    if not rows:
+        raise ValueError("mpnn position CSV has no data rows")
+
+    out_rows: list[dict[str, str]] = []
+    for r in rows:
+        pdb_name = (r.get(name_col) or "").strip()
+        if not pdb_name:
+            raise ValueError(f"Empty pdb name in row: {r}")
+        raw = (r.get(pos_col) or "").strip()
+        if not raw:
+            out = ""
+        else:
+            pieces = [p.strip() for p in raw.split(",") if p.strip()]
+            values: list[int] = []
+            for p in pieces:
+                values.extend(_expand_position_token(p))
+            vals = sorted(set(values))
+            out = " ".join(str(v) for v in vals)
+        out_rows.append({"pdb_name": pdb_name, "motif_index": out})
+
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["pdb_name", "motif_index"])
+    writer.writeheader()
+    writer.writerows(out_rows)
+    return buf.getvalue().encode("utf-8")
+
+
+def _chain_order_from_pdb(pdb_path: Path) -> list[str]:
+    order: list[str] = []
+    seen: set[str] = set()
+    with pdb_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                continue
+            if len(line) < 22:
+                continue
+            chain_id = line[21].strip()
+            if not chain_id or chain_id in seen:
+                continue
+            seen.add(chain_id)
+            order.append(chain_id)
+    return order
+
+
+def _rewrite_fixed_positions_for_proteinmpnn(
+    csv_path: Path, pdb_folder: Path, chain_list: str
+) -> None:
+    """
+    Convert normalized CSV (single position list per pdb) into upstream legacy format
+    expected by ProteinMPNN helper script:
+      second column uses '-' to separate per-chain residue lists in pdb chain order.
+    """
+    designed_chains = [c for c in chain_list.split() if c]
+    if not designed_chains:
+        raise ValueError("--mpnn-chain-list is required when --mpnn-position-list is provided")
+    if len(designed_chains) != 1:
+        raise ValueError(
+            "Current fixed-position CSV format supports one designed chain. "
+            f"Got --mpnn-chain-list={chain_list!r}"
+        )
+
+    text = csv_path.read_text(encoding="utf-8-sig")
+    reader = csv.DictReader(StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("mpnn_fixed_positions.csv has no header")
+    rows = list(reader)
+    if not rows:
+        raise ValueError("mpnn_fixed_positions.csv has no data rows")
+
+    out_rows: list[dict[str, str]] = []
+    target_chain = designed_chains[0]
+    for row in rows:
+        pdb_name = (row.get("pdb_name") or row.get("pdb_id") or "").strip()
+        if not pdb_name:
+            raise ValueError(f"Empty pdb_name/pdb_id in row: {row}")
+        pos_raw = (row.get("motif_index") or row.get("fixed_positions") or "").strip()
+
+        pdb_file = pdb_folder / f"{pdb_name}.pdb"
+        if not pdb_file.exists():
+            raise FileNotFoundError(f"PDB not found for fixed positions row: {pdb_file}")
+        chains = _chain_order_from_pdb(pdb_file)
+        if not chains:
+            raise ValueError(f"Could not detect chain order from: {pdb_file}")
+        if target_chain not in chains:
+            raise ValueError(f"Chain {target_chain!r} not found in {pdb_file.name}; chains={chains}")
+
+        segments: list[str] = []
+        for ch in chains:
+            segments.append(pos_raw if ch == target_chain else "")
+        out_rows.append({"pdb_name": pdb_name, "motif_index": "-".join(segments)})
+
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["pdb_name", "motif_index"])
+    writer.writeheader()
+    writer.writerows(out_rows)
+    csv_path.write_text(buf.getvalue(), encoding="utf-8")
+
+
+def _write_empty_fixed_positions_csv(csv_path: Path, pdb_folder: Path) -> None:
+    """
+    Write a no-op fixed-positions CSV for upstream protein_mpnn_run.py compatibility.
+    This avoids its UnboundLocalError when --position_list is omitted.
+    """
+    rows: list[dict[str, str]] = []
+    for pdb in sorted(pdb_folder.glob("*.pdb")):
+        rows.append({"pdb_name": pdb.stem, "motif_index": ""})
+    if not rows:
+        raise FileNotFoundError(f"No .pdb found under: {pdb_folder}")
+
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["pdb_name", "motif_index"])
+    writer.writeheader()
+    writer.writerows(rows)
+    csv_path.write_text(buf.getvalue(), encoding="utf-8")
+
+
 def _collect_pdbs_for_mpnn(src_outputs: Path) -> list[Path]:
     pdbs = sorted(src_outputs.glob("*.pdb"))
     if not pdbs:
@@ -506,59 +733,27 @@ def _run_abmpnn_on_folder(
     flags: dict[str, str],
     pdb_folder: Path,
     out_folder: Path,
-    ckpt_path: Path,
+    ckpt_path: Path | None,
     num_seqs: int,
     sampling_temp: float,
     seed: int,
     batch_size: int,
     model_name: str | None,
+    chain_list: str | None,
+    position_list_csv: Path | None,
+    omit_aas: str | None,
+    use_soluble_model: bool,
     log_path: Path,
 ) -> None:
     """
-    Ultra-safe runner for ProteinMPNN / ABMPNN scripts.
+    Run ProteinMPNN / ABMPNN script in folder mode.
 
-    Fixes two classes of issues:
-    1) Upstream bug: fixed_positions_dict may be printed without initialization.
-       -> Patch `main(args)` to define `fixed_positions_dict = {}` first.
-    2) Import error when executing a copied script elsewhere (protein_mpnn_utils not found).
-       -> Write patched script NEXT TO the original script and run with cwd=original_dir.
+    This is intentionally "no patch mode": execute upstream script as-is.
     """
     out_folder.mkdir(parents=True, exist_ok=True)
 
-    # -------------------------
-    # Step 0: patch script IN PLACE (same directory as original)
-    # -------------------------
     run_script = mpnn_script
-    patched = False
     patch_dir = mpnn_script.parent  # e.g. /ppiflow/ProteinMPNN
-    try:
-        txt = mpnn_script.read_text(encoding="utf-8", errors="ignore")
-
-        # Only patch if it looks like the ProteinMPNN entry script
-        if mpnn_script.name == "protein_mpnn_run.py" and "def main(args):" in txt:
-            if "fixed_positions_dict = {}  # PATCH" not in txt:
-                lines = txt.splitlines(True)
-                out_lines: list[str] = []
-                inserted = False
-                for line in lines:
-                    out_lines.append(line)
-                    if (not inserted) and line.strip() == "def main(args):":
-                        out_lines.append("    fixed_positions_dict = {}  # PATCH: avoid UnboundLocalError\n")
-                        inserted = True
-
-                if inserted:
-                    run_script = patch_dir / "_patched_protein_mpnn_run.py"
-                    run_script.write_text("".join(out_lines), encoding="utf-8")
-                    patched = True
-            else:
-                # already patched earlier
-                run_script = patch_dir / "_patched_protein_mpnn_run.py"
-                if run_script.exists():
-                    patched = True
-    except Exception:
-        # fall back to original script
-        run_script = mpnn_script
-        patched = False
 
     # -------------------------
     # Step 1: build argv
@@ -584,6 +779,8 @@ def _run_abmpnn_on_folder(
 
     ckpt_flag = flags.get("ckpt_flag") or ""
     if ckpt_flag:
+        if ckpt_path is None:
+            raise ValueError(f"MPNN script expects {ckpt_flag}, but no checkpoint path was resolved.")
         argv += [ckpt_flag, str(ckpt_path)]
     else:
         weights_dir_flag = flags.get("weights_dir_flag") or ""
@@ -640,15 +837,14 @@ def _run_abmpnn_on_folder(
     if batch_flag:
         argv += [batch_flag, str(int(batch_size))]
 
-    # -------------------------
-    # Step 2: DO NOT pass --fixed_positions by default.
-    #
-    # Reason:
-    # - After we patch `fixed_positions_dict = {}` at the start of main(),
-    #   passing an empty fixed_positions file can trigger KeyError in tied_featurize
-    #   (it expects per-sample keys like b['name'] == 'vhh1_0').
-    # -------------------------
-    # (intentionally disabled)
+    if chain_list:
+        argv += ["--chain_list", chain_list]
+    if position_list_csv:
+        argv += ["--position_list", str(position_list_csv)]
+    if omit_aas:
+        argv += ["--omit_AAs", omit_aas]
+    if use_soluble_model:
+        argv += ["--use_soluble_model"]
 
 
     # -------------------------
@@ -667,7 +863,6 @@ def _run_abmpnn_on_folder(
     dbg.append("=== runner ===")
     dbg.append(f"original_script: {mpnn_script}")
     dbg.append(f"executed_script: {run_script}")
-    dbg.append(f"patched: {patched}")
     dbg.append(f"cwd: {patch_dir}")
     dbg.append("")
     dbg.append("=== argv ===")
@@ -755,6 +950,9 @@ def run_ppiflow_structured(
     mpnn_batch_size: int,
     mpnn_seed: int,
     mpnn_ckpt_path: str | None,
+    mpnn_chain_list: str | None,
+    mpnn_omit_aas: str | None,
+    mpnn_use_soluble_model: bool,
 ) -> bytes:
     # -------------------------
     # Branch 1: MPNN tasks (operate on existing run dir)
@@ -771,10 +969,12 @@ def run_ppiflow_structured(
         pdbs = _collect_pdbs_for_mpnn(src_outputs)
 
         mpnn_script = _find_abmpnn_run_script()
-        ckpt_path = _resolve_abmpnn_ckpt(mpnn_ckpt_path)
 
-        # detect flags once
+        # detect flags first, then resolve checkpoint only when needed
         flags = _detect_abmpnn_cli_flags(mpnn_script)
+        ckpt_path: Path | None = None
+        if flags.get("ckpt_flag"):
+            ckpt_path = _resolve_abmpnn_ckpt(mpnn_ckpt_path)
         (src_run_dir / f"{task}.mpnn_help.txt").write_text(_script_help_text(mpnn_script))
 
         mpnn_dir = src_run_dir / task
@@ -790,12 +990,32 @@ def run_ppiflow_structured(
             temp = float(mpnn_temp_stage2)
             manifest_name = "candidates_stage2.csv"
 
-        mpnn_dir = src_run_dir / task
         mpnn_out = mpnn_dir / "out"
         pdb_folder = mpnn_dir / "pdbs"
+        mpnn_inputs = mpnn_dir / "inputs"
         mpnn_dir.mkdir(parents=True, exist_ok=True)
+        mpnn_inputs.mkdir(parents=True, exist_ok=True)
 
         _stage_pdb_folder(pdbs, pdb_folder)
+
+        position_list_csv: Path | None = None
+        for fname, content in input_files:
+            dst = mpnn_inputs / Path(fname).name
+            dst.write_bytes(content)
+            if Path(fname).name == "mpnn_fixed_positions.csv":
+                position_list_csv = dst
+        if position_list_csv and not mpnn_chain_list:
+            raise ValueError(f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided")
+        if position_list_csv:
+            _rewrite_fixed_positions_for_proteinmpnn(
+                csv_path=position_list_csv,
+                pdb_folder=pdb_folder,
+                chain_list=mpnn_chain_list or "",
+            )
+        else:
+            # Keep "full design" behavior while working around upstream UnboundLocalError.
+            position_list_csv = mpnn_inputs / "mpnn_fixed_positions.auto.csv"
+            _write_empty_fixed_positions_csv(position_list_csv, pdb_folder)
 
         log_path = mpnn_dir / "mpnn_folder.log"
         _run_abmpnn_on_folder(
@@ -808,7 +1028,11 @@ def run_ppiflow_structured(
         sampling_temp=temp,
         seed=int(mpnn_seed),
         batch_size=int(mpnn_batch_size),
-        model_name=mpnn_model_name,   # 你要把这个参数加回 signature & local entrypoint
+        model_name=mpnn_model_name,
+        chain_list=mpnn_chain_list,
+        position_list_csv=position_list_csv,
+        omit_aas=mpnn_omit_aas,
+        use_soluble_model=mpnn_use_soluble_model,
         log_path=log_path,
         )
 
@@ -839,11 +1063,15 @@ def run_ppiflow_structured(
             json.dumps(
                 {
                     "mpnn_script": str(mpnn_script),
-                    "ckpt_path": str(ckpt_path),
+                    "ckpt_path": str(ckpt_path) if ckpt_path else None,
                     "num_seq_per_target": num_seq,
                     "sampling_temp": temp,
                     "batch_size": int(mpnn_batch_size),
                     "seed": int(mpnn_seed),
+                    "chain_list": mpnn_chain_list,
+                    "position_list_provided": bool(position_list_csv),
+                    "omit_aas": mpnn_omit_aas,
+                    "use_soluble_model": bool(mpnn_use_soluble_model),
                     "detected_flags": flags,
                 },
                 indent=2,
@@ -1041,6 +1269,8 @@ def run_ppiflow_structured(
         if effective_config:
             argv += ["--config", str(effective_config)]
         argv += [
+            "--model_weights",
+            str(model_ckpt),
             "--target_chain",
             bpf_target_chain,
             "--binder_chain",
@@ -1146,6 +1376,10 @@ def submit_ppiflow(
     mpnn_batch_size: int = 1,
     mpnn_seed: int = 0,
     mpnn_ckpt_path: str | None = None,
+    mpnn_chain_list: str | None = None,
+    mpnn_position_list: str | None = None,
+    mpnn_omit_aas: str | None = None,
+    mpnn_use_soluble_model: bool = False,
 ) -> None:
     """
     Unified Modal CLI.
@@ -1237,6 +1471,15 @@ def submit_ppiflow(
             s = scaffold_motif_names.strip()
             if not s.startswith("["):
                 scaffold_motif_names = json.dumps([s])
+    elif task in MPNN_TASKS:
+        if mpnn_position_list and not mpnn_chain_list:
+            raise ValueError(f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided")
+        if mpnn_position_list:
+            pos_csv = Path(mpnn_position_list).expanduser()
+            if not pos_csv.exists():
+                raise FileNotFoundError(f"Local file not found: {pos_csv}")
+            normalized = _normalize_fixed_positions_csv_bytes(pos_csv.read_bytes())
+            input_files.append(("mpnn_fixed_positions.csv", normalized))
 
     # dispatch
     tar_bytes = run_ppiflow_structured.remote(
@@ -1283,6 +1526,9 @@ def submit_ppiflow(
         mpnn_seed=mpnn_seed,
         mpnn_ckpt_path=mpnn_ckpt_path,
         mpnn_model_name=mpnn_model_name,
+        mpnn_chain_list=mpnn_chain_list,
+        mpnn_omit_aas=mpnn_omit_aas,
+        mpnn_use_soluble_model=mpnn_use_soluble_model,
     )
 
     out_dir_p = Path(out_dir).expanduser()

@@ -33,7 +33,7 @@
   so no local MSA databases are required. Switch to `colabfold` if you have a
   pre-populated database volume.
 * MSA/template preprocessing is run in a CPU-only Modal function and cached in a
-  persistent Modal volume (`protenix-prep-cache`) before GPU inference.
+  persistent Modal volume (`protenix-msa`) before GPU inference.
 * Templates are only used when `--use-template` is passed. Template support
   requires the v1.0.0 model checkpoints.
 * RNA MSA is only supported by v1.0.0 model checkpoints.
@@ -55,6 +55,7 @@
 
 import os
 import shlex
+import shutil
 from hashlib import sha256
 from pathlib import Path
 
@@ -71,13 +72,13 @@ APP_NAME = os.environ.get("MODAL_APP", "Protenix")
 
 # Volume for model weights and data caches
 DATA_VOLUME_NAME = "protenix-data"
-DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
+DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True, version=2)
 DATA_DIR = "/protenix-data"
 
 # Volume for preprocessed MSA/template intermediates
-PREP_VOLUME_NAME = "protenix-prep-cache"
-PREP_VOLUME = Volume.from_name(PREP_VOLUME_NAME, create_if_missing=True)
-PREP_DIR = "/protenix-prep-cache"
+PREP_VOLUME_NAME = "protenix-msa"
+PREP_VOLUME = Volume.from_name(PREP_VOLUME_NAME, create_if_missing=True, version=2)
+PREP_DIR = "/protenix-msa"
 
 # Supported model checkpoints
 SUPPORTED_MODELS = ("protenix_base_default_v1.0.0", "protenix_base_20250630_v1.0.0")
@@ -256,15 +257,12 @@ def prepare_protenix_inputs(
     use_rna_msa: bool = False,
 ) -> str:
     """Run CPU preprocessing and cache prepared JSON + search outputs in a volume."""
-    DATA_VOLUME.reload()
-    PREP_VOLUME.reload()
-
     h = sha256()
     h.update(json_str)
     h.update(b"\x00")
     h.update(f"{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode("utf-8"))
     cache_key = h.hexdigest()
-    cache_dir = Path(PREP_DIR) / cache_key
+    cache_dir = Path(PREP_DIR) / cache_key[:2] / cache_key
     prepared_json_path = cache_dir / "prepared.json"
     if prepared_json_path.exists():
         print(f"💊 Reusing cached preprocessed inputs: {cache_key}")
@@ -299,22 +297,16 @@ def prepare_protenix_inputs(
             if p.name not in {"input.json", "prepared.json"}
         )
         if len(candidates) == 1:
-            import shutil
-
-            shutil.copy2(candidates[0], prepared_json_path)
+            shutil.copyfile(candidates[0], prepared_json_path)
         elif len(candidates) > 1:
             raise RuntimeError(
                 f"Unexpected multiple prepared JSON outputs for cache key {cache_key}: "
                 f"{[p.name for p in candidates]}"
             )
         else:
-            import shutil
-
-            shutil.copy2(input_json_path, prepared_json_path)
+            shutil.copyfile(input_json_path, prepared_json_path)
     else:
-        import shutil
-
-        shutil.copy2(input_json_path, prepared_json_path)
+        shutil.copyfile(input_json_path, prepared_json_path)
 
     PREP_VOLUME.commit()
     print(f"💊 Cached preprocessed inputs: {cache_key}")
@@ -366,14 +358,11 @@ def run_protenix(
     """
     import tempfile
 
-    DATA_VOLUME.reload()
-    PREP_VOLUME.reload()
-
     # Write input JSON to a temporary file
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         if prep_cache_key is not None:
-            input_json_path = Path(PREP_DIR) / prep_cache_key / "prepared.json"
+            input_json_path = Path(PREP_DIR) / prep_cache_key[:2] / prep_cache_key / "prepared.json"
             if not input_json_path.exists():
                 raise FileNotFoundError(
                     f"Prepared input not found for cache key: {prep_cache_key}"
@@ -424,9 +413,7 @@ def run_protenix(
         env_override = {
             "PROTENIX_ROOT_DIR": DATA_DIR,
         }
-        import os as _os
-
-        run_env = _os.environ.copy()
+        run_env = os.environ.copy()
         run_env.update(env_override)
 
         run_command(cmd, env=run_env, cwd=out_dir)
@@ -481,8 +468,6 @@ def submit_protenix_task(
         force_redownload: Whether to force re-download of model weights
         extra_args: Additional CLI arguments passed to protenix pred
     """
-    from pathlib import Path
-
     # Validate model name
     if model_name not in SUPPORTED_MODELS:
         raise ValueError(

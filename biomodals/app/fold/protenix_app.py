@@ -269,7 +269,16 @@ def prepare_protenix_inputs(
     use_template: bool = False,
     use_rna_msa: bool = False,
 ) -> str:
-    """Run CPU preprocessing and cache prepared JSON + search outputs in a volume."""
+    """Run CPU preprocessing and cache prepared JSON + search outputs in a volume.
+
+    Command selection:
+    - ``use_template=True``:  ``protenix prep`` (MSA + template + RNA MSA);
+      output is ``input-final-updated.json``, falling back to
+      ``input-update-msa.json`` if no template/RNA changes were applied.
+    - ``use_template=False``: ``protenix msa`` (MSA search only);
+      output is ``input-update-msa.json``.
+
+    """
     h = sha256()
     h.update(json_str)
     h.update(b"\x00")
@@ -284,40 +293,65 @@ def prepare_protenix_inputs(
     cache_dir.mkdir(parents=True, exist_ok=True)
     input_json_path = cache_dir / "input.json"
     input_json_path.write_bytes(json_str)
+    # The stem "input" is used by Protenix to derive output filenames such as
+    # "input-update-msa.json" and "input-final-updated.json".
+    input_stem = input_json_path.stem
 
     if use_msa or use_template or use_rna_msa:
-        cmd = [
-            "protenix",
-            "prep",
-            "--input",
-            str(input_json_path),
-            "--out_dir",
-            str(cache_dir),
-            "--msa_server_mode",
-            msa_server_mode,
-        ]
         env_override = {
             "PROTENIX_ROOT_DIR": DATA_DIR,
         }
         run_env = os.environ.copy()
         run_env.update(env_override)
-        run_command(cmd, env=run_env, cwd=cache_dir)
 
-        # `protenix prep` writes one updated JSON in out_dir; use it as inference input.
-        candidates = sorted(
-            p
-            for p in cache_dir.glob("*.json")
-            if p.name not in {"input.json", "prepared.json"}
-        )
-        if len(candidates) == 1:
-            shutil.copyfile(candidates[0], prepared_json_path)
-        elif len(candidates) > 1:
-            raise RuntimeError(
-                f"Unexpected multiple prepared JSON outputs for cache key {cache_key}: "
-                f"{[p.name for p in candidates]}"
-            )
+        if use_template:
+            # `protenix prep` (inputprep) runs MSA + template + RNA MSA search.
+            # It first produces `input-update-msa.json`, then (if template or RNA
+            # MSA updates were actually made) renames it to `input-final-updated.json`.
+            cmd = [
+                "protenix",
+                "prep",
+                "--input",
+                str(input_json_path),
+                "--out_dir",
+                str(cache_dir),
+                "--msa_server_mode",
+                msa_server_mode,
+            ]
+            run_command(cmd, env=run_env, cwd=cache_dir)
+
+            # Prefer the fully-updated file; fall back to MSA-only update.
+            expected_files = [
+                cache_dir / f"{input_stem}-final-updated.json",
+                cache_dir / f"{input_stem}-update-msa.json",
+            ]
         else:
-            shutil.copyfile(input_json_path, prepared_json_path)
+            # `protenix msa` runs MSA search only and produces `input-update-msa.json`.
+            cmd = [
+                "protenix",
+                "msa",
+                "--input",
+                str(input_json_path),
+                "--out_dir",
+                str(cache_dir),
+                "--msa_server_mode",
+                msa_server_mode,
+            ]
+            run_command(cmd, env=run_env, cwd=cache_dir)
+
+            expected_files = [
+                cache_dir / f"{input_stem}-update-msa.json",
+            ]
+
+        found_output_json: Path | None = next(
+            (p for p in expected_files if p.exists()), None
+        )
+        if found_output_json is None:
+            raise RuntimeError(
+                f"Expected output JSON not found for cache key {cache_key}. "
+                f"Looked for: {[p.name for p in expected_files]}"
+            )
+        shutil.copyfile(found_output_json, prepared_json_path)
     else:
         shutil.copyfile(input_json_path, prepared_json_path)
 

@@ -78,7 +78,7 @@ APP_NAME = os.environ.get("MODAL_APP", "Protenix")
 
 # Volume for model weights and data caches
 DATA_VOLUME_NAME = "protenix-data"
-DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True, version=2)
+DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
 DATA_DIR = "/protenix-data"
 
 # Volume for preprocessed MSA/template intermediates
@@ -113,7 +113,7 @@ TEMPLATE_CACHE_FILES = (
 
 # Repository and commit hash
 REPO_URL = "https://github.com/y1zhou/Protenix"
-REPO_COMMIT = "14df34247c1b32f2769564620c4b871176cd143d"
+REPO_COMMIT = "ff56ef0d1b72940f29ccc8a377c63d47fa5788c1"
 
 ##########################################
 # Image and app definitions
@@ -147,6 +147,7 @@ runtime_image = (
     .run_commands(
         "python /usr/local/lib/python3.11/site-packages/protenix/model/layer_norm/layer_norm.py",
         gpu=GPU,
+        env={"LAYERNORM_TYPE": "fast_layernorm"},
     )
 )
 
@@ -346,6 +347,7 @@ def run_protenix(
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
+    use_fast_layernorm: bool = False,
     extra_args: str | None = None,
     score_only: bool = False,
 ) -> bytes:
@@ -366,6 +368,7 @@ def run_protenix(
         msa_server_mode: MSA search mode (protenix or colabfold).
         use_template: Whether to use templates.
         use_rna_msa: Whether to use RNA MSA.
+        use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel.
         extra_args: Additional CLI arguments as a string.
         score_only: When True, score an existing PDB/CIF structure using
             ``protenixscore score`` instead of running diffusion prediction.
@@ -376,6 +379,10 @@ def run_protenix(
 
     """
     import tempfile
+
+    run_env = os.environ.copy()
+    if use_fast_layernorm:
+        run_env["LAYERNORM_TYPE"] = "fast_layernorm"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -417,7 +424,6 @@ def run_protenix(
                 "PROTENIX_ROOT_DIR": DATA_DIR,
                 "PROTENIX_CHECKPOINT_DIR": str(Path(DATA_DIR) / "checkpoint"),
             }
-            run_env = os.environ.copy()
             run_env.update(env_override)
             run_command(cmd, env=run_env, cwd=out_dir)
 
@@ -527,7 +533,6 @@ def run_protenix(
             env_override = {
                 "PROTENIX_ROOT_DIR": DATA_DIR,
             }
-            run_env = os.environ.copy()
             run_env.update(env_override)
             run_command(cmd, env=run_env, cwd=out_dir)
 
@@ -561,6 +566,7 @@ def submit_protenix_task(
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
+    use_fast_layernorm: bool = False,
     download_models: bool = False,
     force_redownload: bool = False,
     extra_args: str | None = None,
@@ -583,6 +589,7 @@ def submit_protenix_task(
         msa_server_mode: MSA search mode (protenix or colabfold)
         use_template: Whether to use templates
         use_rna_msa: Whether to use RNA MSA features
+        use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel
         download_models: Whether to download model weights and skip running
         force_redownload: Whether to force re-download of model weights
         extra_args: Additional CLI arguments passed to protenix pred
@@ -641,6 +648,7 @@ def submit_protenix_task(
             run_name=run_name,
             model_name=model_name,
             dtype=dtype,
+            use_fast_layernorm=use_fast_layernorm,
             score_only=True,
         )
     else:
@@ -674,6 +682,7 @@ def submit_protenix_task(
             msa_server_mode=msa_server_mode,
             use_template=use_template,
             use_rna_msa=use_rna_msa,
+            use_fast_layernorm=use_fast_layernorm,
             extra_args=extra_args,
         )
 

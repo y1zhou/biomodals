@@ -113,7 +113,7 @@ TEMPLATE_CACHE_FILES = (
 
 # Repository and commit hash
 REPO_URL = "https://github.com/y1zhou/Protenix"
-REPO_COMMIT = "c5f95477039f88ba9fb0008d372d2a5e98e2b139"
+REPO_COMMIT = "688760e1dfe3b0100f5deb95757b2b04c52ee994"
 
 ##########################################
 # Image and app definitions
@@ -718,7 +718,7 @@ def submit_protenix_task(
             model_name=model_name,
             dtype=dtype,
             use_msa=use_msa,
-            msa_server_mode=msa_server_mode,
+            msa_server_mode="colabfold",
             use_fast_layernorm=use_fast_layernorm,
             score_only=True,
         )

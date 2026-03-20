@@ -445,6 +445,26 @@ def run_protenix(
             input_file = tmpdir_path / f"{run_name}{input_ext}"
             input_file.write_bytes(json_str)
 
+            # Map use_msa → --use_msas (both | false)
+            # ProtenixScore's use_msas controls which chain roles receive MSAs.
+            use_msas_val = "both" if use_msa else "false"
+
+            # Map msa_server_mode → --msa_host_url.
+            # The protenix remote server URL matches what `protenix msa` uses
+            # (MMSEQS_SERVICE_HOST_URL in protenix/web_service/colab_request_parser.py).
+            _PROTENIX_MSA_HOST = "https://protenix-server.com/api/msa"
+            _COLABFOLD_MSA_HOST = "https://api.colabfold.com"
+            msa_host_url = (
+                _PROTENIX_MSA_HOST
+                if msa_server_mode == "protenix"
+                else _COLABFOLD_MSA_HOST
+            )
+
+            # Cache fetched MSAs in the PREP volume so they can be reused across
+            # runs (separate sub-directory from the `protenix msa` cache).
+            score_msa_cache_dir = Path(PREP_DIR) / "score_msa_cache"
+            score_msa_cache_dir.mkdir(parents=True, exist_ok=True)
+
             cmd = [
                 "protenixscore",
                 "score",
@@ -456,6 +476,16 @@ def run_protenix(
                 model_name,
                 "--checkpoint_dir",
                 str(Path(DATA_DIR) / "checkpoint"),
+                "--dtype",
+                dtype,
+                "--use_msas",
+                use_msas_val,
+                "--msa_host_url",
+                msa_host_url,
+                "--msa_cache_dir",
+                str(score_msa_cache_dir),
+                "--msa_cache_mode",
+                "readwrite",
             ]
             env_override = {
                 "PROTENIX_ROOT_DIR": DATA_DIR,
@@ -464,6 +494,8 @@ def run_protenix(
             run_env.update(env_override)
             run_command(cmd, env=run_env, cwd=out_dir)
 
+            # Persist MSA cache back to the volume for reuse in future runs
+            PREP_VOLUME.commit()
             print("💊 Packaging ProtenixScore results...")
             tarball_bytes = package_outputs(str(out_dir))
             print("💊 Packaging complete.")
@@ -678,13 +710,15 @@ def submit_protenix_task(
     )
 
     if score_only:
-        # Score an existing structure; skip MSA preprocessing
+        # Score an existing structure; MSA fetching is handled inside run_protenix
         print(f"🧬 Scoring structure with {model_name}...")
         tarball_bytes = run_protenix.remote(
             json_str=json_str,
             run_name=run_name,
             model_name=model_name,
             dtype=dtype,
+            use_msa=use_msa,
+            msa_server_mode=msa_server_mode,
             use_fast_layernorm=use_fast_layernorm,
             score_only=True,
         )

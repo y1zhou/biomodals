@@ -113,7 +113,7 @@ TEMPLATE_CACHE_FILES = (
 
 # Repository and commit hash
 REPO_URL = "https://github.com/y1zhou/Protenix"
-REPO_COMMIT = "ff56ef0d1b72940f29ccc8a377c63d47fa5788c1"
+REPO_COMMIT = "c5f95477039f88ba9fb0008d372d2a5e98e2b139"
 
 ##########################################
 # Image and app definitions
@@ -142,12 +142,15 @@ runtime_image = (
             "UV_TORCH_BACKEND": "cu128",
         }
     )
-    .uv_pip_install(f"git+{REPO_URL}.git@{REPO_COMMIT}")
+    .run_commands(
+        f"git clone {REPO_URL}.git /Protenix && cd /Protenix && git checkout {REPO_COMMIT}"
+    )
+    .uv_pip_install("/Protenix[cu128]")
     # Trigger kernel compilation
     .run_commands(
         "python /usr/local/lib/python3.11/site-packages/protenix/model/layer_norm/layer_norm.py",
         gpu=GPU,
-        env={"LAYERNORM_TYPE": "fast_layernorm"},
+        env={"LAYERNORM_TYPE": "fast_layernorm"},  # default, but just in case
     )
 )
 

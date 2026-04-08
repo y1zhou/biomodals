@@ -1,5 +1,7 @@
 """Utility scripts for Biomodals apps."""
 
+from pathlib import Path
+
 
 def run_command(cmd: list[str], **kwargs) -> None:
     """Run a shell command and stream output to stdout."""
@@ -22,3 +24,16 @@ def run_command(cmd: list[str], **kwargs) -> None:
 
         if p.returncode != 0:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+
+
+def softlink_dir(src: str | Path, dst: str | Path) -> None:
+    """Create a soft link from src to dst if dst does not exist."""
+    src_path = Path(src)
+    dst_path = Path(dst)
+    if dst_path.exists():
+        print(f"Destination path {dst} already exists. Skipping link creation.")
+        return
+
+    src_path.mkdir(parents=True, exist_ok=True)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    dst_path.symlink_to(src_path, target_is_directory=True)

@@ -6,8 +6,6 @@ from pathlib import Path
 
 from pydantic import BaseModel, computed_field, model_validator
 
-from biomodals.app.constant import MODEL_VOLUME_MOUNTPOINT
-
 
 class AppConfig(BaseModel):
     """Base configuration model for Biomodals apps."""
@@ -36,7 +34,7 @@ class AppConfig(BaseModel):
     # Default execution timeout in seconds (https://modal.com/docs/guide/timeouts)
     timeout: int = int(os.environ.get("TIMEOUT", "1800"))
     # Location to cache model weights and other large artifacts
-    model_cache_root: str = MODEL_VOLUME_MOUNTPOINT
+    model_volume_mountpoint: str = "/biomodals-store"
 
     @computed_field
     @cached_property
@@ -52,7 +50,7 @@ class AppConfig(BaseModel):
     @cached_property
     def model_dir(self) -> Path:
         """Directory to store model weights."""
-        return Path(self.model_cache_root) / self.name
+        return Path(self.model_volume_mountpoint) / self.name
 
     @model_validator(mode="after")
     def ensure_package_info(self):

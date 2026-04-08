@@ -52,7 +52,7 @@ from pathlib import Path
 from modal import App, Image
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MODEL_VOLUME, MODEL_VOLUME_MOUNTPOINT
+from biomodals.app.constant import MODEL_VOLUME
 from biomodals.app.utils import run_command, softlink_dir
 
 ##########################################
@@ -112,7 +112,7 @@ def package_outputs(
 ##########################################
 @app.function(
     cpu=(1.125, 16.125),
-    volumes={MODEL_VOLUME_MOUNTPOINT: MODEL_VOLUME},
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
     timeout=CONF.timeout * 10,
 )
 def download_abnativ_models(force: bool = False) -> None:
@@ -140,7 +140,7 @@ def download_abnativ_models(force: bool = False) -> None:
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={MODEL_VOLUME_MOUNTPOINT: MODEL_VOLUME.read_only()},
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
 )
 def abnativ_score_unpaired(
     fasta_bytes: bytes,
@@ -201,7 +201,7 @@ def abnativ_score_unpaired(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={MODEL_VOLUME_MOUNTPOINT: MODEL_VOLUME.read_only()},
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
 )
 def abnativ_score_paired(
     csv_bytes: bytes,

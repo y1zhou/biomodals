@@ -51,6 +51,8 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
+from biomodals.app.utils import run_command
+
 ##########################################
 # Modal configs
 ##########################################
@@ -80,6 +82,7 @@ runtime_image = (
     .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
     .micromamba_install(["anarci"], channels=["bioconda"])
     .uv_pip_install("abnativ==2.0.3")
+    .add_local_python_source("biomodals")
 )
 
 app = App(APP_NAME, image=runtime_image)
@@ -104,29 +107,6 @@ def package_outputs(
     return sp.check_output(
         cmd, cwd=dir_path.parent, env=os.environ | {"ZSTD_NBTHREADS": str(num_threads)}
     )  # noqa: S603
-
-
-def run_command(cmd: list[str], **kwargs) -> None:
-    """Run a shell command and stream output to stdout."""
-    import subprocess as sp
-
-    print(f"Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
 ##########################################

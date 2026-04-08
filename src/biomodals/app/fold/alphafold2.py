@@ -60,7 +60,6 @@ def score_af2m_binding(
             - "ipae" (dict[int, float]): Average interface PAE between the target and each binder, keyed by binder index.
             - "ipae_binder" (dict[int, list[float]]): Per-residue interface PAE scores for each binder interacting with the target, keyed by binder index.
     """
-
     import numpy as np
 
     plddt_array = np.array(af2m_dict["plddt"])
@@ -161,6 +160,7 @@ def alphafold(
     import json
     import subprocess
     import zipfile
+
     from colabfold.batch import get_queries, run
     from colabfold.download import default_data_dir
 

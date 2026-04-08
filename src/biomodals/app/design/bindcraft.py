@@ -139,13 +139,13 @@ def bindcraft(
         load_af2_models,
         load_helicity,
         load_json_settings,
-        predict_binder_complex,
         mk_afdesign_model,
         mpnn_gen_sequence,
         perform_advanced_settings_check,
         pr,
         pr_relax,
         predict_binder_alone,
+        predict_binder_complex,
         save_fasta,
         score_interface,
         target_pdb_rmsd,
@@ -284,7 +284,7 @@ def bindcraft(
     print(f"Loaded design functions and settings at: {currenttime}")
 
     pr.init(
-        f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1'
+        f"-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {advanced_settings['dalphaball_path']} -corrections::beta_nov16 true -relax:default_repeats 1"
     )
 
     ####################################
@@ -547,9 +547,9 @@ def bindcraft(
                             advanced_settings["optimise_beta"]
                             and float(trajectory_beta) > 15
                         ):
-                            advanced_settings[
-                                "num_recycles_validation"
-                            ] = advanced_settings["optimise_beta_recycles_valid"]
+                            advanced_settings["num_recycles_validation"] = (
+                                advanced_settings["optimise_beta_recycles_valid"]
+                            )
 
                         ### Compile prediction models once for faster prediction of MPNN sequences
                         clear_mem()
@@ -633,11 +633,11 @@ def bindcraft(
                             for model_num in prediction_models:
                                 mpnn_design_pdb = os.path.join(
                                     design_paths["MPNN"],
-                                    f"{mpnn_design_name}_model{model_num+1}.pdb",
+                                    f"{mpnn_design_name}_model{model_num + 1}.pdb",
                                 )
                                 mpnn_design_relaxed = os.path.join(
                                     design_paths["MPNN/Relaxed"],
-                                    f"{mpnn_design_name}_model{model_num+1}.pdb",
+                                    f"{mpnn_design_name}_model{model_num + 1}.pdb",
                                 )
 
                                 if os.path.exists(mpnn_design_pdb):
@@ -772,7 +772,7 @@ def bindcraft(
                             for model_num in prediction_models:
                                 mpnn_binder_pdb = os.path.join(
                                     design_paths["MPNN/Binder"],
-                                    f"{mpnn_design_name}_model{model_num+1}.pdb",
+                                    f"{mpnn_design_name}_model{model_num + 1}.pdb",
                                 )
 
                                 if os.path.exists(mpnn_binder_pdb):

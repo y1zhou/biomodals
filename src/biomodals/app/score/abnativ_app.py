@@ -1,4 +1,4 @@
-r"""AbNatiV source repo: <https://gitlab.developers.cam.ac.uk/ch/sormanni/abnativ>.
+r"""AbNatiV source repo: <https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ>.
 
 ## Configuration
 
@@ -43,25 +43,30 @@ r"""AbNatiV source repo: <https://gitlab.developers.cam.ac.uk/ch/sormanni/abnati
 * When `--model-type` is set to `paired`, the `--input-fasta-or-seq` argument is ignored, and sequences are read from either `--input-paired-csv` or the combination of `--input-vh-seq` and `--input-vl-seq`.
 * In paired mode, `--input-paired-csv` takes precedence over `--input-vh-seq` and `--input-vl-seq` if both are provided.
 """
+
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
-
 import os
 from pathlib import Path
 
 from modal import App, Image
 
+from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME, MODEL_VOLUME_MOUNTPOINT
 from biomodals.app.utils import run_command, softlink_dir
 
 ##########################################
 # Modal configs
 ##########################################
-# T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "A10G")
-TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # seconds
-APP_NAME = os.environ.get("MODAL_APP", "AbNatiV")
+CONF = AppConfig(
+    name="AbNatiV",
+    repo_url="https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ",
+    package_name="abnativ",
+    version="2.0.3",
+    python_version="3.12",
+    cuda_version="cu128",
+    gpu=os.environ.get("GPU", "A10G"),
+)
 
 # AbNatiV hard-coded cache directory for model weights
 ABNATIV_MODEL_DIR = "/root/.abnativ/models/pretrained_models"
@@ -70,22 +75,15 @@ ABNATIV_MODEL_DIR = "/root/.abnativ/models/pretrained_models"
 # Image and app definitions
 ##########################################
 runtime_image = (
-    Image.micromamba(python_version="3.12")
+    Image.micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget", "zstd")
-    .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu128",  # find best torch and CUDA versions
-        }
-    )
+    .env(CONF.default_env)
     .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
     .micromamba_install(["anarci"], channels=["bioconda"])
-    .uv_pip_install("abnativ==2.0.3")
+    .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
     .add_local_python_source("biomodals")
 )
-
-app = App(APP_NAME, image=runtime_image)
+app = App(CONF.name, image=runtime_image)
 
 
 ##########################################
@@ -115,12 +113,12 @@ def package_outputs(
 @app.function(
     cpu=(1.125, 16.125),
     volumes={MODEL_VOLUME_MOUNTPOINT: MODEL_VOLUME},
-    timeout=TIMEOUT * 10,
+    timeout=CONF.timeout * 10,
 )
 def download_abnativ_models(force: bool = False) -> None:
     """Download AbNatiV models into the mounted volume."""
     # Make soft link from AbNatiV's expected model directory to the mounted volume
-    softlink_dir(Path(MODEL_VOLUME_MOUNTPOINT) / APP_NAME, ABNATIV_MODEL_DIR)
+    softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
 
     # Download all artifacts
     print("Downloading AbNatiV models...")
@@ -137,11 +135,11 @@ def download_abnativ_models(force: bool = False) -> None:
 # Inference functions
 ##########################################
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
+    timeout=CONF.timeout,
     volumes={MODEL_VOLUME_MOUNTPOINT: MODEL_VOLUME.read_only()},
 )
 def abnativ_score_unpaired(
@@ -157,7 +155,7 @@ def abnativ_score_unpaired(
     """Manage AbNatiV runs and return all score results."""
     from tempfile import TemporaryDirectory
 
-    softlink_dir(Path(MODEL_VOLUME_MOUNTPOINT) / APP_NAME, ABNATIV_MODEL_DIR)
+    softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
 
     with TemporaryDirectory() as tmpdir:
         work_path = Path(tmpdir) / f"{output_id}_abnativ_{nativeness_type}"
@@ -198,11 +196,11 @@ def abnativ_score_unpaired(
 
 
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
+    timeout=CONF.timeout,
     volumes={MODEL_VOLUME_MOUNTPOINT: MODEL_VOLUME.read_only()},
 )
 def abnativ_score_paired(
@@ -216,7 +214,7 @@ def abnativ_score_paired(
     """Manage AbNatiV runs and return all score results."""
     from tempfile import TemporaryDirectory
 
-    softlink_dir(Path(MODEL_VOLUME_MOUNTPOINT) / APP_NAME, ABNATIV_MODEL_DIR)
+    softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
 
     with TemporaryDirectory() as tmpdir:
         work_path = Path(tmpdir) / f"{output_id}_abnativ_paired"
@@ -307,9 +305,9 @@ def submit_abnativ_task(
 
     # Set up output paths
     print("🧬 Starting AbNatiV run...")
-    if out_dir is None:
-        out_dir = Path.cwd()
-    local_out_dir = Path(out_dir).expanduser().resolve()
+    local_out_dir = (
+        (Path(out_dir) if out_dir is not None else Path.cwd()).expanduser().resolve()
+    )
     local_out_dir.mkdir(parents=True, exist_ok=True)
     out_zst_file = local_out_dir / f"{run_name}_abnativ_{model_type}.tar.zst"
     if out_zst_file.exists():

@@ -1,0 +1,80 @@
+"""Common configurations for Biomodals apps."""
+
+import os
+from functools import cached_property
+from pathlib import Path
+
+from pydantic import BaseModel, computed_field, model_validator
+
+from biomodals.app.constant import MODEL_VOLUME_MOUNTPOINT
+
+
+class AppConfig(BaseModel):
+    """Base configuration model for Biomodals apps."""
+
+    # Metadata
+    name: str
+    repo_url: str | None = None
+    repo_commit_hash: str | None = None
+    package_name: str | None = None
+    version: str | None = None
+    python_version: str | None = None
+
+    # Runtime configs
+    # Model GPU (https://modal.com/docs/guide/gpu)
+    # 16GB: T4
+    # 24GB: L4, A10G
+    # 40GB: A100-40G, A100 (using A100 may cause Modal to auto-upgrade to A100-80G)
+    # 48GB: L40S
+    # 80GB: A100-80G, H100 (may auto-upgrade to H200, use H100! to avoid)
+    # 96GB: RTX-PRO-6000
+    # 141GB: H200
+    # 180GB: B200 (B200+ may auto-upgrade to B300, which requires CUDA13.0+)
+    gpu: str = "A10G"
+    # https://modal.com/docs/guide/cuda
+    cuda_version: str = "cu128"
+    # Default execution timeout in seconds (https://modal.com/docs/guide/timeouts)
+    timeout: int = int(os.environ.get("TIMEOUT", "1800"))
+    # Location to cache model weights and other large artifacts
+    model_cache_root: str = MODEL_VOLUME_MOUNTPOINT
+
+    @computed_field
+    @cached_property
+    def default_env(self) -> dict[str, str]:
+        """Environment variables to set in the runtime image."""
+        return {
+            "UV_COMPILE_BYTECODE": "0",  # slower image build, faster runtime
+            "HF_XET_HIGH_PERFORMANCE": "1",
+            "UV_TORCH_BACKEND": self.cuda_version,
+        }
+
+    @computed_field
+    @cached_property
+    def model_dir(self) -> Path:
+        """Directory to store model weights."""
+        return Path(self.model_cache_root) / self.name
+
+    @model_validator(mode="after")
+    def ensure_package_info(self):
+        """Ensure that the package information is complete."""
+        if self.repo_url is None and self.package_name is None:
+            raise ValueError(
+                "At least one of 'repo_url' or 'package_name' must be provided."
+            )
+        if self.repo_commit_hash is None and self.version is None:
+            raise ValueError(
+                "Provide 'repo_commit_hash' or 'version' for reproducibility."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def ensure_cuda_gpu_compatibility(self):
+        """Ensure that the specified CUDA version is compatible with the GPU."""
+        if not self.cuda_version.startswith("cu"):
+            raise ValueError("CUDA version must start with 'cu', e.g., 'cu128'.")
+
+        is_cu12 = self.cuda_version.startswith("cu12")
+        if is_cu12 and self.gpu.startswith("B200+"):
+            raise ValueError("CUDA 12.x is not compatible with 'B200+ / B300' GPU.")
+
+        return self

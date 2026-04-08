@@ -67,19 +67,24 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MODEL_VOLUME
+from biomodals.app.utils import download_files, run_command
+
 ##########################################
 # Modal configs
 ##########################################
-# T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "L40S")
-TIMEOUT = int(os.environ.get("TIMEOUT", "3600"))  # seconds
-APP_NAME = os.environ.get("MODAL_APP", "Protenix")
-
-# Volume for model weights and data caches
-DATA_VOLUME_NAME = "protenix-data"
-DATA_VOLUME = Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
-DATA_DIR = "/protenix-data"
+CONF = AppConfig(
+    name="Protenix",
+    repo_url="https://github.com/y1zhou/Protenix",
+    repo_commit_hash="688760e1dfe3b0100f5deb95757b2b04c52ee994",
+    package_name="protenix",
+    version="1.0.0",
+    python_version="3.11",
+    cuda_version="cu130",
+    gpu=os.environ.get("GPU", "L40S"),
+    timeout=int(os.environ.get("TIMEOUT", "86400")),
+)
 
 # Volume for preprocessed MSA/template intermediates
 PREP_VOLUME_NAME = "protenix-msa"
@@ -111,22 +116,18 @@ TEMPLATE_CACHE_FILES = (
     "common/release_date_cache.json",
 )
 
-# Repository and commit hash
-REPO_URL = "https://github.com/y1zhou/Protenix"
-REPO_COMMIT = "688760e1dfe3b0100f5deb95757b2b04c52ee994"
-
 ##########################################
 # Image and app definitions
 ##########################################
 
 # https://modal.com/docs/guide/cuda#for-more-complex-setups-use-an-officially-supported-cuda-image
-cuda_version = "12.8.1"  # should be no greater than host CUDA version
+cuda_version = CONF.cuda_version_numeric  # should be no greater than host CUDA version
 flavor = "devel"  # includes full CUDA toolkit
 operating_sys = "ubuntu24.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
 runtime_image = (
-    Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
+    Image.from_registry(f"nvidia/cuda:{tag}", add_python=CONF.python_version)
     .apt_install(
         "git",
         "build-essential",
@@ -136,25 +137,29 @@ runtime_image = (
         "wget",
     )
     .env(
-        {
+        CONF.default_env
+        | {
             "PYTHONUNBUFFERED": "1",
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu128",
+            "PROTENIX_ROOT_DIR": str(CONF.model_dir),
+            "PROTENIX_CHECKPOINT_DIR": str(CONF.model_dir / "checkpoint"),
         }
     )
     .run_commands(
-        f"git clone {REPO_URL}.git /Protenix && cd /Protenix && git checkout {REPO_COMMIT}"
+        f"git clone {CONF.repo_url}.git /{CONF.name}"
+        f" && cd /{CONF.name}"
+        f" && git checkout {CONF.repo_commit_hash}"
     )
-    .uv_pip_install("/Protenix[cu128]")
+    .uv_pip_install(f"/{CONF.name}[{CONF.cuda_version}]")
     # Trigger kernel compilation
     .run_commands(
         "python /usr/local/lib/python3.11/site-packages/protenix/model/layer_norm/layer_norm.py",
-        gpu=GPU,
+        gpu=CONF.gpu,
         env={"LAYERNORM_TYPE": "fast_layernorm"},  # default, but just in case
     )
+    .uv_pip_install("aiofiles", "niquests", "pydantic", "tqdm")
+    .add_local_python_source("biomodals")
 )
-
-app = App(APP_NAME, image=runtime_image)
+app = App(CONF.name, image=runtime_image)
 
 
 ##########################################
@@ -176,47 +181,12 @@ def package_outputs(
     return sp.check_output(cmd, cwd=dir_path.parent)
 
 
-def run_command(cmd: list[str], **kwargs) -> None:
-    """Run a shell command and stream output to stdout."""
-    import subprocess as sp
-
-    print(f"💊 Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("stdout is None")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-
-        if p.returncode != 0:
-            raise RuntimeError(f"Command failed with return code {p.returncode}")
-
-
-def download_from_url(url: str, local_path: Path, force: bool = False) -> None:
-    """Download a file from a URL if it doesn't already exist."""
-    import urllib.request
-
-    if local_path.exists() and not force:
-        print(f"  ✓ Already exists: {local_path.name}")
-        return
-
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"  ⬇ Downloading: {url}")
-    urllib.request.urlretrieve(url, str(local_path))  # noqa: S310
-    print(f"  ✓ Saved to: {local_path}")
-
-
 ##########################################
 # Fetch model weights and data caches
 ##########################################
-@app.function(volumes={DATA_DIR: DATA_VOLUME}, timeout=TIMEOUT)
+@app.function(
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME}, timeout=CONF.timeout
+)
 def download_protenix_data(
     model_name: str = "protenix_base_default_v1.0.0",
     force: bool = False,
@@ -230,31 +200,33 @@ def download_protenix_data(
         include_templates: Also download template-related data files.
 
     """
-    data_root = Path(DATA_DIR)
+    data_root = CONF.model_dir
+    files_to_download: dict[str, str | Path] = {}
 
     # Download common data caches
-    print("💊 Downloading Protenix data caches...")
-    for rel_path in DATA_CACHE_FILES:
-        url = f"{PROTENIX_DOWNLOAD_BASE}/{rel_path}"
-        download_from_url(url, data_root / rel_path, force=force)
+    data_caches = {
+        f"{PROTENIX_DOWNLOAD_BASE}/{rel_path}": data_root / rel_path
+        for rel_path in DATA_CACHE_FILES
+    }
+    files_to_download = files_to_download | data_caches
 
     # Download template data if requested
     if include_templates:
-        print("💊 Downloading template data files...")
-        for rel_path in TEMPLATE_CACHE_FILES:
-            url = f"{PROTENIX_DOWNLOAD_BASE}/{rel_path}"
-            download_from_url(url, data_root / rel_path, force=force)
+        template_caches = {
+            f"{PROTENIX_DOWNLOAD_BASE}/{rel_path}": data_root / rel_path
+            for rel_path in TEMPLATE_CACHE_FILES
+        }
+        files_to_download = files_to_download | template_caches
 
     # Download model checkpoint
-    print(f"💊 Downloading model checkpoint: {model_name}")
     ckpt_url = f"{PROTENIX_DOWNLOAD_BASE}/checkpoint/{model_name}.pt"
-    download_from_url(
-        url=ckpt_url,
-        local_path=data_root / "checkpoint" / f"{model_name}.pt",
-        force=force,
+    files_to_download = files_to_download | {
+        ckpt_url: data_root / "checkpoint" / f"{model_name}.pt"
+    }
+    download_files(
+        files_to_download, force=force, progress_bar_desc="💊 Downloading Protenix data"
     )
-
-    DATA_VOLUME.commit()
+    MODEL_VOLUME.commit()
     print("💊 Download complete")
 
 
@@ -262,8 +234,8 @@ def download_protenix_data(
 # Inference functions
 ##########################################
 @app.function(
-    timeout=TIMEOUT,
-    volumes={DATA_DIR: DATA_VOLUME, PREP_DIR: PREP_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME, PREP_DIR: PREP_VOLUME},
 )
 def prepare_protenix_inputs(
     json_str: bytes,
@@ -301,12 +273,6 @@ def prepare_protenix_inputs(
     input_stem = input_json_path.stem
 
     if use_msa or use_template or use_rna_msa:
-        env_override = {
-            "PROTENIX_ROOT_DIR": DATA_DIR,
-        }
-        run_env = os.environ.copy()
-        run_env.update(env_override)
-
         if use_template:
             # `protenix prep` (inputprep) runs MSA + template + RNA MSA search.
             # It first produces `input-update-msa.json`, then (if template or RNA
@@ -321,7 +287,7 @@ def prepare_protenix_inputs(
                 "--msa_server_mode",
                 msa_server_mode,
             ]
-            run_command(cmd, env=run_env, cwd=cache_dir)
+            run_command(cmd, cwd=cache_dir)
 
             # Prefer the fully-updated file; fall back to MSA-only update.
             expected_files = [
@@ -340,7 +306,7 @@ def prepare_protenix_inputs(
                 "--msa_server_mode",
                 msa_server_mode,
             ]
-            run_command(cmd, env=run_env, cwd=cache_dir)
+            run_command(cmd, cwd=cache_dir)
 
             expected_files = [
                 cache_dir / f"{input_stem}-update-msa.json",
@@ -364,11 +330,15 @@ def prepare_protenix_inputs(
 
 
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={DATA_DIR: DATA_VOLUME, PREP_DIR: PREP_VOLUME, OUTPUT_DIR: OUTPUT_VOLUME},
+    timeout=CONF.timeout,
+    volumes={
+        CONF.model_volume_mountpoint: MODEL_VOLUME,
+        PREP_DIR: PREP_VOLUME,
+        OUTPUT_DIR: OUTPUT_VOLUME,
+    },
 )
 def run_protenix(
     json_str: bytes | None,
@@ -474,8 +444,6 @@ def run_protenix(
                 str(out_dir),
                 "--model_name",
                 model_name,
-                "--checkpoint_dir",
-                str(Path(DATA_DIR) / "checkpoint"),
                 "--dtype",
                 dtype,
                 "--use_msas",
@@ -487,11 +455,6 @@ def run_protenix(
                 "--msa_cache_mode",
                 "readwrite",
             ]
-            env_override = {
-                "PROTENIX_ROOT_DIR": DATA_DIR,
-                "PROTENIX_CHECKPOINT_DIR": str(Path(DATA_DIR) / "checkpoint"),
-            }
-            run_env.update(env_override)
             run_command(cmd, env=run_env, cwd=out_dir)
 
             # Persist MSA cache back to the volume for reuse in future runs
@@ -599,10 +562,6 @@ def run_protenix(
             if extra_args:
                 cmd.extend(shlex.split(extra_args))
 
-            env_override = {
-                "PROTENIX_ROOT_DIR": DATA_DIR,
-            }
-            run_env.update(env_override)
             run_command(cmd, env=run_env, cwd=out_dir)
 
             # Persist new outputs to the volume so interrupted runs can resume

@@ -52,6 +52,51 @@ class AppConfig(BaseModel):
         """Directory to store model weights."""
         return Path(self.model_volume_mountpoint) / self.name
 
+    @computed_field
+    @cached_property
+    def cuda_version_numeric(self) -> str:
+        """Numeric CUDA version, e.g., '128' for 'cu128'.
+
+        https://github.com/astral-sh/uv/blob/main/crates/uv-torch/src/backend.rs
+        """
+        if not self.cuda_version.startswith("cu"):
+            return ""
+
+        available_uv_backends = {
+            "130",
+            "129",
+            "128",
+            "126",
+            "125",
+            "124",
+            "123",
+            "122",
+            "121",
+            "120",
+            "118",
+            "117",
+            "116",
+            "115",
+            "114",
+            "113",
+            "112",
+            "111",
+            "110",
+            "102",
+            "101",
+            "100",
+            "92",
+            "91",
+            "90",
+        }
+
+        if (cuda_ver := self.cuda_version[2:]) not in available_uv_backends:
+            raise ValueError(
+                f"CUDA version {self.cuda_version} is not supported by UV. "
+                f"Available versions: {available_uv_backends}"
+            )
+        return f"{cuda_ver[:-1]}.{cuda_ver[-1]}.0"
+
     @model_validator(mode="after")
     def ensure_package_info(self):
         """Ensure that the package information is complete."""

@@ -242,39 +242,6 @@ def collect_outputs_for_bundle(root_dir: str | Path) -> list[Path]:
     return sorted(files, key=lambda p: str(p))
 
 
-def package_dir_to_tar_zst(dir_path: str | Path) -> bytes:
-    """Package an entire directory into a tar.zst and return bytes."""
-    import subprocess as sp
-
-    dp = Path(dir_path)
-    cmd = ["tar", "--zstd", "-cf", "-", dp.name]
-    return sp.check_output(cmd, cwd=str(dp.parent))  # noqa: S603
-
-
-def package_files_to_tar_zst(files: list[Path], base_dir: str | Path) -> bytes:
-    """Create a tar.zst containing only selected files (relative to base_dir)."""
-    import subprocess as sp
-    import tempfile
-
-    base = Path(base_dir)
-
-    # Ensure all files are under base (avoid tar errors + path traversal).
-    rel_paths: list[str] = []
-    for p in files:
-        rel_paths.append(str(Path(p).relative_to(base)))
-
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-        for rel in rel_paths:
-            f.write(rel + "\n")
-        filelist = f.name
-
-    try:
-        cmd = ["tar", "--zstd", "-cf", "-", "-C", str(base), "-T", filelist]
-        return sp.check_output(cmd)  # noqa: S603
-    finally:
-        Path(filelist).unlink(missing_ok=True)
-
-
 # -------------------------
 # Step 1: download model weights into the models Volume
 # -------------------------
@@ -402,13 +369,8 @@ def rfdiffusion_infer(
         RFD_OUT_VOLUME.commit()
 
         # ---- bundle outputs for return ----
-        selected = collect_outputs_for_bundle(str(run_dir))
-        if selected:
-            tar_bytes = package_files_to_tar_zst(selected, base_dir=str(run_dir))
-        else:
-            tar_bytes = package_dir_to_tar_zst(str(run_dir))
-
-        return tar_bytes
+        selected = collect_outputs_for_bundle(run_dir)
+        return package_outputs(run_dir, paths_to_bundle=selected)
 
 
 # -------------------------

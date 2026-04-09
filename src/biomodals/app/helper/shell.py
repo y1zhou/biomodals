@@ -11,7 +11,7 @@ from biomodals.app.helper.internal import timed_function
 
 def run_command(
     cmd: list[str] | str, *, rich_print_kwargs: dict | None = None, **kwargs
-) -> None:
+) -> list[str]:
     """Run a shell command and stream output to stdout."""
     import os
     import shlex
@@ -42,15 +42,19 @@ def run_command(
     else:
         kwargs["env"] = default_env | kwargs["env"]
 
+    all_outputs: list[str] = []
     with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
         if p.stdout is None:
             raise RuntimeError("Failed to capture stdout from the command.")
 
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
             print(buffered_output, **print_kwargs)
+            all_outputs.append(buffered_output.rstrip("\n"))
 
         if p.returncode != 0:
             raise sp.CalledProcessError(p.returncode, cmd)
+
+        return all_outputs
 
 
 def run_command_with_log(cmd: list[str] | str, log_file: str | Path, **kwargs) -> None:
@@ -115,6 +119,8 @@ def package_outputs(
     Args:
         root: Root directory in the archive. All paths will be relative to this.
         paths_to_bundle: Specific paths (relative to root) to include in the archive.
+            It is also okay if these paths are absolute, as long as they are under
+            the root directory. If None, the entire root directory will be included.
         tar_args: Additional arguments to pass to `tar`. For example, you can
             use `--exclude` to skip certain files or directories, or `-h` to
             follow symlinks. See `man tar` for details.
@@ -122,14 +128,24 @@ def package_outputs(
     """
     import shutil
     import subprocess as sp
+    import tempfile
 
     # Ensure zstd is available
     if shutil.which("zstd") is None:
         raise RuntimeError("zstd is not installed or not found in PATH.")
 
-    # TODO: check effect of symlinks
     root_path = Path(root).resolve()
-    cmd = ["tar", "-I", f"zstd -T{num_threads}", "-O"]  # ZSTD_NBTHREADS
+    if root_path.is_file():
+        warnings.warn(
+            f"root_path '{root_path}' should be a directory; skipping 'paths_to_bundle'.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        paths_to_bundle = [root_path.name]
+        root_path = root_path.parent
+
+    workdir = root_path.parent  # We want the tarball to contain a top-level dir
+    cmd = ["tar", "-I", f"zstd -T{num_threads}", "-O"]  # $ZSTD_NBTHREADS
     if tar_args is not None:
         cmd.extend(tar_args)
 
@@ -146,6 +162,8 @@ def package_outputs(
                 stacklevel=2,
             )
             continue
+
+        # TODO: deal with symlinks
         if not out_path.resolve().is_relative_to(root_path):
             warnings.warn(
                 f"'{p}' is not under the root '{root_path}' and will be skipped.",
@@ -154,14 +172,19 @@ def package_outputs(
             )
             continue
 
-        cmd_paths.append(str(out_path.relative_to(root_path.parent, walk_up=False)))
+        cmd_paths.append(str(out_path.relative_to(workdir, walk_up=False)))
 
     # If no valid subpaths, use all of the root directory
     if not cmd_paths:
-        cmd_paths = [str(root_path.name)]
+        return sp.check_output([*cmd, "-c", root_path.name], cwd=workdir)  # noqa: S603
 
-    cmd.extend(["-c", *cmd_paths])
-    return sp.check_output(cmd, cwd=root_path.parent)  # noqa: S603
+    # Write the list of paths to a temporary file and use --files-from to pass to tar
+    # We use this instead of passing paths directly to avoid issues
+    # with very long command lines when there are many files in cmd_paths
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".list") as tmp_file:
+        tmp_file.write("\n".join(cmd_paths))
+        tmp_file.flush()
+        return sp.check_output([*cmd, "-c", "-T", tmp_file.name], cwd=workdir)  # noqa: S603
 
 
 def softlink_dir(src: str | Path, dst: str | Path) -> None:

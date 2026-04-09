@@ -33,8 +33,8 @@
 * The output directory will contain a `run-config.json` file with the run parameters used.
 * Inference results will be saved as `<model-name>_models.tar.zst` files. Extract them and analyze results using `abcfold2 postprocess`.
 """
-# Ignore ruff warnings about import location and unsafe subprocess usage
-# ruff: noqa: PLC0415, S603
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 
 import os
 from pathlib import Path

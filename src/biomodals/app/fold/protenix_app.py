@@ -56,8 +56,8 @@
   files produced by `protenixscore score`.
 """
 
-# Ignore ruff warnings about import location and unsafe subprocess usage
-# ruff: noqa: PLC0415, S603
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 
 import os
 import shlex

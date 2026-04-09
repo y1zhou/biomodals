@@ -65,6 +65,8 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
+from biomodals.app.helper.shell import package_outputs, run_command
+
 # -------------------------
 # Modal configs
 # -------------------------
@@ -156,6 +158,7 @@ runtime_image = (
         "python -m pip install --no-cache-dir -r requirements.txt && "
         "python setup.py install"
     )
+    .add_local_python_source("biomodals")
 )
 
 
@@ -184,42 +187,6 @@ def validate_run_name(run_name: str) -> str:
     if ".." in run_name:
         raise ValueError("Invalid --run-name: '..' is not allowed.")
     return run_name
-
-
-def run_command(cmd: list[str], cwd: str | Path | None = None, **kwargs) -> None:
-    """Run a command and stream stdout/stderr.
-
-    This is intentionally a thin wrapper around `subprocess.Popen` to:
-    - avoid shell invocation (argv list only)
-    - surface live logs in Modal
-    - raise on non-zero exit
-
-    Args:
-        cmd: Command argv list (no shell).
-        cwd: Optional working directory.
-        **kwargs: Passed through to `subprocess.Popen` (e.g., env=...).
-    """
-    import shlex
-    import subprocess as sp
-
-    cwd_str = str(cwd) if cwd is not None else None
-    print("Running:", shlex.join(cmd), f"(cwd={cwd_str})" if cwd_str else "")
-
-    # Default streaming settings; callers may override via kwargs.
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("text", True)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, cwd=cwd_str, **kwargs) as p:  # noqa: S603
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-        rc = p.wait()
-        if rc != 0:
-            raise sp.CalledProcessError(rc, cmd, buffered_output)
 
 
 def _require_fd() -> None:

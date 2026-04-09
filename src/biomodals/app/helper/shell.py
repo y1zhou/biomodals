@@ -9,27 +9,95 @@ from pathlib import Path
 from biomodals.app.helper.internal import timed_function
 
 
-def run_command(cmd: list[str], **kwargs) -> None:
+def run_command(
+    cmd: list[str] | str, *, rich_print_kwargs: dict | None = None, **kwargs
+) -> None:
     """Run a shell command and stream output to stdout."""
+    import os
+    import shlex
     import subprocess as sp
 
-    print(f"Running command: {' '.join(cmd)}")
+    print_kwargs = {"end": "", "flush": True}
+    try:
+        from rich import print
+
+        if rich_print_kwargs is not None:
+            print_kwargs = print_kwargs | rich_print_kwargs
+    except ImportError:
+        pass
+
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+
+    print(f"Running command: {shlex.join(cmd)}")
     # Set default kwargs for sp.Popen
     kwargs.setdefault("stdout", sp.PIPE)
     kwargs.setdefault("stderr", sp.STDOUT)
     kwargs.setdefault("bufsize", 1)
     kwargs.setdefault("encoding", "utf-8")
 
+    default_env = os.environ | {"SYSTEMD_COLORS": "1"}
+    if "env" not in kwargs:
+        kwargs["env"] = default_env
+    else:
+        kwargs["env"] = default_env | kwargs["env"]
+
     with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
         if p.stdout is None:
             raise RuntimeError("Failed to capture stdout from the command.")
 
-        buffered_output = None
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
+            print(buffered_output, **print_kwargs)
 
         if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
+            raise sp.CalledProcessError(p.returncode, cmd)
+
+
+def run_command_with_log(cmd: list[str] | str, log_file: str | Path, **kwargs) -> None:
+    """Run a shell command and log output to a file."""
+    import shlex
+    import subprocess as sp
+    from datetime import UTC, datetime
+    from time import time
+
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+
+    cmd_str = shlex.join(cmd)
+    print(f"Running command: {cmd_str}")
+
+    kwargs.setdefault("stdout", sp.PIPE)
+    kwargs.setdefault("stderr", sp.STDOUT)
+    kwargs.setdefault("bufsize", 1)
+    kwargs.setdefault("encoding", "utf-8")
+
+    log_path = Path(log_file)
+    banner = "=" * 100
+    now = time()
+    with (
+        log_path.open("a", buffering=1) as f,
+        sp.Popen(cmd, **kwargs) as p,  # noqa: S603
+    ):
+        if p.stdout is None:
+            raise RuntimeError("Failed to capture stdout from the command.")
+
+        f.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
+        f.write(f"Running command: {cmd_str}\n{banner}\n")
+
+        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
+            f.write(buffered_output)
+
+        f.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
+        f.write(f"Elapsed time: {time() - now:.2f} seconds\n")
+
+        if p.returncode != 0:
+            warnings.warn(
+                f"Command '{cmd_str}' failed with return code {p.returncode}. "
+                f"Check log file {log_path} for details.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            raise sp.CalledProcessError(p.returncode, cmd)
 
 
 @timed_function

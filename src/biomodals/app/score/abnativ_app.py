@@ -44,8 +44,8 @@ r"""AbNatiV source repo: <https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ>.
 * In paired mode, `--input-paired-csv` takes precedence over `--input-vh-seq` and `--input-vl-seq` if both are provided.
 """
 
-# Ignore ruff warnings about import location and unsafe subprocess usage
-# ruff: noqa: PLC0415, S603
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 import os
 from pathlib import Path
 

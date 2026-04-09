@@ -2,12 +2,14 @@
 
 import importlib
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
+
+from biomodals.app.helper.shell import run_command as _run_command
 
 # ruff: noqa: S603
 APP_HOME = Path(__file__).parent.resolve() / "app"
@@ -53,38 +55,6 @@ def app_path_to_module_path(app_path: Path) -> str:
         .replace("-", "_")
     )
     return f"biomodals.app.{module_path}"
-
-
-def _run_command(
-    cmd: list[str], console_kwargs: dict[str, Any] | None = None, **kwargs
-) -> None:
-    """Run a shell command and stream output to stdout."""
-    import os
-    import subprocess as sp
-
-    console.print(f"Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    default_env = os.environ | {"SYSTEMD_COLORS": "1"}
-    if "env" not in kwargs:
-        kwargs["env"] = default_env
-    else:
-        kwargs["env"] = default_env | kwargs["env"]
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            console.print(buffered_output, end="", **console_kwargs or {})
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
 ##########################################
@@ -254,7 +224,7 @@ def run_command(
             env = {"MODAL_APP": f"#{app_name}# {flags[run_name_idx]}"}
         else:
             env = {}
-        _run_command([*cmd, *flags], console_kwargs={"markup": False}, env=env)
+        _run_command([*cmd, *flags], rich_print_kwargs={"markup": False}, env=env)
     elif entrypoint_name is not None:
         _run_command(["biomodals", "help", str(full_app)])
     else:

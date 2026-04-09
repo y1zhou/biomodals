@@ -20,14 +20,16 @@
 * All output files are saved to a Modal volume named `gromacs-outputs`.
 * The production trajectory should be under the name `production_{run_name}.xtc`.
 """
-# Ignore ruff warnings about import location and unsafe subprocess usage
-# ruff: noqa: PLC0415, S603
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 
 import os
 from pathlib import Path
 
 import modal
 from modal import App, Image, Volume
+
+from biomodals.app.helper.shell import run_command
 
 ##########################################
 # Modal configs
@@ -179,6 +181,7 @@ runtime_image = (
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
     .add_local_dir(Path(__file__).parent / "gromacs", GMX_SCRIPTS, copy=True)
+    .add_local_python_source("biomodals")
 )
 
 biotite_image = (
@@ -193,29 +196,6 @@ app = App(APP_NAME, image=runtime_image)
 ##########################################
 # Helper functions
 ##########################################
-def run_command(cmd: list[str], **kwargs) -> None:
-    """Run a shell command and stream output to stdout."""
-    import subprocess as sp
-
-    print(f"Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
-
-
 def file1_needs_update(file1: Path, file2: Path) -> bool:
     """Return True if file1 doesn't exist or is older than file2."""
     if not file1.exists():

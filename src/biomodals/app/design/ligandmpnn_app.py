@@ -17,15 +17,19 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 * Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
 """
 
-# Ignore ruff warnings about import location and unsafe subprocess usage
-# ruff: noqa: PLC0415, S603
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 import os
 from pathlib import Path
 from typing import Any
 
 from modal import App, Image, Volume
 
-from biomodals.app.helper.shell import package_outputs
+from biomodals.app.helper.shell import (
+    package_outputs,
+    run_command,
+    run_command_with_log,
+)
 
 ##########################################
 # Modal configs
@@ -81,29 +85,6 @@ app = App(APP_NAME, image=runtime_image)
 ##########################################
 # Helper functions
 ##########################################
-def run_command(cmd: list[str], **kwargs) -> None:
-    """Run a shell command and stream output to stdout."""
-    import subprocess as sp
-
-    print(f"💊 Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
-
-
 def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
     """Convert a PyTorch .pt file to a dictionary of numpy arrays.
 
@@ -214,10 +195,6 @@ def ligandmpnn_run(
     Returns:
         Outputs bundled into a `.tar.zst` file.
     """
-    import subprocess as sp
-    import time
-    from datetime import UTC, datetime
-
     import numpy as np
     from tqdm import tqdm
 
@@ -240,35 +217,7 @@ def ligandmpnn_run(
             "--out_folder",
             str(workdir / "outputs" / f"seed-{seed}"),
         ]
-        with (
-            sp.Popen(
-                cmd,
-                bufsize=1,
-                stdout=sp.PIPE,
-                stderr=sp.STDOUT,
-                encoding="utf-8",
-                cwd=REPO_DIR,
-            ) as p,
-            open(log_path, "a", buffering=1) as log_file,
-        ):
-            if p.stdout is None:
-                raise RuntimeError("Failed to capture stdout from the command.")
-
-            now = time.time()
-            banner = "=" * 100
-            log_file.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
-            log_file.write(f"Running command: {' '.join(cmd)}\n{banner}\n")
-
-            while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-                log_file.write(buffered_output)  # not realtime without volume commit
-                print(buffered_output, end="", flush=True)
-
-            log_file.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
-            log_file.write(f"Elapsed time: {time.time() - now:.2f} seconds\n")
-
-            if p.returncode != 0:
-                print(f"💊 LigandMPNN run failed. Error log is in {log_path}")
-                raise sp.CalledProcessError(p.returncode, cmd)
+        run_command_with_log(cmd, log_file=log_path, cwd=REPO_DIR)
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")

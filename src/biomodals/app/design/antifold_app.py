@@ -35,8 +35,8 @@
 * The model does not like large antigens in the input structure. In our benchmarks antigens don't seem to affect results much, so for performance you may want to remove the antigen chains from the input structure and only provide the antibody chain(s).
 * Make sure *all* antibody chains are IMGT-numbered!
 """
-# Ignore ruff warnings about import location and unsafe subprocess usage
-# ruff: noqa: PLC0415, S603
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 
 import os
 import sys

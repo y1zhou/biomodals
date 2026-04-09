@@ -53,7 +53,7 @@ from modal import App, Image
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.utils import run_command, softlink_dir
+from biomodals.app.helper.shell import package_outputs, run_command, softlink_dir
 
 ##########################################
 # Modal configs
@@ -84,27 +84,6 @@ runtime_image = (
     .add_local_python_source("biomodals")
 )
 app = App(CONF.name, image=runtime_image)
-
-
-##########################################
-# Helper functions
-##########################################
-def package_outputs(
-    dir: str, tar_args: list[str] | None = None, num_threads: int = 16
-) -> bytes:
-    """Package directory into a tar.zst archive and return as bytes."""
-    import os
-    import subprocess as sp
-
-    dir_path = Path(dir)
-    cmd = ["tar", "--zstd"]
-    if tar_args is not None:
-        cmd.extend(tar_args)
-    cmd.extend(["-cf", "-", dir_path.name])
-
-    return sp.check_output(
-        cmd, cwd=dir_path.parent, env=os.environ | {"ZSTD_NBTHREADS": str(num_threads)}
-    )  # noqa: S603
 
 
 ##########################################

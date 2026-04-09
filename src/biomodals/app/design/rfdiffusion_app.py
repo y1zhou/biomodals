@@ -60,12 +60,16 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import shutil
 from pathlib import Path
 
 from modal import App, Image, Volume
 
-from biomodals.app.helper.shell import package_outputs, run_command
+from biomodals.app.helper.shell import (
+    find_with_fd,
+    package_outputs,
+    run_command,
+    warmup_directory,
+)
 
 # -------------------------
 # Modal configs
@@ -189,57 +193,10 @@ def validate_run_name(run_name: str) -> str:
     return run_name
 
 
-def _require_fd() -> None:
-    """Fail fast if `fd` is not available (required in the runtime image)."""
-    if shutil.which("fd") is None:
-        raise RuntimeError(
-            "fd (fd-find) is required but was not found on PATH. "
-            "Install fd-find in the runtime image and expose it as `fd`."
-        )
-
-
-def warmup_directory(
-    dir_path: str | Path, file_pattern: str = ".", jobs: int = 256
-) -> None:
-    """Warm up the disk cache for files in a directory using `fd`.
-
-    This is optional, and mostly useful when subsequent steps will re-read many
-    files (e.g., large tarballs or model weights).
-    """
-    _require_fd()
-    dir_path = Path(dir_path)
-
-    cmd = [
-        "fd",
-        "-t",
-        "f",
-        file_pattern,
-        str(dir_path),
-        "-j",
-        str(jobs),
-        "-x",
-        "dd",
-        "if={}",
-        "of=/dev/null",
-        "bs=1M",
-        "status=none",
-    ]
-    run_command(cmd)
-
-
-def collect_outputs_for_bundle(root_dir: str | Path) -> list[Path]:
-    """Collect the output artifacts we typically want to download.
-
-    Uses `fd` only (no shell). Returns absolute Paths under `root_dir`, sorted for
-    reproducible bundling.
-    """
-    _require_fd()
-
-    root = Path(root_dir)
-    exts = (".pdb", ".trb", ".json", ".yaml", ".yml", ".log", ".txt", ".csv")
-    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
-
-    return sorted(files, key=lambda p: str(p))
+def collect_outputs_for_bundle(root_dir: str | Path) -> list[str]:
+    """Collect the output artifacts we typically want to download."""
+    exts = "|".join(("pdb", "trb", "json", "yaml", "yml", "log", "txt", "csv"))
+    return find_with_fd(root_dir, rf"\.{exts}$", ["-tf"])
 
 
 # -------------------------
@@ -369,6 +326,7 @@ def rfdiffusion_infer(
         RFD_OUT_VOLUME.commit()
 
         # ---- bundle outputs for return ----
+        warmup_directory(run_dir)
         selected = collect_outputs_for_bundle(run_dir)
         return package_outputs(run_dir, paths_to_bundle=selected)
 

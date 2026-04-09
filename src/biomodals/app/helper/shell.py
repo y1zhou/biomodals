@@ -10,9 +10,26 @@ from biomodals.app.helper.internal import timed_function
 
 
 def run_command(
-    cmd: list[str] | str, *, rich_print_kwargs: dict | None = None, **kwargs
+    cmd: list[str] | str,
+    *,
+    verbose: bool = True,
+    rich_print_kwargs: dict | None = None,
+    **kwargs,
 ) -> list[str]:
-    """Run a shell command and stream output to stdout."""
+    """Run a shell command and stream output to stdout.
+
+    Args:
+        cmd: Command to run, either as a string or a list of arguments.
+        verbose: If True, print the command output to stdout in real time.
+        rich_print_kwargs: Optional kwargs to pass to `rich.print` if available.
+        **kwargs: Additional keyword arguments to pass to `subprocess.Popen`.
+            For example, you can use `cwd` to specify the working directory, or
+            `env` to specify environment variables.
+
+    Returns:
+        A list of output lines from the command. Note that both STDOUT and STDERR
+        are captured.
+    """
     import os
     import shlex
     import subprocess as sp
@@ -48,7 +65,8 @@ def run_command(
             raise RuntimeError("Failed to capture stdout from the command.")
 
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, **print_kwargs)
+            if verbose:
+                print(buffered_output, **print_kwargs)
             all_outputs.append(buffered_output.rstrip("\n"))
 
         if p.returncode != 0:
@@ -102,6 +120,53 @@ def run_command_with_log(cmd: list[str] | str, log_file: str | Path, **kwargs) -
                 stacklevel=2,
             )
             raise sp.CalledProcessError(p.returncode, cmd)
+
+
+def find_with_fd(dir_path: str | Path, file_pattern: str = ".", *args) -> list[str]:
+    """Find files in a directory matching a pattern using fd.
+
+    Args:
+        dir_path: Directory to search in.
+        file_pattern: Pattern to match files against.
+        *args: Additional arguments to pass to fd.
+
+    Returns:
+        List of matching file paths as strings. Note that the paths are relative
+        to ``dir_path``.
+    """
+    import shutil
+
+    fd_binary = shutil.which("fd") or shutil.which("fdfind")
+    if fd_binary is None:
+        raise FileNotFoundError(
+            "Neither 'fd' nor 'fdfind' is installed. Please install one of them to use this function."
+        )
+    if not Path(dir_path).exists():
+        raise FileNotFoundError(dir_path)
+
+    cmd = [fd_binary, file_pattern, str(dir_path), *args]
+    return run_command(cmd, verbose=False)
+
+
+def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
+    """Warm up the disk cache for all files in a directory matching a pattern."""
+    if not Path(dir_path).exists():
+        raise FileNotFoundError(dir_path)
+    fd_args = [
+        "-tf",
+        "-j256",
+        "-x",
+        "dd",
+        "if={}",
+        "of=/dev/null",
+        "bs=1M",
+        "status=none",
+    ]
+    try:
+        find_with_fd(dir_path, file_pattern, *fd_args)
+    except FileNotFoundError as e:
+        warnings.warn(str(e), RuntimeWarning, stacklevel=2)
+        return
 
 
 @timed_function

@@ -43,6 +43,7 @@ from biomodals.app.helper.shell import (
     package_outputs,
     run_command,
     run_command_with_log,
+    warmup_directory,
 )
 
 ##########################################
@@ -129,24 +130,6 @@ def package_outputs_helper(
         tar_args=tar_args,
         num_threads=num_threads,
     )
-
-
-def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
-    """Warm up the disk cache for all files in a directory matching a pattern."""
-    cmd = [
-        "fdfind",
-        "-tf",
-        file_pattern,
-        str(dir_path),
-        "-j256",
-        "-x",
-        "dd",
-        "if={}",
-        "of=/dev/null",
-        "bs=1M",
-        "status=none",
-    ]
-    run_command(cmd)
 
 
 class YAMLReferenceLoader:
@@ -556,7 +539,6 @@ def refilter_designs(
 
     workdir = Path(OUTPUTS_DIR) / run_name
     warmup_directory(workdir / "combined-outputs")
-    OUTPUTS_VOLUME.reload()
 
     filter_task = Filter(
         design_dir=workdir / "combined-outputs",

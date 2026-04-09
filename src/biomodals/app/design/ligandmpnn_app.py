@@ -20,11 +20,12 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 # Ignore ruff warnings about import location and unsafe subprocess usage
 # ruff: noqa: PLC0415, S603
 import os
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from modal import App, Image, Volume
+
+from biomodals.app.helper.shell import package_outputs
 
 ##########################################
 # Modal configs
@@ -71,6 +72,7 @@ runtime_image = (
     .run_commands("uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm")
     .apt_install("wget", "fd-find")
     .workdir(REPO_DIR)
+    .add_local_python_source("biomodals")
 )
 
 app = App(APP_NAME, image=runtime_image)
@@ -100,44 +102,6 @@ def run_command(cmd: list[str], **kwargs) -> None:
 
         if p.returncode != 0:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
-
-
-def package_outputs(
-    root: str | Path,
-    paths_to_bundle: Iterable[str | Path],
-    tar_args: list[str] | None = None,
-    num_threads: int = 16,
-) -> bytes:
-    """Package directories into a tar.zst archive and return as bytes.
-
-    We make an assumption here that all paths to bundle are under the same root.
-    This should be safe for `collect_boltzgen_data` usage.
-
-    Args:
-        root: Root directory in the archive. All paths will be relative to this.
-        paths_to_bundle: Specific paths (relative to root) to include in the archive.
-        tar_args: Additional arguments to pass to `tar`.
-        num_threads: Number of threads to use for compression.
-    """
-    import subprocess as sp
-    from pathlib import Path
-
-    root_path = Path(root)  # don't resolve, as the mapped location could be a soft link
-    cmd = ["tar", "-I", f"zstd -T{num_threads}"]  # ZSTD_NBTHREADS
-    if tar_args is not None:
-        cmd.extend(tar_args)
-    cmd.extend(["-c"])
-
-    # Our volume file structure is: outputs/[run_id]/...
-    # We want to preserve the relative paths
-    for p in paths_to_bundle:
-        out_path = root_path.joinpath(p)
-        if out_path.exists():
-            cmd.append(str(out_path.relative_to(root_path.parent)))
-        else:
-            print(f"💊 Warning: path {out_path} does not exist and will be skipped.")
-
-    return sp.check_output(cmd, cwd=root_path.parent)
 
 
 def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
@@ -316,7 +280,8 @@ def ligandmpnn_run(
         print(f"💊 Saved numpy output: {npz_path}")
         f.unlink()  # remove .pt file
 
-    tar_bytes = package_outputs(workdir, ["outputs", log_path.name])
+    print("💊 Packaging results...")
+    tar_bytes = package_outputs(workdir, paths_to_bundle=["outputs", log_path.name])
     return tar_bytes
 
 

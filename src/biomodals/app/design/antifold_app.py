@@ -44,6 +44,8 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
+from biomodals.app.helper.shell import package_outputs, run_command
+
 ##########################################
 # Modal configs
 ##########################################
@@ -96,53 +98,10 @@ runtime_image = (
         extra_options="--no-build-isolation",  # https://github.com/astral-sh/uv/issues/5040
     )
     .workdir(ANTIFOLD_REPO_DIR)
+    .add_local_python_source("biomodals")
 )
 
 app = App(APP_NAME, image=runtime_image)
-
-
-##########################################
-# Helper functions
-##########################################
-def package_outputs(
-    dir: str, tar_args: list[str] | None = None, num_threads: int = 16
-) -> bytes:
-    """Package directory into a tar.zst archive and return as bytes."""
-    import os
-    import subprocess as sp
-
-    dir_path = Path(dir)
-    cmd = ["tar", "--zstd"]
-    if tar_args is not None:
-        cmd.extend(tar_args)
-    cmd.extend(["-cf", "-", dir_path.name])
-
-    return sp.check_output(
-        cmd, cwd=dir_path.parent, env=os.environ | {"ZSTD_NBTHREADS": str(num_threads)}
-    )  # noqa: S603
-
-
-def run_command(cmd: list[str], **kwargs) -> None:
-    """Run a shell command and stream output to stdout."""
-    import subprocess as sp
-
-    print(f"Running command: {' '.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-
-    with sp.Popen(cmd, **kwargs) as p:
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        buffered_output = None
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            print(buffered_output, end="", flush=True)
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
 ##########################################
@@ -231,9 +190,8 @@ def antifold_inference(
 
         run_command(cmd)
 
-        print("Packaging results...")
-        tarball_bytes = package_outputs(str(work_path))
-        print("Packaging complete.")
+        print("💊 Packaging results...")
+        tarball_bytes = package_outputs(work_path)
 
     if not cache_model_path.exists():
         # Cache the model for future runs
@@ -315,23 +273,21 @@ def submit_antifold_task(
     print("🧬 Running AntiFold inverse folding...")
     with open(struct_file, "rb") as f:
         struct_bytes = f.read()
-    antifold_outputs: bytes = (
-        antifold_inference.remote(  # pyrefly: ignore[bad-assignment,invalid-param-spec]
-            struct_bytes,
-            struct_file_type,
-            run_name,
-            heavy_chain,
-            light_chain,
-            antigen_chain,
-            nanobody_chain,
-            regions,
-            num_seq_per_target,
-            sampling_temp,
-            limit_variation,
-            extract_embeddings,
-            num_threads,
-            seed,
-        )
+    antifold_outputs: bytes = antifold_inference.remote(  # pyrefly: ignore[bad-assignment,invalid-param-spec]
+        struct_bytes,
+        struct_file_type,
+        run_name,
+        heavy_chain,
+        light_chain,
+        antigen_chain,
+        nanobody_chain,
+        regions,
+        num_seq_per_target,
+        sampling_temp,
+        limit_variation,
+        extract_embeddings,
+        num_threads,
+        seed,
     )
     local_out_dir.mkdir(parents=True, exist_ok=True)
     out_zst_file.write_bytes(antifold_outputs)

@@ -69,7 +69,8 @@ from modal import App, Image, Volume
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.utils import download_files, run_command
+from biomodals.app.helper.shell import package_outputs, run_command
+from biomodals.app.helper.web import download_files
 
 ##########################################
 # Modal configs
@@ -96,11 +97,13 @@ OUTPUT_VOLUME_NAME = "protenix-outputs"
 OUTPUT_VOLUME = Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True, version=2)
 OUTPUT_DIR = "/protenix-outputs"
 
-# Supported model checkpoints
-SUPPORTED_MODELS = ("protenix_base_default_v1.0.0", "protenix_base_20250630_v1.0.0")
-
 # Base URL for downloading checkpoints and data caches
+# https://github.com/bytedance/Protenix/blob/main/protenix/web_service/dependency_url.py
 PROTENIX_DOWNLOAD_BASE = "https://protenix.tos-cn-beijing.volces.com"
+
+# Supported model checkpoints
+# TODO: keep an eye on protenix-v2
+SUPPORTED_MODELS = ("protenix_base_default_v1.0.0", "protenix_base_20250630_v1.0.0")
 
 # CCD and other data caches required for inference
 DATA_CACHE_FILES = (
@@ -160,25 +163,6 @@ runtime_image = (
     .add_local_python_source("biomodals")
 )
 app = App(CONF.name, image=runtime_image)
-
-
-##########################################
-# Helper functions
-##########################################
-def package_outputs(
-    dir: str, tar_args: list[str] | None = None, num_threads: int = 16
-) -> bytes:
-    """Package directory into a tar.zst archive and return as bytes."""
-    import subprocess as sp
-    from pathlib import Path
-
-    dir_path = Path(dir)
-    cmd = ["tar", "-I", f"zstd -T{num_threads}"]  # ZSTD_NBTHREADS
-    if tar_args is not None:
-        cmd.extend(tar_args)
-    cmd.extend(["-c", dir_path.name])
-
-    return sp.check_output(cmd, cwd=dir_path.parent)
 
 
 ##########################################
@@ -460,8 +444,7 @@ def run_protenix(
             # Persist MSA cache back to the volume for reuse in future runs
             PREP_VOLUME.commit()
             print("💊 Packaging ProtenixScore results...")
-            tarball_bytes = package_outputs(str(out_dir))
-            print("💊 Packaging complete.")
+            tarball_bytes = package_outputs(out_dir)
             return tarball_bytes
 
         # --- Prediction mode ---
@@ -570,8 +553,7 @@ def run_protenix(
 
         # Package outputs
         print("💊 Packaging Protenix results...")
-        tarball_bytes = package_outputs(str(out_dir))
-        print("💊 Packaging complete.")
+        tarball_bytes = package_outputs(out_dir)
 
     return tarball_bytes
 

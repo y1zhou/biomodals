@@ -39,6 +39,8 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
+from biomodals.app.helper.shell import package_outputs
+
 ##########################################
 # Modal configs
 ##########################################
@@ -94,6 +96,7 @@ runtime_image = (
     )
     .env({"PATH": f"{BOLTZGEN_REPO_DIR}/.venv/bin:$PATH"})
     .workdir(BOLTZGEN_REPO_DIR)
+    .add_local_python_source("biomodals")
 )
 
 app = App(APP_NAME, image=runtime_image)
@@ -109,42 +112,19 @@ app = App(APP_NAME, image=runtime_image)
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )
-def package_outputs(
+def package_outputs_helper(
     root: str | Path,
     paths_to_bundle: Iterable[str | Path],
     tar_args: list[str] | None = None,
     num_threads: int = 16,
 ) -> bytes:
-    """Package directories into a tar.zst archive and return as bytes.
-
-    We make an assumption here that all paths to bundle are under the same root.
-    This should be safe for `collect_boltzgen_data` usage.
-
-    Args:
-        root: Root directory in the archive. All paths will be relative to this.
-        paths_to_bundle: Specific paths (relative to root) to include in the archive.
-        tar_args: Additional arguments to pass to `tar`.
-        num_threads: Number of threads to use for compression.
-    """
-    import subprocess as sp
-    from pathlib import Path
-
-    root_path = Path(root)  # don't resolve, as the mapped location could be a soft link
-    cmd = ["tar", "-I", f"zstd -T{num_threads}"]  # ZSTD_NBTHREADS
-    if tar_args is not None:
-        cmd.extend(tar_args)
-    cmd.extend(["-c"])
-
-    # Our volume file structure is: outputs/[run_id]/...
-    # We want to preserve the relative paths
-    for p in paths_to_bundle:
-        out_path = root_path.joinpath(p)
-        if out_path.exists():
-            cmd.append(str(out_path.relative_to(root_path.parent)))
-        else:
-            print(f"💊 Warning: path {out_path} does not exist and will be skipped.")
-
-    return sp.check_output(cmd, cwd=root_path.parent)
+    """Modal runner to package directories into a tar.zst archive and return as bytes."""
+    return package_outputs(
+        root,
+        paths_to_bundle=paths_to_bundle,
+        tar_args=tar_args,
+        num_threads=num_threads,
+    )
 
 
 def run_command(cmd: list[str], **kwargs) -> None:
@@ -410,7 +390,7 @@ def collect_boltzgen_data(
         OUTPUTS_VOLUME.reload()
 
         print("💊 Packaging filtered BoltzGen outputs...")
-        tarball_bytes = package_outputs.remote(
+        tarball_bytes = package_outputs_helper.remote(
             outdir.parent / "pass-filter-designs",
             [
                 "all-designs.parquet",
@@ -419,7 +399,6 @@ def collect_boltzgen_data(
                 "refold-cif/",
             ],
         )
-        print("💊 Packaging complete.")
         return tarball_bytes
     else:
         print("💊 Skipping refiltering of BoltzGen outputs.")

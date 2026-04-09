@@ -166,10 +166,8 @@ def abnativ_score_unpaired(
             cmd.append("-plot")
 
         run_command(cmd)
-
-        print("Packaging results...")
-        tarball_bytes = package_outputs(str(work_path))
-        print("Packaging complete.")
+        print("💊 Packaging results...")
+        tarball_bytes = package_outputs(work_path)
 
     return tarball_bytes
 
@@ -222,9 +220,8 @@ def abnativ_score_paired(
 
         run_command(cmd)
 
-        print("Packaging results...")
-        tarball_bytes = package_outputs(str(work_path))
-        print("Packaging complete.")
+        print("💊 Packaging results...")
+        tarball_bytes = package_outputs(work_path)
 
     return tarball_bytes
 

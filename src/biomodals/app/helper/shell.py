@@ -6,6 +6,8 @@ import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
+from biomodals.app.helper.internal import timed_function
+
 
 def run_command(cmd: list[str], **kwargs) -> None:
     """Run a shell command and stream output to stdout."""
@@ -30,8 +32,10 @@ def run_command(cmd: list[str], **kwargs) -> None:
             raise sp.CalledProcessError(p.returncode, cmd, buffered_output)
 
 
+@timed_function
 def package_outputs(
     root: str | Path,
+    *,
     paths_to_bundle: Iterable[str | Path] | None = None,
     tar_args: list[str] | None = None,
     num_threads: int = 16,

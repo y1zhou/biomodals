@@ -234,7 +234,7 @@ def package_outputs(
             )
             continue
 
-        cmd_paths.append(str(out_path.relative_to(workdir, walk_up=False)))
+        cmd_paths.append(str(out_path.relative_to(workdir)))
 
     # If no valid subpaths, use all of the root directory
     if not cmd_paths:

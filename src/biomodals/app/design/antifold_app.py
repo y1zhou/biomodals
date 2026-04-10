@@ -21,7 +21,6 @@
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
-| `MODAL_APP` | `AntiFold` | Name of the Modal app to use. |
 | `GPU` | `A10G` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
 | `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
 
@@ -42,78 +41,56 @@ import os
 import sys
 from pathlib import Path
 
-from modal import App, Image, Volume
+from modal import App, Image
 
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MODEL_VOLUME
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import package_outputs, run_command
 
 ##########################################
 # Modal configs
 ##########################################
-# T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "A10G")
-TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # seconds
-APP_NAME = os.environ.get("MODAL_APP", "AntiFold")
-
-# Volume for model cache
-ANTIFOLD_VOLUME = Volume.from_name("antifold-models", create_if_missing=True)
-ANTIFOLD_MODEL_DIR = "/antifold-models"
-
-# Repositories and commit hashes
-ANTIFOLD_REPO = "https://github.com/oxpig/AntiFold"
-ANTIFOLD_COMMIT = "789d46786624c01eb44f177ef4c0deeeb6e77469"
-ANTIFOLD_REPO_DIR = "/opt/antifold"
+CONF = AppConfig(
+    name="AntiFold",
+    repo_url="https://github.com/oxpig/AntiFold",
+    repo_commit_hash="789d46786624c01eb44f177ef4c0deeeb6e77469",
+    version="0.3.1",
+    python_version="3.10",
+    cuda_version="cu121",
+    gpu=os.environ.get("GPU", "A10G"),
+)
+MODEL_DIR = CONF.model_dir
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = (
-    Image.debian_slim()
-    .apt_install("git", "build-essential", "wget", "zstd")
-    .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu121",  # find best torch and CUDA versions
-            "HF_HOME": str(ANTIFOLD_MODEL_DIR),  # store boltzgen model weights
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",  # speed up downloads
-        }
-    )
-    .run_commands(
-        " && ".join(
-            (
-                f"git clone {ANTIFOLD_REPO} {ANTIFOLD_REPO_DIR}",
-                f"cd {ANTIFOLD_REPO_DIR}",
-                f"git checkout {ANTIFOLD_COMMIT}",
-                "uv venv --python 3.10",
-                "uv pip install .",
-            ),
-        )
-    )
-    .env({"PATH": f"{ANTIFOLD_REPO_DIR}/.venv/bin:$PATH"})
+runtime_image = patch_image_for_helper(
+    Image.debian_slim(python_version=CONF.python_version)
+    .apt_install("git", "build-essential", "wget")
+    .env(CONF.default_env)
+    .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}")
     .uv_pip_install(["torch==2.2.0", "torchvision"])
     .uv_pip_install(
         "torch-scatter",
-        find_links="https://data.pyg.org/whl/torch-2.2.0+cu121.html",
+        find_links=f"https://data.pyg.org/whl/torch-2.2.0+{CONF.cuda_version}.html",
         extra_options="--no-build-isolation",  # https://github.com/astral-sh/uv/issues/5040
     )
-    .workdir(ANTIFOLD_REPO_DIR)
-    .add_local_python_source("biomodals")
 )
 
-app = App(APP_NAME, image=runtime_image)
+app = App(CONF.name, image=runtime_image)
 
 
 ##########################################
 # Inference functions
 ##########################################
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
-    volumes={ANTIFOLD_MODEL_DIR: ANTIFOLD_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
 )
 def antifold_inference(
     struct_bytes: bytes,
@@ -136,15 +113,14 @@ def antifold_inference(
 
     # AntiFold hard-coded the download logic to look for models in ./models/model.pt
     model_path = (
-        Path(ANTIFOLD_REPO_DIR)
-        / ".venv"
+        Path(sys.exec_prefix)
         / "lib"
-        / "python3.10"
+        / f"python{CONF.python_version}"
         / "site-packages"
         / "models"
         / "model.pt"
     )
-    cache_model_path = Path(ANTIFOLD_MODEL_DIR) / "model.pt"
+    cache_model_path = MODEL_DIR / "model.pt"
     if cache_model_path.exists():
         model_path.parent.mkdir(parents=True, exist_ok=True)
         model_path.symlink_to(cache_model_path)
@@ -157,7 +133,8 @@ def antifold_inference(
             f.write(struct_bytes)
         cmd = [
             sys.executable,
-            "antifold/main.py",
+            "-m",
+            "antifold.main",
             "--pdb_file",
             str(input_struct),
             "--out_dir",
@@ -198,7 +175,7 @@ def antifold_inference(
         import shutil
 
         shutil.copyfile(model_path, cache_model_path)
-        ANTIFOLD_VOLUME.commit()
+        MODEL_VOLUME.commit()
 
     return tarball_bytes
 

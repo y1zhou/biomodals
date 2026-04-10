@@ -8,7 +8,6 @@ See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
-| `MODAL_APP` | `LigandMPNN` | Name of the Modal app to use. |
 | `GPU` | `L40S` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
 | `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
 
@@ -23,63 +22,87 @@ import os
 from pathlib import Path
 from typing import Any
 
-from modal import App, Image, Volume
+from modal import App, Image
 
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import (
+    find_with_fd,
     package_outputs,
-    run_command,
     run_command_with_log,
 )
+from biomodals.app.helper.web import download_files
 
 ##########################################
 # Modal configs
 ##########################################
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "L40S")
-TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # for inputs and startup in seconds
-APP_NAME = os.environ.get("MODAL_APP", "LigandMPNN")
+CONF = AppConfig(
+    name="LigandMPNN",
+    repo_url="https://github.com/dauparas/LigandMPNN",
+    repo_commit_hash="26ec57ac976ade5379920dbd43c7f97a91cf82de",
+    # https://github.com/dauparas/LigandMPNN/pull/45
+    package_name="ligandmpnn",
+    version="0.1.2",
+    python_version="3.11",
+    cuda_version="cu121",
+    gpu=os.environ.get("GPU", "A10G"),
+)
+REPO_DIR = CONF.git_clone_dir
 
-# Volume for model cache
-LIGANDMPNN_VOLUME_NAME = "ligandmpnn-models"
-LIGANDMPNN_VOLUME = Volume.from_name(LIGANDMPNN_VOLUME_NAME, create_if_missing=True)
-
-# Repositories and commit hashes
-REPO_URL = "https://github.com/dauparas/LigandMPNN"
-REPO_COMMIT = "26ec57ac976ade5379920dbd43c7f97a91cf82de"
-REPO_DIR = "/opt/LigandMPNN"
+AVAILABLE_MODELS = {
+    # ProteinMPNN
+    # --model_type "protein_mpnn" --checkpoint_protein_mpnn
+    "proteinmpnn_v_48_002.pt",
+    "proteinmpnn_v_48_010.pt",
+    "proteinmpnn_v_48_020.pt",
+    "proteinmpnn_v_48_030.pt",
+    # LigandMPNN with num_edges=32; atom_context_num=25
+    # --model_type "ligand_mpnn" --checkpoint_ligand_mpnn
+    "ligandmpnn_v_32_005_25.pt",
+    "ligandmpnn_v_32_010_25.pt",
+    "ligandmpnn_v_32_020_25.pt",
+    "ligandmpnn_v_32_030_25.pt",
+    # Per residue label membrane ProteinMPNN
+    # --model_type "per_residue_label_membrane_mpnn"
+    # --checkpoint_per_residue_label_membrane_mpnn
+    "per_residue_label_membrane_mpnn_v_48_020.pt",
+    # Global label membrane ProteinMPNN
+    # --model_type "global_label_membrane_mpnn"
+    # --checkpoint_global_label_membrane_mpnn
+    "global_label_membrane_mpnn_v_48_020.pt",
+    # SolubleMPNN
+    # --model_type "soluble_mpnn" --checkpoint_soluble_mpnn
+    "solublempnn_v_48_002.pt",
+    "solublempnn_v_48_010.pt",
+    "solublempnn_v_48_020.pt",
+    "solublempnn_v_48_030.pt",
+    # LigandMPNN for side-chain packing (multi-step denoising model)
+    # --checkpoint_path_sc
+    "ligandmpnn_sc_v_32_002_16.pt",
+}
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = (
-    Image.debian_slim()
-    .apt_install("git", "build-essential", "zstd")
-    .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu121",  # find best torch and CUDA versions
-        }
-    )
-    .run_commands(
-        " && ".join(
-            (
-                f"git clone {REPO_URL} {REPO_DIR}",
-                f"cd {REPO_DIR}",
-                f"git checkout {REPO_COMMIT}",
-                "uv venv --python 3.11",
-                "uv pip install -r requirements.txt",
-            ),
-        )
-    )
-    .env({"PATH": f"{REPO_DIR}/.venv/bin:$PATH"})
-    .run_commands("uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm")
-    .apt_install("wget", "fd-find")
-    .workdir(REPO_DIR)
-    .add_local_python_source("biomodals")
+runtime_image = patch_image_for_helper(
+    Image.debian_slim(python_version=CONF.python_version)
+    .apt_install("git", "build-essential", "wget")
+    .env(CONF.default_env)
+    # .run_commands(
+    #     " && ".join(
+    #         (
+    #             f"git clone {CONF.repo_url} {REPO_DIR}",
+    #             f"cd {REPO_DIR}",
+    #             f"git checkout {CONF.repo_commit_hash}",
+    #             "uv pip install --system -r requirements.txt",
+    #         )
+    #     )
+    # )
+    .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
 )
 
-app = App(APP_NAME, image=runtime_image)
+app = App(CONF.name, image=runtime_image)
 
 
 ##########################################
@@ -112,17 +135,24 @@ def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
 # Fetch model weights
 ##########################################
 @app.function(
-    volumes={f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME},
-    timeout=TIMEOUT,
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    timeout=MAX_TIMEOUT,
     image=runtime_image,
 )
 def download_weights() -> None:
-    """Download ProteinMPNN models into the mounted volume."""
-    print("💊 Downloading boltzgen models...")
-    cmd = ["bash", f"{REPO_DIR}/get_model_params.sh", f"{REPO_DIR}/model_params"]
+    """Download ProteinMPNN models into the mounted volume.
 
-    run_command(cmd, cwd=REPO_DIR)
-    LIGANDMPNN_VOLUME.commit()
+    Ref: https://github.com/dauparas/LigandMPNN/blob/main/get_model_params.sh
+    """
+    base_url = "https://files.ipd.uw.edu/pub/ligandmpnn"
+    print(f"💊 Downloading {CONF.name} models...")
+    download_files(
+        {
+            f"{base_url}/{model_name}": CONF.model_dir / "model_params" / model_name
+            for model_name in AVAILABLE_MODELS
+        }
+    )
+    MODEL_VOLUME.commit()
     print("💊 Model download complete")
 
 
@@ -133,12 +163,12 @@ def build_base_command(
     run_name: str,
     script_mode: str,
     struct_bytes: bytes,
-    seeds: list[int],
     cli_args: dict[str, str | int | float | bool],
     bias_aa_per_residue_bytes: bytes | None = None,
     omit_aa_per_residue_bytes: bytes | None = None,
 ) -> tuple[list[str], Path]:
     """Build base command for LigandMPNN execution."""
+    import sys
     import tempfile
     from pathlib import Path
 
@@ -164,7 +194,12 @@ def build_base_command(
             f.write(omit_aa_per_residue_bytes)
             cli_args["--omit_AA_per_residue"] = str(omit_aa_per_res_file)
 
-    cmd = ["python", f"{REPO_DIR}/{script_mode}.py"]
+    mod_name = (
+        f"{CONF.package_name}.{script_mode}"
+        if script_mode == "run"
+        else f"{CONF.package_name}.utils.{script_mode}"
+    )
+    cmd = [sys.executable, "-m", mod_name]
     for arg, val in cli_args.items():
         if isinstance(val, bool):
             cmd.extend([str(arg), str(int(val))])
@@ -175,10 +210,10 @@ def build_base_command(
 
 
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=86400,
-    volumes={f"{REPO_DIR}/model_params": LIGANDMPNN_VOLUME.read_only()},
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
     image=runtime_image,
 )
 def ligandmpnn_run(
@@ -202,7 +237,6 @@ def ligandmpnn_run(
         run_name,
         script_mode,
         struct_bytes,
-        seeds,
         cli_args,
         bias_aa_per_residue_bytes,
         omit_aa_per_residue_bytes,
@@ -217,17 +251,19 @@ def ligandmpnn_run(
             "--out_folder",
             str(workdir / "outputs" / f"seed-{seed}"),
         ]
-        run_command_with_log(cmd, log_file=log_path, cwd=REPO_DIR)
+        run_command_with_log(cmd, log_file=log_path, cwd=CONF.model_dir)
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")
-    for f in (workdir / "outputs").glob("**/*.pt"):
+    torch_files = find_with_fd(workdir / "outputs", r"\.pt$")
+    for f in torch_files:
         np_dict = torch_to_numpy(f)
-        npz_path = f.with_suffix(".npz")
+        f_path = Path(f)
+        npz_path = f_path.with_suffix(".npz")
 
         np.savez(npz_path, **np_dict)
         print(f"💊 Saved numpy output: {npz_path}")
-        f.unlink()  # remove .pt file
+        f_path.unlink()  # remove .pt file
 
     print("💊 Packaging results...")
     tar_bytes = package_outputs(workdir, paths_to_bundle=["outputs", log_path.name])

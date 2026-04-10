@@ -1,6 +1,7 @@
 """Helper script for constructing actual modal run commands."""
 
 import importlib
+import shlex
 from pathlib import Path
 from typing import Annotated
 
@@ -216,7 +217,12 @@ def run_modal_app(
         cmd.append("-d")
     cmd.append(str(full_app))
 
-    if flags:
+    if modal_mode == "shell":
+        console.print(
+            "To start an interactive shell for the app, run:\n"
+            f"[bold green]uv run {shlex.join(cmd)}[/bold green]"
+        )
+    elif flags:
         # TODO: figure out a way to tag run names into the app.
         # Previously we used the MODAL_APP environment variable for ephemeral
         # apps run with the --run-name flag, but with the new AppConfig API

@@ -1,8 +1,4 @@
-"""Helper functions for operations using external shell commands.
-
-Runtime environment dependency:
-- rich (optional)
-"""
+"""Helper functions for operations using external shell commands."""
 
 from __future__ import annotations
 

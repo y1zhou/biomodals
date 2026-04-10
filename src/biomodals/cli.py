@@ -224,7 +224,7 @@ def run_command(
             env = {"MODAL_APP": f"#{app_name}# {flags[run_name_idx]}"}
         else:
             env = {}
-        _run_command([*cmd, *flags], rich_print_kwargs={"markup": False}, env=env)
+        _run_command([*cmd, *flags], try_rich_print=False, env=env)
     elif entrypoint_name is not None:
         _run_command(["biomodals", "help", str(full_app)])
     else:

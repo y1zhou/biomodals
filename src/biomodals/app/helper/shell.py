@@ -1,4 +1,8 @@
-"""Helper functions for operations using external shell commands."""
+"""Helper functions for operations using external shell commands.
+
+Runtime environment dependency:
+- rich (optional)
+"""
 
 from __future__ import annotations
 
@@ -10,18 +14,14 @@ from biomodals.app.helper.internal import timed_function
 
 
 def run_command(
-    cmd: list[str] | str,
-    *,
-    verbose: bool = True,
-    rich_print_kwargs: dict | None = None,
-    **kwargs,
+    cmd: list[str] | str, *, verbose: bool = True, try_rich_print: bool = True, **kwargs
 ) -> list[str]:
     """Run a shell command and stream output to stdout.
 
     Args:
         cmd: Command to run, either as a string or a list of arguments.
         verbose: If True, print the command output to stdout in real time.
-        rich_print_kwargs: Optional kwargs to pass to `rich.print` if available.
+        try_rich_print: If True, attempt to use `rich.print` for output formatting.
         **kwargs: Additional keyword arguments to pass to `subprocess.Popen`.
             For example, you can use `cwd` to specify the working directory, or
             `env` to specify environment variables.
@@ -34,14 +34,15 @@ def run_command(
     import shlex
     import subprocess as sp
 
-    print_kwargs = {"end": "", "flush": True}
-    try:
-        from rich import print
+    if try_rich_print:
+        try:
+            import builtins
 
-        if rich_print_kwargs is not None:
-            print_kwargs = print_kwargs | rich_print_kwargs
-    except ImportError:
-        pass
+            import rich
+
+            builtins.print = rich.print  # ty:ignore[invalid-assignment]
+        except ImportError:
+            pass
 
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
@@ -66,7 +67,7 @@ def run_command(
 
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
             if verbose:
-                print(buffered_output, **print_kwargs)
+                print(buffered_output, end="", flush=True)
             all_outputs.append(buffered_output.rstrip("\n"))
 
         if p.returncode != 0:

@@ -13,7 +13,7 @@ pembro_vl='EIVLTQSPATLSLSPGERATLSCRASKGVSTSGYSYLHWYQQKPGQAPRLLIYLASYLESGVPARFSGS
 
 temp_dir=$(mktemp -d)
 
-uv run --project "${SCRIPT_DIR}" "${ENTRY_BIN}" r abnativ -- \
+"${ENTRY_BIN}" r abnativ -- \
     --run-name biomodals_abnativ_example \
     --out-dir "${temp_dir}" \
     --input-vh-seq "${pembro_vh}" \

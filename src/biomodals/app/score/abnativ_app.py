@@ -100,7 +100,7 @@ def download_abnativ_models(force: bool = False) -> None:
     softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
 
     # Download all artifacts
-    print("Downloading AbNatiV models...")
+    print(f"💊 Downloading {CONF.name} models...")
     cmd = ["abnativ", "init"]
     if force:
         cmd.append("--force_update")

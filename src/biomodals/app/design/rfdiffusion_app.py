@@ -64,6 +64,7 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import (
     find_with_fd,
     package_outputs,
@@ -106,7 +107,7 @@ RFD_CHECKPOINT_URLS: dict[str, str] = {
 # For an example of a newer, modern CUDA/PyTorch-style Docker environment, see:
 # https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile
 # The runtime image below is defined directly with Modal and is not built from that Dockerfile.
-runtime_image = (
+runtime_image = patch_image_for_helper(
     Image.debian_slim(python_version="3.10")
     .apt_install(
         "git",
@@ -162,7 +163,6 @@ runtime_image = (
         "python -m pip install --no-cache-dir -r requirements.txt && "
         "python setup.py install"
     )
-    .add_local_python_source("biomodals")
 )
 
 

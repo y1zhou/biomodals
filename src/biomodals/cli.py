@@ -228,7 +228,10 @@ def run_modal_app(
         # apps run with the --run-name flag, but with the new AppConfig API
         # this is no longer read.
         # Smart guess of run_name to modify the MODAL_APP environment variable
-        run_command([*cmd, *flags], try_rich_print=False)
+        run_command(
+            [*cmd, *flags],
+            # try_rich_print=False,
+        )
     elif entrypoint_name is not None:
         run_command(["biomodals", "help", str(full_app)])
     else:

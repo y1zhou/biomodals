@@ -65,10 +65,11 @@ import shutil
 from hashlib import sha256
 from pathlib import Path
 
-from modal import App, Image, Volume
+from modal import App, Image
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MODEL_VOLUME
+from biomodals.app.constant import MODEL_VOLUME, MSA_CACHE_VOLUME
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import package_outputs, run_command
 from biomodals.app.helper.web import download_files
 
@@ -78,32 +79,34 @@ from biomodals.app.helper.web import download_files
 CONF = AppConfig(
     name="Protenix",
     repo_url="https://github.com/y1zhou/Protenix",
-    repo_commit_hash="688760e1dfe3b0100f5deb95757b2b04c52ee994",
+    repo_commit_hash="7e1de70749910c401339dd49aa62735510c22959",
     package_name="protenix",
-    version="1.0.0",
+    version="2.0.0",
     python_version="3.11",
     cuda_version="cu130",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "86400")),
 )
 
-# Volume for preprocessed MSA/template intermediates
-PREP_VOLUME_NAME = "protenix-msa"
-PREP_VOLUME = Volume.from_name(PREP_VOLUME_NAME, create_if_missing=True, version=2)
-PREP_DIR = "/protenix-msa"
+# Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
+MSA_CACHE_DIR = "/protenix-msa"
 
 # Volume for prediction outputs (enables skip/resume across interrupted runs)
-OUTPUT_VOLUME_NAME = "protenix-outputs"
-OUTPUT_VOLUME = Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True, version=2)
-OUTPUT_DIR = "/protenix-outputs"
+OUTPUTS_VOLUME_NAME, OUTPUTS_VOLUME = CONF.out_volume()
+OUTPUTS_DIR = CONF.output_volume_mountpoint
+MODEL_DIR = CONF.model_dir
 
 # Base URL for downloading checkpoints and data caches
 # https://github.com/bytedance/Protenix/blob/main/protenix/web_service/dependency_url.py
 PROTENIX_DOWNLOAD_BASE = "https://protenix.tos-cn-beijing.volces.com"
 
 # Supported model checkpoints
-# TODO: keep an eye on protenix-v2
-SUPPORTED_MODELS = ("protenix_base_default_v1.0.0", "protenix_base_20250630_v1.0.0")
+
+SUPPORTED_MODELS = (
+    "protenix_base_default_v1.0.0",
+    "protenix_base_20250630_v1.0.0",
+    # "protenix-v2.pt",  # TODO: keep an eye on protenix-v2
+)
 
 # CCD and other data caches required for inference
 DATA_CACHE_FILES = (
@@ -129,7 +132,7 @@ flavor = "devel"  # includes full CUDA toolkit
 operating_sys = "ubuntu24.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
-runtime_image = (
+runtime_image = patch_image_for_helper(
     Image.from_registry(f"nvidia/cuda:{tag}", add_python=CONF.python_version)
     .apt_install(
         "git",
@@ -147,20 +150,13 @@ runtime_image = (
             "PROTENIX_CHECKPOINT_DIR": str(CONF.model_dir / "checkpoint"),
         }
     )
-    .run_commands(
-        f"git clone {CONF.repo_url}.git /{CONF.name}"
-        f" && cd /{CONF.name}"
-        f" && git checkout {CONF.repo_commit_hash}"
-    )
-    .uv_pip_install(f"/{CONF.name}[{CONF.cuda_version}]")
+    .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}[{CONF.cuda_version}]")
     # Trigger kernel compilation
     .run_commands(
-        "python /usr/local/lib/python3.11/site-packages/protenix/model/layer_norm/layer_norm.py",
+        "python -m protenix.model.layer_norm.layer_norm",
         gpu=CONF.gpu,
         env={"LAYERNORM_TYPE": "fast_layernorm"},  # default, but just in case
     )
-    .uv_pip_install("aiofiles", "niquests", "pydantic", "tqdm")
-    .add_local_python_source("biomodals")
 )
 app = App(CONF.name, image=runtime_image)
 
@@ -202,6 +198,8 @@ def download_protenix_data(
         }
         files_to_download = files_to_download | template_caches
 
+    # TODO: https://github.com/bytedance/Protenix/blob/main/scripts/database/download_protenix_data.sh
+
     # Download model checkpoint
     ckpt_url = f"{PROTENIX_DOWNLOAD_BASE}/checkpoint/{model_name}.pt"
     files_to_download = files_to_download | {
@@ -217,9 +215,13 @@ def download_protenix_data(
 ##########################################
 # Inference functions
 ##########################################
+# TODO: fix cache keys (preferrably re-use uniaf3 code)
 @app.function(
     timeout=CONF.timeout,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME, PREP_DIR: PREP_VOLUME},
+    volumes={
+        CONF.model_volume_mountpoint: MODEL_VOLUME,
+        MSA_CACHE_DIR: MSA_CACHE_VOLUME,
+    },
 )
 def prepare_protenix_inputs(
     json_str: bytes,
@@ -243,7 +245,7 @@ def prepare_protenix_inputs(
     h.update(b"\x00")
     h.update(f"{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode())
     cache_key = h.hexdigest()
-    cache_dir = Path(PREP_DIR) / cache_key[:2] / cache_key
+    cache_dir = Path(MSA_CACHE_DIR) / CONF.name / cache_key[:2] / cache_key
     prepared_json_path = cache_dir / "prepared.json"
     if prepared_json_path.exists():
         print(f"💊 Reusing cached preprocessed inputs: {cache_key}")
@@ -308,7 +310,7 @@ def prepare_protenix_inputs(
     else:
         shutil.copyfile(input_json_path, prepared_json_path)
 
-    PREP_VOLUME.commit()
+    MSA_CACHE_VOLUME.commit()
     print(f"💊 Cached preprocessed inputs: {cache_key}")
     return cache_key
 
@@ -319,9 +321,9 @@ def prepare_protenix_inputs(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
     volumes={
-        CONF.model_volume_mountpoint: MODEL_VOLUME,
-        PREP_DIR: PREP_VOLUME,
-        OUTPUT_DIR: OUTPUT_VOLUME,
+        CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
+        MSA_CACHE_DIR: MSA_CACHE_VOLUME,
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
     },
 )
 def run_protenix(
@@ -338,6 +340,7 @@ def run_protenix(
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
+    use_tfg_guidance: bool = False,
     use_fast_layernorm: bool = False,
     extra_args: str | None = None,
     score_only: bool = False,
@@ -359,6 +362,7 @@ def run_protenix(
         msa_server_mode: MSA search mode (protenix or colabfold).
         use_template: Whether to use templates.
         use_rna_msa: Whether to use RNA MSA.
+        use_tfg_guidance: Enable Training-Free Guidance (TFG) for refined sampling.
         use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel.
         extra_args: Additional CLI arguments as a string.
         score_only: When True, score an existing PDB/CIF structure using
@@ -416,7 +420,7 @@ def run_protenix(
 
             # Cache fetched MSAs in the PREP volume so they can be reused across
             # runs (separate sub-directory from the `protenix msa` cache).
-            score_msa_cache_dir = Path(PREP_DIR) / "score_msa_cache"
+            score_msa_cache_dir = Path(MSA_CACHE_DIR) / "score_msa_cache"
             score_msa_cache_dir.mkdir(parents=True, exist_ok=True)
 
             cmd = [
@@ -442,7 +446,7 @@ def run_protenix(
             run_command(cmd, env=run_env, cwd=out_dir)
 
             # Persist MSA cache back to the volume for reuse in future runs
-            PREP_VOLUME.commit()
+            MSA_CACHE_VOLUME.commit()
             print("💊 Packaging ProtenixScore results...")
             tarball_bytes = package_outputs(out_dir)
             return tarball_bytes
@@ -459,10 +463,10 @@ def run_protenix(
             f"|{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode()
         )
         output_cache_key = h_out.hexdigest()
-        vol_run_dir = Path(OUTPUT_DIR) / run_name / output_cache_key
+        vol_run_dir = Path(OUTPUTS_DIR) / run_name / output_cache_key
 
         # Sync the volume to see outputs from any previous (possibly interrupted) run
-        OUTPUT_VOLUME.reload()
+        OUTPUTS_VOLUME.reload()
         vol_run_dir.mkdir(parents=True, exist_ok=True)
 
         # Determine which seeds have already been saved to the volume.
@@ -494,7 +498,7 @@ def run_protenix(
             # Resolve input JSON path
             if prep_cache_key is not None:
                 input_json_path = (
-                    Path(PREP_DIR)
+                    Path(MSA_CACHE_DIR)
                     / prep_cache_key[:2]
                     / prep_cache_key
                     / "prepared.json"
@@ -540,6 +544,8 @@ def run_protenix(
                 str(use_template),
                 "--use_rna_msa",
                 str(use_rna_msa),
+                "--use_tfg_guidance",
+                str(use_tfg_guidance),
             ]
 
             if extra_args:
@@ -549,7 +555,7 @@ def run_protenix(
 
             # Persist new outputs to the volume so interrupted runs can resume
             shutil.copytree(str(out_dir), str(vol_run_dir), dirs_exist_ok=True)
-            OUTPUT_VOLUME.commit()
+            OUTPUTS_VOLUME.commit()
 
         # Package outputs
         print("💊 Packaging Protenix results...")
@@ -576,6 +582,7 @@ def submit_protenix_task(
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
+    use_tfg_guidance: bool = False,
     use_fast_layernorm: bool = False,
     download_models: bool = False,
     force_redownload: bool = False,
@@ -599,6 +606,7 @@ def submit_protenix_task(
         msa_server_mode: MSA search mode (protenix or colabfold)
         use_template: Whether to use templates
         use_rna_msa: Whether to use RNA MSA features
+        use_tfg_guidance: Enable Training-Free Guidance (TFG) for refined sampling
         use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel
         download_models: Whether to download model weights and skip running
         force_redownload: Whether to force re-download of model weights
@@ -694,6 +702,7 @@ def submit_protenix_task(
             msa_server_mode=msa_server_mode,
             use_template=use_template,
             use_rna_msa=use_rna_msa,
+            use_tfg_guidance=use_tfg_guidance,
             use_fast_layernorm=use_fast_layernorm,
             extra_args=extra_args,
         )

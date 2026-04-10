@@ -52,7 +52,8 @@ from pathlib import Path
 from modal import App, Image
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MODEL_VOLUME
+from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import package_outputs, run_command, softlink_dir
 
 ##########################################
@@ -74,14 +75,13 @@ ABNATIV_MODEL_DIR = "/root/.abnativ/models/pretrained_models"
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = (
+runtime_image = patch_image_for_helper(
     Image.micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget", "zstd")
     .env(CONF.default_env)
     .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
     .micromamba_install(["anarci"], channels=["bioconda"])
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
-    .add_local_python_source("biomodals")
 )
 app = App(CONF.name, image=runtime_image)
 
@@ -92,7 +92,7 @@ app = App(CONF.name, image=runtime_image)
 @app.function(
     cpu=(1.125, 16.125),
     volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
-    timeout=CONF.timeout * 10,
+    timeout=MAX_TIMEOUT,
 )
 def download_abnativ_models(force: bool = False) -> None:
     """Download AbNatiV models into the mounted volume."""

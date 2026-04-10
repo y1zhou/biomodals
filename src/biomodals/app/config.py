@@ -4,7 +4,10 @@ import os
 from functools import cached_property
 from pathlib import Path
 
+from modal import Volume
 from pydantic import BaseModel, computed_field, model_validator
+
+from biomodals.app.constant import MAX_TIMEOUT
 
 
 class AppConfig(BaseModel):
@@ -35,14 +38,24 @@ class AppConfig(BaseModel):
     timeout: int = int(os.environ.get("TIMEOUT", "1800"))
     # Location to cache model weights and other large artifacts
     model_volume_mountpoint: str = "/biomodals-store"
+    # Location to mount output volume (if in use)
+    output_volume_mountpoint: str = "/biomodals-outputs"
+
+    def out_volume(self) -> tuple[str, Volume]:
+        """Volume for storing outputs."""
+        vol_name = f"{self.name}-outputs"
+        return vol_name, Volume.from_name(vol_name, create_if_missing=True, version=2)
 
     @computed_field
     @cached_property
     def default_env(self) -> dict[str, str]:
         """Environment variables to set in the runtime image."""
+        model_cache_dir = Path(self.model_volume_mountpoint).resolve()
         return {
-            "UV_COMPILE_BYTECODE": "0",  # slower image build, faster runtime
+            "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
             "HF_XET_HIGH_PERFORMANCE": "1",
+            "HF_HOME": str(model_cache_dir / "huggingface"),
+            "TORCH_HOME": str(model_cache_dir / "torch"),
             "UV_TORCH_BACKEND": self.cuda_version,
         }
 
@@ -50,7 +63,13 @@ class AppConfig(BaseModel):
     @cached_property
     def model_dir(self) -> Path:
         """Directory to store model weights."""
-        return Path(self.model_volume_mountpoint) / self.name
+        return Path(self.model_volume_mountpoint).resolve() / self.name
+
+    @computed_field
+    @cached_property
+    def git_clone_dir(self) -> Path:
+        """Directory to store cloned Git repositories."""
+        return Path(f"/opt/{self.name}")
 
     @computed_field
     @cached_property
@@ -120,4 +139,11 @@ class AppConfig(BaseModel):
         if is_cu12 and self.gpu.startswith("B200+"):
             raise ValueError("CUDA 12.x is not compatible with 'B200+ / B300' GPU.")
 
+        return self
+
+    @model_validator(mode="after")
+    def ensure_timeout_within_range(self):
+        """Ensure that the specified timeout is within a reasonable range."""
+        # between 1 second and 24 hours
+        self.timeout = max(1, min(self.timeout, MAX_TIMEOUT))
         return self

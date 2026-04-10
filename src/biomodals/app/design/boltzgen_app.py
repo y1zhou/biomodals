@@ -37,8 +37,11 @@ import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
-from modal import App, Image, Volume
+from modal import App, Image
 
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import (
     package_outputs,
     run_command,
@@ -49,62 +52,35 @@ from biomodals.app.helper.shell import (
 ##########################################
 # Modal configs
 ##########################################
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "L40S")
-TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # for inputs and startup in seconds
-APP_NAME = os.environ.get("MODAL_APP", "BoltzGen")
-
-# Volume for model cache
-BOLTZGEN_VOLUME_NAME = "boltzgen-models"
-BOLTZGEN_VOLUME = Volume.from_name(BOLTZGEN_VOLUME_NAME, create_if_missing=True)
-BOLTZGEN_MODEL_DIR = "/boltzgen-models"
-
-# Volume for outputs
-OUTPUTS_VOLUME_NAME = "boltzgen-outputs"
-OUTPUTS_VOLUME = Volume.from_name(
-    OUTPUTS_VOLUME_NAME, create_if_missing=True, version=2
+CONF = AppConfig(
+    name="BoltzGen",
+    repo_url="https://github.com/y1zhou/boltzgen",
+    repo_commit_hash="fd24c656257dc780882b91c0bbad61e13a15fc6b",
+    package_name="boltzgen",
+    version="0.2.0",
+    python_version="3.12",
+    cuda_version="cu128",
+    gpu=os.environ.get("GPU", "L40S"),
 )
-OUTPUTS_DIR = "/boltzgen-outputs"
 
-# Repositories and commit hashes
-BOLTZGEN_REPO = "https://github.com/y1zhou/boltzgen"
-BOLTZGEN_COMMIT = "fd24c656257dc780882b91c0bbad61e13a15fc6b"
-BOLTZGEN_REPO_DIR = "/opt/boltzgen"
+# Volumes to be mounted
+OUTPUTS_VOLUME_NAME, OUTPUTS_VOLUME = CONF.out_volume()
+OUTPUTS_DIR = CONF.output_volume_mountpoint
+MODEL_DIR = CONF.model_dir
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = (
-    Image.debian_slim()
-    .apt_install("git", "build-essential", "zstd")
-    .apt_install("fd-find")  # for warming up disk cache when downloading outputs
-    .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu128",  # find best torch and CUDA versions
-            "HF_HOME": str(BOLTZGEN_MODEL_DIR),  # store boltzgen model weights
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",  # speed up downloads
-        }
-    )
-    .run_commands(
-        " && ".join(
-            (
-                f"git clone {BOLTZGEN_REPO} {BOLTZGEN_REPO_DIR}",
-                f"cd {BOLTZGEN_REPO_DIR}",
-                f"git checkout {BOLTZGEN_COMMIT}",
-                "uv venv --python 3.12",
-                "uv pip install .",
-                "uv pip install polars[pandas,numpy,calamine,xlsxwriter] tqdm",
-            ),
-        )
-    )
-    .env({"PATH": f"{BOLTZGEN_REPO_DIR}/.venv/bin:$PATH"})
-    .workdir(BOLTZGEN_REPO_DIR)
-    .add_local_python_source("biomodals")
+runtime_image = patch_image_for_helper(
+    Image.debian_slim(python_version=CONF.python_version)
+    .apt_install("git", "build-essential", "zstd", "fd-find")
+    .env(CONF.default_env)
+    .uv_pip_install("polars[pandas,numpy,calamine,xlsxwriter]", "tqdm")
+    .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}")
+    .workdir(str(CONF.git_clone_dir))
 )
 
-app = App(APP_NAME, image=runtime_image)
+app = App(CONF.name, image=runtime_image)
 
 
 ##########################################
@@ -113,7 +89,7 @@ app = App(APP_NAME, image=runtime_image)
 @app.function(
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
+    timeout=MAX_TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )
@@ -226,18 +202,20 @@ class YAMLReferenceLoader:
 # Fetch model weights
 ##########################################
 @app.function(
-    volumes={BOLTZGEN_MODEL_DIR: BOLTZGEN_VOLUME}, timeout=TIMEOUT, image=runtime_image
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    timeout=MAX_TIMEOUT,
+    image=runtime_image,
 )
 def boltzgen_download(force: bool = False) -> None:
     """Download BoltzGen models into the mounted volume."""
     # Download all artifacts (~/.cache overridden to volume mount)
     print("💊 Downloading boltzgen models...")
-    cmd = ["boltzgen", "download", "all", "--cache", BOLTZGEN_MODEL_DIR]
+    cmd = ["boltzgen", "download", "all", "--cache", str(MODEL_DIR)]
     if force:
         cmd.append("--force_download")
-    run_command(cmd, cwd=BOLTZGEN_REPO_DIR)
+    run_command(cmd)
 
-    BOLTZGEN_VOLUME.commit()
+    MODEL_VOLUME.commit()
     print("💊 Model download complete")
 
 
@@ -245,7 +223,7 @@ def boltzgen_download(force: bool = False) -> None:
 # Inference functions
 ##########################################
 @app.function(
-    timeout=TIMEOUT, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME}, image=runtime_image
+    timeout=CONF.timeout, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME}, image=runtime_image
 )
 def prepare_boltzgen_run(
     yaml_content: bytes, run_name: str, additional_files: dict[str, bytes]
@@ -271,7 +249,7 @@ def prepare_boltzgen_run(
 
 @app.function(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
+    timeout=MAX_TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )
@@ -373,13 +351,13 @@ def collect_boltzgen_data(
 
 
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     cpu=1.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
+    timeout=MAX_TIMEOUT,
     volumes={
         OUTPUTS_DIR: OUTPUTS_VOLUME,
-        BOLTZGEN_MODEL_DIR: BOLTZGEN_VOLUME.read_only(),
+        CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
     },
     image=runtime_image,
 )
@@ -422,7 +400,7 @@ def boltzgen_run(
         "--budget",
         str(budget),
         "--cache",
-        str(BOLTZGEN_MODEL_DIR),
+        str(MODEL_DIR),
     ]
 
     if steps:
@@ -439,7 +417,7 @@ def boltzgen_run(
     out_path.mkdir(parents=True, exist_ok=True)
     log_path = out_path / "boltzgen-run.log"
     print(f"💊 Running BoltzGen, saving logs to {log_path}")
-    run_command_with_log(cmd, log_file=log_path, cwd=BOLTZGEN_REPO_DIR)
+    run_command_with_log(cmd, log_file=log_path, cwd=out_path)
 
     OUTPUTS_VOLUME.commit()
     return str(out_dir)
@@ -447,7 +425,7 @@ def boltzgen_run(
 
 @app.function(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
+    timeout=MAX_TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )
@@ -523,7 +501,7 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
 
 @app.function(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=86400,
+    timeout=CONF.timeout,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
     image=runtime_image,
 )

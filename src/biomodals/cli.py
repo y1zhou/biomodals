@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from biomodals.app.helper.shell import run_command as _run_command
+from biomodals.app.helper.shell import run_command
 
 # ruff: noqa: S603
 APP_HOME = Path(__file__).parent.resolve() / "app"
@@ -170,7 +170,7 @@ def show_app_help(
 
 @app.command(name="run")
 @app.command(name="r")
-def run_command(
+def run_modal_app(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to generate run command for.")
     ],
@@ -217,18 +217,16 @@ def run_command(
     cmd.append(str(full_app))
 
     if flags:
+        # TODO: figure out a way to tag run names into the app.
+        # Previously we used the MODAL_APP environment variable for ephemeral
+        # apps run with the --run-name flag, but with the new AppConfig API
+        # this is no longer read.
         # Smart guess of run_name to modify the MODAL_APP environment variable
-        run_name_idx = flags.index("--run-name") + 1 if "--run-name" in flags else None
-        if run_name_idx:
-            app_name = app_path.stem.replace("_app", "")
-            env = {"MODAL_APP": f"#{app_name}# {flags[run_name_idx]}"}
-        else:
-            env = {}
-        _run_command([*cmd, *flags], try_rich_print=False, env=env)
+        run_command([*cmd, *flags], try_rich_print=False)
     elif entrypoint_name is not None:
-        _run_command(["biomodals", "help", str(full_app)])
+        run_command(["biomodals", "help", str(full_app)])
     else:
-        _run_command(["biomodals", "help", str(app_path)])
+        run_command(["biomodals", "help", str(app_path)])
 
 
 if __name__ == "__main__":

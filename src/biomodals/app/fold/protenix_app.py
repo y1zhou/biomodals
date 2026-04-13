@@ -85,7 +85,7 @@ CONF = AppConfig(
     python_version="3.11",
     cuda_version="cu130",
     gpu=os.environ.get("GPU", "L40S"),
-    timeout=int(os.environ.get("TIMEOUT", "86400")),
+    timeout=int(os.environ.get("TIMEOUT", "3600")),
 )
 
 # Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
@@ -653,9 +653,7 @@ def submit_protenix_task(
     # Ensure models and data caches are available
     print(f"🧬 Checking Protenix model and data caches for {model_name}...")
     download_protenix_data.remote(
-        model_name=model_name,
-        force=False,
-        include_templates=use_template,
+        model_name=model_name, force=False, include_templates=use_template
     )
 
     if score_only:

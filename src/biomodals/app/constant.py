@@ -6,7 +6,12 @@ from modal import Volume
 MODEL_VOLUME = Volume.from_name("biomodals-store", create_if_missing=True)
 
 # Volume for caching MSA databases, which are large and shared across apps
-MSA_DB_VOLUME = Volume.from_name("biomodals-msa-db", create_if_missing=True, version=2)
+AF3_MSA_DB_VOLUME = Volume.from_name(
+    "AlphaFold3-msa-db", create_if_missing=True, version=2
+)
+PROTENIX_MSA_DB_VOLUME = Volume.from_name(
+    "Protenix-msa-db", create_if_missing=True, version=2
+)
 
 # Volume for caching MSA search results
 MSA_CACHE_VOLUME = Volume.from_name(

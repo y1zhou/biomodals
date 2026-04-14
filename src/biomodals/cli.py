@@ -247,9 +247,9 @@ def run_modal_app(
             env["TIMEOUT"] = str(timeout)
         run_command([*cmd, *flags], env=env)
     elif entrypoint_name is not None:
-        run_command(["biomodals", "help", str(full_app)])
+        run_command(["biomodals", "help", str(full_app)], try_rich_print=True)
     else:
-        run_command(["biomodals", "help", str(app_path)])
+        run_command(["biomodals", "help", str(app_path)], try_rich_print=True)
 
 
 if __name__ == "__main__":

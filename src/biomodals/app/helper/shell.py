@@ -10,7 +10,11 @@ from biomodals.app.helper.internal import timed_function
 
 
 def run_command(
-    cmd: list[str] | str, *, verbose: bool = True, try_rich_print: bool = True, **kwargs
+    cmd: list[str] | str,
+    *,
+    verbose: bool = True,
+    try_rich_print: bool = False,
+    **kwargs,
 ) -> list[str]:
     """Run a shell command and stream output to stdout.
 

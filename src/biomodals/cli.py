@@ -183,6 +183,17 @@ def run_modal_app(
         bool,
         typer.Option("--detach", "-d", help="Run the modal command in detached mode."),
     ] = False,
+    gpu: Annotated[
+        str | None,
+        typer.Option("--gpu", help="GPU type to use for the modal run (e.g. 'L40S'). "),
+    ] = None,
+    timeout: Annotated[
+        int | None,
+        typer.Option(
+            "--timeout",
+            help="Timeout in seconds for the modal run. If not specified, use the app default.",
+        ),
+    ] = None,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the modal run command."),
@@ -227,11 +238,14 @@ def run_modal_app(
         # Previously we used the MODAL_APP environment variable for ephemeral
         # apps run with the --run-name flag, but with the new AppConfig API
         # this is no longer read.
-        # Smart guess of run_name to modify the MODAL_APP environment variable
-        run_command(
-            [*cmd, *flags],
-            # try_rich_print=False,
-        )
+        import os
+
+        env = os.environ.copy()
+        if gpu is not None:
+            env["GPU"] = gpu
+        if timeout is not None:
+            env["TIMEOUT"] = str(timeout)
+        run_command([*cmd, *flags], env=env)
     elif entrypoint_name is not None:
         run_command(["biomodals", "help", str(full_app)])
     else:

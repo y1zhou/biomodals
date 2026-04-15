@@ -4,9 +4,9 @@
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input-json` | **Required** | Path to input JSON file (or PDB/CIF when `--score-only`). For a description of the JSON schema, see https://github.com/y1zhou/Protenix/blob/main/docs/infer_json_format.md. |
+| `--input-file` | **Required** | Path to input JSON file (or PDB/CIF when `--score-only`). For a description of the JSON schema, see https://github.com/y1zhou/Protenix/blob/main/docs/infer_json_format.md. |
 | `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in the current working directory. |
-| `--run-name` | stem name of `--input-json` | Optional run name used to name output files. |
+| `--run-name` | stem name of `--input-file` | Optional run name used to name output files. |
 | `--model-name` | `protenix_base_default_v1.0.0` | Model checkpoint name. Supported models: `protenix_base_default_v1.0.0`, `protenix_base_20250630_v1.0.0`. |
 | `--seeds` | `"101"` | Comma-separated random seeds for inference. |
 | `--cycle` | `10` | Pairformer cycle number. |
@@ -19,7 +19,7 @@
 | `--use-rna-msa`/`--no-use-rna-msa` | `--no-use-rna-msa` | Whether to use RNA MSA features. |
 | `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and data caches, then exit without running inference. |
 | `--force-redownload`/`--no-force-redownload` | `--no-force-redownload` | Whether to force re-download even if files already exist. |
-| `--score-only` | `False` | If True, score an existing structure with the Protenix confidence head via `protenixscore score` instead of running prediction. The `--input-json` argument should be a PDB or CIF file path. |
+| `--score-only` | `False` | If True, score an existing structure with the Protenix confidence head via `protenixscore score` instead of running prediction. The `--input-file` argument should be a PDB or CIF file path. |
 | `--extra-args` | `None` | Additional CLI arguments passed directly to `protenix pred` as a single string. |
 
 ## Additional notes
@@ -55,17 +55,18 @@
 
 import os
 import shlex
-import shutil
-from hashlib import sha256
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import modal
 from modal import App, Image
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MODEL_VOLUME, MSA_CACHE_VOLUME
+from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
 from biomodals.app.helper import hash_string, patch_image_for_helper
 from biomodals.app.helper.shell import package_outputs, run_command
+from biomodals.app.helper.structure import struct2seq
 from biomodals.app.helper.web import download_files
 
 ##########################################
@@ -83,60 +84,56 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", "3600")),
 )
 
-# Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
-MSA_CACHE_DIR = "/protenix-msa"
 
-# Volume for prediction outputs (enables skip/resume across interrupted runs)
-OUTPUTS_VOLUME_NAME, OUTPUTS_VOLUME = CONF.out_volume()
-OUTPUTS_DIR = CONF.output_volume_mountpoint
-MODEL_DIR = CONF.model_dir
+@dataclass
+class ProtenixAppInfo:
+    """Container for app-specific configuration and constants."""
 
-# Base URL for downloading checkpoints and data caches
-# https://github.com/bytedance/Protenix/blob/main/protenix/web_service/dependency_url.py
-PROTENIX_DOWNLOAD_BASE = "https://protenix.tos-cn-beijing.volces.com"
+    # https://modal.com/docs/guide/cuda#for-more-complex-setups-use-an-officially-supported-cuda-image
+    cuda_version = (
+        CONF.cuda_version_numeric
+    )  # should be no greater than host CUDA version
+    flavor = "devel"  # includes full CUDA toolkit
+    operating_sys = "ubuntu24.04"
 
-# Supported model checkpoints
+    # Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
+    msa_cache_dir: str = "/protenix-msa"
+    # Volume for prediction outputs (enables skip/resume across interrupted runs)
+    model_dir: Path = CONF.model_dir
 
-SUPPORTED_MODELS = (
-    "protenix_base_default_v1.0.0",
-    "protenix_base_20250630_v1.0.0",
-    # "protenix-v2.pt",  # TODO: keep an eye on protenix-v2
-)
+    # Base URL for downloading checkpoints and data caches
+    # https://github.com/bytedance/Protenix/blob/main/protenix/web_service/dependency_url.py
+    base_url: str = "https://protenix.tos-cn-beijing.volces.com"
 
-# CCD and other data caches required for inference
-DATA_CACHE_FILES = (
-    "common/components.cif",
-    "common/components.cif.rdkit_mol.pkl",
-    "common/clusters-by-entity-40.txt",
-    "common/obsolete_release_date.csv",
-)
+    # Supported model checkpoints
+    supported_models: Sequence[str] = (
+        "protenix_base_default_v1.0.0",
+        "protenix_base_20250630_v1.0.0",
+        # "protenix-v2.pt",  # TODO: keep an eye on protenix-v2
+    )
+    # CCD and other data caches required for inference
+    data_cache: Sequence[str] = (
+        "common/components.cif",
+        "common/components.cif.rdkit_mol.pkl",
+        "common/clusters-by-entity-40.txt",
+        "common/obsolete_release_date.csv",
+    )
+    # Additional files needed when templates are enabled
+    template_cache: Sequence[str] = (
+        "common/obsolete_to_successor.json",
+        "common/release_date_cache.json",
+    )
 
-# Additional files needed when templates are enabled
-TEMPLATE_CACHE_FILES = (
-    "common/obsolete_to_successor.json",
-    "common/release_date_cache.json",
-)
 
 ##########################################
 # Image and app definitions
 ##########################################
-
-# https://modal.com/docs/guide/cuda#for-more-complex-setups-use-an-officially-supported-cuda-image
-cuda_version = CONF.cuda_version_numeric  # should be no greater than host CUDA version
-flavor = "devel"  # includes full CUDA toolkit
-operating_sys = "ubuntu24.04"
-tag = f"{cuda_version}-{flavor}-{operating_sys}"
-
+APP_INFO = ProtenixAppInfo()
+tag = f"{APP_INFO.cuda_version}-{APP_INFO.flavor}-{APP_INFO.operating_sys}"
 runtime_image = patch_image_for_helper(
     Image.from_registry(f"nvidia/cuda:{tag}", add_python=CONF.python_version)
-    .apt_install(
-        "git",
-        "build-essential",
-        "zstd",
-        "hmmer",
-        "kalign",
-        "wget",
-    )
+    .entrypoint([])  # remove verbose logging in the base image
+    .apt_install("git", "build-essential", "zstd", "hmmer", "kalign", "wget")
     .env(
         CONF.default_env
         | {
@@ -183,23 +180,23 @@ def download_protenix_data(
 
     # Download common data caches
     data_caches = {
-        f"{PROTENIX_DOWNLOAD_BASE}/{rel_path}": data_root / rel_path
-        for rel_path in DATA_CACHE_FILES
+        f"{APP_INFO.base_url}/{rel_path}": data_root / rel_path
+        for rel_path in APP_INFO.data_cache
     }
     files_to_download = files_to_download | data_caches
 
     # Download template data if requested
     if include_templates:
         template_caches = {
-            f"{PROTENIX_DOWNLOAD_BASE}/{rel_path}": data_root / rel_path
-            for rel_path in TEMPLATE_CACHE_FILES
+            f"{APP_INFO.base_url}/{rel_path}": data_root / rel_path
+            for rel_path in APP_INFO.template_cache
         }
         files_to_download = files_to_download | template_caches
 
     # TODO: https://github.com/bytedance/Protenix/blob/main/scripts/database/download_protenix_data.sh
 
     # Download model checkpoint
-    ckpt_url = f"{PROTENIX_DOWNLOAD_BASE}/checkpoint/{model_name}.pt"
+    ckpt_url = f"{APP_INFO.base_url}/checkpoint/{model_name}.pt"
     files_to_download = files_to_download | {
         ckpt_url: data_root / "checkpoint" / f"{model_name}.pt"
     }
@@ -213,11 +210,13 @@ def download_protenix_data(
 ##########################################
 # Inference functions
 ##########################################
-@app.function(timeout=CONF.timeout, volumes={MSA_CACHE_DIR: MSA_CACHE_VOLUME})
+@app.function(timeout=CONF.timeout, volumes={APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME})
 def query_protenix_msa_server(
     query_command: str, input_json_path: str, output_dir: str, msa_server_mode: str
 ) -> None:
     """Query the Protenix remote MSA server with the given command."""
+    from uniaf3.schema import ProtenixConfig
+
     cmd = [
         "protenix",
         query_command,
@@ -226,22 +225,53 @@ def query_protenix_msa_server(
         f"--msa_server_mode={msa_server_mode}",
     ]
     run_command(cmd)
+
+    # Move the searched files out of the run_name subdir such that future
+    # runs with different names could hit the same cache
+    out_path = Path(output_dir)
+    msa_out_dir = next(out_path.glob("*/msa"))
+    run_name_dir = msa_out_dir.parent
+    run_name = run_name_dir.name
+    for subdir in run_name_dir.iterdir():
+        subdir.rename(out_path / subdir.name)
+
+    # Also need to update the file paths in the JSON to reflect new locations
+    def _get_new_location(old_path: str | None) -> str | None:
+        if old_path is None:
+            return
+        old_path_file = Path(old_path)
+        if old_path_file.is_relative_to(run_name_dir):
+            return str(out_path / old_path_file.relative_to(run_name_dir))
+        return old_path
+
+    for conf_json in out_path.glob(f"{run_name}-*.json"):
+        conf = ProtenixConfig.from_file(conf_json)
+        for task in conf.root:
+            for seq in task.sequences:
+                if seq.proteinChain is not None:
+                    seq.proteinChain.unpairedMsaPath = _get_new_location(
+                        seq.proteinChain.unpairedMsaPath
+                    )
+                    seq.proteinChain.pairedMsaPath = _get_new_location(
+                        seq.proteinChain.pairedMsaPath
+                    )
+                if seq.rnaSequence is not None:
+                    seq.rnaSequence.unpairedMsaPath = _get_new_location(
+                        seq.rnaSequence.unpairedMsaPath
+                    )
+        conf.to_files(out_path, conf_json.stem)
+
+    run_name_dir.rmdir()
     MSA_CACHE_VOLUME.commit()
 
 
-@app.function(
-    timeout=CONF.timeout,
-    volumes={
-        CONF.model_volume_mountpoint: MODEL_VOLUME,
-        MSA_CACHE_DIR: MSA_CACHE_VOLUME,
-    },
-)
+@app.function(timeout=CONF.timeout, volumes={APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME})
 def prepare_protenix_inputs(
-    json_str: bytes,
+    input_bytes: bytes,
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
-) -> str | None:
+) -> bytes:
     """Run CPU preprocessing and cache prepared JSON + search outputs in a volume."""
     from tempfile import mkdtemp
 
@@ -249,7 +279,7 @@ def prepare_protenix_inputs(
 
     tmpdir = Path(mkdtemp(prefix="protenix_prep_"))  # cleaned on container exit
     tmp_json_path = tmpdir / "input.json"
-    tmp_json_path.write_bytes(json_str)
+    tmp_json_path.write_bytes(input_bytes)
 
     # `protenix prep` (inputprep) runs MSA + template + RNA MSA search.
     # It first produces `input-update-msa.json`, then (if template or RNA
@@ -259,29 +289,34 @@ def prepare_protenix_inputs(
     match (use_template, use_rna_msa):
         case (True, True):
             protenix_command = "prep"
+            updated_suffix = "final-updated"
         case (True, False):
             protenix_command = "mt"
+            updated_suffix = "final-updated"
         case (False, False):
             protenix_command = "msa"
+            updated_suffix = "update-msa"
         case _:
             raise ValueError("RNA MSA without templates is not supported")
 
     # Load protein and RNA sequences from input JSON
     conf = ProtenixConfig.from_file(tmp_json_path)
     msa_tasks = []
+    seq_indices: dict[int, dict[str, list[int]]] = {}  # task_id -> {seq -> [indices]}
+    output_dirs: list[str] = []
     for task_idx, task in enumerate(conf.root):
         protein_seqs: list[str] = []
         rna_seqs: list[str] = []
-        seq_hashes: dict[int, str] = {}
+        seq_indices[task_idx] = {}
         for seq_idx, seq in enumerate(task.sequences):
             if seq.proteinChain is not None:
                 prot_seq = seq.proteinChain.sequence
                 protein_seqs.append(prot_seq)
-                seq_hashes[seq_idx] = hash_string(prot_seq)
+                seq_indices[task_idx].setdefault(prot_seq, []).append(seq_idx)
             elif seq.rnaSequence is not None:
                 rna_seq = seq.rnaSequence.sequence
                 rna_seqs.append(rna_seq)
-                seq_hashes[seq_idx] = hash_string(rna_seq)
+                seq_indices[task_idx].setdefault(rna_seq, []).append(seq_idx)
 
         hash_key = (
             hash_string(":".join(protein_seqs + rna_seqs))
@@ -289,20 +324,20 @@ def prepare_protenix_inputs(
             else hash_string(":".join(protein_seqs))
         )
         cache_dir = (
-            Path(MSA_CACHE_DIR) / CONF.name / msa_server_mode / hash_key[:2] / hash_key
+            Path(APP_INFO.msa_cache_dir)
+            / CONF.name
+            / msa_server_mode
+            / hash_key[:2]
+            / hash_key
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
+        output_dirs.append(str(cache_dir))
 
         # Skip run if expected output is already cached for this input
-        cache_hit = any(
-            (cache_dir / f).exists()
-            for f in ("x-final-updated.json", "x-update-msa.json")
-        )
-        if cache_hit:
-            # TODO: fill `conf` with cached paths
+        task_name = task.name
+        if (cache_dir / f"{task_name}-{updated_suffix}.json").exists():
             continue
 
-        task_name = task.name
         ProtenixConfig([task]).to_files(cache_dir, task_name)
         MSA_CACHE_VOLUME.commit()
         msa_task = query_protenix_msa_server.spawn(
@@ -314,24 +349,39 @@ def prepare_protenix_inputs(
         msa_tasks.append(msa_task)
 
     _ = modal.FunctionCall.gather(*msa_tasks)
-    MSA_CACHE_VOLUME.commit()
+    MSA_CACHE_VOLUME.reload()
+
+    # Add the MSA paths back to the input JSON
+    for task_idx, task in enumerate(conf.root):
+        task_name = task.name
+        cache_dir = Path(output_dirs[task_idx])
+        updated_suffix = (
+            "update-msa" if not (use_template or use_rna_msa) else "final-updated"
+        )
+        updated_json_path = cache_dir / f"{task_name}-{updated_suffix}.json"
+        if not updated_json_path.exists():
+            raise FileNotFoundError(
+                f"Expected MSA output not found: {updated_json_path}"
+            )
+        updated_conf = ProtenixConfig.from_file(updated_json_path)
+        conf.root[task_idx] = updated_conf.root[0]
+
+    return conf.to_json().encode()
 
 
 @app.function(
     gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes={
         CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
-        MSA_CACHE_DIR: MSA_CACHE_VOLUME,
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME,
     },
 )
 def run_protenix(
-    json_str: bytes | None,
+    input_bytes: bytes,
     run_name: str,
-    prep_cache_key: str | None = None,
     model_name: str = "protenix_base_default_v1.0.0",
     seeds: str = "101",
     cycle: int = 10,
@@ -350,8 +400,7 @@ def run_protenix(
     """Run Protenix structure prediction or confidence scoring.
 
     Args:
-        json_str: Input JSON bytes for prediction, or PDB/CIF bytes when
-            score_only is True.
+        input_bytes: Input JSON for prediction, or PDB/CIF in `score_only` mode.
         run_name: Name for this run (used for output directory).
         prep_cache_key: Cache key from a prior prepare_protenix_inputs call.
         model_name: Model checkpoint name.
@@ -375,194 +424,105 @@ def run_protenix(
         or scoring outputs when score_only is True.
 
     """
-    import tempfile
+    from tempfile import mkdtemp
 
     run_env = os.environ.copy()
     if use_fast_layernorm:
         run_env["LAYERNORM_TYPE"] = "fast_layernorm"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        out_dir = tmpdir_path / "output"
-        out_dir.mkdir()
+    tmpdir_path = Path(mkdtemp(prefix="protenix_run_"))  # cleaned on container exit
+    out_dir = tmpdir_path / run_name
+    out_dir.mkdir()
 
-        if score_only:
-            # Score an existing structure with the Protenix confidence head
-            if json_str is None:
-                raise ValueError("json_str must be provided when score_only=True")
+    # Score an existing structure with the Protenix confidence head
+    if score_only:
+        # Detect CIF vs PDB format: CIF files start with 'data_' (after
+        # any leading comment lines starting with '#'), PDB files with
+        # record types like HEADER/ATOM/REMARK.
+        input_ext = ".pdb"
+        for _line in input_bytes.splitlines():
+            stripped = _line.strip()
+            if not stripped or stripped.startswith(b"#"):
+                continue
+            if stripped.startswith(b"data_"):
+                input_ext = ".cif"
+            break
+        input_file = tmpdir_path / f"{run_name}{input_ext}"
+        input_file.write_bytes(input_bytes)
 
-            # Detect CIF vs PDB format: CIF files start with 'data_' (after
-            # any leading comment lines starting with '#'), PDB files with
-            # record types like HEADER/ATOM/REMARK.
-            input_ext = ".pdb"
-            for _line in json_str.splitlines():
-                stripped = _line.strip()
-                if not stripped or stripped.startswith(b"#"):
-                    continue
-                if stripped.startswith(b"data_"):
-                    input_ext = ".cif"
-                break
-            input_file = tmpdir_path / f"{run_name}{input_ext}"
-            input_file.write_bytes(json_str)
+        # Map use_msa → --use_msas (both | false)
+        # ProtenixScore's use_msas controls which chain roles receive MSAs.
+        use_msas_val = "both" if use_msa else "false"
 
-            # Map use_msa → --use_msas (both | false)
-            # ProtenixScore's use_msas controls which chain roles receive MSAs.
-            use_msas_val = "both" if use_msa else "false"
-
-            # Map msa_server_mode → --msa_host_url.
-            # The protenix remote server URL matches what `protenix msa` uses
-            # (MMSEQS_SERVICE_HOST_URL in protenix/web_service/colab_request_parser.py).
-            _PROTENIX_MSA_HOST = "https://protenix-server.com/api/msa"
-            _COLABFOLD_MSA_HOST = "https://api.colabfold.com"
-            msa_host_url = (
-                _PROTENIX_MSA_HOST
-                if msa_server_mode == "protenix"
-                else _COLABFOLD_MSA_HOST
-            )
-
-            # Cache fetched MSAs in the PREP volume so they can be reused across
-            # runs (separate sub-directory from the `protenix msa` cache).
-            score_msa_cache_dir = Path(MSA_CACHE_DIR) / "score_msa_cache"
-            score_msa_cache_dir.mkdir(parents=True, exist_ok=True)
-
-            cmd = [
-                "protenixscore",
-                "score",
-                "--input",
-                str(input_file),
-                "--output",
-                str(out_dir),
-                "--model_name",
-                model_name,
-                "--dtype",
-                dtype,
-                "--use_msas",
-                use_msas_val,
-                "--msa_host_url",
-                msa_host_url,
-                "--msa_cache_dir",
-                str(score_msa_cache_dir),
-                "--msa_cache_mode",
-                "readwrite",
-            ]
-            run_command(cmd, env=run_env, cwd=out_dir)
-
-            # Persist MSA cache back to the volume for reuse in future runs
-            MSA_CACHE_VOLUME.commit()
-            print("💊 Packaging ProtenixScore results...")
-            tarball_bytes = package_outputs(out_dir)
-            return tarball_bytes
-
-        # --- Prediction mode ---
-        # Compute a cache key for this run (excludes seeds so we can track per-seed)
-        h_out = sha256()
-        if prep_cache_key is not None:
-            h_out.update(prep_cache_key.encode("utf-8"))
-        elif json_str is not None:
-            h_out.update(json_str)
-        h_out.update(
-            f"{model_name}|{cycle}|{step}|{sample}|{dtype}"
-            f"|{use_msa}|{msa_server_mode}|{use_template}|{use_rna_msa}".encode()
+        # Map msa_server_mode → --msa_host_url.
+        # The protenix remote server URL matches what `protenix msa` uses
+        # (MMSEQS_SERVICE_HOST_URL in protenix/web_service/colab_request_parser.py).
+        msa_host_url = (
+            "https://protenix-server.com/api/msa"
+            if msa_server_mode == "protenix"
+            else "https://api.colabfold.com"
         )
-        output_cache_key = h_out.hexdigest()
-        vol_run_dir = Path(OUTPUTS_DIR) / run_name / output_cache_key
 
-        # Sync the volume to see outputs from any previous (possibly interrupted) run
-        OUTPUTS_VOLUME.reload()
-        vol_run_dir.mkdir(parents=True, exist_ok=True)
-
-        # Determine which seeds have already been saved to the volume.
-        # Protenix outputs follow <vol_run_dir>/<sample_name>/seed_<N>/ so we
-        # only need to look one directory level deep.
-        seed_list = [int(s.strip()) for s in seeds.split(",")]
-        done_seeds = [
-            s
-            for s in seed_list
-            if any(d.is_dir() for d in vol_run_dir.glob(f"*/seed_{s}"))
+        # Cache fetched MSAs so they can be reused across runs
+        input_seqs = struct2seq(input_file)
+        cache_key = hash_string(":".join(x[1] for x in input_seqs))
+        score_msa_cache_dir = (
+            Path(APP_INFO.msa_cache_dir)
+            / f"{CONF.name}_score"
+            / msa_server_mode
+            / cache_key[:2]
+            / cache_key
+        )
+        score_msa_cache_dir.mkdir(parents=True, exist_ok=True)
+        # TODO: split MSA search and score steps
+        cmd = [
+            "protenixscore",
+            "score",
+            f"--input={input_file}",
+            f"--output={out_dir}",
+            f"--model_name={model_name}",
+            f"--dtype={dtype}",
+            f"--use_msas={use_msas_val}",
+            f"--msa_host_url={msa_host_url}",
+            f"--msa_cache_dir={score_msa_cache_dir}",
+            "--msa_cache_mode=readwrite",
         ]
-        missing_seeds = [s for s in seed_list if s not in done_seeds]
+        run_command(cmd, env=run_env, cwd=out_dir)
 
-        if not missing_seeds:
-            print(
-                f"💊 All {len(seed_list)} seed(s) found in output cache; "
-                "skipping inference."
-            )
-            shutil.copytree(str(vol_run_dir), str(out_dir), dirs_exist_ok=True)
-        else:
-            if done_seeds:
-                print(
-                    f"💊 {len(done_seeds)} seed(s) cached; "
-                    f"running {len(missing_seeds)} remaining seed(s)."
-                )
-                # Restore already-completed seeds so the final tarball is complete
-                shutil.copytree(str(vol_run_dir), str(out_dir), dirs_exist_ok=True)
-
-            # Resolve input JSON path
-            if prep_cache_key is not None:
-                input_json_path = (
-                    Path(MSA_CACHE_DIR)
-                    / prep_cache_key[:2]
-                    / prep_cache_key
-                    / "prepared.json"
-                )
-                if not input_json_path.exists():
-                    raise FileNotFoundError(
-                        f"Prepared input not found for cache key: {prep_cache_key}"
-                    )
-            else:
-                if json_str is None:
-                    raise ValueError(
-                        "Either prep_cache_key or json_str must be provided"
-                    )
-                input_json_path = tmpdir_path / f"{run_name}.json"
-                input_json_path.write_bytes(json_str)
-
-            # Run protenix pred for missing seeds only
-            missing_seeds_str = ",".join(str(s) for s in missing_seeds)
-            cmd = [
-                "protenix",
-                "pred",
-                "-i",
-                str(input_json_path),
-                "-o",
-                str(out_dir),
-                "-s",
-                missing_seeds_str,
-                "-c",
-                str(cycle),
-                "-p",
-                str(step),
-                "-e",
-                str(sample),
-                "-d",
-                dtype,
-                "-n",
-                model_name,
-                "--use_msa",
-                str(use_msa),
-                "--msa_server_mode",
-                msa_server_mode,
-                "--use_template",
-                str(use_template),
-                "--use_rna_msa",
-                str(use_rna_msa),
-                "--use_tfg_guidance",
-                str(use_tfg_guidance),
-            ]
-
-            if extra_args:
-                cmd.extend(shlex.split(extra_args))
-
-            run_command(cmd, env=run_env, cwd=out_dir)
-
-            # Persist new outputs to the volume so interrupted runs can resume
-            shutil.copytree(str(out_dir), str(vol_run_dir), dirs_exist_ok=True)
-            OUTPUTS_VOLUME.commit()
-
-        # Package outputs
-        print("💊 Packaging Protenix results...")
+        # Persist MSA cache back to the volume for reuse in future runs
+        MSA_CACHE_VOLUME.commit()
+        print("💊 Packaging ProtenixScore results...")
         tarball_bytes = package_outputs(out_dir)
+        return tarball_bytes
 
+    # --- Prediction mode ---
+    input_json_path = tmpdir_path / f"{run_name}.json"
+    input_json_path.write_bytes(input_bytes)
+    cmd = [
+        "protenix",
+        "pred",
+        f"--input={input_json_path}",
+        f"--out_dir={out_dir}",
+        f"--seeds={seeds}",
+        f"--cycle={cycle}",
+        f"--step={step}",
+        f"--sample={sample}",
+        f"--dtype={dtype}",
+        f"--model_name={model_name}",
+        f"--use_msa={use_msa}",
+        f"--msa_server_mode={msa_server_mode}",
+        f"--use_template={use_template}",
+        f"--use_rna_msa={use_rna_msa}",
+        f"--use_tfg_guidance={use_tfg_guidance}",
+    ]
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
+
+    run_command(cmd, env=run_env, cwd=out_dir)
+
+    # Package outputs
+    print("💊 Packaging Protenix results...")
+    tarball_bytes = package_outputs(out_dir)
     return tarball_bytes
 
 
@@ -571,7 +531,7 @@ def run_protenix(
 ##########################################
 @app.local_entrypoint()
 def submit_protenix_task(
-    input_json: str,
+    input_file: str,
     out_dir: str | None = None,
     run_name: str | None = None,
     model_name: str = "protenix_base_default_v1.0.0",
@@ -586,7 +546,6 @@ def submit_protenix_task(
     use_rna_msa: bool = False,
     use_tfg_guidance: bool = False,
     use_fast_layernorm: bool = False,
-    download_models: bool = False,
     force_redownload: bool = False,
     extra_args: str | None = None,
     score_only: bool = False,
@@ -594,8 +553,7 @@ def submit_protenix_task(
     """Run Protenix structure prediction on Modal and fetch results to `out_dir`.
 
     Args:
-        input_json: Path to input JSON file, or a PDB/CIF file when score_only
-            is True.
+        input_file: Path to input JSON file, or a PDB/CIF file in `score_only` mode.
         out_dir: Optional output directory (defaults to $CWD)
         run_name: Optional run name (defaults to input filename stem)
         model_name: Model checkpoint name
@@ -610,7 +568,6 @@ def submit_protenix_task(
         use_rna_msa: Whether to use RNA MSA features
         use_tfg_guidance: Enable Training-Free Guidance (TFG) for refined sampling
         use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel
-        download_models: Whether to download model weights and skip running
         force_redownload: Whether to force re-download of model weights
         extra_args: Additional CLI arguments passed to protenix pred
         score_only: When True, score an existing PDB/CIF structure using
@@ -618,25 +575,14 @@ def submit_protenix_task(
 
     """
     # Validate model name
-    if model_name not in SUPPORTED_MODELS:
+    if model_name not in APP_INFO.supported_models:
         raise ValueError(
             f"Unsupported model: {model_name}. "
-            f"Supported models: {', '.join(SUPPORTED_MODELS)}"
+            f"Supported models: {', '.join(APP_INFO.supported_models)}"
         )
-
-    # Handle download-only mode
-    if download_models:
-        print(f"🧬 Downloading models: {model_name}")
-        download_protenix_data.remote(
-            model_name=model_name,
-            force=force_redownload,
-            include_templates=use_template,
-        )
-        print("🧬 Download complete!")
-        return
 
     # Validate input and output paths
-    input_path = Path(input_json).expanduser().resolve()
+    input_path = Path(input_file).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
@@ -653,15 +599,15 @@ def submit_protenix_task(
     # Ensure models and data caches are available
     print(f"🧬 Checking Protenix model and data caches for {model_name}...")
     download_protenix_data.remote(
-        model_name=model_name, force=False, include_templates=use_template
+        model_name=model_name, force=force_redownload, include_templates=use_template
     )
 
-    json_str = input_path.read_bytes()
+    input_bytes = input_path.read_bytes()
     if score_only:
         # Score an existing structure; MSA fetching is handled inside run_protenix
         print(f"🧬 Scoring structure with {model_name}...")
         tarball_bytes = run_protenix.remote(
-            json_str=json_str,
+            input_bytes=input_bytes,
             run_name=run_name,
             model_name=model_name,
             dtype=dtype,
@@ -672,38 +618,36 @@ def submit_protenix_task(
         )
     else:
         # Preprocess (MSA/template) on CPU and cache in volume for reuse
-        prep_cache_key: str | None = None
         if use_msa or use_template or use_rna_msa:
             print("🧬 Running Protenix preprocessing and caching intermediates...")
-            prep_cache_key = prepare_protenix_inputs.remote(
-                json_str=json_str,
+            input_bytes = prepare_protenix_inputs.remote(
+                input_bytes=input_bytes,
                 msa_server_mode=msa_server_mode,
                 use_template=use_template,
                 use_rna_msa=use_rna_msa,
             )
 
         # Run inference
-        # print(f"🧬 Running Protenix inference with {model_name}...")
-        # tarball_bytes = run_protenix.remote(
-        #     json_str=None if prep_cache_key is not None else json_str,
-        #     run_name=run_name,
-        #     prep_cache_key=prep_cache_key,
-        #     model_name=model_name,
-        #     seeds=seeds,
-        #     cycle=cycle,
-        #     step=step,
-        #     sample=sample,
-        #     dtype=dtype,
-        #     use_msa=use_msa,
-        #     msa_server_mode=msa_server_mode,
-        #     use_template=use_template,
-        #     use_rna_msa=use_rna_msa,
-        #     use_tfg_guidance=use_tfg_guidance,
-        #     use_fast_layernorm=use_fast_layernorm,
-        #     extra_args=extra_args,
-        # )
+        print(f"🧬 Running inference with {model_name}...")
+        tarball_bytes = run_protenix.remote(
+            input_bytes=input_bytes,
+            run_name=run_name,
+            model_name=model_name,
+            seeds=seeds,
+            cycle=cycle,
+            step=step,
+            sample=sample,
+            dtype=dtype,
+            use_msa=use_msa,
+            msa_server_mode=msa_server_mode,
+            use_template=use_template,
+            use_rna_msa=use_rna_msa,
+            use_tfg_guidance=use_tfg_guidance,
+            use_fast_layernorm=use_fast_layernorm,
+            extra_args=extra_args,
+        )
 
     # Save results locally
-    # local_out_dir.mkdir(parents=True, exist_ok=True)
-    # out_file.write_bytes(tarball_bytes)
-    # print(f"🧬 Protenix run complete! Results saved to {out_file}")
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+    out_file.write_bytes(tarball_bytes)
+    print(f"🧬 Protenix run complete! Results saved to {out_file}")

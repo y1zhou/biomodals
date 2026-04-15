@@ -18,7 +18,7 @@ def patch_image_for_helper(image: Image) -> Image:
     return (
         image.apt_install("zstd", "fd-find")
         .uv_pip_install(helper_deps)
-        .add_local_python_source("biomodals")
+        .add_local_python_source("biomodals", copy=True)
     )
 
 

@@ -2,6 +2,7 @@
 
 import importlib
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -61,6 +62,62 @@ def app_path_to_module_path(app_path: Path) -> str:
 ##########################################
 # CLI Commands
 ##########################################
+def _docstring_to_markdown_table(f: Callable) -> list[str]:
+    """Convert a function docstring with Args into a list of Markdown rows.
+
+    The docstring is assumed to be in the Google style, where arguments are
+    described in an "Args:" section, with each argument on a new line.
+    If the description of an argument spans multiple lines, it is indented
+    with an additional level of indentation.
+    """
+    import inspect
+
+    sig = inspect.signature(f)
+    doc = inspect.getdoc(f) or ""
+    args_start = doc.find("Args:\n")
+    if args_start == -1:
+        return []
+
+    # Find the indentation level of the arguments
+    doc = doc[args_start:]
+    first_arg_line = doc.split("\n")[1]
+    indent_level = len(first_arg_line) - len(first_arg_line.lstrip())
+
+    # Make a dict of argument descriptions
+    arg_descriptions: dict[str, str] = {}
+    doc_list = doc.split("\n")
+    for i, line in enumerate(doc_list):
+        if line.strip() == "Args:":
+            continue
+        if line.startswith(" " * indent_level) and ":" in line:
+            arg_name = line.strip().split(":")[0]
+            description = line.strip().split(":")[1].strip()
+            # Check for additional lines in the description
+            next_line_index = i + 1
+            while next_line_index < len(doc_list) and doc_list[
+                next_line_index
+            ].startswith(" " * (indent_level * 2)):
+                description += " " + doc_list[next_line_index].strip()
+                next_line_index += 1
+            arg_descriptions[arg_name] = description
+
+    table_rows = [
+        "| Flag | Default | Description |",
+        "|------|---------|-------------|",
+    ]
+    for name, p in sig.parameters.items():
+        flag = f"--{name.replace('_', '-')}"
+        default = (
+            f"`{p.default}`"
+            if p.default is not inspect.Parameter.empty
+            else "**Required**"
+        )
+        description = arg_descriptions.get(name, "")
+        table_rows.append(f"| `{flag}` | {default} | {description} |")
+
+    return table_rows
+
+
 @app.command(name="list")
 @app.command(name="ls")
 @app.command(name="l")
@@ -121,7 +178,8 @@ def show_app_help(
         module = importlib.import_module(module_path)
 
         remote_modal_functions: list[str] = []
-        local_entrypoint_docstring: str = ""
+        # local_entrypoint_docstring: str = ""
+        args_table: list[str] = []
         for obj in dir(module):
             f = getattr(module, obj)
             if isinstance(f, modal.Function):
@@ -138,11 +196,10 @@ def show_app_help(
                 remote_modal_functions.append(obj)
 
             if isinstance(f, modal.app.LocalEntrypoint):
-                local_entrypoint_docstring = f.info.raw_f.__doc__ or ""
+                # local_entrypoint_docstring = f.info.raw_f.__doc__ or ""
+                args_table = _docstring_to_markdown_table(f.info.raw_f)
 
-        console.print(
-            f"[bold]Help for application '[green]{app_path}[/green]':[/bold]\n"
-        )
+        console.print(f"[bold]Help for application '[green]{app_path}[/green]':[/bold]")
         console.print(
             "\n\n[bold underline2]Module documentation[/bold underline2]\n",
             justify="center",
@@ -153,16 +210,16 @@ def show_app_help(
                 f"[bold]Modal functions in this app:[/bold] [green]{', '.join(remote_modal_functions)}[/green]\n"
             )
         if docstring := module.__doc__:
-            rendered_doc = Markdown(docstring)
-            console.print(rendered_doc)
-        if local_entrypoint_docstring:
+            console.print(Markdown(docstring))
+        if args_table:
             console.print(
-                "\n\n[bold underline2]Local entrypoint documentation[/bold underline2]\n",
+                "\n\n[bold underline2]Entrypoint CLI flags[/bold underline2]",
                 justify="center",
                 highlight=True,
             )
-            console.print(local_entrypoint_docstring)
-        if not (docstring or local_entrypoint_docstring):
+            console.print(Markdown("\n".join(args_table)))
+            # console.print(local_entrypoint_docstring)
+        if not (docstring or args_table):
             console.print("No documentation available.")
     except ImportError as e:
         console.print(f"[bold red]Error:[/bold red] Failed to import '{module_path}'")

@@ -1,34 +1,12 @@
 """Protenix source repo: <https://github.com/y1zhou/Protenix>.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-file` | **Required** | Path to input JSON file (or PDB/CIF when `--score-only`). For a description of the JSON schema, see https://github.com/y1zhou/Protenix/blob/main/docs/infer_json_format.md. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in the current working directory. |
-| `--run-name` | stem name of `--input-file` | Optional run name used to name output files. |
-| `--model-name` | `protenix_base_default_v1.0.0` | Model checkpoint name. Supported models: `protenix_base_default_v1.0.0`, `protenix_base_20250630_v1.0.0`. |
-| `--seeds` | `"101"` | Comma-separated random seeds for inference. |
-| `--cycle` | `10` | Pairformer cycle number. |
-| `--step` | `200` | Number of diffusion steps. |
-| `--sample` | `5` | Number of samples per seed. |
-| `--dtype` | `"bf16"` | Inference dtype (`bf16` or `fp32`). |
-| `--use-msa`/`--no-use-msa` | `--use-msa` | Whether to use MSA features. |
-| `--msa-server-mode` | `protenix` | MSA search mode: `protenix` (remote server, no local DB needed) or `colabfold`. |
-| `--use-template`/`--no-use-template` | `--no-use-template` | Whether to search for and use templates. |
-| `--use-rna-msa`/`--no-use-rna-msa` | `--no-use-rna-msa` | Whether to use RNA MSA features. |
-| `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and data caches, then exit without running inference. |
-| `--force-redownload`/`--no-force-redownload` | `--no-force-redownload` | Whether to force re-download even if files already exist. |
-| `--score-only` | `False` | If True, score an existing structure with the Protenix confidence head via `protenixscore score` instead of running prediction. The `--input-file` argument should be a PDB or CIF file path. |
-| `--extra-args` | `None` | Additional CLI arguments passed directly to `protenix pred` as a single string. |
-
-## Additional notes
+## Notes
 
 * The default `--msa-server-mode protenix` uses the Protenix remote MSA server,
   so no local MSA databases are required. Switch to `colabfold` if you have a
   pre-populated database volume.
 * MSA/template preprocessing is run in a CPU-only Modal function and cached in a
-  persistent Modal volume (`protenix-msa`) before GPU inference.
+  persistent Modal volume before GPU inference.
 * Templates are only used when `--use-template` is passed. Template support
   requires the v1.0.0 model checkpoints.
 * RNA MSA is only supported by v1.0.0 model checkpoints.
@@ -36,14 +14,10 @@
   substructure constraints specified in the input JSON.
 * For large structures (>2000 tokens), consider using an A100 (80GB) or H100
   GPU by setting the `GPU` environment variable.
-* Prediction outputs are cached in a persistent Modal volume (`protenix-outputs`)
-  keyed by run name and inference parameters. Interrupted runs resume from the
-  last completed seed automatically.
 
 ## Outputs
 
-* Results will be saved to the specified `--out-dir` as
-  `<run-name>_protenix_outputs.tar.zst`.
+* Results will be saved to the specified `--out-dir` as `<run-name>.tar.zst`.
 * For prediction runs, the tarball contains predicted `.cif` structure files and
   `*_summary_confidence.json` files with pLDDT, pAE, and ranking scores.
 * For `--score-only` runs, the tarball contains per-structure confidence JSON
@@ -554,25 +528,28 @@ def submit_protenix_task(
 
     Args:
         input_file: Path to input JSON file, or a PDB/CIF file in `score_only` mode.
-        out_dir: Optional output directory (defaults to $CWD)
-        run_name: Optional run name (defaults to input filename stem)
-        model_name: Model checkpoint name
-        seeds: Comma-separated random seeds for inference
-        cycle: Pairformer cycle number
-        step: Number of diffusion steps
-        sample: Number of samples per seed
-        dtype: Inference dtype (bf16 or fp32)
-        use_msa: Whether to use MSA features
-        msa_server_mode: MSA search mode (protenix or colabfold)
-        use_template: Whether to use templates
-        use_rna_msa: Whether to use RNA MSA features
-        use_tfg_guidance: Enable Training-Free Guidance (TFG) for refined sampling
-        use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel
-        force_redownload: Whether to force re-download of model weights
-        extra_args: Additional CLI arguments passed to protenix pred
+            For a description of the JSON schema, see
+            <https://github.com/y1zhou/Protenix/blob/main/docs/infer_json_format.md>.
+        out_dir: Optional local output directory. If not specified, outputs
+            will be saved in the current working directory.
+        run_name: Optional run name for output files. Defaults to input filename stem.
+        model_name: Model checkpoint name. See `APP_INFO.supported_models`
+            for available models.
+        seeds: Comma-separated random seeds for inference.
+        cycle: Pairformer cycle number.
+        step: Number of diffusion steps.
+        sample: Number of samples per seed.
+        dtype: Inference dtype (bf16 or fp32).
+        use_msa: Whether to use MSA features. Pass `--no-use-msa` to disable.
+        msa_server_mode: MSA search mode (`protenix` or `colabfold`).
+        use_template: Whether to use templates. Requires Protenix data files.
+        use_rna_msa: Whether to use RNA MSA features.
+        use_tfg_guidance: Enable Training-Free Guidance (TFG) for refined sampling.
+        use_fast_layernorm: Whether to enable the custom CUDA layernorm kernel.
+        force_redownload: Whether to force re-download of model weights.
+        extra_args: Additional CLI arguments passed to `protenix pred`.
         score_only: When True, score an existing PDB/CIF structure using
             ``protenixscore score`` instead of running prediction.
-
     """
     # Validate model name
     if model_name not in APP_INFO.supported_models:

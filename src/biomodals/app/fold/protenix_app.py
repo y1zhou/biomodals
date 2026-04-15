@@ -79,7 +79,7 @@ CONF = AppConfig(
     package_name="protenix",
     version="2.0.0",
     python_version="3.11",
-    cuda_version="cu130",
+    cuda_version="cu128",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "3600")),
 )
@@ -90,11 +90,10 @@ class ProtenixAppInfo:
     """Container for app-specific configuration and constants."""
 
     # https://modal.com/docs/guide/cuda#for-more-complex-setups-use-an-officially-supported-cuda-image
-    cuda_version = (
-        CONF.cuda_version_numeric
-    )  # should be no greater than host CUDA version
-    flavor = "devel"  # includes full CUDA toolkit
-    operating_sys = "ubuntu24.04"
+    # CUDA version should be no greater than host CUDA version
+    # "devel" image includes the full CUDA toolkit, which is required for
+    # building custom LayerNorm kernels
+    cuda_tag = f"{CONF.cuda_version_numeric}-devel-ubuntu24.04"
 
     # Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
     msa_cache_dir: str = "/protenix-msa"
@@ -129,9 +128,10 @@ class ProtenixAppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = ProtenixAppInfo()
-tag = f"{APP_INFO.cuda_version}-{APP_INFO.flavor}-{APP_INFO.operating_sys}"
 runtime_image = patch_image_for_helper(
-    Image.from_registry(f"nvidia/cuda:{tag}", add_python=CONF.python_version)
+    Image.from_registry(
+        f"nvidia/cuda:{APP_INFO.cuda_tag}", add_python=CONF.python_version
+    )
     .entrypoint([])  # remove verbose logging in the base image
     .apt_install("git", "build-essential", "zstd", "hmmer", "kalign", "wget")
     .env(
@@ -393,7 +393,7 @@ def run_protenix(
     use_template: bool = False,
     use_rna_msa: bool = False,
     use_tfg_guidance: bool = False,
-    use_fast_layernorm: bool = False,
+    use_fast_layernorm: bool = True,
     extra_args: str | None = None,
     score_only: bool = False,
 ) -> bytes:
@@ -545,7 +545,7 @@ def submit_protenix_task(
     use_template: bool = False,
     use_rna_msa: bool = False,
     use_tfg_guidance: bool = False,
-    use_fast_layernorm: bool = False,
+    use_fast_layernorm: bool = True,
     force_redownload: bool = False,
     extra_args: str | None = None,
     score_only: bool = False,

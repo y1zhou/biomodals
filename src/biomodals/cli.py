@@ -4,7 +4,7 @@ import importlib
 import shlex
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
@@ -129,14 +129,54 @@ def list_available_apps(
         bool,
         typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
     ] = False,
+    sort_by: Annotated[
+        Literal["name", "category", "time"],
+        typer.Option(
+            "--sort-by",
+            "-s",
+            help="Key to sort the applications by in the table display.",
+            case_sensitive=False,
+        ),
+    ] = "time",
+    reverse: Annotated[
+        bool,
+        typer.Option(
+            "--reverse", "-r", help="Reverse the sorting order in the table display."
+        ),
+    ] = False,
 ) -> dict[str, Path]:
     """Show a list of all available biomodals applications."""
-    table = Table("App name", "App path", "Category")
+    from datetime import datetime
+
+    table_headers = ["App name", "App path", "Category", "Updated at"]
+    table = Table(*table_headers)
 
     available_apps = get_all_apps(use_absolute_paths)
+    table_rows: list[tuple[str, str, str, str]] = []
     for app_name, app_path in available_apps.items():
         app_category = app_path.parent.name
-        table.add_row(f"[green]{app_name}[/green]", str(app_path), app_category)
+        updated_date = app_path.stat().st_mtime
+
+        table_rows.append(
+            (
+                f"[green]{app_name}[/green]",
+                str(app_path),
+                app_category,
+                datetime.fromtimestamp(updated_date).strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        )
+    match sort_by:
+        case "name":
+            sort_by_idx = table_headers.index("App name")
+        case "category":
+            sort_by_idx = table_headers.index("Category")
+        case "time":
+            sort_by_idx = table_headers.index("Updated at")
+        case _:
+            raise ValueError(f"Invalid sort key: {sort_by}")
+    table_rows.sort(key=lambda x: x[sort_by_idx], reverse=reverse)
+    for r in table_rows:
+        table.add_row(*r)
 
     console.print(
         "\n:dna: To see help for an application, use:\n"
@@ -317,6 +357,45 @@ def run_modal_app(
         run_command(["biomodals", "help", str(full_app)], try_rich_print=True)
     else:
         run_command(["biomodals", "help", str(app_path)], try_rich_print=True)
+
+
+@app.command(
+    name="deploy",
+    no_args_is_help=True,
+    help="Deploy a biomodals application to Modal (alias: d).",
+)
+@app.command(name="d", no_args_is_help=True, hidden=True)
+def deploy_app(
+    app_name_or_path: Annotated[
+        str, typer.Argument(help="Name or path of the app to generate run command for.")
+    ],
+    name: Annotated[
+        str | None, typer.Option("--name", "-n", help="Name of the deployment.")
+    ] = None,
+    tag: Annotated[
+        str | None,
+        typer.Option("--tag", "-t", help="Tag the deployment with a version."),
+    ] = None,
+):
+    """Deploy a biomodals application to Modal."""
+    all_apps = get_all_apps(use_absolute_paths=True)
+    app_name_or_path = app_name_or_path.split("::", maxsplit=1)[0]
+    if app_name_or_path in all_apps:
+        app_path = all_apps[app_name_or_path]
+    else:
+        app_path = Path(app_name_or_path).expanduser()
+        if not app_path.exists():
+            console.print(
+                f"[bold red]Error:[/bold red] Application '{app_name_or_path}' not found."
+            )
+            raise typer.Exit(code=1)
+    cmd = ["modal", "deploy"]
+    if name:
+        cmd.extend(["--name", name])
+    if tag:
+        cmd.extend(["--tag", tag])
+    cmd.append(str(app_path))
+    run_command(cmd)
 
 
 if __name__ == "__main__":

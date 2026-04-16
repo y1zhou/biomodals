@@ -34,7 +34,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import modal
-from modal import App, Image
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
@@ -47,6 +46,7 @@ from biomodals.app.helper.web import download_files
 # Modal configs
 ##########################################
 CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
     name="Protenix",
     repo_url="https://github.com/y1zhou/Protenix",
     repo_commit_hash="7e1de70749910c401339dd49aa62735510c22959",
@@ -103,7 +103,7 @@ class AppInfo:
 ##########################################
 APP_INFO = AppInfo()
 runtime_image = patch_image_for_helper(
-    Image.from_registry(
+    modal.Image.from_registry(
         f"nvidia/cuda:{APP_INFO.cuda_tag}", add_python=CONF.python_version
     )
     .entrypoint([])  # remove verbose logging in the base image
@@ -127,7 +127,7 @@ runtime_image = patch_image_for_helper(
         env={"LAYERNORM_TYPE": "fast_layernorm"},  # default, but just in case
     )
 )
-app = App(CONF.name, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
@@ -276,21 +276,15 @@ def prepare_protenix_inputs(
     # Load protein and RNA sequences from input JSON
     conf = ProtenixConfig.from_file(tmp_json_path)
     msa_tasks = []
-    seq_indices: dict[int, dict[str, list[int]]] = {}  # task_id -> {seq -> [indices]}
     output_dirs: list[str] = []
-    for task_idx, task in enumerate(conf.root):
+    for task in conf.root:
         protein_seqs: list[str] = []
         rna_seqs: list[str] = []
-        seq_indices[task_idx] = {}
-        for seq_idx, seq in enumerate(task.sequences):
-            if seq.proteinChain is not None:
-                prot_seq = seq.proteinChain.sequence
-                protein_seqs.append(prot_seq)
-                seq_indices[task_idx].setdefault(prot_seq, []).append(seq_idx)
-            elif seq.rnaSequence is not None:
-                rna_seq = seq.rnaSequence.sequence
-                rna_seqs.append(rna_seq)
-                seq_indices[task_idx].setdefault(rna_seq, []).append(seq_idx)
+        for seq in task.sequences:
+            if (prot_chain := seq.proteinChain) is not None:
+                protein_seqs.append(prot_chain.sequence)
+            elif (rna_chain := seq.rnaSequence) is not None:
+                rna_seqs.append(rna_chain.sequence)
 
         hash_key = (
             hash_string(":".join(protein_seqs + rna_seqs))

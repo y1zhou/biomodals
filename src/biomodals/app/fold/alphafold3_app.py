@@ -1,27 +1,16 @@
 """AlphaFold3 source repo: <https://github.com/google-deepmind/alphafold3>.
 
-Note that this script only provides a runtime for AlphaFold3.
+## Additional notes
+
+This script only provides a runtime for AlphaFold3.
 To acquire the model weights and MSA databases, please follow instructions at:
 
 <https://github.com/google-deepmind/alphafold3#obtaining-model-parameters>
 
-Make sure the model checkpoint is available at `/biomodals-store/AlphaFold3/af3.bin`,
-and the MSA databases are available at `/AlphaFold3-msa-db/`.
+Make sure the model checkpoint is available at `/AlphaFold3/af3.bin` in the `biomodals-store` volume,
+and the MSA databases are available at the `AlphaFold3-msa-db` volume.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `GPU` | `L40S` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
-| `TIMEOUT` | `3600` | Timeout for each Modal function in seconds. |
-
-## Additional notes
-
-See <https://github.com/google-deepmind/alphafold3/tree/main/docs>.
+See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general docs.
 
 ## Outputs
 
@@ -35,7 +24,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from modal import App, Image
+import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import (
@@ -51,6 +40,7 @@ from biomodals.app.helper.shell import run_command_with_log
 # Modal configs
 ##########################################
 CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
     name="AlphaFold3",
     repo_url="https://github.com/google-deepmind/alphafold3",
     repo_commit_hash="87bd9e678d9acacc4aa9baa05e820f32b80e1b49",
@@ -82,7 +72,7 @@ APP_INFO = AppInfo()
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
 runtime_image = patch_image_for_helper(
-    Image.debian_slim(python_version=CONF.python_version)
+    modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "zstd", "zlib1g-dev", "wget")
     .env(
         CONF.default_env
@@ -126,14 +116,14 @@ runtime_image = patch_image_for_helper(
     .run_commands("build_data")  # installed in the previous step
     .env({"PATH": "/hmmer/bin:$PATH"})
 )
-app = App(CONF.name, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
 # Inference functions
 ##########################################
 @app.function(
-    cpu=8,
+    cpu=(8, 32),  # 8c per database searched with HMMER
     memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
     timeout=CONF.timeout,
     volumes={
@@ -203,7 +193,7 @@ def run_inference_pipeline() -> bytes:
         Tarball bytes of inference outputs (CIF files + confidence JSONs).
 
     """
-    pass
+    return b""  # TODO
 
 
 ##########################################

@@ -59,9 +59,6 @@ def app_path_to_module_path(app_path: Path) -> str:
     return f"biomodals.app.{module_path}"
 
 
-##########################################
-# CLI Commands
-##########################################
 def _docstring_to_markdown_table(f: Callable) -> list[str]:
     """Convert a function docstring with Args into a list of Markdown rows.
 
@@ -118,9 +115,15 @@ def _docstring_to_markdown_table(f: Callable) -> list[str]:
     return table_rows
 
 
-@app.command(name="list")
-@app.command(name="ls")
-@app.command(name="l")
+##########################################
+# CLI Commands
+##########################################
+@app.command(
+    name="list",
+    help="Show a list of all available biomodals applications (aliases: ls, l).",
+)
+@app.command(name="ls", hidden=True)
+@app.command(name="l", hidden=True)
 def list_available_apps(
     use_absolute_paths: Annotated[
         bool,
@@ -137,20 +140,23 @@ def list_available_apps(
 
     console.print(
         "\n:dna: To see help for an application, use:\n"
-        "     [bold]biomodals help <[green]app-name[/green]>[/bold]"
-        " or [bold]biomodals help <[green]app-path[/green]>[/bold]"
+        "     [bold]biomodals help <[green]app-name-or-path[/green]>[/bold]"
     )
     console.print(
         "\n:dna: To run an application on [link=https://modal.com]modal.com[/link], use:\n"
-        r"     [bold]modal run <[green]app-path[/green]>[/bold] [gray]\[OPTIONS][/gray]"
+        r"     [bold]biomodals run <[green]app-name-or-path[/green]>[/bold] -- [gray]\[OPTIONS][/gray]"
     )
     console.print("\n:dna: [bold]Available biomodals applications:[/bold]")
     console.print(table)
     return available_apps
 
 
-@app.command(name="help")
-@app.command(name="h")
+@app.command(
+    name="help",
+    no_args_is_help=True,
+    help="Show help for a specific biomodals application (alias: h).",
+)
+@app.command(name="h", no_args_is_help=True, hidden=True)
 def show_app_help(
     app_name: Annotated[
         str, typer.Argument(help="Name or path of the app to show help for.")
@@ -226,8 +232,12 @@ def show_app_help(
         raise typer.Exit(code=1) from e
 
 
-@app.command(name="run")
-@app.command(name="r")
+@app.command(
+    name="run",
+    no_args_is_help=True,
+    help="Run a biomodals application on Modal (alias: r).",
+)
+@app.command(name="r", no_args_is_help=True, hidden=True)
 def run_modal_app(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to generate run command for.")
@@ -256,7 +266,7 @@ def run_modal_app(
         typer.Argument(help="Additional flags to pass to the modal run command."),
     ] = None,
 ):
-    """Generate the modal run command for a specific biomodals application.
+    """Run a biomodals application on Modal.
 
     Use with: `biomodals run <app-name> [OPTIONS] -- [app-options]`, where `[app-options]` are
     additional flags to pass to the `modal run <app-name>` command.

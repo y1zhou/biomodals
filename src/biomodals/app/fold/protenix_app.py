@@ -60,7 +60,7 @@ CONF = AppConfig(
 
 
 @dataclass
-class ProtenixAppInfo:
+class AppInfo:
     """Container for app-specific configuration and constants."""
 
     # https://modal.com/docs/guide/cuda#for-more-complex-setups-use-an-officially-supported-cuda-image
@@ -101,7 +101,7 @@ class ProtenixAppInfo:
 ##########################################
 # Image and app definitions
 ##########################################
-APP_INFO = ProtenixAppInfo()
+APP_INFO = AppInfo()
 runtime_image = patch_image_for_helper(
     Image.from_registry(
         f"nvidia/cuda:{APP_INFO.cuda_tag}", add_python=CONF.python_version

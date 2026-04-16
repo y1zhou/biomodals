@@ -20,6 +20,7 @@ class AppConfig(BaseModel):
     package_name: str | None = None
     version: str | None = None
     python_version: str | None = None
+    tags: dict[str, str] | None = None
 
     # Runtime configs
     # Model GPU (https://modal.com/docs/guide/gpu)
@@ -41,10 +42,10 @@ class AppConfig(BaseModel):
     # Location to mount output volume (if in use)
     output_volume_mountpoint: str = "/biomodals-outputs"
 
-    def out_volume(self) -> tuple[str, Volume]:
+    def get_out_volume(self) -> Volume:
         """Volume for storing outputs."""
         vol_name = f"{self.name}-outputs"
-        return vol_name, Volume.from_name(vol_name, create_if_missing=True, version=2)
+        return Volume.from_name(vol_name, create_if_missing=True, version=2)
 
     @computed_field
     @cached_property

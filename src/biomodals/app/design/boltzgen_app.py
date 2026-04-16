@@ -64,7 +64,8 @@ CONF = AppConfig(
 )
 
 # Volumes to be mounted
-OUTPUTS_VOLUME_NAME, OUTPUTS_VOLUME = CONF.out_volume()
+OUTPUTS_VOLUME = CONF.get_out_volume()
+OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name
 OUTPUTS_DIR = CONF.output_volume_mountpoint
 MODEL_DIR = CONF.model_dir
 

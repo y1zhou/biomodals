@@ -32,6 +32,7 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 # ruff: noqa: PLC0415
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from modal import App, Image
@@ -43,7 +44,7 @@ from biomodals.app.constant import (
     MODEL_VOLUME,
     MSA_CACHE_VOLUME,
 )
-from biomodals.app.helper import patch_image_for_helper
+from biomodals.app.helper import hash_string, patch_image_for_helper
 from biomodals.app.helper.shell import run_command_with_log
 
 ##########################################
@@ -61,18 +62,23 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", "3600")),
 )
 
-# Volume for genetic serach databases
-MSA_DB_DIR = "/AlphaFold3-msa-db"
-MSA_CACHE_DIR = "/biomodals-msa-cache"
 
-# Volume for prediction outputs (enables skip/resume across interrupted runs)
-OUTPUTS_VOLUME_NAME, OUTPUTS_VOLUME = CONF.out_volume()
-OUTPUTS_DIR = CONF.output_volume_mountpoint
-MODEL_DIR = CONF.model_dir
+@dataclass
+class AppInfo:
+    """Container for AlphaFold3-specific information and configurations."""
+
+    # Volume mount path for genetic search databases
+    msa_db_dir: str = "/AlphaFold3-msa-db"
+    # Volume mount path for MSA output cache
+    msa_cache_dir: str = "/biomodals-msa-cache"
+    # Volume mount path for model checkpoints and JAX cache
+    model_dir: Path = CONF.model_dir
+
 
 ##########################################
 # Image and app definitions
 ##########################################
+APP_INFO = AppInfo()
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
 runtime_image = patch_image_for_helper(
@@ -132,18 +138,36 @@ app = App(CONF.name, image=runtime_image)
     timeout=CONF.timeout,
     volumes={
         CONF.model_volume_mountpoint: MODEL_VOLUME,
-        MSA_DB_DIR: AF3_MSA_DB_VOLUME,
-        MSA_CACHE_DIR: MSA_CACHE_VOLUME,
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME,
     },
 )
-def run_data_pipeline(json_file: str | Path) -> Path:
+def run_data_pipeline(json_bytes: bytes) -> Path:
     """Run AlphaFold3 data pipeline (CPU-only)."""
     import sys
+    from tempfile import mkdtemp
 
-    json_path = Path(json_file).resolve()
-    out_dir = Path(OUTPUTS_DIR) / json_path.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from uniaf3.schema.alphafold3 import AF3Config
+
+    temp_dir: Path = Path(mkdtemp(prefix="alphafold3_data_"))
+    json_path = temp_dir / "input.json"
+    json_path.write_bytes(json_bytes)
+
+    # Determine cache key for input
+    conf = AF3Config.from_file(json_path)
+    protein_seqs: list[str] = []
+    rna_seqs: list[str] = []
+    for seq in conf.sequences:
+        if (prot_chain := seq.protein) is not None:
+            protein_seqs.append(prot_chain.sequence)
+        elif (rna_chain := seq.rna) is not None:
+            rna_seqs.append(rna_chain.sequence)
+
+    hash_key = hash_string(":".join(protein_seqs + rna_seqs))
+    cache_dir = Path(APP_INFO.msa_cache_dir) / CONF.name / hash_key[:2] / hash_key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # TODO: copy volume db files to /tmp for faster access, or shard DB
 
     # TODO: more performant runs when multiple inputs share same chains
     # https://github.com/google-deepmind/alphafold3/blob/main/docs/performance.md
@@ -152,13 +176,13 @@ def run_data_pipeline(json_file: str | Path) -> Path:
         str(CONF.git_clone_dir / "run_alphafold.py"),
         "--run_inference=false",
         f"--json_path={json_path}",
-        f"--output_dir={out_dir}",
+        f"--output_dir={cache_dir}",
         f"--model_dir={CONF.model_dir}",
-        f"--db_dir={MSA_DB_DIR}",
+        f"--db_dir={APP_INFO.msa_db_dir}",
         f"--jax_compilation_cache_dir={CONF.model_dir / 'jax_cache'}",
     ]
-    run_command_with_log(cmd, log_file=out_dir / "data_pipeline.log")
-    return out_dir
+    run_command_with_log(cmd, log_file=cache_dir / f"{conf.name}.log")
+    return cache_dir
 
 
 @app.function(
@@ -168,8 +192,8 @@ def run_data_pipeline(json_file: str | Path) -> Path:
     timeout=MAX_TIMEOUT,
     volumes={
         CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
-        MSA_CACHE_DIR: MSA_CACHE_VOLUME,
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.read_only(),
+        CONF.output_volume_mountpoint: CONF.get_out_volume(),
     },
 )
 def run_inference_pipeline() -> bytes:
@@ -215,7 +239,7 @@ def submit_alphafold3_task(
     if run_name is None:
         run_name = input_path.stem
 
-    json_str = input_path.read_bytes()
+    json_bytes = input_path.read_bytes()
 
     local_out_dir = (
         Path(out_dir).expanduser().resolve() if out_dir is not None else Path.cwd()
@@ -226,12 +250,7 @@ def submit_alphafold3_task(
 
     # Run inference
     print(f"🧬 Running {CONF.name} data pipeline...")
-    with OUTPUTS_VOLUME.batch_upload() as batch:
-        batch.put_file(input_path, f"/{run_name}/{run_name}.json")
-
-    remote_run_dir = run_data_pipeline.remote(
-        f"{OUTPUTS_DIR}/{run_name}/{run_name}.json"
-    )
+    remote_run_dir = run_data_pipeline.remote(json_bytes)
     print(f"🧬 Data pipeline results generated in remote directory: {remote_run_dir}")
 
     # Save results locally

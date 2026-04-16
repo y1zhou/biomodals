@@ -38,7 +38,11 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
 from biomodals.app.helper import hash_string, patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, run_command
+from biomodals.app.helper.shell import (
+    package_outputs,
+    run_command,
+    run_command_with_log,
+)
 from biomodals.app.helper.structure import struct2seq
 from biomodals.app.helper.web import download_files
 
@@ -447,7 +451,7 @@ def run_protenix(
             "protenixscore",
             "score",
             f"--input={input_file}",
-            f"--output={out_dir}",
+            f"--output={tmpdir_path}",
             f"--model_name={model_name}",
             f"--dtype={dtype}",
             f"--use_msas={use_msas_val}",
@@ -455,7 +459,13 @@ def run_protenix(
             f"--msa_cache_dir={score_msa_cache_dir}",
             "--msa_cache_mode=readwrite",
         ]
-        run_command(cmd, env=run_env, cwd=out_dir)
+        run_command_with_log(
+            cmd,
+            log_file=out_dir / f"{run_name}.log",
+            verbose=True,
+            env=run_env,
+            cwd=tmpdir_path,
+        )
 
         # Persist MSA cache back to the volume for reuse in future runs
         MSA_CACHE_VOLUME.commit()
@@ -470,7 +480,7 @@ def run_protenix(
         "protenix",
         "pred",
         f"--input={input_json_path}",
-        f"--out_dir={out_dir}",
+        f"--out_dir={tmpdir_path}",
         f"--seeds={seeds}",
         f"--cycle={cycle}",
         f"--step={step}",
@@ -486,7 +496,13 @@ def run_protenix(
     if extra_args:
         cmd.extend(shlex.split(extra_args))
 
-    run_command(cmd, env=run_env, cwd=out_dir)
+    run_command_with_log(
+        cmd,
+        log_file=out_dir / f"{run_name}.log",
+        verbose=True,
+        env=run_env,
+        cwd=tmpdir_path,
+    )
 
     # Package outputs
     print("💊 Packaging Protenix results...")

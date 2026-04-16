@@ -91,7 +91,9 @@ def run_command(
         return all_outputs
 
 
-def run_command_with_log(cmd: list[str] | str, log_file: str | Path, **kwargs) -> None:
+def run_command_with_log(
+    cmd: list[str] | str, log_file: str | Path, verbose: bool = False, **kwargs
+) -> None:
     """Run a shell command and log output to a file."""
     import shlex
     import subprocess as sp
@@ -124,6 +126,8 @@ def run_command_with_log(cmd: list[str] | str, log_file: str | Path, **kwargs) -
 
         while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
             f.write(buffered_output)
+            if verbose:
+                print(buffered_output, end="", flush=True)
 
         f.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
         f.write(f"Elapsed time: {time() - now:.2f} seconds\n")

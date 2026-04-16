@@ -50,7 +50,7 @@ CONF = AppConfig(
     python_version="3.12",
     cuda_version="cu130",
     gpu=os.environ.get("GPU", "L40S"),
-    timeout=int(os.environ.get("TIMEOUT", "3600")),
+    timeout=int(os.environ.get("TIMEOUT", "21600")),
 )
 
 
@@ -138,6 +138,8 @@ def _cache_conf_unpaired_msa(conf: AF3Config, msa_cache_dir: Path) -> AF3Config:
                 single_msa_path.exists()
                 and prot_chain.unpairedMsa is None
                 and prot_chain.unpairedMsaPath is None
+                # https://github.com/google-deepmind/alphafold3/blob/main/docs/input.md#multiple-sequence-alignment
+                and (prot_chain.pairedMsa is not None or prot_chain.pairedMsa == "")
             ):
                 prot_chain.unpairedMsa = single_msa_path.read_text()
                 continue

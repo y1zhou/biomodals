@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess as sp
 import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
 from biomodals.app.helper.internal import timed_function
+
+
+def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
+    """Run a shell command in the background without waiting for it to finish."""
+    import shlex
+
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+
+    print(f"Running background command: {shlex.join(cmd)}")
+    kwargs.setdefault("stdout", sp.DEVNULL)
+    kwargs.setdefault("stderr", sp.DEVNULL)
+    return sp.Popen(cmd, **kwargs)  # noqa: S603
 
 
 def run_command(
@@ -135,8 +150,6 @@ def find_with_fd(dir_path: str | Path, file_pattern: str = ".", *args) -> list[s
         List of matching file paths as strings. Note that the paths are relative
         to ``dir_path``.
     """
-    import shutil
-
     fd_binary = shutil.which("fd") or shutil.which("fdfind")
     if fd_binary is None:
         raise FileNotFoundError(
@@ -192,7 +205,6 @@ def package_outputs(
             follow symlinks. See `man tar` for details.
         num_threads: Number of threads to use for zstd compression.
     """
-    import shutil
     import subprocess as sp
     import tempfile
 
@@ -251,6 +263,34 @@ def package_outputs(
         tmp_file.write("\n".join(cmd_paths))
         tmp_file.flush()
         return sp.check_output([*cmd, "-c", "-T", tmp_file.name], cwd=workdir)  # noqa: S603
+
+
+@timed_function
+def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
+    """Copy files from source to destination paths.
+
+    Args:
+        src_dst_mapping: A dictionary mapping source file paths to destination file paths.
+            Both keys and values can be either strings or Path objects. The function
+            will create any necessary parent directories for the destination paths.
+    """
+    import subprocess as sp
+
+    subprocesses = []
+    for src, dst in src_dst_mapping.items():
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if not src_path.exists():
+            raise FileNotFoundError(f"Source file '{src_path}' does not exist.")
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocesses.append(sp.Popen(["cp", "-an", str(src_path), str(dst_path)]))  # noqa: S603, S607
+
+    for p in subprocesses:
+        p.wait()
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"Copying '{src}' to '{dst}' failed with return code {p.returncode}."
+            )
 
 
 def softlink_dir(src: str | Path, dst: str | Path) -> None:

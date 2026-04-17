@@ -135,7 +135,7 @@ def list_available_apps(
         typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
     ] = False,
     sort_by: Annotated[
-        Literal["name", "category", "time"],
+        Literal["name", "category", "group", "time", "date", "updated"],
         typer.Option(
             "--sort-by",
             "-s",
@@ -149,12 +149,19 @@ def list_available_apps(
             "--reverse", "-r", help="Reverse the sorting order in the table display."
         ),
     ] = False,
+    short: Annotated[
+        bool,
+        typer.Option(
+            "--short",
+            help="Only show app names without paths or additional info.",
+            is_flag=True,
+        ),
+    ] = False,
 ) -> dict[str, Path]:
     """Show a list of all available biomodals applications."""
     from datetime import datetime
 
     table_headers = ["App name", "App path", "Category", "Updated at"]
-    table = Table(*table_headers)
 
     available_apps = get_all_apps(use_absolute_paths)
     table_rows: list[tuple[str, str, str, str]] = []
@@ -173,13 +180,19 @@ def list_available_apps(
     match sort_by:
         case "name":
             sort_by_idx = table_headers.index("App name")
-        case "category":
+        case "category" | "group":
             sort_by_idx = table_headers.index("Category")
-        case "time":
+        case "time" | "date" | "updated":
             sort_by_idx = table_headers.index("Updated at")
         case _:
             raise ValueError(f"Invalid sort key: {sort_by}")
     table_rows.sort(key=lambda x: x[sort_by_idx], reverse=reverse)
+    if short:
+        for r in table_rows:
+            console.print(r[0])
+        return available_apps
+
+    table = Table(*table_headers)
     for r in table_rows:
         table.add_row(*r)
 

@@ -100,17 +100,22 @@ def _docstring_to_markdown_table(f: Callable) -> list[str]:
 
     table_rows = [
         "| Flag | Default | Description |",
-        "|------|---------|-------------|",
+        "|-----:|:--------|:------------|",
     ]
     for name, p in sig.parameters.items():
-        flag = f"--{name.replace('_', '-')}"
+        flag_base = name.replace("_", "-")
         default = (
-            f"`{p.default}`"
+            f"{p.default}"
             if p.default is not inspect.Parameter.empty
             else "**Required**"
         )
+        flag = (
+            f"`--{flag_base}`"
+            if type(p.default) is not bool
+            else f"`--{flag_base}`/`--no-{flag_base}`"
+        )
         description = arg_descriptions.get(name, "")
-        table_rows.append(f"| `{flag}` | {default} | {description} |")
+        table_rows.append(f"| {flag} | {default} | {description} |")
 
     return table_rows
 

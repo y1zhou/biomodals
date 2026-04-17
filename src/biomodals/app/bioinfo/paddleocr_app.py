@@ -1,94 +1,94 @@
-"""Parse document and extract text with PaddleOCR: <https://www.paddleocr.ai/latest/index.html/>.
-
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input` | **Required** | Path to the input PDF or image file. |
-
-## Outputs
-
-* TODO
-"""
+"""Parse document and extract text with PaddleOCR: <https://www.paddleocr.ai/latest/index.html/>."""
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
-from modal import App, Image, Volume
+import modal
+
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MODEL_VOLUME
+from biomodals.app.helper import patch_image_for_helper
+from biomodals.app.helper.shell import package_outputs, softlink_dir
 
 ##########################################
 # Modal configs
 ##########################################
-# T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "L40S")
-TIMEOUT = int(os.environ.get("TIMEOUT", "86400"))  # seconds
-APP_NAME = os.environ.get("MODAL_APP", "PaddleOCR")
+CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
+    name="PaddleOCR",
+    repo_url="https://github.com/PaddlePaddle/PaddleOCR",
+    package_name="paddleocr",
+    version="3.4.1",
+    python_version="3.12",
+    cuda_version="cu126",
+    gpu=os.environ.get("GPU", "L40S"),
+    timeout=int(os.environ.get("TIMEOUT", "86400")),
+)
 
-MODEL_WEIGHTS_PATH = "/root/.paddlex"
-MODEL_WEIGHTS_VOLUME = Volume.from_name("paddleocr-models", create_if_missing=True)
 
-OUT_VOLUME_NAME = "paddleocr-output"
-OUT_VOLUME = Volume.from_name(OUT_VOLUME_NAME, create_if_missing=True, version=2)
-OUT_VOLUME_PATH = f"/{OUT_VOLUME_NAME}"
+@dataclass
+class AppInfo:
+    """Container for PaddleOCR-specific configuration and constants."""
+
+    model_weights_path: str = "/root/.paddlex"
+
 
 ##########################################
 # Image and app definitions
 ##########################################
+APP_INFO = AppInfo()
 runtime_image = (
-    Image.debian_slim(python_version="3.12")
-    .apt_install("git", "build-essential")
-    .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu126",  # find best torch and CUDA versions
-        }
+    patch_image_for_helper(
+        modal.Image.debian_slim(python_version=CONF.python_version)
+        .apt_install("git", "build-essential", "libgl1-mesa-glx", "libglib2.0-0")
+        .env(CONF.default_env),
+        copy_patch_files=True,
     )
     .uv_pip_install(
         "paddlepaddle-gpu==3.2.1",
-        index_url="https://www.paddlepaddle.org.cn/packages/stable/cu126/",
+        index_url=f"https://www.paddlepaddle.org.cn/packages/stable/{CONF.cuda_version}/",
     )
-    .uv_pip_install("paddleocr[all]")
+    .uv_pip_install(f"{CONF.package_name}[all]=={CONF.version}")
     .uv_pip_install(
-        "https://paddle-whl.bj.bcebos.com/nightly/cu126/safetensors/safetensors-0.6.2.dev0-cp38-abi3-linux_x86_64.whl"
+        f"https://paddle-whl.bj.bcebos.com/nightly/{CONF.cuda_version}/safetensors/safetensors-0.6.2.dev0-cp38-abi3-linux_x86_64.whl"
     )
-    .apt_install("libgl1-mesa-glx", "libglib2.0-0")
 )
-
-app = App(APP_NAME, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
 # Inference functions
 ##########################################
 @app.function(
-    gpu=GPU,
-    cpu=8,
+    gpu=CONF.gpu,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUT_VOLUME_PATH: OUT_VOLUME, MODEL_WEIGHTS_PATH: MODEL_WEIGHTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
 )
-def run_paddleocr(input_content: bytes, run_name: str) -> str:
+def run_paddleocr(input_content: bytes, input_name: str) -> bytes:
     """Run PaddleOCR on the input PDF content and return extracted markdown and images."""
+    from tempfile import mkdtemp
+
     from paddleocr import PaddleOCRVL
 
-    run_dir = ".".join(run_name.split(".")[:-1])
-    workdir = Path(OUT_VOLUME_PATH) / run_dir
-    if workdir.exists():
-        return str(workdir)
+    # PaddleOCR hardcodes the model cache directory
+    model_cache_dir = Path(CONF.model_volume_mountpoint) / CONF.name
+    model_cache_dir.mkdir(parents=True, exist_ok=True)
+    softlink_dir(model_cache_dir, Path(APP_INFO.model_weights_path))
 
-    workdir.mkdir(parents=True, exist_ok=True)
-    input_file = workdir / run_name
+    run_dir = ".".join(input_name.split(".")[:-1])
+    workdir = Path(mkdtemp(prefix=f"{CONF.name}_")) / run_dir
+    workdir.mkdir()
+    input_file = workdir / input_name
     input_file.write_bytes(input_content)
 
     pipeline = PaddleOCRVL()
 
     markdown_list = []
     markdown_images = []
-
     for res in pipeline.predict_iter(input=str(input_file)):
         md_info = res.markdown
         markdown_list.append(md_info)
@@ -108,21 +108,34 @@ def run_paddleocr(input_content: bytes, run_name: str) -> str:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             image.save(file_path)
 
-    return str(workdir)
+    return package_outputs(workdir)
 
 
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
 @app.local_entrypoint()
-def submit_paddleocr_task(input: str) -> None:
-    """Run PaddleOCR on Modal and save results to a local directory."""
-    # Load input PDB
+def submit_paddleocr_task(input: str, output_dir: str | None = None) -> None:
+    """Run PaddleOCR on Modal and save results to a local directory.
+
+    Args:
+        input: Path to the input PDF or image file.
+        output_dir: Path to the directory where results will be saved. OCR
+            results will be saved with the same filename as the input, but
+            with a `.tar.zst` extension.
+    """
+    # Load input file
     input_file_path = Path(input).expanduser().resolve()
     input_content = input_file_path.read_bytes()
-    run_name = input_file_path.name
+    input_filename = input_file_path.name
 
     # Run PaddleOCR
-    _ = run_paddleocr.remote(input_content, run_name)
-    print("See PaddleOCR results with:\n")
-    print(f"  modal volume ls {OUT_VOLUME_NAME} {run_name}")
+    tarball_bytes = run_paddleocr.remote(input_content, input_filename)
+    if output_dir is None:
+        out_dir_path = Path.cwd()
+    else:
+        out_dir_path = Path(output_dir).expanduser().resolve()
+    out_path = out_dir_path / f"{input_file_path.stem}.tar.zst"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(tarball_bytes)
+    print(f"Saved OCR results to {out_path}")

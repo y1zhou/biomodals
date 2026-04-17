@@ -1,7 +1,5 @@
 r"""AbNatiV source repo: <https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ>.
 
-## Configuration
-
 ## Notes
 
 * Always check the `--model-type` argument to ensure you are using the correct model for your sequences.

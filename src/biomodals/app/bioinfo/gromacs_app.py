@@ -1,5 +1,7 @@
 """Run MD simulation with GROMACS: <https://www.gromacs.org/>.
 
+**It is recommended to run this app in detached mode, as the runs can be very long.**
+
 ## Outputs
 
 * All output files are saved to a Modal volume named `Gromacs-outputs`.
@@ -15,6 +17,7 @@ from pathlib import Path
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.constant import MAX_TIMEOUT
 from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import run_command
 
@@ -29,7 +32,7 @@ CONF = AppConfig(
     python_version="3.13",
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "L40S"),
-    timeout=int(os.environ.get("TIMEOUT", "86400")),
+    timeout=int(os.environ.get("TIMEOUT", str(MAX_TIMEOUT))),
 )
 
 

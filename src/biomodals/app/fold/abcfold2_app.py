@@ -1,25 +1,5 @@
 """ABCFold2 source repo: <https://github.com/y1zhou/ABCFold/tree/feat/schema>.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-yaml` | **Required** | Path to YAML design specification file. For a detailed description of the YAML schema, see https://github.com/y1zhou/ABCFold/blob/feat/schema/abcfold/schema.py. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in the current working directory. |
-| `--run-name` | stem name of `--input-yaml` | Optional run name used to name output directory. |
-| `--msa-chains` | None (all chains) | Optional comma-separated list of chains to search MSAs for. If not specified, MSAs will be searched for all chains. To skip MSA searches entirely, pass 'empty'. |
-| `--search-templates`/`--no-search-templates` | `--no-search-templates` | Whether to search for templates and add to input YAML. |
-| `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and skip running. |
-| `--force-redownload` | `--no-force-redownload` | Whether to force re-download of model weights even if they exist. |
-| `--run-boltz`/`--no-run-boltz` | `--run-boltz` | Whether to run Boltz inference. |
-| `--run-chai`/`--no-run-chai` | `--run-chai` | Whether to run Chai inference. |
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `MODAL_APP` | `ABCFold2` | Name of the Modal app to use. |
-| `GPU` | `A10G` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
-| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
-
 ## Additional notes on input flags
 
 * MSAs will *always* be searched automatically, since omitting MSAs for Boltz/Chai translates to worse performance in most cases.
@@ -37,109 +17,124 @@
 # ruff: noqa: PLC0415
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
-from modal import App, FunctionCall, Image, Volume
+import modal
 
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MODEL_VOLUME
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import package_outputs
+from biomodals.app.helper.web import download_files
 
 ##########################################
 # Modal configs
 ##########################################
-# T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "A10G")
-TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))  # seconds
-APP_NAME = os.environ.get("MODAL_APP", "ABCFold2")
-
-# Volume for model cache
-CHAI_VOLUME_NAME = "chai-models"
-CHAI_VOLUME = Volume.from_name(CHAI_VOLUME_NAME, create_if_missing=True)
-CHAI_MODEL_DIR = "/chai-models"
-
-BOLTZ_VOLUME_NAME = "boltz-models"
-BOLTZ_VOLUME = Volume.from_name(BOLTZ_VOLUME_NAME, create_if_missing=True)
-BOLTZ_MODEL_DIR = "/boltz-models"
-
-# Volume for outputs
-OUTPUTS_VOLUME_NAME = "abcfold2-outputs"
-OUTPUTS_VOLUME = Volume.from_name(
-    OUTPUTS_VOLUME_NAME, create_if_missing=True, version=2
+# TODO: migrate to uniaf3
+CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
+    name="ABCFold2",
+    repo_url="https://github.com/y1zhou/ABCFold",
+    repo_commit_hash="fcfdd49fbec0db73eb38dfad49f9649e81147337",
+    package_name="abcfold",
+    version="0.2.0",
+    python_version="3.12",
+    cuda_version="cu128",
+    gpu=os.environ.get("GPU", "A10G"),
+    timeout=int(os.environ.get("TIMEOUT", "3600")),
 )
-OUTPUTS_DIR = "/abcfold2-outputs"
+ChaiConf = AppConfig(
+    name="Chai-1",
+    repo_url="https://github.com/y1zhou/chai-lab",
+    repo_commit_hash="0ac68311911bfcd28b118fc289437bf3eff8ac97",
+    package_name="chai_lab",
+    version="0.6.1",
+)
+BoltzConf = AppConfig(
+    name="Boltz",
+    repo_url="https://github.com/jwohlwend/boltz",
+    repo_commit_hash="cb04aeccdd480fd4db707f0bbafde538397fa2ac",
+    package_name="boltz",
+    version="2.2.1",
+)
 
-# Repositories and commit hashes
-ABCFOLD_DIR = "/opt/ABCFold"
-ABCFOLD_REPO = "https://github.com/y1zhou/ABCFold"
-ABCFOLD_COMMIT = "fcfdd49fbec0db73eb38dfad49f9649e81147337"
 
-CHAI_DIR = "/opt/chai-lab"
-CHAI_REPO = "https://github.com/y1zhou/chai-lab"
-CHAI_COMMIT = "0ac68311911bfcd28b118fc289437bf3eff8ac97"
+@dataclass
+class AppInfo:
+    """Container for ABCFold2-specific configuration and constants."""
 
-BOLTZ_DIR = "/opt/boltz"
-BOLTZ_REPO = "https://github.com/jwohlwend/boltz"
-BOLTZ_COMMIT = "cb04aeccdd480fd4db707f0bbafde538397fa2ac"
-BOLTZ_MODEL_HASH = "6fdef46d763fee7fbb83ca5501ccceff43b85607"  # HF revision
+    abcfold_dir: str = str(CONF.git_clone_dir)
+    boltz_model_hash: str = "6fdef46d763fee7fbb83ca5501ccceff43b85607"
+
 
 ##########################################
 # Image and app definitions
 ##########################################
-download_image = (
-    Image.debian_slim()
-    .pip_install("huggingface_hub[hf_transfer]==0.26.3")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})  # speed up downloads
+APP_INFO = AppInfo()
+
+# Volumes
+OUTPUTS_VOLUME = CONF.get_out_volume()
+OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name
+OUTPUTS_DIR = CONF.output_volume_mountpoint
+
+download_image = patch_image_for_helper(
+    modal.Image.debian_slim()
+    .uv_pip_install("huggingface_hub>=1.10")
+    .env(
+        CONF.default_env
+        | {
+            "CHAI_DOWNLOADS_DIR": str(ChaiConf.model_dir),
+            "BOLTZ_CACHE": str(BoltzConf.model_dir),
+        }
+    )
 )
 
-runtime_image = (
-    Image.debian_slim()
+runtime_image = patch_image_for_helper(
+    modal.Image.debian_slim()
     .apt_install("git", "build-essential")
     .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu128",  # find best torch and CUDA versions
-            "CHAI_DOWNLOADS_DIR": str(CHAI_MODEL_DIR),  # store chai model weights
-            "BOLTZ_CACHE": str(BOLTZ_MODEL_DIR),  # store boltz model weights
+        CONF.default_env
+        | {
+            "CHAI_DOWNLOADS_DIR": str(ChaiConf.model_dir),
+            "BOLTZ_CACHE": str(BoltzConf.model_dir),
         }
     )
     .run_commands(
         " && ".join(
             (
                 # Clone Boltz and Chai
-                f"git clone {BOLTZ_REPO} {BOLTZ_DIR}",
-                f"cd {BOLTZ_DIR}",
-                f"git checkout {BOLTZ_COMMIT}",
-                f"git clone {CHAI_REPO} {CHAI_DIR}",
-                f"cd {CHAI_DIR}",
-                f"git checkout {CHAI_COMMIT}",
+                f"git clone {BoltzConf.repo_url} {BoltzConf.git_clone_dir}",
+                f"cd {BoltzConf.git_clone_dir}",
+                f"git checkout {BoltzConf.repo_commit_hash}",
+                f"git clone {ChaiConf.repo_url} {ChaiConf.git_clone_dir}",
+                f"cd {ChaiConf.git_clone_dir}",
+                f"git checkout {ChaiConf.repo_commit_hash}",
                 # Setup ABCFold2 environment
-                f"git clone {ABCFOLD_REPO} {ABCFOLD_DIR}",
-                f"cd {ABCFOLD_DIR}",
-                f"git checkout {ABCFOLD_COMMIT}",
+                f"git clone {CONF.repo_url} {APP_INFO.abcfold_dir}",
+                f"cd {APP_INFO.abcfold_dir}",
+                f"git checkout {CONF.repo_commit_hash}",
                 "uv venv --python 3.12",
-                f"uv pip install {BOLTZ_DIR}[cuda] {CHAI_DIR}",
+                f"uv pip install {BoltzConf.git_clone_dir}[cuda] {ChaiConf.git_clone_dir}",
                 "uv pip install .",
             ),
         )
     )
-    .env({"PATH": f"{ABCFOLD_DIR}/.venv/bin:$PATH"})
-    .apt_install(
-        "kalign",  # for Chai templates
-        "zstd",  # for packaging outputs
-    )
-    .workdir(ABCFOLD_DIR)
-    .add_local_python_source("biomodals")
+    .env({"PATH": f"{APP_INFO.abcfold_dir}/.venv/bin:$PATH"})
+    .apt_install("kalign")  # for Chai templates
+    .workdir(APP_INFO.abcfold_dir)
 )
 
-app = App(APP_NAME, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
 # Fetch model weights
 ##########################################
 @app.function(
-    volumes={BOLTZ_MODEL_DIR: BOLTZ_VOLUME}, timeout=TIMEOUT, image=download_image
+    volumes={str(BoltzConf.model_volume_mountpoint): MODEL_VOLUME},
+    timeout=CONF.timeout,
+    image=download_image,
 )
 def download_boltz_models(force: bool = False) -> None:
     """Download Boltz models into the mounted volume.
@@ -152,37 +147,26 @@ def download_boltz_models(force: bool = False) -> None:
 
     snapshot_download(
         repo_id="boltz-community/boltz-2",
-        revision=BOLTZ_MODEL_HASH,
-        local_dir=BOLTZ_MODEL_DIR,
+        revision=APP_INFO.boltz_model_hash,
+        local_dir=BoltzConf.model_dir,
         force_download=force,
     )
-    tar_mols = Path(BOLTZ_MODEL_DIR) / "mols.tar"
-    if not (Path(BOLTZ_MODEL_DIR) / "mols").exists():
+    boltz_download_dir = BoltzConf.model_dir
+    tar_mols = boltz_download_dir / "mols.tar"
+    if not (boltz_download_dir / "mols").exists():
         with tarfile.open(str(tar_mols), "r") as tar:
-            tar.extractall(BOLTZ_MODEL_DIR)  # noqa: S202
+            tar.extractall(boltz_download_dir)  # noqa: S202
 
-    BOLTZ_VOLUME.commit()
-
-
-async def download_file(session, url: str, local_path: Path):
-    """Download a file asynchronously using aiohttp."""
-    async with session.get(url) as response:
-        response.raise_for_status()
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(local_path, "wb") as f:
-            while chunk := await response.content.read(8192):
-                f.write(chunk)
+    MODEL_VOLUME.commit()
 
 
 @app.function(
-    volumes={CHAI_MODEL_DIR: CHAI_VOLUME}, timeout=TIMEOUT, image=download_image
+    volumes={str(ChaiConf.model_volume_mountpoint): MODEL_VOLUME},
+    timeout=CONF.timeout,
+    image=download_image,
 )
 async def download_chai_models(force=False):
     """From https://modal.com/docs/examples/chai1."""
-    import asyncio
-
-    import aiohttp
-
     base_url = "https://chaiassets.com/chai1-inference-depencencies/"  # sic
     inference_dependencies = [
         "conformers_v1.apkl",
@@ -195,23 +179,12 @@ async def download_chai_models(force=False):
         "esm2/traced_sdpa_esm2_t36_3B_UR50D_fp16.pt",
     ]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-    }
-
     # launch downloads concurrently
-    chai_model_dir = Path(CHAI_MODEL_DIR)
-    async with aiohttp.ClientSession(headers=headers) as session:
-        tasks = []
-        for dep in inference_dependencies:
-            local_path = chai_model_dir / dep
-            if force or not local_path.exists():
-                url = base_url + dep
-                print(f"🧬 downloading {dep} to {local_path}")
-                tasks.append(download_file(session, url, local_path))
-
-        # run all of the downloads and await their completion
-        await asyncio.gather(*tasks)
+    chai_model_dir = ChaiConf.model_dir
+    download_tasks = {
+        f"{base_url}{dep}": chai_model_dir / dep for dep in inference_dependencies
+    }
+    download_files(download_tasks, progress_bar_desc="Downloading Chai models")
 
     # Special treatment for ESM
     esm2_path = chai_model_dir / "esm2" / "traced_sdpa_esm2_t36_3B_UR50D_fp16.pt"
@@ -220,7 +193,9 @@ async def download_chai_models(force=False):
         esm_path.parent.mkdir(parents=True, exist_ok=True)
         esm_path.symlink_to(esm2_path)
 
-    CHAI_VOLUME.commit()  # ensures models are visible on remote filesystem before exiting, otherwise takes a few seconds, racing with inference
+    # ensures models are visible on remote filesystem before exiting,
+    # otherwise takes a few seconds, racing with inference
+    MODEL_VOLUME.commit()
 
 
 ##########################################
@@ -241,7 +216,7 @@ def load_params_from_run_yaml(yaml_path: Path) -> dict:
     }
 
 
-@app.function(image=runtime_image, timeout=TIMEOUT)
+@app.function(image=runtime_image, timeout=CONF.timeout)
 def get_run_id(yaml_str: bytes) -> str:
     """Get content-based run ID from ABCFold2 config."""
     import tempfile
@@ -259,8 +234,11 @@ def get_run_id(yaml_str: bytes) -> str:
 
 @app.function(
     image=runtime_image,
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
+    timeout=CONF.timeout,
+    volumes={
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        BoltzConf.model_volume_mountpoint: MODEL_VOLUME,
+    },
 )
 def prepare_abcfold2(
     yaml_str: bytes, search_templates: bool, msa_chains: str | None = None
@@ -305,7 +283,7 @@ def prepare_abcfold2(
         _ = prepare_chai(
             conf_file=yaml_path,
             out_dir=out_dir_full,
-            ccd_lib_dir=Path(BOLTZ_MODEL_DIR) / "mols",
+            ccd_lib_dir=BoltzConf.model_dir / "mols",
         )
         OUTPUTS_VOLUME.commit()
 
@@ -321,8 +299,11 @@ def prepare_abcfold2(
     cpu=(0.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
+    timeout=CONF.timeout,
+    volumes={
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        BoltzConf.model_volume_mountpoint: MODEL_VOLUME,
+    },
 )
 def collect_abcfold2_boltz_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
@@ -330,7 +311,7 @@ def collect_abcfold2_boltz_data(
     """Manage Boltz runs and return all Boltz results."""
     from pathlib import Path
 
-    work_path = Path(run_conf["workdir"]).expanduser().resolve()
+    work_path = Path(str(run_conf["workdir"])).expanduser().resolve()
     run_id = run_conf["run_id"]
     work_path = work_path / "boltz_models"
     boltz_conf_path = work_path / f"{run_id}.yaml"
@@ -340,6 +321,11 @@ def collect_abcfold2_boltz_data(
         raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
 
     random_seeds = run_conf.get("seeds", [])
+    if not isinstance(random_seeds, list):
+        if random_seeds is None:
+            random_seeds = []
+        else:
+            random_seeds = [int(random_seeds)]
     seeds_to_run = []
     for seed in random_seeds:
         boltz_run_dir = work_path / f"boltz_results_seed-{seed}"
@@ -370,11 +356,14 @@ def collect_abcfold2_boltz_data(
 
 
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, BOLTZ_MODEL_DIR: BOLTZ_VOLUME},
+    timeout=CONF.timeout,
+    volumes={
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        BoltzConf.model_volume_mountpoint: MODEL_VOLUME,
+    },
 )
 def run_abcfold2_boltz(
     seed: int,
@@ -413,8 +402,11 @@ def run_abcfold2_boltz(
     cpu=(0.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
+    timeout=CONF.timeout,
+    volumes={
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        ChaiConf.model_volume_mountpoint: MODEL_VOLUME,
+    },
 )
 def collect_abcfold2_chai_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
@@ -422,7 +414,7 @@ def collect_abcfold2_chai_data(
     """Manage Chai runs and return all Chai results."""
     from pathlib import Path
 
-    work_path = Path(run_conf["workdir"]).expanduser().resolve()
+    work_path = Path(str(run_conf["workdir"])).expanduser().resolve()
     run_id = run_conf["run_id"]
     work_path = work_path / "chai_models"
     chai_conf_path = work_path / f"{run_id}.yaml"
@@ -432,6 +424,11 @@ def collect_abcfold2_chai_data(
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
 
     random_seeds = run_conf.get("seeds", [])
+    if not isinstance(random_seeds, list):
+        if random_seeds is None:
+            random_seeds = []
+        else:
+            random_seeds = [int(random_seeds)]
     seeds_to_run = []
     for seed in random_seeds:
         chai_run_dir = work_path / f"chai_seed-{seed}"
@@ -450,11 +447,14 @@ def collect_abcfold2_chai_data(
 
 
 @app.function(
-    gpu=GPU,
+    gpu=CONF.gpu,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME, CHAI_MODEL_DIR: CHAI_VOLUME},
+    timeout=CONF.timeout,
+    volumes={
+        OUTPUTS_DIR: OUTPUTS_VOLUME,
+        ChaiConf.model_volume_mountpoint: MODEL_VOLUME,
+    },
 )
 def run_abcfold2_chai(
     seed: int,
@@ -511,19 +511,24 @@ def submit_abcfold2_task(
 ) -> None:
     """Run ABCFold2 on modal and fetch results to `out_dir`.
 
-    Note that MSAs will be searched automatically. Templates will be searched only if
-    `search_templates` is True.
+    Note that MSAs will be searched automatically. Templates will be searched
+    only if `search_templates` is True.
 
     Args:
-        input_yaml: Path to YAML design specification file
-        out_dir: Optional output directory (defaults to $CWD)
-        run_name: Optional run name (defaults to {input filename stem})
-        msa_chains: Optional comma-separated list of chains to search MSAs for (defaults to all chains)
-        search_templates: Whether to search for templates and add to input YAML
-        download_models: Whether to download model weights before running
-        force_redownload: Whether to force re-download of model weights
-        run_boltz: Whether to run Boltz inference
-        run_chai: Whether to run Chai inference
+        input_yaml: Path to YAML design specification file. For a detailed
+            description of the YAML schema, see
+            <https://github.com/y1zhou/ABCFold/blob/feat/schema/abcfold/schema.py>.
+        out_dir: Optional output directory. If not specified, outputs will
+            be saved in the current working directory.
+        run_name: Optional name for the output directory. Defaults to the
+            stem of the input YAML file.
+        msa_chains: Optional comma-separated list of chains to search MSAs for.
+            If not specified, MSAs will be searched for all chains.
+        search_templates: Whether to search for templates and add to input YAML.
+        download_models: Whether to download model weights and skip running.
+        force_redownload: Whether to force re-download of model weights.
+        run_boltz: Whether to run Boltz inference.
+        run_chai: Whether to run Chai inference.
     """
     import json
     from pathlib import Path
@@ -559,7 +564,7 @@ def submit_abcfold2_task(
         download_chai_models.remote(force=force_redownload)
 
     # Run Boltz for each seed
-    inference_tasks: list[FunctionCall] = []
+    inference_tasks: list[modal.FunctionCall] = []
     output_paths: list[Path] = []
     if run_boltz:
         out_path = local_out_dir / "boltz_models.tar.zst"
@@ -580,7 +585,7 @@ def submit_abcfold2_task(
         print("🧬 No inference tasks specified, exiting...")
         return
 
-    inference_data = FunctionCall.gather(*inference_tasks)
+    inference_data = modal.FunctionCall.gather(*inference_tasks)
     for out_path, data in zip(output_paths, inference_data, strict=True):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(data)

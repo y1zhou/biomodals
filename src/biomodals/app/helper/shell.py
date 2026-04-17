@@ -73,7 +73,11 @@ def run_command(
     if "env" not in kwargs:
         kwargs["env"] = default_env
     else:
-        kwargs["env"] = default_env | kwargs["env"]
+        new_env = default_env | kwargs["env"]
+        kwargs["env"] = new_env.copy()
+        for k, v in new_env.items():
+            if v is None:
+                del kwargs["env"][k]
 
     all_outputs: list[str] = []
     with sp.Popen(cmd, **kwargs) as p:  # noqa: S603

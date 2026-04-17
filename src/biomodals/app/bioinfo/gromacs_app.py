@@ -1,65 +1,62 @@
 """Run MD simulation with GROMACS: <https://www.gromacs.org/>.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-pdb` | **Required** | Path to the input PDB file. |
-| `--run-name` | PDB filename stem | Name for this simulation run. Note that if the name exists in the remote volume, files in the remote will be preferred over the local one. Make sure to use unique names if you want to start a new run! |
-| `--simulation-time-ns` | 5 | Length of the production MD simulation in nanoseconds. |
-| `--run-pdbfixer` | False | Whether to run PDBFixer to clean the input PDB file before preparation. |
-| `--cpu-only` | False | Whether to run GROMACS on CPU only. If False, GROMACS will use GPU acceleration. |
-| `--num-threads` | 32 | Number of CPU threads to use for GROMACS. |
-| `--use-openmp-threads` | False | Whether to use OpenMP threading in GROMACS. If False, GROMACS will use its own internal threading. |
-| `--ld-seed` | -1 | Random seed for the Langevin dynamics thermostat during equilibration. If -1, a random seed will be chosen. |
-| `--gen-seed` | -1 | Random seed for initial velocity generation during equilibration. If -1, a random seed will be chosen. |
-| `--genion-seed` | 0 | Random seed for ion placement during system neutralization. |
-
 ## Outputs
 
-* All output files are saved to a Modal volume named `gromacs-outputs`.
+* All output files are saved to a Modal volume named `Gromacs-outputs`.
 * The production trajectory should be under the name `production_{run_name}.xtc`.
 """
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import modal
-from modal import App, Image, Volume
 
+from biomodals.app.config import AppConfig
+from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import run_command
 
 ##########################################
 # Modal configs
 ##########################################
-# T4: 16GB, L4: 24GB, A10G: 24GB, L40S: 48GB, A100-40G, A100-80G, H100: 80GB
-# https://modal.com/docs/guide/gpu
-GPU = os.environ.get("GPU", "L40S")
-TIMEOUT = int(os.environ.get("TIMEOUT", "86400"))  # seconds
-APP_NAME = os.environ.get("MODAL_APP", "Gromacs")
-N_GMX_THREADS = int(os.environ.get("N_GMX_THREADS", "16"))
-
-# Volume for outputs
-OUTPUTS_VOLUME_NAME = "gromacs-outputs"
-OUTPUTS_VOLUME = Volume.from_name(
-    OUTPUTS_VOLUME_NAME, create_if_missing=True, version=2
+CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
+    name="Gromacs",
+    repo_url="https://github.com/gromacs/gromacs",
+    version="2026.1",
+    python_version="3.13",
+    cuda_version="cu128",
+    gpu=os.environ.get("GPU", "L40S"),
+    timeout=int(os.environ.get("TIMEOUT", "86400")),
 )
-OUTPUTS_DIR = f"/{OUTPUTS_VOLUME_NAME}"
-GMX_SCRIPTS = "/gromacs-scripts"
 
-# Dependency versions
-UCX_TAG = "1.18.0"
-OPENMPI_TAG = "5.0.6"
-FFTW_TAG = "3.3.10"
-GROMACS_TAG = "2024.5"
+
+@dataclass
+class AppInfo:
+    """Container for Gromacs-specific configuration and constants."""
+
+    # Build configs
+    gmx_scripts: str = "/biomodals-gromacs-scripts"
+    gmx_threads: int = int(os.environ.get("N_GMX_THREADS", "16"))
+    # Dependency versions
+    ucx_tag: str = "1.20.0"
+    openmpi_tag: str = "5.0.9"
+    fftw_tag: str = "3.3.10"
+
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = (
-    Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.13")
+APP_INFO = AppInfo()
+OUTPUTS_VOLUME = CONF.get_out_volume()
+OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
+
+runtime_image = patch_image_for_helper(
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python=CONF.python_version
+    )
     .entrypoint([])  # remove verbose logging by base image on entry
     .apt_install(
         "git",
@@ -76,14 +73,7 @@ runtime_image = (
         "libgomp1",
         "liblapack3",
     )
-    .env(
-        {
-            # "UV_COMPILE_BYTECODE": "1",  # slower image build, faster runtime
-            # https://modal.com/docs/guide/cuda
-            "UV_TORCH_BACKEND": "cu128",  # find best torch and CUDA versions
-            "PATH": "/root/.local/bin:$PATH",
-        }
-    )
+    .env(CONF.default_env | {"PATH": "/root/.local/bin:$PATH"})
     .run_commands("curl -L micro.mamba.pm/install.sh | bash")
     .micromamba_install(
         "ambertools=23", "pdbfixer", channels=["conda-forge", "bioconda"]
@@ -95,10 +85,10 @@ runtime_image = (
         " && ".join(
             (
                 "cd /opt",
-                f"wget https://github.com/openucx/ucx/releases/download/v{UCX_TAG}/ucx-{UCX_TAG}.tar.gz",
-                f"tar -xzf ucx-{UCX_TAG}.tar.gz",
-                f"rm ucx-{UCX_TAG}.tar.gz",
-                f"cd ucx-{UCX_TAG}/",
+                f"wget https://github.com/openucx/ucx/releases/download/v{APP_INFO.ucx_tag}/ucx-{APP_INFO.ucx_tag}.tar.gz",
+                f"tar -xzf ucx-{APP_INFO.ucx_tag}.tar.gz",
+                f"rm ucx-{APP_INFO.ucx_tag}.tar.gz",
+                f"cd ucx-{APP_INFO.ucx_tag}/",
                 "./contrib/configure-release --with-cuda=/usr/local/cuda prefix=/usr/local",
                 "make -j install",
             ),
@@ -109,10 +99,10 @@ runtime_image = (
         " && ".join(
             (
                 "cd /opt",
-                f"wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-{OPENMPI_TAG}.tar.bz2",
-                f"tar -xf openmpi-{OPENMPI_TAG}.tar.bz2",
-                f"rm openmpi-{OPENMPI_TAG}.tar.bz2",
-                f"cd openmpi-{OPENMPI_TAG}/",
+                f"wget https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-{APP_INFO.openmpi_tag}.tar.bz2",
+                f"tar -xf openmpi-{APP_INFO.openmpi_tag}.tar.bz2",
+                f"rm openmpi-{APP_INFO.openmpi_tag}.tar.bz2",
+                f"cd openmpi-{APP_INFO.openmpi_tag}/",
                 "./configure --with-cuda=/usr/local/cuda --with-ucx=/usr/local/ prefix=/usr/local",
                 "make -j install",
             ),
@@ -123,10 +113,10 @@ runtime_image = (
         " && ".join(
             (
                 "cd /opt",
-                f"wget http://www.fftw.org/fftw-{FFTW_TAG}.tar.gz",
-                f"tar -xzf fftw-{FFTW_TAG}.tar.gz",
-                f"rm fftw-{FFTW_TAG}.tar.gz",
-                f"cd fftw-{FFTW_TAG}/",
+                f"wget http://www.fftw.org/fftw-{APP_INFO.fftw_tag}.tar.gz",
+                f"tar -xzf fftw-{APP_INFO.fftw_tag}.tar.gz",
+                f"rm fftw-{APP_INFO.fftw_tag}.tar.gz",
+                f"cd fftw-{APP_INFO.fftw_tag}/",
                 "./configure --disable-fortran --disable-shared --enable-static "
                 "--with-pic --enable-avx512 --enable-avx2 --enable-avx --enable-sse2 "
                 "--enable-float --prefix=/usr/local",
@@ -146,10 +136,10 @@ runtime_image = (
             (
                 # gmx binaries
                 "cd /opt",
-                "wget https://ftp.gromacs.org/gromacs/gromacs-2024.5.tar.gz",
-                f"tar -xzf gromacs-{GROMACS_TAG}.tar.gz",
-                f"rm gromacs-{GROMACS_TAG}.tar.gz",
-                f"cd gromacs-{GROMACS_TAG}/",
+                f"wget https://ftp.gromacs.org/gromacs/gromacs-{CONF.version}.tar.gz",
+                f"tar -xzf gromacs-{CONF.version}.tar.gz",
+                f"rm gromacs-{CONF.version}.tar.gz",
+                f"cd gromacs-{CONF.version}/",
                 "mkdir build",
                 "cd build",
                 "cmake .. "
@@ -157,10 +147,10 @@ runtime_image = (
                 "-DCMAKE_PREFIX_PATH='/usr/local' "
                 "-DGMX_GPU=CUDA "
                 "-DGMX_BUILD_OWN_FFTW=OFF -DGMX_FFT_LIBRARY=fftw3 "
-                "-DGMX_SIMD=AVX_512",
+                "-DGMX_SIMD=AVX2_256",  # AVX_512
                 "make -j install",
                 # Build GROMACS with OpenMPI
-                f"cd /opt/gromacs-{GROMACS_TAG}/",
+                f"cd /opt/gromacs-{CONF.version}/",
                 "mkdir build_mpi",
                 "cd build_mpi",
                 "cmake .. "
@@ -171,7 +161,7 @@ runtime_image = (
                 "-DCMAKE_C_COMPILER=mpicc "
                 "-DCMAKE_CXX_COMPILER=mpicxx "
                 "-DGMX_BUILD_OWN_FFTW=OFF -DGMX_FFT_LIBRARY=fftw3 "
-                "-DGMX_SIMD=AVX_512",
+                "-DGMX_SIMD=AVX2_256",
                 "make -j install",
             ),
         ),
@@ -180,17 +170,16 @@ runtime_image = (
         "echo 'micromamba activate base' >> /etc/profile",
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
-    .add_local_dir(Path(__file__).parent / "gromacs", GMX_SCRIPTS, copy=True)
-    .add_local_python_source("biomodals")
+    .add_local_dir(Path(__file__).parent / "gromacs", APP_INFO.gmx_scripts, copy=True)
 )
 
-biotite_image = (
-    Image.debian_slim()
+biotite_image = patch_image_for_helper(
+    modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
     .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
 )
 
-app = App(APP_NAME, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
@@ -209,18 +198,18 @@ def file1_needs_update(file1: Path, file2: Path) -> bool:
 # Inference functions
 ##########################################
 @app.function(
-    gpu=GPU,
-    cpu=N_GMX_THREADS + 0.125,
+    gpu=CONF.gpu,
+    cpu=APP_INFO.gmx_threads + 0.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
 def prepare_tpr_gpu(
     pdb_content: bytes,
     run_name: str,
     simulation_time_ns: int = 5,
     run_pdbfixer: bool = False,
-    num_threads: int = N_GMX_THREADS,
+    num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
     ld_seed: int = -1,
     gen_seed: int = -1,
@@ -234,7 +223,7 @@ def prepare_tpr_gpu(
     """
     from pathlib import Path
 
-    work_path = Path(OUTPUTS_DIR) / run_name
+    work_path = Path(CONF.output_volume_mountpoint) / run_name
     work_path.mkdir(parents=True, exist_ok=True)
 
     # Skip prep if production tpr already exists
@@ -252,7 +241,7 @@ def prepare_tpr_gpu(
     input_pdb_path.write_bytes(pdb_content)
     OUTPUTS_VOLUME.commit()
 
-    script_path = Path(GMX_SCRIPTS) / "prepare-tpr.sh"
+    script_path = Path(APP_INFO.gmx_scripts) / "prepare-tpr.sh"
     if not script_path.exists():
         raise FileNotFoundError(f"Gromacs script not found: {script_path}")
 
@@ -277,27 +266,23 @@ def prepare_tpr_gpu(
     if use_openmp_threads:
         cmd.append("--use-openmp-threads")
     # Modal adds this automatically but we want Gromacs to handle threading
-    env = os.environ.copy()
-    if "OMP_NUM_THREADS" in env:
-        del env["OMP_NUM_THREADS"]
-
-    _ = run_command(cmd, cwd=str(work_path), env=env)
+    _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     OUTPUTS_VOLUME.commit()
     return work_path
 
 
 @app.function(
-    cpu=N_GMX_THREADS + 0.125,
+    cpu=APP_INFO.gmx_threads + 0.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
 def prepare_tpr_cpu(
     pdb_content: bytes,
     run_name: str,
     simulation_time_ns: int = 5,
     run_pdbfixer: bool = False,
-    num_threads: int = N_GMX_THREADS,
+    num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
     ld_seed: int = -1,
     gen_seed: int = -1,
@@ -311,7 +296,7 @@ def prepare_tpr_cpu(
     """
     from pathlib import Path
 
-    work_path = Path(OUTPUTS_DIR) / run_name
+    work_path = Path(CONF.output_volume_mountpoint) / run_name
     work_path.mkdir(parents=True, exist_ok=True)
 
     # Skip prep if production tpr already exists
@@ -329,7 +314,7 @@ def prepare_tpr_cpu(
     input_pdb_path.write_bytes(pdb_content)
     OUTPUTS_VOLUME.commit()
 
-    script_path = Path(GMX_SCRIPTS) / "prepare-tpr.sh"
+    script_path = Path(APP_INFO.gmx_scripts) / "prepare-tpr.sh"
     if not script_path.exists():
         raise FileNotFoundError(f"Gromacs script not found: {script_path}")
 
@@ -353,6 +338,8 @@ def prepare_tpr_cpu(
         cmd.append("--fix-pdb")
     if use_openmp_threads:
         cmd.append("--use-openmp-threads")
+    # Modal adds this automatically but we want Gromacs to handle threading
+    _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
 
     OUTPUTS_VOLUME.commit()
     return work_path
@@ -360,10 +347,9 @@ def prepare_tpr_cpu(
 
 @app.function(
     image=biotite_image,
-    cpu=1,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
 def find_traj_last_step(traj_file: str, topology_file: str) -> int:
     """Calculated simulated steps from the simulation time (in ps) in a trajectory."""
@@ -394,23 +380,23 @@ def find_traj_last_step(traj_file: str, topology_file: str) -> int:
 
 
 @app.function(
-    gpu=GPU,
-    cpu=N_GMX_THREADS + 0.125,
+    gpu=CONF.gpu,
+    cpu=APP_INFO.gmx_threads + 0.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
 def production_run_gpu(
     run_name: str,
     simulation_time_ns: int,
-    num_threads: int = N_GMX_THREADS,
+    num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
 ) -> Path:
     """Production Gromacs run."""
     import shutil
     from pathlib import Path
 
-    work_path = Path(OUTPUTS_DIR) / run_name
+    work_path = Path(CONF.output_volume_mountpoint) / run_name
     deffnm = f"production_{run_name}"
     tpr_file_path = work_path / f"{deffnm}.tpr"
     if not tpr_file_path.exists():
@@ -462,32 +448,28 @@ def production_run_gpu(
         cmd.extend(["-nt", str(num_threads)])
 
     # Modal adds this automatically but we want Gromacs to handle threading
-    env = os.environ.copy()
-    if "OMP_NUM_THREADS" in env:
-        del env["OMP_NUM_THREADS"]
-
-    _ = run_command(cmd, cwd=str(work_path), env=env)
+    _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     OUTPUTS_VOLUME.commit()
     return work_path
 
 
 @app.function(
-    cpu=N_GMX_THREADS + 0.125,
+    cpu=APP_INFO.gmx_threads + 0.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
 def production_run_cpu(
     run_name: str,
     simulation_time_ns: int,
-    num_threads: int = N_GMX_THREADS,
+    num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
 ) -> Path:
     """Production Gromacs run."""
     import shutil
     from pathlib import Path
 
-    work_path = Path(OUTPUTS_DIR) / run_name
+    work_path = Path(CONF.output_volume_mountpoint) / run_name
     deffnm = f"production_{run_name}"
     tpr_file_path = work_path / f"{deffnm}.tpr"
     if not tpr_file_path.exists():
@@ -539,11 +521,7 @@ def production_run_cpu(
         cmd.extend(["-nt", str(num_threads)])
 
     # Modal adds this automatically but we want Gromacs to handle threading
-    env = os.environ.copy()
-    if "OMP_NUM_THREADS" in env:
-        del env["OMP_NUM_THREADS"]
-
-    _ = run_command(cmd, cwd=str(work_path), env=env)
+    _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     OUTPUTS_VOLUME.commit()
     return work_path
 
@@ -552,8 +530,8 @@ def production_run_cpu(
     image=biotite_image,
     cpu=1,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    timeout=TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
 def postprocess_traj(
     traj_prefix: str,
@@ -574,7 +552,7 @@ def postprocess_traj(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    work_path = Path(OUTPUTS_DIR) / run_name
+    work_path = Path(CONF.output_volume_mountpoint) / run_name
     input_pdb_path = work_path / f"{run_name}.pdb"
     if not input_pdb_path.exists():
         raise FileNotFoundError(f"Input PDB file not found: {input_pdb_path}")
@@ -737,15 +715,33 @@ def submit_gromacs_task(
     simulation_time_ns: int = 5,
     run_pdbfixer: bool = False,
     cpu_only: bool = False,
-    num_threads: int = N_GMX_THREADS,
+    num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
 ) -> None:
-    """Run GROMACS MD simulations on Modal and save results to a volume."""
-    from pathlib import Path
+    """Run GROMACS MD simulations on Modal and save results to a volume.
 
+    Args:
+        input_pdb: Path to the input PDB file.
+        run_name: Name for this simulation run. Defaults to input PDB filename
+            stem. Note that if the name exists in the remote volume, files in
+            the remote will be preferred over the local one. Make sure to use
+            unique names if you want to start a new run!
+        simulation_time_ns: Length of the production MD simulation in nanoseconds.
+        run_pdbfixer: Whether to run PDBFixer to clean the input PDB file
+            before preparation.
+        cpu_only: Whether to run GROMACS on CPU only. If False, GROMACS will
+            use GPU acceleration.
+        num_threads: Number of CPU threads to use for GROMACS.
+        use_openmp_threads: Whether to use OpenMP threading in GROMACS.
+        ld_seed: Random seed for the Langevin dynamics thermostat during
+            equilibration. If -1, a random seed will be chosen.
+        gen_seed: Random seed for initial velocity generation during
+            equilibration. If -1, a random seed will be chosen.
+        genion_seed: Random seed for ion placement during system neutralization.
+    """
     # Load input PDB
     pdb_path = Path(input_pdb).expanduser().resolve()
     pdb_str = pdb_path.read_bytes()
@@ -796,6 +792,6 @@ def submit_gromacs_task(
 
     _ = modal.FunctionCall.gather(*process_traj_tasks, prod_traj_task)
 
-    remote_volume_dir = remote_workdir.relative_to(OUTPUTS_DIR)
+    remote_volume_dir = remote_workdir.relative_to(CONF.output_volume_mountpoint)
     print("🧬 Gromacs preparation complete! Check data with: \n")
     print(f"  modal volume ls {OUTPUTS_VOLUME_NAME} {remote_volume_dir}")

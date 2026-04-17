@@ -167,6 +167,7 @@ def list_available_apps(
     table_rows: list[tuple[str, str, str, str]] = []
     for app_name, app_path in available_apps.items():
         app_category = app_path.parent.name
+        # TODO: consider using git commit history for updated time if available
         updated_date = app_path.stat().st_mtime
 
         table_rows.append(

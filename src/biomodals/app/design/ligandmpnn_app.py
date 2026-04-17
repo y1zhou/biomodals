@@ -4,13 +4,6 @@
 
 See <https://github.com/dauparas/LigandMPNN#available-models> for details.
 
-## Configuration
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `GPU` | `L40S` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
-| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
-
 ## Outputs
 
 * Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
@@ -22,7 +15,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from modal import App, Image
+import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
@@ -38,6 +31,7 @@ from biomodals.app.helper.web import download_files
 # Modal configs
 ##########################################
 CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
     name="LigandMPNN",
     repo_url="https://github.com/dauparas/LigandMPNN",
     repo_commit_hash="26ec57ac976ade5379920dbd43c7f97a91cf82de",
@@ -86,7 +80,7 @@ AVAILABLE_MODELS = {
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    Image.debian_slim(python_version=CONF.python_version)
+    modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget")
     .env(CONF.default_env)
     # .run_commands(
@@ -102,7 +96,7 @@ runtime_image = patch_image_for_helper(
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
 )
 
-app = App(CONF.name, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
@@ -137,7 +131,6 @@ def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
 @app.function(
     volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
     timeout=MAX_TIMEOUT,
-    image=runtime_image,
 )
 def download_weights() -> None:
     """Download ProteinMPNN models into the mounted volume.
@@ -214,7 +207,6 @@ def build_base_command(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=86400,
     volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
-    image=runtime_image,
 )
 def ligandmpnn_run(
     run_name: str,

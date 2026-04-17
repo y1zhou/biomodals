@@ -2,41 +2,6 @@ r"""AbNatiV source repo: <https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ>.
 
 ## Configuration
 
-**General flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--run-name` | **Required** | Prefix used to name the output directory and files. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved to the current working directory. |
-| `--model-type` | `VH` | Selects the AbNatiV trained model (VH, VKappa, VLambda, VHH), or AbNatiV2 models (VH2, VL2, VHH2). If set to "paired", the paired V2 model will be used. |
-| `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and skip running. |
-| `--force-redownload` | `--no-force-redownload` | Whether to force re-download of model weights even if they exist. |
-| `--mean-score-only`/`--no-mean-score-only` | `--no-mean-score-only` | When True, only export a per-sequence score file instead of both sequence and per-position nativeness profiles. |
-| `--align-before-scoring`/`--no-align-before-scoring` | `--align-before-scoring` | Align and clean the sequences before scoring. |
-| `--num-workers` | `1` | Number of workers to parallelize the alignment process. |
-| `--plot-profiles`/`--no-plot-profiles` | `--plot-profiles` | Generate and save per-sequence profile plots under `{output_directory}/{output_id}_profiles`. |
-
-**Single-sequence model flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-fasta-or-seq` | `None` | Path to a FASTA file or a single-sequence string. Required for single-chain models. |
-| `--is-vhh`/`--no-is-vhh` | `--no-is-vhh` | Use the VHH alignment seed, which is better for nanobody sequences. |
-
-**Paired-sequence model flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-paired-csv` | `None` | Path to a CSV file containing paired VH and VL sequences. The CSV file should have columns "ID", "vh_seq", and "vl_seq". Required for paired model unless the following args are both provided. |
-| `--input-vh-seq` | `None` | A single-sequence string for VH sequences. Used if `--input-paired-csv` is not provided. |
-| `--input-vl-seq` | `None` | A single-sequence string for VL sequences. Used if `--input-paired-csv` is not provided. |
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `MODAL_APP` | `AbNatiV` | Name of the Modal app to use. |
-| `GPU` | `A10G` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
-| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
-
 ## Notes
 
 * Always check the `--model-type` argument to ensure you are using the correct model for your sequences.
@@ -49,7 +14,7 @@ r"""AbNatiV source repo: <https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ>.
 import os
 from pathlib import Path
 
-from modal import App, Image
+import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
@@ -60,6 +25,7 @@ from biomodals.app.helper.shell import package_outputs, run_command, softlink_di
 # Modal configs
 ##########################################
 CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
     name="AbNatiV",
     repo_url="https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ",
     package_name="abnativ",
@@ -76,14 +42,14 @@ ABNATIV_MODEL_DIR = "/root/.abnativ/models/pretrained_models"
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    Image.micromamba(python_version=CONF.python_version)
+    modal.Image.micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget", "zstd")
     .env(CONF.default_env)
     .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
     .micromamba_install(["anarci"], channels=["bioconda"])
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
 )
-app = App(CONF.name, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
@@ -117,7 +83,6 @@ def download_abnativ_models(force: bool = False) -> None:
     gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    image=runtime_image,
     timeout=CONF.timeout,
     volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
 )
@@ -176,7 +141,6 @@ def abnativ_score_unpaired(
     gpu=CONF.gpu,
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
-    image=runtime_image,
     timeout=CONF.timeout,
     volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
 )
@@ -255,22 +219,32 @@ def submit_abnativ_task(
 
     Args:
         run_name: Prefix used to name the output directory and files.
-        out_dir: Local directory where the results are persisted; defaults to the current working directory.
+        out_dir: Local directory where the results are persisted. If not specified,
+            outputs will be saved to the current working directory.
         input_fasta_or_seq: Path to a FASTA file or a single-sequence string.
-        input_paired_csv: (For paired model only) Path to a CSV file containing paired VH and VL sequences.
-            The CSV file should have columns "ID", "vh_seq", and "vl_seq".
+            Required for single-chain models.
+        input_paired_csv: (For paired model only) Path to a CSV file containing
+            paired VH and VL sequences. The CSV file should have columns "ID",
+            "vh_seq", and "vl_seq". Required for paired model unless `input_vh_seq`
+            and `input_vl_seq` are both provided.
         input_vh_seq: (For paired model only) A single-sequence string for VH sequences.
+            Used if `input_paired_csv` is not provided.
         input_vl_seq: (For paired model only) A single-sequence string for VL sequences.
-        download_models: If True, download the AbNatiV models before inference.
+            Used if `input_paired_csv` is not provided.
+        download_models: Whether to download model weights and skip inference.
         force_redownload: Force re-download of the models even if they already exist.
-        model_type: Selects the AbNatiV trained model (VH, VKappa, VLambda, VHH), or AbNatiV2 models (VH2, VL2, VHH2).
-            If set to "paired", the paired V2 model will be used. `input_fasta_or_seq` will be ignored, and sequences
+        model_type: Selects the AbNatiV trained model (VH, VKappa, VLambda, VHH),
+            or AbNatiV2 models (VH2, VL2, VHH2). If set to "paired", the paired V2
+            model will be used. `input_fasta_or_seq` will be ignored, and sequences
             will be read from `input_{paired_csv, vh_seq, vl_seq}` instead.
-        mean_score_only: When True, only export a per-sequence score file instead of both sequence and per-position nativeness profiles.
-        align_before_scoring: Align and clean the sequences before scoring; can be slow for large sets.
+        mean_score_only: When True, only export a per-sequence score file instead of
+            both sequence and per-position nativeness profiles.
+        align_before_scoring: Align and clean the sequences before scoring.
             If not set, all input sequences need to be Aho-numbered.
+            Note that this can be slow for large sets.
         num_workers: Number of workers to parallelize the alignment process.
         is_vhh: Use the VHH alignment seed, which is better for nanobody sequences.
+            Only applicable for single-chain models.
         plot_profiles: Generate and save per-sequence profile plots under `{output_directory}/{output_id}_profiles`.
     """
     # Ignore everything else if downloading models

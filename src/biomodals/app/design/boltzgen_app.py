@@ -1,29 +1,5 @@
 """BoltzGen source repo: <https://github.com/HannesStark/boltzgen>.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input-yaml` | **Required** | Path to YAML design specification file. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved in a Modal volume only. |
-| `--run-name` | stem name of `--input-yaml` | Optional run name used to name output directory. |
-| `--num-parallel-runs` | `1` | Number of parallel runs to submit. |
-| `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download model weights and skip running. |
-| `--force-redownload` | `--no-force-redownload` | Whether to force re-download of model weights even if they exist. |
-| `--protocol` | `nanobody-anything` | Design protocol, one of: protein-anything, peptide-anything, protein-small_molecule, `antibody-anything`, or nanobody-anything. |
-| `--num-designs` | `10` | Number of designs to generate *per run*. |
-| `--steps` | `None` | Specific pipeline steps to run (e.g. "design,inverse_folding"). |
-| `--extra-args` | `None` | Additional CLI arguments as a single string. |
-| `--salvage-mode`/`--no-salvage-mode` | `--no-salvage-mode` | Whether to try to finish incomplete runs. |
-
-For a complete set of BoltzGen CLI options that can be passed via `--extra-args`, see <https://github.com/HannesStark/boltzgen#all-command-line-arguments>.
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `MODAL_APP` | `BoltzGen` | Name of the Modal app to use. |
-| `GPU` | `L40S` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
-| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
-
 ## Outputs
 
 * Results will be saved to the specified `--out-dir` under a subdirectory named after the `--run-name`.
@@ -37,7 +13,7 @@ import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
-from modal import App, Image
+import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
@@ -53,6 +29,7 @@ from biomodals.app.helper.shell import (
 # Modal configs
 ##########################################
 CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
     name="BoltzGen",
     repo_url="https://github.com/y1zhou/boltzgen",
     repo_commit_hash="fd24c656257dc780882b91c0bbad61e13a15fc6b",
@@ -65,7 +42,7 @@ CONF = AppConfig(
 
 # Volumes to be mounted
 OUTPUTS_VOLUME = CONF.get_out_volume()
-OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name
+OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
 OUTPUTS_DIR = CONF.output_volume_mountpoint
 MODEL_DIR = CONF.model_dir
 
@@ -73,7 +50,7 @@ MODEL_DIR = CONF.model_dir
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    Image.debian_slim(python_version=CONF.python_version)
+    modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "zstd", "fd-find")
     .env(CONF.default_env)
     .uv_pip_install("polars[pandas,numpy,calamine,xlsxwriter]", "tqdm")
@@ -81,7 +58,7 @@ runtime_image = patch_image_for_helper(
     .workdir(str(CONF.git_clone_dir))
 )
 
-app = App(CONF.name, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
@@ -610,26 +587,38 @@ def submit_boltzgen_task(
     """Run BoltzGen with results saved as a tarball to `out_dir`.
 
     Args:
-        input_yaml: Path to YAML design specification file
-        out_dir: Local output directory; defaults to $PWD
-        run_name: Name for this BoltzGen run; defaults to yaml file stem. Can be used
-            together with `salvage_mode` to continue previous runs.
-        num_parallel_runs: Number of parallel runs to submit
-        download_models: Whether to download model weights before running
-        force_redownload: Whether to force re-download of model weights
+        input_yaml: Path to YAML design specification file.
+        out_dir: Optional local output directory. If not specified, outputs
+            will be saved in a Modal volume only.
+        run_name: Name for this BoltzGen run; defaults to yaml file stem. Can
+            be used together with `salvage_mode` to continue previous runs.
+        num_parallel_runs: Number of parallel runs to submit. Due to the stochastic
+            nature of BoltzGen, running multiple parallel runs with the same
+            YAML input would generate different results.
+        download_models: Whether to download model weights and skip running.
+        force_redownload: Whether to force re-download of model weights even if they exist.
         protocol: Design protocol, one of: protein-anything, peptide-anything,
-            protein-small_molecule, or nanobody-anything
-        num_designs: Number of designs to generate
-        budget: Number of designs to keep after filtering
-        steps: Specific pipeline steps to run (e.g. "design inverse_folding")
-        extra_args: Additional CLI arguments as string
-        salvage_mode: Whether to only try to finish incomplete runs
-        focus_run_ids: Comma-separated run IDs to focus on (only used in salvage mode)
-        ignore_run_ids: Comma-separated run IDs to ignore (only used in salvage mode).
+            protein-small_molecule, antibody-anything, or nanobody-anything.
+        num_designs: Number of designs to generate *per run*. Note that this
+            is just the number of generated designs, and there is no guarantee
+            that all designs will pass the filtering criteria.
+        budget: Number of designs to keep after filtering. It is recommended
+            to set this to a reasonably large number (e.g. 100) to get the best
+            results, and do further filtering locally after combining multiple runs.
+        steps: Specific pipeline steps to run (e.g. "design inverse_folding").
+        extra_args: Additional CLI arguments as a string. See
+            <https://github.com/HannesStark/boltzgen#all-command-line-arguments>.
+        salvage_mode: Whether to only try to finish incomplete runs. In salvage mode,
+            the app will look for existing run outputs under the same `run_name`
+            and only run BoltzGen for runs that are not completed.
+        focus_run_ids: Comma-separated run IDs to focus on
+            (only used in `salvage_mode`).
+        ignore_run_ids: Comma-separated run IDs to ignore
+            (only used in `salvage_mode`).
             Note that `ignore_run_ids` takes precedence over `focus_run_ids`.
-        filter_results: If true, bundle top `'budget` results into a tarball and download to `out_dir`.
+        filter_results: If true, bundle top `budget` results into a tarball and download to `out_dir`.
             Otherwise, use subprocesses to call `modal volume get` for downloads.
-            This flag is useless if `out_dir` is None.
+            This flag is useless if `out_dir` is not specified.
     """
     from pathlib import Path
 

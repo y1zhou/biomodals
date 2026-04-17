@@ -1,29 +1,5 @@
 """AntiFold source repo: <https://github.com/oxpig/AntiFold>.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--struct-file` | **Required** | Path to input PDB or mmCIF file containing the antibody structure. **The antibody chains in the file must be IMGT-numbered.** |
-| `--run-name` | None | Prefix used to name the output directory and files. |
-| `--out-dir` | `$CWD` | Optional local output directory. If not specified, outputs will be saved to the current working directory. |
-| `--heavy-chain` | 1st chain in structure file | Chain ID of the heavy chain. |
-| `--light-chain` | 2nd chain in structure file | Chain ID of the light chain. |
-| `--antigen-chain` | None | Chain ID of the antigen, if present. |
-| `--nanobody-chain` | None | Chain ID of the nanobody, if applicable. |
-| `--regions` | `CDR1 CDR2 CDR3` | Space-separated string specifying the regions to design. See <https://github.com/oxpig/AntiFold/blob/789d46786624c01eb44f177ef4c0deeeb6e77469/antifold/antiscripts.py#L738> for options. |
-| `--num-seq-per-target` | `0` | Number of sequences to generate. |
-| `--sampling-temp` | `0.2` | Sampling temperature controls generated sequence diversity, by scaling the inverse folding probabilities before sampling. Temperature = 1 means no change, while temperature ~ 0 only samples the most likely amino-acid at each position (acts as argmax). |
-| `--limit-variation` | `False` | If set, limits variation to as many mutations as expected from temperature sampling. |
-| `--extract-embeddings` | `False` | If set, extracts and saves per-residue embeddings and return them in an NumPy array. |
-| `--num-threads` | `0` | Number of CPU threads to use. Defaults to all available. |
-| `--seed` | `42` | Random seed for reproducibility. |
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `GPU` | `A10G` | Type of GPU to use. See https://modal.com/docs/guide/gpu for details. |
-| `TIMEOUT` | `1800` | Timeout for each Modal function in seconds. |
-
 ## Notes
 
 * By default there would be two files in the output archive file:
@@ -41,7 +17,7 @@ import os
 import sys
 from pathlib import Path
 
-from modal import App, Image
+import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
@@ -52,6 +28,7 @@ from biomodals.app.helper.shell import package_outputs, run_command
 # Modal configs
 ##########################################
 CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
     name="AntiFold",
     repo_url="https://github.com/oxpig/AntiFold",
     repo_commit_hash="789d46786624c01eb44f177ef4c0deeeb6e77469",
@@ -66,7 +43,7 @@ MODEL_DIR = CONF.model_dir
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    Image.debian_slim(python_version=CONF.python_version)
+    modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget")
     .env(CONF.default_env)
     .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}")
@@ -78,7 +55,7 @@ runtime_image = patch_image_for_helper(
     )
 )
 
-app = App(CONF.name, image=runtime_image)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 ##########################################
@@ -205,15 +182,19 @@ def submit_antifold_task(
     """Run AntiFold inverse folding for a given antibody(-antigen) structure.
 
     Args:
-        run_name: Prefix used to name the output directory and files.
         struct_file: Path to input PDB or mmCIF file containing the antibody structure.
-            The antibody chains in the file should be IMGT-numbered.
-        out_dir: Local directory where the results are persisted; defaults to the current working directory.
+            **The antibody chains in the file must be IMGT-numbered.**
+        run_name: Prefix used to name the output directory and files. If not
+            specified, defaults to the stem of the input structure file name.
+        out_dir: Local directory where the results are persisted. If not
+            specified, defaults to the current working directory.
         heavy_chain: Chain ID of the heavy chain; defaults to the first chain in the structure file.
         light_chain: Chain ID of the light chain; defaults to the second chain in the structure file.
         antigen_chain: Chain ID of the antigen, if present.
         nanobody_chain: Chain ID of the nanobody, if applicable.
-        regions: Space-separated string specifying the regions to design.
+        regions: Space-separated string specifying the regions to design. See
+            <https://github.com/oxpig/AntiFold/blob/789d46786624c01eb44f177ef4c0deeeb6e77469/antifold/antiscripts.py#L738>
+            for options.
         num_seq_per_target: Number of sequences to generate.
         sampling_temp: Sampling temperature controls generated sequence diversity,
             by scaling the inverse folding probabilities before sampling.
@@ -221,8 +202,9 @@ def submit_antifold_task(
             likely amino-acid at each position (acts as argmax).
         limit_variation: If True, limits variation to as many mutations as expected
             from temperature sampling.
-        extract_embeddings: If True, extracts and saves per-residue embeddings.
-        num_threads: Number of CPU threads to use.
+        extract_embeddings: If True, extracts and saves per-residue embeddings
+            into NumPy arrays.
+        num_threads: Number of CPU threads to use. Defaults to all available.
         seed: Random seed for reproducibility.
     """
     # Set up output paths

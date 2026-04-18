@@ -16,7 +16,7 @@ async def _download_files(
     num_retries: int = 1,
     progress_bar_desc: str | None = None,
 ):
-    """Download multiple files concurrently using aiohttp.
+    """Download multiple files concurrently.
 
     Args:
         urls: Keys are URLs, and values are local file paths.
@@ -56,7 +56,7 @@ async def _download_files(
 async def _download_file(
     session: niquests.AsyncSession, url: str, local_path: Path, force: bool
 ):
-    """Download a file asynchronously using aiohttp."""
+    """Download a file asynchronously."""
     import aiofiles
 
     try:

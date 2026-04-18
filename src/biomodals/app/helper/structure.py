@@ -11,11 +11,11 @@ def struct2seq(path: str | Path, **kwargs) -> list[tuple[str, str]]:
     Each tuple contains a chain ID and its corresponding sequence.
     Note that only the first model in the structure is considered.
 
-    WARNING: non-standard residue names and non-polymer molecules are silently dropped
-        unless they are passed as additional keyword arguments. For example, to map
-        "ASH" to "A", you can call this function as `struct2seq(path, ASH="A")`.
-        Similarly, you can map water molecules or ligands with
-        `struct2seq(path, HOH="o", LIG="l")`.
+    WARNING: non-standard residue names and non-polymer molecules are represented
+    as "X" by default, unless they are passed as additional keyword arguments.
+    For example, to map "ASH" to "A", you can call this function as
+    `struct2seq(path, ASH="A")`. Similarly, you can map water molecules or
+    ligands with `struct2seq(path, HOH="o", LIG="l")`.
 
     Args:
         path: Path to the PDB or mmCIF structure file. The file format is

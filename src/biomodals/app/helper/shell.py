@@ -232,7 +232,7 @@ def package_outputs(
         root_path = root_path.parent
 
     workdir = root_path.parent  # We want the tarball to contain a top-level dir
-    cmd = ["tar", "-I", f"zstd -T{num_threads}", "-O"]  # $ZSTD_NBTHREADS
+    cmd = ["tar", "-I", f"zstd -T{num_threads}", "-f", "-"]  # $ZSTD_NBTHREADS
     if tar_args is not None:
         cmd.extend(tar_args)
 
@@ -283,23 +283,39 @@ def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
             Both keys and values can be either strings or Path objects. The function
             will create any necessary parent directories for the destination paths.
     """
+    import shlex
+    import shutil
     import subprocess as sp
 
-    subprocesses = []
+    subprocesses: list[sp.Popen] = []
+    cp_binary = shutil.which("cp")
+    if cp_binary is None:
+        raise FileNotFoundError("The 'cp' command is not available on this system.")
     for src, dst in src_dst_mapping.items():
         src_path = Path(src)
         dst_path = Path(dst)
         if not src_path.exists():
             raise FileNotFoundError(f"Source file '{src_path}' does not exist.")
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocesses.append(sp.Popen(["cp", "-an", str(src_path), str(dst_path)]))  # noqa: S603, S607
-
-    for p in subprocesses:
-        p.wait()
-        if p.returncode != 0:
-            raise RuntimeError(
-                f"Copying '{src}' to '{dst}' failed with return code {p.returncode}."
+        subprocesses.append(
+            sp.Popen(  # noqa: S603
+                [cp_binary, "-an", str(src_path), str(dst_path)],
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
             )
+        )
+
+    err_msgs: list[str] = []
+    for p in subprocesses:
+        _, p_stderr = p.communicate()
+        if p.returncode != 0:
+            p_cmd = shlex.join(p.args)
+            p_err_msg = p_stderr.decode().strip()
+            err_msgs.append(
+                f"'{p_cmd}' failed with return code {p.returncode}: {p_err_msg}"
+            )
+    if err_msgs:
+        raise RuntimeError("\n".join(err_msgs))
 
 
 def softlink_dir(src: str | Path, dst: str | Path) -> None:

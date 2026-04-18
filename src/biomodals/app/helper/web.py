@@ -47,22 +47,28 @@ async def _download_files(
         for url, local_file in urls.items():
             local_path = Path(local_file)
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            if force or not local_path.exists():
-                tasks.append(_download_file(session, url, local_path))
+            tasks.append(_download_file(session, url, local_path, force))
 
         # run all of the downloads and await their completion
         await tqdm_asyncio.gather(*tasks, desc=progress_bar_desc)
 
 
-async def _download_file(session: niquests.AsyncSession, url: str, local_path: Path):
+async def _download_file(
+    session: niquests.AsyncSession, url: str, local_path: Path, force: bool
+):
     """Download a file asynchronously using aiohttp."""
     import aiofiles
 
     try:
         response = await session.get(url, stream=True)
         response.raise_for_status()
-        if not local_path.exists() or (
-            int(response.headers["content-length"]) != local_path.stat().st_size
+        if (
+            force
+            or (not local_path.exists())
+            or (
+                "content-length" in response.headers
+                and int(response.headers["content-length"]) != local_path.stat().st_size
+            )
         ):
             async with aiofiles.open(local_path, "wb") as f:
                 async for chunk in await response.iter_content():

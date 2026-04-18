@@ -62,7 +62,8 @@ def run_command(
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
 
-    print(f"Running command: {shlex.join(cmd)}")
+    if verbose:
+        print(f"Running command: {shlex.join(cmd)}")
     # Set default kwargs for sp.Popen
     kwargs.setdefault("stdout", sp.PIPE)
     kwargs.setdefault("stderr", sp.STDOUT)

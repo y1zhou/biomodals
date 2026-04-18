@@ -59,6 +59,27 @@ def app_path_to_module_path(app_path: Path) -> str:
     return f"biomodals.app.{module_path}"
 
 
+def _git_last_modified(app_path: Path) -> float:
+    """Get the last commit timestamp for a file using git log.
+
+    Returns the Unix timestamp of the last commit that touched the file,
+    or None if the file is not tracked by git or git is not available.
+    """
+    try:
+        output = run_command(
+            ["git", "log", "-1", "--format=%ct", "--", str(app_path)],
+            verbose=False,
+            cwd=Path.cwd(),
+        )
+        if output and output[0].strip():
+            return float(output[0].strip())
+    except Exception:  # noqa: S110
+        pass
+
+    # fallback to file mod time if git info is not available
+    return float(app_path.stat().st_mtime)
+
+
 def _docstring_to_markdown_table(f: Callable) -> list[str]:
     """Convert a function docstring with Args into a list of Markdown rows.
 
@@ -149,6 +170,13 @@ def list_available_apps(
             "--reverse", "-r", help="Reverse the sorting order in the table display."
         ),
     ] = False,
+    use_git_time: Annotated[
+        bool,
+        typer.Option(
+            "--git-time",
+            help="Use the last git commit time instead of file modification time for sorting.",
+        ),
+    ] = False,
     short: Annotated[
         bool,
         typer.Option(
@@ -167,9 +195,11 @@ def list_available_apps(
     table_rows: list[tuple[str, str, str, str]] = []
     for app_name, app_path in available_apps.items():
         app_category = app_path.parent.name
-        # TODO: consider using git commit history for updated time if available
-        updated_date = app_path.stat().st_mtime
-
+        updated_date = (
+            _git_last_modified(app_path)
+            if use_git_time
+            else float(app_path.stat().st_mtime)
+        )
         table_rows.append(
             (
                 f"[green]{app_name}[/green]",

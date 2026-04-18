@@ -5,10 +5,15 @@ description = "Run biomodelling tasks with Modal"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "aiofiles>=25.1.0",
     "modal>=1.2.1",
+    "niquests>=3.18.4",
+    "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
     "rich>=14.2.0",
+    "tqdm>=4.67.3",
     "typer>=0.20.0",
+    "uniaf3>=0.2.0",
 ]
 
 [project.scripts]
@@ -17,7 +22,3 @@ biomodals = "biomodals.cli:app"
 [build-system]
 requires = ["uv_build>=0.9,<0.10.0"]
 build-backend = "uv_build"
-
-[tool.uv.build-backend]
-module-name = "biomodals"
-module-root = ""

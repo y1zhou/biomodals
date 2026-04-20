@@ -102,7 +102,7 @@ def run_command_with_log(
     """Run a shell command and log output to a file."""
     import shlex
     import subprocess as sp
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     from time import time
 
     if isinstance(cmd, str):
@@ -135,7 +135,10 @@ def run_command_with_log(
                 print(buffered_output, end="", flush=True)
 
         f.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
-        f.write(f"Elapsed time: {time() - now:.2f} seconds\n")
+
+        elapsed_seconds = float(time() - now)
+        elapsed_time = timedelta(seconds=elapsed_seconds)
+        f.write(f"Elapsed time: {elapsed_time}\n")
 
         if p.returncode != 0:
             warnings.warn(

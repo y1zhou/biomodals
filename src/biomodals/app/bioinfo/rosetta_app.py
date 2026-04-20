@@ -89,6 +89,7 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
                 ["-s", str(mount_dir / pdb), "-out:path:all", str(workdir / task_idx)]
             )
             run_command_with_log(cmd, log_file=workdir / task_idx / "rosetta.log")
+            OUT_VOLUME.commit()
 
     # Run workers in parallel within the pod
     from concurrent.futures import ThreadPoolExecutor
@@ -107,7 +108,7 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
 )
 def package_outputs_helper(
     root: str | Path,
-    paths_to_bundle: Iterable[str | Path],
+    paths_to_bundle: Iterable[str | Path] | None = None,
     tar_args: list[str] | None = None,
     num_threads: int = 16,
 ) -> bytes:
@@ -259,7 +260,7 @@ def submit_rosetta_task(
             "pdb", "rosetta_script", and optionally "flags_file" that specify the
             *local* file paths to the respective files for each run. If there is
             a `rosetta_binary` column, the binary will be used; otherwise the
-            binary specied by the `rosetta_binary` argument will be used for all rows.
+            binary specified by `rosetta_binary` will be used for all rows.
             This argument takes precedence over the individual `input_*` arguments.
             This allows batch processing of multiple Rosetta runs with one input.
         out_dir: Optional output directory. If not provided, results will only

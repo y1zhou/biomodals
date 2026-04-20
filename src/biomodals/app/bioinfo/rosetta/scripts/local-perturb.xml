@@ -1,4 +1,4 @@
-<!-- <root xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="file:///nfs_beijing_pd/zhouyi/share/software/rosettascripts.xsd"/> -->
+<!-- Schema: https://www.rosettacommons.org/docs/latest/scripting_documentation/RosettaScripts/RosettaScripts -->
 <ROSETTASCRIPTS>
     <SCOREFXNS>
         <ScoreFunction name="sfxn" weights="ref2015" />

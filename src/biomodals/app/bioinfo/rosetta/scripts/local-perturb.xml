@@ -1,0 +1,33 @@
+<!-- Schema: https://www.rosettacommons.org/docs/latest/scripting_documentation/RosettaScripts/RosettaScripts -->
+<ROSETTASCRIPTS>
+    <SCOREFXNS>
+        <ScoreFunction name="sfxn" weights="ref2015" />
+    </SCOREFXNS>
+    <RESIDUE_SELECTORS>
+    </RESIDUE_SELECTORS>
+    <PACKER_PALETTES>
+    </PACKER_PALETTES>
+    <TASKOPERATIONS>
+    </TASKOPERATIONS>
+    <MOVE_MAP_FACTORIES>
+    </MOVE_MAP_FACTORIES>
+    <SIMPLE_METRICS>
+    </SIMPLE_METRICS>
+    <FILTERS>
+    </FILTERS>
+    <MOVERS>
+        <!-- Consider using MultipleOutputWrapper if it can be run in parallel -->
+        <!-- https://www.rosettacommons.org/docs/latest/scripting_documentation/RosettaScripts/Movers/movers_pages/RosettaScripts-MultiplePoseMover -->
+
+        <!-- See https://www.rosettacommons.org/docs/latest/application_documentation/docking/docking-protocol#standard-docking-options -->
+        <!-- <RigidBodyPerturbNoCenter name="rb" rot_mag="0.1" trans_mag="0.4" /> -->
+        <DockSetupMover name="dock_setup" partners="%%chain_partners%%" rb_mover="null" />
+        <DockingInitialPerturbation randomize1="false" randomize2="false" use_ellipsoidal_randomization="false" dock_pert="true" trans="%%translation_angstrom%%" rot="%%rotation_degree%%" uniform_trans="%%uniform_trans%%" spin="false" center_at_interface="false" slide="false" name="perturb" />
+
+    </MOVERS>
+    <PROTOCOLS>
+        <Add mover_name="dock_setup" />
+        <Add mover_name="perturb" />
+    </PROTOCOLS>
+    <OUTPUT scorefxn="sfxn" />
+</ROSETTASCRIPTS>

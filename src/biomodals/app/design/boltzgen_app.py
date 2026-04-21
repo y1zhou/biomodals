@@ -32,9 +32,9 @@ CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
     name="BoltzGen",
     repo_url="https://github.com/y1zhou/boltzgen",
-    repo_commit_hash="fd24c656257dc780882b91c0bbad61e13a15fc6b",
+    repo_commit_hash="09179d427ecce120c17b8336b9e50c091fab2147",
     package_name="boltzgen",
-    version="0.2.0",
+    version="0.3.1",
     python_version="3.12",
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "L40S"),
@@ -44,7 +44,6 @@ CONF = AppConfig(
 OUTPUTS_VOLUME = CONF.get_out_volume()
 OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
 OUTPUTS_DIR = CONF.output_volume_mountpoint
-MODEL_DIR = CONF.model_dir
 
 ##########################################
 # Image and app definitions
@@ -181,14 +180,14 @@ class YAMLReferenceLoader:
 ##########################################
 @app.function(
     volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    secrets=[modal.Secret.from_name("huggingface")],
     timeout=MAX_TIMEOUT,
-    image=runtime_image,
 )
 def boltzgen_download(force: bool = False) -> None:
     """Download BoltzGen models into the mounted volume."""
-    # Download all artifacts (~/.cache overridden to volume mount)
+    # Download all artifacts to $HF_HOME
     print("💊 Downloading boltzgen models...")
-    cmd = ["boltzgen", "download", "all", "--cache", str(MODEL_DIR)]
+    cmd = ["boltzgen", "download", "all"]
     if force:
         cmd.append("--force_download")
     run_command(cmd)
@@ -200,9 +199,7 @@ def boltzgen_download(force: bool = False) -> None:
 ##########################################
 # Inference functions
 ##########################################
-@app.function(
-    timeout=CONF.timeout, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME}, image=runtime_image
-)
+@app.function(timeout=CONF.timeout, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME})
 def prepare_boltzgen_run(
     yaml_content: bytes, run_name: str, additional_files: dict[str, bytes]
 ) -> None:
@@ -229,7 +226,6 @@ def prepare_boltzgen_run(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
-    image=runtime_image,
 )
 def collect_boltzgen_data(
     run_name: str,
@@ -337,7 +333,7 @@ def collect_boltzgen_data(
         OUTPUTS_DIR: OUTPUTS_VOLUME,
         CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
     },
-    image=runtime_image,
+    secrets=[modal.Secret.from_name("huggingface")],
 )
 def boltzgen_run(
     out_dir: str,
@@ -369,16 +365,10 @@ def boltzgen_run(
         "boltzgen",
         "run",
         str(input_yaml_path),
-        "--protocol",
-        protocol,
-        "--output",
-        str(out_dir),
-        "--num_designs",
-        str(num_designs),
-        "--budget",
-        str(budget),
-        "--cache",
-        str(MODEL_DIR),
+        f"--protocol={protocol}",
+        f"--output={out_dir}",
+        f"--num_designs={num_designs}",
+        f"--budget={budget}",
     ]
 
     if steps:
@@ -405,7 +395,6 @@ def boltzgen_run(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
-    image=runtime_image,
 )
 def combine_multiple_runs(run_name: str, run_ids: list[str]):
     """Combine outputs from multiple BoltzGen runs into a single table."""
@@ -481,7 +470,6 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
-    image=runtime_image,
 )
 def refilter_designs(
     run_name: str,

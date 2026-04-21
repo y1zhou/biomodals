@@ -332,3 +332,12 @@ def softlink_dir(src: str | Path, dst: str | Path) -> None:
     src_path.mkdir(parents=True, exist_ok=True)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     dst_path.symlink_to(src_path, target_is_directory=True)
+
+
+def sanitize_filename(filename: str, separator: str = "_") -> str:
+    """Sanitize a filename by replacing unsafe characters with a specified separator."""
+    import os
+
+    root_dir = Path(os.sep)
+    f = (root_dir / filename.strip()).resolve().relative_to(root_dir)
+    return separator.join(f.parts)

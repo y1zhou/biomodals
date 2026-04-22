@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import modal
+import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
@@ -77,12 +78,19 @@ def package_outputs_helper(
     num_threads: int = 16,
 ) -> bytes:
     """Modal runner to package directories into a tar.zst archive and return as bytes."""
+    warmup_directory(root)
     return package_outputs(
         root,
         paths_to_bundle=paths_to_bundle,
         tar_args=tar_args,
         num_threads=num_threads,
     )
+
+
+def _is_boltzgen_run_complete(run_dir: Path) -> bool:
+    """Return whether a BoltzGen run directory contains the final outputs."""
+    final_dir = run_dir / "final_ranked_designs"
+    return final_dir.exists() and (final_dir / "results_overview.pdf").exists()
 
 
 class YAMLReferenceLoader:
@@ -222,78 +230,92 @@ def prepare_boltzgen_run(
     OUTPUTS_VOLUME.commit()
 
 
+@app.function(timeout=CONF.timeout, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME})
+def get_run_ids(
+    run_name: str,
+    num_parallel_runs: int,
+    salvage_mode: bool = False,
+    focus_run_ids: str | None = None,
+    ignore_run_ids: str | None = None,
+) -> list[str]:
+    """Gather BoltzGen run IDs to collect data for."""
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    OUTPUTS_VOLUME.reload()
+    outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
+
+    if not salvage_mode:
+        today: str = datetime.now(UTC).strftime("%Y%m%d")
+        return [f"{today}-{uuid4().hex}" for _ in range(num_parallel_runs)]
+
+    if not outdir.exists():
+        raise RuntimeError(
+            f"💊 No existing run directories found for run name '{run_name}'."
+        )
+    all_run_dirs = [d for d in outdir.iterdir() if d.is_dir()]
+    if not all_run_dirs:
+        raise RuntimeError(
+            f"💊 No existing run directories found for run name '{run_name}'."
+        )
+    # run_dirs = [d for d in all_run_dirs if not _is_boltzgen_run_complete(d)]
+    run_ids = [d.name for d in all_run_dirs]
+    if focus_run_ids is not None:
+        focus_set = set(focus_run_ids.split(","))
+        run_ids = [d for d in run_ids if d in focus_set]
+    if ignore_run_ids is not None:
+        ignore_set = set(ignore_run_ids.split(","))
+        run_ids = [d for d in run_ids if d not in ignore_set]
+
+    return run_ids
+
+
 @app.function(
-    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    memory=(128, 65536),  # reserve 128MB, OOM at 64GB
     timeout=MAX_TIMEOUT,
     volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
 )
 def collect_boltzgen_data(
     run_name: str,
-    num_parallel_runs: int,
+    run_ids: list[str],
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
     budget: int = 10,
     steps: str | None = None,
     extra_args: str | None = None,
-    salvage_mode: bool = False,
-    focus_run_ids: str | None = None,
-    ignore_run_ids: str | None = None,
     filter_results: bool = True,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
-    from datetime import UTC, datetime
-    from uuid import uuid4
-
+    OUTPUTS_VOLUME.reload()
     outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
-    if salvage_mode:
-        all_run_dirs = [d for d in outdir.iterdir() if d.is_dir()]
-        if not all_run_dirs:
-            raise RuntimeError(
-                f"💊 No existing run directories found for run name '{run_name}'."
-            )
-        run_dirs = [
-            d
-            for d in all_run_dirs
-            if not (
-                (d_final_dir := (d / "final_ranked_designs")).exists()
-                and (d_final_dir / "results_overview.pdf").exists()
-            )
-        ]
-        run_ids = [d.name for d in all_run_dirs]
-        if focus_run_ids is not None:
-            focus_set = set(focus_run_ids.split(","))
-            run_dirs = [d for d in run_dirs if d.name in focus_set]
-            run_ids = [d for d in run_ids if d in focus_set]
-        if ignore_run_ids is not None:
-            ignore_set = set(ignore_run_ids.split(","))
-            run_dirs = [d for d in run_dirs if d.name not in ignore_set]
-            run_ids = [d for d in run_ids if d not in ignore_set]
+    config_dir = outdir.parent / "inputs" / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
 
-    else:
-        today: str = datetime.now(UTC).strftime("%Y%m%d")
-        run_dirs = [outdir / f"{today}-{uuid4().hex}" for _ in range(num_parallel_runs)]
-        run_ids = [d.name for d in run_dirs]
+    all_run_dirs = [outdir / x for x in run_ids]
+    run_dirs = [d for d in all_run_dirs if not _is_boltzgen_run_complete(d)]
 
     kwargs = {
-        "input_yaml_path": str(
-            outdir.parent / "inputs" / "config" / f"{run_name}.yaml"
-        ),
+        "input_yaml_path": str(config_dir / f"{run_name}.yaml"),
         "protocol": protocol,
         "num_designs": num_designs,
         "steps": steps,
         "extra_args": extra_args,
     }
-    cli_args_json_path = outdir.parent / "inputs" / "config" / "cli-args.json"
+    cli_args_json_path = config_dir / "cli-args.json"
     if not cli_args_json_path.exists():
-        import json
-
         # Save a copy of the CLI args for reference
-        with cli_args_json_path.open("w") as f:
-            json.dump(kwargs, f, indent=2)
+        with cli_args_json_path.open("wb") as f:
+            f.write(orjson.dumps(kwargs, option=orjson.OPT_INDENT_2))
 
     if run_dirs:
+        print(
+            f"💊 Launching or resuming {len(run_dirs)} incomplete BoltzGen runs "
+            f"out of {len(run_ids)} planned runs."
+        )
         for boltzgen_dir in boltzgen_run.map(run_dirs, kwargs=kwargs):
             print(f"💊 BoltzGen run completed: {boltzgen_dir}")
+    else:
+        print("💊 All planned BoltzGen runs are already complete; skipping relaunch.")
 
     OUTPUTS_VOLUME.reload()
     if filter_results:
@@ -333,7 +355,6 @@ def collect_boltzgen_data(
         OUTPUTS_DIR: OUTPUTS_VOLUME,
         CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
     },
-    secrets=[modal.Secret.from_name("huggingface")],
 )
 def boltzgen_run(
     out_dir: str,
@@ -634,6 +655,7 @@ def submit_boltzgen_task(
                 f"🧬 Including additional referenced files: {list(yml_parser.additional_files.keys())}"
             )
 
+        # TODO: use OUTPUTS_VOLUME.batch_upload to avoid spinning up container
         print(f"🧬 Submitting BoltzGen run for yaml: {input_yaml}")
         yaml_str = yaml_path.read_bytes()
 
@@ -645,20 +667,24 @@ def submit_boltzgen_task(
     else:
         print(f"🧬 Salvage mode enabled; skipping input preparation for {run_name}.")
 
-    print("🧬 Running BoltzGen...")
     budget = min(budget, num_designs)
-    outputs = collect_boltzgen_data.remote(
+    run_ids = get_run_ids.remote(
         run_name=run_name,
         num_parallel_runs=num_parallel_runs,
+        salvage_mode=salvage_mode,
+        focus_run_ids=focus_run_ids,
+        ignore_run_ids=ignore_run_ids,
+    )
+    print(f"🧬 Collecting BoltzGen data for runs {run_ids}")
+    outputs = collect_boltzgen_data.remote(
+        run_name=run_name,
+        run_ids=run_ids,
         protocol=protocol,
         num_designs=num_designs,
         budget=budget,
         steps=steps,
         extra_args=extra_args,
-        salvage_mode=salvage_mode,
-        focus_run_ids=focus_run_ids,
-        ignore_run_ids=ignore_run_ids,
-        filter_results=filter_results and out_dir is not None,
+        filter_results=filter_results and (out_dir is not None),
     )
     if out_dir is None:
         return
@@ -666,8 +692,14 @@ def submit_boltzgen_task(
     local_out_dir = Path(out_dir).expanduser().resolve()
     local_out_dir.mkdir(parents=True, exist_ok=True)
     if filter_results:
+        if not isinstance(outputs, bytes):
+            raise TypeError("Expected filtered BoltzGen outputs as a tarball.")
         (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
     else:
+        if not isinstance(outputs, list):
+            raise TypeError(
+                "Expected unfiltered BoltzGen outputs as a list of run IDs."
+            )
         (local_out_dir / "outputs").mkdir(exist_ok=True)
         for run_id in outputs:
             run_out_dir: Path = local_out_dir / "outputs" / run_id

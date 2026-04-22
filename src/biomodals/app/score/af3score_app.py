@@ -6,17 +6,6 @@
 - Inputs can be a single `.pdb` file or a directory of `.pdb` files.
 - The wrapper preserves AF3Score's internal length-based batching and schedules
   those internal batches in GPU waves when needed.
-
-## Outputs
-
-- Outputs are persisted in the Modal volume `af3score-outputs`, mounted at `/af3score-outputs`.
-- Each run writes to `/af3score-outputs/<output_dir_name>`.
-- Official AF3Score per-structure directories are written under
-  `/af3score-outputs/<output_dir_name>/outputs`.
-- Aggregate metrics are written to
-  `/af3score-outputs/<output_dir_name>/af3score_metrics.csv`.
-- A copy of the aggregate metrics CSV is also written to
-  `/af3score-outputs/<output_dir_name>/outputs/af3score_metrics.csv`.
 """
 
 # Ignore ruff warnings about import location
@@ -29,14 +18,19 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 
 import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import hash_string, patch_image_for_helper
-from biomodals.app.helper.shell import copy_files, run_command, sanitize_filename
+from biomodals.app.helper import patch_image_for_helper
+from biomodals.app.helper.shell import (
+    copy_files,
+    run_command,
+    run_command_with_log,
+    sanitize_filename,
+)
 
 ##########################################
 # Modal configs
@@ -57,17 +51,14 @@ CONF = AppConfig(
 class AppInfo:
     """Container for AF3Score-specific configuration and constants."""
 
-    stage_prefix: str = "af3score_inputs"
     af3_weights: str = "AlphaFold3/af3.bin"
-    supported_input_suffixes: frozenset[str] = frozenset({".pdb"})
+    out_volume: modal.Volume = CONF.get_out_volume()
 
-
-APP_INFO = AppInfo()
-OUTPUTS_VOLUME = CONF.get_out_volume()
 
 ##########################################
 # Image and app definitions
 ##########################################
+APP_INFO = AppInfo()
 runtime_image = patch_image_for_helper(
     modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install(
@@ -102,76 +93,94 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ##########################################
 # Helper functions
 ##########################################
-def _run_paths(output_dir_name: str) -> dict[str, Path]:
+def _get_af3_sanitized_name(name: str) -> str:
+    """Sanitize a name to be compatible with AF3Score's internal naming."""
+    import string
+
+    lower_spaceless_name = name.lower().replace(" ", "_")
+    allowed_chars = set(string.ascii_lowercase + string.digits + "_-.")
+    return "".join(c for c in lower_spaceless_name if c in allowed_chars)
+
+
+def _run_paths(run_name: str) -> dict[str, Path]:
     """Return the standard run-level paths for one AF3Score output directory."""
-    run_root = Path(CONF.output_volume_mountpoint) / output_dir_name
+    mount_path = Path(CONF.output_volume_mountpoint)
+    run_root = mount_path / run_name
     output_dir = run_root / "outputs"
     return {
+        "mount_root": mount_path,
         "run_root": run_root,
-        "lock_dir": run_root / ".run.lock",
-        "work_root": run_root / "work",
+        "inputs_dir": run_root / "inputs",
+        "prep_dir": run_root / "prepare",
         "output_dir": output_dir,
         "failed_dir": output_dir / "failed_records",
-        "metrics_input_dir": run_root / "metric_inputs",
         "metrics_csv": run_root / "af3score_metrics.csv",
     }
 
 
-def _sample_output_dir(output_dir: Path, input_name: str | Path) -> Path:
-    """Return the canonical AF3Score output directory for one input structure."""
-    # TODO: why is this hardcoded?
-    return output_dir / Path(input_name).stem.casefold() / "seed-10_sample-0"
-
-
-def _has_completed_outputs(output_dir: Path, input_name: str | Path) -> bool:
+def _has_completed_outputs(output_dir: Path, input_id: str) -> bool:
     """Check whether AF3Score wrote the required output JSON files."""
-    sample_dir = _sample_output_dir(output_dir, input_name)
+    sample_dir = output_dir / input_id / "seed-10_sample-0"
     return (sample_dir / "summary_confidences.json").exists() and (
         sample_dir / "confidences.json"
     ).exists()
 
 
-def _collect_input_files(input_root: Path) -> list[Path]:
+def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
     """Collect supported AF3Score input files from a file or directory."""
     if not input_root.exists():
         raise FileNotFoundError(f"Input path does not exist: {input_root}")
 
     if input_root.is_file():
-        all_files = (
-            [input_root]
-            if input_root.suffix.lower() in APP_INFO.supported_input_suffixes
-            else []
-        )
+        all_files = [input_root] if input_root.suffix == ".pdb" else []
     else:
-        all_files = [
-            path
-            for path in input_root.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in APP_INFO.supported_input_suffixes
-        ]
+        all_files = list(input_root.glob("*.pdb"))
 
     if not all_files:
-        raise ValueError(
-            "No supported structure files were found in the provided input path. "
-            f"Supported suffixes: {', '.join(sorted(APP_INFO.supported_input_suffixes))}"
-        )
+        raise ValueError(f"No .pdb files were found in '{input_root}'.")
 
-    unique: dict[str, Path] = {}
-    for structure_path in all_files:
-        stem_key = structure_path.stem.casefold()
-        if stem_key in unique and unique[stem_key] != structure_path:
-            raise ValueError(
-                "Duplicate input structure stems are not supported because output names "
-                "must stay stable across resume runs: "
-                f"{unique[stem_key]} and {structure_path}"
-            )
-        unique[stem_key] = structure_path
-    return sorted(unique.values(), key=lambda path: path.name.casefold())
+    symlinks: list[Path] = []
+    for f in all_files:
+        symlink_path = stage_dir / _get_af3_sanitized_name(f.name)
+        if symlink_path.exists():
+            raise ValueError(f"Duplicated sanitized file name: {symlink_path.name}")
+        symlink_path.symlink_to(f)
+        symlinks.append(symlink_path)
+    return symlinks
 
 
-def _local_metrics_filename(output_dir_name: str) -> str:
-    """Return the local metrics filename for one AF3Score run."""
-    return f"{output_dir_name.replace('/', '_')}_af3score_metrics.csv"
+def _adjust_num_cpu_gpu(
+    total_num_files: int, max_num_batches: int, max_num_workers: int
+) -> tuple[int, int]:
+    """Adjust the number of CPU workers and GPU batches based on the total number of files."""
+    max_num_batches = min(max(1, max_num_batches), total_num_files)
+    num_jobs_per_batch = max(
+        1, (total_num_files + max_num_batches - 1) // max_num_batches
+    )
+    adjusted_max_num_workers = min(max(1, max_num_workers), num_jobs_per_batch)
+    return adjusted_max_num_workers, max_num_batches
+
+
+@dataclass
+class ChunkSpec:
+    """Container for AF3Score batch chunk specifications."""
+
+    batch_name: str  # Unique name for the batch, e.g. "batch_0"
+    batch_json_dir: str  # Path to the batch's input JSON directory
+    batch_pdb_dir: str  # Path to the batch's input PDB directory
+
+
+@dataclass
+class TaskSpec:
+    """Container for AF3Score batch task specifications."""
+
+    total: int  # Total number of input files
+    pending: int  # Number of input files pending AF3Score processing
+    skipped: int  # Number of input files skipped due to existing outputs
+    input_files: list[str]  # List of all input file names (including suffix)
+    chunk_specs: list[ChunkSpec]  # List of batch chunk specifications
+    output_dir: str  # Path to the remote AF3Score output directory
+    failed_dir: str  # Path to the remote AF3Score failed records directory
 
 
 ##########################################
@@ -181,174 +190,153 @@ def _local_metrics_filename(output_dir_name: str) -> str:
     cpu=(0.125, 1.125),
     memory=(512, 2048),
     timeout=CONF.timeout,
-    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
+    volumes={CONF.output_volume_mountpoint: AppInfo.out_volume},
 )
-def af3score_manage_lock(output_dir_name: str, acquire: bool = True) -> None:
+def af3score_manage_lock(run_name: str, acquire: bool = True) -> None:
     """Internal-only remote helper for acquiring or releasing one run-level lock."""
     # TODO: replace with a task queue; mkdir in Volumes may not be atomic
-    OUTPUTS_VOLUME.reload()
-    paths = _run_paths(output_dir_name)
+    AppInfo.out_volume.reload()
+    paths = _run_paths(run_name)
+    root_dir = paths["run_root"]
+    lock_dir = root_dir / ".run.lock"
     if acquire:
-        paths["run_root"].mkdir(parents=True, exist_ok=True)
+        root_dir.mkdir(parents=True, exist_ok=True)
         try:
-            paths["lock_dir"].mkdir()
+            lock_dir.mkdir()
         except FileExistsError as exc:
             raise RuntimeError(
-                f"`output_dir_name={output_dir_name}` is already in use by another active AF3Score run."
+                f"`{run_name=}` is already in use by another active AF3Score run."
             ) from exc
-        OUTPUTS_VOLUME.commit()
+        AppInfo.out_volume.commit()
         return
 
-    if paths["lock_dir"].exists():
-        shutil.rmtree(paths["lock_dir"])
-        OUTPUTS_VOLUME.commit()
+    if lock_dir.exists():
+        lock_dir.rmdir()
+        AppInfo.out_volume.commit()
 
 
 @app.function(
     cpu=(1.125, 16.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
-    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
+    volumes={CONF.output_volume_mountpoint: AppInfo.out_volume},
 )
 def af3score_prepare(
-    staged_input_dir: str,
-    input_files: list[str],
-    output_dir_name: str,
-    num_jobs: int = 10,
-    prepare_workers: int = 8,
-) -> dict[str, object]:
-    """Internal-only remote step for preparing AF3Score batches from staged inputs."""
-    OUTPUTS_VOLUME.reload()
-    staged_dir = Path(staged_input_dir).resolve()
+    paths: dict[str, Path], input_files: list[str], num_jobs: int, prepare_workers: int
+) -> TaskSpec:
+    """Prepare AF3Score batches from staged inputs."""
+    AppInfo.out_volume.reload()
+    staged_dir = paths["inputs_dir"].resolve()
     if not staged_dir.exists():
         raise FileNotFoundError(f"Staged input directory not found: {staged_dir}")
 
-    paths = _run_paths(output_dir_name)
-    for path in (paths["work_root"], paths["output_dir"], paths["metrics_input_dir"]):
+    for path in (paths["output_dir"], paths["failed_dir"]):
         path.mkdir(parents=True, exist_ok=True)
-    paths["failed_dir"].mkdir(exist_ok=True)
 
-    all_files = [
-        staged_dir / input_name for input_name in sorted(input_files, key=str.casefold)
-    ]
+    all_files = [staged_dir / input_name for input_name in input_files]
     input_names = [path.name for path in all_files]
     total_files = len(all_files)
-    print(f"💊 [INFO] Total files: {total_files}", flush=True)
-    print(f"💊 [INFO] Output root: {paths['run_root']}", flush=True)
-
-    copy_files(
-        {
-            pdb: paths["metrics_input_dir"] / f"{pdb.stem.casefold()}.pdb"
-            for pdb in all_files
-        }
-    )
+    print(f"💊 [INFO] Total files: {total_files}")
+    print(f"💊 [INFO] Output root: {paths['run_root']}")
 
     pending_files: list[Path] = []
     skipped = 0
-    for pdb in all_files:
-        if _has_completed_outputs(paths["output_dir"], pdb.name):
-            print(f"💊 [SKIP] {pdb.name}", flush=True)
+    out_dir = paths["output_dir"]
+    for pdb_file in all_files:
+        if _has_completed_outputs(out_dir, pdb_file.stem):
+            # print(f"💊 [SKIP] {pdb_file.name}", flush=True)
             skipped += 1
             continue
-        print(f"💊 [BATCH] Pending: {pdb.name}", flush=True)
-        pending_files.append(pdb)
+        # print(f"💊 [BATCH] Pending: {pdb_file.name}", flush=True)
+        pending_files.append(pdb_file)
 
     if not pending_files:
-        return {
-            "total": total_files,
-            "pending": 0,
-            "skipped": skipped,
-            "input_files": input_names,
-            "chunk_specs": [],
-            "output_dir": str(paths["output_dir"]),
-            "failed_dir": str(paths["failed_dir"]),
-        }
+        return TaskSpec(
+            total=total_files,
+            pending=0,
+            skipped=skipped,
+            input_files=input_names,
+            chunk_specs=[],
+            output_dir=str(out_dir),
+            failed_dir=str(paths["failed_dir"]),
+        )
 
-    prepare_root = paths["work_root"] / "prepare"
+    prepare_root = paths["prep_dir"]
     pending_input_dir = prepare_root / "pending_inputs"
     batch_dir = prepare_root / "input_batch"
     if prepare_root.exists():
         shutil.rmtree(prepare_root)
-    prepare_root.mkdir(parents=True, exist_ok=True)
     pending_input_dir.mkdir(parents=True, exist_ok=True)
 
-    # TODO: Let AF3Score consume the canonicalized metric input directory directly.
     copy_files(
         {
-            paths["metrics_input_dir"] / f"{source_path.stem.casefold()}.pdb": (
-                pending_input_dir / f"{source_path.stem}.pdb"
-            )
+            source_path: pending_input_dir / source_path.name
             for source_path in pending_files
         }
     )
-
+    # Adjust CPU and GPU resources
+    n_cpu, n_batches = _adjust_num_cpu_gpu(
+        len(pending_files), num_jobs, prepare_workers
+    )
     run_command(
         [
             sys.executable,
             str(CONF.git_clone_dir / "01_prepare_get_json.py"),
-            "--input_dir",
-            str(pending_input_dir),
-            "--output_dir_cif",
-            str(prepare_root / "single_chain_cif"),
-            "--save_csv",
-            str(prepare_root / "single_seq.csv"),
-            "--output_dir_json",
-            str(prepare_root / "json"),
-            "--batch_dir",
-            str(batch_dir),
-            "--num_jobs",
-            str(max(1, num_jobs)),
-            "--num_workers",
-            str(max(1, prepare_workers)),
+            f"--input_dir={pending_input_dir}",
+            f"--output_dir_cif={prepare_root / 'single_chain_cif'}",
+            f"--save_csv={prepare_root / 'single_seq.csv'}",
+            f"--output_dir_json={prepare_root / 'json'}",
+            f"--batch_dir={batch_dir}",
+            f"--num_jobs={n_batches}",
+            f"--num_workers={n_cpu}",
         ]
     )
 
-    chunk_specs: list[dict[str, object]] = []
+    chunk_specs: list[ChunkSpec] = []
     batch_json_root = batch_dir / "json"
     if batch_json_root.exists():
-        for batch_json_dir in sorted(
-            path for path in batch_json_root.iterdir() if path.is_dir()
-        ):
+        for batch_json_dir in batch_json_root.iterdir():
+            if not batch_json_dir.is_dir():
+                continue
             chunk_specs.append(
-                {
-                    "batch_name": batch_json_dir.name,
-                    "batch_json_dir": str(batch_json_dir),
-                    "batch_pdb_dir": str((batch_dir / "pdb") / batch_json_dir.name),
-                }
+                ChunkSpec(
+                    batch_name=batch_json_dir.name,
+                    batch_json_dir=str(batch_json_dir),
+                    batch_pdb_dir=str(batch_dir / "pdb" / batch_json_dir.name),
+                )
             )
 
-    print(f"💊 [INFO] Prepared {len(chunk_specs)} internal batches", flush=True)
-    return {
-        "total": total_files,
-        "pending": len(pending_files),
-        "skipped": skipped,
-        "input_files": input_names,
-        "chunk_specs": chunk_specs,
-        "output_dir": str(paths["output_dir"]),
-        "failed_dir": str(paths["failed_dir"]),
-    }
+    print(f"💊 [INFO] Prepared {len(chunk_specs)} internal batches")
+    return TaskSpec(
+        total=total_files,
+        pending=len(pending_files),
+        skipped=skipped,
+        input_files=input_names,
+        chunk_specs=chunk_specs,
+        output_dir=str(paths["output_dir"]),
+        failed_dir=str(paths["failed_dir"]),
+    )
 
 
 @app.function(
     gpu=CONF.gpu,
-    cpu=(2.125, 16.125),
-    memory=(4096, 65536),
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
     timeout=CONF.timeout,
     volumes={
-        CONF.output_volume_mountpoint: OUTPUTS_VOLUME,
+        CONF.output_volume_mountpoint: AppInfo.out_volume,
         CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
     },
 )
 def af3score_run(
-    output_dir_name: str, batch_name: str, batch_json_dir: str, batch_pdb_dir: str
-) -> dict[str, str]:
-    """Internal-only remote step for running one AF3Score batch on one GPU."""
-    OUTPUTS_VOLUME.reload()
+    paths: dict[str, Path], batch_name: str, batch_json_dir: str, batch_pdb_dir: str
+):
+    """Run one AF3Score batch."""
+    AppInfo.out_volume.reload()
     af3_weights = Path(CONF.model_volume_mountpoint) / APP_INFO.af3_weights
     if not af3_weights.exists():
         raise FileNotFoundError(f"AlphaFold3 model weights not found: {af3_weights}")
 
-    paths = _run_paths(output_dir_name)
     with TemporaryDirectory(prefix=f"af3score_gpu_{batch_name}_") as temp_dir:
         batch_gpu_root = Path(temp_dir)
         batch_h5_dir = batch_gpu_root / "jax"
@@ -360,28 +348,23 @@ def af3score_run(
             [
                 sys.executable,
                 str(CONF.git_clone_dir / "02_prepare_pdb2jax.py"),
-                "--pdb_folder",
-                str(Path(batch_pdb_dir)),
-                "--output_folder",
-                str(batch_h5_dir),
-                "--num_workers",
-                str(jax_workers),
+                f"--pdb_folder={batch_pdb_dir}",
+                f"--output_folder={batch_h5_dir}",
+                f"--num_workers={jax_workers}",
             ]
         )
 
+        # TODO: this or reuse AlphaFold3 buckets?
         bucket = batch_name.rsplit("_", 1)[-1]
-        run_command(
+        out_dir = paths["output_dir"]
+        run_command_with_log(
             [
                 sys.executable,
                 str(CONF.git_clone_dir / "run_af3score.py"),
-                "--model_dir",
-                str(af3_weights.parent),
-                "--batch_json_dir",
-                str(Path(batch_json_dir)),
-                "--batch_h5_dir",
-                str(batch_h5_dir),
-                "--output_dir",
-                str(paths["output_dir"]),
+                f"--model_dir={af3_weights.parent}",
+                f"--batch_json_dir={batch_json_dir}",
+                f"--batch_h5_dir={batch_h5_dir}",
+                f"--output_dir={out_dir}",
                 "--run_data_pipeline=False",
                 "--run_inference=true",
                 "--init_guess=true",
@@ -394,120 +377,88 @@ def af3score_run(
                 "--write_ranking_scores_csv=false",
                 "--write_terms_of_use_file=false",
                 "--write_fold_input_json_file=false",
-            ]
+            ],
+            log_file=out_dir / f"{batch_name}.log",
         )
-
-    return {
-        "batch_name": batch_name,
-        "output_dir": str(paths["output_dir"]),
-    }
+        AppInfo.out_volume.commit()
 
 
 @app.function(
-    cpu=(1.125, 8.125),
+    cpu=(0.125, 16.125),
     memory=(1024, 16384),
     timeout=CONF.timeout,
-    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
+    volumes={CONF.output_volume_mountpoint: AppInfo.out_volume},
 )
 def af3score_postprocess(
-    input_files: list[str],
-    output_dir_name: str = "",
+    input_files: list[str], paths: dict[str, Path]
 ) -> dict[str, int | str]:
-    """Internal-only remote step for validation, failure records, and metrics generation."""
-    OUTPUTS_VOLUME.reload()
-    all_files = sorted(input_files, key=str.casefold)
-    paths = _run_paths(output_dir_name)
-    for path in (paths["output_dir"], paths["failed_dir"], paths["metrics_input_dir"]):
+    """Validate records and collect metrics for all inputs."""
+    AppInfo.out_volume.reload()
+    for path in (paths["output_dir"], paths["failed_dir"]):
         path.mkdir(parents=True, exist_ok=True)
 
     processed = 0
     failed = 0
     completed_output_dirs: list[Path] = []
-    for input_name in all_files:
-        stem = Path(input_name).stem
-        sample_dir = _sample_output_dir(paths["output_dir"], input_name)
-        if _has_completed_outputs(paths["output_dir"], input_name):
-            failed_record = paths["failed_dir"] / f"{stem}.err"
+    out_dir = paths["output_dir"]
+    for input_name in input_files:
+        input_id = Path(input_name).stem
+        failed_record = paths["failed_dir"] / f"{input_id}.err"
+        if _has_completed_outputs(out_dir, input_id):
             if failed_record.exists():
                 failed_record.unlink()
             processed += 1
-            completed_output_dirs.append(sample_dir.parent)
-            continue
-
-        (paths["failed_dir"] / f"{stem}.err").write_text(
-            f"Missing AF3 output files: {sample_dir}",
-            encoding="utf-8",
-        )
-        failed += 1
-
-    metrics_copy_path = paths["output_dir"] / "af3score_metrics.csv"
-    metrics_rows = 0
-    if completed_output_dirs:
-        with TemporaryDirectory(prefix="af3score_metrics_") as temp_dir:
-            temp_root = Path(temp_dir)
-            metrics_view_dir = temp_root / "metrics_view"
-            metrics_view_dir.mkdir(parents=True, exist_ok=True)
-            for candidate in completed_output_dirs:
-                (metrics_view_dir / candidate.name).symlink_to(
-                    candidate,
-                    target_is_directory=True,
-                )
-
-            temp_metrics_csv = temp_root / "af3score_metrics.csv"
-            run_command(
-                [
-                    sys.executable,
-                    str(CONF.git_clone_dir / "04_get_metrics.py"),
-                    "--input_pdb_dir",
-                    str(paths["metrics_input_dir"]),
-                    "--af3score_output_dir",
-                    str(metrics_view_dir),
-                    "--save_metric_csv",
-                    str(temp_metrics_csv),
-                    "--num_workers",
-                    str(max(1, min(16, os.cpu_count() or 4))),
-                ]
+            completed_output_dirs.append(out_dir / input_id)
+        else:
+            failed_record.write_text(
+                f"Missing AF3 output files for sample '{input_id}'"
             )
+            failed += 1
 
-            shutil.copy2(temp_metrics_csv, paths["metrics_csv"])
-            shutil.copy2(paths["metrics_csv"], metrics_copy_path)
+    out_csv_path = paths["metrics_csv"]
+    if not completed_output_dirs:
+        if out_csv_path.exists():
+            out_csv_path.unlink()
+        raise RuntimeError(
+            "No completed AF3Score outputs were found; cannot generate metrics CSV."
+        )
 
-        with paths["metrics_csv"].open(encoding="utf-8") as handle:
-            metrics_rows = max(0, sum(1 for _ in handle) - 1)
-    else:
-        for stale_path in (paths["metrics_csv"], metrics_copy_path):
-            if stale_path.exists():
-                stale_path.unlink()
+    with TemporaryDirectory(prefix="af3score_metrics_") as temp_dir:
+        temp_root = Path(temp_dir)
+        metrics_view_dir = temp_root / "metrics_view"
+        metrics_view_dir.mkdir()
+        for candidate in completed_output_dirs:
+            (metrics_view_dir / candidate.name).symlink_to(
+                candidate,
+                target_is_directory=True,
+            )
+        run_command(
+            [
+                sys.executable,
+                str(CONF.git_clone_dir / "04_get_metrics.py"),
+                f"--input_pdb_dir={paths['inputs_dir']}",
+                f"--af3score_output_dir={metrics_view_dir}",
+                f"--save_metric_csv={out_csv_path}",
+                f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",
+            ]
+        )
 
-    if paths["work_root"].exists():
-        shutil.rmtree(paths["work_root"])
-    OUTPUTS_VOLUME.commit()
+    with out_csv_path.open(encoding="utf-8") as f:
+        metrics_rows = max(0, sum(1 for _ in f) - 1)
+
+    if paths["prep_dir"].exists():
+        shutil.rmtree(paths["prep_dir"])
+    AppInfo.out_volume.commit()
     return {
-        "output_dir": str(paths["output_dir"]),
+        "output_dir": str(out_dir),
         "failed_dir": str(paths["failed_dir"]),
-        "total": len(all_files),
+        "total": len(input_files),
         "processed": processed,
         "failed": failed,
-        "metrics_csv_exists": int(paths["metrics_csv"].exists()),
-        "metrics_csv": str(paths["metrics_csv"]),
-        "metrics_csv_in_output_dir": str(metrics_copy_path),
+        "metrics_csv_exists": int(out_csv_path.exists()),
+        "metrics_csv": str(out_csv_path),
         "metrics_rows": metrics_rows,
     }
-
-
-@app.function(
-    cpu=(0.125, 1.125),
-    memory=(512, 4096),
-    timeout=CONF.timeout,
-    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
-)
-def af3score_fetch_metrics_csv(output_dir_name: str = "") -> bytes | None:
-    """Internal-only remote helper for reading the final AF3Score metrics CSV."""
-    OUTPUTS_VOLUME.reload()
-    metrics_csv = _run_paths(output_dir_name)["metrics_csv"]
-    if not metrics_csv.exists():
-        return None
-    return metrics_csv.read_bytes()
 
 
 ##########################################
@@ -516,145 +467,115 @@ def af3score_fetch_metrics_csv(output_dir_name: str = "") -> bytes | None:
 @app.local_entrypoint()
 def submit_af3score_task(
     input_dir: str,
-    output_dir_name: str,
-    output_dir: str,
-    num_jobs: int = 10,
+    run_name: str,
+    output_dir: str | None = None,
     prepare_workers: int = 8,
-    max_concurrent_gpus: int = 10,
+    max_batches: int = 10,
+    force: bool = True,
 ) -> None:
     """Stage local PDB inputs, run AF3Score on Modal, and download the final metrics CSV.
 
     Args:
         input_dir: Path to a single PDB file or a directory of PDB files. Note
             that only `.pdb` files are supported as structural inputs.
-        output_dir_name: Remote run directory name under the `af3score-outputs`
-            Modal volume root.
-        output_dir: Local directory where the final AF3Score metrics CSV will
-            be written.
-        num_jobs: Target number of internal batches for
-            `01_prepare_get_json.py`.
-        prepare_workers: Worker count for `01_prepare_get_json.py`.
-        max_concurrent_gpus: Maximum number of internal AF3Score batches to run
-            at the same time.
+        run_name: Remote run directory name under the Modal volume root.
+        output_dir: Local directory to save the final AF3Score metrics CSV. If
+            not specified, the current working directory will be used.
+        prepare_workers: Number of CPUs to use for processing input PDBs into
+            AlphaFold3-style input files (JSON and each chain as CIF template).
+        max_batches: Maximum number of batches (GPU tasks) to run at the same
+            time. AF3Score internally batches inputs of similar lengths
+            together in the `01_prepare_get_json.py` script, so we don't need
+            to batch manually when uploading inputs.
+        force: If True, ignore existing PDB files when uploading `input_dir`.
     """
-    output_dir_name = sanitize_filename(output_dir_name)
-    if max_concurrent_gpus < 1:
-        raise ValueError("`--max-concurrent-gpus` must be >= 1.")
-
     input_root = Path(input_dir).expanduser().resolve()
-    all_files = _collect_input_files(input_root)
+    stage_tmp_dir = Path(mkdtemp())
+    all_files = _collect_input_files(input_root, stage_tmp_dir)
+    num_files = len(all_files)
+    print(f"🧬 Total files: {num_files}")
 
-    print(f"🧬 Total files: {len(all_files)}")
-    af3score_manage_lock.remote(output_dir_name=output_dir_name, acquire=True)
+    # TODO: Deal with duplicate inputs. Locks? Distributed dicts?
+    run_name = sanitize_filename(run_name)
+    run_paths = _run_paths(run_name)
+    if not force:
+        for x in AppInfo.out_volume.iterdir("/"):
+            if x.path == run_name:
+                raise ValueError(
+                    f"Run name '{run_name}' already exists in Modal volume."
+                )
+    af3score_manage_lock.remote(run_name=run_name, acquire=True)
     try:
-        # TODO: Use a content-derived staging key if cross-machine reuse becomes important.
-        dataset_hash = hash_string(str(input_root))[:12]
-        stage_root = Path(APP_INFO.stage_prefix) / dataset_hash / "inputs"
-        remote_stage_root = CONF.output_volume_mountpoint / stage_root
-
-        with OUTPUTS_VOLUME.batch_upload(force=True) as batch:
-            print(f"🧬 Processing {len(all_files)} files", flush=True)
-            for pdb_path in all_files:
-                # TODO: use .put_dir
-                # TODO: split into batches based on max_concurrent_gpus
-                batch.put_file(pdb_path, f"/{stage_root / pdb_path.name}")
+        print(f"🧬 Uploading files in {input_root} to Modal")
+        stage_root = run_paths["inputs_dir"].relative_to(run_paths["mount_root"])
+        with AppInfo.out_volume.batch_upload(force=force) as batch:
+            if num_files == 1:
+                f = all_files[0]
+                batch.put_file(f, f"/{stage_root}/{f.name}")
+            else:
+                batch.put_directory(all_files[0].parent, f"/{stage_root}/")
 
         prepare_result = af3score_prepare.remote(
-            staged_input_dir=str(remote_stage_root),
+            paths=run_paths,
             input_files=[path.name for path in all_files],
-            output_dir_name=output_dir_name,
-            num_jobs=max(1, num_jobs),
-            prepare_workers=max(1, prepare_workers),
+            num_jobs=max_batches,
+            prepare_workers=prepare_workers,
         )
-        for key, value in prepare_result.items():
-            if key not in {"chunk_specs", "input_files"}:
-                print(f"🧬 [PREPARE] {key}: {value}", flush=True)
+        for k in ("total", "pending", "skipped"):
+            print(f"🧬 [PREPARE] {k}: {getattr(prepare_result, k)}")
 
-        chunk_specs = prepare_result.get("chunk_specs", [])
-        if not isinstance(chunk_specs, list):
-            raise RuntimeError(
-                "`af3score_prepare` returned an invalid chunk spec list."
-            )
-        if any(not isinstance(spec, dict) for spec in chunk_specs):
-            raise RuntimeError(
-                f"`af3score_prepare` returned an invalid chunk spec list: {chunk_specs}"
-            )
-        required_chunk_keys = {"batch_name", "batch_json_dir", "batch_pdb_dir"}
-        if any(not required_chunk_keys.issubset(spec) for spec in chunk_specs):
-            raise RuntimeError(
-                f"`af3score_prepare` returned incomplete chunk specs: {chunk_specs}"
-            )
-
+        chunk_specs = prepare_result.chunk_specs
         total_chunks = len(chunk_specs)
+
+        def _af3score_run(spec: ChunkSpec) -> None:
+            """Submit one AF3Score batch run as a remote function call."""
+            af3score_run.remote(
+                paths=run_paths,
+                batch_name=spec.batch_name,
+                batch_json_dir=spec.batch_json_dir,
+                batch_pdb_dir=spec.batch_pdb_dir,
+            )
+
         if total_chunks:
-            print(
-                "🧬 Running "
-                f"{total_chunks} internal batches with "
-                f"max_concurrent_gpus={max_concurrent_gpus}",
-                flush=True,
-            )
+            max_batches = min(max_batches, total_chunks)
+            print(f"🧬 Running {total_chunks} batches with a max of {max_batches} GPUs")
 
-        for wave_start in range(0, total_chunks, max_concurrent_gpus):
-            wave_specs = chunk_specs[wave_start : wave_start + max_concurrent_gpus]
-            wave_index = (wave_start // max_concurrent_gpus) + 1
-            total_waves = (
-                total_chunks + max_concurrent_gpus - 1
-            ) // max_concurrent_gpus
-            print(
-                "🧬 Launching wave "
-                f"{wave_index}/{total_waves} with {len(wave_specs)} internal batches",
-                flush=True,
-            )
-            batch_names: list[str] = []
-            function_calls: list[modal.FunctionCall] = []
-            for spec in wave_specs:
-                batch_name = str(spec["batch_name"])
-                function_call = af3score_run.spawn(
-                    output_dir_name=output_dir_name,
-                    batch_name=batch_name,
-                    batch_json_dir=str(spec["batch_json_dir"]),
-                    batch_pdb_dir=str(spec["batch_pdb_dir"]),
-                )
-                batch_names.append(batch_name)
-                function_calls.append(function_call)
+            from concurrent.futures import ThreadPoolExecutor
 
-            wave_results = modal.FunctionCall.gather(*function_calls)
-            for batch_name, result in zip(batch_names, wave_results, strict=True):
-                print(f"🧬 [RESULT] internal_batch={batch_name} {result}", flush=True)
-                print(f"🧬 [INFO] finished internal_batch={batch_name}", flush=True)
+            with ThreadPoolExecutor(max_workers=max_batches) as executor:
+                futures = [executor.submit(_af3score_run, spec) for spec in chunk_specs]
+                for future in futures:
+                    future.result()  # wait for all workers to finish
 
         postprocess_result = af3score_postprocess.remote(
-            input_files=list(prepare_result.get("input_files", [])),
-            output_dir_name=output_dir_name,
+            input_files=prepare_result.input_files,
+            paths=run_paths,
         )
         for key, value in postprocess_result.items():
             prefix = "[METRICS]" if str(key).startswith("metrics_") else "[POSTPROCESS]"
-            print(f"🧬 {prefix} {key}: {value}", flush=True)
+            print(f"🧬 {prefix} {key}: {value}")
 
         total_processed = postprocess_result.get("metrics_rows")
         if isinstance(total_processed, int):
-            print(f"🧬 [INFO] {total_processed}/{len(all_files)} done", flush=True)
+            print(f"🧬 [INFO] {total_processed}/{len(all_files)} done")
 
-        if bool(postprocess_result.get("metrics_csv_exists")):
-            local_base = Path(output_dir).expanduser().resolve()
-            local_base.mkdir(parents=True, exist_ok=True)
-            if not os.access(local_base, os.W_OK):
-                raise PermissionError(
-                    f"Local output path is not writable: {local_base}"
-                )
+        if postprocess_result["metrics_csv_exists"]:
+            if output_dir is None:
+                local_out_dir = Path.cwd()
+            else:
+                local_out_dir = Path(output_dir).expanduser().resolve()
+            local_out_dir.mkdir(parents=True, exist_ok=True)
 
-            metrics_csv_bytes = af3score_fetch_metrics_csv.remote(
-                output_dir_name=output_dir_name
-            )
-            if metrics_csv_bytes is None:
-                raise FileNotFoundError(
-                    "AF3Score reported a metrics CSV, but the file could not be read."
-                )
-
-            local_metrics_csv = local_base / _local_metrics_filename(output_dir_name)
-            local_metrics_csv.write_bytes(metrics_csv_bytes)
-            print(f"🧬 Local metrics CSV: {local_metrics_csv}", flush=True)
+            local_metrics_csv = local_out_dir / f"{run_name}_af3score_metrics.csv"
+            print("🧬 Downloading metrics CSV...")
+            with open(local_metrics_csv, "wb") as f:
+                for chunk in AppInfo.out_volume.read_file(
+                    str(run_paths["metrics_csv"].relative_to(run_paths["mount_root"]))
+                ):
+                    f.write(chunk)
+            print(f"🧬 Local metrics CSV: {local_metrics_csv}")
         else:
-            print("🧬 Local metrics CSV: not generated", flush=True)
+            print("🧬 Local metrics CSV: not generated")
     finally:
-        af3score_manage_lock.remote(output_dir_name=output_dir_name, acquire=False)
+        af3score_manage_lock.remote(run_name=run_name, acquire=False)
+        shutil.rmtree(stage_tmp_dir)

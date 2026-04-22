@@ -11,6 +11,18 @@ from pathlib import Path
 from biomodals.app.helper.internal import timed_function
 
 
+def _build_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Build environment variables for subprocesses."""
+    import os
+
+    default_env = os.environ | {"SYSTEMD_COLORS": "1"}
+    if env is None:
+        return default_env
+    new_env = default_env | env
+    # Remove keys with None values to avoid issues with subprocesses
+    return {k: v for k, v in new_env.items() if v is not None}
+
+
 def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
     """Run a shell command in the background without waiting for it to finish."""
     import shlex
@@ -21,6 +33,7 @@ def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
     print(f"Running background command: {shlex.join(cmd)}")
     kwargs.setdefault("stdout", sp.DEVNULL)
     kwargs.setdefault("stderr", sp.DEVNULL)
+    kwargs["env"] = _build_env(kwargs.get("env", None))
     return sp.Popen(cmd, **kwargs)  # noqa: S603
 
 
@@ -45,7 +58,6 @@ def run_command(
         A list of output lines from the command. Note that both STDOUT and STDERR
         are captured.
     """
-    import os
     import shlex
     import subprocess as sp
 
@@ -69,16 +81,7 @@ def run_command(
     kwargs.setdefault("stderr", sp.STDOUT)
     kwargs.setdefault("bufsize", 1)
     kwargs.setdefault("encoding", "utf-8")
-
-    default_env = os.environ | {"SYSTEMD_COLORS": "1"}
-    if "env" not in kwargs:
-        kwargs["env"] = default_env
-    else:
-        new_env = default_env | kwargs["env"]
-        kwargs["env"] = new_env.copy()
-        for k, v in new_env.items():
-            if v is None:
-                del kwargs["env"][k]
+    kwargs["env"] = _build_env(kwargs.get("env", None))
 
     all_outputs: list[str] = []
     with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
@@ -115,8 +118,10 @@ def run_command_with_log(
     kwargs.setdefault("stderr", sp.STDOUT)
     kwargs.setdefault("bufsize", 1)
     kwargs.setdefault("encoding", "utf-8")
+    kwargs["env"] = _build_env(kwargs.get("env", None))
 
-    log_path = Path(log_file)
+    log_path = Path(log_file).expanduser().resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     banner = "=" * 100
     now = time()
     with (
@@ -332,3 +337,12 @@ def softlink_dir(src: str | Path, dst: str | Path) -> None:
     src_path.mkdir(parents=True, exist_ok=True)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     dst_path.symlink_to(src_path, target_is_directory=True)
+
+
+def sanitize_filename(filename: str, separator: str = "_") -> str:
+    """Sanitize a filename by replacing unsafe characters with a specified separator."""
+    import os
+
+    root_dir = Path(os.sep)
+    f = (root_dir / filename.strip()).resolve().relative_to(root_dir)
+    return separator.join(f.parts)

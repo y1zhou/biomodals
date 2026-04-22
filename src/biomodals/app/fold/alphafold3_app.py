@@ -59,11 +59,9 @@ class AppInfo:
     """Container for AlphaFold3-specific information and configurations."""
 
     # Volume mount path for genetic search databases
-    msa_db_dir: str = "/AlphaFold3-msa-db"
+    msa_db_dir: str = f"/{CONF.name}-msa-db"
     # Volume mount path for MSA output cache
     msa_cache_dir: str = "/biomodals-msa-cache"
-    # Volume mount path for model checkpoints and JAX cache
-    model_dir: Path = CONF.model_dir
 
 
 ##########################################

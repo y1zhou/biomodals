@@ -158,7 +158,7 @@ def _adjust_num_cpu_gpu(
         1, (total_num_files + max_num_batches - 1) // max_num_batches
     )
     adjusted_max_num_workers = min(max(1, max_num_workers), num_jobs_per_batch)
-    return adjusted_max_num_workers, max_num_batches
+    return max_num_batches, adjusted_max_num_workers
 
 
 @dataclass
@@ -236,18 +236,15 @@ def af3score_prepare(
     all_files = [staged_dir / input_name for input_name in input_files]
     input_names = [path.name for path in all_files]
     total_files = len(all_files)
-    print(f"💊 [INFO] Total files: {total_files}")
-    print(f"💊 [INFO] Output root: {paths['run_root']}")
+    print(f"💊 [PREP] Processing {total_files} files in '{paths['run_root']}'")
 
     pending_files: list[Path] = []
     skipped = 0
     out_dir = paths["output_dir"]
     for pdb_file in all_files:
         if _has_completed_outputs(out_dir, pdb_file.stem):
-            # print(f"💊 [SKIP] {pdb_file.name}", flush=True)
             skipped += 1
             continue
-        # print(f"💊 [BATCH] Pending: {pdb_file.name}", flush=True)
         pending_files.append(pdb_file)
 
     if not pending_files:
@@ -275,7 +272,7 @@ def af3score_prepare(
         }
     )
     # Adjust CPU and GPU resources
-    n_cpu, n_batches = _adjust_num_cpu_gpu(
+    n_batches, n_cpu = _adjust_num_cpu_gpu(
         len(pending_files), num_jobs, prepare_workers
     )
     run_command(
@@ -306,7 +303,7 @@ def af3score_prepare(
                 )
             )
 
-    print(f"💊 [INFO] Prepared {len(chunk_specs)} internal batches")
+    print(f"💊 [PREP] Inputs split into {len(chunk_specs)} batches")
     return TaskSpec(
         total=total_files,
         pending=len(pending_files),
@@ -344,6 +341,7 @@ def af3score_run(
 
         # TODO: Benchmark whether AF3Score's JAX preprocessing can safely scale past one worker.
         jax_workers = 1
+        print(f"💊 [RUN] Converting PDB to JAX arrays for batch '{batch_name}'")
         run_command(
             [
                 sys.executable,
@@ -357,6 +355,7 @@ def af3score_run(
         # TODO: this or reuse AlphaFold3 buckets?
         bucket = batch_name.rsplit("_", 1)[-1]
         out_dir = paths["output_dir"]
+        print(f"💊 [RUN] Starting AF3Score batch '{batch_name}'")
         run_command_with_log(
             [
                 sys.executable,
@@ -493,9 +492,8 @@ def submit_af3score_task(
     stage_tmp_dir = Path(mkdtemp())
     all_files = _collect_input_files(input_root, stage_tmp_dir)
     num_files = len(all_files)
-    print(f"🧬 Total files: {num_files}")
+    print(f"🧬 Total files: {num_files} found in '{input_root}'")
 
-    # TODO: Deal with duplicate inputs. Locks? Distributed dicts?
     run_name = sanitize_filename(run_name)
     run_paths = _run_paths(run_name)
     if not force:
@@ -506,7 +504,7 @@ def submit_af3score_task(
                 )
     af3score_manage_lock.remote(run_name=run_name, acquire=True)
     try:
-        print(f"🧬 Uploading files in {input_root} to Modal")
+        print(f"🧬 Uploading '{input_root}' to Modal")
         stage_root = run_paths["inputs_dir"].relative_to(run_paths["mount_root"])
         with AppInfo.out_volume.batch_upload(force=force) as batch:
             if num_files == 1:
@@ -521,8 +519,10 @@ def submit_af3score_task(
             num_jobs=max_batches,
             prepare_workers=prepare_workers,
         )
-        for k in ("total", "pending", "skipped"):
-            print(f"🧬 [PREPARE] {k}: {getattr(prepare_result, k)}")
+        print(
+            f"🧬 Processed inputs: {prepare_result.skipped} skipped, "
+            f"{prepare_result.pending} pending, {prepare_result.total} total"
+        )
 
         chunk_specs = prepare_result.chunk_specs
         total_chunks = len(chunk_specs)
@@ -556,8 +556,7 @@ def submit_af3score_task(
             print(f"🧬 {prefix} {key}: {value}")
 
         total_processed = postprocess_result.get("metrics_rows")
-        if isinstance(total_processed, int):
-            print(f"🧬 [INFO] {total_processed}/{len(all_files)} done")
+        print(f"🧬 {total_processed}/{len(all_files)} postprocessed")
 
         if postprocess_result["metrics_csv_exists"]:
             if output_dir is None:
@@ -575,7 +574,7 @@ def submit_af3score_task(
                     f.write(chunk)
             print(f"🧬 Local metrics CSV: {local_metrics_csv}")
         else:
-            print("🧬 Local metrics CSV: not generated")
+            print("🧬 Metrics CSV not generated!")
     finally:
         af3score_manage_lock.remote(run_name=run_name, acquire=False)
         shutil.rmtree(stage_tmp_dir)

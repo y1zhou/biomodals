@@ -20,7 +20,7 @@ repos:
 
   # python code formatting
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: "v0.14.0"
+    rev: "v0.15.9"
     hooks:
       - id: ruff-check
         args:
@@ -64,7 +64,7 @@ repos:
 
   # jupyter notebook cell output clearing
   - repo: https://github.com/kynan/nbstripout
-    rev: 0.8.1
+    rev: 0.9.1
     hooks:
       - id: nbstripout
-        args: ["--drop-empty-cells", "--keep-output"]
+        args: ["--drop-empty-cells", "--keep-output", "--unix-newline"]

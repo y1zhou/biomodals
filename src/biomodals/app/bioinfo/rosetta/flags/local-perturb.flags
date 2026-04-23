@@ -1,0 +1,10 @@
+-ignore_zero_occupancy false
+
+-nstruct 100
+-out:file:scorefile_format json
+-out:file:scorefile local_perturb.jsonl
+
+-parser:script_vars chain_partners=BC_A
+-parser:script_vars translation_angstrom=1
+-parser:script_vars rotation_degree=8
+-parser:script_vars uniform_trans=1.0

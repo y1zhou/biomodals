@@ -11,7 +11,7 @@ import modal
 from pydantic import BaseModel, computed_field, model_validator
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.app.helper import patch_image_for_helper
 from biomodals.app.helper.shell import run_command_with_log, sanitize_filename
 
@@ -174,22 +174,26 @@ class PPIFlowArgs(BaseModel):
 @app.function(volumes={CONF.model_volume_mountpoint: MODEL_VOLUME}, timeout=MAX_TIMEOUT)
 def fetch_model_weights(force: bool = False) -> None:
     """Download PPIFlow models into the mounted volume."""
-    from biomodals.app.helper.web import download_files
-
     model_dir = CONF.model_dir
     base_url = "https://drive.google.com/uc?export=download&confirm=t&id="
-    download_files(
-        {
-            f"{base_url}1WBSjCTEtia9S1hJ54mYH1PZdDqpLVsgw": model_dir / "antibody.ckpt",
-            f"{base_url}1PbpoC7VdkCpoNlxduDhnQ3RuLyWwAuOT": model_dir / "binder.ckpt",
-            f"{base_url}1Oo9nbSH3MwT8KIriij5clmnTFrhDJEn5": model_dir / "monomer.ckpt",
-            f"{base_url}1aEwzmdlSN9tiIOl5TgM_muHjfFPLue8a": model_dir / "nanobody.ckpt",
-        },
-        force=force,
-        progress_bar_desc="Downloading models...",
+    tasks = {
+        f"{base_url}1WBSjCTEtia9S1hJ54mYH1PZdDqpLVsgw": model_dir / "antibody.ckpt",
+        f"{base_url}1PbpoC7VdkCpoNlxduDhnQ3RuLyWwAuOT": model_dir / "binder.ckpt",
+        f"{base_url}1Oo9nbSH3MwT8KIriij5clmnTFrhDJEn5": model_dir / "monomer.ckpt",
+        f"{base_url}1aEwzmdlSN9tiIOl5TgM_muHjfFPLue8a": model_dir / "nanobody.ckpt",
+    }
+    raise RuntimeError(
+        "This doesn't work because Google Drive requires confirmation for "
+        "large file downloads. Please manually download the model weights and "
+        f"place them in Volume {MODEL_VOLUME.name or MODEL_VOLUME_NAME}:\n"
+        + "\n".join(
+            f"  - {url} -> {path.relative_to(CONF.model_volume_mountpoint)}"
+            for url, path in tasks.items()
+        )
     )
-    MODEL_VOLUME.commit()
-    print(f"💊 {CONF.name} model download complete")
+    # download_files(tasks, force=force, progress_bar_desc="Downloading models...")
+    # MODEL_VOLUME.commit()
+    # print(f"💊 {CONF.name} model download complete")
 
 
 ##########################################

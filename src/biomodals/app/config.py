@@ -64,7 +64,7 @@ class AppConfig(BaseModel):
     @cached_property
     def model_dir(self) -> Path:
         """Directory to store model weights."""
-        return Path(self.model_volume_mountpoint).resolve() / self.name
+        return Path(self.model_volume_mountpoint) / self.name
 
     @computed_field
     @cached_property

@@ -145,11 +145,11 @@ Expected checkpoint layout (one-time upload examples):
   modal volume put ppiflow-models monomer.ckpt /monomer.ckpt
   modal volume put ppiflow-models nanobody.ckpt /nanobody.ckpt  2) proteinmpnn
   2) Upload ProteinMPNN weights to persistent Volume (one-time)
-  modal volume put ppiflow-models v_48_002.pt /proteinmpnn_v_48_002.pt 
-  modal volume put ppiflow-models v_48_010.pt /proteinmpnn_v_48_010.pt 
-  modal volume put ppiflow-models v_48_020.pt /proteinmpnn_v_48_020.pt 
+  modal volume put ppiflow-models v_48_002.pt /proteinmpnn_v_48_002.pt
+  modal volume put ppiflow-models v_48_010.pt /proteinmpnn_v_48_010.pt
+  modal volume put ppiflow-models v_48_020.pt /proteinmpnn_v_48_020.pt
   3) abmpnn weights
-  modal volume put ppiflow-models abmpnn.pt /abmpnn.pt 
+  modal volume put ppiflow-models abmpnn.pt /abmpnn.pt
 
 ## Outputs
 
@@ -238,12 +238,15 @@ Expected checkpoint layout (one-time upload examples):
 
 """
 
+# TODO: reuse *_app modules for constructing the workflow
+
 from __future__ import annotations
 
 import csv
 import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 from collections.abc import Iterable
@@ -270,7 +273,9 @@ RUNS_DIR = Path("/ppiflow-runs")
 # -------------------------
 # Image definition
 # -------------------------
-PPIFLOW_REPO = "https://github.com/zhuqianhui2-hash/PPIFlow.git"  # updated at 2026-02-10-18:00
+PPIFLOW_REPO = (
+    "https://github.com/zhuqianhui2-hash/PPIFlow.git"  # updated at 2026-02-10-18:00
+)
 PPIFLOW_DIR = "/ppiflow"
 
 PYTORCH_CU121_INDEX = "https://download.pytorch.org/whl/cu121"
@@ -354,7 +359,9 @@ runtime_image = (
         "liblzma-dev",
     )
     .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": PPIFLOW_DIR})
-    .run_commands(f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}")
+    .run_commands(
+        f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}"
+    )
     .pip_install(*TORCH_PKGS, extra_index_url=PYTORCH_CU121_INDEX)
     .uv_pip_install(*PYG_PKGS, find_links=PYG_WHL)
     .uv_pip_install(*INFER_PKGS)
@@ -377,6 +384,7 @@ TASK_TO_SCRIPT: dict[str, str] = {
 }
 
 MPNN_TASKS = {"mpnn_stage1", "mpnn_stage2"}
+
 
 # -------------------------
 # Helpers
@@ -420,8 +428,8 @@ def _collect_artifacts(run_dir: Path) -> None:
 
 
 def _script_help_text(script: Path) -> str:
-    p = subprocess.run(
-        ["python", str(script), "--help"],
+    p = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--help"],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
@@ -430,14 +438,16 @@ def _script_help_text(script: Path) -> str:
     return p.stdout or ""
 
 
-def _script_supports_flag(script: Path, flag: str, help_text: str | None = None) -> bool:
+def _script_supports_flag(
+    script: Path, flag: str, help_text: str | None = None
+) -> bool:
     txt = help_text if help_text is not None else _script_help_text(script)
     return flag in txt
 
 
 def _find_abmpnn_run_script() -> Path:
-    """
-    Find ABMPNN/ProteinMPNN runnable script under /ppiflow/ProteinMPNN.
+    """Find ABMPNN/ProteinMPNN runnable script under /ppiflow/ProteinMPNN.
+
     We try common names, then fallback to a glob search.
     """
     base = Path(PPIFLOW_DIR) / "ProteinMPNN"
@@ -495,8 +505,7 @@ def _expand_position_token(token: str) -> list[int]:
 
 
 def _normalize_fixed_positions_csv_bytes(raw_csv: bytes) -> bytes:
-    """
-    Accept user-friendly fixed-position syntax and convert to ProteinMPNN style.
+    """Accept user-friendly fixed-position syntax and convert to ProteinMPNN style.
 
     Supported input for the second column (e.g. motif_index / fixed_positions):
     - "1 2 3 10 11"
@@ -568,14 +577,17 @@ def _chain_order_from_pdb(pdb_path: Path) -> list[str]:
 def _rewrite_fixed_positions_for_proteinmpnn(
     csv_path: Path, pdb_folder: Path, chain_list: str
 ) -> None:
-    """
+    """Generate fixed-position CSV for ProteinMPNN.
+
     Convert normalized CSV (single position list per pdb) into upstream legacy format
     expected by ProteinMPNN helper script:
       second column uses '-' to separate per-chain residue lists in pdb chain order.
     """
     designed_chains = [c for c in chain_list.split() if c]
     if not designed_chains:
-        raise ValueError("--mpnn-chain-list is required when --mpnn-position-list is provided")
+        raise ValueError(
+            "--mpnn-chain-list is required when --mpnn-position-list is provided"
+        )
     if len(designed_chains) != 1:
         raise ValueError(
             "Current fixed-position CSV format supports one designed chain. "
@@ -600,12 +612,16 @@ def _rewrite_fixed_positions_for_proteinmpnn(
 
         pdb_file = pdb_folder / f"{pdb_name}.pdb"
         if not pdb_file.exists():
-            raise FileNotFoundError(f"PDB not found for fixed positions row: {pdb_file}")
+            raise FileNotFoundError(
+                f"PDB not found for fixed positions row: {pdb_file}"
+            )
         chains = _chain_order_from_pdb(pdb_file)
         if not chains:
             raise ValueError(f"Could not detect chain order from: {pdb_file}")
         if target_chain not in chains:
-            raise ValueError(f"Chain {target_chain!r} not found in {pdb_file.name}; chains={chains}")
+            raise ValueError(
+                f"Chain {target_chain!r} not found in {pdb_file.name}; chains={chains}"
+            )
 
         segments: list[str] = []
         for ch in chains:
@@ -620,8 +636,8 @@ def _rewrite_fixed_positions_for_proteinmpnn(
 
 
 def _write_empty_fixed_positions_csv(csv_path: Path, pdb_folder: Path) -> None:
-    """
-    Write a no-op fixed-positions CSV for upstream protein_mpnn_run.py compatibility.
+    """Write a no-op fixed-positions CSV for upstream protein_mpnn_run.py compatibility.
+
     This avoids its UnboundLocalError when --position_list is omitted.
     """
     rows: list[dict[str, str]] = []
@@ -647,27 +663,42 @@ def _collect_pdbs_for_mpnn(src_outputs: Path) -> list[Path]:
 def _gather_mpnn_fastas(mpnn_out_root: Path) -> list[Path]:
     # accept .fa / .fasta / .faa etc. under seqs/
     hits: list[Path] = []
-    for pat in ("seqs/*.fa", "seqs/*.fasta", "seqs/*.faa", "seqs/*.fa.gz", "seqs/*.fasta.gz"):
+    for pat in (
+        "seqs/*.fa",
+        "seqs/*.fasta",
+        "seqs/*.faa",
+        "seqs/*.fa.gz",
+        "seqs/*.fasta.gz",
+    ):
         hits.extend(mpnn_out_root.rglob(pat))
     return sorted(set(hits))
+
 
 def _detect_abmpnn_cli_flags(mpnn_script: Path) -> dict[str, str]:
     ht = _script_help_text(mpnn_script)
 
     # folder input (this is required for ProteinMPNN/protein_mpnn_run.py)
-    folder_flag = "--folder_with_pdbs_path" if _script_supports_flag(mpnn_script, "--folder_with_pdbs_path", ht) else ""
+    folder_flag = (
+        "--folder_with_pdbs_path"
+        if _script_supports_flag(mpnn_script, "--folder_with_pdbs_path", ht)
+        else ""
+    )
     if not folder_flag and _script_supports_flag(mpnn_script, "--pdb_dir", ht):
         folder_flag = "--pdb_dir"
     if not folder_flag and _script_supports_flag(mpnn_script, "--input_folder", ht):
         folder_flag = "--input_folder"
 
     # single pdb input (optional, many scripts do NOT support it)
-    pdb_flag = "--pdb_path" if _script_supports_flag(mpnn_script, "--pdb_path", ht) else ""
+    pdb_flag = (
+        "--pdb_path" if _script_supports_flag(mpnn_script, "--pdb_path", ht) else ""
+    )
     if not pdb_flag and _script_supports_flag(mpnn_script, "--input_pdb", ht):
         pdb_flag = "--input_pdb"
 
     # out dir
-    out_flag = "--out_folder" if _script_supports_flag(mpnn_script, "--out_folder", ht) else ""
+    out_flag = (
+        "--out_folder" if _script_supports_flag(mpnn_script, "--out_folder", ht) else ""
+    )
     if not out_flag and _script_supports_flag(mpnn_script, "--output_dir", ht):
         out_flag = "--output_dir"
     if not out_flag and _script_supports_flag(mpnn_script, "--out_dir", ht):
@@ -689,16 +720,32 @@ def _detect_abmpnn_cli_flags(mpnn_script: Path) -> dict[str, str]:
             break
 
     # ProteinMPNN classic interface (dir + model_name)
-    weights_dir_flag = "--path_to_model_weights" if _script_supports_flag(mpnn_script, "--path_to_model_weights", ht) else ""
-    model_name_flag = "--model_name" if _script_supports_flag(mpnn_script, "--model_name", ht) else ""
+    weights_dir_flag = (
+        "--path_to_model_weights"
+        if _script_supports_flag(mpnn_script, "--path_to_model_weights", ht)
+        else ""
+    )
+    model_name_flag = (
+        "--model_name" if _script_supports_flag(mpnn_script, "--model_name", ht) else ""
+    )
 
-    nseq_flag = "--num_seq_per_target" if _script_supports_flag(mpnn_script, "--num_seq_per_target", ht) else ""
+    nseq_flag = (
+        "--num_seq_per_target"
+        if _script_supports_flag(mpnn_script, "--num_seq_per_target", ht)
+        else ""
+    )
     if not nseq_flag and _script_supports_flag(mpnn_script, "--num_seqs", ht):
         nseq_flag = "--num_seqs"
 
-    temp_flag = "--sampling_temp" if _script_supports_flag(mpnn_script, "--sampling_temp", ht) else ""
+    temp_flag = (
+        "--sampling_temp"
+        if _script_supports_flag(mpnn_script, "--sampling_temp", ht)
+        else ""
+    )
     seed_flag = "--seed" if _script_supports_flag(mpnn_script, "--seed", ht) else ""
-    batch_flag = "--batch_size" if _script_supports_flag(mpnn_script, "--batch_size", ht) else ""
+    batch_flag = (
+        "--batch_size" if _script_supports_flag(mpnn_script, "--batch_size", ht) else ""
+    )
 
     if not out_flag:
         raise RuntimeError(
@@ -745,8 +792,7 @@ def _run_abmpnn_on_folder(
     use_soluble_model: bool,
     log_path: Path,
 ) -> None:
-    """
-    Run ProteinMPNN / ABMPNN script in folder mode.
+    """Run ProteinMPNN / ABMPNN script in folder mode.
 
     This is intentionally "no patch mode": execute upstream script as-is.
     """
@@ -780,7 +826,9 @@ def _run_abmpnn_on_folder(
     ckpt_flag = flags.get("ckpt_flag") or ""
     if ckpt_flag:
         if ckpt_path is None:
-            raise ValueError(f"MPNN script expects {ckpt_flag}, but no checkpoint path was resolved.")
+            raise ValueError(
+                f"MPNN script expects {ckpt_flag}, but no checkpoint path was resolved."
+            )
         argv += [ckpt_flag, str(ckpt_path)]
     else:
         weights_dir_flag = flags.get("weights_dir_flag") or ""
@@ -811,17 +859,17 @@ def _run_abmpnn_on_folder(
         # --- auto-detect CA-only checkpoint and toggle --ca_only ---
         try:
             import torch
+
             ckpt = torch.load(str(expected_pt), map_location="cpu")
             sd = ckpt.get("model_state_dict", ckpt)
             w = sd.get("features.edge_embedding.weight", None)
             if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
                 if int(w.shape[1]) == 167:
                     argv += ["--ca_only"]
-        except Exception:
-            pass
-
-
-
+        except Exception as e:
+            print(
+                f"Warning: failed to auto-detect CA-only checkpoint for {expected_pt}: {e}"
+            )
 
     nseq_flag = flags.get("nseq_flag") or ""
     temp_flag = flags.get("temp_flag") or ""
@@ -846,11 +894,10 @@ def _run_abmpnn_on_folder(
     if use_soluble_model:
         argv += ["--use_soluble_model"]
 
-
     # -------------------------
     # Step 3: run with cwd = original ProteinMPNN dir to satisfy relative imports
     # -------------------------
-    p = subprocess.run(
+    p = subprocess.run(  # noqa: S603
         argv,
         check=False,
         text=True,
@@ -873,12 +920,9 @@ def _run_abmpnn_on_folder(
     log_path.write_text("\n".join(dbg))
 
     if p.returncode != 0:
-        raise RuntimeError(f"ABMPNN/ProteinMPNN failed (exit {p.returncode}). See {log_path}")
-
-
-
-
-
+        raise RuntimeError(
+            f"ABMPNN/ProteinMPNN failed (exit {p.returncode}). See {log_path}"
+        )
 
 
 def _stage_pdb_folder(pdbs: list[Path], dst_dir: Path) -> None:
@@ -954,12 +998,15 @@ def run_ppiflow_structured(
     mpnn_omit_aas: str | None,
     mpnn_use_soluble_model: bool,
 ) -> bytes:
+    """Unified runner for PPIFlow structured sampling tasks."""
     # -------------------------
     # Branch 1: MPNN tasks (operate on existing run dir)
     # -------------------------
     if task in MPNN_TASKS:
         if not mpnn_source_task or not mpnn_source_run:
-            raise ValueError("mpnn_stage1/2 requires --mpnn-source-task and --mpnn-source-run")
+            raise ValueError(
+                "mpnn_stage1/2 requires --mpnn-source-task and --mpnn-source-run"
+            )
 
         src_run_dir = RUNS_DIR / mpnn_source_task / mpnn_source_run
         src_outputs = src_run_dir / "outputs"
@@ -975,7 +1022,9 @@ def run_ppiflow_structured(
         ckpt_path: Path | None = None
         if flags.get("ckpt_flag"):
             ckpt_path = _resolve_abmpnn_ckpt(mpnn_ckpt_path)
-        (src_run_dir / f"{task}.mpnn_help.txt").write_text(_script_help_text(mpnn_script))
+        (src_run_dir / f"{task}.mpnn_help.txt").write_text(
+            _script_help_text(mpnn_script)
+        )
 
         mpnn_dir = src_run_dir / task
         mpnn_out = mpnn_dir / "out"
@@ -1005,7 +1054,9 @@ def run_ppiflow_structured(
             if Path(fname).name == "mpnn_fixed_positions.csv":
                 position_list_csv = dst
         if position_list_csv and not mpnn_chain_list:
-            raise ValueError(f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided")
+            raise ValueError(
+                f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided"
+            )
         if position_list_csv:
             _rewrite_fixed_positions_for_proteinmpnn(
                 csv_path=position_list_csv,
@@ -1019,26 +1070,28 @@ def run_ppiflow_structured(
 
         log_path = mpnn_dir / "mpnn_folder.log"
         _run_abmpnn_on_folder(
-         mpnn_script=mpnn_script,
-        flags=flags,
-        pdb_folder=pdb_folder,
-        out_folder=mpnn_out,
-        ckpt_path=ckpt_path,
-        num_seqs=num_seq,
-        sampling_temp=temp,
-        seed=int(mpnn_seed),
-        batch_size=int(mpnn_batch_size),
-        model_name=mpnn_model_name,
-        chain_list=mpnn_chain_list,
-        position_list_csv=position_list_csv,
-        omit_aas=mpnn_omit_aas,
-        use_soluble_model=mpnn_use_soluble_model,
-        log_path=log_path,
+            mpnn_script=mpnn_script,
+            flags=flags,
+            pdb_folder=pdb_folder,
+            out_folder=mpnn_out,
+            ckpt_path=ckpt_path,
+            num_seqs=num_seq,
+            sampling_temp=temp,
+            seed=int(mpnn_seed),
+            batch_size=int(mpnn_batch_size),
+            model_name=mpnn_model_name,
+            chain_list=mpnn_chain_list,
+            position_list_csv=position_list_csv,
+            omit_aas=mpnn_omit_aas,
+            use_soluble_model=mpnn_use_soluble_model,
+            log_path=log_path,
         )
 
         fastas = _gather_mpnn_fastas(mpnn_out)
         if not fastas:
-            raise RuntimeError(f"No fasta outputs found under {mpnn_out} (expected */seqs/*.fa*)")
+            raise RuntimeError(
+                f"No fasta outputs found under {mpnn_out} (expected */seqs/*.fa*)"
+            )
 
         rows: list[dict[str, Any]] = []
         for fa in fastas:
@@ -1057,7 +1110,11 @@ def run_ppiflow_structured(
                 }
             )
 
-        _write_csv(src_run_dir / manifest_name, rows, ["pdb_path", "seq_fasta", "iptm", "ptm", "passed"])
+        _write_csv(
+            src_run_dir / manifest_name,
+            rows,
+            ["pdb_path", "seq_fasta", "iptm", "ptm", "passed"],
+        )
 
         (src_run_dir / f"{task}.meta.json").write_text(
             json.dumps(
@@ -1090,7 +1147,9 @@ def run_ppiflow_structured(
     # Branch 2: PPIFlow sampling tasks
     # -------------------------
     if task not in TASK_TO_SCRIPT:
-        raise ValueError(f"Unknown task={task}. Choose from {sorted(TASK_TO_SCRIPT) + sorted(MPNN_TASKS)}")
+        raise ValueError(
+            f"Unknown task={task}. Choose from {sorted(TASK_TO_SCRIPT) + sorted(MPNN_TASKS)}"
+        )
 
     script = Path(TASK_TO_SCRIPT[task])
     if not script.exists():
@@ -1123,7 +1182,9 @@ def run_ppiflow_structured(
             cfg_guess = Path(PPIFLOW_DIR) / config
             cfg_path = cfg_guess if cfg_guess.exists() else cfg_path
         if not cfg_path.exists():
-            raise FileNotFoundError(f"Config not found: {config} (resolved: {cfg_path})")
+            raise FileNotFoundError(
+                f"Config not found: {config} (resolved: {cfg_path})"
+            )
         effective_config = run_dir / "effective_config.yaml"
         _write_effective_config(cfg_path, effective_config)
 
@@ -1162,7 +1223,12 @@ def run_ppiflow_structured(
     elif task in {"antibody", "nanobody"}:
         antigen_pdb = p_in("antigen.pdb")
         framework_pdb = p_in("framework.pdb")
-        argv += ["--antigen_pdb", str(antigen_pdb), "--framework_pdb", str(framework_pdb)]
+        argv += [
+            "--antigen_pdb",
+            str(antigen_pdb),
+            "--framework_pdb",
+            str(framework_pdb),
+        ]
 
         if not ab_antigen_chain:
             raise ValueError("antibody/nanobody requires --ab-antigen-chain")
@@ -1209,7 +1275,14 @@ def run_ppiflow_structured(
         motif_csv = p_in("motif.csv")
         if effective_config:
             argv += ["--config", str(effective_config)]
-        argv += ["--model_weights", str(model_ckpt), "--output_dir", str(outputs_dir), "--motif_csv", str(motif_csv)]
+        argv += [
+            "--model_weights",
+            str(model_ckpt),
+            "--output_dir",
+            str(outputs_dir),
+            "--motif_csv",
+            str(motif_csv),
+        ]
         if scaffold_motif_names:
             argv += ["--motif_names", scaffold_motif_names]
         argv += ["--samples_num", str(scaffold_samples_num)]
@@ -1288,7 +1361,7 @@ def run_ppiflow_structured(
     (run_dir / "cmd.txt").write_text(" ".join(argv) + "\n")
     run_cwd = inputs_dir if task == "scaffolding" else None
 
-    p = subprocess.run(
+    p = subprocess.run(  # noqa: S603
         argv,
         check=False,
         text=True,
@@ -1301,7 +1374,9 @@ def run_ppiflow_structured(
     # if fail, but outputs exist, keep; else raise
     pdbs = sorted((run_dir / "outputs").glob("*.pdb"))
     if p.returncode != 0 and not pdbs:
-        raise RuntimeError(f"PPIFlow failed (exit {p.returncode}). See {run_dir}/stdout.log")
+        raise RuntimeError(
+            f"PPIFlow failed (exit {p.returncode}). See {run_dir}/stdout.log"
+        )
 
     _collect_artifacts(run_dir)
     RUNS_VOL.commit()
@@ -1381,8 +1456,8 @@ def submit_ppiflow(
     mpnn_omit_aas: str | None = None,
     mpnn_use_soluble_model: bool = False,
 ) -> None:
-    """
-    Unified Modal CLI.
+    """Unified Modal CLI.
+
     - Sampling tasks upload inputs (role-based).
     - MPNN tasks do NOT upload inputs; they operate on an existing run:
         --mpnn-source-task <task> --mpnn-source-run <run_name>
@@ -1412,14 +1487,16 @@ def submit_ppiflow(
 
         if task in {"antibody", "nanobody"}:
             if not ab_antigen_pdb or not ab_framework_pdb:
-                raise ValueError(f"{task} requires --ab-antigen-pdb and --ab-framework-pdb")
-            input_files.append(_read_file_as("antigen.pdb", ab_antigen_pdb))  # type: ignore[arg-type]
-            input_files.append(_read_file_as("framework.pdb", ab_framework_pdb))  # type: ignore[arg-type]
+                raise ValueError(
+                    f"{task} requires --ab-antigen-pdb and --ab-framework-pdb"
+                )
+            input_files.append(_read_file_as("antigen.pdb", ab_antigen_pdb))
+            input_files.append(_read_file_as("framework.pdb", ab_framework_pdb))
 
         if task in {"ab_partial_flow", "nb_partial_flow"}:
             if not pf_complex_pdb:
                 raise ValueError(f"{task} requires --pf-complex-pdb")
-            input_files.append(_read_file_as("complex.pdb", pf_complex_pdb))  # type: ignore[arg-type]
+            input_files.append(_read_file_as("complex.pdb", pf_complex_pdb))
 
         if task == "scaffolding":
             if not scaffold_motif_csv:
@@ -1432,8 +1509,12 @@ def submit_ppiflow(
             csv_text = csv_path.read_text(encoding="utf-8-sig")
             reader = csv.DictReader(StringIO(csv_text))
             required_cols = {"target", "length", "contig", "motif_path"}
-            if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
-                raise ValueError(f"motif.csv must have columns {sorted(required_cols)}, got {reader.fieldnames}")
+            if not reader.fieldnames or not required_cols.issubset(
+                set(reader.fieldnames)
+            ):
+                raise ValueError(
+                    f"motif.csv must have columns {sorted(required_cols)}, got {reader.fieldnames}"
+                )
 
             rows = list(reader)
             if not rows:
@@ -1450,11 +1531,15 @@ def submit_ppiflow(
                 if not mp_path.is_absolute():
                     mp_path = (csv_dir / mp_path).resolve()
                 if not mp_path.exists():
-                    raise FileNotFoundError(f"motif_path file not found: {mp_path} (from motif_path={mp!r})")
+                    raise FileNotFoundError(
+                        f"motif_path file not found: {mp_path} (from motif_path={mp!r})"
+                    )
 
                 stable_name = mp_path.name
                 if stable_name in motif_files and motif_files[stable_name] != mp_path:
-                    stable_name = f"{mp_path.stem}.{len(motif_files) + 1}{mp_path.suffix}"
+                    stable_name = (
+                        f"{mp_path.stem}.{len(motif_files) + 1}{mp_path.suffix}"
+                    )
                 motif_files[stable_name] = mp_path
                 r["motif_path"] = stable_name
 
@@ -1473,7 +1558,9 @@ def submit_ppiflow(
                 scaffold_motif_names = json.dumps([s])
     elif task in MPNN_TASKS:
         if mpnn_position_list and not mpnn_chain_list:
-            raise ValueError(f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided")
+            raise ValueError(
+                f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided"
+            )
         if mpnn_position_list:
             pos_csv = Path(mpnn_position_list).expanduser()
             if not pos_csv.exists():

@@ -292,6 +292,7 @@ def collect_boltzgen_data(
     steps: str | None = None,
     extra_args: str | None = None,
     filter_results: bool = True,
+    filter_rmsd_threshold: float = 4.0,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
     OUTPUTS_VOLUME.reload()
@@ -332,7 +333,7 @@ def collect_boltzgen_data(
         print("💊 Collecting BoltzGen outputs...")
         combine_multiple_runs.remote(run_name, run_ids)
         print("💊 Filtering combined BoltzGen designs...")
-        refilter_designs.remote(run_name, budget)
+        refilter_designs.remote(run_name, budget, filter_rmsd_threshold)
         OUTPUTS_VOLUME.reload()
 
         print("💊 Packaging filtered BoltzGen outputs...")
@@ -633,6 +634,7 @@ def submit_boltzgen_task(
     focus_run_ids: str | None = None,
     ignore_run_ids: str | None = None,
     filter_results: bool = False,
+    filter_rmsd_threshold: float = 4.0,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
 
@@ -669,6 +671,9 @@ def submit_boltzgen_task(
         filter_results: If true, bundle top `budget` results into a tarball and download to `out_dir`.
             Otherwise, use subprocesses to call `modal volume get` for downloads.
             This flag is useless if `out_dir` is not specified.
+        filter_rmsd_threshold: RMSD threshold for refiltering designs. This is
+            only used if `filter_results` is true. The RMSD calculation is
+            between the designed structure and the refolded structure.
     """
     from pathlib import Path
 
@@ -728,6 +733,7 @@ def submit_boltzgen_task(
         steps=steps,
         extra_args=extra_args,
         filter_results=filter_results and (out_dir is not None),
+        filter_rmsd_threshold=filter_rmsd_threshold,
     )
     if out_dir is None:
         return

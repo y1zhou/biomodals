@@ -23,6 +23,7 @@ from biomodals.app.helper.shell import (
     package_outputs,
     run_command,
     run_command_with_log,
+    sanitize_filename,
     warmup_directory,
 )
 
@@ -90,7 +91,11 @@ def package_outputs_helper(
 def _is_boltzgen_run_complete(run_dir: Path) -> bool:
     """Return whether a BoltzGen run directory contains the final outputs."""
     final_dir = run_dir / "final_ranked_designs"
-    return final_dir.exists() and (final_dir / "results_overview.pdf").exists()
+    return (
+        run_dir.exists()
+        and final_dir.exists()
+        and (final_dir / "results_overview.pdf").exists()
+    )
 
 
 class YAMLReferenceLoader:
@@ -237,6 +242,7 @@ def get_run_ids(
     salvage_mode: bool = False,
     focus_run_ids: str | None = None,
     ignore_run_ids: str | None = None,
+    skip_finished: bool = False,
 ) -> list[str]:
     """Gather BoltzGen run IDs to collect data for."""
     from datetime import UTC, datetime
@@ -258,7 +264,9 @@ def get_run_ids(
         raise RuntimeError(
             f"💊 No existing run directories found for run name '{run_name}'."
         )
-    # run_dirs = [d for d in all_run_dirs if not _is_boltzgen_run_complete(d)]
+    if skip_finished:
+        all_run_dirs = [d for d in all_run_dirs if not _is_boltzgen_run_complete(d)]
+
     run_ids = [d.name for d in all_run_dirs]
     if focus_run_ids is not None:
         focus_set = set(focus_run_ids.split(","))
@@ -312,7 +320,7 @@ def collect_boltzgen_data(
             f"💊 Launching or resuming {len(run_dirs)} incomplete BoltzGen runs "
             f"out of {len(run_ids)} planned runs."
         )
-        for boltzgen_dir in boltzgen_run.map(run_dirs, kwargs=kwargs):
+        for boltzgen_dir in BoltzGenRunner().boltzgen_run.map(run_dirs, kwargs=kwargs):
             print(f"💊 BoltzGen run completed: {boltzgen_dir}")
     else:
         print("💊 All planned BoltzGen runs are already complete; skipping relaunch.")
@@ -346,7 +354,7 @@ def collect_boltzgen_data(
         return run_ids
 
 
-@app.function(
+@app.cls(
     gpu=CONF.gpu,
     cpu=1.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
@@ -356,60 +364,93 @@ def collect_boltzgen_data(
         CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
     },
 )
-def boltzgen_run(
-    out_dir: str,
-    input_yaml_path: str,
-    protocol: str = "nanobody-anything",
-    num_designs: int = 10,
-    budget: int = 1,
-    steps: str | None = None,
-    extra_args: str | None = None,
-) -> str:
-    """Run BoltzGen on a yaml specification.
+class BoltzGenRunner:
+    """Class to run BoltzGen on a YAML specification."""
 
-    Args:
-        out_dir: Output directory path
-        input_yaml_path: Path to YAML design specification file
-        protocol: Design protocol (protein-anything, peptide-anything, etc.)
-        num_designs: Number of designs to generate
-        budget: Number of designs to keep after filtering. This is not very useful
-            here because we are likely to run multiple parallel runs and combine later.
-        steps: Specific pipeline steps to run (e.g. "design inverse_folding")
-        extra_args: Additional CLI arguments as string
+    @modal.method()
+    def boltzgen_run(
+        self,
+        out_dir: str,
+        input_yaml_path: str,
+        protocol: str = "nanobody-anything",
+        num_designs: int = 10,
+        budget: int = 1,
+        steps: str | None = None,
+        extra_args: str | None = None,
+    ) -> str:
+        """Run BoltzGen on a yaml specification.
 
-    Returns:
-    -------
-        Path to output directory as string.
-    """
-    # Build command
-    cmd = [
-        "boltzgen",
-        "run",
-        str(input_yaml_path),
-        f"--protocol={protocol}",
-        f"--output={out_dir}",
-        f"--num_designs={num_designs}",
-        f"--budget={budget}",
-    ]
+        Args:
+            out_dir: Output directory path
+            input_yaml_path: Path to YAML design specification file
+            protocol: Design protocol (protein-anything, peptide-anything, etc.)
+            num_designs: Number of designs to generate
+            budget: Number of designs to keep after filtering. This is not very useful
+                here because we are likely to run multiple parallel runs and combine later.
+            steps: Specific pipeline steps to run (e.g. "design inverse_folding")
+            extra_args: Additional CLI arguments as string
 
-    if steps:
-        cmd.extend(["--steps", *steps.split()])
-    if extra_args:
-        cmd.extend(extra_args.split())
+        Returns:
+        -------
+            Path to output directory as string.
+        """
+        import time
 
-    out_path = Path(out_dir)
-    # Handle preempted runs by continuing from existing output
-    if out_path.exists():
-        cmd.append("--reuse")
-        warmup_directory(out_path)
+        out_path = Path(out_dir)
+        if _is_boltzgen_run_complete(out_path):
+            return str(out_dir)
 
-    out_path.mkdir(parents=True, exist_ok=True)
-    log_path = out_path / "boltzgen-run.log"
-    print(f"💊 Running BoltzGen, saving logs to {log_path}")
-    run_command_with_log(cmd, log_file=log_path, cwd=out_path)
+        # Make lock directory to prevent other GPU workers running the same job
+        # Stale locks >1 day are ignored
+        lock_dir = out_path / ".lock"
+        self.lock_dir = lock_dir
+        if lock_dir.exists() and (lock_dir.stat().st_mtime < (time.time() - 24 * 3600)):
+            print(f"💊 Removing stale lock for {out_dir}.")
+            lock_dir.rmdir()
+            OUTPUTS_VOLUME.commit()
+        try:
+            lock_dir.mkdir(exist_ok=False)
+            OUTPUTS_VOLUME.commit()
+        except FileExistsError:
+            print(
+                f"💊 Another worker is already running BoltzGen for {out_dir}; skipping."
+            )
+            return str(out_dir)
 
-    OUTPUTS_VOLUME.commit()
-    return str(out_dir)
+        # Build command
+        cmd = [
+            "boltzgen",
+            "run",
+            str(input_yaml_path),
+            f"--protocol={protocol}",
+            f"--output={out_dir}",
+            f"--num_designs={num_designs}",
+            f"--budget={budget}",
+        ]
+
+        if steps:
+            cmd.extend(["--steps", *steps.split()])
+        if extra_args:
+            cmd.extend(extra_args.split())
+
+        # Handle preempted runs by continuing from existing output
+        if out_path.exists():
+            cmd.append("--reuse")
+            warmup_directory(out_path)
+
+        out_path.mkdir(parents=True, exist_ok=True)
+        log_path = out_path / "boltzgen-run.log"
+        print(f"💊 Running BoltzGen, saving logs to {log_path}")
+        run_command_with_log(cmd, log_file=log_path, cwd=out_path)
+        return str(out_dir)
+
+    @modal.exit()
+    def clean_locks(self):
+        """Clean up any lock directories that might be left from preempted runs."""
+        if self.lock_dir.exists():
+            print(f"💊 Cleaning up lock directory {self.lock_dir}")
+            self.lock_dir.rmdir()
+        OUTPUTS_VOLUME.commit()
 
 
 @app.function(
@@ -640,6 +681,8 @@ def submit_boltzgen_task(
         if input_yaml is None:
             raise ValueError("input_yaml must be provided if run_name is not set.")
         run_name = Path(input_yaml).stem
+    else:
+        run_name = sanitize_filename(run_name)
 
     # Prepare BoltzGen run inputs if we're not re-running incomplete jobs
     if not salvage_mode:

@@ -1,0 +1,8 @@
+name: ppiflow_5b8c_vhh
+samples_per_target: 3
+antigen_pdb: 5B8C.pdb
+antigen_chain: C
+specified_hotspots: "C64,C66,C68,C75,C76,C77,C78,C83,C85,C87,C88,C89,C90,C126,C128,C132"
+framework_pdb: 7eow_nanobody_framework.pdb
+heavy_chain: A
+cdr_length: "CDRH1,10-12,CDRH2,7-9,CDRH3,16-20"

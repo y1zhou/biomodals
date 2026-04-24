@@ -3,7 +3,8 @@
 from modal import Volume
 
 # Volume for caching all model weights
-MODEL_VOLUME = Volume.from_name("biomodals-store", create_if_missing=True)
+MODEL_VOLUME_NAME = "biomodals-store"
+MODEL_VOLUME = Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 
 # Volume for caching MSA databases, which are large and shared across apps
 AF3_MSA_DB_VOLUME = Volume.from_name(

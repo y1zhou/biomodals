@@ -152,6 +152,8 @@ def _prepare_input_csv(
         if not input_csv_path.exists():
             raise FileNotFoundError(f"Input CSV file not found: {input_csv_path}")
 
+        rel_root_dir = input_csv_path.parent
+
         df = pl.read_csv(input_csv_path)
         all_cols = df.columns
         if "pdb" not in all_cols:
@@ -170,6 +172,7 @@ def _prepare_input_csv(
             raise ValueError(
                 "'input_pdb' needs to be provided if 'input_csv' is not provided"
             )
+        rel_root_dir = Path.cwd()
         df = pl.DataFrame(
             {
                 "binary": [rosetta_binary],
@@ -188,10 +191,34 @@ def _prepare_input_csv(
     if df_missing_script.height > 0:
         raise ValueError(f"Missing 'rosetta_script':\n{df_missing_script}")
 
-    for f in df.get_column("pdb"):
-        local_path = Path(f).expanduser().resolve()
-        if not local_path.exists():
-            raise FileNotFoundError(f"Input PDB file not found: {local_path}")
+    def _localize_input_path(
+        path_str: str, *, col_name: str, allow_search_path: bool = False
+    ) -> Path:
+        local_path = Path(path_str).expanduser()
+        # Absolute path, or relative to $PWD
+        if local_path.exists():
+            return local_path
+
+        if (abs_path := (rel_root_dir / local_path)).exists():
+            return abs_path
+        if allow_search_path:
+            search_path = rosetta_search_path / local_path
+            if search_path.exists():
+                return search_path
+        raise FileNotFoundError(f"'{col_name}' file not found locally: {local_path}")
+
+    df_pdbs = (
+        df.select("pdb")
+        .unique()
+        .with_columns(
+            pl.col("pdb")
+            .map_elements(
+                lambda p: str(_localize_input_path(p, col_name="pdb")),
+                return_dtype=pl.Utf8,
+            )
+            .alias("pdb_path")
+        )
+    )
 
     # Get hashes for script and flags files to identify unique files for upload
     def _get_file_hashes(
@@ -201,14 +228,13 @@ def _prepare_input_csv(
         file_abs_paths: list[str] = []
         file_hashes: list[str] = []
         for f in df_files.get_column(col_name):
-            if (local_path := Path(f).expanduser().resolve()).exists():
-                file_abs_paths.append(str(local_path))
-                file_hashes.append(hash_string(local_path.read_text()))
-            elif (rel_f := (rosetta_search_path / f)).exists():
-                file_abs_paths.append(str(rel_f))
-                file_hashes.append(hash_string(rel_f.read_text()))
-            else:
-                raise FileNotFoundError(f"'{col_name}' file not found locally: {f}")
+            local_path = _localize_input_path(
+                f,
+                col_name=col_name,
+                allow_search_path=True,
+            )
+            file_abs_paths.append(str(local_path))
+            file_hashes.append(hash_string(local_path.read_text()))
         return df_files.with_columns(
             pl.Series(hash_col_name, file_hashes),
             pl.Series(real_path_col_name, file_abs_paths),
@@ -218,13 +244,15 @@ def _prepare_input_csv(
     df_flags = _get_file_hashes("flags_file", "flags_hash", "flags_path")
 
     return (
-        df.join(df_scripts, on="rosetta_script", how="left", maintain_order="left")
+        df.join(df_pdbs, on="pdb", how="left", maintain_order="left")
+        .join(df_scripts, on="rosetta_script", how="left", maintain_order="left")
         .join(df_flags, on="flags_file", how="left", maintain_order="left")
         .with_columns(
+            pl.col("pdb_path").alias("pdb"),
             pl.col("script_path").alias("rosetta_script"),
             pl.col("flags_path").alias("flags_file"),
         )
-        .drop("script_path", "flags_path")
+        .drop("pdb_path", "script_path", "flags_path")
         .with_row_index(name="index", offset=1)
     )
 
@@ -263,6 +291,10 @@ def submit_rosetta_task(
             binary specified by `rosetta_binary` will be used for all rows.
             This argument takes precedence over the individual `input_*` arguments.
             This allows batch processing of multiple Rosetta runs with one input.
+            If the `pdb` column contains relative paths, they will be resolved
+            relative to `$PWD` as well as the parent directory of the CSV file.
+            For the `rosetta_script` and `flags_file` columns, they will be resolved
+            relative to `$PWD`, CSV parent, and `rosetta_search_path`.
         out_dir: Optional output directory. If not provided, results will only
             be saved to the Modal output volume and not downloaded locally. If
             provided, results will be saved to `out_dir` with the same filename as
@@ -273,9 +305,8 @@ def submit_rosetta_task(
             allocated per pod. Also note that the parallelism is achieved by running
             multiple Rosetta jobs, not by parallelizing a single Rosetta job, so
             more threads for a single job will not speed up the runtime.
-
-        rosetta_search_path: The search path for Rosetta to find input files such
-            as Rosetta scripts and flags files.
+        rosetta_search_path: The additional search path for Rosetta to find
+            Rosetta scripts and flags files.
     """
     # Validate and read input
     run_id = uuid4().hex
@@ -344,7 +375,9 @@ def submit_rosetta_task(
     )
     max_num_pods = max(1, max_num_pods)  # ensure at least 1 pod
 
-    print(f"🧬 Running in {max_num_pods} pods with {num_cpu_per_pod} CPUs each...")
+    print(
+        f"🧬 Running task {run_name}-{run_id} in {max_num_pods} {num_cpu_per_pod}-CPU pods..."
+    )
     rosetta_tasks = [
         run_rosetta.spawn(run_name, run_id, num_cpu_per_pod)
         for _ in range(max_num_pods)

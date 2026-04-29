@@ -3,6 +3,7 @@
 ## Model checkpoints
 
 See <https://github.com/dauparas/LigandMPNN#available-models> for details.
+Additionally, we include the AbMPNN model from <https://zenodo.org/records/8164693>.
 
 ## Outputs
 
@@ -136,15 +137,21 @@ def download_weights() -> None:
     """Download ProteinMPNN models into the mounted volume.
 
     Ref: https://github.com/dauparas/LigandMPNN/blob/main/get_model_params.sh
+    AbMPNN ref: https://zenodo.org/records/8164693
     """
     base_url = "https://files.ipd.uw.edu/pub/ligandmpnn"
+    ligandmpnn_weights = {
+        f"{base_url}/{model_name}": CONF.model_dir / "model_params" / model_name
+        for model_name in AVAILABLE_MODELS
+    }
+    abmpnn_dict = {
+        "https://zenodo.org/records/8164693/files/abmpnn.pt?download=1": CONF.model_dir
+        / "model_params"
+        / "abmpnn.pt"
+    }
+
     print(f"💊 Downloading {CONF.name} models...")
-    download_files(
-        {
-            f"{base_url}/{model_name}": CONF.model_dir / "model_params" / model_name
-            for model_name in AVAILABLE_MODELS
-        }
-    )
+    download_files(ligandmpnn_weights | abmpnn_dict)
     MODEL_VOLUME.commit()
     print("💊 Model download complete")
 
@@ -320,7 +327,7 @@ def submit_ligandmpnn_task(
         download_models: Whether to download model weights and skip running
 
         model_type: One of: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn,
-            global_label_membrane_mpnn, soluble_mpnn
+            global_label_membrane_mpnn, soluble_mpnn, and abmpnn
         checkpoint: Optional path to model weights. Note that the name should match
             the `model_type` specified.
         seeds: Comma-separated random seeds for design generation
@@ -398,7 +405,7 @@ def submit_ligandmpnn_task(
         int(s_num) for s in seeds.split(",") if (s_num := s.strip()).isdigit()
     ]
     cli_args = {
-        "--model_type": model_type,
+        "--model_type": "protein_mpnn" if model_type == "abmpnn" else model_type,
         "--batch_size": str(batch_size),
         "--number_of_batches": str(number_of_batches),
         # 0/1 flags
@@ -429,6 +436,10 @@ def submit_ligandmpnn_task(
     # Non-default args
     if checkpoint is not None:
         cli_args[f"--checkpoint_{model_type}"] = checkpoint
+    elif model_type == "abmpnn":
+        cli_args["--checkpoint_protein_mpnn"] = str(
+            CONF.model_dir / "model_params" / "abmpnn.pt"
+        )
     if fixed_residues is not None:
         cli_args["--fixed_residues"] = fixed_residues
     if redesigned_residues is not None:

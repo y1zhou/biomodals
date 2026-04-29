@@ -31,6 +31,10 @@ This repo uses a single-context domain doc layout. See `docs/agents/domain.md`.
 
 This repo is built on Modal, a serverless cloud platform for running Python code. See `docs/agents/modal.md`.
 
+### Workflow development
+
+When creating, editing, or reviewing files under `src/biomodals/workflow/`, read `docs/agents/workflow-development.md` first.
+
 ## Biomodals app development
 
 When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, read `.github/instructions/app-development.instructions.md` first.

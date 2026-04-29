@@ -13,7 +13,11 @@ from pydantic import BaseModel, computed_field, model_validator
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import run_command_with_log, sanitize_filename
+from biomodals.app.helper.shell import (
+    package_outputs,
+    run_command_with_log,
+    sanitize_filename,
+)
 
 ##########################################
 # Modal configs
@@ -329,6 +333,87 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
 
     OUTPUTS_VOLUME.commit()
     return str(workdir)
+
+
+@app.function(
+    gpu=CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=MAX_TIMEOUT,
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
+)
+def ppiflow_run_bytes(
+    config_dict: dict[str, object],
+    design_mode: str,
+    input_files: list[tuple[str, bytes]],
+    run_name: str,
+) -> bytes:
+    """Run PPIFlow from in-memory inputs and return packaged outputs.
+
+    This workflow-oriented helper keeps the existing volume-backed
+    ``ppiflow_run`` behavior intact while allowing orchestrators in other Modal
+    apps to call deployed PPIFlow without reading the PPIFlow output volume.
+    """
+    from tempfile import TemporaryDirectory
+
+    safe_run_name = sanitize_filename(run_name)
+    with TemporaryDirectory(prefix=f"ppiflow_{safe_run_name}_") as tmpdir:
+        workdir = Path(tmpdir) / safe_run_name
+        inputs_dir = workdir / "inputs"
+        out_dir = workdir / "outputs"
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for file_name, content in input_files:
+            (inputs_dir / Path(file_name).name).write_bytes(content)
+
+        conf_data = dict(config_dict)
+        match design_mode:
+            case "binder":
+                conf_data["input_pdb"] = (
+                    inputs_dir / Path(str(conf_data["input_pdb"])).name
+                )
+                conf = SampleBinderConfig.model_validate(conf_data)
+            case "antibody" | "nanobody" | "antibody_nanobody":
+                conf_data["antigen_pdb"] = (
+                    inputs_dir / Path(str(conf_data["antigen_pdb"])).name
+                )
+                conf_data["framework_pdb"] = (
+                    inputs_dir / Path(str(conf_data["framework_pdb"])).name
+                )
+                conf = SampleAntibodyNanobodyConfig.model_validate(conf_data)
+            case "binder_partial" | "binder_partial_flow":
+                conf_data["input_pdb"] = (
+                    inputs_dir / Path(str(conf_data["input_pdb"])).name
+                )
+                conf = SampleBinderPartialConfig.model_validate(conf_data)
+            case "antibody_nanobody_partial" | "ab_partial_flow" | "nb_partial_flow":
+                conf_data["complex_pdb"] = (
+                    inputs_dir / Path(str(conf_data["complex_pdb"])).name
+                )
+                conf = SampleAntibodyNanobodyPartialConfig.model_validate(conf_data)
+            case _:
+                raise ValueError(f"Unsupported design_mode: {design_mode}")
+
+        args = PPIFlowArgs(args=conf)
+        model_weights_path = CONF.model_dir / args.model_weights_name
+        if not model_weights_path.exists():
+            raise FileNotFoundError(
+                f"PPIFlow model checkpoint is missing: {model_weights_path}"
+            )
+
+        arg_fields = args.args.model_dump(exclude_none=True)
+        cmd = [
+            "python",
+            str(SCRIPTS_DIR / args.script_name),
+            *(f"--{k}={v}" for k, v in arg_fields.items()),
+            f"--output_dir={out_dir}",
+            f"--model_weights={model_weights_path}",
+        ]
+        log_path = workdir / f"{CONF.name}-run.log"
+        print(f"💊 Running {CONF.name}, saving logs to {log_path}")
+        run_command_with_log(cmd, log_file=log_path)
+        return package_outputs(workdir)
 
 
 ##########################################

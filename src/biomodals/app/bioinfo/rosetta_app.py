@@ -11,9 +11,11 @@ See <https://docs.rosettacommons.org/docs/latest/Home> for documentation.
 # ruff: noqa: PLC0415
 
 import os
+import subprocess
 from collections.abc import Iterable
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import modal
@@ -119,6 +121,82 @@ def package_outputs_helper(
         tar_args=tar_args,
         num_threads=num_threads,
     )
+
+
+@app.function(
+    cpu=(0.125, 30.125),
+    memory=(1024, 43008),
+    timeout=CONF.timeout,
+)
+def run_rosetta_batch_bytes(
+    jobs: list[dict[str, object]],
+    run_name: str,
+    num_cpu_per_pod: int = 1,
+) -> bytes:
+    """Run Rosetta jobs from in-memory inputs and return packaged outputs."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from biomodals.app.helper.shell import run_command_with_log, sanitize_filename
+
+    if not jobs:
+        raise ValueError("At least one Rosetta job is required")
+
+    safe_run_name = sanitize_filename(run_name)
+    with TemporaryDirectory(prefix=f"rosetta_{safe_run_name}_") as tmpdir:
+        workdir = Path(tmpdir) / safe_run_name
+        inputs_dir = workdir / "inputs"
+        outputs_dir = workdir / "outputs"
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        def _write_optional_text(
+            job_dir: Path, job: dict[str, object], key: str
+        ) -> Path | None:
+            text = job.get(f"{key}_text")
+            if text is None:
+                return None
+            name = sanitize_filename(str(job.get(f"{key}_name") or f"{key}.txt"))
+            path = job_dir / name
+            path.write_text(str(text))
+            return path
+
+        def _worker(job: dict[str, object]) -> None:
+            idx = sanitize_filename(str(job.get("index") or len(str(job))))
+            job_dir = inputs_dir / idx
+            out_dir = outputs_dir / idx
+            job_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            pdb_bytes = job.get("pdb_bytes")
+            if not isinstance(pdb_bytes, bytes):
+                raise TypeError(f"Rosetta job {idx!r} is missing pdb_bytes")
+            pdb_name = sanitize_filename(str(job.get("pdb_name") or f"{idx}.pdb"))
+            pdb_path = job_dir / pdb_name
+            pdb_path.write_bytes(pdb_bytes)
+
+            script_path = _write_optional_text(job_dir, job, "rosetta_script")
+            flags_path = _write_optional_text(job_dir, job, "flags")
+            binary = str(job.get("binary") or "relax")
+            cmd = [binary]
+            if script_path is not None:
+                cmd.extend(["-parser:protocol", str(script_path)])
+            if flags_path is not None:
+                cmd.append(f"@{flags_path}")
+            cmd.extend(["-s", str(pdb_path), "-out:path:all", str(out_dir)])
+
+            try:
+                run_command_with_log(cmd, log_file=out_dir / "rosetta.log")
+            except subprocess.CalledProcessError:
+                (out_dir / "FAILED").write_text("Rosetta command failed\n")
+                raise
+
+        max_workers = max(1, min(num_cpu_per_pod, len(jobs), 30))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_worker, job) for job in jobs]
+            for future in futures:
+                future.result()
+
+        return package_outputs(workdir)
 
 
 ##########################################

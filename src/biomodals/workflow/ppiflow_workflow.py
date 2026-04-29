@@ -1,30 +1,21 @@
-"""Task-queue orchestrator for PPIFlow-style multi-stage design workflows.
+"""PPIFlow-style Modal workflow orchestrator.
 
-This workflow coordinates deployed Modal functions from:
-
-- ``biomodals.app.design.ppiflow_app``
-- ``biomodals.app.fol d.flowpacker_app``
-- ``biomodals.app.design.ligandmpnn_app``
-- ``biomodals.app.bioinfo.rosetta_app``
-- ``biomodals.app.score.af3score_app``
-
-The orchestrator builds a dependency-aware queue and runs independent steps in
-parallel worker threads from the local entrypoint.
+Follows the staged workflow in Mingchenchen/PPIFlow while dispatching to already
+-deployed Biomodals app functions.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import modal
 
-DEFAULT_APP_NAMES = {
+APP_NAMES = {
     "ppiflow": "PPIFlow",
     "flowpacker": "FlowPacker",
     "ligandmpnn": "LigandMPNN",
@@ -34,61 +25,66 @@ DEFAULT_APP_NAMES = {
 
 
 @dataclass
-class WorkflowTask:
-    """One queued workflow step."""
+class TaskSpec:
+    """One DAG node in the orchestrator task queue."""
 
     task_id: str
     app_key: str
-    fn_name: str
+    function_name: str
     kwargs: dict[str, Any]
-    needs: set[str] = field(default_factory=set)
+    deps: set[str] = field(default_factory=set)
 
 
-def _lookup_function(task: WorkflowTask):
-    app_name = DEFAULT_APP_NAMES[task.app_key]
-    return modal.Function.lookup(app_name, task.fn_name)
+def _lookup_modal_function(app_key: str, function_name: str):
+    return modal.Function.lookup(APP_NAMES[app_key], function_name)
 
 
-def _run_task(task: WorkflowTask) -> tuple[str, Any]:
-    fn = _lookup_function(task)
-    print(f"🧬 starting task '{task.task_id}' via {DEFAULT_APP_NAMES[task.app_key]}.{task.fn_name}")
+def _run_remote_task(task: TaskSpec) -> tuple[str, Any]:
+    fn = _lookup_modal_function(task.app_key, task.function_name)
+    print(f"🧬 [{task.task_id}] start -> {APP_NAMES[task.app_key]}.{task.function_name}")
     result = fn.remote(**task.kwargs)
-    print(f"🧬 completed task '{task.task_id}'")
+    print(f"🧬 [{task.task_id}] done")
     return task.task_id, result
 
 
-def _schedule(tasks: list[WorkflowTask], max_workers: int = 4) -> dict[str, Any]:
-    by_id = {task.task_id: task for task in tasks}
-    remaining = {task.task_id: set(task.needs) for task in tasks}
-    ready = deque([task_id for task_id, deps in remaining.items() if not deps])
+def _run_task_queue(tasks: list[TaskSpec], max_workers: int) -> dict[str, Any]:
+    task_map = {task.task_id: task for task in tasks}
+    unmet_deps = {task.task_id: set(task.deps) for task in tasks}
+    ready = deque([task_id for task_id, deps in unmet_deps.items() if not deps])
 
     outputs: dict[str, Any] = {}
-    in_flight: dict[Any, str] = {}
+    running: dict[Future, str] = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        while ready or in_flight:
-            while ready and len(in_flight) < max_workers:
+        while ready or running:
+            while ready and len(running) < max_workers:
                 task_id = ready.popleft()
-                fut = pool.submit(_run_task, by_id[task_id])
-                in_flight[fut] = task_id
+                fut = pool.submit(_run_remote_task, task_map[task_id])
+                running[fut] = task_id
 
-            done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
-            for fut in done:
-                task_id = in_flight.pop(fut)
-                finished_task_id, result = fut.result()
-                outputs[finished_task_id] = result
+            completed_futures, _ = wait(running.keys(), return_when=FIRST_COMPLETED)
+            for fut in completed_futures:
+                done_task_id = running.pop(fut)
+                _, result = fut.result()
+                outputs[done_task_id] = result
 
-                for waiting_task_id, deps in remaining.items():
-                    if task_id in deps:
-                        deps.remove(task_id)
-                        if not deps and waiting_task_id not in outputs and waiting_task_id not in ready and waiting_task_id not in in_flight.values():
-                            ready.append(waiting_task_id)
+                for task_id, deps in unmet_deps.items():
+                    if done_task_id in deps:
+                        deps.remove(done_task_id)
+                        if not deps and task_id not in outputs and task_id not in ready:
+                            if task_id not in running.values():
+                                ready.append(task_id)
 
-    unresolved = {k: v for k, v in remaining.items() if v and k not in outputs}
+    unresolved = {task_id: deps for task_id, deps in unmet_deps.items() if deps}
     if unresolved:
-        raise RuntimeError(f"Unresolved workflow dependencies: {unresolved}")
-
+        raise RuntimeError(f"DAG has unresolved dependencies: {unresolved}")
     return outputs
+
+
+def _read_optional_bytes(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    return Path(path).expanduser().resolve().read_bytes()
 
 
 app = modal.App("PPIFlowWorkflow")
@@ -96,89 +92,127 @@ app = modal.App("PPIFlowWorkflow")
 
 @app.local_entrypoint()
 def submit_ppiflow_workflow(
-    run_name: str,
+    ppiflow_run_name: str,
     ppiflow_args_json: str,
-    ligandmpnn_input_pdb: str,
-    flowpacker_input_pdb: str,
-    rosetta_input_pdb: str,
-    rosetta_script: str,
-    af3_paths_json: str,
+    run_flowpacker: bool = True,
+    run_ligandmpnn: bool = True,
+    run_rosetta: bool = False,
+    run_af3score: bool = True,
+    flowpacker_input_pdb: str | None = None,
+    ligandmpnn_input_pdb: str | None = None,
+    rosetta_run_id: str | None = None,
+    rosetta_num_cpu_per_pod: int = 1,
+    af3_input_files_json: str = "[]",
+    af3_paths_json: str = "{}",
     max_workers: int = 4,
 ) -> None:
-    """Execute a queued PPIFlow workflow.
+    """Run a PPIFlow-compatible staged workflow using deployed Modal functions.
 
     Args:
-        run_name: Stable workflow run identifier.
-        ppiflow_args_json: JSON payload compatible with ``PPIFlowArgs`` model.
-        ligandmpnn_input_pdb: Path to input pdb for LigandMPNN.
-        flowpacker_input_pdb: Path to input pdb for FlowPacker.
-        rosetta_input_pdb: Path to input pdb for Rosetta.
-        rosetta_script: Path to RosettaScript XML file.
-        af3_paths_json: JSON dict with ``run_root/inputs_dir/output_dir/failed_dir/metrics_csv``.
-        max_workers: Number of parallel local orchestration workers.
+        ppiflow_run_name: Name used for the PPIFlow backbone generation step.
+        ppiflow_args_json: JSON that can instantiate ``PPIFlowArgs`` for `ppiflow_run`.
+        run_flowpacker: Whether to run the FlowPacker packing stage.
+        run_ligandmpnn: Whether to run the LigandMPNN design stage.
+        run_rosetta: Whether to run Rosetta refinement stage.
+        run_af3score: Whether to run AF3Score postprocess stage.
+        flowpacker_input_pdb: Input PDB for FlowPacker.
+        ligandmpnn_input_pdb: Input PDB for LigandMPNN.
+        rosetta_run_id: Optional explicit Rosetta run id.
+        rosetta_num_cpu_per_pod: CPU parallelism passed to Rosetta run function.
+        af3_input_files_json: JSON list of AF3 input file names.
+        af3_paths_json: JSON dict of AF3 path bundle.
+        max_workers: Max local orchestration workers for independent stages.
     """
-    run_stamp = int(time.time())
-    ligand_bytes = Path(ligandmpnn_input_pdb).expanduser().resolve().read_bytes()
-    flowpacker_bytes = Path(flowpacker_input_pdb).expanduser().resolve().read_bytes()
-    ppiflow_args = json.loads(ppiflow_args_json)
+    ppiflow_args: dict[str, Any] = json.loads(ppiflow_args_json)
+    af3_input_files = json.loads(af3_input_files_json)
+    af3_paths = json.loads(af3_paths_json)
 
-    rosetta_run_id = f"{run_name}-{run_stamp}"
-
-    tasks = [
-        WorkflowTask(
+    tasks: list[TaskSpec] = [
+        TaskSpec(
             task_id="ppiflow_design",
             app_key="ppiflow",
-            fn_name="ppiflow_run",
-            kwargs={"args": ppiflow_args, "run_name": f"{run_name}-ppiflow"},
-        ),
-        WorkflowTask(
-            task_id="ligandmpnn_sequences",
-            app_key="ligandmpnn",
-            fn_name="ligandmpnn_run",
-            kwargs={
-                "run_name": f"{run_name}-ligandmpnn",
-                "script_mode": "run",
-                "struct_bytes": ligand_bytes,
-                "seeds": [0, 1, 2],
-                "cli_args": {"--verbose": True},
-            },
-            needs={"ppiflow_design"},
-        ),
-        WorkflowTask(
-            task_id="flowpacker_pack",
-            app_key="flowpacker",
-            fn_name="run_flowpacker",
-            kwargs={
-                "input_files": [(Path(flowpacker_input_pdb).name, flowpacker_bytes)],
-                "run_name": f"{run_name}-flowpacker",
-                "n_samples": 1,
-            },
-            needs={"ppiflow_design"},
-        ),
-        WorkflowTask(
-            task_id="rosetta_refine",
-            app_key="rosetta",
-            fn_name="run_rosetta",
-            kwargs={
-                "run_name": run_name,
-                "run_id": rosetta_run_id,
-                "num_cpu_per_pod": 1,
-            },
-            needs={"ppiflow_design"},
-        ),
-        WorkflowTask(
-            task_id="af3_score",
-            app_key="af3score",
-            fn_name="af3score_postprocess",
-            kwargs={
-                "input_files": [Path(flowpacker_input_pdb).name],
-                "paths": json.loads(af3_paths_json),
-            },
-            needs={"ligandmpnn_sequences", "flowpacker_pack", "rosetta_refine"},
-        ),
+            function_name="ppiflow_run",
+            kwargs={"args": ppiflow_args, "run_name": ppiflow_run_name},
+        )
     ]
 
-    results = _schedule(tasks=tasks, max_workers=max_workers)
-    print("🧬 Workflow completed. Task outputs:")
+    if run_ligandmpnn:
+        if ligandmpnn_input_pdb is None:
+            raise ValueError("`ligandmpnn_input_pdb` is required when run_ligandmpnn=True")
+        ligand_bytes = Path(ligandmpnn_input_pdb).expanduser().resolve().read_bytes()
+        tasks.append(
+            TaskSpec(
+                task_id="ligandmpnn_stage",
+                app_key="ligandmpnn",
+                function_name="ligandmpnn_run",
+                kwargs={
+                    "run_name": f"{ppiflow_run_name}-ligandmpnn",
+                    "script_mode": "run",
+                    "struct_bytes": ligand_bytes,
+                    "seeds": [0, 1, 2],
+                    "cli_args": {},
+                    "bias_aa_per_residue_bytes": None,
+                    "omit_aa_per_residue_bytes": None,
+                },
+                deps={"ppiflow_design"},
+            )
+        )
+
+    if run_flowpacker:
+        if flowpacker_input_pdb is None:
+            raise ValueError("`flowpacker_input_pdb` is required when run_flowpacker=True")
+        flowpacker_bytes = Path(flowpacker_input_pdb).expanduser().resolve().read_bytes()
+        tasks.append(
+            TaskSpec(
+                task_id="flowpacker_stage",
+                app_key="flowpacker",
+                function_name="run_flowpacker",
+                kwargs={
+                    "input_files": [(Path(flowpacker_input_pdb).name, flowpacker_bytes)],
+                    "run_name": f"{ppiflow_run_name}-flowpacker",
+                    "model_name": "cluster",
+                    "use_confidence": False,
+                    "n_samples": 1,
+                },
+                deps={"ppiflow_design"},
+            )
+        )
+
+    if run_rosetta:
+        tasks.append(
+            TaskSpec(
+                task_id="rosetta_stage",
+                app_key="rosetta",
+                function_name="run_rosetta",
+                kwargs={
+                    "run_name": ppiflow_run_name,
+                    "run_id": rosetta_run_id or f"{ppiflow_run_name}-rosetta",
+                    "num_cpu_per_pod": rosetta_num_cpu_per_pod,
+                },
+                deps={"ppiflow_design"},
+            )
+        )
+
+    if run_af3score:
+        deps = {"ppiflow_design"}
+        if run_ligandmpnn:
+            deps.add("ligandmpnn_stage")
+        if run_flowpacker:
+            deps.add("flowpacker_stage")
+        if run_rosetta:
+            deps.add("rosetta_stage")
+
+        tasks.append(
+            TaskSpec(
+                task_id="af3score_stage",
+                app_key="af3score",
+                function_name="af3score_postprocess",
+                kwargs={"input_files": af3_input_files, "paths": af3_paths},
+                deps=deps,
+            )
+        )
+
+    results = _run_task_queue(tasks=tasks, max_workers=max_workers)
+    print("🧬 workflow finished")
     for task_id, result in results.items():
-        print(f"  - {task_id}: {type(result).__name__}")
+        print(f"🧬 {task_id}: {type(result).__name__}")

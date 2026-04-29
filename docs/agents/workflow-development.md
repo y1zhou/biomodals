@@ -8,7 +8,7 @@ Workflow files under `src/biomodals/workflow/` orchestrate multiple Biomodals ap
 - Define a module-level `CONF = AppConfig(...)` and `app = modal.App(...)`, as app files do.
 - Keep module docstrings user-facing. Include upstream workflow links, required deployed apps, persistent output behavior, and example commands.
 - Prefer upstream-compatible config files when wrapping an upstream scheduler. Avoid inventing a new schema unless the workflow needs one.
-- Local entrypoints should be named `submit_<workflow-name>_workflow(...)` and use Google-style `Args:` docstrings so `biomodals help` can render flags.
+- Local entrypoints should be named `submit_<workflow-name>_workflow(...)` and use Google-style `Args:` docstrings. Workflow files are currently invoked directly with `modal run`; check their flags with `modal run src/biomodals/workflow/<name>_workflow.py --help`.
 
 ## Deployed App Calls
 
@@ -36,6 +36,6 @@ Workflow files under `src/biomodals/workflow/` orchestrate multiple Biomodals ap
 ## Validation
 
 - During development, small local unit tests or scratch scripts are fine, but do not commit generated test files unless the user asks for them.
-- Run `uv run biomodals list` and `uv run biomodals help <workflow-or-app>` when CLI discovery or docstrings change.
+- Run `uv run biomodals list` and `uv run biomodals help <app-name>` when app discovery or app docstrings change. For workflows, run `uv run modal run src/biomodals/workflow/<name>_workflow.py --help`.
 - Run `prek run --files <changed files>` when practical before committing.
 - Do not claim that a workflow works end-to-end on Modal unless it has actually been run on Modal.

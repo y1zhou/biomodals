@@ -27,6 +27,10 @@ Use the default five-label triage vocabulary. See `docs/agents/triage-labels.md`
 
 This repo uses a single-context domain doc layout. See `docs/agents/domain.md`.
 
+### Modal platform
+
+This repo is built on Modal, a serverless cloud platform for running Python code. See `docs/agents/modal.md`.
+
 ## Biomodals app development
 
 When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, read `.github/instructions/app-development.instructions.md` first.
@@ -64,3 +68,5 @@ The instruction file describes the baseline, but the reference apps show accepte
 - Commit Modal volumes after writing cache entries, model downloads, uploaded inputs, or intermediate outputs.
 - Use deterministic cache keys from `hash_string()` for expensive reusable work, with sharded paths such as `<AppName>/<hash[:2]>/<hash>/`.
 - For user-facing local output, resolve `out_dir`, create it if needed, avoid overwriting existing tarballs unless explicitly intended, and print the final path or Modal volume location.
+
+When developing new apps that must violate these conventions for good reason, document the reason for the deviation in the `docs/agents/` directory, and refer to it in this `AGENTS.md` file.

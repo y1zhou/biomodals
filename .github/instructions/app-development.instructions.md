@@ -35,7 +35,7 @@ Keep it user-facing: explain what the tool does, what inputs it needs, and what 
 
 - Always add `# ruff: noqa: PLC0415` near the top to suppress "import not at top of file" warnings — Modal functions need lazy imports inside function bodies.
 - Top-level imports: `os`, `modal`, `Path`, and anything from `biomodals.app.*`.
-- Heavy third-party imports (torch, numpy, domain libraries) go **inside** function bodies to keep the local environment lightweight and avoid import errors when the CLI introspects the module.
+- Imports required only inside the Modal runtime image, and not declared as dependencies of the `biomodals` package, must stay inside the function or method that uses them. Top-level imports are acceptable when the dependency is part of the `biomodals` package dependencies and is used by multiple local functions.
 
 ## Section Order and Separator Comments
 
@@ -95,6 +95,7 @@ class AppInfo:
 ```
 
 Instantiate as `APP_INFO = AppInfo()` right after the class definition. This keeps the namespace clean and groups related constants.
+Use an `AppInfo` dataclass only when it improves readability by grouping several related constants. For a small number of simple constants, module-level constants like `OUT_VOLUME` or `OUTPUTS_DIR` are acceptable and can be easier to maintain.
 
 ## Image Building
 
@@ -125,7 +126,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ## Remote Functions (@app.function)
 
 - Always specify `timeout` (use `CONF.timeout` or `MAX_TIMEOUT` from constants).
-- Specify resource hints: `gpu=CONF.gpu`, `cpu=(min, max)`, `memory=(min, max)`.
+- Specify resource hints: `gpu=CONF.gpu`, `cpu=(min, max)`, `memory=(min, max)`. Unless absolutely required, the CPU minimum should always be `0.125`.
 - CPU-only functions (e.g. data pipelines, MSA search) omit the `gpu` parameter.
 - GPU inference functions should use `MAX_TIMEOUT` for long-running tasks and mount model volumes read-only.
 - Use `TemporaryDirectory` or `mkdtemp` for working directories — they are cleaned on container exit.
@@ -273,6 +274,10 @@ The standard data flow is:
 
 This avoids mounting local filesystems into containers. Only `bytes` cross the local ↔ remote boundary.
 
+Data flow depends on the app category. Short-lived inference should usually send local input bytes to a remote function and return tarball bytes directly, as described above.
+Long-running apps should cache intermediate and final results in Modal volumes.
+Parallel or interruptible runs should use queues, locks, stable run IDs, and resumable runners where possible.
+
 ## Caching Strategy
 
 - Use `hash_string()` on input sequences/content to create deterministic cache keys.
@@ -282,4 +287,9 @@ This avoids mounting local filesystems into containers. Only `bytes` cross the l
 
 ## Apps That Don't Use AppConfig (Legacy)
 
-Older apps (e.g. `abcfold2_app.py`, `rfdiffusion_app.py`, `gromacs_app.py`) use raw constants (`GPU`, `TIMEOUT`, `APP_NAME`) and manual volume definitions. When touching these files, prefer migrating to `AppConfig` + `AppInfo` pattern if the change scope permits. New apps **must** use `AppConfig`.
+Older apps (e.g. `abcfold2_app.py`, `rfdiffusion_app.py`, `gromacs_app.py`) use raw constants (`GPU`, `TIMEOUT`, `APP_NAME`) and manual volume definitions. When touching these files, prefer migrating to `AppConfig` + `AppInfo` pattern if the change scope permits. New apps **must** use `AppConfig` unless there are very few constants.
+
+## Examples
+
+When the app development is done, generate an example bash script under `examples/app/` that demonstrates how to call the local entrypoint with `biomodals run`.
+If data files under `examples/data/` are not sufficient, add small example input files (e.g. a short FASTA) for testing purposes.

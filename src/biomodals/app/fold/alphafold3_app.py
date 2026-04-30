@@ -35,6 +35,12 @@ from biomodals.app.constant import (
     MSA_CACHE_VOLUME,
 )
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.output import (
+    build_local_output_path,
+    ensure_output_file_available,
+    resolve_local_output_dir,
+    write_local_tarball,
+)
 from biomodals.helper.shell import copy_files, package_outputs, run_command_with_log
 
 ##########################################
@@ -71,7 +77,8 @@ APP_INFO = AppInfo()
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "zstd", "zlib1g-dev", "wget")
     .env(
         CONF.default_env
@@ -82,32 +89,30 @@ runtime_image = patch_image_for_helper(
         }
     )
     .run_commands(
-        " && ".join(
-            (
-                # Clone AlphaFold3 repo
-                f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
-                f"cd {CONF.git_clone_dir}",
-                f"git checkout {CONF.repo_commit_hash}",
-                # Download, check hash, and extract HMMER
-                "mkdir /hmmer_build",
-                "wget http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz --directory-prefix /hmmer_build",
-                "cd /hmmer_build",
-                "echo 'ca70d94fd0cf271bd7063423aabb116d42de533117343a9b27a65c17ff06fbf3 hmmer-3.4.tar.gz' | sha256sum --check",
-                "tar zxf hmmer-3.4.tar.gz",
-                "rm hmmer-3.4.tar.gz",
-                # Apply the --seq_limit patch to HMMER
-                "cd /hmmer_build",
-                f"patch -p0 < {CONF.git_clone_dir}/docker/jackhmmer_seq_limit.patch",
-                # Build and install HMMER
-                "cd /hmmer_build/hmmer-3.4",
-                "./configure --prefix=/hmmer",
-                "make -j",
-                "make install",
-                "cd /hmmer_build/hmmer-3.4/easel",
-                "make install",
-                "rm -rf /hmmer_build",
-            )
-        )
+        " && ".join((
+            # Clone AlphaFold3 repo
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+            # Download, check hash, and extract HMMER
+            "mkdir /hmmer_build",
+            "wget http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz --directory-prefix /hmmer_build",
+            "cd /hmmer_build",
+            "echo 'ca70d94fd0cf271bd7063423aabb116d42de533117343a9b27a65c17ff06fbf3 hmmer-3.4.tar.gz' | sha256sum --check",
+            "tar zxf hmmer-3.4.tar.gz",
+            "rm hmmer-3.4.tar.gz",
+            # Apply the --seq_limit patch to HMMER
+            "cd /hmmer_build",
+            f"patch -p0 < {CONF.git_clone_dir}/docker/jackhmmer_seq_limit.patch",
+            # Build and install HMMER
+            "cd /hmmer_build/hmmer-3.4",
+            "./configure --prefix=/hmmer",
+            "make -j",
+            "make install",
+            "cd /hmmer_build/hmmer-3.4/easel",
+            "make install",
+            "rm -rf /hmmer_build",
+        ))
     )
     .workdir(str(CONF.git_clone_dir))
     # .uv_sync(frozen=True, extra_options="--no-editable")
@@ -347,12 +352,9 @@ def submit_alphafold3_task(
     if run_name is None:
         run_name = input_path.stem
 
-    local_out_dir = (
-        Path(out_dir).expanduser().resolve() if out_dir is not None else Path.cwd()
-    )
-    out_file = local_out_dir / f"{run_name}.tar.zst"
-    if out_file.exists():
-        raise FileExistsError(f"Output file already exists: {out_file}")
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(local_out_dir, run_name=run_name)
+    ensure_output_file_available(out_file)
 
     # Run inference
     if search_msa:
@@ -381,6 +383,5 @@ def submit_alphafold3_task(
     )
 
     # Save results locally
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_file.write_bytes(tarball_bytes)
+    write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 {CONF.name} run complete! Results saved to {out_file}")

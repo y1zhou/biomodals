@@ -38,6 +38,12 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.output import (
+    build_local_output_path,
+    ensure_output_file_available,
+    resolve_local_output_dir,
+    write_local_tarball,
+)
 from biomodals.helper.shell import (
     package_outputs,
     run_command,
@@ -107,9 +113,8 @@ class AppInfo:
 ##########################################
 APP_INFO = AppInfo()
 runtime_image = patch_image_for_helper(
-    modal.Image.from_registry(
-        f"nvidia/cuda:{APP_INFO.cuda_tag}", add_python=CONF.python_version
-    )
+    modal.Image
+    .from_registry(f"nvidia/cuda:{APP_INFO.cuda_tag}", add_python=CONF.python_version)
     .entrypoint([])  # remove verbose logging in the base image
     .apt_install("git", "build-essential", "zstd", "hmmer", "kalign", "wget")
     .env(
@@ -576,12 +581,13 @@ def submit_protenix_task(
     if run_name is None:
         run_name = input_path.stem
 
-    local_out_dir = (
-        Path(out_dir).expanduser().resolve() if out_dir is not None else Path.cwd()
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(
+        local_out_dir,
+        run_name=run_name,
+        suffix=f"_{CONF.name}",
     )
-    out_file = local_out_dir / f"{run_name}_{CONF.name}.tar.zst"
-    if out_file.exists():
-        raise FileExistsError(f"Output file already exists: {out_file}")
+    ensure_output_file_available(out_file)
 
     # Ensure models and data caches are available
     print(f"🧬 Checking Protenix model and data caches for {model_name}...")
@@ -635,6 +641,5 @@ def submit_protenix_task(
         )
 
     # Save results locally
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_file.write_bytes(tarball_bytes)
+    write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 Protenix run complete! Results saved to {out_file}")

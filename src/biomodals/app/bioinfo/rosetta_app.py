@@ -13,6 +13,7 @@ See <https://docs.rosettacommons.org/docs/latest/Home> for documentation.
 import os
 import subprocess
 from collections.abc import Iterable
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,7 +24,7 @@ import polars as pl
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.shell import package_outputs
+from biomodals.helper.shell import package_outputs, sanitize_filename
 
 ##########################################
 # Modal configs
@@ -39,6 +40,113 @@ CONF = AppConfig(
 )
 OUT_VOLUME = CONF.get_out_volume()
 ROSETTA_DIR = Path(__file__).parent / "rosetta"
+
+
+@dataclass(frozen=True)
+class _RosettaCommandJob:
+    index: str
+    binary: str
+    pdb_path: Path
+    out_dir: Path
+    rosetta_script_path: Path | None = None
+    flags_path: Path | None = None
+
+
+def _build_rosetta_command(
+    *,
+    binary: str,
+    pdb_path: Path,
+    out_dir: Path,
+    rosetta_script_path: Path | None = None,
+    flags_path: Path | None = None,
+) -> list[str]:
+    cmd = [binary]
+    if rosetta_script_path is not None:
+        cmd.extend(["-parser:protocol", str(rosetta_script_path)])
+    if flags_path is not None:
+        cmd.append(f"@{flags_path}")
+    cmd.extend(["-s", str(pdb_path), "-out:path:all", str(out_dir)])
+    return cmd
+
+
+def _command_for_rosetta_job(job: _RosettaCommandJob) -> list[str]:
+    return _build_rosetta_command(
+        binary=job.binary,
+        pdb_path=job.pdb_path,
+        out_dir=job.out_dir,
+        rosetta_script_path=job.rosetta_script_path,
+        flags_path=job.flags_path,
+    )
+
+
+def _required_rosetta_job_value(job_spec: dict[str, object], key: str) -> object:
+    value = job_spec[key]
+    if value is None:
+        raise ValueError(f"Rosetta job is missing {key!r}")
+    return value
+
+
+def _optional_mounted_path(mount_dir: Path, path: object) -> Path | None:
+    if path is None:
+        return None
+    return mount_dir / str(path)
+
+
+def _normalize_volume_rosetta_job(
+    job_spec: dict[str, object], *, mount_dir: Path, workdir: Path
+) -> _RosettaCommandJob:
+    task_idx = str(_required_rosetta_job_value(job_spec, "index"))
+    return _RosettaCommandJob(
+        index=task_idx,
+        binary=str(_required_rosetta_job_value(job_spec, "binary")),
+        pdb_path=mount_dir / str(_required_rosetta_job_value(job_spec, "pdb")),
+        out_dir=workdir / task_idx,
+        rosetta_script_path=_optional_mounted_path(
+            mount_dir, job_spec.get("rosetta_script")
+        ),
+        flags_path=_optional_mounted_path(mount_dir, job_spec.get("flags_file")),
+    )
+
+
+def _write_optional_rosetta_text_file(
+    job_dir: Path, job_spec: dict[str, object], key: str
+) -> Path | None:
+    text = job_spec.get(f"{key}_text")
+    if text is None:
+        return None
+    name = sanitize_filename(str(job_spec.get(f"{key}_name") or f"{key}.txt"))
+    path = job_dir / name
+    path.write_text(str(text))
+    return path
+
+
+def _normalize_bytes_rosetta_job(
+    job_spec: dict[str, object], *, inputs_dir: Path, outputs_dir: Path
+) -> _RosettaCommandJob:
+    idx = sanitize_filename(str(job_spec.get("index") or len(str(job_spec))))
+    job_dir = inputs_dir / idx
+    out_dir = outputs_dir / idx
+    job_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pdb_bytes = job_spec.get("pdb_bytes")
+    if not isinstance(pdb_bytes, bytes):
+        raise TypeError(f"Rosetta job {idx!r} is missing pdb_bytes")
+    pdb_name = sanitize_filename(str(job_spec.get("pdb_name") or f"{idx}.pdb"))
+    pdb_path = job_dir / pdb_name
+    pdb_path.write_bytes(pdb_bytes)
+
+    return _RosettaCommandJob(
+        index=idx,
+        binary=str(job_spec.get("binary") or "relax"),
+        pdb_path=pdb_path,
+        out_dir=out_dir,
+        rosetta_script_path=_write_optional_rosetta_text_file(
+            job_dir, job_spec, "rosetta_script"
+        ),
+        flags_path=_write_optional_rosetta_text_file(job_dir, job_spec, "flags"),
+    )
+
 
 ##########################################
 # Image and app definitions
@@ -75,22 +183,14 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
                 print(f"💊 No more jobs in queue for worker {worker_idx}")
                 return
 
-            task_idx = str(job_spec["index"])
-            binary = job_spec["binary"]
-            pdb = job_spec["pdb"]
-            rosetta_script = job_spec["rosetta_script"]
-            flags_file = job_spec["flags_file"]
-
-            cmd = [binary]
-            if rosetta_script is not None:
-                cmd.extend(["-parser:protocol", str(mount_dir / rosetta_script)])
-            if flags_file is not None:
-                cmd.append(f"@{mount_dir / flags_file}")
-
-            cmd.extend(
-                ["-s", str(mount_dir / pdb), "-out:path:all", str(workdir / task_idx)]
+            job = _normalize_volume_rosetta_job(
+                job_spec,
+                mount_dir=mount_dir,
+                workdir=workdir,
             )
-            run_command_with_log(cmd, log_file=workdir / task_idx / "rosetta.log")
+            run_command_with_log(
+                _command_for_rosetta_job(job), log_file=job.out_dir / "rosetta.log"
+            )
             OUT_VOLUME.commit()
 
     # Run workers in parallel within the pod
@@ -136,7 +236,7 @@ def run_rosetta_batch_bytes(
     """Run Rosetta jobs from in-memory inputs and return packaged outputs."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from biomodals.helper.shell import run_command_with_log, sanitize_filename
+    from biomodals.helper.shell import run_command_with_log
 
     if not jobs:
         raise ValueError("At least one Rosetta job is required")
@@ -149,45 +249,19 @@ def run_rosetta_batch_bytes(
         inputs_dir.mkdir(parents=True, exist_ok=True)
         outputs_dir.mkdir(parents=True, exist_ok=True)
 
-        def _write_optional_text(
-            job_dir: Path, job: dict[str, object], key: str
-        ) -> Path | None:
-            text = job.get(f"{key}_text")
-            if text is None:
-                return None
-            name = sanitize_filename(str(job.get(f"{key}_name") or f"{key}.txt"))
-            path = job_dir / name
-            path.write_text(str(text))
-            return path
-
-        def _worker(job: dict[str, object]) -> None:
-            idx = sanitize_filename(str(job.get("index") or len(str(job))))
-            job_dir = inputs_dir / idx
-            out_dir = outputs_dir / idx
-            job_dir.mkdir(parents=True, exist_ok=True)
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            pdb_bytes = job.get("pdb_bytes")
-            if not isinstance(pdb_bytes, bytes):
-                raise TypeError(f"Rosetta job {idx!r} is missing pdb_bytes")
-            pdb_name = sanitize_filename(str(job.get("pdb_name") or f"{idx}.pdb"))
-            pdb_path = job_dir / pdb_name
-            pdb_path.write_bytes(pdb_bytes)
-
-            script_path = _write_optional_text(job_dir, job, "rosetta_script")
-            flags_path = _write_optional_text(job_dir, job, "flags")
-            binary = str(job.get("binary") or "relax")
-            cmd = [binary]
-            if script_path is not None:
-                cmd.extend(["-parser:protocol", str(script_path)])
-            if flags_path is not None:
-                cmd.append(f"@{flags_path}")
-            cmd.extend(["-s", str(pdb_path), "-out:path:all", str(out_dir)])
+        def _worker(job_spec: dict[str, object]) -> None:
+            job = _normalize_bytes_rosetta_job(
+                job_spec,
+                inputs_dir=inputs_dir,
+                outputs_dir=outputs_dir,
+            )
 
             try:
-                run_command_with_log(cmd, log_file=out_dir / "rosetta.log")
+                run_command_with_log(
+                    _command_for_rosetta_job(job), log_file=job.out_dir / "rosetta.log"
+                )
             except subprocess.CalledProcessError:
-                (out_dir / "FAILED").write_text("Rosetta command failed\n")
+                (job.out_dir / "FAILED").write_text("Rosetta command failed\n")
                 raise
 
         max_workers = max(1, min(num_cpu_per_pod, len(jobs), 30))
@@ -251,14 +325,12 @@ def _prepare_input_csv(
                 "'input_pdb' needs to be provided if 'input_csv' is not provided"
             )
         rel_root_dir = Path.cwd()
-        df = pl.DataFrame(
-            {
-                "binary": [rosetta_binary],
-                "pdb": [input_pdb],
-                "rosetta_script": [input_rosetta_script],
-                "flags_file": [input_flags_file],
-            }
-        )
+        df = pl.DataFrame({
+            "binary": [rosetta_binary],
+            "pdb": [input_pdb],
+            "rosetta_script": [input_rosetta_script],
+            "flags_file": [input_flags_file],
+        })
 
     # Check for missing values in required columns
     df = df.select(pl.col(c).cast(pl.Utf8) for c in cols)
@@ -286,10 +358,12 @@ def _prepare_input_csv(
         raise FileNotFoundError(f"'{col_name}' file not found locally: {local_path}")
 
     df_pdbs = (
-        df.select("pdb")
+        df
+        .select("pdb")
         .unique()
         .with_columns(
-            pl.col("pdb")
+            pl
+            .col("pdb")
             .map_elements(
                 lambda p: str(_localize_input_path(p, col_name="pdb")),
                 return_dtype=pl.Utf8,
@@ -322,7 +396,8 @@ def _prepare_input_csv(
     df_flags = _get_file_hashes("flags_file", "flags_hash", "flags_path")
 
     return (
-        df.join(df_pdbs, on="pdb", how="left", maintain_order="left")
+        df
+        .join(df_pdbs, on="pdb", how="left", maintain_order="left")
         .join(df_scripts, on="rosetta_script", how="left", maintain_order="left")
         .join(df_flags, on="flags_file", how="left", maintain_order="left")
         .with_columns(
@@ -433,15 +508,13 @@ def submit_rosetta_task(
                     batch.put_file(local_flags, f"/{remote_flags}")
                     uploaded_files.add(remote_flags)
 
-            queue.put(
-                {
-                    "index": r["index"],
-                    "binary": r["binary"],
-                    "pdb": remote_pdb,
-                    "rosetta_script": remote_script,
-                    "flags_file": remote_flags,
-                }
-            )
+            queue.put({
+                "index": r["index"],
+                "binary": r["binary"],
+                "pdb": remote_pdb,
+                "rosetta_script": remote_script,
+                "flags_file": remote_flags,
+            })
         buffer = BytesIO()
         tasks_df.write_parquet(buffer)
         batch.put_file(buffer, f"/{run_name}-{run_id}/tasks.parquet")

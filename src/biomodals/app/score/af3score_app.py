@@ -31,6 +31,10 @@ from biomodals.helper.shell import (
     run_command_with_log,
     sanitize_filename,
 )
+from biomodals.helper.volume_run import (
+    build_volume_run_paths,
+    has_completed_output_files,
+)
 
 ##########################################
 # Modal configs
@@ -104,26 +108,21 @@ def _get_af3_sanitized_name(name: str) -> str:
 
 def _run_paths(run_name: str) -> dict[str, Path]:
     """Return the standard run-level paths for one AF3Score output directory."""
-    mount_path = Path(CONF.output_volume_mountpoint)
-    run_root = mount_path / run_name
-    output_dir = run_root / "outputs"
-    return {
-        "mount_root": mount_path,
-        "run_root": run_root,
-        "inputs_dir": run_root / "inputs",
-        "prep_dir": run_root / "prepare",
-        "output_dir": output_dir,
-        "failed_dir": output_dir / "failed_records",
-        "metrics_csv": run_root / "af3score_metrics.csv",
-    }
+    return build_volume_run_paths(
+        Path(CONF.output_volume_mountpoint),
+        run_name,
+        metrics_filename="af3score_metrics.csv",
+    )
 
 
 def _has_completed_outputs(output_dir: Path, input_id: str) -> bool:
     """Check whether AF3Score wrote the required output JSON files."""
-    sample_dir = output_dir / input_id / "seed-10_sample-0"
-    return (sample_dir / "summary_confidences.json").exists() and (
-        sample_dir / "confidences.json"
-    ).exists()
+    return has_completed_output_files(
+        output_dir,
+        input_id,
+        sample_subdir="seed-10_sample-0",
+        required_files=("summary_confidences.json", "confidences.json"),
+    )
 
 
 def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:

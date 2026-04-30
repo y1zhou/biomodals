@@ -32,6 +32,10 @@ from biomodals.helper.shell import (
     run_command_with_log,
     sanitize_filename,
 )
+from biomodals.helper.volume_run import (
+    build_volume_run_paths,
+    has_completed_output_files,
+)
 
 ##########################################
 # Modal configs
@@ -61,7 +65,8 @@ class AppInfo:
 ##########################################
 APP_INFO = AppInfo()
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install(
         "build-essential", "cmake", "git", "ninja-build", "pkg-config", "zlib1g-dev"
     )
@@ -76,13 +81,11 @@ runtime_image = patch_image_for_helper(
         }
     )
     .run_commands(
-        " && ".join(
-            (
-                f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
-                f"cd {CONF.git_clone_dir}",
-                f"git checkout {CONF.repo_commit_hash}",
-            )
-        )
+        " && ".join((
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+        ))
     )
     .workdir(str(CONF.git_clone_dir))
     .uv_pip_install(str(CONF.git_clone_dir), "biopython", "h5py", "pandas")
@@ -105,26 +108,21 @@ def _get_af3_sanitized_name(name: str) -> str:
 
 def _run_paths(run_name: str) -> dict[str, Path]:
     """Return the standard run-level paths for one AF3Score output directory."""
-    mount_path = Path(CONF.output_volume_mountpoint)
-    run_root = mount_path / run_name
-    output_dir = run_root / "outputs"
-    return {
-        "mount_root": mount_path,
-        "run_root": run_root,
-        "inputs_dir": run_root / "inputs",
-        "prep_dir": run_root / "prepare",
-        "output_dir": output_dir,
-        "failed_dir": output_dir / "failed_records",
-        "metrics_csv": run_root / "af3score_metrics.csv",
-    }
+    return build_volume_run_paths(
+        Path(CONF.output_volume_mountpoint),
+        run_name,
+        metrics_filename="af3score_metrics.csv",
+    )
 
 
 def _has_completed_outputs(output_dir: Path, input_id: str) -> bool:
     """Check whether AF3Score wrote the required output JSON files."""
-    sample_dir = output_dir / input_id / "seed-10_sample-0"
-    return (sample_dir / "summary_confidences.json").exists() and (
-        sample_dir / "confidences.json"
-    ).exists()
+    return has_completed_output_files(
+        output_dir,
+        input_id,
+        sample_subdir="seed-10_sample-0",
+        required_files=("summary_confidences.json", "confidences.json"),
+    )
 
 
 def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
@@ -266,29 +264,25 @@ def af3score_prepare(
         shutil.rmtree(prepare_root)
     pending_input_dir.mkdir(parents=True, exist_ok=True)
 
-    copy_files(
-        {
-            source_path: pending_input_dir / source_path.name
-            for source_path in pending_files
-        }
-    )
+    copy_files({
+        source_path: pending_input_dir / source_path.name
+        for source_path in pending_files
+    })
     # Adjust CPU and GPU resources
     n_batches, n_cpu = _adjust_num_cpu_gpu(
         len(pending_files), num_jobs, prepare_workers
     )
-    run_command(
-        [
-            sys.executable,
-            str(CONF.git_clone_dir / "01_prepare_get_json.py"),
-            f"--input_dir={pending_input_dir}",
-            f"--output_dir_cif={prepare_root / 'single_chain_cif'}",
-            f"--save_csv={prepare_root / 'single_seq.csv'}",
-            f"--output_dir_json={prepare_root / 'json'}",
-            f"--batch_dir={batch_dir}",
-            f"--num_jobs={n_batches}",
-            f"--num_workers={n_cpu}",
-        ]
-    )
+    run_command([
+        sys.executable,
+        str(CONF.git_clone_dir / "01_prepare_get_json.py"),
+        f"--input_dir={pending_input_dir}",
+        f"--output_dir_cif={prepare_root / 'single_chain_cif'}",
+        f"--save_csv={prepare_root / 'single_seq.csv'}",
+        f"--output_dir_json={prepare_root / 'json'}",
+        f"--batch_dir={batch_dir}",
+        f"--num_jobs={n_batches}",
+        f"--num_workers={n_cpu}",
+    ])
 
     chunk_specs: list[ChunkSpec] = []
     batch_json_root = batch_dir / "json"
@@ -343,15 +337,13 @@ def af3score_run(
         # TODO: Benchmark whether AF3Score's JAX preprocessing can safely scale past one worker.
         jax_workers = 1
         print(f"💊 [RUN] Converting PDB to JAX arrays for batch '{batch_name}'")
-        run_command(
-            [
-                sys.executable,
-                str(CONF.git_clone_dir / "02_prepare_pdb2jax.py"),
-                f"--pdb_folder={batch_pdb_dir}",
-                f"--output_folder={batch_h5_dir}",
-                f"--num_workers={jax_workers}",
-            ]
-        )
+        run_command([
+            sys.executable,
+            str(CONF.git_clone_dir / "02_prepare_pdb2jax.py"),
+            f"--pdb_folder={batch_pdb_dir}",
+            f"--output_folder={batch_h5_dir}",
+            f"--num_workers={jax_workers}",
+        ])
 
         # TODO: this or reuse AlphaFold3 buckets?
         bucket = batch_name.rsplit("_", 1)[-1]
@@ -432,16 +424,14 @@ def af3score_postprocess(
                 candidate,
                 target_is_directory=True,
             )
-        run_command(
-            [
-                sys.executable,
-                str(CONF.git_clone_dir / "04_get_metrics.py"),
-                f"--input_pdb_dir={paths['inputs_dir']}",
-                f"--af3score_output_dir={metrics_view_dir}",
-                f"--save_metric_csv={out_csv_path}",
-                f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",
-            ]
-        )
+        run_command([
+            sys.executable,
+            str(CONF.git_clone_dir / "04_get_metrics.py"),
+            f"--input_pdb_dir={paths['inputs_dir']}",
+            f"--af3score_output_dir={metrics_view_dir}",
+            f"--save_metric_csv={out_csv_path}",
+            f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",
+        ])
 
     with out_csv_path.open(encoding="utf-8") as f:
         metrics_rows = max(0, sum(1 for _ in f) - 1)
@@ -510,19 +500,17 @@ def af3score_run_bytes(
         n_batches, n_cpu = _adjust_num_cpu_gpu(
             len(all_files), max_batches, prepare_workers
         )
-        run_command(
-            [
-                sys.executable,
-                str(CONF.git_clone_dir / "01_prepare_get_json.py"),
-                f"--input_dir={pending_input_dir}",
-                f"--output_dir_cif={prep_dir / 'single_chain_cif'}",
-                f"--save_csv={prep_dir / 'single_seq.csv'}",
-                f"--output_dir_json={prep_dir / 'json'}",
-                f"--batch_dir={batch_dir}",
-                f"--num_jobs={n_batches}",
-                f"--num_workers={n_cpu}",
-            ]
-        )
+        run_command([
+            sys.executable,
+            str(CONF.git_clone_dir / "01_prepare_get_json.py"),
+            f"--input_dir={pending_input_dir}",
+            f"--output_dir_cif={prep_dir / 'single_chain_cif'}",
+            f"--save_csv={prep_dir / 'single_seq.csv'}",
+            f"--output_dir_json={prep_dir / 'json'}",
+            f"--batch_dir={batch_dir}",
+            f"--num_jobs={n_batches}",
+            f"--num_workers={n_cpu}",
+        ])
 
         batch_json_root = batch_dir / "json"
         for batch_json_dir in sorted(batch_json_root.iterdir()):
@@ -533,15 +521,13 @@ def af3score_run_bytes(
             with TemporaryDirectory(prefix=f"af3score_gpu_{batch_name}_") as temp_dir:
                 batch_h5_dir = Path(temp_dir) / "jax"
                 batch_h5_dir.mkdir(parents=True, exist_ok=True)
-                run_command(
-                    [
-                        sys.executable,
-                        str(CONF.git_clone_dir / "02_prepare_pdb2jax.py"),
-                        f"--pdb_folder={batch_pdb_dir}",
-                        f"--output_folder={batch_h5_dir}",
-                        "--num_workers=1",
-                    ]
-                )
+                run_command([
+                    sys.executable,
+                    str(CONF.git_clone_dir / "02_prepare_pdb2jax.py"),
+                    f"--pdb_folder={batch_pdb_dir}",
+                    f"--output_folder={batch_h5_dir}",
+                    "--num_workers=1",
+                ])
 
                 bucket = batch_name.rsplit("_", 1)[-1]
                 af3_weights = Path(CONF.model_volume_mountpoint) / APP_INFO.af3_weights
@@ -591,16 +577,14 @@ def af3score_run_bytes(
                 (metrics_view_dir / candidate.name).symlink_to(
                     candidate, target_is_directory=True
                 )
-            run_command(
-                [
-                    sys.executable,
-                    str(CONF.git_clone_dir / "04_get_metrics.py"),
-                    f"--input_pdb_dir={inputs_dir}",
-                    f"--af3score_output_dir={metrics_view_dir}",
-                    f"--save_metric_csv={metrics_csv}",
-                    f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",
-                ]
-            )
+            run_command([
+                sys.executable,
+                str(CONF.git_clone_dir / "04_get_metrics.py"),
+                f"--input_pdb_dir={inputs_dir}",
+                f"--af3score_output_dir={metrics_view_dir}",
+                f"--save_metric_csv={metrics_csv}",
+                f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",
+            ])
 
         return package_outputs(run_root)
 

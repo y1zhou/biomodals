@@ -1,0 +1,4 @@
+interface:
+  display_name: "Biomodals App Development"
+  short_description: "Build and review Biomodals Modal apps"
+  default_prompt: "Use $biomodals-app-development to create or review a biomodals Modal app."

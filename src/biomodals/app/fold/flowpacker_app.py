@@ -40,8 +40,14 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, run_command_with_log
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.output import (
+    build_local_output_path,
+    ensure_output_file_available,
+    resolve_local_output_dir,
+    write_local_tarball,
+)
+from biomodals.helper.shell import package_outputs, run_command_with_log
 
 ##########################################
 # Modal configs
@@ -92,17 +98,16 @@ class AppInfo:
 APP_INFO = AppInfo()
 
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "git-lfs", "build-essential")
     .env(CONF.default_env | {"GIT_LFS_SKIP_SMUDGE": "1"})
     .run_commands(
-        " && ".join(
-            (
-                f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
-                f"cd {CONF.git_clone_dir}",
-                f"git checkout {CONF.repo_commit_hash}",
-            )
-        )
+        " && ".join((
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+        ))
     )
     .workdir(str(CONF.git_clone_dir))
     .uv_pip_install(
@@ -129,7 +134,7 @@ def _checkpoint_path(name: str) -> Path:
 )
 def download_flowpacker_checkpoints(force: bool = False) -> None:
     """Download FlowPacker Git LFS checkpoints into the model volume."""
-    from biomodals.app.helper.shell import run_command
+    from biomodals.helper.shell import run_command
 
     checkpoint_dir = CONF.model_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -402,12 +407,9 @@ def submit_flowpacker_task(
             resolved_input.stem if resolved_input.is_file() else resolved_input.name
         )
 
-    local_out_dir = (
-        Path(out_dir).expanduser().resolve() if out_dir is not None else Path.cwd()
-    )
-    out_file = local_out_dir / f"{run_name}.tar.zst"
-    if out_file.exists():
-        raise FileExistsError(f"Output file already exists: {out_file}")
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(local_out_dir, run_name=run_name)
+    ensure_output_file_available(out_file)
 
     print(f"🧬 Submitting FlowPacker run '{run_name}' with {len(input_files)} input(s)")
     tarball_bytes = run_flowpacker.remote(
@@ -424,6 +426,5 @@ def submit_flowpacker_task(
         seed=seed,
     )
 
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_file.write_bytes(tarball_bytes)
+    write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 Run complete! Results saved to {out_file}")

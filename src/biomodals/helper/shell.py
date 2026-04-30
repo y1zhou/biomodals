@@ -8,7 +8,7 @@ import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
-from biomodals.app.helper.internal import timed_function
+from biomodals.helper.internal import timed_function
 
 
 def _build_env(env: dict[str, str] | None) -> dict[str, str]:

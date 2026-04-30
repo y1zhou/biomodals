@@ -1,1625 +1,1602 @@
-"""PPIFlow source repo: <https://github.com/zhuqianhui2-hash/PPIFlow>.
+"""Modal workflow orchestrator for the PPIFlow two-stage design pipeline.
 
-This file (`ppiflow_app.py`) is a **single Modal entrypoint** that routes to multiple upstream
-PPIFlow sampling scripts (binder / antibody / nanobody / monomer / partial-flow variants),
-while enforcing a **stable output layout** and **inference-safe config override**.
+This workflow preserves the upstream PPIFlow scheduler inputs:
 
-## What this wrapper guarantees
+    modal run src/biomodals/workflow/ppiflow_workflow.py \
+      --task task.yaml \
+      --steps steps.yaml \
+      --stage 1
 
-- **One CLI** (`--task`) for multiple PPIFlow scripts in `/ppiflow/sample_*.py`.
-- **Role-based uploads**: local input files are uploaded with stable filenames (e.g. `binder_input.pdb`,
-  `antigen.pdb`, `framework.pdb`, `complex.pdb`, `motif.csv`) so the remote worker never guesses ordering.
-- **Forced outputs** (remote side):
-  - `--output_dir` is forced to `/runs/<task>/<run_name>/outputs`
-  - `--name` is forced to `<run_name>`
-- **Effective config** (remote side):
-  - If a `--config` is provided, an `effective_config.yaml` is written under the run directory with:
-    `model.use_deepspeed_evo_attention = False`
-  - This makes inference **portable** (does not require deepspeed/nvcc kernels).
-
-## Configuration
-
-### Primary flags (local entrypoint)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--task` | `binder` | Task router. One of: `binder`, `antibody`, `nanobody`, `monomer`, `scaffolding`, `ab_partial_flow`, `nb_partial_flow`, `binder_partial_flow`, `mpnn_stage1`, `mpnn_stage2`. |
-| `--run-name` | `test1` | Unique run identifier. Controls output directory name and tarball name (`<task>.<run-name>.tar.gz`). |
-| `--out-dir` | `./ppiflow_outputs` | Local directory to write the returned run bundle (`.tar.gz`). |
-| `--model-weights` | **Required** | Local/remote path to a checkpoint. Remote resolves to `/models/<basename>` unless already under `/models/`. |
-| `--config` | `None` | YAML config path (absolute in container or repo-relative). If provided, it will be rewritten to `effective_config.yaml` with deepspeed evo attention disabled. |
-
-### Input file flags (local -> uploaded to Modal)
-
-| Task | Required local file flags | Uploaded filename on worker |
-|------|---------------------------|-----------------------------|
-| `binder` | `--binder-input-pdb` | `binder_input.pdb` |
-| `binder_partial_flow` | `--binder-input-pdb` | `binder_input.pdb` |
-| `antibody` / `nanobody` | `--ab-antigen-pdb`, `--ab-framework-pdb` | `antigen.pdb`, `framework.pdb` |
-| `ab_partial_flow` / `nb_partial_flow` | `--pf-complex-pdb` | `complex.pdb` |
-| `scaffolding` | `--scaffold-motif-csv` | `motif.csv` |
-| `monomer` | *(no file upload required)* | *(none)* |
-| `mpnn_stage1` | *(no local upload; uses existing run)* | *(none; reads `/runs/<mpnn_source_task>/<mpnn_source_run>/outputs/*.pdb`)* |
-| `mpnn_stage2` | *(no local upload; uses existing run)* | *(none; reads `/runs/<mpnn_source_task>/<mpnn_source_run>/outputs/*.pdb`)* |
-
-### Binder args (sample_binder.py)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--binder-target-chain` | `B` | Target chain ID passed to `--target_chain`. |
-| `--binder-binder-chain` | `A` | Binder chain ID passed to `--binder_chain`. |
-| `--binder-specified-hotspots` | `None` | Hotspots string, e.g. `"B119,B141,B200"`. |
-| `--binder-samples-min-length` | `75` | Minimum binder length. |
-| `--binder-samples-max-length` | `76` | Maximum binder length. |
-| `--binder-samples-per-target` | `5` | Number of samples per target. |
-
-### Antibody / Nanobody args (sample_antibody_nanobody.py)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--ab-antigen-chain` | `None` | **Required** for `antibody/nanobody`. Passed to `--antigen_chain`. |
-| `--ab-heavy-chain` | `None` | **Required** for `antibody/nanobody`. Passed to `--heavy_chain`. |
-| `--ab-light-chain` | `None` | Optional light chain. Passed to `--light_chain` when provided. |
-| `--ab-specified-hotspots` | `None` | Optional hotspot residues on antigen, e.g. `"A56,A58"`. |
-| `--ab-cdr-length` | `None` | Optional CDR length override (string format per upstream script). |
-| `--ab-samples-per-target` | `5` | Samples per target for antibody/nanobody. |
-
-### Monomer unconditional args (sample_monomer.py)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--mono-length-subset` | `None` | **Required** for `monomer`. String list, e.g. `"[60, 80, 100]"`. |
-| `--mono-samples-num` | `5` | Number of unconditional samples. |
-
-### Scaffolding args (sample_monomer.py motif mode)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--scaffold-motif-names` | `None` | Optional motif name filter passed as `--motif_names`. |
-| `--scaffold-samples-num` | `5` | Number of scaffolding samples. |
-
-### Partial flow antibody / nanobody args (sample_antibody_nanobody_partial.py)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--pf-fixed-positions` | `None` | **Required**. Fixed positions string, e.g. `"H26,H27,H28,L50-63"`. |
-| `--pf-cdr-position` | `None` | **Required**. CDR ranges string, e.g. `"H26-32,H45-56,H97-113"`. |
-| `--pf-start-t` | `None` | **Required**. Partial flow start time (float). |
-| `--pf-samples-per-target` | `None` | **Required**. Samples per target. |
-| `--pf-retry-limit` | `10` | Passed as `--retry_Limit` (upstream spelling). |
-| `--pf-specified-hotspots` | `None` | Optional hotspots for partial flow. |
-| `--pf-antigen-chain` | `None` | **Required**. Passed to `--antigen_chain`. |
-| `--pf-heavy-chain` | `None` | **Required**. Passed to `--heavy_chain`. |
-| `--pf-light-chain` | `None` | Optional. Passed to `--light_chain` when provided. |
-
-### Partial flow binder args (sample_binder_partial.py)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--bpf-target-chain` | `B` | Target chain passed to `--target_chain`. |
-| `--bpf-binder-chain` | `A` | Binder chain passed to `--binder_chain`. |
-| `--bpf-start-t` | `0.7` | Partial flow start time passed to `--start_t`. |
-
-### MPNN / ABMPNN tasks
-For a complete set of protein_mpnn CLI options that can be used, see <https://github.com/Mingchenchen/PPIFlow/blob/main/ProteinMPNN/README.md>.
-
-
-`mpnn_stage1` and `mpnn_stage2` both run sequence design on an existing backbone run:
-
-- Required source run flags: `--mpnn-source-task`, `--mpnn-source-run`
-- Input backbones come from: `/runs/<mpnn_source_task>/<mpnn_source_run>/outputs/*.pdb`
-- Model choice: `--mpnn-model-name` (use `abmpnn` to run ABMPNN weights from `/models/abmpnn.pt`)
-- Runtime controls: `--mpnn-batch-size` (default `1`), `--mpnn-seed` (default `0`)
-- Optional design constraints:
-  - `--mpnn-chain-list` (chains to design)
-  - `--mpnn-position-list` (CSV path for fixed positions; if omitted, design is unconstrained/full-chain)
-  - `--mpnn-omit-aas` (optional amino acids to omit, e.g. `C`)
-  - `--mpnn-use-soluble-model` (optional flag for ProteinMPNN soluble weights mode)
-
-Stage semantics in this wrapper:
-
-- `mpnn_stage1` (exploration): default `--mpnn-num-seq-per-target-stage1 8`, `--mpnn-temp-stage1 0.5`
-- `mpnn_stage2` (conservative refinement): default `--mpnn-num-seq-per-target-stage2 4`, `--mpnn-temp-stage2 0.1`
-
-Current behavior note:
-
-- `mpnn_stage2` currently does not consume AF3-filtered outputs automatically; it is a second MPNN pass with different sampling settings.
-
-## Environment variables (Modal)
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `MODAL_APP` | `ppiflow` | Name of the Modal app. |
-| `GPU` | `L40S` | GPU type for the worker (e.g. `A10G`, `A100`, `L40S`). |
-| `TIMEOUT` | `36000` | Modal function timeout (seconds). |
-
-## Persistent volumes & paths
-
-- Models volume: `ppiflow-models` mounted at `/models`
-- Runs volume: `ppiflow-runs` mounted at `/ppiflow-runs`
-
-Expected checkpoint layout (one-time upload examples):
-  1) ppiflow
-  modal volume put ppiflow-models antibody.ckpt /antibody.ckpt
-  modal volume put ppiflow-models binder.ckpt /binder.ckpt
-  modal volume put ppiflow-models monomer.ckpt /monomer.ckpt
-  modal volume put ppiflow-models nanobody.ckpt /nanobody.ckpt  2) proteinmpnn
-  2) Upload ProteinMPNN weights to persistent Volume (one-time)
-  modal volume put ppiflow-models v_48_002.pt /proteinmpnn_v_48_002.pt
-  modal volume put ppiflow-models v_48_010.pt /proteinmpnn_v_48_010.pt
-  modal volume put ppiflow-models v_48_020.pt /proteinmpnn_v_48_020.pt
-  3) abmpnn weights
-  modal volume put ppiflow-models abmpnn.pt /abmpnn.pt
-
-## Outputs
-
-- Each run is stored under the runs volume at:
-  `/runs/<task>/<run_name>/`
-  with:
-  - `inputs/`  (uploaded inputs)
-  - `outputs/` (upstream script outputs; forced `--output_dir`)
-  - `effective_config.yaml` (if `--config` provided)
-  - `cmd.txt` (exact executed command)
-  - `stdout.log` (combined stdout/stderr)
-  - `artifacts/` (best-effort collected: metrics/config + any `.csv`)
-
-- The local CLI saves a `.tar.gz` bundle to:
-  `<out-dir>/<task>.<run-name>.tar.gz`
-
-## Typical usage
-
-  # Binder (de novo)
-  modal run ppiflow_app.py --task binder -- \
-    --binder-input-pdb ~/target.pdb \
-    --binder-target-chain B \
-    --binder-binder-chain A \
-    --binder-specified-hotspots "B119,B141,B200" \
-    --binder-samples-min-length 75 \
-    --binder-samples-max-length 76 \
-    --binder-samples-per-target 5 \
-    --config /ppiflow/configs/inference_binder.yaml \
-    --model-weights /models/binder.ckpt \
-    --run-name test1 \
-    --out-dir ./ppiflow_outputs
-
-  # Antibody partial flow
-  modal run ppiflow_app.py --task ab_partial_flow -- \
-    --pf-complex-pdb ~/complex.pdb \
-    --pf-fixed-positions "H26,H27,H28,L50-63" \
-    --pf-cdr-position "H26-32,H45-56,H97-113" \
-    --pf-start-t 0.8 \
-    --pf-samples-per-target 5 \
-    --pf-antigen-chain A \
-    --pf-heavy-chain H \
-    --pf-light-chain L \
-    --model-weights /models/antibody.ckpt \
-    --run-name abp1
-
-  # MPNN stage1 (exploration) on an existing binder run
-  modal run ppiflow_app.py --task mpnn_stage1 -- \
-    --mpnn-source-task binder \
-    --mpnn-source-run test1 \
-    --mpnn-model-name v_48_020 \
-    --mpnn-num-seq-per-target-stage1 8 \
-    --mpnn-temp-stage1 0.5 \
-    --run-name mpnn_test1\
-    --mpnn-batch-size 1 \
-    --mpnn-seed 0
-
-
-  # MPNN stage2 (conservative refinement) on the same source run
-  modal run ppiflow_app.py --task mpnn_stage2 -- \
-    --mpnn-source-task binder \
-    --mpnn-source-run test1 \
-    --mpnn-model-name v_48_020 \
-    --mpnn-num-seq-per-target-stage2 4 \
-    --mpnn-temp-stage2 0.1 \
-    --run-name test1 \
-    --mpnn-batch-size 1 \
-    --mpnn-seed 0
-
-  # ABMPNN with fixed framework positions (design only selected residues/chains)
-  modal run ppiflow_app.py --task mpnn_stage1 -- \
-    --mpnn-source-task nanobody \
-    --mpnn-source-run nb1 \
-    --mpnn-model-name abmpnn \
-    --mpnn-chain-list A \
-    --mpnn-position-list ./fixed_positions.csv \
-    --mpnn-num-seq-per-target-stage1 8 \
-    --mpnn-temp-stage1 0.5
-
-  # ABMPNN full design (no fixed positions file provided)
-  modal run ppiflow_app.py --task mpnn_stage1 -- \
-    --mpnn-source-task nanobody \
-    --mpnn-source-run nb1 \
-    --mpnn-model-name abmpnn \
-    --mpnn-num-seq-per-target-stage1 8 \
-    --mpnn-temp-stage1 0.5
-
+It calls already deployed Biomodals apps with ``modal.Function.from_name`` and
+packages a local ``.tar.zst`` containing the canonical upstream layout:
+``stage1/``, ``stage2/``, and ``design_output/``.
 """
 
-# TODO: reuse *_app modules for constructing the workflow
+# Ignore ruff warnings about import location
+# ruff: noqa: PLC0415
 
 from __future__ import annotations
 
 import csv
 import json
 import os
+import re
+import shutil
 import subprocess
-import sys
-import tarfile
-import tempfile
-from collections.abc import Iterable
-from io import StringIO
+from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+from uuid import uuid4
 
-from modal import App, Image, Volume
+import modal
+import yaml
+from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
-# -------------------------
+from biomodals.app.config import AppConfig
+from biomodals.app.constant import MAX_TIMEOUT
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, sanitize_filename
+
+##########################################
 # Modal configs
-# -------------------------
-APP_NAME = os.environ.get("MODAL_APP", "ppiflow")
-GPU = os.environ.get("GPU", "L40S")  # e.g. A10G, A100, L40S
-TIMEOUT = int(os.environ.get("TIMEOUT", "36000"))
-
-# Persistent Volumes
-MODELS_VOL = Volume.from_name("ppiflow-models", create_if_missing=True)
-RUNS_VOL = Volume.from_name("ppiflow-runs", create_if_missing=True)
-
-MODELS_DIR = Path("/models")
-RUNS_DIR = Path("/ppiflow-runs")
-
-# -------------------------
-# Image definition
-# -------------------------
-PPIFLOW_REPO = (
-    "https://github.com/zhuqianhui2-hash/PPIFlow.git"  # updated at 2026-02-10-18:00
+##########################################
+CONF = AppConfig(
+    tags={"group": "workflow"},
+    name="PPIFlowWorkflow",
+    repo_url="https://github.com/Mingchenchen/PPIFlow",
+    package_name="biomodals-ppiflow-workflow",
+    version="0.1.0",
+    python_version="3.12",
+    timeout=int(os.environ.get("TIMEOUT", str(MAX_TIMEOUT))),
 )
-PPIFLOW_DIR = "/ppiflow"
+OUT_VOLUME = CONF.get_out_volume()
+MOUNT_ROOT = Path(CONF.output_volume_mountpoint)
 
-PYTORCH_CU121_INDEX = "https://download.pytorch.org/whl/cu121"
-PYG_WHL = "https://data.pyg.org/whl/torch-2.3.0+cu121.html"
-
-TORCH_PKGS = [
-    "torch==2.3.1+cu121",
-    "torchvision==0.18.1+cu121",
-    "torchaudio==2.3.1+cu121",
-]
-
-PYG_PKGS = [
-    "pyg-lib==0.4.0+pt23cu121",
-    "torch-scatter==2.1.2+pt23cu121",
-    "torch-sparse==0.6.18+pt23cu121",
-    "torch-cluster==1.6.3+pt23cu121",
-    "torch-spline-conv==1.2.2+pt23cu121",
-    "torch-geometric==2.6.1",
-]
-
-INFER_PKGS = [
-    "numpy==1.26.3",
-    "scipy==1.15.2",
-    "pandas==2.2.3",
-    "scikit-learn==1.2.2",
-    "pyyaml==6.0.2",
-    "omegaconf==2.3.0",
-    "hydra-core==1.3.2",
-    "hydra-submitit-launcher==1.2.0",
-    "submitit==1.5.3",
-    "tqdm==4.67.1",
-    "lightning==2.5.0.post0",
-    "pytorch-lightning==2.5.0.post0",
-    "torchmetrics==1.6.2",
-    "lightning-utilities==0.14.0",
-    "einops==0.8.1",
-    "dm-tree==0.1.6",
-    "optree==0.14.1",
-    "opt-einsum==3.4.0",
-    "opt-einsum-fx==0.1.4",
-    "e3nn==0.5.6",
-    "fair-esm==2.0.0",
-    "biopython==1.83",
-    "biotite==1.0.1",
-    "biotraj==1.2.2",
-    "gemmi==0.6.5",
-    "ihm==2.2",
-    "modelcif==0.7",
-    "tmtools==0.2.0",
-    "freesasa==2.2.1",
-    "mdtraj==1.10.3",
-    "requests==2.32.3",
-    "packaging==24.2",
-    "typing-extensions==4.12.2",
-    "protobuf==3.20.2",
-    "tensorboard==2.19.0",
-    "tensorboard-data-server==0.7.2",
-    "grpcio==1.72.1",
-    "gputil==1.4.0",
-    "gpustat==1.1.1",
-    "hjson==3.1.0",
-    "ninja==1.11.1.3",
-]
-
-runtime_image = (
-    Image.debian_slim(python_version="3.10")
-    .apt_install(
-        "git",
-        "curl",
-        "ca-certificates",
-        "build-essential",
-        "python3-dev",
-        "pkg-config",
-        "gfortran",
-        "libopenblas-dev",
-        "liblapack-dev",
-        "libhdf5-dev",
-        "libnetcdf-dev",
-        "zlib1g-dev",
-        "libbz2-dev",
-        "liblzma-dev",
-    )
-    .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": PPIFLOW_DIR})
-    .run_commands(
-        f"rm -rf {PPIFLOW_DIR} && git clone --depth 1 {PPIFLOW_REPO} {PPIFLOW_DIR}"
-    )
-    .pip_install(*TORCH_PKGS, extra_index_url=PYTORCH_CU121_INDEX)
-    .uv_pip_install(*PYG_PKGS, find_links=PYG_WHL)
-    .uv_pip_install(*INFER_PKGS)
+runtime_image = patch_image_for_helper(
+    modal.Image.debian_slim(python_version=CONF.python_version).env(CONF.default_env)
 )
-
-app = App(APP_NAME)
-
-# -------------------------
-# Task routing (PPIFlow sampling scripts only)
-# -------------------------
-TASK_TO_SCRIPT: dict[str, str] = {
-    "binder": f"{PPIFLOW_DIR}/sample_binder.py",
-    "antibody": f"{PPIFLOW_DIR}/sample_antibody_nanobody.py",
-    "nanobody": f"{PPIFLOW_DIR}/sample_antibody_nanobody.py",
-    "monomer": f"{PPIFLOW_DIR}/sample_monomer.py",
-    "scaffolding": f"{PPIFLOW_DIR}/sample_monomer.py",
-    "ab_partial_flow": f"{PPIFLOW_DIR}/sample_antibody_nanobody_partial.py",
-    "nb_partial_flow": f"{PPIFLOW_DIR}/sample_antibody_nanobody_partial.py",
-    "binder_partial_flow": f"{PPIFLOW_DIR}/sample_binder_partial.py",
-}
-
-MPNN_TASKS = {"mpnn_stage1", "mpnn_stage2"}
-
-
-# -------------------------
-# Helpers
-# -------------------------
-def _tar_dir(src_dir: Path, out_tar_gz: Path) -> None:
-    with tarfile.open(out_tar_gz, "w:gz") as tf:
-        tf.add(src_dir, arcname=src_dir.name)
-
-
-def _iter_files(root: Path) -> Iterable[Path]:
-    for p in root.rglob("*"):
-        if p.is_file():
-            yield p
-
-
-def _write_effective_config(src_config: Path, dst_config: Path) -> None:
-    import yaml
-
-    cfg = yaml.safe_load(src_config.read_text()) or {}
-    cfg.setdefault("model", {})
-    cfg["model"]["use_deepspeed_evo_attention"] = False
-    dst_config.write_text(yaml.safe_dump(cfg, sort_keys=False))
-
-
-def _collect_artifacts(run_dir: Path) -> None:
-    artifacts = run_dir / "artifacts"
-    artifacts.mkdir(parents=True, exist_ok=True)
-
-    want_exact = {"metrics.csv", "config.yml", "config.yaml"}
-    for f in _iter_files(run_dir):
-        if f.name in want_exact:
-            dst = artifacts / f.name
-            if not dst.exists():
-                dst.write_bytes(f.read_bytes())
-
-    for f in _iter_files(run_dir):
-        if f.suffix.lower() == ".csv":
-            dst = artifacts / f.name
-            if not dst.exists():
-                dst.write_bytes(f.read_bytes())
-
-
-def _script_help_text(script: Path) -> str:
-    p = subprocess.run(  # noqa: S603
-        [sys.executable, str(script), "--help"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    return p.stdout or ""
-
-
-def _script_supports_flag(
-    script: Path, flag: str, help_text: str | None = None
-) -> bool:
-    txt = help_text if help_text is not None else _script_help_text(script)
-    return flag in txt
-
-
-def _find_abmpnn_run_script() -> Path:
-    """Find ABMPNN/ProteinMPNN runnable script under /ppiflow/ProteinMPNN.
-
-    We try common names, then fallback to a glob search.
-    """
-    base = Path(PPIFLOW_DIR) / "ProteinMPNN"
-    candidates = [
-        base / "protein_mpnn_run.py",
-        base / "run.py",
-        base / "protein_mpnn_run_main.py",
-        Path(PPIFLOW_DIR) / "protein_mpnn_run.py",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-
-    hits = sorted(base.rglob("*mpnn*run*.py"))
-    if hits:
-        return hits[0]
-
-    raise FileNotFoundError(
-        f"ABMPNN run script not found under {base}. "
-        "Expected something like ProteinMPNN/protein_mpnn_run.py"
-    )
-
-
-def _resolve_abmpnn_ckpt(user_path: str | None) -> Path:
-    if user_path:
-        p = Path(user_path)
-    else:
-        p = Path(PPIFLOW_DIR) / "ProteinMPNN" / "model_weights" / "abmpnn.pt"
-    if not p.exists():
-        raise FileNotFoundError(f"ABMPNN checkpoint not found: {p}")
-    return p
-
-
-def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
-    buf = StringIO()
-    w = csv.DictWriter(buf, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        w.writerow(r)
-    path.write_text(buf.getvalue())
-
-
-def _expand_position_token(token: str) -> list[int]:
-    token = token.strip()
-    if not token:
-        return []
-    if "-" in token:
-        a, b = token.split("-", 1)
-        start = int(a.strip())
-        end = int(b.strip())
-        if end < start:
-            raise ValueError(f"Invalid range: {token}")
-        return list(range(start, end + 1))
-    return [int(token)]
-
-
-def _normalize_fixed_positions_csv_bytes(raw_csv: bytes) -> bytes:
-    """Accept user-friendly fixed-position syntax and convert to ProteinMPNN style.
-
-    Supported input for the second column (e.g. motif_index / fixed_positions):
-    - "1 2 3 10 11"
-    - "1-25,34-50,59-96,118-127"
-
-    Output second column is normalized to:
-    - "1 2 3 ... 127"
-    """
-    text = raw_csv.decode("utf-8-sig")
-    reader = csv.DictReader(StringIO(text))
-    if not reader.fieldnames:
-        raise ValueError("mpnn position CSV has no header")
-
-    fns = list(reader.fieldnames)
-    lower_map = {f.lower(): f for f in fns}
-    name_col = lower_map.get("pdb_name") or lower_map.get("pdb_id")
-    pos_col = lower_map.get("motif_index") or lower_map.get("fixed_positions")
-    if not name_col or not pos_col:
-        raise ValueError(
-            "mpnn position CSV must contain (pdb_name or pdb_id) and "
-            "(motif_index or fixed_positions) columns"
-        )
-
-    rows = list(reader)
-    if not rows:
-        raise ValueError("mpnn position CSV has no data rows")
-
-    out_rows: list[dict[str, str]] = []
-    for r in rows:
-        pdb_name = (r.get(name_col) or "").strip()
-        if not pdb_name:
-            raise ValueError(f"Empty pdb name in row: {r}")
-        raw = (r.get(pos_col) or "").strip()
-        if not raw:
-            out = ""
-        else:
-            pieces = [p.strip() for p in raw.split(",") if p.strip()]
-            values: list[int] = []
-            for p in pieces:
-                values.extend(_expand_position_token(p))
-            vals = sorted(set(values))
-            out = " ".join(str(v) for v in vals)
-        out_rows.append({"pdb_name": pdb_name, "motif_index": out})
-
-    buf = StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["pdb_name", "motif_index"])
-    writer.writeheader()
-    writer.writerows(out_rows)
-    return buf.getvalue().encode("utf-8")
-
-
-def _chain_order_from_pdb(pdb_path: Path) -> list[str]:
-    order: list[str] = []
-    seen: set[str] = set()
-    with pdb_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if not (line.startswith("ATOM") or line.startswith("HETATM")):
-                continue
-            if len(line) < 22:
-                continue
-            chain_id = line[21].strip()
-            if not chain_id or chain_id in seen:
-                continue
-            seen.add(chain_id)
-            order.append(chain_id)
-    return order
-
-
-def _rewrite_fixed_positions_for_proteinmpnn(
-    csv_path: Path, pdb_folder: Path, chain_list: str
-) -> None:
-    """Generate fixed-position CSV for ProteinMPNN.
-
-    Convert normalized CSV (single position list per pdb) into upstream legacy format
-    expected by ProteinMPNN helper script:
-      second column uses '-' to separate per-chain residue lists in pdb chain order.
-    """
-    designed_chains = [c for c in chain_list.split() if c]
-    if not designed_chains:
-        raise ValueError(
-            "--mpnn-chain-list is required when --mpnn-position-list is provided"
-        )
-    if len(designed_chains) != 1:
-        raise ValueError(
-            "Current fixed-position CSV format supports one designed chain. "
-            f"Got --mpnn-chain-list={chain_list!r}"
-        )
-
-    text = csv_path.read_text(encoding="utf-8-sig")
-    reader = csv.DictReader(StringIO(text))
-    if not reader.fieldnames:
-        raise ValueError("mpnn_fixed_positions.csv has no header")
-    rows = list(reader)
-    if not rows:
-        raise ValueError("mpnn_fixed_positions.csv has no data rows")
-
-    out_rows: list[dict[str, str]] = []
-    target_chain = designed_chains[0]
-    for row in rows:
-        pdb_name = (row.get("pdb_name") or row.get("pdb_id") or "").strip()
-        if not pdb_name:
-            raise ValueError(f"Empty pdb_name/pdb_id in row: {row}")
-        pos_raw = (row.get("motif_index") or row.get("fixed_positions") or "").strip()
-
-        pdb_file = pdb_folder / f"{pdb_name}.pdb"
-        if not pdb_file.exists():
-            raise FileNotFoundError(
-                f"PDB not found for fixed positions row: {pdb_file}"
-            )
-        chains = _chain_order_from_pdb(pdb_file)
-        if not chains:
-            raise ValueError(f"Could not detect chain order from: {pdb_file}")
-        if target_chain not in chains:
-            raise ValueError(
-                f"Chain {target_chain!r} not found in {pdb_file.name}; chains={chains}"
-            )
-
-        segments: list[str] = []
-        for ch in chains:
-            segments.append(pos_raw if ch == target_chain else "")
-        out_rows.append({"pdb_name": pdb_name, "motif_index": "-".join(segments)})
-
-    buf = StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["pdb_name", "motif_index"])
-    writer.writeheader()
-    writer.writerows(out_rows)
-    csv_path.write_text(buf.getvalue(), encoding="utf-8")
-
-
-def _write_empty_fixed_positions_csv(csv_path: Path, pdb_folder: Path) -> None:
-    """Write a no-op fixed-positions CSV for upstream protein_mpnn_run.py compatibility.
-
-    This avoids its UnboundLocalError when --position_list is omitted.
-    """
-    rows: list[dict[str, str]] = []
-    for pdb in sorted(pdb_folder.glob("*.pdb")):
-        rows.append({"pdb_name": pdb.stem, "motif_index": ""})
-    if not rows:
-        raise FileNotFoundError(f"No .pdb found under: {pdb_folder}")
-
-    buf = StringIO()
-    writer = csv.DictWriter(buf, fieldnames=["pdb_name", "motif_index"])
-    writer.writeheader()
-    writer.writerows(rows)
-    csv_path.write_text(buf.getvalue(), encoding="utf-8")
-
-
-def _collect_pdbs_for_mpnn(src_outputs: Path) -> list[Path]:
-    pdbs = sorted(src_outputs.glob("*.pdb"))
-    if not pdbs:
-        raise FileNotFoundError(f"No .pdb found under: {src_outputs}")
-    return pdbs
-
-
-def _gather_mpnn_fastas(mpnn_out_root: Path) -> list[Path]:
-    # accept .fa / .fasta / .faa etc. under seqs/
-    hits: list[Path] = []
-    for pat in (
-        "seqs/*.fa",
-        "seqs/*.fasta",
-        "seqs/*.faa",
-        "seqs/*.fa.gz",
-        "seqs/*.fasta.gz",
-    ):
-        hits.extend(mpnn_out_root.rglob(pat))
-    return sorted(set(hits))
-
-
-def _detect_abmpnn_cli_flags(mpnn_script: Path) -> dict[str, str]:
-    ht = _script_help_text(mpnn_script)
-
-    # folder input (this is required for ProteinMPNN/protein_mpnn_run.py)
-    folder_flag = (
-        "--folder_with_pdbs_path"
-        if _script_supports_flag(mpnn_script, "--folder_with_pdbs_path", ht)
-        else ""
-    )
-    if not folder_flag and _script_supports_flag(mpnn_script, "--pdb_dir", ht):
-        folder_flag = "--pdb_dir"
-    if not folder_flag and _script_supports_flag(mpnn_script, "--input_folder", ht):
-        folder_flag = "--input_folder"
-
-    # single pdb input (optional, many scripts do NOT support it)
-    pdb_flag = (
-        "--pdb_path" if _script_supports_flag(mpnn_script, "--pdb_path", ht) else ""
-    )
-    if not pdb_flag and _script_supports_flag(mpnn_script, "--input_pdb", ht):
-        pdb_flag = "--input_pdb"
-
-    # out dir
-    out_flag = (
-        "--out_folder" if _script_supports_flag(mpnn_script, "--out_folder", ht) else ""
-    )
-    if not out_flag and _script_supports_flag(mpnn_script, "--output_dir", ht):
-        out_flag = "--output_dir"
-    if not out_flag and _script_supports_flag(mpnn_script, "--out_dir", ht):
-        out_flag = "--out_dir"
-
-    # checkpoint (ABMPNN single file OR ProteinMPNN model dir system)
-    ckpt_candidates = [
-        "--checkpoint_path",
-        "--checkpoint",
-        "--model_path",
-        "--weights",
-        "--ckpt",
-        "--checkpoint_file",
-    ]
-    ckpt_flag = ""
-    for f in ckpt_candidates:
-        if _script_supports_flag(mpnn_script, f, ht):
-            ckpt_flag = f
-            break
-
-    # ProteinMPNN classic interface (dir + model_name)
-    weights_dir_flag = (
-        "--path_to_model_weights"
-        if _script_supports_flag(mpnn_script, "--path_to_model_weights", ht)
-        else ""
-    )
-    model_name_flag = (
-        "--model_name" if _script_supports_flag(mpnn_script, "--model_name", ht) else ""
-    )
-
-    nseq_flag = (
-        "--num_seq_per_target"
-        if _script_supports_flag(mpnn_script, "--num_seq_per_target", ht)
-        else ""
-    )
-    if not nseq_flag and _script_supports_flag(mpnn_script, "--num_seqs", ht):
-        nseq_flag = "--num_seqs"
-
-    temp_flag = (
-        "--sampling_temp"
-        if _script_supports_flag(mpnn_script, "--sampling_temp", ht)
-        else ""
-    )
-    seed_flag = "--seed" if _script_supports_flag(mpnn_script, "--seed", ht) else ""
-    batch_flag = (
-        "--batch_size" if _script_supports_flag(mpnn_script, "--batch_size", ht) else ""
-    )
-
-    if not out_flag:
-        raise RuntimeError(
-            f"Cannot detect output flag for {mpnn_script}. "
-            "Expected one of: --out_folder / --output_dir / --out_dir"
-        )
-
-    # For protein_mpnn_run.py, folder_flag is required
-    if "protein_mpnn_run.py" in str(mpnn_script) and not folder_flag:
-        raise RuntimeError(
-            f"{mpnn_script} appears to require folder input, but folder flag not detected. "
-            "Expected --folder_with_pdbs_path."
-        )
-
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+
+##########################################
+# Data models and constants
+##########################################
+STAGE1_STEPS = (
+    "PPIFlowStep",
+    "MPNNStep_stage1",
+    "AbMPNNStep_stage1",
+    "FlowpackerStep_stage1",
+    "AF3scoreStep_stage1",
+    "FilterStep_stage1",
+)
+STAGE2_STEPS = (
+    "RosettaFixStep",
+    "PartialStep",
+    "MPNNStep_stage2",
+    "AbMPNNStep_stage2",
+    "FlowpackerStep_stage2",
+    "AF3scoreStep_stage2",
+    "FilterStep_stage2",
+    "ReFoldStep",
+    "DockQStep",
+    "RosettaRelaxStep",
+    "RankStep",
+    "ReportStep",
+)
+STRUCTURE_SUFFIXES = {".pdb", ".cif"}
+LOCAL_INPUT_SUFFIXES = {".pdb", ".cif", ".csv", ".json", ".yaml", ".yml", ".txt"}
+
+
+@dataclass(frozen=True)
+class WorkflowState:
+    """Paths and config shared across workflow steps."""
+
+    run_root: Path
+    run_name: str
+    task: dict[str, Any]
+    enabled: dict[str, bool]
+    steps: dict[str, Any]
+    app_names: dict[str, str]
+    max_workers: int
+
+    @property
+    def gentype(self) -> str:
+        """Return the upstream PPIFlow design type."""
+        return str(self.task.get("gentype") or self.task.get("design_mode") or "binder")
+
+    @property
+    def stage1_dir(self) -> Path:
+        """Return the canonical Stage 1 output directory."""
+        return self.run_root / "stage1"
+
+    @property
+    def stage2_dir(self) -> Path:
+        """Return the canonical Stage 2 output directory."""
+        return self.run_root / "stage2"
+
+    @property
+    def design_output_dir(self) -> Path:
+        """Return the canonical final design output directory."""
+        return self.run_root / "design_output"
+
+
+##########################################
+# Generic helpers
+##########################################
+def _env_app_name(*keys: str, default: str) -> str:
+    for key in keys:
+        if value := os.environ.get(key):
+            return value
+    return default
+
+
+def _default_app_names() -> dict[str, str]:
     return {
-        "folder_flag": folder_flag,
-        "pdb_flag": pdb_flag,
-        "out_flag": out_flag,
-        "ckpt_flag": ckpt_flag,
-        "weights_dir_flag": weights_dir_flag,
-        "model_name_flag": model_name_flag,
-        "nseq_flag": nseq_flag,
-        "temp_flag": temp_flag,
-        "seed_flag": seed_flag,
-        "batch_flag": batch_flag,
+        "ppiflow": _env_app_name("PPIFLOW_APP_NAME", "PPIFLOW_APP", default="PPIFlow"),
+        "ligandmpnn": _env_app_name(
+            "LIGANDMPNN_APP_NAME", "LIGANDMPNN_APP", default="LigandMPNN"
+        ),
+        "flowpacker": _env_app_name(
+            "FLOWPACKER_APP_NAME", "FLOWPACKER_APP", default="FlowPacker"
+        ),
+        "af3score": _env_app_name(
+            "AF3SCORE_APP_NAME", "AF3SCORE_APP", default="AF3Score"
+        ),
+        "alphafold3": _env_app_name(
+            "ALPHAFOLD3_APP_NAME", "ALPHAFOLD3_APP", default="AlphaFold3"
+        ),
+        "rosetta": _env_app_name("ROSETTA_APP_NAME", "ROSETTA_APP", default="Rosetta"),
+        "dockq": _env_app_name("DOCKQ_APP_NAME", "DOCKQ_APP", default="DockQ"),
     }
 
 
-def _run_abmpnn_on_folder(
-    *,
-    mpnn_script: Path,
-    flags: dict[str, str],
-    pdb_folder: Path,
-    out_folder: Path,
-    ckpt_path: Path | None,
-    num_seqs: int,
-    sampling_temp: float,
-    seed: int,
-    batch_size: int,
-    model_name: str | None,
-    chain_list: str | None,
-    position_list_csv: Path | None,
-    omit_aas: str | None,
-    use_soluble_model: bool,
-    log_path: Path,
-) -> None:
-    """Run ProteinMPNN / ABMPNN script in folder mode.
+def _remote_function(app_names: dict[str, str], key: str, function_name: str):
+    return modal.Function.from_name(app_names[key], function_name)
 
-    This is intentionally "no patch mode": execute upstream script as-is.
-    """
-    out_folder.mkdir(parents=True, exist_ok=True)
 
-    run_script = mpnn_script
-    patch_dir = mpnn_script.parent  # e.g. /ppiflow/ProteinMPNN
+def _load_yaml_bytes(data: bytes) -> dict[str, Any]:
+    loaded = yaml.safe_load(data.decode("utf-8")) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError("YAML root must be a mapping")
+    return loaded
 
-    # -------------------------
-    # Step 1: build argv
-    # -------------------------
-    argv: list[str] = ["python", str(run_script)]
 
-    folder_flag = flags.get("folder_flag") or ""
-    pdb_flag = flags.get("pdb_flag") or ""
-    if folder_flag:
-        argv += [folder_flag, str(pdb_folder)]
-    elif pdb_flag:
-        raise RuntimeError(
-            "MPNN runner is configured for folder mode, but folder_flag is missing and pdb_flag exists. "
-            "Implement a single-PDB runner or ensure folder_flag is detected correctly."
-        )
-    else:
-        raise RuntimeError("Neither folder_flag nor pdb_flag detected for MPNN script.")
+def _task_section(task_doc: dict[str, Any]) -> dict[str, Any]:
+    section = task_doc.get("task", task_doc)
+    if not isinstance(section, dict):
+        raise ValueError("task.yaml must contain a mapping under 'task'")
+    return section
 
-    out_flag = flags.get("out_flag") or ""
-    if not out_flag:
-        raise RuntimeError("No out_flag detected for MPNN script.")
-    argv += [out_flag, str(out_folder)]
 
-    ckpt_flag = flags.get("ckpt_flag") or ""
-    if ckpt_flag:
-        if ckpt_path is None:
-            raise ValueError(
-                f"MPNN script expects {ckpt_flag}, but no checkpoint path was resolved."
-            )
-        argv += [ckpt_flag, str(ckpt_path)]
-    else:
-        weights_dir_flag = flags.get("weights_dir_flag") or ""
-        model_name_flag = flags.get("model_name_flag") or ""
-        if not weights_dir_flag or not model_name_flag:
-            raise RuntimeError(
-                "MPNN script does not expose a checkpoint flag and does not expose "
-                "--path_to_model_weights/--model_name. Cannot pass weights."
-            )
-        weights_dir = Path("/models")
-        argv += [weights_dir_flag, str(weights_dir)]
+def _enabled_section(task_doc: dict[str, Any]) -> dict[str, bool]:
+    enabled = task_doc.get("steps", {})
+    if not isinstance(enabled, dict):
+        raise ValueError("task.yaml 'steps' section must be a mapping")
+    return {str(key): bool(value) for key, value in enabled.items()}
 
-        if not model_name:
-            raise ValueError(
-                "mpnn_model_name is required for this ProteinMPNN script (--model_name). "
-                "You passed None/empty."
-            )
-        argv += [model_name_flag, str(model_name)]
 
-        # --- sanity check for classic ProteinMPNN ---
-        expected_pt = weights_dir / f"{model_name}.pt"
-        if not expected_pt.exists():
-            available = sorted(p.name for p in weights_dir.glob("*.pt"))
-            raise FileNotFoundError(
-                f"ProteinMPNN weight not found: {expected_pt}\n"
-                f"Available under /models: {available}"
-            )
-        # --- auto-detect CA-only checkpoint and toggle --ca_only ---
-        try:
-            import torch
+def _step_enabled(enabled: dict[str, bool], step_name: str) -> bool:
+    return bool(enabled.get(step_name, False))
 
-            ckpt = torch.load(str(expected_pt), map_location="cpu")
-            sd = ckpt.get("model_state_dict", ckpt)
-            w = sd.get("features.edge_embedding.weight", None)
-            if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
-                if int(w.shape[1]) == 167:
-                    argv += ["--ca_only"]
-        except Exception as e:
-            print(
-                f"Warning: failed to auto-detect CA-only checkpoint for {expected_pt}: {e}"
-            )
 
-    nseq_flag = flags.get("nseq_flag") or ""
-    temp_flag = flags.get("temp_flag") or ""
-    seed_flag = flags.get("seed_flag") or ""
-    batch_flag = flags.get("batch_flag") or ""
+def _step_cfg(state: WorkflowState, step_name: str) -> dict[str, Any]:
+    cfg = state.steps.get(step_name, {})
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"steps.yaml entry {step_name!r} must be a mapping")
+    return cfg
 
-    if nseq_flag:
-        argv += [nseq_flag, str(int(num_seqs))]
-    if temp_flag:
-        argv += [temp_flag, str(float(sampling_temp))]
-    if seed_flag:
-        argv += [seed_flag, str(int(seed))]
-    if batch_flag:
-        argv += [batch_flag, str(int(batch_size))]
 
-    if chain_list:
-        argv += ["--chain_list", chain_list]
-    if position_list_csv:
-        argv += ["--position_list", str(position_list_csv)]
-    if omit_aas:
-        argv += ["--omit_AAs", omit_aas]
-    if use_soluble_model:
-        argv += ["--use_soluble_model"]
+def _ensure_layout(run_root: Path) -> None:
+    for path in (
+        run_root / "inputs",
+        run_root / "stage1",
+        run_root / "stage2",
+        run_root / "design_output",
+        run_root / "_logs",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
 
-    # -------------------------
-    # Step 3: run with cwd = original ProteinMPNN dir to satisfy relative imports
-    # -------------------------
-    p = subprocess.run(  # noqa: S603
-        argv,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=str(patch_dir),  # critical: make `protein_mpnn_utils` importable
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _write_warning(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(message.rstrip() + "\n", encoding="utf-8")
+
+
+def _copy_file(src: Path, dst: Path) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _copy_structure_files(
+    source_files: list[Path], dst_dir: Path, *, prefix: str | None = None
+) -> list[Path]:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for idx, src in enumerate(source_files, start=1):
+        stem = sanitize_filename(src.stem)
+        name = f"{sanitize_filename(prefix)}_{stem}{src.suffix}" if prefix else src.name
+        dst = dst_dir / name
+        if dst.exists():
+            dst = dst_dir / f"{stem}_{idx}{src.suffix}"
+        copied.append(_copy_file(src, dst))
+    return copied
+
+
+def _collect_structure_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in STRUCTURE_SUFFIXES
+        and not any(part.startswith(".") for part in path.parts)
     )
 
-    dbg: list[str] = []
-    dbg.append("=== runner ===")
-    dbg.append(f"original_script: {mpnn_script}")
-    dbg.append(f"executed_script: {run_script}")
-    dbg.append(f"cwd: {patch_dir}")
-    dbg.append("")
-    dbg.append("=== argv ===")
-    dbg.append(" ".join(argv))
-    dbg.append("")
-    dbg.append("=== output ===")
-    dbg.append(p.stdout or "")
-    log_path.write_text("\n".join(dbg))
 
-    if p.returncode != 0:
-        raise RuntimeError(
-            f"ABMPNN/ProteinMPNN failed (exit {p.returncode}). See {log_path}"
+def _collect_pdb_files(root: Path) -> list[Path]:
+    return [
+        path for path in _collect_structure_files(root) if path.suffix.lower() == ".pdb"
+    ]
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    return next((path for path in paths if path.exists()), None)
+
+
+def _extract_tar_zst_bytes(tarball: bytes, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tar_bin = shutil.which("tar")
+    if tar_bin is None:
+        raise FileNotFoundError("tar is not available in PATH")
+    with TemporaryDirectory(prefix="ppiflow_extract_") as tmpdir:
+        archive_path = Path(tmpdir) / "bundle.tar.zst"
+        archive_path.write_bytes(tarball)
+        subprocess.run(  # noqa: S603
+            [tar_bin, "-I", "zstd", "-xf", str(archive_path), "-C", str(out_dir)],
+            check=True,
         )
+    return out_dir
 
 
-def _stage_pdb_folder(pdbs: list[Path], dst_dir: Path) -> None:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for p in pdbs:
-        # keep stable filenames
-        (dst_dir / p.name).write_bytes(p.read_bytes())
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        if "," in value:
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return [value]
+    return [value]
 
 
-# -------------------------
-# Remote GPU job: unified runner
-# -------------------------
-@app.function(
-    gpu=GPU,
-    cpu=(2, 8),
-    timeout=TIMEOUT,
-    image=runtime_image,
-    volumes={str(MODELS_DIR): MODELS_VOL, str(RUNS_DIR): RUNS_VOL},
-)
-def run_ppiflow_structured(
-    # ---------- common ----------
-    task: str,
-    run_name: str,
+def _as_int(value: Any, default: int) -> int:
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _as_float(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _write_csv_rows(
+    path: Path, fieldnames: list[str], rows: list[dict[str, Any]]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+##########################################
+# Local input staging
+##########################################
+def _iter_file_refs(obj: Any) -> list[str]:
+    refs: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_text = str(key).lower()
+            if isinstance(value, str):
+                suffix = Path(value).suffix.lower()
+                if suffix in LOCAL_INPUT_SUFFIXES or key_text.endswith(
+                    ("pdb", "cif", "csv", "json", "yaml", "yml", "file", "path")
+                ):
+                    refs.append(value)
+            else:
+                refs.extend(_iter_file_refs(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            refs.extend(_iter_file_refs(item))
+    return refs
+
+
+def _collect_local_inputs(
+    task_doc: dict[str, Any], task_path: Path
+) -> list[tuple[str, bytes]]:
+    """Collect local files referenced by task.yaml for remote staging."""
+    base_dir = task_path.parent
+    staged: dict[str, bytes] = {}
+    for ref in _iter_file_refs(task_doc):
+        if not ref or ref.startswith(("/biomodals-", "/opt/", "s3://", "gs://")):
+            continue
+        candidate = Path(ref).expanduser()
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        staged[str(Path(ref).name)] = candidate.read_bytes()
+    return sorted(staged.items())
+
+
+def _stage_input_files(run_root: Path, input_files: list[tuple[str, bytes]]) -> None:
+    input_dir = run_root / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    for file_name, content in input_files:
+        (input_dir / sanitize_filename(Path(file_name).name)).write_bytes(content)
+
+
+##########################################
+# PPIFlow helpers
+##########################################
+def _gentype_to_ppiflow_mode(gentype: str) -> str:
+    if gentype == "binder":
+        return "binder"
+    if gentype in {"antibody", "nanobody", "antibody_nanobody"}:
+        return "antibody_nanobody"
+    raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}")
+
+
+def _base_ppiflow_config(state: WorkflowState, cfg: dict[str, Any]) -> dict[str, Any]:
+    task = state.task
+    conf = dict(task)
+    conf.update({key: value for key, value in cfg.items() if value is not None})
+    conf["name"] = str(task.get("name") or state.run_name)
+    conf["specified_hotspots"] = str(conf.get("specified_hotspots") or "")
+    conf["samples_per_target"] = _as_int(
+        conf.get("samples_per_target"), _as_int(cfg.get("samples_per_target"), 100)
+    )
+    return conf
+
+
+def _call_ppiflow(
+    state: WorkflowState,
+    config: dict[str, Any],
+    design_mode: str,
     input_files: list[tuple[str, bytes]],
-    model_weights: str | None,
-    config: str | None,
-    # ---------- binder (sample_binder.py) ----------
-    binder_target_chain: str,
-    binder_binder_chain: str,
-    binder_specified_hotspots: str | None,
-    binder_samples_min_length: int,
-    binder_samples_max_length: int,
-    binder_samples_per_target: int,
-    # ---------- antibody/nanobody (sample_antibody_nanobody.py) ----------
-    ab_antigen_chain: str | None,
-    ab_heavy_chain: str | None,
-    ab_light_chain: str | None,
-    ab_specified_hotspots: str | None,
-    ab_cdr_length: str | None,
-    ab_samples_per_target: int,
-    # ---------- monomer (sample_monomer.py unconditional) ----------
-    mono_length_subset: str | None,
-    mono_samples_num: int,
-    # ---------- scaffolding (sample_monomer.py motif) ----------
-    scaffold_motif_names: str | None,
-    scaffold_samples_num: int,
-    # ---------- partial flow antibody/nanobody ----------
-    pf_fixed_positions: str | None,
-    pf_cdr_position: str | None,
-    pf_specified_hotspots: str | None,
-    pf_start_t: float | None,
-    pf_samples_per_target: int | None,
-    pf_retry_limit: int,
-    pf_antigen_chain: str | None,
-    pf_heavy_chain: str | None,
-    pf_light_chain: str | None,
-    # ---------- partial flow binder ----------
-    bpf_target_chain: str,
-    bpf_binder_chain: str,
-    bpf_start_t: float,
-    # ---------- mpnn ----------
-    mpnn_source_task: str | None,
-    mpnn_source_run: str | None,
-    mpnn_num_seq_per_target_stage1: int,
-    mpnn_num_seq_per_target_stage2: int,
-    mpnn_temp_stage1: float,
-    mpnn_temp_stage2: float,
-    mpnn_model_name: str | None,
-    mpnn_batch_size: int,
-    mpnn_seed: int,
-    mpnn_ckpt_path: str | None,
-    mpnn_chain_list: str | None,
-    mpnn_omit_aas: str | None,
-    mpnn_use_soluble_model: bool,
-) -> bytes:
-    """Unified runner for PPIFlow structured sampling tasks."""
-    # -------------------------
-    # Branch 1: MPNN tasks (operate on existing run dir)
-    # -------------------------
-    if task in MPNN_TASKS:
-        if not mpnn_source_task or not mpnn_source_run:
-            raise ValueError(
-                "mpnn_stage1/2 requires --mpnn-source-task and --mpnn-source-run"
+    out_dir: Path,
+    run_label: str,
+) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ppiflow_fn = _remote_function(state.app_names, "ppiflow", "ppiflow_run_bytes")
+    tarball = ppiflow_fn.remote(
+        config_dict=config,
+        design_mode=design_mode,
+        input_files=input_files,
+        run_name=run_label,
+    )
+    _extract_tar_zst_bytes(tarball, out_dir)
+    return _collect_pdb_files(out_dir)
+
+
+def _run_ppiflow_step(
+    state: WorkflowState, input_files: list[tuple[str, bytes]]
+) -> list[Path]:
+    out_dir = state.stage1_dir / "ppiflow_output"
+    if not _step_enabled(state.enabled, "PPIFlowStep"):
+        _write_warning(out_dir / "SKIPPED.txt", "PPIFlowStep is disabled")
+        return _collect_pdb_files(out_dir)
+
+    cfg = _step_cfg(state, "PPIFlowStep")
+    config = _base_ppiflow_config(state, cfg)
+    gentype = state.gentype
+    if gentype == "binder":
+        config["input_pdb"] = config.get("input_pdb") or config.get("complex_pdb")
+        config["target_chain"] = config.get("target_chain", "B")
+        config["binder_chain"] = config.get("binder_chain", "A")
+    else:
+        config["antigen_chain"] = config.get("antigen_chain", "C")
+        config["heavy_chain"] = config.get("heavy_chain", "A")
+        if gentype == "nanobody":
+            config["light_chain"] = None
+
+    return _call_ppiflow(
+        state,
+        config=config,
+        design_mode=_gentype_to_ppiflow_mode(gentype),
+        input_files=input_files,
+        out_dir=out_dir,
+        run_label=f"{state.run_name}-stage1-ppiflow",
+    )
+
+
+def _partial_config_for_pdb(
+    state: WorkflowState,
+    cfg: dict[str, Any],
+    pdb_path: Path,
+    fixed_positions: str,
+) -> tuple[str, dict[str, Any]]:
+    conf = _base_ppiflow_config(state, cfg)
+    conf["samples_per_target"] = _as_int(
+        cfg.get("samples_per_target"), _as_int(state.task.get("samples_per_target"), 10)
+    )
+    conf["start_t"] = _as_float(cfg.get("start_t"), 0.15)
+    conf["fixed_positions"] = fixed_positions
+    if state.gentype == "binder":
+        conf["input_pdb"] = pdb_path.name
+        conf["target_chain"] = cfg.get(
+            "target_chain", state.task.get("target_chain", "B")
+        )
+        conf["binder_chain"] = cfg.get(
+            "binder_chain", state.task.get("binder_chain", "A")
+        )
+        conf["sample_hotspot_rate_min"] = _as_float(
+            cfg.get("sample_hotspot_rate_min"),
+            _as_float(state.task.get("sample_hotspot_rate_min"), 0.2),
+        )
+        conf["sample_hotspot_rate_max"] = _as_float(
+            cfg.get("sample_hotspot_rate_max"),
+            _as_float(state.task.get("sample_hotspot_rate_max"), 0.5),
+        )
+        return "binder_partial_flow", conf
+
+    cdr_position = cfg.get("cdr_position") or state.task.get("cdr_position")
+    if not cdr_position:
+        raise ValueError(
+            "PartialStep for antibody/nanobody requires 'cdr_position' in "
+            "steps.yaml PartialStep or task.yaml task"
+        )
+    conf["complex_pdb"] = pdb_path.name
+    conf["cdr_position"] = cdr_position
+    conf["antigen_chain"] = cfg.get(
+        "antigen_chain", state.task.get("antigen_chain", "C")
+    )
+    conf["heavy_chain"] = cfg.get("heavy_chain", state.task.get("heavy_chain", "A"))
+    conf["light_chain"] = cfg.get("light_chain", state.task.get("light_chain"))
+    conf["retry_Limit"] = _as_int(cfg.get("retry_Limit"), 10)
+    return "antibody_nanobody_partial", conf
+
+
+##########################################
+# LigandMPNN and FlowPacker queue helpers
+##########################################
+def _seeds_from_cfg(cfg: dict[str, Any]) -> list[int]:
+    raw = cfg.get("seeds", cfg.get("seed", 0))
+    seeds: list[int] = []
+    for value in _as_list(raw):
+        if value == "":
+            continue
+        seeds.append(int(value))
+    return seeds or [0]
+
+
+def _ligandmpnn_cli_args(
+    state: WorkflowState,
+    cfg: dict[str, Any],
+    *,
+    fixed_residues: str | None = None,
+) -> dict[str, str | int | float | bool]:
+    model_type = str(
+        cfg.get("model_type")
+        or ("abmpnn" if state.gentype in {"antibody", "nanobody"} else "soluble_mpnn")
+    )
+    run_model_type = "protein_mpnn" if model_type == "abmpnn" else model_type
+    cli_args: dict[str, str | int | float | bool] = {
+        "--model_type": run_model_type,
+        "--batch_size": str(_as_int(cfg.get("batch_size"), 1)),
+        "--number_of_batches": str(
+            _as_int(
+                cfg.get("number_of_batches"),
+                _as_int(cfg.get("num_seq_per_target"), 1),
             )
-
-        src_run_dir = RUNS_DIR / mpnn_source_task / mpnn_source_run
-        src_outputs = src_run_dir / "outputs"
-        if not src_outputs.exists():
-            raise FileNotFoundError(f"Source outputs missing: {src_outputs}")
-
-        pdbs = _collect_pdbs_for_mpnn(src_outputs)
-
-        mpnn_script = _find_abmpnn_run_script()
-
-        # detect flags first, then resolve checkpoint only when needed
-        flags = _detect_abmpnn_cli_flags(mpnn_script)
-        ckpt_path: Path | None = None
-        if flags.get("ckpt_flag"):
-            ckpt_path = _resolve_abmpnn_ckpt(mpnn_ckpt_path)
-        (src_run_dir / f"{task}.mpnn_help.txt").write_text(
-            _script_help_text(mpnn_script)
+        ),
+        "--temperature": str(
+            _as_float(cfg.get("temperature", cfg.get("sampling_temp")), 0.1)
+        ),
+        "--save_stats": "1",
+        "--pack_side_chains": _as_bool(cfg.get("pack_side_chains"), True),
+        "--number_of_packs_per_design": str(
+            _as_int(cfg.get("number_of_packs_per_design"), 1)
+        ),
+        "--sc_num_denoising_steps": str(_as_int(cfg.get("sc_num_denoising_steps"), 3)),
+        "--sc_num_samples": str(_as_int(cfg.get("sc_num_samples"), 8)),
+        "--repack_everything": _as_bool(cfg.get("repack_everything"), False),
+        "--pack_with_ligand_context": _as_bool(
+            cfg.get("pack_with_ligand_context"), True
+        ),
+        "--ligand_mpnn_use_atom_context": _as_bool(
+            cfg.get("ligand_mpnn_use_atom_context"), True
+        ),
+        "--ligand_mpnn_cutoff_for_score": str(
+            _as_float(cfg.get("ligand_mpnn_cutoff_for_score"), 8.0)
+        ),
+        "--ligand_mpnn_use_side_chain_context": _as_bool(
+            cfg.get("ligand_mpnn_use_side_chain_context"), False
+        ),
+        "--global_transmembrane_label": _as_bool(
+            cfg.get("global_transmembrane_label"), False
+        ),
+        "--parse_atoms_with_zero_occupancy": _as_bool(
+            cfg.get("parse_atoms_with_zero_occupancy"), False
+        ),
+    }
+    checkpoint = cfg.get("checkpoint")
+    if checkpoint is not None:
+        cli_args[f"--checkpoint_{model_type}"] = str(checkpoint)
+    elif model_type == "abmpnn":
+        cli_args["--checkpoint_protein_mpnn"] = (
+            "/biomodals-store/LigandMPNN/model_params/abmpnn.pt"
         )
 
-        mpnn_dir = src_run_dir / task
-        mpnn_out = mpnn_dir / "out"
-        mpnn_dir.mkdir(parents=True, exist_ok=True)
+    for cfg_key, cli_key in (
+        ("chains_to_design", "--chains_to_design"),
+        ("parse_these_chains_only", "--parse_these_chains_only"),
+        ("omit_aa", "--omit_AA"),
+        ("bias_aa", "--bias_AA"),
+        ("redesigned_residues", "--redesigned_residues"),
+    ):
+        if cfg.get(cfg_key) is not None:
+            cli_args[cli_key] = str(cfg[cfg_key])
+    if fixed_residues:
+        cli_args["--fixed_residues"] = fixed_residues
+    elif cfg.get("fixed_residues") is not None:
+        cli_args["--fixed_residues"] = str(cfg["fixed_residues"])
+    return cli_args
 
-        if task == "mpnn_stage1":
-            num_seq = int(mpnn_num_seq_per_target_stage1)
-            temp = float(mpnn_temp_stage1)
-            manifest_name = "candidates_stage1.csv"
-        else:
-            num_seq = int(mpnn_num_seq_per_target_stage2)
-            temp = float(mpnn_temp_stage2)
-            manifest_name = "candidates_stage2.csv"
 
-        mpnn_out = mpnn_dir / "out"
-        pdb_folder = mpnn_dir / "pdbs"
-        mpnn_inputs = mpnn_dir / "inputs"
-        mpnn_dir.mkdir(parents=True, exist_ok=True)
-        mpnn_inputs.mkdir(parents=True, exist_ok=True)
+def _normalize_fixed_positions_for_mpnn(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text or text.upper() == "NONE":
+        return None
+    positions: list[str] = []
+    for token in text.split(","):
+        token = token.strip()
+        match = re.fullmatch(r"[A-Za-z]?(\d+)", token)
+        if match:
+            positions.append(match.group(1))
+    return " ".join(positions) if positions else None
 
-        _stage_pdb_folder(pdbs, pdb_folder)
 
-        position_list_csv: Path | None = None
-        for fname, content in input_files:
-            dst = mpnn_inputs / Path(fname).name
-            dst.write_bytes(content)
-            if Path(fname).name == "mpnn_fixed_positions.csv":
-                position_list_csv = dst
-        if position_list_csv and not mpnn_chain_list:
-            raise ValueError(
-                f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided"
-            )
-        if position_list_csv:
-            _rewrite_fixed_positions_for_proteinmpnn(
-                csv_path=position_list_csv,
-                pdb_folder=pdb_folder,
-                chain_list=mpnn_chain_list or "",
-            )
-        else:
-            # Keep "full design" behavior while working around upstream UnboundLocalError.
-            position_list_csv = mpnn_inputs / "mpnn_fixed_positions.auto.csv"
-            _write_empty_fixed_positions_csv(position_list_csv, pdb_folder)
-
-        log_path = mpnn_dir / "mpnn_folder.log"
-        _run_abmpnn_on_folder(
-            mpnn_script=mpnn_script,
-            flags=flags,
-            pdb_folder=pdb_folder,
-            out_folder=mpnn_out,
-            ckpt_path=ckpt_path,
-            num_seqs=num_seq,
-            sampling_temp=temp,
-            seed=int(mpnn_seed),
-            batch_size=int(mpnn_batch_size),
-            model_name=mpnn_model_name,
-            chain_list=mpnn_chain_list,
-            position_list_csv=position_list_csv,
-            omit_aas=mpnn_omit_aas,
-            use_soluble_model=mpnn_use_soluble_model,
-            log_path=log_path,
-        )
-
-        fastas = _gather_mpnn_fastas(mpnn_out)
-        if not fastas:
-            raise RuntimeError(
-                f"No fasta outputs found under {mpnn_out} (expected */seqs/*.fa*)"
-            )
-
-        rows: list[dict[str, Any]] = []
-        for fa in fastas:
-            # .../out/<pdb_stem>/seqs/<something>.fa
-            try:
-                pdb_stem = fa.parent.parent.name
-            except Exception:
-                pdb_stem = fa.stem
+def _collect_mpnn_sequences(mpnn_out: Path, output_csv: Path) -> None:
+    rows: list[dict[str, Any]] = []
+    for fasta in sorted(mpnn_out.rglob("*.fa")) + sorted(mpnn_out.rglob("*.fasta")):
+        seqs: list[str] = []
+        parts: list[str] = []
+        for line in fasta.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if parts:
+                    seqs.append("".join(parts))
+                    parts = []
+            else:
+                parts.append(line)
+        if parts:
+            seqs.append("".join(parts))
+        for idx, seq in enumerate(seqs[1:] or seqs):
             rows.append(
                 {
-                    "pdb_path": str((src_outputs / f"{pdb_stem}.pdb").resolve()),
-                    "seq_fasta": str(fa.resolve()),
-                    "iptm": "",
-                    "ptm": "",
-                    "passed": "",
+                    "link_name": f"{fasta.stem}.pdb".lower(),
+                    "sequence_dict": str({"A": seq.split("/")[0]}),
+                    "seq_idx": idx,
                 }
             )
-
-        _write_csv(
-            src_run_dir / manifest_name,
-            rows,
-            ["pdb_path", "seq_fasta", "iptm", "ptm", "passed"],
-        )
-
-        (src_run_dir / f"{task}.meta.json").write_text(
-            json.dumps(
-                {
-                    "mpnn_script": str(mpnn_script),
-                    "ckpt_path": str(ckpt_path) if ckpt_path else None,
-                    "num_seq_per_target": num_seq,
-                    "sampling_temp": temp,
-                    "batch_size": int(mpnn_batch_size),
-                    "seed": int(mpnn_seed),
-                    "chain_list": mpnn_chain_list,
-                    "position_list_provided": bool(position_list_csv),
-                    "omit_aas": mpnn_omit_aas,
-                    "use_soluble_model": bool(mpnn_use_soluble_model),
-                    "detected_flags": flags,
-                },
-                indent=2,
-            )
-        )
-
-        RUNS_VOL.commit()
-
-        # Return a tar of the SOURCE run dir (so you get both backbone outputs and mpnn outputs)
-        with tempfile.TemporaryDirectory() as td:
-            tar_path = Path(td) / f"{task}.{run_name}.tar.gz"
-            _tar_dir(src_run_dir, tar_path)
-            return tar_path.read_bytes()
-
-    # -------------------------
-    # Branch 2: PPIFlow sampling tasks
-    # -------------------------
-    if task not in TASK_TO_SCRIPT:
-        raise ValueError(
-            f"Unknown task={task}. Choose from {sorted(TASK_TO_SCRIPT) + sorted(MPNN_TASKS)}"
-        )
-
-    script = Path(TASK_TO_SCRIPT[task])
-    if not script.exists():
-        raise FileNotFoundError(f"Script not found in image: {script}")
-
-    run_dir = RUNS_DIR / task / run_name
-    inputs_dir = run_dir / "inputs"
-    outputs_dir = run_dir / "outputs"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    inputs_dir.mkdir(parents=True, exist_ok=True)
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-
-    # ---- write inputs (role-based filenames) ----
-    for fname, content in input_files:
-        (inputs_dir / Path(fname).name).write_bytes(content)
-
-    # ---- resolve model checkpoint (required for sampling tasks) ----
-    if not model_weights:
-        raise ValueError("--model-weights is required for PPIFlow sampling tasks")
-    mw = Path(model_weights)
-    model_ckpt = mw if str(mw).startswith(str(MODELS_DIR)) else (MODELS_DIR / mw.name)
-    if not model_ckpt.exists():
-        raise FileNotFoundError(f"Model checkpoint not found: {model_ckpt}")
-
-    # ---- resolve config + write effective config (optional) ----
-    effective_config: Path | None = None
-    if config:
-        cfg_path = Path(config)
-        if not cfg_path.is_absolute():
-            cfg_guess = Path(PPIFLOW_DIR) / config
-            cfg_path = cfg_guess if cfg_guess.exists() else cfg_path
-        if not cfg_path.exists():
-            raise FileNotFoundError(
-                f"Config not found: {config} (resolved: {cfg_path})"
-            )
-        effective_config = run_dir / "effective_config.yaml"
-        _write_effective_config(cfg_path, effective_config)
-
-    def p_in(name: str) -> Path:
-        p = inputs_dir / name
-        if not p.exists():
-            raise FileNotFoundError(f"Required input file missing: {p}")
-        return p
-
-    argv: list[str] = ["python", str(script)]
-
-    if task == "binder":
-        input_pdb = p_in("binder_input.pdb")
-        argv += ["--input_pdb", str(input_pdb)]
-        argv += ["--target_chain", binder_target_chain]
-        argv += ["--binder_chain", binder_binder_chain]
-        if effective_config:
-            argv += ["--config", str(effective_config)]
-        if binder_specified_hotspots:
-            argv += ["--specified_hotspots", binder_specified_hotspots]
-        argv += [
-            "--samples_min_length",
-            str(binder_samples_min_length),
-            "--samples_max_length",
-            str(binder_samples_max_length),
-            "--samples_per_target",
-            str(binder_samples_per_target),
-            "--model_weights",
-            str(model_ckpt),
-            "--output_dir",
-            str(outputs_dir),
-            "--name",
-            run_name,
-        ]
-
-    elif task in {"antibody", "nanobody"}:
-        antigen_pdb = p_in("antigen.pdb")
-        framework_pdb = p_in("framework.pdb")
-        argv += [
-            "--antigen_pdb",
-            str(antigen_pdb),
-            "--framework_pdb",
-            str(framework_pdb),
-        ]
-
-        if not ab_antigen_chain:
-            raise ValueError("antibody/nanobody requires --ab-antigen-chain")
-        if not ab_heavy_chain:
-            raise ValueError("antibody/nanobody requires --ab-heavy-chain")
-
-        argv += ["--antigen_chain", ab_antigen_chain, "--heavy_chain", ab_heavy_chain]
-        if ab_light_chain:
-            argv += ["--light_chain", ab_light_chain]
-        if ab_specified_hotspots:
-            argv += ["--specified_hotspots", ab_specified_hotspots]
-        if ab_cdr_length:
-            argv += ["--cdr_length", ab_cdr_length]
-        if effective_config:
-            argv += ["--config", str(effective_config)]
-        argv += [
-            "--samples_per_target",
-            str(ab_samples_per_target),
-            "--model_weights",
-            str(model_ckpt),
-            "--output_dir",
-            str(outputs_dir),
-            "--name",
-            run_name,
-        ]
-
-    elif task == "monomer":
-        if mono_length_subset is None:
-            raise ValueError("monomer requires --mono-length-subset")
-        if effective_config:
-            argv += ["--config", str(effective_config)]
-        argv += [
-            "--model_weights",
-            str(model_ckpt),
-            "--output_dir",
-            str(outputs_dir),
-            "--length_subset",
-            mono_length_subset,
-            "--samples_num",
-            str(mono_samples_num),
-        ]
-
-    elif task == "scaffolding":
-        motif_csv = p_in("motif.csv")
-        if effective_config:
-            argv += ["--config", str(effective_config)]
-        argv += [
-            "--model_weights",
-            str(model_ckpt),
-            "--output_dir",
-            str(outputs_dir),
-            "--motif_csv",
-            str(motif_csv),
-        ]
-        if scaffold_motif_names:
-            argv += ["--motif_names", scaffold_motif_names]
-        argv += ["--samples_num", str(scaffold_samples_num)]
-
-    elif task in {"ab_partial_flow", "nb_partial_flow"}:
-        complex_pdb = p_in("complex.pdb")
-
-        if not pf_fixed_positions:
-            raise ValueError(f"{task} requires --pf-fixed-positions")
-        if not pf_cdr_position:
-            raise ValueError(f"{task} requires --pf-cdr-position")
-        if pf_start_t is None:
-            raise ValueError(f"{task} requires --pf-start-t")
-        if pf_samples_per_target is None:
-            raise ValueError(f"{task} requires --pf-samples-per-target")
-        if not pf_antigen_chain:
-            raise ValueError(f"{task} requires --pf-antigen-chain")
-        if not pf_heavy_chain:
-            raise ValueError(f"{task} requires --pf-heavy-chain")
-
-        argv += [
-            "--complex_pdb",
-            str(complex_pdb),
-            "--fixed_positions",
-            pf_fixed_positions,
-            "--cdr_position",
-            pf_cdr_position,
-            "--start_t",
-            str(pf_start_t),
-            "--samples_per_target",
-            str(pf_samples_per_target),
-            "--output_dir",
-            str(outputs_dir),
-            "--retry_Limit",
-            str(pf_retry_limit),
-        ]
-        if pf_specified_hotspots:
-            argv += ["--specified_hotspots", pf_specified_hotspots]
-        if effective_config:
-            argv += ["--config", str(effective_config)]
-
-        argv += [
-            "--model_weights",
-            str(model_ckpt),
-            "--antigen_chain",
-            pf_antigen_chain,
-            "--heavy_chain",
-            pf_heavy_chain,
-        ]
-        if pf_light_chain:
-            argv += ["--light_chain", pf_light_chain]
-        argv += ["--name", run_name]
-
-    elif task == "binder_partial_flow":
-        input_pdb = p_in("binder_input.pdb")
-        argv += ["--input_pdb", str(input_pdb)]
-        if effective_config:
-            argv += ["--config", str(effective_config)]
-        argv += [
-            "--model_weights",
-            str(model_ckpt),
-            "--target_chain",
-            bpf_target_chain,
-            "--binder_chain",
-            bpf_binder_chain,
-            "--start_t",
-            str(bpf_start_t),
-            "--output_dir",
-            str(outputs_dir),
-        ]
-
-    else:
-        raise ValueError(f"Task routed but not implemented: {task}")
-
-    # ---- run ----
-    (run_dir / "cmd.txt").write_text(" ".join(argv) + "\n")
-    run_cwd = inputs_dir if task == "scaffolding" else None
-
-    p = subprocess.run(  # noqa: S603
-        argv,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=str(run_cwd) if run_cwd else None,
-    )
-    (run_dir / "stdout.log").write_text(p.stdout or "")
-
-    # if fail, but outputs exist, keep; else raise
-    pdbs = sorted((run_dir / "outputs").glob("*.pdb"))
-    if p.returncode != 0 and not pdbs:
-        raise RuntimeError(
-            f"PPIFlow failed (exit {p.returncode}). See {run_dir}/stdout.log"
-        )
-
-    _collect_artifacts(run_dir)
-    RUNS_VOL.commit()
-
-    with tempfile.TemporaryDirectory() as td:
-        tar_path = Path(td) / f"{task}.{run_name}.tar.gz"
-        _tar_dir(run_dir, tar_path)
-        return tar_path.read_bytes()
+    _write_csv_rows(output_csv, ["link_name", "sequence_dict", "seq_idx"], rows)
 
 
-# -------------------------
-# Local entrypoint
-# -------------------------
-@app.local_entrypoint()
-def submit_ppiflow(
-    # ---------- common ----------
-    task: str = "binder",
-    run_name: str = "test1",
-    out_dir: str = "./ppiflow_outputs",
-    # ---------- local input files ----------
-    binder_input_pdb: str | None = None,
-    ab_antigen_pdb: str | None = None,
-    ab_framework_pdb: str | None = None,
-    pf_complex_pdb: str | None = None,
-    scaffold_motif_csv: str | None = None,
-    # ---------- model weights (sampling tasks only) ----------
-    model_weights: str | None = None,
-    # ---------- config ----------
-    config: str | None = None,
-    # ---------- binder args ----------
-    binder_target_chain: str = "B",
-    binder_binder_chain: str = "A",
-    binder_specified_hotspots: str | None = None,
-    binder_samples_min_length: int = 75,
-    binder_samples_max_length: int = 76,
-    binder_samples_per_target: int = 5,
-    # ---------- antibody/nanobody args ----------
-    ab_antigen_chain: str | None = None,
-    ab_heavy_chain: str | None = None,
-    ab_light_chain: str | None = None,
-    ab_specified_hotspots: str | None = None,
-    ab_cdr_length: str | None = None,
-    ab_samples_per_target: int = 5,
-    # ---------- monomer unconditional ----------
-    mono_length_subset: str | None = None,
-    mono_samples_num: int = 5,
-    # ---------- scaffolding ----------
-    scaffold_motif_names: str | None = None,
-    scaffold_samples_num: int = 5,
-    # ---------- partial flow antibody/nanobody ----------
-    pf_fixed_positions: str | None = None,
-    pf_cdr_position: str | None = None,
-    pf_specified_hotspots: str | None = None,
-    pf_start_t: float | None = None,
-    pf_samples_per_target: int | None = None,
-    pf_retry_limit: int = 10,
-    pf_antigen_chain: str | None = None,
-    pf_heavy_chain: str | None = None,
-    pf_light_chain: str | None = None,
-    # ---------- partial flow binder ----------
-    bpf_target_chain: str = "B",
-    bpf_binder_chain: str = "A",
-    bpf_start_t: float = 0.7,
-    # ---------- mpnn ----------
-    mpnn_source_task: str | None = None,
-    mpnn_source_run: str | None = None,
-    mpnn_num_seq_per_target_stage1: int = 8,
-    mpnn_num_seq_per_target_stage2: int = 4,
-    mpnn_temp_stage1: float = 0.5,
-    mpnn_temp_stage2: float = 0.1,
-    mpnn_model_name: str = "v_48_020",
-    mpnn_batch_size: int = 1,
-    mpnn_seed: int = 0,
-    mpnn_ckpt_path: str | None = None,
-    mpnn_chain_list: str | None = None,
-    mpnn_position_list: str | None = None,
-    mpnn_omit_aas: str | None = None,
-    mpnn_use_soluble_model: bool = False,
+def _run_queue(
+    state: WorkflowState,
+    queue_label: str,
+    tasks: list[dict[str, Any]],
 ) -> None:
-    """Unified Modal CLI.
+    if not tasks:
+        return
+    queue_name = f"{CONF.name}-{state.run_name}-{queue_label}-{uuid4().hex}"
+    queue = modal.Queue.from_name(queue_name, create_if_missing=True)
+    for task in tasks:
+        queue.put(task)
+    worker_count = max(1, min(state.max_workers, len(tasks)))
+    calls = [
+        ppiflow_queue_worker.spawn(queue_name, state.app_names)
+        for _ in range(worker_count)
+    ]
+    modal.FunctionCall.gather(*calls)
+    modal.Queue.objects.delete(queue_name)
+    OUT_VOLUME.reload()
 
-    - Sampling tasks upload inputs (role-based).
-    - MPNN tasks do NOT upload inputs; they operate on an existing run:
-        --mpnn-source-task <task> --mpnn-source-run <run_name>
-    """
-    allowed = set(TASK_TO_SCRIPT) | set(MPNN_TASKS)
-    if task not in allowed:
-        raise ValueError(f"--task must be one of {sorted(allowed)}")
 
-    def _read_file_as(role_name: str, path: str | None) -> tuple[str, bytes] | None:
-        if not path:
-            return None
-        pp = Path(path).expanduser()
-        if not pp.exists():
-            raise FileNotFoundError(f"Local file not found: {pp}")
-        return (role_name, pp.read_bytes())
-
-    input_files: list[tuple[str, bytes]] = []
-
-    # Build uploads only for sampling tasks
-    if task in TASK_TO_SCRIPT:
-        if task in {"binder", "binder_partial_flow"}:
-            if not binder_input_pdb:
-                raise ValueError(f"{task} requires --binder-input-pdb")
-            item = _read_file_as("binder_input.pdb", binder_input_pdb)
-            if item:
-                input_files.append(item)
-
-        if task in {"antibody", "nanobody"}:
-            if not ab_antigen_pdb or not ab_framework_pdb:
-                raise ValueError(
-                    f"{task} requires --ab-antigen-pdb and --ab-framework-pdb"
-                )
-            input_files.append(_read_file_as("antigen.pdb", ab_antigen_pdb))
-            input_files.append(_read_file_as("framework.pdb", ab_framework_pdb))
-
-        if task in {"ab_partial_flow", "nb_partial_flow"}:
-            if not pf_complex_pdb:
-                raise ValueError(f"{task} requires --pf-complex-pdb")
-            input_files.append(_read_file_as("complex.pdb", pf_complex_pdb))
-
-        if task == "scaffolding":
-            if not scaffold_motif_csv:
-                raise ValueError("scaffolding requires --scaffold-motif-csv")
-
-            csv_path = Path(scaffold_motif_csv).expanduser()
-            if not csv_path.exists():
-                raise FileNotFoundError(f"Local file not found: {csv_path}")
-
-            csv_text = csv_path.read_text(encoding="utf-8-sig")
-            reader = csv.DictReader(StringIO(csv_text))
-            required_cols = {"target", "length", "contig", "motif_path"}
-            if not reader.fieldnames or not required_cols.issubset(
-                set(reader.fieldnames)
-            ):
-                raise ValueError(
-                    f"motif.csv must have columns {sorted(required_cols)}, got {reader.fieldnames}"
-                )
-
-            rows = list(reader)
-            if not rows:
-                raise ValueError("motif.csv has no data rows")
-
-            csv_dir = csv_path.parent
-            motif_files: dict[str, Path] = {}
-            for r in rows:
-                mp = (r.get("motif_path") or "").strip()
-                if not mp:
-                    raise ValueError(f"motif_path is empty in row: {r}")
-
-                mp_path = Path(mp).expanduser() if mp.startswith("~") else Path(mp)
-                if not mp_path.is_absolute():
-                    mp_path = (csv_dir / mp_path).resolve()
-                if not mp_path.exists():
-                    raise FileNotFoundError(
-                        f"motif_path file not found: {mp_path} (from motif_path={mp!r})"
-                    )
-
-                stable_name = mp_path.name
-                if stable_name in motif_files and motif_files[stable_name] != mp_path:
-                    stable_name = (
-                        f"{mp_path.stem}.{len(motif_files) + 1}{mp_path.suffix}"
-                    )
-                motif_files[stable_name] = mp_path
-                r["motif_path"] = stable_name
-
-            out_buf = StringIO()
-            writer = csv.DictWriter(out_buf, fieldnames=reader.fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-            input_files.append(("motif.csv", out_buf.getvalue().encode("utf-8")))
-
-            for stable_name, p in motif_files.items():
-                input_files.append((stable_name, p.read_bytes()))
-
-        if task == "scaffolding" and scaffold_motif_names:
-            s = scaffold_motif_names.strip()
-            if not s.startswith("["):
-                scaffold_motif_names = json.dumps([s])
-    elif task in MPNN_TASKS:
-        if mpnn_position_list and not mpnn_chain_list:
-            raise ValueError(
-                f"{task} requires --mpnn-chain-list when --mpnn-position-list is provided"
+def _run_mpnn_stage(
+    state: WorkflowState,
+    source_pdbs: list[Path],
+    *,
+    stage_dir: Path,
+    step_name: str,
+    output_subdir: str,
+    fixed_positions_csv: Path | None = None,
+) -> tuple[list[Path], Path]:
+    cfg = _step_cfg(state, step_name)
+    mpnn_pdbs_dir = stage_dir / "mpnn_pdbs"
+    mpnn_out = stage_dir / output_subdir
+    copied_pdbs = _copy_structure_files(source_pdbs, mpnn_pdbs_dir)
+    fixed_map: dict[str, str | None] = {}
+    if fixed_positions_csv and fixed_positions_csv.exists():
+        for row in _read_csv_rows(fixed_positions_csv):
+            stem = Path(row.get("filename", "")).stem.lower()
+            fixed_map[stem] = _normalize_fixed_positions_for_mpnn(
+                row.get("fixed_positions")
             )
-        if mpnn_position_list:
-            pos_csv = Path(mpnn_position_list).expanduser()
-            if not pos_csv.exists():
-                raise FileNotFoundError(f"Local file not found: {pos_csv}")
-            normalized = _normalize_fixed_positions_csv_bytes(pos_csv.read_bytes())
-            input_files.append(("mpnn_fixed_positions.csv", normalized))
 
-    # dispatch
-    tar_bytes = run_ppiflow_structured.remote(
-        task=task,
-        run_name=run_name,
-        input_files=input_files,
-        model_weights=model_weights,
-        config=config,
-        binder_target_chain=binder_target_chain,
-        binder_binder_chain=binder_binder_chain,
-        binder_specified_hotspots=binder_specified_hotspots,
-        binder_samples_min_length=binder_samples_min_length,
-        binder_samples_max_length=binder_samples_max_length,
-        binder_samples_per_target=binder_samples_per_target,
-        ab_antigen_chain=ab_antigen_chain,
-        ab_heavy_chain=ab_heavy_chain,
-        ab_light_chain=ab_light_chain,
-        ab_specified_hotspots=ab_specified_hotspots,
-        ab_cdr_length=ab_cdr_length,
-        ab_samples_per_target=ab_samples_per_target,
-        mono_length_subset=mono_length_subset,
-        mono_samples_num=mono_samples_num,
-        scaffold_motif_names=scaffold_motif_names,
-        scaffold_samples_num=scaffold_samples_num,
-        pf_fixed_positions=pf_fixed_positions,
-        pf_cdr_position=pf_cdr_position,
-        pf_specified_hotspots=pf_specified_hotspots,
-        pf_start_t=pf_start_t,
-        pf_samples_per_target=pf_samples_per_target,
-        pf_retry_limit=pf_retry_limit,
-        pf_antigen_chain=pf_antigen_chain,
-        pf_heavy_chain=pf_heavy_chain,
-        pf_light_chain=pf_light_chain,
-        bpf_target_chain=bpf_target_chain,
-        bpf_binder_chain=bpf_binder_chain,
-        bpf_start_t=bpf_start_t,
-        mpnn_source_task=mpnn_source_task,
-        mpnn_source_run=mpnn_source_run,
-        mpnn_num_seq_per_target_stage1=mpnn_num_seq_per_target_stage1,
-        mpnn_num_seq_per_target_stage2=mpnn_num_seq_per_target_stage2,
-        mpnn_temp_stage1=mpnn_temp_stage1,
-        mpnn_temp_stage2=mpnn_temp_stage2,
-        mpnn_batch_size=mpnn_batch_size,
-        mpnn_seed=mpnn_seed,
-        mpnn_ckpt_path=mpnn_ckpt_path,
-        mpnn_model_name=mpnn_model_name,
-        mpnn_chain_list=mpnn_chain_list,
-        mpnn_omit_aas=mpnn_omit_aas,
-        mpnn_use_soluble_model=mpnn_use_soluble_model,
+    tasks: list[dict[str, Any]] = []
+    for idx, pdb_path in enumerate(copied_pdbs, start=1):
+        fixed_residues = fixed_map.get(pdb_path.stem.lower())
+        tasks.append(
+            {
+                "kind": "ligandmpnn",
+                "run_name": f"{state.run_name}-{step_name}-{idx}",
+                "input_path": str(pdb_path),
+                "output_dir": str(mpnn_out / pdb_path.stem),
+                "seeds": _seeds_from_cfg(cfg),
+                "cli_args": _ligandmpnn_cli_args(
+                    state, cfg, fixed_residues=fixed_residues
+                ),
+            }
+        )
+    _run_queue(state, step_name.lower(), tasks)
+    _collect_mpnn_sequences(mpnn_out, mpnn_pdbs_dir / "mpnn_seqs.csv")
+    mpnn_pdbs = _collect_pdb_files(mpnn_out)
+    if not mpnn_pdbs:
+        _write_warning(
+            mpnn_out / "NO_PACKED_PDBS.txt",
+            "LigandMPNN did not emit packed PDBs; downstream steps use input backbones.",
+        )
+        mpnn_pdbs = copied_pdbs
+    return mpnn_pdbs, mpnn_pdbs_dir / "mpnn_seqs.csv"
+
+
+def _run_flowpacker_stage(
+    state: WorkflowState,
+    source_pdbs: list[Path],
+    *,
+    stage_dir: Path,
+    step_name: str,
+) -> list[Path]:
+    cfg = _step_cfg(state, step_name)
+    out_dir = stage_dir / "flowpacker_output"
+    tasks = [
+        {
+            "kind": "flowpacker",
+            "run_name": f"{state.run_name}-{step_name}-{idx}",
+            "input_path": str(pdb_path),
+            "output_dir": str(out_dir / pdb_path.stem),
+            "model_name": str(cfg.get("model_name") or cfg.get("model") or "cluster"),
+            "use_confidence": _as_bool(cfg.get("use_confidence"), False),
+            "n_samples": _as_int(cfg.get("n_samples"), 1),
+            "num_steps": _as_int(cfg.get("num_steps"), 10),
+            "sample_coeff": _as_float(cfg.get("sample_coeff"), 5.0),
+            "use_gt_masks": _as_bool(cfg.get("use_gt_masks"), False),
+            "inpaint": cfg.get("inpaint"),
+            "save_traj": _as_bool(cfg.get("save_traj"), False),
+            "seed": _as_int(cfg.get("seed"), 42),
+        }
+        for idx, pdb_path in enumerate(source_pdbs, start=1)
+    ]
+    _run_queue(state, step_name.lower(), tasks)
+    packed = _collect_pdb_files(out_dir)
+    if not packed:
+        _write_warning(
+            out_dir / "NO_FLOWPACKER_PDBS.txt",
+            "FlowPacker produced no PDB files; downstream steps use input structures.",
+        )
+        packed = source_pdbs
+    return packed
+
+
+##########################################
+# AF3Score and filtering
+##########################################
+def _run_af3score_stage(
+    state: WorkflowState,
+    source_pdbs: list[Path],
+    *,
+    stage_dir: Path,
+    step_name: str,
+) -> Path:
+    cfg = _step_cfg(state, step_name)
+    out_dir = stage_dir / "af3score_output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not source_pdbs:
+        raise ValueError(f"{step_name} requires at least one PDB input")
+    af3score_fn = _remote_function(state.app_names, "af3score", "af3score_run_bytes")
+    tarball = af3score_fn.remote(
+        input_files=[(path.name, path.read_bytes()) for path in source_pdbs],
+        run_name=f"{state.run_name}-{step_name}",
+        prepare_workers=_as_int(cfg.get("prepare_workers"), 8),
+        max_batches=_as_int(cfg.get("max_batches"), 10),
+    )
+    _extract_tar_zst_bytes(tarball, out_dir)
+    return out_dir
+
+
+def _parse_filter_clause(clause: str) -> tuple[str, float]:
+    match = re.fullmatch(r"\s*(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)\s*", clause)
+    if not match:
+        raise ValueError(f"Invalid filter clause: {clause!r}")
+    return match.group(1), float(match.group(2))
+
+
+def _metric_passes(value: float, op: str, threshold: float) -> bool:
+    if op == ">":
+        return value > threshold
+    if op == ">=":
+        return value >= threshold
+    if op == "<":
+        return value < threshold
+    if op == "<=":
+        return value <= threshold
+    if op == "==":
+        return value == threshold
+    if op == "!=":
+        return value != threshold
+    raise ValueError(f"Unsupported filter operator: {op}")
+
+
+def _row_passes_filters(row: dict[str, str], filters: dict[str, Any]) -> bool:
+    for metric, condition in filters.items():
+        if metric not in row or row[metric] == "":
+            return False
+        value = float(row[metric])
+        clauses = condition if isinstance(condition, list) else [condition]
+        for clause in clauses:
+            if isinstance(clause, dict):
+                for op, threshold in clause.items():
+                    if not _metric_passes(value, str(op), float(threshold)):
+                        return False
+            elif isinstance(clause, str):
+                op, threshold = _parse_filter_clause(clause)
+                if not _metric_passes(value, op, threshold):
+                    return False
+            else:
+                if value < float(clause):
+                    return False
+    return True
+
+
+def _default_filter(stage: int) -> dict[str, str]:
+    return {"iptm": "> 0.7"} if stage == 1 else {"iptm": "> 0.8"}
+
+
+def _filter_stage(
+    state: WorkflowState,
+    source_pdbs: list[Path],
+    *,
+    stage_dir: Path,
+    step_name: str,
+    out_name: str,
+    output_csv_name: str,
+    default_stage: int,
+) -> list[Path]:
+    cfg = _step_cfg(state, step_name)
+    out_dir = stage_dir / out_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metrics_csv = _first_existing(
+        sorted((stage_dir / "af3score_output").rglob("af3score_metrics.csv"))
+    )
+    if metrics_csv is None:
+        _write_warning(
+            out_dir / "FILTER_WARNING.txt",
+            "AF3Score metrics CSV was not found; all input PDBs were retained.",
+        )
+        retained = _copy_structure_files(source_pdbs, out_dir)
+        _write_csv_rows(
+            out_dir / output_csv_name,
+            ["filename"],
+            [{"filename": p.name} for p in retained],
+        )
+        return retained
+
+    rows = _read_csv_rows(metrics_csv)
+    filters = cfg.get("filters") or _default_filter(default_stage)
+    passing_rows = [row for row in rows if _row_passes_filters(row, filters)]
+    if not passing_rows:
+        _write_warning(
+            out_dir / "FILTER_WARNING.txt",
+            "No structures passed filters; all input PDBs were retained.",
+        )
+        passing_rows = rows
+
+    pdb_by_stem = {path.stem.lower(): path for path in source_pdbs}
+    retained: list[Path] = []
+    out_rows: list[dict[str, Any]] = []
+    for row in passing_rows:
+        names = [
+            row.get("description", ""),
+            row.get("filename", ""),
+            row.get("pdb", ""),
+            row.get("name", ""),
+        ]
+        stem = next((Path(name).stem.lower() for name in names if name), "")
+        src = pdb_by_stem.get(stem)
+        if src is None and len(source_pdbs) == 1:
+            src = source_pdbs[0]
+        if src is None:
+            continue
+        dst = _copy_file(src, out_dir / src.name)
+        retained.append(dst)
+        out_rows.append({"filename": dst.name, **row})
+
+    if not retained:
+        retained = _copy_structure_files(source_pdbs, out_dir)
+        out_rows = [{"filename": p.name} for p in retained]
+    fieldnames = list(dict.fromkeys(["filename", *(rows[0].keys() if rows else [])]))
+    _write_csv_rows(out_dir / output_csv_name, fieldnames, out_rows)
+    return retained
+
+
+##########################################
+# Rosetta, partial flow, AF3 refold, DockQ
+##########################################
+def _rosetta_jobs(
+    pdbs: list[Path],
+    cfg: dict[str, Any],
+    *,
+    binary_default: str = "relax",
+) -> list[dict[str, object]]:
+    jobs: list[dict[str, object]] = []
+    for idx, pdb_path in enumerate(pdbs, start=1):
+        jobs.append(
+            {
+                "index": idx,
+                "pdb_name": pdb_path.name,
+                "pdb_bytes": pdb_path.read_bytes(),
+                "binary": str(
+                    cfg.get("binary") or cfg.get("rosetta_binary") or binary_default
+                ),
+                "rosetta_script_text": cfg.get("rosetta_script_text"),
+                "rosetta_script_name": cfg.get("rosetta_script_name", "protocol.xml"),
+                "flags_text": cfg.get("flags_text"),
+                "flags_name": cfg.get("flags_name", "flags.txt"),
+            }
+        )
+    return jobs
+
+
+def _run_rosetta_batch(
+    state: WorkflowState,
+    source_pdbs: list[Path],
+    *,
+    step_name: str,
+    out_dir: Path,
+    binary_default: str = "relax",
+) -> list[Path]:
+    cfg = _step_cfg(state, step_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not source_pdbs:
+        return []
+    rosetta_fn = _remote_function(state.app_names, "rosetta", "run_rosetta_batch_bytes")
+    tarball = rosetta_fn.remote(
+        jobs=_rosetta_jobs(source_pdbs, cfg, binary_default=binary_default),
+        run_name=f"{state.run_name}-{step_name}",
+        num_cpu_per_pod=max(1, min(30, len(source_pdbs))),
+    )
+    _extract_tar_zst_bytes(tarball, out_dir)
+    return _collect_pdb_files(out_dir) or source_pdbs
+
+
+def _write_fixed_positions_csv(
+    state: WorkflowState, source_pdbs: list[Path], output_csv: Path
+) -> None:
+    cfg = _step_cfg(state, "PartialStep")
+    explicit = cfg.get("fixed_positions") or state.task.get("fixed_positions")
+    rows = [
+        {
+            "filename": pdb.name,
+            "fixed_positions": str(explicit or "NONE"),
+        }
+        for pdb in source_pdbs
+    ]
+    _write_csv_rows(output_csv, ["filename", "fixed_positions"], rows)
+    if not explicit:
+        _write_warning(
+            output_csv.with_suffix(".warning.txt"),
+            "No residue-energy CSV was available from RosettaFixStep; "
+            "fixed_positions was set to NONE for each structure.",
+        )
+
+
+def _run_partial_step(state: WorkflowState, source_pdbs: list[Path]) -> list[Path]:
+    cfg = _step_cfg(state, "PartialStep")
+    partial_out = state.stage2_dir / "partial_output"
+    before_partial = state.stage2_dir / "before_partial_pdbs"
+    fixed_csv = state.stage2_dir / "fixed_positions.csv"
+    copied = _copy_structure_files(source_pdbs, before_partial)
+    rows = _read_csv_rows(fixed_csv)
+    fixed_by_name = {
+        row["filename"]: row.get("fixed_positions", "NONE") for row in rows
+    }
+
+    results: list[Path] = []
+    for idx, pdb_path in enumerate(copied, start=1):
+        fixed_positions = fixed_by_name.get(pdb_path.name, "NONE")
+        per_target_out = partial_out / pdb_path.stem
+        if not fixed_positions or fixed_positions.upper() == "NONE":
+            _copy_file(pdb_path, per_target_out / pdb_path.name)
+            _write_warning(
+                per_target_out / "PARTIAL_SKIPPED.txt",
+                "No fixed positions were provided; copied input structure unchanged.",
+            )
+            results.append(per_target_out / pdb_path.name)
+            continue
+        mode, config = _partial_config_for_pdb(state, cfg, pdb_path, fixed_positions)
+        input_files = [(pdb_path.name, pdb_path.read_bytes())]
+        results.extend(
+            _call_ppiflow(
+                state,
+                config=config,
+                design_mode=mode,
+                input_files=input_files,
+                out_dir=per_target_out,
+                run_label=f"{state.run_name}-partial-{idx}",
+            )
+        )
+    return results or _collect_pdb_files(partial_out)
+
+
+AA3_TO_1 = {
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
+}
+
+
+def _pdb_to_sequences(path: Path) -> list[tuple[str, str]]:
+    residues: dict[str, list[tuple[tuple[str, str], str]]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.startswith("ATOM"):
+            continue
+        atom = line[12:16].strip()
+        if atom != "CA":
+            continue
+        resname = line[17:20].strip().upper()
+        chain = (line[21].strip() or "A")[:1]
+        res_id = line[22:27].strip()
+        key = (chain, res_id, resname)
+        if key in seen:
+            continue
+        seen.add(key)
+        residues.setdefault(chain, []).append(
+            ((res_id, resname), AA3_TO_1.get(resname, "X"))
+        )
+    return [
+        (chain, "".join(aa for _, aa in chain_residues))
+        for chain, chain_residues in residues.items()
+        if chain_residues
+    ]
+
+
+def _af3_json_for_pdb(pdb_path: Path, cfg: dict[str, Any]) -> bytes:
+    sequences = [
+        AF3SequenceEntry(protein=AF3Protein(id=chain, sequence=seq))
+        for chain, seq in _pdb_to_sequences(pdb_path)
+    ]
+    if not sequences:
+        raise ValueError(f"No protein sequences could be parsed from {pdb_path}")
+    seed = _as_int(cfg.get("model_seed", cfg.get("seed")), 1)
+    conf = AF3Config(
+        name=sanitize_filename(pdb_path.stem),
+        modelSeeds=[seed],
+        sequences=sequences,
+    )
+    return conf.model_dump_json(indent=2).encode("utf-8")
+
+
+def _run_refold_and_relax(state: WorkflowState, source_pdbs: list[Path]) -> None:
+    refold_cfg = _step_cfg(state, "ReFoldStep")
+    relax_cfg = _step_cfg(state, "RosettaRelaxStep")
+    tasks: list[dict[str, Any]] = []
+    if _step_enabled(state.enabled, "ReFoldStep"):
+        for idx, pdb_path in enumerate(source_pdbs, start=1):
+            output_dir = state.stage2_dir / "refold_output" / pdb_path.stem
+            json_path = output_dir / "input.json"
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_bytes(_af3_json_for_pdb(pdb_path, refold_cfg))
+            tasks.append(
+                {
+                    "kind": "af3_refold",
+                    "run_name": f"{state.run_name}-refold-{idx}",
+                    "input_path": str(pdb_path),
+                    "output_dir": str(output_dir),
+                    "json_path": str(json_path),
+                    "recycle": _as_int(refold_cfg.get("recycle"), 10),
+                    "sample": _as_int(
+                        refold_cfg.get("sample", refold_cfg.get("seed_num")), 5
+                    ),
+                }
+            )
+    if _step_enabled(state.enabled, "RosettaRelaxStep"):
+        for idx, pdb_path in enumerate(source_pdbs, start=1):
+            tasks.append(
+                {
+                    "kind": "rosetta_relax",
+                    "run_name": f"{state.run_name}-relax-{idx}",
+                    "input_path": str(pdb_path),
+                    "output_dir": str(
+                        state.stage2_dir / "rosetta_relax_output" / pdb_path.stem
+                    ),
+                    "rosetta_cfg": relax_cfg,
+                }
+            )
+    _run_queue(state, "refold-relax", tasks)
+
+
+def _pair_refold_models(
+    refold_out: Path, references: list[Path]
+) -> list[dict[str, object]]:
+    model_files = sorted(
+        path
+        for path in refold_out.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".pdb", ".cif"}
+    )
+    pairs: list[dict[str, object]] = []
+    for idx, model in enumerate(model_files, start=1):
+        model_context = "/".join(
+            part.lower() for part in model.relative_to(refold_out).parts
+        )
+        ref = next(
+            (
+                candidate
+                for candidate in references
+                if candidate.stem.lower() in model_context
+            ),
+            references[0] if len(references) == 1 else None,
+        )
+        if ref is None:
+            continue
+        pairs.append(
+            {
+                "id": f"{ref.stem}_{idx}",
+                "model_name": model.name,
+                "model_bytes": model.read_bytes(),
+                "reference_name": ref.name,
+                "reference_bytes": ref.read_bytes(),
+            }
+        )
+    return pairs
+
+
+def _run_dockq(state: WorkflowState, references: list[Path]) -> Path:
+    out_dir = state.stage2_dir / "dockq_output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pairs = _pair_refold_models(state.stage2_dir / "refold_output", references)
+    if not pairs:
+        _write_warning(out_dir / "DOCKQ_SKIPPED.txt", "No refold/reference pairs found")
+        return out_dir
+    cfg = _step_cfg(state, "DockQStep")
+    dockq_args = cfg.get("dockq_args", ["--short"])
+    if isinstance(dockq_args, str):
+        dockq_args = [part for part in dockq_args.split(" ") if part]
+    dockq_fn = _remote_function(state.app_names, "dockq", "run_dockq_batch")
+    tarball = dockq_fn.remote(
+        pairs=pairs,
+        run_name=f"{state.run_name}-dockq",
+        dockq_args=dockq_args,
+    )
+    _extract_tar_zst_bytes(tarball, out_dir)
+    return out_dir
+
+
+##########################################
+# Ranking and report
+##########################################
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _read_optional_csv(path: Path | None) -> list[dict[str, str]]:
+    if path is None or not path.exists():
+        return []
+    return _read_csv_rows(path)
+
+
+def _rank_and_report(state: WorkflowState, filtered_pdbs: list[Path]) -> None:
+    out_dir = state.design_output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stage2_filter_csv = _first_existing(
+        sorted((state.stage2_dir / "filtered_iptm08").glob("filtered_iptm08.csv"))
+    )
+    dockq_csv = _first_existing(
+        sorted((state.stage2_dir / "dockq_output").rglob("dockq_results.csv"))
+    )
+    af_rows = _read_optional_csv(stage2_filter_csv)
+    dockq_rows = _read_optional_csv(dockq_csv)
+    dockq_by_id = {row.get("id", ""): row for row in dockq_rows}
+    dockq_by_ref = {
+        Path(row.get("reference", "")).stem.lower(): row for row in dockq_rows
+    }
+
+    ranked_rows: list[dict[str, Any]] = []
+    for pdb_path in filtered_pdbs:
+        af_row = next(
+            (
+                row
+                for row in af_rows
+                if Path(row.get("filename", row.get("description", ""))).stem.lower()
+                == pdb_path.stem.lower()
+            ),
+            {},
+        )
+        dockq_row = dockq_by_ref.get(pdb_path.stem.lower()) or dockq_by_id.get(
+            pdb_path.stem, {}
+        )
+        ranked_rows.append(
+            {
+                "design": pdb_path.stem,
+                "pdb": str(pdb_path.relative_to(state.run_root)),
+                "iptm": af_row.get("iptm", af_row.get("ranking_score", "")),
+                "dockq": dockq_row.get("dockq", ""),
+                "irmsd": dockq_row.get("irmsd", ""),
+                "lrmsd": dockq_row.get("lrmsd", ""),
+                "fnat": dockq_row.get("fnat", ""),
+            }
+        )
+
+    ranked_rows.sort(
+        key=lambda row: (_safe_float(row.get("dockq")), _safe_float(row.get("iptm"))),
+        reverse=True,
+    )
+    _write_csv_rows(
+        out_dir / "ranked_designs.csv",
+        ["design", "pdb", "iptm", "dockq", "irmsd", "lrmsd", "fnat"],
+        ranked_rows,
     )
 
-    out_dir_p = Path(out_dir).expanduser()
-    out_dir_p.mkdir(parents=True, exist_ok=True)
-    out_tar = out_dir_p / f"{task}.{run_name}.tar.gz"
-    out_tar.write_bytes(tar_bytes)
-    print(f"[ok] saved: {out_tar}")
+    top_dir = out_dir / "top_models"
+    for row in ranked_rows[: min(10, len(ranked_rows))]:
+        src = state.run_root / str(row["pdb"])
+        if src.exists():
+            _copy_file(src, top_dir / src.name)
+
+    report = [
+        "# PPIFlow Workflow Report",
+        "",
+        f"- Run: {state.run_name}",
+        f"- Gentype: {state.gentype}",
+        f"- Ranked designs: {len(ranked_rows)}",
+        f"- Stage 1 enabled steps: {', '.join(k for k in STAGE1_STEPS if _step_enabled(state.enabled, k)) or 'none'}",
+        f"- Stage 2 enabled steps: {', '.join(k for k in STAGE2_STEPS if _step_enabled(state.enabled, k)) or 'none'}",
+        "",
+        "See `ranked_designs.csv` for sortable metrics.",
+    ]
+    (out_dir / "design_report.md").write_text(
+        "\n".join(report) + "\n", encoding="utf-8"
+    )
+    (out_dir / "design_report.html").write_text(
+        "<html><body><pre>"
+        + "\n".join(report).replace("&", "&amp;").replace("<", "&lt;")
+        + "</pre></body></html>\n",
+        encoding="utf-8",
+    )
+
+
+##########################################
+# Queue worker
+##########################################
+@app.function(
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=MAX_TIMEOUT,
+    volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
+)
+def ppiflow_queue_worker(queue_name: str, app_names: dict[str, str]) -> None:
+    """Process independent per-structure workflow tasks from a Modal queue."""
+    queue = modal.Queue.from_name(queue_name)
+    while True:
+        task = queue.get(block=False)
+        if task is None:
+            return
+
+        kind = task["kind"]
+        output_dir = Path(task["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if kind == "ligandmpnn":
+            input_path = Path(task["input_path"])
+            ligandmpnn_fn = _remote_function(app_names, "ligandmpnn", "ligandmpnn_run")
+            tarball = ligandmpnn_fn.remote(
+                task["run_name"],
+                "run",
+                input_path.read_bytes(),
+                task["seeds"],
+                task["cli_args"],
+                None,
+                None,
+            )
+            _extract_tar_zst_bytes(tarball, output_dir)
+        elif kind == "flowpacker":
+            input_path = Path(task["input_path"])
+            flowpacker_fn = _remote_function(app_names, "flowpacker", "run_flowpacker")
+            tarball = flowpacker_fn.remote(
+                input_files=[(input_path.name, input_path.read_bytes())],
+                run_name=task["run_name"],
+                model_name=task["model_name"],
+                use_confidence=task["use_confidence"],
+                n_samples=task["n_samples"],
+                num_steps=task["num_steps"],
+                sample_coeff=task["sample_coeff"],
+                use_gt_masks=task["use_gt_masks"],
+                inpaint=task["inpaint"],
+                save_traj=task["save_traj"],
+                seed=task["seed"],
+            )
+            _extract_tar_zst_bytes(tarball, output_dir)
+        elif kind == "af3_refold":
+            data_fn = _remote_function(app_names, "alphafold3", "run_data_pipeline")
+            inference_fn = _remote_function(
+                app_names, "alphafold3", "run_inference_pipeline"
+            )
+            json_path = data_fn.remote(Path(task["json_path"]).read_bytes())
+            tarball = inference_fn.remote(
+                json_path,
+                recycle=task["recycle"],
+                sample=task["sample"],
+            )
+            _extract_tar_zst_bytes(tarball, output_dir)
+        elif kind == "rosetta_relax":
+            input_path = Path(task["input_path"])
+            rosetta_fn = _remote_function(
+                app_names, "rosetta", "run_rosetta_batch_bytes"
+            )
+            tarball = rosetta_fn.remote(
+                jobs=[
+                    _rosetta_jobs(
+                        [input_path],
+                        task.get("rosetta_cfg", {}),
+                        binary_default="relax",
+                    )[0]
+                ],
+                run_name=task["run_name"],
+                num_cpu_per_pod=1,
+            )
+            _extract_tar_zst_bytes(tarball, output_dir)
+        else:
+            raise ValueError(f"Unsupported queue task kind: {kind}")
+
+        _write_json(output_dir / "workflow_task.json", task)
+        OUT_VOLUME.commit()
+
+
+##########################################
+# Stage runners
+##########################################
+def _run_stage1(
+    state: WorkflowState, input_files: list[tuple[str, bytes]]
+) -> list[Path]:
+    ppiflow_pdbs = _run_ppiflow_step(state, input_files)
+    if not ppiflow_pdbs:
+        ppiflow_pdbs = _collect_pdb_files(state.run_root / "inputs")
+    if not ppiflow_pdbs:
+        raise RuntimeError("Stage 1 produced no PDB files")
+
+    mpnn_pdbs = ppiflow_pdbs
+    if state.gentype == "binder" and _step_enabled(state.enabled, "MPNNStep_stage1"):
+        mpnn_pdbs, _ = _run_mpnn_stage(
+            state,
+            ppiflow_pdbs,
+            stage_dir=state.stage1_dir,
+            step_name="MPNNStep_stage1",
+            output_subdir="mpnn_output",
+        )
+    elif state.gentype in {"antibody", "nanobody"} and _step_enabled(
+        state.enabled, "AbMPNNStep_stage1"
+    ):
+        mpnn_pdbs, _ = _run_mpnn_stage(
+            state,
+            ppiflow_pdbs,
+            stage_dir=state.stage1_dir,
+            step_name="AbMPNNStep_stage1",
+            output_subdir="abmpnn_output",
+        )
+
+    packed_pdbs = mpnn_pdbs
+    if _step_enabled(state.enabled, "FlowpackerStep_stage1"):
+        packed_pdbs = _run_flowpacker_stage(
+            state,
+            mpnn_pdbs,
+            stage_dir=state.stage1_dir,
+            step_name="FlowpackerStep_stage1",
+        )
+
+    scored_pdbs = packed_pdbs
+    if _step_enabled(state.enabled, "AF3scoreStep_stage1"):
+        _run_af3score_stage(
+            state,
+            packed_pdbs,
+            stage_dir=state.stage1_dir,
+            step_name="AF3scoreStep_stage1",
+        )
+    if _step_enabled(state.enabled, "FilterStep_stage1"):
+        scored_pdbs = _filter_stage(
+            state,
+            packed_pdbs,
+            stage_dir=state.stage1_dir,
+            step_name="FilterStep_stage1",
+            out_name="filtered_iptm07",
+            output_csv_name="filtered_iptm07.csv",
+            default_stage=1,
+        )
+    return scored_pdbs
+
+
+def _stage2_seed_inputs(state: WorkflowState) -> list[Path]:
+    candidates = _collect_pdb_files(state.stage1_dir / "filtered_iptm07")
+    if candidates:
+        return candidates
+    input_pdbs = _collect_pdb_files(state.run_root / "inputs")
+    if input_pdbs:
+        out_dir = state.stage1_dir / "filtered_iptm07"
+        _write_warning(
+            out_dir / "STAGE2_INPUT_WARNING.txt",
+            "Stage 2 was requested without Stage 1 filtered outputs; using staged input PDBs.",
+        )
+        return _copy_structure_files(input_pdbs, out_dir)
+    raise RuntimeError("Stage 2 requires Stage 1 filtered PDBs or input PDBs")
+
+
+def _run_stage2(state: WorkflowState) -> list[Path]:
+    stage2_inputs = _stage2_seed_inputs(state)
+
+    rosetta_fixed = stage2_inputs
+    if _step_enabled(state.enabled, "RosettaFixStep"):
+        rosetta_fixed = _run_rosetta_batch(
+            state,
+            stage2_inputs,
+            step_name="RosettaFixStep",
+            out_dir=state.stage2_dir / "rosetta_fix_output",
+            binary_default="relax",
+        )
+
+    fixed_csv = state.stage2_dir / "fixed_positions.csv"
+    if _step_enabled(state.enabled, "PartialStep"):
+        _write_fixed_positions_csv(state, stage2_inputs, fixed_csv)
+        partial_pdbs = _run_partial_step(state, stage2_inputs)
+    else:
+        partial_pdbs = rosetta_fixed
+
+    mpnn_pdbs = partial_pdbs
+    if state.gentype == "binder" and _step_enabled(state.enabled, "MPNNStep_stage2"):
+        mpnn_pdbs, _ = _run_mpnn_stage(
+            state,
+            partial_pdbs,
+            stage_dir=state.stage2_dir,
+            step_name="MPNNStep_stage2",
+            output_subdir="mpnn_output",
+            fixed_positions_csv=fixed_csv if fixed_csv.exists() else None,
+        )
+    elif state.gentype in {"antibody", "nanobody"} and _step_enabled(
+        state.enabled, "AbMPNNStep_stage2"
+    ):
+        mpnn_pdbs, _ = _run_mpnn_stage(
+            state,
+            partial_pdbs,
+            stage_dir=state.stage2_dir,
+            step_name="AbMPNNStep_stage2",
+            output_subdir="abmpnn_output",
+            fixed_positions_csv=fixed_csv if fixed_csv.exists() else None,
+        )
+
+    packed_pdbs = mpnn_pdbs
+    if _step_enabled(state.enabled, "FlowpackerStep_stage2"):
+        packed_pdbs = _run_flowpacker_stage(
+            state,
+            mpnn_pdbs,
+            stage_dir=state.stage2_dir,
+            step_name="FlowpackerStep_stage2",
+        )
+
+    filtered_pdbs = packed_pdbs
+    if _step_enabled(state.enabled, "AF3scoreStep_stage2"):
+        _run_af3score_stage(
+            state,
+            packed_pdbs,
+            stage_dir=state.stage2_dir,
+            step_name="AF3scoreStep_stage2",
+        )
+    if _step_enabled(state.enabled, "FilterStep_stage2"):
+        filtered_pdbs = _filter_stage(
+            state,
+            packed_pdbs,
+            stage_dir=state.stage2_dir,
+            step_name="FilterStep_stage2",
+            out_name="filtered_iptm08",
+            output_csv_name="filtered_iptm08.csv",
+            default_stage=2,
+        )
+
+    _run_refold_and_relax(state, filtered_pdbs)
+    if _step_enabled(state.enabled, "DockQStep"):
+        _run_dockq(state, filtered_pdbs)
+    if _step_enabled(state.enabled, "RankStep") or _step_enabled(
+        state.enabled, "ReportStep"
+    ):
+        _rank_and_report(state, filtered_pdbs)
+    return filtered_pdbs
+
+
+##########################################
+# Main remote function and local entrypoint
+##########################################
+@app.function(
+    cpu=(1.125, 16.125),
+    memory=(1024, 65536),
+    timeout=MAX_TIMEOUT,
+    volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
+)
+def run_ppiflow_workflow(
+    task_yaml_bytes: bytes,
+    steps_yaml_bytes: bytes,
+    input_files: list[tuple[str, bytes]],
+    run_name: str,
+    stage: int | None,
+    max_workers: int,
+    app_names: dict[str, str],
+    force: bool,
+) -> bytes:
+    """Run the PPIFlow workflow on Modal and return a packaged archive."""
+    task_doc = _load_yaml_bytes(task_yaml_bytes)
+    steps_doc = _load_yaml_bytes(steps_yaml_bytes)
+    task = _task_section(task_doc)
+    enabled = _enabled_section(task_doc)
+    safe_run_name = sanitize_filename(run_name)
+    run_root = MOUNT_ROOT / safe_run_name
+    if run_root.exists():
+        if force:
+            shutil.rmtree(run_root)
+        else:
+            raise FileExistsError(
+                f"Workflow volume run already exists: {run_root}. "
+                "Use --force or choose a different --run-name."
+            )
+    _ensure_layout(run_root)
+    _stage_input_files(run_root, input_files)
+    _write_json(run_root / "inputs" / "task.yaml.json", task_doc)
+    _write_json(run_root / "inputs" / "steps.yaml.json", steps_doc)
+    _write_json(run_root / "inputs" / "deployed_apps.json", app_names)
+    OUT_VOLUME.commit()
+
+    state = WorkflowState(
+        run_root=run_root,
+        run_name=safe_run_name,
+        task=task,
+        enabled=enabled,
+        steps=steps_doc,
+        app_names=app_names,
+        max_workers=max(1, max_workers),
+    )
+
+    if stage not in {None, 1, 2}:
+        raise ValueError("--stage must be omitted, 1, or 2")
+    if stage in {None, 1}:
+        _run_stage1(state, input_files)
+        OUT_VOLUME.commit()
+    if stage in {None, 2}:
+        _run_stage2(state)
+        OUT_VOLUME.commit()
+
+    return package_outputs(run_root)
+
+
+@app.local_entrypoint()
+def submit_ppiflow_workflow(
+    task: str,
+    steps: str,
+    stage: int | None = None,
+    out_dir: str | None = None,
+    run_name: str | None = None,
+    max_workers: int = 4,
+    force: bool = False,
+) -> None:
+    """Run the upstream-YAML-compatible PPIFlow workflow.
+
+    Args:
+        task: Path to upstream-style task.yaml. The file should contain a
+            top-level ``task:`` mapping and optional ``steps:`` enable map.
+        steps: Path to upstream-style steps.yaml with per-step runtime options.
+        stage: Optional stage selector. Use ``1`` for Stage 1 only, ``2`` for
+            Stage 2 only, or omit to run both stages.
+        out_dir: Optional local output directory for the final ``.tar.zst``.
+            Defaults to ``task.output_base_dir`` when present, otherwise CWD.
+        run_name: Optional run name. Defaults to ``task.name`` or the task file
+            stem. The name also becomes the top-level directory in the archive.
+        max_workers: Maximum Modal queue workers for independent per-structure
+            tasks.
+        force: Replace an existing local tarball or remote workflow run with
+            the same name.
+    """
+    task_path = Path(task).expanduser().resolve()
+    steps_path = Path(steps).expanduser().resolve()
+    if not task_path.exists():
+        raise FileNotFoundError(f"Task YAML not found: {task_path}")
+    if not steps_path.exists():
+        raise FileNotFoundError(f"Steps YAML not found: {steps_path}")
+
+    task_doc = yaml.safe_load(task_path.read_text(encoding="utf-8")) or {}
+    task_section = _task_section(task_doc)
+    resolved_run_name = run_name or str(task_section.get("name") or task_path.stem)
+    if out_dir is None:
+        out_dir = str(task_section.get("output_base_dir") or Path.cwd())
+    local_out_dir = Path(out_dir).expanduser().resolve()
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = local_out_dir / f"{sanitize_filename(resolved_run_name)}.tar.zst"
+    if out_file.exists() and not force:
+        raise FileExistsError(f"Output file already exists: {out_file}")
+
+    input_files = _collect_local_inputs(task_doc, task_path)
+    app_names = _default_app_names()
+    print(f"🧬 Submitting PPIFlow workflow '{resolved_run_name}'")
+    print(f"🧬 Staged {len(input_files)} local input file(s)")
+    tarball = run_ppiflow_workflow.remote(
+        task_yaml_bytes=task_path.read_bytes(),
+        steps_yaml_bytes=steps_path.read_bytes(),
+        input_files=input_files,
+        run_name=resolved_run_name,
+        stage=stage,
+        max_workers=max_workers,
+        app_names=app_names,
+        force=force,
+    )
+    out_file.write_bytes(tarball)
+    print(f"🧬 PPIFlow workflow complete. Results saved to {out_file}")

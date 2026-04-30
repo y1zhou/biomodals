@@ -64,8 +64,8 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import (
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
     run_command,

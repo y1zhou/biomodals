@@ -10,8 +10,8 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, softlink_dir
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, softlink_dir
 
 ##########################################
 # Modal configs

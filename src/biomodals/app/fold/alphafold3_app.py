@@ -34,8 +34,8 @@ from biomodals.app.constant import (
     MODEL_VOLUME,
     MSA_CACHE_VOLUME,
 )
-from biomodals.app.helper import hash_string, patch_image_for_helper
-from biomodals.app.helper.shell import copy_files, package_outputs, run_command_with_log
+from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.shell import copy_files, package_outputs, run_command_with_log
 
 ##########################################
 # Modal configs

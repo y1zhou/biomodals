@@ -20,8 +20,8 @@ import modal
 import polars as pl
 
 from biomodals.app.config import AppConfig
-from biomodals.app.helper import hash_string, patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs
+from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.shell import package_outputs
 
 ##########################################
 # Modal configs

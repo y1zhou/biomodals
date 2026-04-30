@@ -40,8 +40,8 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, run_command_with_log
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, run_command_with_log
 
 ##########################################
 # Modal configs
@@ -129,7 +129,7 @@ def _checkpoint_path(name: str) -> Path:
 )
 def download_flowpacker_checkpoints(force: bool = False) -> None:
     """Download FlowPacker Git LFS checkpoints into the model volume."""
-    from biomodals.app.helper.shell import run_command
+    from biomodals.helper.shell import run_command
 
     checkpoint_dir = CONF.model_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)

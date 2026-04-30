@@ -37,14 +37,14 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
-from biomodals.app.helper import hash_string, patch_image_for_helper
-from biomodals.app.helper.shell import (
+from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.shell import (
     package_outputs,
     run_command,
     run_command_with_log,
 )
-from biomodals.app.helper.structure import struct2seq
-from biomodals.app.helper.web import download_files
+from biomodals.helper.structure import struct2seq
+from biomodals.helper.web import download_files
 
 ##########################################
 # Modal configs

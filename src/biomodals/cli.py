@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from biomodals.app.helper.shell import run_command
+from biomodals.helper.shell import run_command
 
 # ruff: noqa: S603
 APP_HOME = Path(__file__).parent.resolve() / "app"

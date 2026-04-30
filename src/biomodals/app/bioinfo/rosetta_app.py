@@ -22,8 +22,8 @@ import modal
 import polars as pl
 
 from biomodals.app.config import AppConfig
-from biomodals.app.helper import hash_string, patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs
+from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.shell import package_outputs
 
 ##########################################
 # Modal configs
@@ -62,7 +62,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 )
 def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
     """Run Rosetta scripts."""
-    from biomodals.app.helper.shell import run_command_with_log
+    from biomodals.helper.shell import run_command_with_log
 
     mount_dir = Path(CONF.output_volume_mountpoint)
     workdir = mount_dir / f"{run_name}-{run_id}"
@@ -136,7 +136,7 @@ def run_rosetta_batch_bytes(
     """Run Rosetta jobs from in-memory inputs and return packaged outputs."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from biomodals.app.helper.shell import run_command_with_log, sanitize_filename
+    from biomodals.helper.shell import run_command_with_log, sanitize_filename
 
     if not jobs:
         raise ValueError("At least one Rosetta job is required")

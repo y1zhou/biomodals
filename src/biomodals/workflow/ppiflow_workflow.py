@@ -35,8 +35,8 @@ from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, sanitize_filename
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, sanitize_filename
 
 ##########################################
 # Modal configs

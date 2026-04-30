@@ -34,7 +34,7 @@ Keep it user-facing: explain what the tool does, what inputs it needs, and what 
 ## Ruff Noqa and Imports
 
 - Always add `# ruff: noqa: PLC0415` near the top to suppress "import not at top of file" warnings — Modal functions need lazy imports inside function bodies.
-- Top-level imports: `os`, `modal`, `Path`, and anything from `biomodals.app.*`.
+- Top-level imports: `os`, `modal`, `Path`, `biomodals.app.*`, and `biomodals.helper.*`.
 - Imports required only inside the Modal runtime image, and not declared as dependencies of the `biomodals` package, must stay inside the function or method that uses them. Top-level imports are acceptable when the dependency is part of the `biomodals` package dependencies and is used by multiple local functions.
 
 ## Section Order and Separator Comments
@@ -99,7 +99,7 @@ Use an `AppInfo` dataclass only when it improves readability by grouping several
 
 ## Image Building
 
-- Always wrap image construction with `patch_image_for_helper(...)` from `biomodals.app.helper` — this injects the helper modules, `zstd`, and `fd-find` into the image so that `package_outputs`, `run_command`, etc. work at runtime in the container.
+- Always wrap image construction with `patch_image_for_helper(...)` from `biomodals.helper` — this injects the helper modules, `zstd`, and `fd-find` into the image so that `package_outputs`, `run_command`, etc. work at runtime in the container.
 - Prefer `modal.Image.debian_slim()` or `modal.Image.from_registry()` as base.
 - Use `.env(CONF.default_env | {...})` to merge app-specific env vars with the defaults.
 - Use `.uv_pip_install(...)` for Python dependencies (Modal's built-in uv integration).
@@ -148,22 +148,22 @@ Standard resource annotations pattern:
 
 ## Helper Module Usage
 
-Always prefer helpers from `biomodals.app.helper` over reimplementing:
+Always prefer helpers from `biomodals.helper` over reimplementing:
 
-| Helper                                | Module             | Use For                                       |
-| ------------------------------------- | ------------------ | --------------------------------------------- |
-| `run_command(cmd)`                    | `helper.shell`     | Run a shell command with streaming output     |
-| `run_command_with_log(cmd, log_file)` | `helper.shell`     | Run and log to a file (inference runs)        |
-| `run_background_command(cmd)`         | `helper.shell`     | Non-blocking subprocess                       |
-| `package_outputs(root)`               | `helper.shell`     | Bundle outputs into a `.tar.zst` bytes object |
-| `copy_files(mapping)`                 | `helper.shell`     | Parallel file copying (volume → local SSD)    |
-| `find_with_fd(dir, pattern)`          | `helper.shell`     | Find files using fd/fdfind                    |
-| `warmup_directory(dir)`               | `helper.shell`     | Pre-cache files into memory                   |
-| `softlink_dir(src, dst)`              | `helper.shell`     | Create symlinks for tool-expected paths       |
-| `download_files(urls)`                | `helper.web`       | Async concurrent downloads with retries       |
-| `struct2seq(path)`                    | `helper.structure` | PDB/CIF → list of (chain_id, sequence)        |
-| `hash_string(s)`                      | `helper.__init__`  | SHA-256 hash for cache keys                   |
-| `patch_image_for_helper(image)`       | `helper.__init__`  | Inject helpers into Modal image               |
+| Helper                                | Module                       | Use For                                       |
+| ------------------------------------- | ---------------------------- | --------------------------------------------- |
+| `run_command(cmd)`                    | `biomodals.helper.shell`     | Run a shell command with streaming output     |
+| `run_command_with_log(cmd, log_file)` | `biomodals.helper.shell`     | Run and log to a file (inference runs)        |
+| `run_background_command(cmd)`         | `biomodals.helper.shell`     | Non-blocking subprocess                       |
+| `package_outputs(root)`               | `biomodals.helper.shell`     | Bundle outputs into a `.tar.zst` bytes object |
+| `copy_files(mapping)`                 | `biomodals.helper.shell`     | Parallel file copying (volume -> local SSD)   |
+| `find_with_fd(dir, pattern)`          | `biomodals.helper.shell`     | Find files using fd/fdfind                    |
+| `warmup_directory(dir)`               | `biomodals.helper.shell`     | Pre-cache files into memory                   |
+| `softlink_dir(src, dst)`              | `biomodals.helper.shell`     | Create symlinks for tool-expected paths       |
+| `download_files(urls)`                | `biomodals.helper.web`       | Async concurrent downloads with retries       |
+| `struct2seq(path)`                    | `biomodals.helper.structure` | PDB/CIF -> list of (chain_id, sequence)       |
+| `hash_string(s)`                      | `biomodals.helper.__init__`  | SHA-256 hash for cache keys                   |
+| `patch_image_for_helper(image)`       | `biomodals.helper.__init__`  | Inject helpers into Modal image               |
 
 ## Local Entrypoint
 

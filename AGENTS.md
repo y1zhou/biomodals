@@ -51,7 +51,7 @@ Use these apps as the current implementation standards:
 - Add `# ruff: noqa: PLC0415` near the top because Modal functions often need runtime-only imports.
 - Use `AppConfig` for new apps. Pin either `repo_commit_hash` or `version`, and allow `gpu` and `timeout` to be overridden through environment variables when applicable.
 - Build images with `patch_image_for_helper(...)` so the runtime has Biomodals helper code and shell tooling available.
-- Prefer helpers from `biomodals.app.helper` and `biomodals.app.helper.shell` over reimplementing shell execution, packaging, downloads, file copying, warming, and hashing.
+- Prefer helpers from `biomodals.helper` and `biomodals.helper.shell` over reimplementing shell execution, packaging, downloads, file copying, warming, and hashing.
 - Use `@app.local_entrypoint()` functions named `submit_<toolname>_task(...)`, with Google-style `Args:` docstrings so `biomodals help` can render CLI documentation.
 - Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
 

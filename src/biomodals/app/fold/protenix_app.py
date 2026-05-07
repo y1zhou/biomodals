@@ -38,9 +38,8 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.output import (
+from biomodals.helper.io import (
     build_local_output_path,
-    ensure_output_file_available,
     resolve_local_output_dir,
     write_local_tarball,
 )
@@ -587,7 +586,6 @@ def submit_protenix_task(
         run_name=run_name,
         suffix=f"_{CONF.name}",
     )
-    ensure_output_file_available(out_file)
 
     # Ensure models and data caches are available
     print(f"🧬 Checking Protenix model and data caches for {model_name}...")

@@ -41,9 +41,8 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.output import (
+from biomodals.helper.io import (
     build_local_output_path,
-    ensure_output_file_available,
     resolve_local_output_dir,
     write_local_tarball,
 )
@@ -409,7 +408,6 @@ def submit_flowpacker_task(
 
     local_out_dir = resolve_local_output_dir(out_dir)
     out_file = build_local_output_path(local_out_dir, run_name=run_name)
-    ensure_output_file_available(out_file)
 
     print(f"🧬 Submitting FlowPacker run '{run_name}' with {len(input_files)} input(s)")
     tarball_bytes = run_flowpacker.remote(

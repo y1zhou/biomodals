@@ -35,9 +35,8 @@ from biomodals.app.constant import (
     MSA_CACHE_VOLUME,
 )
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.output import (
+from biomodals.helper.io import (
     build_local_output_path,
-    ensure_output_file_available,
     resolve_local_output_dir,
     write_local_tarball,
 )
@@ -283,7 +282,7 @@ def run_data_pipeline(json_bytes: bytes) -> Path:
 
 @app.function(
     gpu=CONF.gpu,
-    cpu=(1.125, 16.125),  # burst for tar compression
+    cpu=(0.125, 16.125),  # burst for tar compression
     memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
     timeout=MAX_TIMEOUT,
     volumes={
@@ -354,7 +353,6 @@ def submit_alphafold3_task(
 
     local_out_dir = resolve_local_output_dir(out_dir)
     out_file = build_local_output_path(local_out_dir, run_name=run_name)
-    ensure_output_file_available(out_file)
 
     # Run inference
     if search_msa:

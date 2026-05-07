@@ -32,30 +32,7 @@ def callback():
 
     This CLI helps users discover available biomodals applications and view their help documentation.
     """
-
-
-##########################################
-# Helper Functions
-##########################################
-def _git_last_modified(app_path: Path) -> float:
-    """Get the last commit timestamp for a file using git log.
-
-    Returns the Unix timestamp of the last commit that touched the file,
-    or None if the file is not tracked by git or git is not available.
-    """
-    try:
-        output = run_command(
-            ["git", "log", "-1", "--format=%ct", "--", str(app_path)],
-            verbose=False,
-            cwd=Path.cwd(),
-        )
-        if output and output[0].strip():
-            return float(output[0].strip())
-    except Exception:  # noqa: S110
-        pass
-
-    # fallback to file mod time if git info is not available
-    return float(app_path.stat().st_mtime)
+    ...
 
 
 ##########################################
@@ -73,25 +50,18 @@ def list_available_apps(
         typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
     ] = False,
     sort_by: Annotated[
-        Literal["name", "category", "group", "time", "date", "updated"],
+        Literal["name", "category", "group", "path"],
         typer.Option(
             "--sort-by",
             "-s",
             help="Key to sort the applications by in the table display.",
             case_sensitive=False,
         ),
-    ] = "time",
+    ] = "path",
     reverse: Annotated[
         bool,
         typer.Option(
             "--reverse", "-r", help="Reverse the sorting order in the table display."
-        ),
-    ] = False,
-    use_git_time: Annotated[
-        bool,
-        typer.Option(
-            "--git-time",
-            help="Use the last git commit time instead of file modification time for sorting.",
         ),
     ] = False,
     short: Annotated[
@@ -104,32 +74,23 @@ def list_available_apps(
     ] = False,
 ) -> dict[str, Path]:
     """Show a list of all available biomodals applications."""
-    from datetime import datetime
-
-    table_headers = ["App name", "App path", "Category", "Updated at"]
-
+    table_headers = ["App name", "Category", "App path"]
     available_apps = get_all_apps(use_absolute_paths)
-    table_rows: list[tuple[str, str, str, str]] = []
+    table_rows: list[tuple[str, str, str]] = []
     for app_name, app_path in available_apps.items():
         app_category = app_path.parent.name
-        updated_date = (
-            _git_last_modified(app_path)
-            if use_git_time
-            else float(app_path.stat().st_mtime)
-        )
         table_rows.append((
             f"[green]{app_name}[/green]",
-            str(app_path),
             app_category,
-            datetime.fromtimestamp(updated_date).strftime("%Y-%m-%d %H:%M:%S"),
+            str(app_path),
         ))
     match sort_by:
         case "name":
             sort_by_idx = table_headers.index("App name")
         case "category" | "group":
             sort_by_idx = table_headers.index("Category")
-        case "time" | "date" | "updated":
-            sort_by_idx = table_headers.index("Updated at")
+        case "path":
+            sort_by_idx = table_headers.index("App path")
         case _:
             raise ValueError(f"Invalid sort key: {sort_by}")
     table_rows.sort(key=lambda x: x[sort_by_idx], reverse=reverse)
@@ -167,6 +128,7 @@ def show_app_help(
     ],
 ):
     """Show help for a specific biomodals application."""
+    # TODO: show modal function docstring when ::function is passed
     import modal
 
     app_reference = parse_app_reference(app_name)

@@ -18,21 +18,25 @@ Results are saved locally as `<run-name>.tar.zst`. The archive contains
 
 from __future__ import annotations
 
-import csv
 import os
 import re
 import shlex
 import subprocess
 from collections.abc import Iterable
-from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import modal
+import polars as pl
 
 from biomodals.app.config import AppConfig
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, sanitize_filename
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.io import (
+    build_local_output_path,
+    resolve_local_output_dir,
+    write_local_tarball,
+)
+from biomodals.helper.shell import package_outputs, sanitize_filename
 
 ##########################################
 # Modal configs
@@ -52,7 +56,8 @@ CONF = AppConfig(
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("zstd")
     .env(CONF.default_env)
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}", "pandas")
@@ -187,10 +192,13 @@ def _write_results_csv(rows: Iterable[dict[str, str]], csv_path: Path) -> None:
         "error",
         "log",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    normalized = [
+        {field: str(row.get(field, "")) for field in fieldnames} for row in rows
+    ]
+    pl.DataFrame(
+        normalized,
+        schema={field: pl.String for field in fieldnames},
+    ).write_csv(csv_path)
 
 
 ##########################################
@@ -234,17 +242,15 @@ def run_dockq_batch(
 ##########################################
 def _pairs_from_csv(input_csv: Path) -> list[dict[str, object]]:
     """Read standalone DockQ pair specs from a local CSV."""
-    text = input_csv.read_text(encoding="utf-8-sig")
-    reader = csv.DictReader(StringIO(text))
+    df = pl.read_csv(input_csv, infer_schema_length=0)
     required = {"model", "reference"}
-    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+    if not required.issubset(set(df.columns)):
         raise ValueError(
-            f"DockQ input CSV must contain columns {sorted(required)}, "
-            f"got {reader.fieldnames}"
+            f"DockQ input CSV must contain columns {sorted(required)}, got {df.columns}"
         )
 
     pairs: list[dict[str, object]] = []
-    for idx, row in enumerate(reader, start=1):
+    for idx, row in enumerate(df.iter_rows(named=True), start=1):
         model = Path(row["model"]).expanduser()
         reference = Path(row["reference"]).expanduser()
         if not model.is_absolute():
@@ -255,16 +261,14 @@ def _pairs_from_csv(input_csv: Path) -> list[dict[str, object]]:
             raise FileNotFoundError(f"Model structure not found: {model}")
         if not reference.exists():
             raise FileNotFoundError(f"Reference structure not found: {reference}")
-        pairs.append(
-            {
-                "id": row.get("id") or f"pair_{idx}",
-                "model_name": model.name,
-                "model_bytes": model.read_bytes(),
-                "reference_name": reference.name,
-                "reference_bytes": reference.read_bytes(),
-                "mapping": row.get("mapping") or None,
-            }
-        )
+        pairs.append({
+            "id": row.get("id") or f"pair_{idx}",
+            "model_name": model.name,
+            "model_bytes": model.read_bytes(),
+            "reference_name": reference.name,
+            "reference_bytes": reference.read_bytes(),
+            "mapping": row.get("mapping") or None,
+        })
     return pairs
 
 
@@ -294,12 +298,8 @@ def submit_dockq_task(
     if run_name is None:
         run_name = input_path.stem
 
-    local_out_dir = (
-        Path(out_dir).expanduser().resolve() if out_dir is not None else Path.cwd()
-    )
-    out_file = local_out_dir / f"{run_name}.tar.zst"
-    if out_file.exists():
-        raise FileExistsError(f"Output file already exists: {out_file}")
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(local_out_dir, run_name=run_name)
 
     pairs = _pairs_from_csv(input_path)
     print(f"🧬 Submitting DockQ run '{run_name}' with {len(pairs)} pair(s)")
@@ -309,6 +309,5 @@ def submit_dockq_task(
         dockq_args=shlex.split(dockq_args),
     )
 
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_file.write_bytes(tarball_bytes)
+    write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 DockQ run complete! Results saved to {out_file}")

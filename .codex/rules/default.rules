@@ -1,0 +1,5 @@
+prefix_rule(pattern=["uv", "run", "biomodals", "list"], decision="allow")
+prefix_rule(pattern=["uv", "run", "biomodals", "ls"], decision="allow")
+prefix_rule(pattern=["uv", "run", "biomodals", "l"], decision="allow")
+prefix_rule(pattern=["uv", "run", "biomodals", "help"], decision="allow")
+prefix_rule(pattern=["uv", "run", "biomodals", "h"], decision="allow")

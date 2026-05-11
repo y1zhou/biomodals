@@ -220,6 +220,10 @@ def run_data_pipeline(json_bytes: bytes) -> Path:
 
     # Check cache_dir for existing results and return early if found
     # Note that the file could be from a different run with different seeds
+    # TODO: when input contains different DNA/ligand chains, the same MSA cache
+    # can be reused. Consider adding chain mapping and MSA field update logic.
+    # It may also make sense to strip `conf` to just protein/RNA sequences, and
+    # standardize fields such as `name` and `modelSeeds` for better reproducibility.
     run_name = conf.name
     cache_data_file = cache_dir / run_name / f"{run_name}_data.json"
     if cache_data_file.exists():
@@ -309,13 +313,15 @@ def run_inference_pipeline(
     run_name = conf.name
     conf.modelSeeds = model_seeds
     with TemporaryDirectory(prefix=f"alphafold3_inference_{run_name}_") as temp_dir:
-        out_dir = Path(temp_dir) / run_name
+        temp_path = Path(temp_dir)
+        out_dir = temp_path / run_name
+        conf.to_files(temp_path, run_name)
         cmd = [
             sys.executable,
             str(CONF.git_clone_dir / "run_alphafold.py"),
             "--run_inference=true",
             "--run_data_pipeline=false",
-            f"--json_path={json_path}",
+            f"--json_path={temp_path / f'{run_name}.json'}",
             f"--output_dir={out_dir}",
             f"--model_dir={CONF.model_dir}",
             f"--jax_compilation_cache_dir={CONF.model_dir / 'jax_cache'}",

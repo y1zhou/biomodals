@@ -21,8 +21,10 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 # ruff: noqa: PLC0415
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import modal
 import orjson
@@ -47,7 +49,12 @@ from biomodals.helper.io import (
     resolve_local_output_dir,
     write_local_tarball,
 )
-from biomodals.helper.shell import copy_files, package_outputs, run_command_with_log
+from biomodals.helper.shell import (
+    copy_files,
+    package_outputs,
+    run_command,
+    run_command_with_log,
+)
 
 ##########################################
 # Modal configs
@@ -134,8 +141,6 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ##########################################
 def _load_conf_from_bytes(json_bytes: bytes) -> AF3Config:
     """Load AlphaFold3 config from JSON bytes."""
-    from tempfile import TemporaryDirectory
-
     with TemporaryDirectory() as temp_dir:
         f = Path(temp_dir) / "config.json"
         f.write_bytes(json_bytes)
@@ -340,8 +345,6 @@ def search_msa_and_templates(
         return msa_json_bytes
 
     # Parallelize MSA search by chains
-    from tempfile import TemporaryDirectory
-
     with TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         data_pipeline_futures = []
@@ -388,7 +391,6 @@ def run_inference_pipeline(
 
     """
     import sys
-    from tempfile import TemporaryDirectory
 
     with TemporaryDirectory(prefix="alphafold3_inference_") as temp_dir:
         temp_path = Path(temp_dir)
@@ -398,6 +400,8 @@ def run_inference_pipeline(
         conf = AF3Config.from_file(input_json_path)
         run_name = conf.name
         conf.modelSeeds = model_seeds
+        conf.to_files(temp_path, "input")
+        print(f"💊 Running inference for {run_name} with seeds {model_seeds}")
 
         out_dir = temp_path / run_name
         cmd = [
@@ -428,6 +432,7 @@ def submit_alphafold3_task(
     run_name: str | None = None,
     search_msa: bool = True,
     search_chains_in_parallel: bool = True,
+    max_num_gpus: int = 1,
     recycle: int = 10,
     sample: int = 5,
 ) -> None:
@@ -442,6 +447,9 @@ def submit_alphafold3_task(
             jobs when there is more than one protein/RNA chain to query MSA.
             If True, a 32-core job will be spawned for *each* chain. If False,
             a single container will be used for all chains sequentially.
+        max_num_gpus: Maximum number of GPUs to use during inference. If >1,
+            multiple `model_inference` jobs will be spawned in parallel based
+            on the number of model seeds in the JSON config.
         recycle: Number of Pairformer recycles to use during inference.
         sample: Number of diffusion samples to generate per seed.
     """
@@ -454,9 +462,6 @@ def submit_alphafold3_task(
     if run_name is None:
         run_name = conf.name
 
-    local_out_dir = resolve_local_output_dir(out_dir)
-    out_file = build_local_output_path(local_out_dir, run_name=run_name)
-
     # Run inference
     if search_msa:
         print(f"🧬 Running {CONF.name} data pipeline...")
@@ -464,10 +469,48 @@ def submit_alphafold3_task(
     else:
         json_bytes = input_path.read_bytes()
 
-    print(f"🧬 Running {CONF.name} inference pipeline...")
-    tarball_bytes = run_inference_pipeline.remote(
-        json_bytes, recycle=recycle, sample=sample, model_seeds=conf.modelSeeds
-    )
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(local_out_dir, run_name=run_name)
+    num_seeds = len(conf.modelSeeds)
+    num_containers = max(1, min(max_num_gpus, num_seeds))
+    print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
+    if num_containers == 1:
+        tarball_bytes = run_inference_pipeline.remote(
+            json_bytes, recycle=recycle, sample=sample, model_seeds=conf.modelSeeds
+        )
+    else:
+        inference_futures = [
+            run_inference_pipeline.spawn(
+                json_bytes,
+                recycle=recycle,
+                sample=sample,
+                model_seeds=conf.modelSeeds[i::num_containers],
+            )
+            for i in range(num_containers)
+        ]
+        tarballs = modal.FunctionCall.gather(*inference_futures)
+
+        with TemporaryDirectory() as tmp_dir:
+            for i, tarball_bytes in enumerate(tarballs):
+                tar_filename = out_file.with_name(f"{run_name}_part{i}.tar.zst")
+                write_local_tarball(tar_filename, tarball_bytes, overwrite=True)
+                run_command(
+                    [
+                        shutil.which("tar") or "tar",
+                        "-I",
+                        "zstd",
+                        "-xf",
+                        str(tar_filename),
+                    ],
+                    verbose=False,
+                    cwd=tmp_dir,
+                )
+
+            # Combine the parts into a single .tar.zst file
+            tarball_bytes = package_outputs(Path(tmp_dir) / run_name)
+        print(
+            f"🧬 Note that top-level {run_name}_*.{{cif,json,csv}} may not be correct since they are from parallel workers"
+        )
 
     # Save results locally
     write_local_tarball(out_file, tarball_bytes)

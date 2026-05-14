@@ -51,7 +51,8 @@ OUTPUTS_DIR = CONF.output_volume_mountpoint
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "zstd", "fd-find")
     .env(CONF.default_env)
     .uv_pip_install("polars[pandas,numpy,calamine,xlsxwriter]", "tqdm")
@@ -518,7 +519,8 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
     metrics_df = pl.concat(metrics_dfs, how="diagonal")
     ca_coords_seqs_df = pl.concat(ca_coords_seqs_dfs, how="vertical")
     if (not (out_dir / "aggregate_metrics_analyze.csv").exists()) or (
-        pl.scan_csv(out_dir / "aggregate_metrics_analyze.csv")
+        pl
+        .scan_csv(out_dir / "aggregate_metrics_analyze.csv")
         .select(pl.len())
         .collect()
         .item()
@@ -542,7 +544,7 @@ def refilter_designs(
 ):
     """Refilter combined BoltzGen designs using boltzgen.task.filter.Filter."""
     import polars as pl
-    from boltzgen.task.filter.filter import Filter
+    from boltzgen.task.filter.filter import Filter  # type: ignore[ty:unresolved-import]
 
     workdir = Path(OUTPUTS_DIR) / run_name
     warmup_directory(workdir / "combined-outputs")

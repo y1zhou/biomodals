@@ -1,6 +1,5 @@
 """Helper script for constructing actual modal run commands."""
 
-import importlib
 import shlex
 from pathlib import Path
 from typing import Annotated, Literal
@@ -10,14 +9,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from biomodals.app.catalog import (
-    AppNotFoundError,
-    app_path_to_module_path,
-    docstring_to_markdown_table,
-    get_all_apps,
-    parse_app_reference,
-    resolve_app_path,
-)
+from biomodals.app.catalog import AppNotFoundError, BiomodalsApp, get_all_apps
 from biomodals.helper.shell import run_command
 
 # ruff: noqa: S603
@@ -33,6 +25,30 @@ def callback():
     This CLI helps users discover available biomodals applications and view their help documentation.
     """
     ...
+
+
+##########################################
+# CLI Commands
+##########################################
+def _load_app(name: str) -> BiomodalsApp:
+    """Load a biomodals app by name or path."""
+    try:
+        return BiomodalsApp(name)
+    except AppNotFoundError as e:
+        console.print(f"[bold red]Error[/bold red] failed to find app '{name}': {e}")
+        raise typer.Exit(code=1) from e
+    except ImportError as e:
+        console.print(f"[bold red]Error[/bold red] Failed to import '{name}': {e}")
+        raise typer.Exit(code=1) from e
+
+
+def _print_title(title: str) -> None:
+    """Styling for titles."""
+    console.print(
+        f"\n\n[bold underline2]{title}[/bold underline2]\n",
+        justify="center",
+        highlight=True,
+    )
 
 
 ##########################################
@@ -126,73 +142,70 @@ def show_app_help(
     app_name: Annotated[
         str, typer.Argument(help="Name or path of the app to show help for.")
     ],
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Show detailed help for all functions."),
+    ] = False,
 ):
-    """Show help for a specific biomodals application."""
-    # TODO: show modal function docstring when ::function is passed
-    import modal
+    """Show help for a specific biomodals application.
 
-    app_reference = parse_app_reference(app_name)
-    try:
-        app_path = resolve_app_path(app_reference.app)
-    except AppNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from e
-
-    module_path = app_path_to_module_path(app_path)
-    try:
-        module = importlib.import_module(module_path)
-
-        remote_modal_functions: list[str] = []
-        # local_entrypoint_docstring: str = ""
-        args_table: list[str] = []
-        for obj in dir(module):
-            f = getattr(module, obj)
-            if isinstance(f, modal.Function):
-                # When an entrypoint name is specified, show only its docstring
-                if (
-                    app_reference.entrypoint is not None
-                    and obj == app_reference.entrypoint
-                ):
-                    console.print(
-                        "[bold]Docstring for entrypoint function "
-                        f"'[green]{app_reference.entrypoint}[/green]':[/bold]\n"
-                    )
-                    console.print(
-                        f.get_raw_f().__doc__ or "No documentation available."
-                    )
-                    return
-
-                remote_modal_functions.append(obj)
-
-            if isinstance(f, modal.app.LocalEntrypoint):
-                # local_entrypoint_docstring = f.info.raw_f.__doc__ or ""
-                args_table = docstring_to_markdown_table(f.info.raw_f)
-
-        console.print(f"[bold]Help for application '[green]{app_path}[/green]':[/bold]")
+    If unsure which app to use, run `biomodals list` to see available apps.
+    If you would like to see help for a local entrypoint or Modal function,
+    add `::<function-name>` to the app name to show help for that specific function.
+    """
+    app = _load_app(app_name)
+    if app._entrypoint is not None:
+        # When an entrypoint name is specified, show only its docstring
+        f = app[app._entrypoint]
         console.print(
-            "\n\n[bold underline2]Module documentation[/bold underline2]\n",
-            justify="center",
-            highlight=True,
+            f"[bold]Help for {f.func_type} function"
+            f"'[green]{f.name}[/green]'"
+            f" in app '[green]{app.name}[/green]' ({app.category}):[/bold]\n"
         )
-        if remote_modal_functions:
+        console.print(f.docstring or "No documentation available.")
+        if table_rows := f.args_table:
+            _print_title("Entrypoint CLI flags")
+            console.print(Markdown("\n".join(table_rows)))
+        return
+
+    # When no entrypoint is specified, show the app help
+    console.print(
+        "[bold]Help for application"
+        f" '[green]{app.name}[/green]' ({app.category}):[/bold]"
+    )
+    if app.module_doc:
+        _print_title("Module documentation")
+        console.print(Markdown(app.module_doc))
+    if app._remote_modal_func_idx:
+        remote_modal_functions = [app[x] for x in app._remote_modal_func_idx]
+
+        _print_title("Remote Modal functions in this app")
+        remote_func_names = ", ".join([x.name for x in remote_modal_functions])
+        console.print(f"[green]{remote_func_names}[/green]\n")
+        if verbose:
+            for f in remote_modal_functions:
+                if f.docstring:
+                    console.print(f"\n[bold green]{f.name}[/bold green]")
+                    console.print(Markdown(f.docstring))
+
+    if f_indices := app._local_entrypoint_idx:
+        _print_title("Local entrypoints in this app")
+        num_entrypoints = len(f_indices)
+        if num_entrypoints > 1:
             console.print(
-                f"[bold]Modal functions in this app:[/bold] [green]{', '.join(remote_modal_functions)}[/green]\n"
+                f"[red]{num_entrypoints} entrypoints found, "
+                "showing help for the first one with docs:[/red]\n"
             )
-        if docstring := module.__doc__:
-            console.print(Markdown(docstring))
-        if args_table:
-            console.print(
-                "\n\n[bold underline2]Entrypoint CLI flags[/bold underline2]",
-                justify="center",
-                highlight=True,
-            )
-            console.print(Markdown("\n".join(args_table)))
-            # console.print(local_entrypoint_docstring)
-        if not (docstring or args_table):
-            console.print("No documentation available.")
-    except ImportError as e:
-        console.print(f"[bold red]Error:[/bold red] Failed to import '{module_path}'")
-        raise typer.Exit(code=1) from e
+        for f_idx in f_indices:
+            f = app[f_idx]
+
+            if f.args_table:
+                console.print(f"[bold green]{f.name}[/bold green] CLI flags:\n")
+                console.print(Markdown("\n".join(f.args_table)))
+                return
+            elif f.docstring and verbose:
+                console.print(f"[bold green]{f.name}[/bold green] documentation:\n")
+                console.print(Markdown(f.docstring))
 
 
 @app.command(
@@ -203,7 +216,7 @@ def show_app_help(
 @app.command(name="r", no_args_is_help=True, hidden=True)
 def run_modal_app(
     app_name_or_path: Annotated[
-        str, typer.Argument(help="Name or path of the app to generate run command for.")
+        str, typer.Argument(help="Name or path of the app to run.")
     ],
     modal_mode: Annotated[
         str,
@@ -234,19 +247,14 @@ def run_modal_app(
     Use with: `biomodals run <app-name> [OPTIONS] -- [app-options]`, where `[app-options]` are
     additional flags to pass to the `modal run <app-name>` command.
     """
-    app_reference = parse_app_reference(app_name_or_path)
-    try:
-        app_path = resolve_app_path(app_reference.app)
-    except AppNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from e
+    import sys
+
+    app = _load_app(app_name_or_path)
 
     full_app = (
-        str(app_path)
-        if app_reference.entrypoint is None
-        else f"{app_path}::{app_reference.entrypoint}"
+        str(app.path) if app._entrypoint is None else f"{app.path}::{app._entrypoint}"
     )
-    cmd = ["modal", modal_mode]
+    cmd = [sys.executable, "-m", "modal", modal_mode]
     if detach:
         cmd.append("-d")
     cmd.append(str(full_app))
@@ -254,7 +262,7 @@ def run_modal_app(
     if modal_mode == "shell":
         console.print(
             "To start an interactive shell for the app, run:\n"
-            f"[bold green]uv run {shlex.join(cmd)}[/bold green]"
+            f"[bold green]{shlex.join(cmd)}[/bold green]"
         )
     elif flags:
         # TODO: figure out a way to tag run names into the app.
@@ -269,10 +277,10 @@ def run_modal_app(
         if timeout is not None:
             env["TIMEOUT"] = str(timeout)
         run_command([*cmd, *flags], env=env)
-    elif app_reference.entrypoint is not None:
+    elif app._entrypoint is not None:
         run_command(["biomodals", "help", str(full_app)], try_rich_print=True)
     else:
-        run_command(["biomodals", "help", str(app_path)], try_rich_print=True)
+        run_command(["biomodals", "help", str(app.path)], try_rich_print=True)
 
 
 @app.command(
@@ -283,7 +291,7 @@ def run_modal_app(
 @app.command(name="d", no_args_is_help=True, hidden=True)
 def deploy_app(
     app_name_or_path: Annotated[
-        str, typer.Argument(help="Name or path of the app to generate run command for.")
+        str, typer.Argument(help="Name or path of the app to deploy.")
     ],
     name: Annotated[
         str | None, typer.Option("--name", "-n", help="Name of the deployment.")
@@ -294,18 +302,13 @@ def deploy_app(
     ] = None,
 ):
     """Deploy a biomodals application to Modal."""
-    app_reference = parse_app_reference(app_name_or_path)
-    try:
-        app_path = resolve_app_path(app_reference.app)
-    except AppNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from e
+    app = _load_app(app_name_or_path)
     cmd = ["modal", "deploy"]
     if name:
         cmd.extend(["--name", name])
     if tag:
         cmd.extend(["--tag", tag])
-    cmd.append(str(app_path))
+    cmd.append(str(app.path))
     run_command(cmd)
 
 

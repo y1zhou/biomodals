@@ -1,9 +1,13 @@
 """Application discovery and help-table helpers for the Biomodals CLI."""
 
+import importlib
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+import modal
 
 APP_HOME = Path(__file__).parent.resolve()
 
@@ -15,14 +19,6 @@ class AppNotFoundError(ValueError):
         """Initialize the error with the unresolved app name."""
         self.app_name = app_name
         super().__init__(f"Application '{app_name}' not found.")
-
-
-@dataclass(frozen=True)
-class AppReference:
-    """Parsed app reference with optional Modal entrypoint."""
-
-    app: str
-    entrypoint: str | None = None
 
 
 def get_all_apps(
@@ -45,34 +41,123 @@ def get_all_apps(
     return available_apps
 
 
-def parse_app_reference(app_name_or_path: str) -> AppReference:
-    """Split an app reference into app name/path and optional entrypoint."""
-    app_name, separator, entrypoint_name = app_name_or_path.partition("::")
-    return AppReference(app=app_name, entrypoint=entrypoint_name if separator else None)
+@dataclass(frozen=True)
+class AppFunction:
+    """Information about a Modal or local entrypoint function."""
+
+    name: str
+    func_type: Literal["modal", "local_entrypoint"]
+    docstring: str | None
+    args_table: list[str]
 
 
-def resolve_app_path(app_name_or_path: str, *, app_home: Path = APP_HOME) -> Path:
-    """Resolve an app name or filesystem path to an app file path."""
-    all_apps = get_all_apps(use_absolute_paths=True, app_home=app_home)
-    if app_name_or_path in all_apps:
-        return all_apps[app_name_or_path]
+class BiomodalsApp:
+    """Metadata container for an app.
 
-    app_path = Path(app_name_or_path).expanduser()
-    if not app_path.exists():
-        raise AppNotFoundError(app_name_or_path)
-    return app_path
+    Attributes:
+        name (str): The name of the app.
+        category (str): The category of the app.
+        path (Path): The path to the app file.
+        module (str): The module path of the app.
+        module_doc (str | None): The docstring of the module.
+        functions (list[AppFunction]): A list of local entrypoint or Modal functions defined in the app.
 
+        _entrypoint (str | None): The name of the entrypoint function of interest.
+        _func_idx (dict[str, int]): A mapping of function names to their index in the functions list.
+        _local_entrypoint_idx (list[int]): A list of indices of local entrypoint functions in the functions list.
+        _remote_modal_func_idx (list[int]): A list of indices of remote Modal functions in the functions list.
+    """
 
-def app_path_to_module_path(app_path: Path, *, app_home: Path = APP_HOME) -> str:
-    """Convert an app path to a module path."""
-    module_path = (
-        str(app_path.resolve().relative_to(app_home))
-        .replace("/", ".")
-        .replace("\\", ".")
-        .replace(".py", "")
-        .replace("-", "_")
-    )
-    return f"biomodals.app.{module_path}"
+    def __init__(
+        self, app_name_or_path: str, all_apps: dict[str, Path] | None = None
+    ) -> None:
+        """Initialize the app with a given name or path."""
+        # Extract entrypoint name if specified
+        name_or_path, separator, entrypoint_name = app_name_or_path.partition("::")
+        self._entrypoint = None
+        if entrypoint_name:
+            self._entrypoint = entrypoint_name
+
+        # Normalize app name & path
+        self._all_apps = all_apps or get_all_apps(
+            use_absolute_paths=True, app_home=APP_HOME
+        )
+        self.name, self.path = self.resolve_app_path(name_or_path)
+        self.category = self.path.parent.name
+        self.module = self.app_path_to_module_path(self.path)
+
+        # Load functions and build index for quick lookup
+        self.functions: list[AppFunction] = []
+        self.populate_functions()
+
+        self._func_idx: dict[str, int] = {}
+        self._local_entrypoint_idx: list[int] = []
+        self._remote_modal_func_idx: list[int] = []
+        for idx, func in enumerate(self.functions):
+            self._func_idx[func.name] = idx
+            if func.func_type == "local_entrypoint":
+                self._local_entrypoint_idx.append(idx)
+            elif func.func_type == "modal":
+                self._remote_modal_func_idx.append(idx)
+            else:
+                raise ValueError(f"Unknown function type: {func.func_type}")
+
+        if self._entrypoint and self._entrypoint not in self._func_idx:
+            raise AppNotFoundError(
+                f"Entrypoint '{self._entrypoint}' not found in app '{self.name}'."
+            )
+
+    def __getitem__(self, name: str | int) -> AppFunction:
+        """Get a function by its name or index."""
+        if isinstance(name, str):
+            return self.functions[self._func_idx[name]]
+        return self.functions[name]
+
+    def resolve_app_path(self, app_name_or_path: str) -> tuple[str, Path]:
+        """Resolve an app name or filesystem path to its name and absolute path."""
+        if app_name_or_path in self._all_apps:
+            return app_name_or_path, self._all_apps[app_name_or_path]
+
+        app_path = Path(app_name_or_path).expanduser()
+        if not app_path.exists():
+            raise AppNotFoundError(app_name_or_path)
+        return app_path.stem.removesuffix("_app"), app_path
+
+    @staticmethod
+    def app_path_to_module_path(app_path: Path) -> str:
+        """Convert an app path to a module path."""
+        module_path = (
+            str(app_path.resolve().relative_to(APP_HOME))
+            .replace("/", ".")
+            .replace("\\", ".")
+            .replace(".py", "")
+            .replace("-", "_")
+        )
+        return f"biomodals.app.{module_path}"
+
+    def populate_functions(self):
+        """Collect all functions within the app."""
+        module = importlib.import_module(self.module)
+        self.module_doc = module.__doc__
+
+        for obj in dir(module):
+            f = getattr(module, obj)
+            if isinstance(f, modal.Function):
+                raw_f = f.get_raw_f()
+                func_type = "modal"
+            elif isinstance(f, modal.app.LocalEntrypoint):
+                raw_f = f.info.raw_f
+                func_type = "local_entrypoint"
+            else:
+                continue
+            self.functions.append(
+                AppFunction(
+                    name=obj,
+                    func_type=func_type,
+                    docstring=raw_f.__doc__ or None,
+                    args_table=_docstring_to_markdown_table(raw_f),
+                )
+            )
 
 
 def _arg_descriptions_from_google_docstring(doc: str) -> dict[str, str]:
@@ -110,7 +195,7 @@ def _arg_descriptions_from_google_docstring(doc: str) -> dict[str, str]:
     return arg_descriptions
 
 
-def docstring_to_markdown_table(f: Callable) -> list[str]:
+def _docstring_to_markdown_table(f: Callable) -> list[str]:
     """Convert a function docstring with Args into Markdown table rows."""
     sig = inspect.signature(f)
     arg_descriptions = _arg_descriptions_from_google_docstring(inspect.getdoc(f) or "")

@@ -286,7 +286,7 @@ def iggm(
 
         # Collect all output files
         return [
-            (out_file.relative_to(out_dir), out_file.read_bytes())
+            (str(out_file.relative_to(out_dir)), out_file.read_bytes())
             for out_file in out_dir.rglob("*")
             if out_file.is_file()
         ]

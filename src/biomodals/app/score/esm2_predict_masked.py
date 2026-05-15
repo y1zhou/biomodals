@@ -114,7 +114,7 @@ def esm2(fasta_name: str, fasta_str: str, make_figures: bool = False):
 
         print(results_list)
         return [
-            (out_file.relative_to(td_out), open(out_file, "rb").read())
+            (str(out_file.relative_to(td_out)), open(out_file, "rb").read())
             for out_file in Path(td_out).glob("**/*.*")
         ]
 

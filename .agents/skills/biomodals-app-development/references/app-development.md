@@ -113,6 +113,15 @@ Always specify a timeout with `CONF.timeout` or `MAX_TIMEOUT`. Add resource hint
 - Long-running GPU inference should usually use `MAX_TIMEOUT` and read-only model mounts.
 - Use `TemporaryDirectory` or `mkdtemp` for working directories.
 - Return output tarball bytes with `package_outputs(output_dir)` for quick jobs.
+- Prefer primitive return payloads across the Modal boundary: `int`, `str`,
+  `float`, `bool`, `bytes`, `list`, `dict`, or `None`. Return complex objects
+  only when they provide much more benefit than a primitive representation, and
+  the returned type must be serializable by `cloudpickle`.
+- Keep `Path` objects internal to the local process or Modal container. Return
+  file paths, volume paths, and relative output paths as `str(path)`, including
+  paths nested inside tuples, lists, dicts, or dataclasses. Convert back with
+  `Path(...)` or `PurePosixPath(...)` on the receiving side only when path
+  operations are needed.
 
 Resource pattern:
 
@@ -196,5 +205,8 @@ Older apps can use raw constants such as `GPU`, `TIMEOUT`, and `APP_NAME`. When 
 
 - When app development changes invocation or adds a new app, add or update an example bash script under `examples/app/` using `biomodals run`.
 - Use small example inputs under `examples/data/` only when existing data is insufficient.
+- For Modal functions, verify returned payloads are primitive or otherwise
+  intentionally complex and `cloudpickle`-serializable; convert returned paths to
+  strings.
 - After edits, run `prek run --files <changed files>` when practical.
 - For CLI or app discovery changes, smoke test `uv run biomodals list` and `uv run biomodals help <app-name>` when practical.

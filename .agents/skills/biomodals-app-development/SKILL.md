@@ -33,6 +33,11 @@ Keep app code compatible with `biomodals help` and app discovery:
 - Prefer helpers from `biomodals.helper` and `biomodals.helper.shell` instead of open-coded shell, archive, copy, download, hashing, or warmup logic.
 - Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals help <app>` renders flags.
 - Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
+- Keep Modal function return values primitive when practical: `int`, `str`,
+  `float`, `bool`, `bytes`, `list`, `dict`, or `None`. Return complex objects
+  only when they provide much more benefit than a primitive payload, and ensure
+  the type is serializable by `cloudpickle`. For example, return paths as
+  `str(path)` rather than `Path` objects.
 - Add or update an example command under `examples/app/` when app behavior or invocation changes.
 
 ## Review Checklist
@@ -44,6 +49,9 @@ When reviewing or finishing an app change, check:
 - Runtime boundaries: dependencies used only inside Modal images stay lazily imported.
 - Volumes: model volumes are read-only for inference unless the tool writes caches there; writable volumes are committed after writes.
 - Data flow: quick jobs return `.tar.zst` bytes via `package_outputs(...)`; persistent, resumable, or batch jobs use `CONF.get_out_volume()` or shared volumes.
+- Modal return payloads: prefer primitive, `cloudpickle`-serializable values;
+  avoid returning `Path` objects directly or nested inside tuples, lists, dicts,
+  or dataclasses.
 - Output safety: local output directories are created, existing tarballs are not overwritten accidentally, and final paths or Modal volume locations are printed.
 - CLI docs: local entrypoint docstrings use exact Google-style `Args:` formatting with continuation indentation.
 - Verification: run `prek run --files <changed files>` when practical, plus `uv run biomodals list` and `uv run biomodals help <app-name>` for CLI or discovery changes.

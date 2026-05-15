@@ -1098,7 +1098,7 @@ def bindcraft(
 
     out_dir = design_path
     return [
-        (out_file.relative_to(out_dir), open(out_file, "rb").read())
+        (str(out_file.relative_to(out_dir)), open(out_file, "rb").read())
         for out_file in Path(out_dir).glob("**/*.*")
     ]
 

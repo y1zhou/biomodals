@@ -233,7 +233,7 @@ def alphafold(
                     break
 
     return [
-        (out_file.relative_to(out_dir), open(out_file, "rb").read())
+        (str(out_file.relative_to(out_dir)), open(out_file, "rb").read())
         for out_file in Path(out_dir).glob("**/*")
         if (return_all_files or Path(out_file).suffix == ".zip")
         if Path(out_file).is_file()

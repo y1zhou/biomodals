@@ -12,14 +12,14 @@
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import run_command
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import run_command
 
 ##########################################
 # Modal configs
@@ -57,7 +57,8 @@ OUTPUTS_VOLUME = CONF.get_out_volume()
 OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
 
 runtime_image = patch_image_for_helper(
-    modal.Image.from_registry(
+    modal.Image
+    .from_registry(
         "nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python=CONF.python_version
     )
     .entrypoint([])  # remove verbose logging by base image on entry
@@ -128,12 +129,10 @@ runtime_image = patch_image_for_helper(
         )
     )
     # Build GROMACS
-    .env(
-        {
-            "PATH": "/usr/local/gromacs/bin:/root/micromamba/bin:$PATH",
-            "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib:${LD_LIBRARY_PATH}",
-        }
-    )
+    .env({
+        "PATH": "/usr/local/gromacs/bin:/root/micromamba/bin:$PATH",
+        "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib:${LD_LIBRARY_PATH}",
+    })
     .run_commands(
         " && ".join(
             (
@@ -177,7 +176,8 @@ runtime_image = patch_image_for_helper(
 )
 
 biotite_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
     .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
 )
@@ -217,15 +217,13 @@ def prepare_tpr_gpu(
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
-) -> Path:
+) -> str:
     """Prepare inputs for production Gromacs run.
 
     Steps: clean input PDB, build topology with Amber FF19SB and TIP3P water,
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
-    from pathlib import Path
-
     work_path = Path(CONF.output_volume_mountpoint) / run_name
     work_path.mkdir(parents=True, exist_ok=True)
 
@@ -238,7 +236,7 @@ def prepare_tpr_gpu(
         )
     ):
         print("✅ Preparation already completed, skipping.")
-        return work_path
+        return str(work_path)
 
     input_pdb_path = work_path / f"{run_name}.pdb"
     input_pdb_path.write_bytes(pdb_content)
@@ -271,7 +269,7 @@ def prepare_tpr_gpu(
     # Modal adds this automatically but we want Gromacs to handle threading
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     OUTPUTS_VOLUME.commit()
-    return work_path
+    return str(work_path)
 
 
 @app.function(
@@ -290,15 +288,13 @@ def prepare_tpr_cpu(
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
-) -> Path:
+) -> str:
     """Prepare inputs for production Gromacs run.
 
     Steps: clean input PDB, build topology with Amber FF19SB and TIP3P water,
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
-    from pathlib import Path
-
     work_path = Path(CONF.output_volume_mountpoint) / run_name
     work_path.mkdir(parents=True, exist_ok=True)
 
@@ -311,7 +307,7 @@ def prepare_tpr_cpu(
         )
     ):
         print("✅ Preparation already completed, skipping.")
-        return work_path
+        return str(work_path)
 
     input_pdb_path = work_path / f"{run_name}.pdb"
     input_pdb_path.write_bytes(pdb_content)
@@ -345,41 +341,37 @@ def prepare_tpr_cpu(
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
 
     OUTPUTS_VOLUME.commit()
-    return work_path
+    return str(work_path)
 
 
 @app.function(
-    image=biotite_image,
+    image=runtime_image,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
     volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
-def find_traj_last_step(traj_file: str, topology_file: str) -> int:
+def find_traj_last_step(traj_file: str) -> int:
     """Calculated simulated steps from the simulation time (in ps) in a trajectory."""
-    from pathlib import Path
+    import shutil
 
-    import biotite.structure as struc
-    import biotite.structure.io as strucio
-    import biotite.structure.io.xtc as xtc
-    import numpy as np
-
-    input_pdb_path = Path(topology_file)
-    if not input_pdb_path.exists():
-        raise FileNotFoundError(f"Input PDB file not found: {input_pdb_path}")
     traj_path = Path(traj_file)
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
 
-    template = strucio.load_structure(input_pdb_path)
-    protein_mask = struc.filter_amino_acids(template)
-    template = template[protein_mask]
+    gmx = shutil.which("gmx") or shutil.which("gmx_mpi")
+    if gmx is None:
+        raise RuntimeError("Gromacs executable not found")
 
-    xtc_file = xtc.XTCFile.read(traj_path, atom_i=np.where(protein_mask)[0])
-    trajectory = xtc_file.get_structure(template)
+    cmd = [gmx, "check", "-f", str(traj_path)]
+    result = run_command(cmd, cwd=traj_path.parent, verbose=False)
 
-    # Get simulation time in ps
-    time = xtc_file.get_time()
-    return int(time[-1] / 0.002)  # dt=2 fs, which is 0.002 ps
+    last_time = None
+    for line in result:
+        if line.startswith("Last frame"):
+            last_time = float(line.strip().split(" ")[-1])
+    if last_time is None:
+        raise ValueError("Last frame time not found in trajectory")
+    return int(last_time / 0.002)  # dt=2 fs, which is 0.002 ps
 
 
 @app.function(
@@ -394,10 +386,9 @@ def production_run_gpu(
     simulation_time_ns: int,
     num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
-) -> Path:
+) -> str:
     """Production Gromacs run."""
     import shutil
-    from pathlib import Path
 
     work_path = Path(CONF.output_volume_mountpoint) / run_name
     deffnm = f"production_{run_name}"
@@ -410,14 +401,12 @@ def production_run_gpu(
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
     nsteps = -2  # default: find nsteps from the mdp file
     if traj_file_path.exists() and checkpoint_file_path.exists():
-        simulated_steps = find_traj_last_step.remote(
-            str(traj_file_path), str(work_path / f"{run_name}.pdb")
-        )
+        simulated_steps = find_traj_last_step.remote(str(traj_file_path))
         total_steps = simulation_time_ns * 500000  # 2 fs timestep
         nsteps = total_steps - simulated_steps
         if nsteps <= 0:
             print("✅ Production run already completed, skipping.")
-            return work_path
+            return str(work_path)
 
     gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
     if gmx is None:
@@ -453,7 +442,7 @@ def production_run_gpu(
     # Modal adds this automatically but we want Gromacs to handle threading
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     OUTPUTS_VOLUME.commit()
-    return work_path
+    return str(work_path)
 
 
 @app.function(
@@ -467,10 +456,9 @@ def production_run_cpu(
     simulation_time_ns: int,
     num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
-) -> Path:
+) -> str:
     """Production Gromacs run."""
     import shutil
-    from pathlib import Path
 
     work_path = Path(CONF.output_volume_mountpoint) / run_name
     deffnm = f"production_{run_name}"
@@ -483,14 +471,12 @@ def production_run_cpu(
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
     nsteps = -2  # default: find nsteps from the mdp file
     if traj_file_path.exists() and checkpoint_file_path.exists():
-        simulated_steps = find_traj_last_step.remote(
-            str(traj_file_path), str(work_path / f"{run_name}.pdb")
-        )
+        simulated_steps = find_traj_last_step.remote(str(traj_file_path))
         total_steps = simulation_time_ns * 500000  # 2 fs timestep
         nsteps = total_steps - simulated_steps
         if nsteps <= 0:
             print("✅ Production run already completed, skipping.")
-            return work_path
+            return str(work_path)
 
         print(f"Continuing production run for additional {nsteps} steps...")
 
@@ -526,7 +512,47 @@ def production_run_cpu(
     # Modal adds this automatically but we want Gromacs to handle threading
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     OUTPUTS_VOLUME.commit()
-    return work_path
+    return str(work_path)
+
+
+@app.function(
+    image=runtime_image,
+    memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
+    timeout=CONF.timeout,
+    volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
+)
+def postprocess_traj(
+    traj_file: str,
+    tpr_file: str,
+    processed_traj_file: str,
+    ref_struct_file: str | None = None,
+) -> None:
+    """Process Gromacs trajectory.
+
+    Remove PBC for the protein chains (best-effort), and dump centered structures.
+    """
+    script_path = Path(APP_INFO.gmx_scripts) / "postprocess-traj.sh"
+    if not script_path.exists():
+        raise FileNotFoundError(f"Gromacs script not found: {script_path}")
+
+    cmd = [
+        str(script_path),
+        "--tpr-file",
+        tpr_file,
+        "--xtc-file",
+        traj_file,
+        "--output-file",
+        processed_traj_file,
+    ]
+    if ref_struct_file is not None:
+        cmd.extend(["--ref-structure", ref_struct_file])
+    _ = run_command(
+        cmd,
+        cwd=str(Path(processed_traj_file).parent),
+        env={"OMP_NUM_THREADS": None},
+        verbose=False,
+    )
+    OUTPUTS_VOLUME.commit()
 
 
 @app.function(
@@ -536,37 +562,51 @@ def production_run_cpu(
     timeout=CONF.timeout,
     volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
-def postprocess_traj(
+def collect_traj_stats(
     traj_prefix: str,
     run_name: str,
     save_processed_traj: bool = False,
     make_figures: bool = True,
-) -> Path:
+) -> str:
     """Process Gromacs trajectory and generate analysis plots.
 
     Ref: https://www.biotite-python.org/latest/examples/gallery/structure/modeling/md_analysis.html
     """
-    from pathlib import Path
-
-    import biotite
-    import biotite.structure as struc
-    import biotite.structure.io as strucio
-    import biotite.structure.io.xtc as xtc
-    import matplotlib.pyplot as plt
+    import biotite  # type: ignore[ty:unresolved-import]
+    import biotite.structure as struc  # type: ignore[ty:unresolved-import]
+    import biotite.structure.io as strucio  # type: ignore[ty:unresolved-import]
+    import biotite.structure.io.xtc as xtc  # type: ignore[ty:unresolved-import]
+    import matplotlib.pyplot as plt  # type: ignore[ty:unresolved-import]
     import numpy as np
 
     work_path = Path(CONF.output_volume_mountpoint) / run_name
-    input_pdb_path = work_path / f"{run_name}.pdb"
-    if not input_pdb_path.exists():
-        raise FileNotFoundError(f"Input PDB file not found: {input_pdb_path}")
     traj_path = work_path / f"{traj_prefix}{run_name}.xtc"
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
 
+    # Remove PBC and align to reference structure
+    processed_traj_path = work_path / f"{traj_prefix}{run_name}_nopbc.xtc"
+    if file1_needs_update(processed_traj_path, traj_path):
+        # remove outdated processed trajectory
+        processed_traj_path.unlink(missing_ok=True)
+    if not processed_traj_path.exists():
+        postprocess_traj.remote(
+            str(traj_path),
+            str(work_path / f"{traj_prefix}{run_name}.tpr"),
+            str(processed_traj_path),
+            ref_struct_file=str(work_path / f"{run_name}.pdb"),
+        )
+    OUTPUTS_VOLUME.reload()
+    traj_1st_frame_pdb_path = work_path / f"{traj_prefix}{run_name}_nopbc_centered.pdb"
+    if not traj_1st_frame_pdb_path.exists():
+        raise RuntimeError(
+            f"Postprocessing trajectory did not generate expected PDB: {traj_1st_frame_pdb_path}"
+        )
+
     # Gromacs does not set the element symbol in its PDB files,
     # but Biotite guesses the element names from the atom names,
     # emitting a warning
-    template = strucio.load_structure(input_pdb_path)
+    template = strucio.load_structure(traj_1st_frame_pdb_path)
     # The structure still has water and ions, that are not needed for our
     # calculations, we are only interested in the protein itself
     # These are removed for the sake of computational speed using a boolean
@@ -581,31 +621,22 @@ def postprocess_traj(
     # Hence, we use the 'XTCFile' class directly to load the trajectory
     # This gives us the additional option that allows us to select the
     # coordinates belonging to the amino acids.
-    xtc_file = xtc.XTCFile.read(traj_path, atom_i=np.where(protein_mask)[0])
+    xtc_file = xtc.XTCFile.read(processed_traj_path, atom_i=np.where(protein_mask)[0])
     trajectory = xtc_file.get_structure(template)
+    if not save_processed_traj:
+        processed_traj_path.unlink()
+        OUTPUTS_VOLUME.commit()
 
     # Get simulation time (ns) for plotting purposes
     time = xtc_file.get_time() / 1000.0
-    print(f"Simulated {time[-1]:.1f} ns")
+    print(f"Simulated {time[-1]:.1f} ns in {traj_path}")
 
     # Remove PBC (gmx trjconv)
-    trajectory = struc.remove_pbc(trajectory)
+    # trajectory = struc.remove_pbc(trajectory)
     trajectory, _ = struc.superimpose(trajectory[0], trajectory)
 
-    # Save the processed trajectory
-    processed_traj_path = work_path / f"{traj_prefix}{run_name}_nopbc.xtc"
-    if file1_needs_update(processed_traj_path, traj_path):
-        processed_traj_path.unlink(
-            missing_ok=True
-        )  # remove outdated processed trajectory
-    if not processed_traj_path.exists() and save_processed_traj:
-        new_traj_file = xtc.XTCFile()
-        new_traj_file.set_structure(trajectory, time=time * 1000.0)  # time in ps
-        new_traj_file.write(processed_traj_path)
-        OUTPUTS_VOLUME.commit()
-
     # Dump the last frame of the processed trajectory as PDB
-    last_frame_path = work_path / f"{traj_prefix}{run_name}.pdb"
+    last_frame_path = work_path / f"{traj_prefix}{run_name}_last_frame.pdb"
     if file1_needs_update(last_frame_path, traj_path):
         last_frame_path.unlink(missing_ok=True)  # remove outdated last frame
     if not last_frame_path.exists():
@@ -705,7 +736,7 @@ def postprocess_traj(
 
             OUTPUTS_VOLUME.commit()
 
-    return work_path
+    return str(work_path)
 
 
 ##########################################
@@ -769,7 +800,8 @@ def submit_gromacs_task(
         remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
 
     process_traj_tasks = [
-        postprocess_traj.spawn(prefix, run_name=run_name) for prefix in ["nvt_", "npt_"]
+        collect_traj_stats.spawn(prefix, run_name=run_name)
+        for prefix in ["nvt_", "npt_"]
     ]
 
     print("🧬 Starting Gromacs production MD simulation...")
@@ -789,12 +821,14 @@ def submit_gromacs_task(
         )
 
     print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
-    prod_traj_task = postprocess_traj.spawn(
+    prod_traj_task = collect_traj_stats.spawn(
         run_name=run_name, traj_prefix="production_", save_processed_traj=True
     )
 
     _ = modal.FunctionCall.gather(*process_traj_tasks, prod_traj_task)
 
-    remote_volume_dir = remote_workdir.relative_to(CONF.output_volume_mountpoint)
+    remote_volume_dir = PurePosixPath(remote_workdir).relative_to(
+        CONF.output_volume_mountpoint
+    )
     print("🧬 Gromacs preparation complete! Check data with: \n")
     print(f"  modal volume ls {OUTPUTS_VOLUME_NAME} {remote_volume_dir}")

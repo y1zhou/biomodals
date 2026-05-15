@@ -10,8 +10,8 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, softlink_dir
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, softlink_dir
 
 ##########################################
 # Modal configs
@@ -42,7 +42,8 @@ class AppInfo:
 APP_INFO = AppInfo()
 runtime_image = (
     patch_image_for_helper(
-        modal.Image.debian_slim(python_version=CONF.python_version)
+        modal.Image
+        .debian_slim(python_version=CONF.python_version)
         .apt_install("git", "build-essential", "libgl1-mesa-glx", "libglib2.0-0")
         .env(CONF.default_env),
         copy_patch_files=True,
@@ -72,7 +73,7 @@ def run_paddleocr(input_content: bytes, input_name: str) -> bytes:
     """Run PaddleOCR on the input PDF content and return extracted markdown and images."""
     from tempfile import mkdtemp
 
-    from paddleocr import PaddleOCRVL
+    from paddleocr import PaddleOCRVL  # type: ignore[ty:unresolved-import]
 
     # PaddleOCR hardcodes the model cache directory
     model_cache_dir = Path(CONF.model_volume_mountpoint) / CONF.name

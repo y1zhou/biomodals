@@ -64,8 +64,8 @@ from pathlib import Path
 
 from modal import App, Image, Volume
 
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import (
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
     run_command,
@@ -108,7 +108,8 @@ RFD_CHECKPOINT_URLS: dict[str, str] = {
 # https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile
 # The runtime image below is defined directly with Modal and is not built from that Dockerfile.
 runtime_image = patch_image_for_helper(
-    Image.debian_slim(python_version="3.10")
+    Image
+    .debian_slim(python_version="3.10")
     .apt_install(
         "git",
         "wget",
@@ -123,14 +124,12 @@ runtime_image = patch_image_for_helper(
     .run_commands(
         f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"
     )
-    .env(
-        {
-            "PYTHONPATH": RFD_REPO_DIR,
-            "PYTHONUNBUFFERED": "1",
-            "DGLBACKEND": "pytorch",
-            "UV_TORCH_BACKEND": "cu121",
-        }
-    )
+    .env({
+        "PYTHONPATH": RFD_REPO_DIR,
+        "PYTHONUNBUFFERED": "1",
+        "DGLBACKEND": "pytorch",
+        "UV_TORCH_BACKEND": "cu121",
+    })
     # install CUDA-enabled PyTorch from official index (avoid accidental CPU-only wheels).
     # Pin torch < 2.6 to avoid the torch.load(weights_only=...) default behavior change.
     .uv_pip_install(

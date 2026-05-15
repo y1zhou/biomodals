@@ -16,8 +16,8 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, run_command, softlink_dir
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, run_command, softlink_dir
 
 ##########################################
 # Modal configs
@@ -40,7 +40,8 @@ ABNATIV_MODEL_DIR = "/root/.abnativ/models/pretrained_models"
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    modal.Image.micromamba(python_version=CONF.python_version)
+    modal.Image
+    .micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget", "zstd")
     .env(CONF.default_env)
     .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])

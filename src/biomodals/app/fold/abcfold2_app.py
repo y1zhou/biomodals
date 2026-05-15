@@ -24,9 +24,9 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs
-from biomodals.app.helper.web import download_files
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs
+from biomodals.helper.web import download_files
 
 ##########################################
 # Modal configs
@@ -79,7 +79,8 @@ OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name
 OUTPUTS_DIR = CONF.output_volume_mountpoint
 
 download_image = patch_image_for_helper(
-    modal.Image.debian_slim()
+    modal.Image
+    .debian_slim()
     .uv_pip_install("huggingface_hub>=1.10")
     .env(
         CONF.default_env
@@ -91,7 +92,8 @@ download_image = patch_image_for_helper(
 )
 
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim()
+    modal.Image
+    .debian_slim()
     .apt_install("git", "build-essential")
     .env(
         CONF.default_env
@@ -143,7 +145,7 @@ def download_boltz_models(force: bool = False) -> None:
     """
     import tarfile
 
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download  # type: ignore[ty:unresolved-import]
 
     snapshot_download(
         repo_id="boltz-community/boltz-2",
@@ -203,7 +205,7 @@ async def download_chai_models(force=False):
 ##########################################
 def load_params_from_run_yaml(yaml_path: Path) -> dict:
     """Load run parameters from ABCFold2 YAML config."""
-    from abcfold.schema import load_abcfold_config
+    from abcfold.schema import load_abcfold_config  # type: ignore[ty:unresolved-import]
 
     conf = load_abcfold_config(yaml_path)
     return {
@@ -221,7 +223,7 @@ def get_run_id(yaml_str: bytes) -> str:
     """Get content-based run ID from ABCFold2 config."""
     import tempfile
 
-    from abcfold.schema import load_abcfold_config
+    from abcfold.schema import load_abcfold_config  # type: ignore[ty:unresolved-import]
 
     # Determine content-based run ID
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -247,7 +249,11 @@ def prepare_abcfold2(
     import tempfile
     from pathlib import Path
 
-    from abcfold.cli.prepare import prepare_boltz, prepare_chai, search_msa
+    from abcfold.cli.prepare import (  # type: ignore[ty:unresolved-import]
+        prepare_boltz,
+        prepare_chai,
+        search_msa,
+    )
 
     run_id: str = get_run_id.local(yaml_str=yaml_str)
     if not search_templates:
@@ -376,7 +382,9 @@ def run_abcfold2_boltz(
     **kwargs,  # ignore extra items from run config
 ) -> str:
     """Run Boltz with the given ABCFold2 configuration."""
-    from abcfold.boltz.run_boltz_abcfold import run_boltz
+    from abcfold.boltz.run_boltz_abcfold import (  # type: ignore[ty:unresolved-import]
+        run_boltz,
+    )
 
     OUTPUTS_VOLUME.reload()
     work_path = Path(workdir).expanduser().resolve()
@@ -467,7 +475,9 @@ def run_abcfold2_chai(
     **kwargs,  # ignore extra items from run config
 ) -> str:
     """Run Chai with the given ABCFold2 configuration."""
-    from abcfold.chai1.run_chai1_abcfold import run_chai
+    from abcfold.chai1.run_chai1_abcfold import (  # type: ignore[ty:unresolved-import]
+        run_chai,
+    )
 
     OUTPUTS_VOLUME.reload()
     work_path = Path(workdir).expanduser().resolve()

@@ -17,20 +17,23 @@ packages a local ``.tar.zst`` containing the canonical upstream layout:
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from io import BytesIO
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
 import modal
+import polars as pl
 import yaml
+from modal.exception import NotFoundError
+from modal.volume import FileEntryType
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.config import AppConfig
@@ -55,7 +58,7 @@ MOUNT_ROOT = Path(CONF.output_volume_mountpoint)
 
 runtime_image = patch_image_for_helper(
     modal.Image.debian_slim(python_version=CONF.python_version).env(CONF.default_env)
-)
+).add_local_python_source("biomodals.app.design.ppiflow_app")
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
@@ -98,7 +101,9 @@ class WorkflowState:
     enabled: dict[str, bool]
     steps: dict[str, Any]
     app_names: dict[str, str]
+    output_volume_names: dict[str, str]
     max_workers: int
+    force: bool
 
     @property
     def gentype(self) -> str:
@@ -131,6 +136,87 @@ def _env_app_name(*keys: str, default: str) -> str:
     return default
 
 
+def resolve_local_output_dir(out_dir: str | Path | None) -> Path:
+    """Resolve a local output directory without creating it."""
+    if out_dir is None:
+        return Path.cwd()
+    return Path(out_dir).expanduser().resolve()
+
+
+def _clean_filename_part(value: str | Path | None) -> str:
+    if value is None:
+        return ""
+    cleaned = sanitize_filename(str(value))
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
+    return re.sub(r"_+", "_", cleaned).strip("._-")
+
+
+def _clean_extension(extension: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", extension.strip())
+    cleaned = cleaned.replace("/", "_").replace("\\", "_").strip("_")
+    if not cleaned:
+        return ""
+    if not cleaned.startswith("."):
+        cleaned = f".{cleaned}"
+    return cleaned
+
+
+def build_local_output_path(
+    out_dir: str | Path,
+    *,
+    run_name: str,
+    prefix: str | Path | None = None,
+    suffix: str | Path | None = None,
+    extension: str = ".tar.zst",
+    overwrite: bool = False,
+) -> Path:
+    """Build a clean local output path and raise if it would overwrite a file."""
+    parts = [
+        part
+        for part in (
+            _clean_filename_part(prefix),
+            _clean_filename_part(run_name),
+            _clean_filename_part(suffix),
+        )
+        if part
+    ]
+    if not parts:
+        raise ValueError(
+            "At least one of prefix, run_name, or suffix must be non-empty"
+        )
+
+    out_path = resolve_local_output_dir(out_dir) / (
+        "_".join(parts) + _clean_extension(extension)
+    )
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(f"Output file already exists: {out_path}")
+    return out_path
+
+
+def write_local_tarball(
+    out_file: str | Path, content: bytes, *, overwrite: bool = False
+) -> Path:
+    """Write tarball bytes to a local path and return the final path."""
+    out_path = Path(out_file).expanduser().resolve()
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(f"Output file already exists: {out_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(content)
+    return out_path
+
+
+def build_run_scoped_name(
+    prefix: str,
+    run_name: str,
+    label: str,
+    *,
+    unique_id: str | None = None,
+) -> str:
+    """Build a sanitized, run-scoped Modal object name."""
+    parts = [prefix, run_name, label, unique_id or uuid4().hex]
+    return "-".join(sanitize_filename(part) for part in parts if part)
+
+
 def _default_app_names() -> dict[str, str]:
     return {
         "ppiflow": _env_app_name("PPIFLOW_APP_NAME", "PPIFLOW_APP", default="PPIFlow"),
@@ -151,8 +237,118 @@ def _default_app_names() -> dict[str, str]:
     }
 
 
+def _default_output_volume_names(app_names: dict[str, str]) -> dict[str, str]:
+    return {
+        "ppiflow": _env_app_name(
+            "PPIFLOW_OUTPUT_VOLUME_NAME",
+            default=f"{app_names['ppiflow']}-outputs",
+        ),
+        "af3score": _env_app_name(
+            "AF3SCORE_OUTPUT_VOLUME_NAME",
+            default=f"{app_names['af3score']}-outputs",
+        ),
+        "rosetta": _env_app_name(
+            "ROSETTA_OUTPUT_VOLUME_NAME",
+            default=f"{app_names['rosetta']}-outputs",
+        ),
+    }
+
+
 def _remote_function(app_names: dict[str, str], key: str, function_name: str):
     return modal.Function.from_name(app_names[key], function_name)
+
+
+def _output_volume(state: WorkflowState, key: str) -> modal.Volume:
+    return modal.Volume.from_name(
+        state.output_volume_names[key],
+        create_if_missing=True,
+        version=2,
+    )
+
+
+def _volume_path_exists(volume: modal.Volume, volume_path: str) -> bool:
+    target = volume_path.strip("/")
+    return any(entry.path.strip("/") == target for entry in volume.iterdir("/"))
+
+
+def _remove_volume_tree(volume: modal.Volume, volume_path: str) -> None:
+    target = f"/{volume_path.strip('/')}"
+    try:
+        volume.remove_file(target, recursive=True)
+    except (FileNotFoundError, NotFoundError):
+        return
+
+
+def _mounted_path_to_volume_path(path: str | Path) -> str:
+    mounted = PurePosixPath(str(path))
+    mount_root = PurePosixPath(str(MOUNT_ROOT))
+    if mounted.is_absolute() and mounted.is_relative_to(mount_root):
+        return str(mounted.relative_to(mount_root))
+    return str(mounted).strip("/")
+
+
+def _stage_bytes_to_volume(
+    volume: modal.Volume,
+    input_files: list[tuple[str, bytes]],
+    volume_dir: str,
+) -> dict[str, Path]:
+    """Stage byte inputs into an app output volume and return mounted paths."""
+    staged: dict[str, Path] = {}
+    used_names: set[str] = set()
+    with volume.batch_upload(force=True) as batch:
+        for file_name, content in input_files:
+            safe_name = sanitize_filename(file_name)
+            if safe_name in used_names:
+                raise ValueError(f"Staged input name collision: {safe_name}")
+            used_names.add(safe_name)
+            remote_path = f"/{volume_dir.strip('/')}/{safe_name}"
+            batch.put_file(BytesIO(content), remote_path)
+            mounted_path = MOUNT_ROOT / volume_dir.strip("/") / safe_name
+            staged[file_name] = mounted_path
+            staged[Path(file_name).name] = mounted_path
+            staged[safe_name] = mounted_path
+    return staged
+
+
+def _copy_volume_tree(
+    volume: modal.Volume,
+    source_dir: str,
+    dst_dir: Path,
+) -> list[Path]:
+    """Copy a directory tree from a Modal volume into the workflow volume."""
+    source = source_dir.strip("/")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    volume.reload()
+    copied: list[Path] = []
+    for entry in volume.iterdir(f"/{source}", recursive=True):
+        if entry.type is not FileEntryType.FILE:
+            continue
+        entry_path = entry.path.strip("/")
+        relative = PurePosixPath(entry_path).relative_to(source)
+        dst = dst_dir / Path(*relative.parts)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with dst.open("wb") as handle:
+            for chunk in volume.read_file(entry.path):
+                handle.write(chunk)
+        copied.append(dst)
+    return copied
+
+
+def _rewrite_config_paths(
+    config: dict[str, Any], staged_paths: dict[str, Path]
+) -> dict[str, Any]:
+    rewritten = dict(config)
+    for key, value in config.items():
+        if not isinstance(value, str | Path):
+            continue
+        staged_path = (
+            staged_paths.get(str(value))
+            or staged_paths.get(sanitize_filename(str(value)))
+            or staged_paths.get(Path(str(value)).name)
+        )
+        if staged_path is not None:
+            rewritten[key] = str(staged_path)
+    return rewritten
 
 
 def _load_yaml_bytes(data: bytes) -> dict[str, Any]:
@@ -305,19 +501,28 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 
 def _read_csv_rows(csv_path: Path) -> list[dict[str, str]]:
-    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
-        return list(csv.DictReader(handle))
+    df = pl.read_csv(csv_path, infer_schema_length=0)
+    return [
+        {key: "" if value is None else str(value) for key, value in row.items()}
+        for row in df.iter_rows(named=True)
+    ]
 
 
 def _write_csv_rows(
     path: Path, fieldnames: list[str], rows: list[dict[str, Any]]
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+    normalized = [
+        {
+            key: "" if row.get(key) is None else str(row.get(key, ""))
+            for key in fieldnames
+        }
+        for row in rows
+    ]
+    pl.DataFrame(
+        normalized,
+        schema={key: pl.String for key in fieldnames},
+    ).write_csv(path)
 
 
 ##########################################
@@ -330,9 +535,16 @@ def _iter_file_refs(obj: Any) -> list[str]:
             key_text = str(key).lower()
             if isinstance(value, str):
                 suffix = Path(value).suffix.lower()
-                if suffix in LOCAL_INPUT_SUFFIXES or key_text.endswith(
-                    ("pdb", "cif", "csv", "json", "yaml", "yml", "file", "path")
-                ):
+                if suffix in LOCAL_INPUT_SUFFIXES or key_text.endswith((
+                    "pdb",
+                    "cif",
+                    "csv",
+                    "json",
+                    "yaml",
+                    "yml",
+                    "file",
+                    "path",
+                )):
                     refs.append(value)
             else:
                 refs.extend(_iter_file_refs(value))
@@ -356,7 +568,14 @@ def _collect_local_inputs(
             candidate = base_dir / candidate
         if not candidate.exists() or not candidate.is_file():
             continue
-        staged[str(Path(ref).name)] = candidate.read_bytes()
+        try:
+            key = str(candidate.relative_to(base_dir))
+        except ValueError:
+            key = str(Path(ref).name)
+        safe_key = sanitize_filename(key)
+        if safe_key in staged:
+            raise ValueError(f"Duplicate staged input path: {safe_key}")
+        staged[key] = candidate.read_bytes()
     return sorted(staged.items())
 
 
@@ -364,7 +583,7 @@ def _stage_input_files(run_root: Path, input_files: list[tuple[str, bytes]]) -> 
     input_dir = run_root / "inputs"
     input_dir.mkdir(parents=True, exist_ok=True)
     for file_name, content in input_files:
-        (input_dir / sanitize_filename(Path(file_name).name)).write_bytes(content)
+        (input_dir / sanitize_filename(file_name)).write_bytes(content)
 
 
 ##########################################
@@ -393,20 +612,31 @@ def _base_ppiflow_config(state: WorkflowState, cfg: dict[str, Any]) -> dict[str,
 def _call_ppiflow(
     state: WorkflowState,
     config: dict[str, Any],
-    design_mode: str,
     input_files: list[tuple[str, bytes]],
     out_dir: Path,
     run_label: str,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    ppiflow_fn = _remote_function(state.app_names, "ppiflow", "ppiflow_run_bytes")
-    tarball = ppiflow_fn.remote(
-        config_dict=config,
-        design_mode=design_mode,
-        input_files=input_files,
-        run_name=run_label,
-    )
-    _extract_tar_zst_bytes(tarball, out_dir)
+    ppiflow_volume = _output_volume(state, "ppiflow")
+    volume_run = sanitize_filename(run_label)
+    if state.force:
+        _remove_volume_tree(ppiflow_volume, volume_run)
+    elif _volume_path_exists(ppiflow_volume, volume_run):
+        raise FileExistsError(
+            f"PPIFlow app volume run already exists: {volume_run}. "
+            "Use --force or choose a different --run-name."
+        )
+
+    staged_paths = _stage_bytes_to_volume(ppiflow_volume, input_files, volume_run)
+    ppiflow_fn = _remote_function(state.app_names, "ppiflow", "ppiflow_run")
+    from biomodals.app.design.ppiflow_app import PPIFlowArgs
+
+    ppiflow_args = PPIFlowArgs.model_validate({
+        "args": _rewrite_config_paths(config, staged_paths)
+    })
+    remote_workdir = ppiflow_fn.remote(ppiflow_args, volume_run)
+    remote_prefix = _mounted_path_to_volume_path(remote_workdir)
+    _copy_volume_tree(ppiflow_volume, remote_prefix, out_dir / volume_run)
     return _collect_pdb_files(out_dir)
 
 
@@ -434,7 +664,6 @@ def _run_ppiflow_step(
     return _call_ppiflow(
         state,
         config=config,
-        design_mode=_gentype_to_ppiflow_mode(gentype),
         input_files=input_files,
         out_dir=out_dir,
         run_label=f"{state.run_name}-stage1-ppiflow",
@@ -608,13 +837,11 @@ def _collect_mpnn_sequences(mpnn_out: Path, output_csv: Path) -> None:
         if parts:
             seqs.append("".join(parts))
         for idx, seq in enumerate(seqs[1:] or seqs):
-            rows.append(
-                {
-                    "link_name": f"{fasta.stem}.pdb".lower(),
-                    "sequence_dict": str({"A": seq.split("/")[0]}),
-                    "seq_idx": idx,
-                }
-            )
+            rows.append({
+                "link_name": f"{fasta.stem}.pdb".lower(),
+                "sequence_dict": str({"A": seq.split("/")[0]}),
+                "seq_idx": idx,
+            })
     _write_csv_rows(output_csv, ["link_name", "sequence_dict", "seq_idx"], rows)
 
 
@@ -625,13 +852,17 @@ def _run_queue(
 ) -> None:
     if not tasks:
         return
-    queue_name = f"{CONF.name}-{state.run_name}-{queue_label}-{uuid4().hex}"
+    queue_name = build_run_scoped_name(CONF.name, state.run_name, queue_label)
     queue = modal.Queue.from_name(queue_name, create_if_missing=True)
     for task in tasks:
         queue.put(task)
     worker_count = max(1, min(state.max_workers, len(tasks)))
     calls = [
-        ppiflow_queue_worker.spawn(queue_name, state.app_names)
+        ppiflow_queue_worker.spawn(
+            queue_name,
+            state.app_names,
+            state.output_volume_names,
+        )
         for _ in range(worker_count)
     ]
     modal.FunctionCall.gather(*calls)
@@ -663,18 +894,14 @@ def _run_mpnn_stage(
     tasks: list[dict[str, Any]] = []
     for idx, pdb_path in enumerate(copied_pdbs, start=1):
         fixed_residues = fixed_map.get(pdb_path.stem.lower())
-        tasks.append(
-            {
-                "kind": "ligandmpnn",
-                "run_name": f"{state.run_name}-{step_name}-{idx}",
-                "input_path": str(pdb_path),
-                "output_dir": str(mpnn_out / pdb_path.stem),
-                "seeds": _seeds_from_cfg(cfg),
-                "cli_args": _ligandmpnn_cli_args(
-                    state, cfg, fixed_residues=fixed_residues
-                ),
-            }
-        )
+        tasks.append({
+            "kind": "ligandmpnn",
+            "run_name": f"{state.run_name}-{step_name}-{idx}",
+            "input_path": str(pdb_path),
+            "output_dir": str(mpnn_out / pdb_path.stem),
+            "seeds": _seeds_from_cfg(cfg),
+            "cli_args": _ligandmpnn_cli_args(state, cfg, fixed_residues=fixed_residues),
+        })
     _run_queue(state, step_name.lower(), tasks)
     _collect_mpnn_sequences(mpnn_out, mpnn_pdbs_dir / "mpnn_seqs.csv")
     mpnn_pdbs = _collect_pdb_files(mpnn_out)
@@ -728,6 +955,22 @@ def _run_flowpacker_stage(
 ##########################################
 # AF3Score and filtering
 ##########################################
+def _af3score_input_name(name: str) -> str:
+    """Return an input name compatible with AF3Score staging."""
+    lower_spaceless_name = sanitize_filename(Path(name).name).lower().replace(" ", "_")
+    return "".join(
+        char
+        for char in lower_spaceless_name
+        if char.isascii() and (char.isalnum() or char in "_-.")
+    )
+
+
+def _record_value(record: object, key: str) -> Any:
+    if isinstance(record, dict):
+        return record[key]
+    return getattr(record, key)
+
+
 def _run_af3score_stage(
     state: WorkflowState,
     source_pdbs: list[Path],
@@ -740,14 +983,73 @@ def _run_af3score_stage(
     out_dir.mkdir(parents=True, exist_ok=True)
     if not source_pdbs:
         raise ValueError(f"{step_name} requires at least one PDB input")
-    af3score_fn = _remote_function(state.app_names, "af3score", "af3score_run_bytes")
-    tarball = af3score_fn.remote(
-        input_files=[(path.name, path.read_bytes()) for path in source_pdbs],
-        run_name=f"{state.run_name}-{step_name}",
-        prepare_workers=_as_int(cfg.get("prepare_workers"), 8),
-        max_batches=_as_int(cfg.get("max_batches"), 10),
+
+    af3score_volume = _output_volume(state, "af3score")
+    volume_run = sanitize_filename(f"{state.run_name}-{step_name}")
+    if state.force:
+        _remove_volume_tree(af3score_volume, volume_run)
+    elif _volume_path_exists(af3score_volume, volume_run):
+        raise FileExistsError(
+            f"AF3Score app volume run already exists: {volume_run}. "
+            "Use --force or choose a different --run-name."
+        )
+
+    run_paths = {
+        "mount_root": MOUNT_ROOT,
+        "run_root": MOUNT_ROOT / volume_run,
+        "input_dir": MOUNT_ROOT / volume_run / "inputs",
+        "inputs_dir": MOUNT_ROOT / volume_run / "inputs",
+        "output_dir": MOUNT_ROOT / volume_run / "outputs",
+        "prep_dir": MOUNT_ROOT / volume_run / "prepare",
+        "failed_dir": MOUNT_ROOT / volume_run / "outputs" / "failed_records",
+        "metrics_csv": MOUNT_ROOT / volume_run / "af3score_metrics.csv",
+    }
+    input_files: list[tuple[str, bytes]] = []
+    for pdb_path in source_pdbs:
+        staged_name = _af3score_input_name(pdb_path.name)
+        if not staged_name:
+            raise ValueError(
+                f"AF3Score input name is empty after sanitizing: {pdb_path}"
+            )
+        input_files.append((staged_name, pdb_path.read_bytes()))
+
+    manage_lock_fn = _remote_function(
+        state.app_names, "af3score", "af3score_manage_lock"
     )
-    _extract_tar_zst_bytes(tarball, out_dir)
+    prepare_fn = _remote_function(state.app_names, "af3score", "af3score_prepare")
+    run_fn = _remote_function(state.app_names, "af3score", "af3score_run")
+    postprocess_fn = _remote_function(
+        state.app_names, "af3score", "af3score_postprocess"
+    )
+
+    manage_lock_fn.remote(run_name=volume_run, acquire=True)
+    try:
+        _stage_bytes_to_volume(af3score_volume, input_files, f"{volume_run}/inputs")
+        prepare_result = prepare_fn.remote(
+            paths=run_paths,
+            input_files=[name for name, _ in input_files],
+            num_jobs=_as_int(cfg.get("max_batches"), 10),
+            prepare_workers=_as_int(cfg.get("prepare_workers"), 8),
+        )
+        calls = [
+            run_fn.spawn(
+                paths=run_paths,
+                batch_name=_record_value(spec, "batch_name"),
+                batch_json_dir=_record_value(spec, "batch_json_dir"),
+                batch_pdb_dir=_record_value(spec, "batch_pdb_dir"),
+            )
+            for spec in _record_value(prepare_result, "chunk_specs")
+        ]
+        if calls:
+            modal.FunctionCall.gather(*calls)
+        postprocess_fn.remote(
+            input_files=_record_value(prepare_result, "input_files"),
+            paths=run_paths,
+        )
+    finally:
+        manage_lock_fn.remote(run_name=volume_run, acquire=False)
+
+    _copy_volume_tree(af3score_volume, volume_run, out_dir / volume_run)
     return out_dir
 
 
@@ -877,21 +1179,97 @@ def _rosetta_jobs(
 ) -> list[dict[str, object]]:
     jobs: list[dict[str, object]] = []
     for idx, pdb_path in enumerate(pdbs, start=1):
-        jobs.append(
-            {
-                "index": idx,
-                "pdb_name": pdb_path.name,
-                "pdb_bytes": pdb_path.read_bytes(),
-                "binary": str(
-                    cfg.get("binary") or cfg.get("rosetta_binary") or binary_default
-                ),
-                "rosetta_script_text": cfg.get("rosetta_script_text"),
-                "rosetta_script_name": cfg.get("rosetta_script_name", "protocol.xml"),
-                "flags_text": cfg.get("flags_text"),
-                "flags_name": cfg.get("flags_name", "flags.txt"),
-            }
-        )
+        jobs.append({
+            "index": idx,
+            "pdb_name": pdb_path.name,
+            "pdb_bytes": pdb_path.read_bytes(),
+            "binary": str(
+                cfg.get("binary") or cfg.get("rosetta_binary") or binary_default
+            ),
+            "rosetta_script_text": cfg.get("rosetta_script_text"),
+            "rosetta_script_name": cfg.get("rosetta_script_name", "protocol.xml"),
+            "flags_text": cfg.get("flags_text"),
+            "flags_name": cfg.get("flags_name", "flags.txt"),
+        })
     return jobs
+
+
+def _run_rosetta_jobs_with_volume(
+    app_names: dict[str, str],
+    output_volume_name: str,
+    jobs: list[dict[str, object]],
+    *,
+    run_name: str,
+    out_dir: Path,
+) -> None:
+    safe_run_name = sanitize_filename(run_name)
+    run_id = uuid4().hex
+    remote_root = f"{safe_run_name}-{run_id}"
+    queue_name = f"{app_names['rosetta']}-queue-{run_id}"
+    rosetta_volume = modal.Volume.from_name(
+        output_volume_name,
+        create_if_missing=True,
+        version=2,
+    )
+    queue = modal.Queue.from_name(queue_name, create_if_missing=True)
+
+    try:
+        with rosetta_volume.batch_upload(force=True) as batch:
+            for job in jobs:
+                job_idx = str(job["index"])
+                job_dir = f"{remote_root}/{job_idx}"
+
+                pdb_name = sanitize_filename(
+                    str(job.get("pdb_name") or f"input_{job_idx}.pdb")
+                )
+                pdb_bytes = job.get("pdb_bytes")
+                if not isinstance(pdb_bytes, bytes):
+                    raise TypeError(f"Rosetta job {job_idx} is missing pdb_bytes")
+                remote_pdb = f"{job_dir}/{pdb_name}"
+                batch.put_file(BytesIO(pdb_bytes), f"/{remote_pdb}")
+
+                remote_script = None
+                if script_text := job.get("rosetta_script_text"):
+                    script_name = sanitize_filename(
+                        str(job.get("rosetta_script_name") or "protocol.xml")
+                    )
+                    remote_script = f"{job_dir}/{script_name}"
+                    batch.put_file(
+                        BytesIO(str(script_text).encode("utf-8")),
+                        f"/{remote_script}",
+                    )
+
+                remote_flags = None
+                if flags_text := job.get("flags_text"):
+                    flags_name = sanitize_filename(
+                        str(job.get("flags_name") or "flags.txt")
+                    )
+                    remote_flags = f"{job_dir}/{flags_name}"
+                    batch.put_file(
+                        BytesIO(str(flags_text).encode("utf-8")),
+                        f"/{remote_flags}",
+                    )
+
+                queue.put({
+                    "index": job_idx,
+                    "binary": job["binary"],
+                    "pdb": remote_pdb,
+                    "rosetta_script": remote_script,
+                    "flags_file": remote_flags,
+                })
+
+        rosetta_fn = _remote_function(app_names, "rosetta", "run_rosetta")
+        package_fn = _remote_function(app_names, "rosetta", "package_outputs_helper")
+        call = rosetta_fn.spawn(
+            safe_run_name,
+            run_id,
+            max(1, min(30, len(jobs))),
+        )
+        modal.FunctionCall.gather(call)
+        tarball = package_fn.remote(root=f"{MOUNT_ROOT}/{remote_root}")
+        _extract_tar_zst_bytes(tarball, out_dir)
+    finally:
+        modal.Queue.objects.delete(queue_name)
 
 
 def _run_rosetta_batch(
@@ -906,13 +1284,13 @@ def _run_rosetta_batch(
     out_dir.mkdir(parents=True, exist_ok=True)
     if not source_pdbs:
         return []
-    rosetta_fn = _remote_function(state.app_names, "rosetta", "run_rosetta_batch_bytes")
-    tarball = rosetta_fn.remote(
-        jobs=_rosetta_jobs(source_pdbs, cfg, binary_default=binary_default),
+    _run_rosetta_jobs_with_volume(
+        state.app_names,
+        state.output_volume_names["rosetta"],
+        _rosetta_jobs(source_pdbs, cfg, binary_default=binary_default),
         run_name=f"{state.run_name}-{step_name}",
-        num_cpu_per_pod=max(1, min(30, len(source_pdbs))),
+        out_dir=out_dir,
     )
-    _extract_tar_zst_bytes(tarball, out_dir)
     return _collect_pdb_files(out_dir) or source_pdbs
 
 
@@ -960,13 +1338,12 @@ def _run_partial_step(state: WorkflowState, source_pdbs: list[Path]) -> list[Pat
             )
             results.append(per_target_out / pdb_path.name)
             continue
-        mode, config = _partial_config_for_pdb(state, cfg, pdb_path, fixed_positions)
+        _mode, config = _partial_config_for_pdb(state, cfg, pdb_path, fixed_positions)
         input_files = [(pdb_path.name, pdb_path.read_bytes())]
         results.extend(
             _call_ppiflow(
                 state,
                 config=config,
-                design_mode=mode,
                 input_files=input_files,
                 out_dir=per_target_out,
                 run_label=f"{state.run_name}-partial-{idx}",
@@ -1015,9 +1392,10 @@ def _pdb_to_sequences(path: Path) -> list[tuple[str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        residues.setdefault(chain, []).append(
-            ((res_id, resname), AA3_TO_1.get(resname, "X"))
-        )
+        residues.setdefault(chain, []).append((
+            (res_id, resname),
+            AA3_TO_1.get(resname, "X"),
+        ))
     return [
         (chain, "".join(aa for _, aa in chain_residues))
         for chain, chain_residues in residues.items()
@@ -1051,32 +1429,28 @@ def _run_refold_and_relax(state: WorkflowState, source_pdbs: list[Path]) -> None
             json_path = output_dir / "input.json"
             json_path.parent.mkdir(parents=True, exist_ok=True)
             json_path.write_bytes(_af3_json_for_pdb(pdb_path, refold_cfg))
-            tasks.append(
-                {
-                    "kind": "af3_refold",
-                    "run_name": f"{state.run_name}-refold-{idx}",
-                    "input_path": str(pdb_path),
-                    "output_dir": str(output_dir),
-                    "json_path": str(json_path),
-                    "recycle": _as_int(refold_cfg.get("recycle"), 10),
-                    "sample": _as_int(
-                        refold_cfg.get("sample", refold_cfg.get("seed_num")), 5
-                    ),
-                }
-            )
+            tasks.append({
+                "kind": "af3_refold",
+                "run_name": f"{state.run_name}-refold-{idx}",
+                "input_path": str(pdb_path),
+                "output_dir": str(output_dir),
+                "json_path": str(json_path),
+                "recycle": _as_int(refold_cfg.get("recycle"), 10),
+                "sample": _as_int(
+                    refold_cfg.get("sample", refold_cfg.get("seed_num")), 5
+                ),
+            })
     if _step_enabled(state.enabled, "RosettaRelaxStep"):
         for idx, pdb_path in enumerate(source_pdbs, start=1):
-            tasks.append(
-                {
-                    "kind": "rosetta_relax",
-                    "run_name": f"{state.run_name}-relax-{idx}",
-                    "input_path": str(pdb_path),
-                    "output_dir": str(
-                        state.stage2_dir / "rosetta_relax_output" / pdb_path.stem
-                    ),
-                    "rosetta_cfg": relax_cfg,
-                }
-            )
+            tasks.append({
+                "kind": "rosetta_relax",
+                "run_name": f"{state.run_name}-relax-{idx}",
+                "input_path": str(pdb_path),
+                "output_dir": str(
+                    state.stage2_dir / "rosetta_relax_output" / pdb_path.stem
+                ),
+                "rosetta_cfg": relax_cfg,
+            })
     _run_queue(state, "refold-relax", tasks)
 
 
@@ -1103,15 +1477,13 @@ def _pair_refold_models(
         )
         if ref is None:
             continue
-        pairs.append(
-            {
-                "id": f"{ref.stem}_{idx}",
-                "model_name": model.name,
-                "model_bytes": model.read_bytes(),
-                "reference_name": ref.name,
-                "reference_bytes": ref.read_bytes(),
-            }
-        )
+        pairs.append({
+            "id": f"{ref.stem}_{idx}",
+            "model_name": model.name,
+            "model_bytes": model.read_bytes(),
+            "reference_name": ref.name,
+            "reference_bytes": ref.read_bytes(),
+        })
     return pairs
 
 
@@ -1182,17 +1554,15 @@ def _rank_and_report(state: WorkflowState, filtered_pdbs: list[Path]) -> None:
         dockq_row = dockq_by_ref.get(pdb_path.stem.lower()) or dockq_by_id.get(
             pdb_path.stem, {}
         )
-        ranked_rows.append(
-            {
-                "design": pdb_path.stem,
-                "pdb": str(pdb_path.relative_to(state.run_root)),
-                "iptm": af_row.get("iptm", af_row.get("ranking_score", "")),
-                "dockq": dockq_row.get("dockq", ""),
-                "irmsd": dockq_row.get("irmsd", ""),
-                "lrmsd": dockq_row.get("lrmsd", ""),
-                "fnat": dockq_row.get("fnat", ""),
-            }
-        )
+        ranked_rows.append({
+            "design": pdb_path.stem,
+            "pdb": str(pdb_path.relative_to(state.run_root)),
+            "iptm": af_row.get("iptm", af_row.get("ranking_score", "")),
+            "dockq": dockq_row.get("dockq", ""),
+            "irmsd": dockq_row.get("irmsd", ""),
+            "lrmsd": dockq_row.get("lrmsd", ""),
+            "fnat": dockq_row.get("fnat", ""),
+        })
 
     ranked_rows.sort(
         key=lambda row: (_safe_float(row.get("dockq")), _safe_float(row.get("iptm"))),
@@ -1241,7 +1611,11 @@ def _rank_and_report(state: WorkflowState, filtered_pdbs: list[Path]) -> None:
     timeout=MAX_TIMEOUT,
     volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
 )
-def ppiflow_queue_worker(queue_name: str, app_names: dict[str, str]) -> None:
+def ppiflow_queue_worker(
+    queue_name: str,
+    app_names: dict[str, str],
+    output_volume_names: dict[str, str],
+) -> None:
     """Process independent per-structure workflow tasks from a Modal queue."""
     queue = modal.Queue.from_name(queue_name)
     while True:
@@ -1297,11 +1671,10 @@ def ppiflow_queue_worker(queue_name: str, app_names: dict[str, str]) -> None:
             _extract_tar_zst_bytes(tarball, output_dir)
         elif kind == "rosetta_relax":
             input_path = Path(task["input_path"])
-            rosetta_fn = _remote_function(
-                app_names, "rosetta", "run_rosetta_batch_bytes"
-            )
-            tarball = rosetta_fn.remote(
-                jobs=[
+            _run_rosetta_jobs_with_volume(
+                app_names,
+                output_volume_names["rosetta"],
+                [
                     _rosetta_jobs(
                         [input_path],
                         task.get("rosetta_cfg", {}),
@@ -1309,9 +1682,8 @@ def ppiflow_queue_worker(queue_name: str, app_names: dict[str, str]) -> None:
                     )[0]
                 ],
                 run_name=task["run_name"],
-                num_cpu_per_pod=1,
+                out_dir=output_dir,
             )
-            _extract_tar_zst_bytes(tarball, output_dir)
         else:
             raise ValueError(f"Unsupported queue task kind: {kind}")
 
@@ -1411,8 +1783,8 @@ def _run_stage2(state: WorkflowState) -> list[Path]:
 
     fixed_csv = state.stage2_dir / "fixed_positions.csv"
     if _step_enabled(state.enabled, "PartialStep"):
-        _write_fixed_positions_csv(state, stage2_inputs, fixed_csv)
-        partial_pdbs = _run_partial_step(state, stage2_inputs)
+        _write_fixed_positions_csv(state, rosetta_fixed, fixed_csv)
+        partial_pdbs = _run_partial_step(state, rosetta_fixed)
     else:
         partial_pdbs = rosetta_fixed
 
@@ -1493,6 +1865,7 @@ def run_ppiflow_workflow(
     stage: int | None,
     max_workers: int,
     app_names: dict[str, str],
+    output_volume_names: dict[str, str],
     force: bool,
 ) -> bytes:
     """Run the PPIFlow workflow on Modal and return a packaged archive."""
@@ -1524,7 +1897,9 @@ def run_ppiflow_workflow(
         enabled=enabled,
         steps=steps_doc,
         app_names=app_names,
+        output_volume_names=output_volume_names,
         max_workers=max(1, max_workers),
+        force=force,
     )
 
     if stage not in {None, 1, 2}:
@@ -1578,14 +1953,16 @@ def submit_ppiflow_workflow(
     resolved_run_name = run_name or str(task_section.get("name") or task_path.stem)
     if out_dir is None:
         out_dir = str(task_section.get("output_base_dir") or Path.cwd())
-    local_out_dir = Path(out_dir).expanduser().resolve()
-    local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = local_out_dir / f"{sanitize_filename(resolved_run_name)}.tar.zst"
-    if out_file.exists() and not force:
-        raise FileExistsError(f"Output file already exists: {out_file}")
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(
+        local_out_dir,
+        run_name=resolved_run_name,
+        overwrite=force,
+    )
 
     input_files = _collect_local_inputs(task_doc, task_path)
     app_names = _default_app_names()
+    output_volume_names = _default_output_volume_names(app_names)
     print(f"🧬 Submitting PPIFlow workflow '{resolved_run_name}'")
     print(f"🧬 Staged {len(input_files)} local input file(s)")
     tarball = run_ppiflow_workflow.remote(
@@ -1596,7 +1973,8 @@ def submit_ppiflow_workflow(
         stage=stage,
         max_workers=max_workers,
         app_names=app_names,
+        output_volume_names=output_volume_names,
         force=force,
     )
-    out_file.write_bytes(tarball)
+    write_local_tarball(out_file, tarball, overwrite=force)
     print(f"🧬 PPIFlow workflow complete. Results saved to {out_file}")

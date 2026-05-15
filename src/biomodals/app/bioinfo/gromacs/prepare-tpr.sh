@@ -244,6 +244,15 @@ if [ ! -f "${workdir}/em_${sample_id}.gro" ]; then
   "${gmx_exe}" mdrun -deffnm "em_${sample_id}" "${mdrun_args[@]}" \
     2>&1 | tee "${workdir}/em_${sample_id}.full.log"
 fi
+# Save the solvated first frame as reference for later
+if [ ! -f "${workdir}/${sample_id}_input.pdb" ]; then
+    printf "System\n" |
+    "${gmx_exe}" trjconv \
+      -s "${workdir}/em_${sample_id}.tpr" \
+      -f "${workdir}/em_${sample_id}.trr" \
+      -o "${workdir}/${sample_id}_input.pdb" \
+      -dump 0 -pbc mol -ur compact
+fi
 
 # cg
 if [ ! -f "${workdir}/cg_${sample_id}.gro" ]; then

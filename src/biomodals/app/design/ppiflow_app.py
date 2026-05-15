@@ -12,8 +12,8 @@ from pydantic import BaseModel, computed_field, model_validator
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import run_command_with_log, sanitize_filename
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import run_command_with_log, sanitize_filename
 
 ##########################################
 # Modal configs
@@ -38,18 +38,17 @@ SCRIPTS_DIR = CONF.git_clone_dir / "tool" / "PPIFlow"
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    modal.Image.micromamba(python_version=CONF.python_version)
+    modal.Image
+    .micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
     .env(CONF.default_env)
     .run_commands(
-        " && ".join(
-            (
-                f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
-                f"cd {CONF.git_clone_dir}",
-                f"git checkout {CONF.repo_commit_hash}",
-                # f"micromamba env create -f {CONF.git_clone_dir / 'ppiflow_af3_merged.yaml'}",
-            )
-        )
+        " && ".join((
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+            # f"micromamba env create -f {CONF.git_clone_dir / 'ppiflow_af3_merged.yaml'}",
+        ))
     )
     .micromamba_install(
         [

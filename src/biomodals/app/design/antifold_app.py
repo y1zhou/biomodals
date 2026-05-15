@@ -21,8 +21,8 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MODEL_VOLUME
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, run_command
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, run_command
 
 ##########################################
 # Modal configs
@@ -43,7 +43,8 @@ MODEL_DIR = CONF.model_dir
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget")
     .env(CONF.default_env)
     .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}")

@@ -2,7 +2,7 @@
 """Create GROMACS topology and coordinate files using Amber force fields."""
 
 # Amber to Gromacs, ParmEd
-import parmed as pmd
+import parmed as pmd  # type: ignore[ty:unresolved-import]
 
 # convert AMBER topology to GROMACS, CHARMM formats
 amber = pmd.load_file("prmtop", "inpcrd")

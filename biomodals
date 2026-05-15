@@ -7,16 +7,15 @@ fi
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 DEFAULT_BIN_NAME='biomodals'
 
+# Show help if no arguments are provided or the first argument is the binary name
 if [ $# -eq 0 ] || { [ $# -eq 1 ] && [[ "$1" == "${DEFAULT_BIN_NAME}" ]] ; }; then
   uv run --project "${SCRIPT_DIR}" "${DEFAULT_BIN_NAME}" --help
 
-# elif [ $# -gt 1 ] && [[ "$1" == "${DEFAULT_BIN_NAME}" ]]; then
-#   uv run --project "${SCRIPT_DIR}" "$@"
+# Run the subcommand if the first argument matches a known subcommand
+elif [ $# -gt 0 ] && [[ "$1" =~ ^(list|ls|l|run|r|help|h|deploy|d)$ ]]; then
+  uv run --project "${SCRIPT_DIR}" "${DEFAULT_BIN_NAME}" "$@"
 
-# elif [ $# -eq 1 ] && [[ "$1" == 'python' ]]; then
-#   uv run --project "${SCRIPT_DIR}" python
-
+# Otherwise, run the command as-is within the uv environment
 else
-  # uv run --project "${SCRIPT_DIR}" "${DEFAULT_BIN_NAME}" "$@"
   uv run --project "${SCRIPT_DIR}" "$@"
 fi

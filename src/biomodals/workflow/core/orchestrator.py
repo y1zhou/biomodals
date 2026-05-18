@@ -8,7 +8,11 @@ from typing import Any
 
 from biomodals.schema import AppRunResult
 from biomodals.workflow.core.builder import Workflow
-from biomodals.workflow.core.runtime import WorkflowRuntime, WorkflowVolume
+from biomodals.workflow.core.runtime import (
+    RemoteNodeRunner,
+    WorkflowRuntime,
+    WorkflowVolume,
+)
 
 
 def run_workflow_definition(
@@ -20,6 +24,7 @@ def run_workflow_definition(
     workflow_volume_name: str,
     force: bool = False,
     workflow_volume: WorkflowVolume | None = None,
+    remote_node_runner: RemoteNodeRunner | None = None,
 ) -> AppRunResult:
     """Run one workflow definition through the workflow runtime."""
     runtime = WorkflowRuntime.from_definition(
@@ -28,6 +33,7 @@ def run_workflow_definition(
         volume_root=volume_root,
         workflow_volume_name=workflow_volume_name,
         workflow_volume=workflow_volume,
+        remote_node_runner=remote_node_runner,
     )
     return runtime.run(run_id=run_id, force=force)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Protocol
@@ -11,6 +12,7 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactSelector,
     AttemptRecord,
+    NodePlacement,
     RunStatus,
     WorkflowArtifact,
     WorkflowRun,
@@ -18,7 +20,9 @@ from biomodals.schema import (
 from biomodals.workflow.core.artifacts import materialize_app_run_result
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.ledger import WorkflowLedger
-from biomodals.workflow.core.nodes import NodeRunContext
+from biomodals.workflow.core.nodes import NodeRunContext, WorkflowNode
+
+RemoteNodeRunner = Callable[[WorkflowNode, NodeRunContext], AppRunResult]
 
 
 class WorkflowVolume(Protocol):
@@ -41,12 +45,14 @@ class WorkflowRuntime:
         volume_root: str | Path,
         workflow_volume_name: str,
         workflow_volume: WorkflowVolume | None = None,
+        remote_node_runner: RemoteNodeRunner | None = None,
     ):
         """Initialize a runtime for one workflow and ledger root."""
         self.workflow = workflow
         self.volume_root = Path(volume_root)
         self.workflow_volume_name = workflow_volume_name
         self.workflow_volume = workflow_volume
+        self.remote_node_runner = remote_node_runner
         self.ledger = WorkflowLedger(self.volume_root)
         self.executed_waves: list[list[str]] = []
 
@@ -59,6 +65,7 @@ class WorkflowRuntime:
         volume_root: str | Path,
         workflow_volume_name: str | None = None,
         workflow_volume: WorkflowVolume | None = None,
+        remote_node_runner: RemoteNodeRunner | None = None,
     ) -> WorkflowRuntime:
         """Create a runtime from a Python workflow definition."""
         if isinstance(workflow_definition, Workflow):
@@ -73,6 +80,7 @@ class WorkflowRuntime:
                     workflow_volume_name or f"{workflow_name}-outputs"
                 ),
                 workflow_volume=workflow_volume,
+                remote_node_runner=remote_node_runner,
             )
         raise NotImplementedError(
             "Serialized workflow definition dictionaries are deferred; pass a "
@@ -119,10 +127,18 @@ class WorkflowRuntime:
             self.executed_waves.append(ready)
             for node_id, node_result in self._run_ready_nodes(ready):
                 if node_result.status == AppRunStatus.FAILED:
-                    self.ledger.mark_node_failed(node_id, "Node returned failed status")
+                    error = (
+                        node_result.warnings[0]
+                        if node_result.warnings
+                        else "Node returned failed status"
+                    )
+                    self.ledger.mark_node_failed(node_id, error)
                     self.ledger.mark_run_status(RunStatus.FAILED)
                     self._commit_volume()
-                    return AppRunResult(status=AppRunStatus.FAILED)
+                    return AppRunResult(
+                        status=AppRunStatus.FAILED,
+                        warnings=node_result.warnings,
+                    )
 
     def _completed_nodes(self, node_ids) -> set[str]:
         return {
@@ -130,10 +146,6 @@ class WorkflowRuntime:
         }
 
     def _run_ready_nodes(self, node_ids: list[str]) -> list[tuple[str, AppRunResult]]:
-        if len(node_ids) == 1:
-            node_id = node_ids[0]
-            return [(node_id, self._run_node(node_id))]
-
         results: list[tuple[str, AppRunResult]] = []
         with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
             futures = {
@@ -177,6 +189,7 @@ class WorkflowRuntime:
         attempt_dir = self._attempt_dir(attempt)
         cache_dir = self.ledger.run_root / "nodes" / node_id / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
+        self._commit_volume()
 
         result = self._dispatch_node(
             spec.node,
@@ -219,8 +232,14 @@ class WorkflowRuntime:
             for input_name, selector in selectors.items()
         }
 
-    @staticmethod
-    def _dispatch_node(node, context: NodeRunContext) -> AppRunResult:
+    def _dispatch_node(
+        self, node: WorkflowNode, context: NodeRunContext
+    ) -> AppRunResult:
+        if (
+            node.placement == NodePlacement.REMOTE
+            and self.remote_node_runner is not None
+        ):
+            return self.remote_node_runner(node, context)
         return node.run(context)
 
     def _next_attempt_id(self, node_id: str) -> str:

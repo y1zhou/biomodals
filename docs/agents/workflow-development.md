@@ -68,6 +68,12 @@ filtering, ranking, reporting, and small manifest transforms.
 Use `REMOTE` placement for long-running work, app-backed work, and work that
 benefits from failure isolation.
 
+The runtime routes `REMOTE` nodes through an injected remote-node runner when
+one is available. The Modal orchestrator supplies a thin remote runner that
+executes one node in a separate Modal function and commits workflow volume
+writes after node code returns. Unit tests use fake runners and must not call
+live Modal APIs.
+
 ## Ledger Layout
 
 The first durable run layout is:

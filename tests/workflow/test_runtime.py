@@ -12,6 +12,8 @@ from biomodals.schema import (
     ArtifactKind,
     InlineBytes,
     NodeExecutionPolicy,
+    NodePlacement,
+    NodeStatus,
     RunStatus,
     VolumePath,
     WorkflowArtifact,
@@ -57,6 +59,28 @@ class FakeNode(WorkflowNativeNode):
 class ExplodingNode(WorkflowNativeNode):
     def run(self, context):
         raise AssertionError(f"{context.node_id} should not run")
+
+
+class RuntimeErrorNode(WorkflowNativeNode):
+    def run(self, context):
+        raise RuntimeError(f"{context.node_id} exploded")
+
+
+class CommitObservedNode(WorkflowNativeNode):
+    def __init__(self, volume: "FakeVolume"):
+        self.volume = volume
+        self.commit_count_at_run = -1
+
+    def run(self, context):
+        self.commit_count_at_run = self.volume.commit_count
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+class RemoteOnlyNode(WorkflowNativeNode):
+    placement = NodePlacement.REMOTE
+
+    def run(self, context):
+        raise AssertionError("remote placement should use remote_node_runner")
 
 
 class FakeVolume:
@@ -182,6 +206,25 @@ def test_failed_node_prevents_downstream_nodes_from_running(tmp_path: Path) -> N
     assert runtime.executed_waves == [["fail"]]
 
 
+def test_single_node_exception_marks_node_and_run_failed(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    workflow.add_node(RuntimeErrorNode(), id="fail")
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.FAILED
+    assert result.warnings == ["fail exploded"]
+    assert runtime.ledger.load_run("demo", "run-1").status == RunStatus.FAILED
+    status = runtime.ledger._load_node_status_or_default("fail")
+    assert status.status == NodeStatus.FAILED
+    assert status.error == "fail exploded"
+
+
 def test_rerun_policy_runs_incomplete_nodes(tmp_path: Path) -> None:
     workflow = Workflow("demo")
     calls: list[str] = []
@@ -216,6 +259,45 @@ def test_resume_policy_receives_durable_cache_path(tmp_path: Path) -> None:
     assert node.seen_cache_dir == tmp_path / "demo/run-1/nodes/long/cache"
     assert node.seen_cache_dir is not None
     assert node.seen_cache_dir.exists()
+
+
+def test_runtime_commits_node_start_before_node_execution(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = FakeVolume()
+    node = CommitObservedNode(volume)
+    workflow.add_node(node, id="long")
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert node.commit_count_at_run >= 3
+
+
+def test_remote_placement_uses_injected_remote_runner(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    workflow.add_node(RemoteOnlyNode(), id="remote")
+    calls = []
+
+    def remote_runner(node, context):
+        calls.append((node, context.node_id))
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        remote_node_runner=remote_runner,
+    )
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == [(workflow.validate().nodes["remote"].node, "remote")]
 
 
 def test_runtime_passes_selected_upstream_artifacts_to_node_context(

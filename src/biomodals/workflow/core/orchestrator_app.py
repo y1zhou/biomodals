@@ -12,6 +12,7 @@ from biomodals.app.constant import MAX_TIMEOUT
 from biomodals.helper import patch_image_for_helper
 from biomodals.schema import AppRunResult
 from biomodals.workflow.core.builder import Workflow
+from biomodals.workflow.core.nodes import NodeRunContext, WorkflowNode
 from biomodals.workflow.core.orchestrator import (
     load_workflow_definition,
     run_workflow_definition,
@@ -48,6 +49,7 @@ def _run_workflow_orchestrator(
         volume_root=Path(CONF.output_volume_mountpoint),
         workflow_volume_name=OUT_VOLUME_NAME,
         workflow_volume=OUT_VOLUME,
+        remote_node_runner=run_remote_workflow_node.remote,
         force=force,
     )
 
@@ -71,6 +73,23 @@ def run_workflow_orchestrator(
         workflow_definition=workflow_definition,
         force=force,
     )
+
+
+@app.function(
+    cpu=(1.125, 16.125),
+    memory=(1024, 65536),
+    timeout=MAX_TIMEOUT,
+    volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
+)
+def run_remote_workflow_node(
+    node: WorkflowNode,
+    context: NodeRunContext,
+) -> AppRunResult:
+    """Run one failure-isolated workflow node in a separate Modal function."""
+    OUT_VOLUME.reload()
+    result = node.run(context)
+    OUT_VOLUME.commit()
+    return result
 
 
 @app.local_entrypoint()

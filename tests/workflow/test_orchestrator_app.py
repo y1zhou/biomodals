@@ -33,12 +33,14 @@ def test_orchestrator_helper_uses_runtime_from_definition(monkeypatch) -> None:
             volume_root: Path,
             workflow_volume_name: str,
             workflow_volume=None,
+            remote_node_runner=None,
         ):
             calls["workflow_name"] = workflow_name
             calls["workflow_definition"] = workflow_definition
             calls["volume_root"] = volume_root
             calls["workflow_volume_name"] = workflow_volume_name
             calls["workflow_volume"] = workflow_volume
+            calls["remote_node_runner"] = remote_node_runner
             return cls()
 
         def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
@@ -64,9 +66,49 @@ def test_orchestrator_helper_uses_runtime_from_definition(monkeypatch) -> None:
         "volume_root": Path("/workflow-outputs"),
         "workflow_volume_name": "WorkflowOrchestrator-outputs",
         "workflow_volume": None,
+        "remote_node_runner": None,
         "run_id": "run-1",
         "force": True,
     }
+
+
+def test_orchestrator_helper_passes_remote_node_runner(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    def remote_runner(node, context):
+        raise AssertionError("not executed by boundary test")
+
+    class FakeRuntime:
+        @classmethod
+        def from_definition(
+            cls,
+            *,
+            workflow_name: str,
+            workflow_definition: dict[str, object],
+            volume_root: Path,
+            workflow_volume_name: str,
+            workflow_volume=None,
+            remote_node_runner=None,
+        ):
+            calls["remote_node_runner"] = remote_node_runner
+            return cls()
+
+        def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+
+    result = orchestrator.run_workflow_definition(
+        workflow_name="demo",
+        run_id="run-1",
+        workflow_definition={"nodes": []},
+        volume_root=Path("/workflow-outputs"),
+        workflow_volume_name="WorkflowOrchestrator-outputs",
+        remote_node_runner=remote_runner,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls["remote_node_runner"] is remote_runner
 
 
 def test_submit_workflow_run_waits_for_remote_result() -> None:

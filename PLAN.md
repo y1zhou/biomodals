@@ -80,13 +80,13 @@ Create or modify these files.
 - Create `src/biomodals/schema/storage.py`: `InlineBytes`, `VolumePath`, and storage discriminators.
 - Create `src/biomodals/schema/app.py`: `AppOutput`, `AppRunResult`, and app status enums.
 - Create `src/biomodals/schema/workflow.py`: `WorkflowArtifact`, `ArtifactFile`, node/run status schemas, execution policy, placement, and selector models.
-- Create `src/biomodals/workflow/artifacts.py`: materialize app outputs into workflow volume paths and create artifact manifests.
-- Create `src/biomodals/workflow/ledger.py`: read/write run, node, attempt, and artifact JSON files.
-- Create `src/biomodals/workflow/nodes.py`: base workflow node protocol plus app-backed and workflow-native node helpers.
-- Create `src/biomodals/workflow/builder.py`: Python workflow definition API and DAG validation.
-- Create `src/biomodals/workflow/runtime.py`: scheduler, skip-if-complete logic, parallel ready-node execution, and node placement dispatch.
-- Create `src/biomodals/workflow/orchestrator_app.py`: remote Modal workflow orchestrator function and local submission helper.
-- Create `src/biomodals/workflow/workers.py`: reusable worker-pool queue helpers for fan-out nodes.
+- Create `src/biomodals/workflow/core/artifacts.py`: materialize app outputs into workflow volume paths and create artifact manifests.
+- Create `src/biomodals/workflow/core/ledger.py`: read/write run, node, attempt, and artifact JSON files.
+- Create `src/biomodals/workflow/core/nodes.py`: base workflow node protocol plus app-backed and workflow-native node helpers.
+- Create `src/biomodals/workflow/core/builder.py`: Python workflow definition API and DAG validation.
+- Create `src/biomodals/workflow/core/runtime.py`: scheduler, skip-if-complete logic, parallel ready-node execution, and node placement dispatch.
+- Create `src/biomodals/workflow/core/orchestrator_app.py`: remote Modal workflow orchestrator function and local submission helper.
+- Create `src/biomodals/workflow/core/workers.py`: reusable worker-pool queue helpers for fan-out nodes.
 - Modify `src/biomodals/workflow/__init__.py`: export the builder and core runtime types.
 - Keep `src/biomodals/workflow/ppiflow_workflow.py` intact during the first runtime extraction; use it as a behavioral reference.
 - Modify `pyproject.toml`: add `pytest` to the `dev` dependency group.
@@ -373,7 +373,7 @@ Expected: all tests pass.
 
 **Files:**
 
-- Create: `src/biomodals/workflow/artifacts.py`
+- Create: `src/biomodals/workflow/core/artifacts.py`
 
 - Create: `tests/workflow/test_artifacts.py`
 
@@ -422,7 +422,7 @@ Expected: all tests pass.
 
 **Files:**
 
-- Create: `src/biomodals/workflow/ledger.py`
+- Create: `src/biomodals/workflow/core/ledger.py`
 
 - Create: `tests/workflow/test_ledger.py`
 
@@ -473,9 +473,9 @@ Expected: all tests pass.
 
 **Files:**
 
-- Create: `src/biomodals/workflow/builder.py`
+- Create: `src/biomodals/workflow/core/builder.py`
 
-- Create: `src/biomodals/workflow/nodes.py`
+- Create: `src/biomodals/workflow/core/nodes.py`
 
 - Modify: `src/biomodals/workflow/__init__.py`
 
@@ -538,7 +538,7 @@ Expected: all tests pass.
 
 **Files:**
 
-- Create: `src/biomodals/workflow/runtime.py`
+- Create: `src/biomodals/workflow/core/runtime.py`
 
 - Create: `tests/workflow/test_runtime.py`
 
@@ -586,7 +586,7 @@ Expected: all tests pass.
 
 **Files:**
 
-- Create: `src/biomodals/workflow/orchestrator_app.py`
+- Create: `src/biomodals/workflow/core/orchestrator_app.py`
 
 - Modify: `src/biomodals/workflow/__init__.py`
 
@@ -667,7 +667,7 @@ Expected: app discovery works once the new orchestrator is registered with the C
 
 **Files:**
 
-- Create: `src/biomodals/workflow/workers.py`
+- Create: `src/biomodals/workflow/core/workers.py`
 
 - Create: `tests/workflow/test_workers.py`
 

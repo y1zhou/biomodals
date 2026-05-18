@@ -16,7 +16,7 @@ from biomodals.schema import (
     InlineBytes,
     VolumePath,
 )
-from biomodals.workflow.artifacts import materialize_app_run_result
+from biomodals.workflow.core.artifacts import materialize_app_run_result
 
 
 def test_materialize_inline_bytes_writes_raw_and_volume_artifact(

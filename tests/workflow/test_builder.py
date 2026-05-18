@@ -6,7 +6,7 @@ import pytest
 
 from biomodals.schema import ArtifactKind
 from biomodals.workflow import Workflow
-from biomodals.workflow.nodes import WorkflowNativeNode
+from biomodals.workflow.core.nodes import WorkflowNativeNode
 
 
 class DummyNode(WorkflowNativeNode):

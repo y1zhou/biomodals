@@ -32,6 +32,8 @@ def callback():
 ##########################################
 def _load_app(name: str) -> BiomodalsApp:
     """Load a biomodals app by name or path."""
+    # TODO(workflows): add a workflow-aware loader that can receive a workflow
+    # catalog from get_all_apps(app_home=WORKFLOW_HOME, suffix="workflow").
     try:
         return BiomodalsApp(name)
     except AppNotFoundError as e:
@@ -90,6 +92,9 @@ def list_available_apps(
     ] = False,
 ) -> dict[str, Path]:
     """Show a list of all available biomodals applications."""
+    # TODO(workflows): add a workflow listing mode or sibling command that calls
+    # get_all_apps(app_home=WORKFLOW_HOME, suffix="workflow") and labels rows as
+    # workflows instead of applications.
     table_headers = ["App name", "Category", "App path"]
     available_apps = get_all_apps(use_absolute_paths)
     table_rows: list[tuple[str, str, str]] = []
@@ -157,6 +162,8 @@ def show_app_help(
     If you would like to see help for a local entrypoint or Modal function,
     add `::<function-name>` to the app name to show help for that specific function.
     """
+    # TODO(workflows): route workflow names through a workflow catalog once the
+    # workflow CLI surface is stable.
     app = _load_app(app_name)
     if app._entrypoint is not None:
         # When an entrypoint name is specified, show only its docstring
@@ -244,6 +251,8 @@ def run_modal_app(
     Use with: `biomodals run <app-name> [OPTIONS] -- [app-options]`, where `[app-options]` are
     additional flags to pass to the `modal run <app-name>` command.
     """
+    # TODO(workflows): add workflow run semantics separately from Modal app runs
+    # so workflow-* names can stage workflow inputs before invoking orchestrators.
     import sys
 
     app = _load_app(app_name_or_path)

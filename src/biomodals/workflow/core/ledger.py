@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
 
 from biomodals.schema import (
     AppRunResult,
@@ -69,7 +72,7 @@ class WorkflowLedger:
         attempts = [*current.attempts]
         if attempt_id not in attempts:
             attempts.append(attempt_id)
-        updates = {
+        updates: dict[str, Any] = {
             "status": NodeStatus.RUNNING,
             "attempts": attempts,
             "error": None,
@@ -207,7 +210,8 @@ class WorkflowLedger:
     @staticmethod
     def _write_json(path: Path, payload: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        if hasattr(payload, "model_dump"):
+        data: Any
+        if isinstance(payload, BaseModel):
             data = payload.model_dump(mode="json")
         else:
             data = payload

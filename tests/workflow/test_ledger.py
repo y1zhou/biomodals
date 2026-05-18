@@ -3,6 +3,7 @@
 # ruff: noqa: D103
 
 from pathlib import Path
+from typing import Any, cast
 
 from biomodals.schema import (
     AppOutput,
@@ -15,7 +16,7 @@ from biomodals.schema import (
     WorkflowArtifact,
     WorkflowRun,
 )
-from biomodals.workflow.ledger import WorkflowLedger
+from biomodals.workflow.core.ledger import WorkflowLedger
 
 
 def test_create_run_writes_and_loads_run_json(tmp_path: Path) -> None:
@@ -98,5 +99,5 @@ def test_record_app_result_accepts_non_utf8_inline_bytes(tmp_path: Path) -> None
     path = ledger.record_app_result("node-1", "attempt-1", result)
 
     assert path.exists()
-    data = ledger._read_json(path)
+    data = cast(dict[str, Any], ledger._read_json(path))
     assert isinstance(data["outputs"][0]["storage"]["data"], str)

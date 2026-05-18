@@ -11,7 +11,8 @@ from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT
 from biomodals.helper import patch_image_for_helper
 from biomodals.schema import AppRunResult
-from biomodals.workflow.runtime import WorkflowRuntime
+from biomodals.workflow.core.builder import Workflow
+from biomodals.workflow.core.runtime import WorkflowRuntime
 
 CONF = AppConfig(
     tags={"group": "workflow"},
@@ -33,7 +34,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 def _run_workflow_orchestrator(
     workflow_name: str,
     run_id: str,
-    workflow_definition: object,
+    workflow_definition: Workflow | dict[str, object],
     force: bool = False,
 ) -> AppRunResult:
     runtime = WorkflowRuntime.from_definition(
@@ -54,7 +55,7 @@ def _run_workflow_orchestrator(
 def run_workflow_orchestrator(
     workflow_name: str,
     run_id: str,
-    workflow_definition: object,
+    workflow_definition: Workflow | dict[str, object],
     force: bool = False,
 ) -> AppRunResult:
     """Run one workflow definition through the workflow runtime."""

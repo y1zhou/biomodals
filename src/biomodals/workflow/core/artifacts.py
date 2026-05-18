@@ -7,6 +7,9 @@ import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
+
+from pydantic import BaseModel
 
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import (
@@ -26,7 +29,8 @@ def _artifact_id(producing_node_id: str, output_name: str) -> str:
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp")
-    if hasattr(payload, "model_dump"):
+    data: Any
+    if isinstance(payload, BaseModel):
         data = payload.model_dump(mode="json")
     else:
         data = payload

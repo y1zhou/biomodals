@@ -7,7 +7,7 @@ from typing import Any
 
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import ArtifactKind, ArtifactSelector
-from biomodals.workflow.nodes import WorkflowNode
+from biomodals.workflow.core.nodes import WorkflowNode
 
 
 @dataclass(frozen=True)

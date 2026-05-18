@@ -33,6 +33,7 @@ def test_inline_bytes_round_trip() -> None:
     loaded = AppRunResult.model_validate(result.model_dump())
 
     assert loaded.outputs[0].storage.kind == StorageKind.INLINE_BYTES
+    assert isinstance(loaded.outputs[0].storage, InlineBytes)
     assert loaded.outputs[0].storage.filename == "packed.tar.zst"
 
 

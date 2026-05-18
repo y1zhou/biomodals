@@ -12,10 +12,10 @@ from biomodals.schema import (
     WorkflowArtifact,
     WorkflowRun,
 )
-from biomodals.workflow.artifacts import materialize_app_run_result
-from biomodals.workflow.builder import Workflow
-from biomodals.workflow.ledger import WorkflowLedger
-from biomodals.workflow.nodes import NodeRunContext
+from biomodals.workflow.core.artifacts import materialize_app_run_result
+from biomodals.workflow.core.builder import Workflow
+from biomodals.workflow.core.ledger import WorkflowLedger
+from biomodals.workflow.core.nodes import NodeRunContext
 
 
 class WorkflowRuntime:

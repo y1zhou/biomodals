@@ -2,7 +2,7 @@
 
 # ruff: noqa: D103
 
-from biomodals.workflow.workers import bounded_worker_count, build_worker_pool_name
+from biomodals.workflow.core.workers import bounded_worker_count, build_worker_pool_name
 
 
 def test_build_worker_pool_name_is_sanitized_and_run_scoped() -> None:

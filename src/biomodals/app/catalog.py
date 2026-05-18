@@ -28,27 +28,22 @@ def get_all_apps(
     *,
     app_home: Path = APP_HOME,
     cwd: Path | None = None,
+    suffix: str = "app",
 ) -> dict[str, Path]:
     """Retrieve all available biomodals applications."""
     available_apps: dict[str, Path] = {}
     base_cwd = Path.cwd() if cwd is None else cwd
-    for app_file in app_home.glob("*/*_app.py"):
+    glob_pattern = f"*/*_{suffix}.py" if app_home == APP_HOME else f"*_{suffix}.py"
+    for app_file in app_home.glob(glob_pattern):
         app_path = (
             app_file.resolve()
             if use_absolute_paths
             else app_file.relative_to(base_cwd, walk_up=True)
         )
-        app_name = app_file.stem.replace("_app", "")
+        app_name = app_file.stem.removesuffix(f"_{suffix}")
+        if suffix == "workflow":
+            app_name = f"workflow-{app_name}"
         available_apps[app_name] = app_path
-    if app_home == APP_HOME:
-        for app_file in WORKFLOW_HOME.glob("*_app.py"):
-            app_path = (
-                app_file.resolve()
-                if use_absolute_paths
-                else app_file.relative_to(base_cwd, walk_up=True)
-            )
-            app_name = f"workflow-{app_file.stem.removesuffix('_app')}"
-            available_apps[app_name] = app_path
     return available_apps
 
 

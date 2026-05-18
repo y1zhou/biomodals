@@ -3,7 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 from biomodals.schema import AppRunResult, AppRunStatus
-from biomodals.workflow.nodes import AppBackedNode, NodeRunContext
+from biomodals.workflow.core.nodes import AppBackedNode, NodeRunContext
 
 
 class FakeRemoteFunction:

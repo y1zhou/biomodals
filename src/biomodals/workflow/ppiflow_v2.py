@@ -20,7 +20,7 @@ from biomodals.schema import (
     NodePlacement,
 )
 from biomodals.workflow import AppBackedNode, Workflow, WorkflowNativeNode
-from biomodals.workflow.nodes import NodeRunContext
+from biomodals.workflow.core.nodes import NodeRunContext
 
 PPI_FLOW_OUTPUT_LAYOUT = (
     "stage1/",

@@ -38,8 +38,8 @@ from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT
-from biomodals.app.helper import patch_image_for_helper
-from biomodals.app.helper.shell import package_outputs, sanitize_filename
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.shell import package_outputs, sanitize_filename
 
 ##########################################
 # Modal configs
@@ -965,7 +965,7 @@ def _af3score_input_name(name: str) -> str:
     )
 
 
-def _record_value(record: object, key: str) -> Any:
+def _record_value(record: Any, key: str) -> Any:
     if isinstance(record, dict):
         return record[key]
     return getattr(record, key)

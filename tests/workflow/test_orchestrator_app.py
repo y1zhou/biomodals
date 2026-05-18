@@ -5,9 +5,10 @@
 from pathlib import Path
 
 from biomodals.schema import AppRunResult, AppRunStatus
-from biomodals.workflow import Workflow, orchestrator_app
-from biomodals.workflow.nodes import WorkflowNativeNode
-from biomodals.workflow.runtime import WorkflowRuntime
+from biomodals.workflow import Workflow
+from biomodals.workflow.core import orchestrator_app
+from biomodals.workflow.core.nodes import WorkflowNativeNode
+from biomodals.workflow.core.runtime import WorkflowRuntime
 
 
 class SucceedNode(WorkflowNativeNode):

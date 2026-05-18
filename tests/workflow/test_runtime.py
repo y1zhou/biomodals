@@ -16,9 +16,9 @@ from biomodals.schema import (
     WorkflowRun,
 )
 from biomodals.workflow import Workflow
-from biomodals.workflow.ledger import WorkflowLedger
-from biomodals.workflow.nodes import WorkflowNativeNode
-from biomodals.workflow.runtime import WorkflowRuntime
+from biomodals.workflow.core.ledger import WorkflowLedger
+from biomodals.workflow.core.nodes import WorkflowNativeNode
+from biomodals.workflow.core.runtime import WorkflowRuntime
 
 
 class FakeNode(WorkflowNativeNode):
@@ -174,6 +174,7 @@ def test_resume_policy_receives_durable_cache_path(tmp_path: Path) -> None:
     runtime.run(run_id="run-1")
 
     assert node.seen_cache_dir == tmp_path / "demo/run-1/nodes/long/cache"
+    assert node.seen_cache_dir is not None
     assert node.seen_cache_dir.exists()
 
 

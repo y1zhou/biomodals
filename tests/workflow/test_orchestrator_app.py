@@ -2,7 +2,11 @@
 
 # ruff: noqa: D101,D102,D103
 
+import sys
+import types
 from pathlib import Path
+
+import pytest
 
 from biomodals.schema import AppRunResult, AppRunStatus
 from biomodals.workflow import Workflow
@@ -63,6 +67,66 @@ def test_orchestrator_helper_uses_runtime_from_definition(monkeypatch) -> None:
         "run_id": "run-1",
         "force": True,
     }
+
+
+def test_submit_workflow_run_waits_for_remote_result() -> None:
+    calls: dict[str, object] = {}
+
+    class FakeOrchestratorFunction:
+        def remote(self, **kwargs):
+            calls.update(kwargs)
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    result = orchestrator.submit_workflow_run(
+        orchestrator_function=FakeOrchestratorFunction(),
+        workflow_name="demo",
+        run_id="run-1",
+        workflow_definition={"nodes": []},
+        force=True,
+    )
+
+    assert result == AppRunResult(status=AppRunStatus.SUCCEEDED)
+    assert calls == {
+        "workflow_name": "demo",
+        "run_id": "run-1",
+        "workflow_definition": {"nodes": []},
+        "force": True,
+    }
+
+
+def test_submit_workflow_run_can_spawn_without_waiting() -> None:
+    calls: dict[str, object] = {}
+
+    class FakeCall:
+        object_id = "fc-123"
+
+    class FakeOrchestratorFunction:
+        def spawn(self, **kwargs):
+            calls.update(kwargs)
+            return FakeCall()
+
+    function_call_id = orchestrator.submit_workflow_run(
+        orchestrator_function=FakeOrchestratorFunction(),
+        workflow_name="demo",
+        run_id="run-1",
+        workflow_definition={"nodes": []},
+        wait=False,
+    )
+
+    assert function_call_id == "fc-123"
+    assert calls["workflow_name"] == "demo"
+    assert calls["run_id"] == "run-1"
+
+
+def test_load_workflow_definition_rejects_serialized_dict_factory(
+    monkeypatch,
+) -> None:
+    module = types.ModuleType("fake_workflow_factory")
+    setattr(module, "build", lambda: {"nodes": []})
+    monkeypatch.setitem(sys.modules, "fake_workflow_factory", module)
+
+    with pytest.raises(TypeError, match="must return a Workflow"):
+        orchestrator.load_workflow_definition("fake_workflow_factory:build")
 
 
 def test_runtime_from_definition_accepts_python_workflow(tmp_path: Path) -> None:

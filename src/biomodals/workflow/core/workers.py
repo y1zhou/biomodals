@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -75,6 +75,57 @@ def enqueue_worker_tasks(queue: QueueLike, tasks: Iterable[WorkerTask]) -> int:
         queue.put(task)
         queued_count += 1
     return queued_count
+
+
+def create_worker_queue(
+    pool_name: str,
+    *,
+    create_if_missing: bool = True,
+    queue_factory: Any | None = None,
+) -> Any:
+    """Create or load the Modal queue for one worker pool."""
+    if queue_factory is None:
+        import modal
+
+        queue_factory = modal.Queue
+    return queue_factory.from_name(pool_name, create_if_missing=create_if_missing)
+
+
+def spawn_worker_pool(
+    worker_function: Any,
+    *,
+    queue: Any,
+    worker_count: int,
+    **worker_kwargs: Any,
+) -> list[Any]:
+    """Spawn a fixed-size worker pool against one queue."""
+    if worker_count < 1:
+        return []
+    return [worker_function.spawn(queue, **worker_kwargs) for _ in range(worker_count)]
+
+
+def gather_worker_pool_results(
+    function_calls: Iterable[Any],
+    *,
+    gather: Callable[..., Iterable[WorkerTaskResult | dict[str, Any]]] | None = None,
+) -> list[WorkerTaskResult]:
+    """Gather Modal worker calls and normalize their task results."""
+    calls = list(function_calls)
+    if not calls:
+        return []
+    if gather is None:
+        import modal
+
+        gather = modal.FunctionCall.gather
+    return [_coerce_worker_task_result(result) for result in gather(*calls)]
+
+
+def _coerce_worker_task_result(
+    result: WorkerTaskResult | dict[str, Any],
+) -> WorkerTaskResult:
+    if isinstance(result, WorkerTaskResult):
+        return result
+    return WorkerTaskResult(**result)
 
 
 def summarize_worker_results(

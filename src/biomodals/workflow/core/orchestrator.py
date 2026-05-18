@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
+from typing import Any
 
 from biomodals.schema import AppRunResult
 from biomodals.workflow.core.builder import Workflow
@@ -28,3 +30,43 @@ def run_workflow_definition(
         workflow_volume=workflow_volume,
     )
     return runtime.run(run_id=run_id, force=force)
+
+
+def load_workflow_definition(factory_ref: str) -> Workflow:
+    """Load a Python workflow definition from ``module:function``."""
+    module_name, separator, function_name = factory_ref.partition(":")
+    if not separator or not module_name or not function_name:
+        raise ValueError("workflow factory must use 'module:function' syntax")
+
+    module = importlib.import_module(module_name)
+    factory = getattr(module, function_name)
+    if not callable(factory):
+        raise TypeError(f"Workflow factory is not callable: {factory_ref}")
+
+    workflow_definition = factory()
+    if isinstance(workflow_definition, Workflow):
+        return workflow_definition
+    raise TypeError("Workflow factory must return a Workflow object")
+
+
+def submit_workflow_run(
+    *,
+    orchestrator_function: Any,
+    workflow_name: str,
+    run_id: str,
+    workflow_definition: Workflow | dict[str, object],
+    force: bool = False,
+    wait: bool = True,
+) -> AppRunResult | str:
+    """Submit one workflow run to a remote orchestrator function."""
+    kwargs = {
+        "workflow_name": workflow_name,
+        "run_id": run_id,
+        "workflow_definition": workflow_definition,
+        "force": force,
+    }
+    if wait:
+        return AppRunResult.model_validate(orchestrator_function.remote(**kwargs))
+
+    function_call = orchestrator_function.spawn(**kwargs)
+    return str(getattr(function_call, "object_id", function_call))

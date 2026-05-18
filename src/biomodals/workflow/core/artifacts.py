@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -115,6 +116,50 @@ def _volume_path(path: Path, volume_root: Path | None) -> str:
     return path.relative_to(volume_root).as_posix()
 
 
+def _materialize_volume_path_copy(
+    *,
+    storage: VolumePath,
+    output_name: str,
+    output_kind: ArtifactKind,
+    workflow_volume_name: str,
+    attempt_dir: Path,
+    volume_root: Path | None,
+    producing_node_id: str,
+    metadata: dict[str, Any],
+    volume_roots: Mapping[str, Path],
+) -> WorkflowArtifact:
+    artifact_id = _artifact_id(producing_node_id, output_name)
+    source_root = volume_roots.get(storage.volume_name)
+    if source_root is None:
+        raise ValueError(
+            f"Missing mounted volume root for output volume {storage.volume_name!r}"
+        )
+    source_path = source_root / storage.path
+    if not source_path.exists():
+        raise FileNotFoundError(f"Volume output path not found: {source_path}")
+
+    materialized_dir = attempt_dir / "materialized_outputs" / artifact_id
+    if source_path.is_dir():
+        shutil.copytree(source_path, materialized_dir, dirs_exist_ok=True)
+    else:
+        materialized_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, materialized_dir / source_path.name)
+
+    return WorkflowArtifact(
+        artifact_id=artifact_id,
+        producing_node_id=producing_node_id,
+        kind=output_kind,
+        storage=VolumePath(
+            volume_name=workflow_volume_name,
+            path=_volume_path(materialized_dir, volume_root),
+            media_type=storage.media_type,
+        ),
+        files=_artifact_files(materialized_dir),
+        source_app_output_name=output_name,
+        metadata=metadata,
+    )
+
+
 def materialize_app_run_result(
     *,
     result: AppRunResult,
@@ -123,6 +168,8 @@ def materialize_app_run_result(
     artifact_dir: Path,
     producing_node_id: str,
     volume_root: Path | None = None,
+    volume_path_mode: Literal["reference", "copy"] = "reference",
+    volume_roots: Mapping[str, Path] | None = None,
 ) -> list[WorkflowArtifact]:
     """Write app outputs into local workflow volume paths and return manifests."""
     artifacts: list[WorkflowArtifact] = []
@@ -140,14 +187,27 @@ def materialize_app_run_result(
                 metadata=output.metadata,
             )
         else:
-            artifact = WorkflowArtifact(
-                artifact_id=artifact_id,
-                producing_node_id=producing_node_id,
-                kind=output.kind,
-                storage=output.storage,
-                source_app_output_name=output.name,
-                metadata=output.metadata,
-            )
+            if volume_path_mode == "copy":
+                artifact = _materialize_volume_path_copy(
+                    storage=output.storage,
+                    output_name=output.name,
+                    output_kind=output.kind,
+                    workflow_volume_name=workflow_volume_name,
+                    attempt_dir=attempt_dir,
+                    volume_root=volume_root,
+                    producing_node_id=producing_node_id,
+                    metadata=output.metadata,
+                    volume_roots=volume_roots or {},
+                )
+            else:
+                artifact = WorkflowArtifact(
+                    artifact_id=artifact_id,
+                    producing_node_id=producing_node_id,
+                    kind=output.kind,
+                    storage=output.storage,
+                    source_app_output_name=output.name,
+                    metadata=output.metadata,
+                )
         _write_json(artifact_dir / f"{artifact.artifact_id}.json", artifact)
         artifacts.append(artifact)
     return artifacts

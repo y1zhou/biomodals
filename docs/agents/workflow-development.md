@@ -37,6 +37,11 @@ materializes each `AppOutput` into one or more `WorkflowArtifact` manifests.
 Inline byte outputs must be written into the workflow run volume before they
 cross a node boundary.
 
+Volume path outputs may either be referenced in place or copied into the
+workflow run volume when the source volume is mounted locally. Reference mode is
+the default because many app outputs are already durable in their owning app
+volume. Copy mode is for workflows that need a self-contained run directory.
+
 The first workflow runtime is Python-first. Pass a `Workflow` object across the
 orchestrator boundary; serialized workflow dictionaries are intentionally
 deferred until the node and app-function contracts stabilize.
@@ -119,6 +124,19 @@ task queue until empty, then the node writes a single completion status.
 Independent ready nodes may run in parallel when all dependencies for each node
 are satisfied.
 
+Keep worker-pool naming, task ids, queue enqueueing, and result aggregation in
+pure helpers. Keep Modal queue creation, worker spawning, and
+`FunctionCall.gather` calls in thin integration helpers so unit tests can use
+fake queues and fake function calls.
+
+## Orchestrator Submission
+
+The reusable workflow orchestrator lives under `biomodals.workflow.core` and is
+not a user-facing workflow script. Its local helper accepts a no-argument Python
+factory in `module:function` form and submits the returned `Workflow` object to
+the remote orchestrator. Domain-specific input staging belongs in top-level
+workflow scripts such as `ppiflow_workflow.py`.
+
 ## PPIFlow V2 Status
 
 `src/biomodals/workflow/ppiflow_v2.py` is currently a definition-only DAG
@@ -127,6 +145,10 @@ inputs, then models the intended node graph and legacy output layout. It is not
 an executable replacement for `ppiflow_workflow.py` until each app-backed node
 is wired to a workflow-compatible app function and native filter/report nodes
 implement result processing.
+
+No safe live PPIFlow smoke fixture is committed yet. Current tests use tiny
+synthetic `task.yaml` and `steps.yaml` payloads to validate stage selection,
+dependencies, and the expected legacy output layout without executing Modal.
 
 ## App Interfaces
 

@@ -8,7 +8,10 @@ from biomodals.workflow.core.workers import (
     bounded_worker_count,
     build_worker_pool_name,
     build_worker_task_id,
+    create_worker_queue,
     enqueue_worker_tasks,
+    gather_worker_pool_results,
+    spawn_worker_pool,
     summarize_worker_results,
 )
 
@@ -58,6 +61,62 @@ def test_enqueue_worker_tasks_uses_queue_put() -> None:
 
     assert queued_count == 2
     assert queue.items == tasks
+
+
+def test_create_worker_queue_uses_injected_queue_factory() -> None:
+    calls = []
+
+    class FakeQueueFactory:
+        @staticmethod
+        def from_name(name, *, create_if_missing):
+            calls.append((name, create_if_missing))
+            return "queue"
+
+    queue = create_worker_queue(
+        "demo-run-node-workers",
+        queue_factory=FakeQueueFactory,
+    )
+
+    assert queue == "queue"
+    assert calls == [("demo-run-node-workers", True)]
+
+
+def test_spawn_worker_pool_spawns_fixed_count_workers() -> None:
+    calls = []
+
+    class FakeWorkerFunction:
+        def spawn(self, queue, **kwargs):
+            calls.append((queue, kwargs))
+            return f"call-{len(calls)}"
+
+    spawned = spawn_worker_pool(
+        FakeWorkerFunction(),
+        queue="queue",
+        worker_count=3,
+        node_id="score",
+    )
+
+    assert spawned == ["call-1", "call-2", "call-3"]
+    assert calls == [
+        ("queue", {"node_id": "score"}),
+        ("queue", {"node_id": "score"}),
+        ("queue", {"node_id": "score"}),
+    ]
+
+
+def test_gather_worker_pool_results_uses_injected_gather() -> None:
+    calls = ["call-1", "call-2"]
+
+    def fake_gather(*function_calls):
+        assert function_calls == tuple(calls)
+        return [
+            WorkerTaskResult(task_id="task-1", succeeded=True),
+            WorkerTaskResult(task_id="task-2", succeeded=True),
+        ]
+
+    results = gather_worker_pool_results(calls, gather=fake_gather)
+
+    assert [result.task_id for result in results] == ["task-1", "task-2"]
 
 
 def test_summarize_worker_results_aggregates_completion_status() -> None:

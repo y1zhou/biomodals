@@ -295,7 +295,7 @@ Builder rules:
 
 - Create: `tests/schema/test_workflow_schemas.py`
 
-- [ ] **Step 1: Write schema tests**
+- [x] **Step 1: Write schema tests**
 
 Create tests covering:
 
@@ -346,7 +346,7 @@ def test_workflow_artifact_is_volume_backed():
     assert artifact.storage.path == "ppiflow/run-1/artifacts/art-packed"
 ```
 
-- [ ] **Step 2: Run tests to confirm failure**
+- [x] **Step 2: Run tests to confirm failure**
 
 Run:
 
@@ -356,11 +356,11 @@ rtk uv run pytest tests/schema/test_workflow_schemas.py -q
 
 Expected: failure because `biomodals.schema` does not exist.
 
-- [ ] **Step 3: Implement schemas**
+- [x] **Step 3: Implement schemas**
 
 Implement the schema sketch above. Include `NodeExecutionPolicy`, `NodePlacement`, `NodeStatus`, `RunStatus`, `ArtifactFile`, `ArtifactSelector`, and `ControlEdge` in `workflow.py`. Add `pytest` to the `dev` dependency group in `pyproject.toml`.
 
-- [ ] **Step 4: Run schema tests**
+- [x] **Step 4: Run schema tests**
 
 Run:
 
@@ -378,7 +378,7 @@ Expected: all tests pass.
 
 - Create: `tests/workflow/test_artifacts.py`
 
-- [ ] **Step 1: Write materialization tests**
+- [x] **Step 1: Write materialization tests**
 
 Cover these cases:
 
@@ -390,7 +390,7 @@ Cover these cases:
 
 - Materialization returns `WorkflowArtifact` objects with volume-backed storage.
 
-- [ ] **Step 2: Implement materialization helpers**
+- [x] **Step 2: Implement materialization helpers**
 
 Add these functions:
 
@@ -409,7 +409,7 @@ def materialize_app_run_result(
 
 Use existing archive helper behavior from `src/biomodals/app/helper/shell.py` and extraction behavior from `ppiflow_workflow.py` as references.
 
-- [ ] **Step 3: Run artifact tests**
+- [x] **Step 3: Run artifact tests**
 
 Run:
 
@@ -427,7 +427,7 @@ Expected: all tests pass.
 
 - Create: `tests/workflow/test_ledger.py`
 
-- [ ] **Step 1: Write ledger tests**
+- [x] **Step 1: Write ledger tests**
 
 Cover:
 
@@ -441,7 +441,7 @@ Cover:
 
 - A completed node is detected from status plus existing artifact manifests.
 
-- [ ] **Step 2: Implement ledger**
+- [x] **Step 2: Implement ledger**
 
 Implement a `WorkflowLedger` class that accepts a mounted volume root path and never imports app modules.
 
@@ -460,7 +460,7 @@ record_artifacts(artifacts: list[WorkflowArtifact]) -> list[Path]
 node_is_complete(node_id: str) -> bool
 ```
 
-- [ ] **Step 3: Run ledger tests**
+- [x] **Step 3: Run ledger tests**
 
 Run:
 
@@ -482,7 +482,7 @@ Expected: all tests pass.
 
 - Create: `tests/workflow/test_builder.py`
 
-- [ ] **Step 1: Write builder tests**
+- [x] **Step 1: Write builder tests**
 
 Cover:
 
@@ -496,7 +496,7 @@ Cover:
 
 - Two nodes depending on the same upstream node are both ready after the upstream succeeds.
 
-- [ ] **Step 2: Implement node contracts**
+- [x] **Step 2: Implement node contracts**
 
 Define:
 
@@ -513,7 +513,7 @@ class WorkflowNode(Protocol):
 
 Define `AppBackedNode` and `WorkflowNativeNode` base classes for common behavior, but keep app-specific logic out of the runtime.
 
-- [ ] **Step 3: Implement builder**
+- [x] **Step 3: Implement builder**
 
 Expose:
 
@@ -525,7 +525,7 @@ Workflow.validate()
 Workflow.ready_nodes(completed_node_ids: set[str])
 ```
 
-- [ ] **Step 4: Run builder tests**
+- [x] **Step 4: Run builder tests**
 
 Run:
 
@@ -543,7 +543,7 @@ Expected: all tests pass.
 
 - Create: `tests/workflow/test_runtime.py`
 
-- [ ] **Step 1: Write runtime tests with fake nodes**
+- [x] **Step 1: Write runtime tests with fake nodes**
 
 Cover:
 
@@ -557,7 +557,7 @@ Cover:
 
 - `RESUME` calls node code with durable cache paths available in the context.
 
-- [ ] **Step 2: Implement runtime**
+- [x] **Step 2: Implement runtime**
 
 Implement scheduler waves:
 
@@ -573,7 +573,7 @@ repeat until all nodes complete or a failure stops the run
 
 For local unit tests, use fake node implementations and a temporary directory as the ledger root.
 
-- [ ] **Step 3: Run runtime tests**
+- [x] **Step 3: Run runtime tests**
 
 Run:
 
@@ -595,7 +595,7 @@ Expected: all tests pass.
 
 - Create: `tests/workflow/test_orchestrator_app.py`
 
-- [ ] **Step 1: Create workflow AppConfig**
+- [x] **Step 1: Create workflow AppConfig**
 
 Use the app-development conventions where they apply to Modal code:
 
@@ -610,7 +610,7 @@ CONF = AppConfig(
 )
 ```
 
-- [ ] **Step 2: Add remote orchestrator function**
+- [x] **Step 2: Add remote orchestrator function**
 
 Add:
 
@@ -637,15 +637,15 @@ def run_workflow_orchestrator(
 
 The function should instantiate `WorkflowRuntime`, run it against the mounted output volume, and return an `AppRunResult` or final workflow artifact manifest list.
 
-- [ ] **Step 3: Add local submission helper**
+- [x] **Step 3: Add local submission helper**
 
 Keep this helper CLI-facing and minimal: stage local inputs, submit the remote orchestrator, and optionally download final outputs. It should not become a second scheduler.
 
-- [ ] **Step 4: Write mocked orchestrator boundary tests**
+- [x] **Step 4: Write mocked orchestrator boundary tests**
 
 Use pytest `monkeypatch` to replace `WorkflowRuntime.from_definition` with a fake runtime that records `workflow_name`, `workflow_definition`, `volume_root`, `run_id`, and `force`. Call the Python function body directly and assert it returns the fake `AppRunResult`. Do not call `run_workflow_orchestrator.remote()` or any live Modal API.
 
-- [ ] **Step 5: Run orchestrator tests**
+- [x] **Step 5: Run orchestrator tests**
 
 Run:
 
@@ -655,7 +655,7 @@ rtk uv run pytest tests/workflow/test_orchestrator_app.py -q
 
 Expected: mocked orchestrator tests pass without contacting Modal.
 
-- [ ] **Step 6: Run discovery smoke tests**
+- [x] **Step 6: Run discovery smoke tests**
 
 Run:
 
@@ -674,11 +674,11 @@ Expected: app discovery works and workflow discovery exposes executable workflow
 
 - Create: `tests/workflow/test_workers.py`
 
-- [ ] **Step 1: Write worker-pool tests**
+- [x] **Step 1: Write worker-pool tests**
 
 Cover queue naming, deterministic task ids, worker count calculation, and completion status aggregation using fake queue objects.
 
-- [ ] **Step 2: Implement worker-pool helper API**
+- [x] **Step 2: Implement worker-pool helper API**
 
 Expose:
 
@@ -695,7 +695,7 @@ def bounded_worker_count(max_workers: int, task_count: int) -> int:
 
 Keep the Modal `Queue` and `FunctionCall.gather` calls in thin integration functions so pure unit tests can exercise most behavior.
 
-- [ ] **Step 3: Run worker tests**
+- [x] **Step 3: Run worker tests**
 
 Run:
 
@@ -715,7 +715,7 @@ Expected: all tests pass.
 
 - Update `examples/app/` only if user-facing invocation changes
 
-- [ ] **Step 1: Read app development standards**
+- [x] **Step 1: Read app development standards**
 
 Read:
 
@@ -725,7 +725,7 @@ Read:
 docs/agents/app-development.md
 ```
 
-- [ ] **Step 2: Add a workflow-compatible remote app function**
+- [x] **Step 2: Add a workflow-compatible remote app function**
 
 The function should:
 
@@ -737,11 +737,11 @@ The function should:
 
 - Preserve the existing local entrypoint behavior and return value.
 
-- [ ] **Step 3: Add a focused app contract test**
+- [x] **Step 3: Add a focused app contract test**
 
 Use pytest to call the workflow contract helper with fake inputs and monkeypatched app-function dependencies. Assert the returned `AppRunResult` contains expected `AppOutput` names, kinds, and storage metadata. Do not call `.remote()`, `.spawn()`, `modal.Function.from_name(...)`, or deployed Modal apps.
 
-- [ ] **Step 4: Run the focused app test**
+- [x] **Step 4: Run the focused app test**
 
 Run:
 
@@ -751,7 +751,7 @@ rtk uv run pytest tests/app/test_flowpacker_workflow_contract.py -q
 
 Expected: the app contract test passes without contacting Modal.
 
-- [ ] **Step 5: Smoke test app discovery**
+- [x] **Step 5: Smoke test app discovery**
 
 Run:
 
@@ -778,7 +778,12 @@ executable replacement for `ppiflow_workflow.py`. Full execution is deferred
 until app-backed nodes are wired to workflow-compatible app functions and
 workflow-native filter/report nodes implement result processing.
 
-- [ ] **Step 1: Model the current PPIFlow stages as workflow nodes**
+**Execution note:** No safe live PPIFlow smoke fixture is committed yet. The
+first implementation uses tiny synthetic `task.yaml` and `steps.yaml` payloads
+in `tests/workflow/test_ppiflow_v2.py` to compare the intended DAG and expected
+legacy output layout without executing Modal.
+
+- [x] **Step 1: Model the current PPIFlow stages as workflow nodes**
 
 Use these initial node boundaries:
 
@@ -804,11 +809,11 @@ Use these initial node boundaries:
 
 - `RankAndReportNode`
 
-- [ ] **Step 2: Preserve current upstream compatibility**
+- [x] **Step 2: Preserve current upstream compatibility**
 
 The v2 workflow should still accept the upstream-style `task.yaml`, `steps.yaml`, and `stage` selector used by `ppiflow_workflow.py`.
 
-- [ ] **Step 3: Compare output shape**
+- [x] **Step 3: Compare output shape**
 
 Run the legacy and v2 workflow against a small smoke input when a safe fixture exists. Compare that both produce:
 
@@ -832,7 +837,7 @@ If no safe fixture exists, document the missing fixture in the plan execution no
 
 - Modify: `AGENTS.md` only if repo-wide agent instructions need a pointer to workflow-development docs.
 
-- [ ] **Step 1: Document workflow-development rules**
+- [x] **Step 1: Document workflow-development rules**
 
 Include:
 
@@ -852,7 +857,7 @@ Include:
 
 - App local entrypoint versus workflow-compatible app function split.
 
-- [ ] **Step 2: Run verification**
+- [x] **Step 2: Run verification**
 
 Run:
 

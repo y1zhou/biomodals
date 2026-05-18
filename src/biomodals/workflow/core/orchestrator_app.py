@@ -12,7 +12,11 @@ from biomodals.app.constant import MAX_TIMEOUT
 from biomodals.helper import patch_image_for_helper
 from biomodals.schema import AppRunResult
 from biomodals.workflow.core.builder import Workflow
-from biomodals.workflow.core.orchestrator import run_workflow_definition
+from biomodals.workflow.core.orchestrator import (
+    load_workflow_definition,
+    run_workflow_definition,
+    submit_workflow_run,
+)
 
 CONF = AppConfig(
     tags={"group": "workflow"},
@@ -67,3 +71,40 @@ def run_workflow_orchestrator(
         workflow_definition=workflow_definition,
         force=force,
     )
+
+
+@app.local_entrypoint()
+def submit_workflow_orchestrator_task(
+    workflow_factory: str,
+    run_id: str,
+    workflow_name: str | None = None,
+    force: bool = False,
+    wait: bool = True,
+) -> None:
+    """Submit a Python workflow definition factory to the remote orchestrator.
+
+    Args:
+        workflow_factory: Import path in `module:function` form. The function
+            must take no arguments and return a `Workflow` object.
+        run_id: Stable workflow run id used for durable ledger paths.
+        workflow_name: Optional workflow name. Defaults to the factory
+            workflow's name.
+        force: Replace an existing run ledger instead of resuming it.
+        wait: Wait locally for the remote orchestrator result. Disable to print
+            the Modal function call id for asynchronous collection.
+    """
+    workflow_definition = load_workflow_definition(workflow_factory)
+    resolved_workflow_name = workflow_name or workflow_definition.name
+
+    result = submit_workflow_run(
+        orchestrator_function=run_workflow_orchestrator,
+        workflow_name=resolved_workflow_name,
+        run_id=run_id,
+        workflow_definition=workflow_definition,
+        force=force,
+        wait=wait,
+    )
+    if isinstance(result, AppRunResult):
+        print(f"Workflow run finished with status: {result.status}")
+    else:
+        print(f"Workflow run submitted. FunctionCall id: {result}")

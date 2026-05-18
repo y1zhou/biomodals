@@ -12,6 +12,7 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactSelector,
     AttemptRecord,
+    NodeExecutionPolicy,
     NodePlacement,
     RunStatus,
     WorkflowArtifact,
@@ -92,7 +93,14 @@ class WorkflowRuntime:
         definition = self.workflow.validate()
         run_path = self.volume_root / definition.name / run_id / "run.json"
         self._reload_volume()
-        if run_path.exists() and not force:
+        if run_path.exists() and force:
+            self.ledger.reset_run(definition.name, run_id)
+            self._commit_volume()
+            self.ledger.create_run(
+                WorkflowRun(workflow_name=definition.name, run_id=run_id)
+            )
+            self._commit_volume()
+        elif run_path.exists():
             self.ledger.load_run(definition.name, run_id)
         else:
             self.ledger.create_run(
@@ -126,18 +134,14 @@ class WorkflowRuntime:
 
             self.executed_waves.append(ready)
             for node_id, node_result in self._run_ready_nodes(ready):
-                if node_result.status == AppRunStatus.FAILED:
-                    error = (
-                        node_result.warnings[0]
-                        if node_result.warnings
-                        else "Node returned failed status"
-                    )
+                if node_result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
+                    error = self._node_error_message(node_result)
                     self.ledger.mark_node_failed(node_id, error)
                     self.ledger.mark_run_status(RunStatus.FAILED)
                     self._commit_volume()
                     return AppRunResult(
-                        status=AppRunStatus.FAILED,
-                        warnings=node_result.warnings,
+                        status=node_result.status,
+                        warnings=node_result.warnings or [error],
                     )
 
     def _completed_nodes(self, node_ids) -> set[str]:
@@ -171,6 +175,13 @@ class WorkflowRuntime:
     def _run_node(self, node_id: str) -> AppRunResult:
         definition = self.workflow.validate()
         spec = definition.nodes[node_id]
+        if (
+            spec.node.execution_policy == NodeExecutionPolicy.RERUN
+            and self.ledger.node_has_state(node_id)
+            and not self.ledger.node_is_complete(node_id)
+        ):
+            self.ledger.reset_node(node_id)
+            self._commit_volume()
         attempt_id = self._next_attempt_id(node_id)
         inputs = self._resolve_inputs(spec.inputs)
         input_artifact_ids = [
@@ -202,7 +213,17 @@ class WorkflowRuntime:
             ),
         )
         self.ledger.record_app_result(node_id, attempt_id, result)
-        if result.status == AppRunStatus.FAILED:
+        if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
+            if result.logs:
+                log_artifacts = materialize_app_run_result(
+                    result=AppRunResult(status=result.status, logs=result.logs),
+                    workflow_volume_name=self.workflow_volume_name,
+                    attempt_dir=attempt_dir,
+                    artifact_dir=self.ledger.run_root / "artifacts",
+                    producing_node_id=node_id,
+                    volume_root=self.volume_root,
+                )
+                self.ledger.record_artifacts(log_artifacts)
             self._commit_volume()
             return result
 
@@ -241,6 +262,14 @@ class WorkflowRuntime:
         ):
             return self.remote_node_runner(node, context)
         return node.run(context)
+
+    @staticmethod
+    def _node_error_message(result: AppRunResult) -> str:
+        if result.warnings:
+            return result.warnings[0]
+        if result.status == AppRunStatus.PARTIAL:
+            return "Node returned partial status"
+        return "Node returned failed status"
 
     def _next_attempt_id(self, node_id: str) -> str:
         attempts_dir = self.ledger.run_root / "nodes" / node_id / "attempts"

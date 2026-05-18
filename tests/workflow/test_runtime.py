@@ -122,6 +122,29 @@ def test_completed_nodes_are_skipped(tmp_path: Path) -> None:
     assert runtime.executed_waves == []
 
 
+def test_force_replaces_existing_run_ledger_and_reruns_completed_nodes(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="one")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    first = runtime.run(run_id="run-1")
+    stale_file = tmp_path / "demo" / "run-1" / "nodes" / "one" / "cache" / "stale"
+    stale_file.write_text("old", encoding="utf-8")
+    second = runtime.run(run_id="run-1", force=True)
+
+    assert first.status == AppRunStatus.SUCCEEDED
+    assert second.status == AppRunStatus.SUCCEEDED
+    assert calls == ["one", "one"]
+    assert not stale_file.exists()
+
+
 def test_independent_ready_nodes_run_in_same_scheduler_wave(
     tmp_path: Path,
 ) -> None:
@@ -206,6 +229,29 @@ def test_failed_node_prevents_downstream_nodes_from_running(tmp_path: Path) -> N
     assert runtime.executed_waves == [["fail"]]
 
 
+def test_partial_node_marks_run_failed_and_blocks_downstream(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    partial = workflow.add_node(
+        FakeNode(result=AppRunResult(status=AppRunStatus.PARTIAL)),
+        id="partial",
+    )
+    workflow.add_node(ExplodingNode(), id="downstream", depends_on=[partial])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.PARTIAL
+    assert runtime.ledger.load_run("demo", "run-1").status == RunStatus.FAILED
+    status = runtime.ledger._load_node_status_or_default("partial")
+    assert status.status == NodeStatus.FAILED
+    assert status.error == "Node returned partial status"
+    assert runtime.executed_waves == [["partial"]]
+
+
 def test_single_node_exception_marks_node_and_run_failed(tmp_path: Path) -> None:
     workflow = Workflow("demo")
     workflow.add_node(RuntimeErrorNode(), id="fail")
@@ -242,6 +288,32 @@ def test_rerun_policy_runs_incomplete_nodes(tmp_path: Path) -> None:
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert calls == ["incomplete"]
+
+
+def test_rerun_policy_discards_incomplete_attempt_state(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="incomplete")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    ledger.mark_node_running("incomplete", "attempt-old")
+    ledger.record_attempt_started("incomplete", "attempt-old")
+    old_cache = tmp_path / "demo" / "run-1" / "nodes" / "incomplete" / "cache" / "old"
+    old_cache.parent.mkdir(parents=True)
+    old_cache.write_text("old", encoding="utf-8")
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["incomplete"]
+    assert not old_cache.exists()
+    status = runtime.ledger._load_node_status_or_default("incomplete")
+    assert status.attempts == ["attempt-1"]
 
 
 def test_resume_policy_receives_durable_cache_path(tmp_path: Path) -> None:

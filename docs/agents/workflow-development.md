@@ -37,6 +37,11 @@ materializes each `AppOutput` into one or more `WorkflowArtifact` manifests.
 Inline byte outputs must be written into the workflow run volume before they
 cross a node boundary.
 
+`AppRunResult.logs` are durable workflow artifacts too. The runtime writes log
+outputs under `nodes/<node-id>/attempts/<attempt-id>/logs/` and records
+artifact manifests for them so failed or partial attempts retain diagnostic
+state.
+
 Volume path outputs may either be referenced in place or copied into the
 workflow run volume when the source volume is mounted locally. Reference mode is
 the default because many app outputs are already durable in their owning app
@@ -59,6 +64,14 @@ Incomplete nodes use one of two policies:
 Long-running nodes must be idempotent against deterministic run, node, input,
 and attempt identifiers. Store resumable state in volumes, not container-local
 scratch paths.
+
+`AppRunStatus.PARTIAL` is terminal but not successful in the first runtime. The
+runtime records the node as failed, records the run as failed, preserves logs,
+and does not unblock downstream nodes.
+
+Forced workflow runs replace the existing run directory before creating a fresh
+ledger. Use force only when discarding previous artifacts, node caches, and
+attempt records is intentional.
 
 ## Node Placement
 

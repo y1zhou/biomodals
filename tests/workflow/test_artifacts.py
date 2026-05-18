@@ -121,6 +121,42 @@ def test_materialize_inline_bytes_preserves_output_metadata(
     assert artifacts[0].metadata == {"stage": "stage1"}
 
 
+def test_materialize_app_run_result_persists_log_outputs_under_attempt_logs(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        logs=[
+            AppOutput(
+                name="stderr",
+                kind=ArtifactKind.LOGS,
+                storage=InlineBytes(data=b"warning\n", filename="stderr.log"),
+                metadata={"stream": "stderr"},
+            )
+        ],
+    )
+
+    artifacts = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        attempt_dir=tmp_path / "attempt",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="node",
+        volume_root=tmp_path,
+    )
+
+    log_path = tmp_path / "attempt" / "logs" / "node-logs-stderr" / "stderr.log"
+    assert log_path.read_bytes() == b"warning\n"
+    assert artifacts[0].kind == ArtifactKind.LOGS
+    assert artifacts[0].source_app_output_name == "stderr"
+    assert artifacts[0].metadata == {"stream": "stderr"}
+    assert artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="attempt/logs/node-logs-stderr",
+    )
+    assert (tmp_path / "artifacts" / "node-logs-stderr.json").exists()
+
+
 def test_materialize_volume_path_references_existing_remote_output(
     tmp_path: Path,
 ) -> None:

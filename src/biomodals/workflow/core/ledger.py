@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,32 @@ class WorkflowLedger:
         updated = run.model_copy(update={"status": status})
         self._write_json(self.run_root / "run.json", updated)
         return updated
+
+    def reset_run(self, workflow_name: str, run_id: str) -> None:
+        """Remove all durable state for one workflow run."""
+        run_root = self.volume_root / workflow_name / run_id
+        if run_root.exists():
+            shutil.rmtree(run_root)
+
+    def node_has_state(self, node_id: str) -> bool:
+        """Return whether a node has any durable state in this run."""
+        return (self.run_root / "nodes" / node_id).exists() or any(
+            artifact.producing_node_id == node_id
+            for artifact in self._load_artifacts_if_any()
+        )
+
+    def reset_node(self, node_id: str) -> None:
+        """Remove durable state for one workflow node."""
+        node_dir = self.run_root / "nodes" / node_id
+        if node_dir.exists():
+            shutil.rmtree(node_dir)
+        artifact_dir = self.run_root / "artifacts"
+        if not artifact_dir.exists():
+            return
+        for path in artifact_dir.glob("*.json"):
+            artifact = WorkflowArtifact.model_validate(self._read_json(path))
+            if artifact.producing_node_id == node_id:
+                path.unlink()
 
     def mark_node_pending(self, node_id: str) -> NodeStatusRecord:
         """Mark a node as pending."""
@@ -153,16 +180,9 @@ class WorkflowLedger:
 
     def select_artifacts(self, selector: ArtifactSelector) -> list[WorkflowArtifact]:
         """Return artifacts matching one upstream selector."""
-        artifact_dir = self.run_root / "artifacts"
-        if not artifact_dir.exists():
-            return []
-        artifacts = [
-            WorkflowArtifact.model_validate(self._read_json(path))
-            for path in sorted(artifact_dir.glob("*.json"))
-        ]
         return [
             artifact
-            for artifact in artifacts
+            for artifact in self._load_artifacts_if_any()
             if self._artifact_matches_selector(artifact, selector)
         ]
 
@@ -204,6 +224,15 @@ class WorkflowLedger:
         if path.exists():
             return NodeStatusRecord.model_validate(self._read_json(path))
         return NodeStatusRecord(node_id=node_id, status=NodeStatus.PENDING)
+
+    def _load_artifacts_if_any(self) -> list[WorkflowArtifact]:
+        artifact_dir = self.run_root / "artifacts"
+        if not artifact_dir.exists():
+            return []
+        return [
+            WorkflowArtifact.model_validate(self._read_json(path))
+            for path in sorted(artifact_dir.glob("*.json"))
+        ]
 
     def _write_node_status(self, status: NodeStatusRecord) -> NodeStatusRecord:
         self._write_json(self._node_status_path(status.node_id), status)

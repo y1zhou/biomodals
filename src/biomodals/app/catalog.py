@@ -10,6 +10,8 @@ from typing import Literal
 import modal
 
 APP_HOME = Path(__file__).parent.resolve()
+BIOMODALS_HOME = APP_HOME.parent
+WORKFLOW_HOME = BIOMODALS_HOME / "workflow"
 
 
 class AppNotFoundError(ValueError):
@@ -26,17 +28,21 @@ def get_all_apps(
     *,
     app_home: Path = APP_HOME,
     cwd: Path | None = None,
+    suffix: Literal["app", "workflow"] = "app",
 ) -> dict[str, Path]:
     """Retrieve all available biomodals applications."""
     available_apps: dict[str, Path] = {}
     base_cwd = Path.cwd() if cwd is None else cwd
-    for app_file in app_home.glob("*/*_app.py"):
+    glob_pattern = f"*/*_{suffix}.py" if app_home == APP_HOME else f"*_{suffix}.py"
+    for app_file in app_home.glob(glob_pattern):
         app_path = (
             app_file.resolve()
             if use_absolute_paths
             else app_file.relative_to(base_cwd, walk_up=True)
         )
-        app_name = app_file.stem.replace("_app", "")
+        app_name = app_file.stem.removesuffix(f"_{suffix}")
+        if suffix == "workflow":
+            app_name = f"workflow-{app_name}"
         available_apps[app_name] = app_path
     return available_apps
 
@@ -79,9 +85,7 @@ class BiomodalsApp:
             self._entrypoint = entrypoint_name
 
         # Normalize app name & path
-        self._all_apps = all_apps or get_all_apps(
-            use_absolute_paths=True, app_home=APP_HOME
-        )
+        self._all_apps = all_apps or get_all_apps(use_absolute_paths=True)
         self.name, self.path = self.resolve_app_path(name_or_path)
         self.category = self.path.parent.name
         self.module = self.app_path_to_module_path(self.path)
@@ -126,14 +130,24 @@ class BiomodalsApp:
     @staticmethod
     def app_path_to_module_path(app_path: Path) -> str:
         """Convert an app path to a module path."""
+        resolved_path = app_path.resolve()
+        if resolved_path.is_relative_to(APP_HOME):
+            module_path = (
+                str(resolved_path.relative_to(APP_HOME))
+                .replace("/", ".")
+                .replace("\\", ".")
+                .replace(".py", "")
+                .replace("-", "_")
+            )
+            return f"biomodals.app.{module_path}"
         module_path = (
-            str(app_path.resolve().relative_to(APP_HOME))
+            str(resolved_path.relative_to(BIOMODALS_HOME))
             .replace("/", ".")
             .replace("\\", ".")
             .replace(".py", "")
             .replace("-", "_")
         )
-        return f"biomodals.app.{module_path}"
+        return f"biomodals.{module_path}"
 
     def populate_functions(self):
         """Collect all functions within the app."""

@@ -47,6 +47,13 @@ from biomodals.helper.io import (
     write_local_tarball,
 )
 from biomodals.helper.shell import package_outputs, run_command_with_log
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    InlineBytes,
+)
 
 ##########################################
 # Modal configs
@@ -313,6 +320,69 @@ def run_flowpacker(
         )
     shutil.copy2(config_path, sample_dir / "biomodals_inference.yaml")
     return package_outputs(sample_dir)
+
+
+def _flowpacker_app_run_result(
+    *,
+    run_name: str,
+    tarball_bytes: bytes,
+) -> AppRunResult:
+    """Wrap FlowPacker archive bytes in the standard app result schema."""
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="flowpacker_outputs",
+                kind=ArtifactKind.STRUCTURES,
+                storage=InlineBytes(
+                    data=tarball_bytes,
+                    filename=f"{run_name}.tar.zst",
+                    media_type="application/zstd",
+                    archive_format="tar.zst",
+                ),
+            )
+        ],
+    )
+
+
+@app.function(
+    gpu=CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=CONF.timeout,
+    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+)
+def run_flowpacker_workflow(
+    input_files: list[tuple[str, bytes]],
+    run_name: str,
+    model_name: str = "cluster",
+    use_confidence: bool = False,
+    n_samples: int = 1,
+    num_steps: int = APP_INFO.default_num_steps,
+    sample_coeff: float = APP_INFO.default_sample_coeff,
+    use_gt_masks: bool = False,
+    inpaint: str | None = None,
+    save_traj: bool = False,
+    seed: int = 42,
+) -> AppRunResult:
+    """Run FlowPacker and return a workflow-compatible app result."""
+    tarball_bytes = run_flowpacker.get_raw_f()(
+        input_files=input_files,
+        run_name=run_name,
+        model_name=model_name,
+        use_confidence=use_confidence,
+        n_samples=n_samples,
+        num_steps=num_steps,
+        sample_coeff=sample_coeff,
+        use_gt_masks=use_gt_masks,
+        inpaint=inpaint,
+        save_traj=save_traj,
+        seed=seed,
+    )
+    return _flowpacker_app_run_result(
+        run_name=run_name,
+        tarball_bytes=tarball_bytes,
+    )
 
 
 ##########################################

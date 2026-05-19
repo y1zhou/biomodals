@@ -9,7 +9,13 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from biomodals.app.catalog import AppNotFoundError, BiomodalsApp, get_all_apps
+from biomodals.app.catalog import (
+    APP_HOME,
+    WORKFLOW_HOME,
+    AppNotFoundError,
+    BiomodalsApp,
+    get_all_apps,
+)
 from biomodals.helper.shell import run_command
 
 # ruff: noqa: S603
@@ -30,10 +36,36 @@ def callback():
 ##########################################
 # CLI Commands
 ##########################################
+def _catalog_for_list_type(
+    list_type: Literal["app", "workflow"],
+    *,
+    use_absolute_paths: bool,
+) -> dict[str, Path]:
+    """Return the catalog for either app scripts or workflow scripts."""
+    return get_all_apps(
+        use_absolute_paths=use_absolute_paths,
+        app_home=APP_HOME if list_type == "app" else WORKFLOW_HOME,
+        suffix=list_type,
+    )
+
+
+def _combined_app_and_workflow_catalog(*, use_absolute_paths: bool) -> dict[str, Path]:
+    """Return a catalog that resolves both app and workflow names."""
+    apps = _catalog_for_list_type("app", use_absolute_paths=use_absolute_paths)
+    workflows = _catalog_for_list_type(
+        "workflow",
+        use_absolute_paths=use_absolute_paths,
+    )
+    return apps | workflows
+
+
 def _load_app(name: str) -> BiomodalsApp:
     """Load a biomodals app by name or path."""
     try:
-        return BiomodalsApp(name)
+        return BiomodalsApp(
+            name,
+            all_apps=_combined_app_and_workflow_catalog(use_absolute_paths=True),
+        )
     except AppNotFoundError as e:
         console.print(f"[bold red]Error[/bold red] failed to find app '{name}': {e}")
         raise typer.Exit(code=1) from e
@@ -61,6 +93,7 @@ def _print_title(title: str) -> None:
 @app.command(name="ls", hidden=True)
 @app.command(name="l", hidden=True)
 def list_available_apps(
+    list_type: Annotated[Literal["app", "workflow"], typer.Argument()] = "app",
     use_absolute_paths: Annotated[
         bool,
         typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
@@ -91,7 +124,10 @@ def list_available_apps(
 ) -> dict[str, Path]:
     """Show a list of all available biomodals applications."""
     table_headers = ["App name", "Category", "App path"]
-    available_apps = get_all_apps(use_absolute_paths)
+    available_apps = _catalog_for_list_type(
+        list_type,
+        use_absolute_paths=use_absolute_paths,
+    )
     table_rows: list[tuple[str, str, str]] = []
     for app_name, app_path in available_apps.items():
         app_category = app_path.parent.name
@@ -244,6 +280,8 @@ def run_modal_app(
     Use with: `biomodals run <app-name> [OPTIONS] -- [app-options]`, where `[app-options]` are
     additional flags to pass to the `modal run <app-name>` command.
     """
+    # TODO(workflows): add workflow run semantics separately from Modal app runs
+    # so workflow-* names can stage workflow inputs before invoking orchestrators.
     import sys
 
     app = _load_app(app_name_or_path)

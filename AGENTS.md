@@ -37,6 +37,12 @@ This repo is built on Modal, a serverless cloud platform for running Python code
 
 When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, use the repo-local `biomodals-app-development` skill. See `docs/agents/app-development.md`.
 
+### Workflow development
+
+When creating or editing reusable workflow runtime code under
+`src/biomodals/workflow/` or shared workflow schemas under
+`src/biomodals/schema/`, see `docs/agents/workflow-development.md`.
+
 ## Biomodals app development
 
 The detailed app-development standards are consolidated in `.agents/skills/biomodals-app-development/`.

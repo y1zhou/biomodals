@@ -15,9 +15,13 @@ The previous `.github/instructions/app-development.instructions.md` file has bee
   - `src/biomodals/app/fold/alphafold3_app.py`
   - `src/biomodals/app/bioinfo/rosetta_app.py`
   - `src/biomodals/app/design/boltzgen_app.py`
+- When adding workflow-compatible app functions, also follow
+  `docs/agents/workflow-development.md`.
 
 ## Maintenance
 
 - Update the skill when app-development standards change.
 - Keep this document as a pointer and coordination note, not a duplicate copy of the skill.
 - If an app needs to intentionally deviate from the skill, add a focused note under `docs/agents/` explaining why and link it from this document.
+- Keep local entrypoints CLI-only. Workflow reuse should happen through remote
+  app functions that return shared schemas from `biomodals.schema`.

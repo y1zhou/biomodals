@@ -1,15 +1,17 @@
-"""Executable workflow scripts and public workflow runtime types."""
+"""Reusable workflow runtime internals."""
 
-from biomodals.workflow.core import (
-    AppBackedNode,
+from biomodals.workflow.core.builder import (
     NodeHandle,
     NodeOutputRef,
-    NodeRunContext,
     Workflow,
     WorkflowDefinition,
+    WorkflowNodeSpec,
+)
+from biomodals.workflow.core.nodes import (
+    AppBackedNode,
+    NodeRunContext,
     WorkflowNativeNode,
     WorkflowNode,
-    WorkflowNodeSpec,
 )
 
 __all__ = [

@@ -8,19 +8,19 @@ repos:
       # list of supported hooks: https://pre-commit.com/hooks.html
       - id: trailing-whitespace
       - id: end-of-file-fixer
-      - id: check-docstring-first
-      - id: check-yaml
       - id: debug-statements
       - id: detect-private-key
       - id: check-executables-have-shebangs
       - id: check-toml
+      - id: check-yaml
       - id: check-case-conflict
+      - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb", "16384"]
 
   # python code formatting
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: "v0.15.9"
+    rev: "v0.15.13"
     hooks:
       - id: ruff-check
         args:
@@ -50,17 +50,24 @@ repos:
       - id: shellcheck
 
   # md formatting
-  - repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.22
+  - repo: https://github.com/rvben/rumdl-pre-commit
+    rev: v0.1.93
     hooks:
-      - id: mdformat
-        args: ["--number"]
-        additional_dependencies:
-          - mdformat-gfm
-          - mdformat-tables
-          - mdformat_frontmatter
-          # - mdformat-toc
-          # - mdformat-black
+      - id: rumdl # Lint only (fails on issues)
+        args: ["-d", "MD013"] # comma-separated ignored rules
+      - id: rumdl-fmt # Auto-format and fail if issues remain
+
+  # - repo: https://github.com/executablebooks/mdformat
+  #   rev: 0.7.22
+  #   hooks:
+  #     - id: mdformat
+  #       args: ["--number"]
+  #       additional_dependencies:
+  #         - mdformat-gfm
+  #         - mdformat-tables
+  #         - mdformat_frontmatter
+  #         # - mdformat-toc
+  #         # - mdformat-black
 
   # jupyter notebook cell output clearing
   - repo: https://github.com/kynan/nbstripout

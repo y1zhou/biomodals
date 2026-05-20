@@ -6,8 +6,11 @@
 - Prefer `uv run ...` for project commands and `biomodals` CLI smoke tests.
 - Use `polars` for tabular data parsing and writing in Python code; avoid new
   `csv` or `pandas` parsing unless an upstream tool API specifically requires it.
+- Use `orjson` for non-Pydantic JSON serialization and deserialization. For
+  Pydantic models, serialize with `model_dump_json()` and parse JSON bytes or
+  strings with `model_validate_json(...)`.
 - CI runs `prek` against `.pre-commit-config.yaml`; after code edits, run `prek run --files <changed files>` when practical.
-- For CLI or app-discovery changes, smoke test with `uv run biomodals list` and `uv run biomodals help <app-name>` when practical.
+- For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` when practical.
 - Keep generated archives, large run outputs, Modal result directories, and local test data out of commits unless the user explicitly asks for them.
 
 ## Instruction maintenance

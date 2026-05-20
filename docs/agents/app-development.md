@@ -11,6 +11,8 @@ The previous `.github/instructions/app-development.instructions.md` file has bee
 
 - Invoke or read the `biomodals-app-development` skill before creating, editing, or reviewing Biomodals app files.
 - Treat the skill as the baseline for app discovery, `AppConfig`, Modal image construction, helper usage, volumes, data flow, local entrypoint docstrings, examples, and smoke tests.
+- Treat `AppConfig` as a shared schema from `biomodals.schema.app`; keep
+  Modal-specific volume and image helpers outside `biomodals.schema`.
 - Compare non-trivial app changes against the current reference apps:
   - `src/biomodals/app/fold/alphafold3_app.py`
   - `src/biomodals/app/bioinfo/rosetta_app.py`

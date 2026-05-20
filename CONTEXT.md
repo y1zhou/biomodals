@@ -10,6 +10,10 @@ Biomodals runs bioinformatics tools as Modal apps and composes them into reusabl
 A durable record of data produced or consumed by a workflow step, including its data category, storage location, and metadata needed by downstream steps.
 _Avoid_: raw app output, untyped file path, loose tarball
 
+**Inline Byte Output**:
+A workflow-compatible app output whose bytes are UTF-8 text small enough to serialize directly in a Pydantic JSON payload before materialization.
+_Avoid_: binary archive, non-text bytes
+
 **Workflow Node**:
 A semantic step in a workflow DAG that consumes workflow artifacts and produces workflow artifacts.
 _Avoid_: Modal function, app function
@@ -26,6 +30,10 @@ _Avoid_: workflow node
 A CLI-facing Modal entrypoint that parses local user inputs, submits app functions, downloads or reports outputs, and returns no workflow contract.
 _Avoid_: workflow entrypoint
 
+**CLI Namespace**:
+A top-level `biomodals` command group that separates app commands from workflow commands.
+_Avoid_: mixed app/workflow command collection
+
 **Workflow-Compatible App Function**:
 An app function with standardized workflow input and output schemas suitable for app-backed workflow nodes.
 _Avoid_: local entrypoint, submit function
@@ -33,6 +41,10 @@ _Avoid_: local entrypoint, submit function
 **Shared Schema**:
 A stable Pydantic contract used across Biomodals packages without depending on app or workflow implementation modules.
 _Avoid_: app config, internal model
+
+**App Configuration Schema**:
+The pure Pydantic fields and validators that describe a Biomodals app's metadata and runtime settings.
+_Avoid_: Modal volume factory, image helper
 
 **App-Backed Node**:
 A workflow node implemented by calling one or more app functions.
@@ -67,8 +79,12 @@ The reusable library that validates a workflow DAG, schedules workflow nodes, tr
 _Avoid_: engine
 
 **Workflow Orchestrator**:
-A remote Modal function that hosts the workflow runtime for one workflow run.
+A Modal-hosted coordinator that owns one workflow run, hosts the workflow runtime, records durable run state, and uses Modal lifecycle hooks to reconcile interrupted work.
 _Avoid_: workflow node, runner
+
+**Workflow Ledger**:
+A per-run SQLite database written by the workflow orchestrator that records run, node, attempt, remote-call, fan-out task, and artifact state for recovery and manual debugging.
+_Avoid_: scattered JSON state files, worker-owned database
 
 **Node Placement**:
 The execution location for a workflow node, either inline in the workflow orchestrator or in a separate remote Modal function.
@@ -92,16 +108,23 @@ _Avoid_: temporary scratch, local cache
 - A **Workflow Node** may use a **Worker Pool** to process dynamically fanned-out tasks.
 - A **Workflow Runtime** schedules **Workflow Nodes** and does not contain tool-specific biological logic.
 - A **Workflow Runtime** may run independent ready nodes in parallel when all of each node's dependencies are satisfied.
-- A **Workflow Orchestrator** runs the **Workflow Runtime** remotely on Modal.
+- A **Workflow Orchestrator** runs the **Workflow Runtime** remotely on Modal and is responsible for run-level lifecycle recovery.
+- A **Workflow Orchestrator** is the only writer to the **Workflow Ledger**.
+- Remote workflow nodes and workers write deterministic files and logs; the **Workflow Orchestrator** reconciles those files into the **Workflow Ledger**.
+- A **Workflow Orchestrator** records Modal function call ids before waiting on remote work and reattaches to those calls during recovery before starting replacement work.
 - A workflow step produces zero or more **Workflow Artifacts**.
 - A workflow step consumes zero or more **Workflow Artifacts** from upstream steps.
-- A **Workflow Artifact** may reference inline bytes or files stored in a remote Modal volume.
-- Byte-backed **Workflow Artifacts** are normalized into volume-backed artifacts after step completion when the data needs to be preserved, inspected, resumed, or consumed by downstream steps.
+- A **Workflow Artifact** references durable files stored in a remote Modal volume.
+- An **Inline Byte Output** is normalized into a volume-backed **Workflow Artifact** before it crosses a workflow node boundary.
+- Binary or non-text app outputs are written to volume paths and represented as volume-backed artifacts, not serialized as inline bytes.
 - A **Workflow Node** may invoke one or more **App Functions** to fulfill one semantic step.
 - An **App** may expose many **App Functions**.
 - A **Local Entrypoint** remains CLI-only and should not be called by the workflow orchestrator.
+- The **CLI Namespace** separates `biomodals app ...` commands from `biomodals workflow ...` commands.
 - A **Workflow-Compatible App Function** may reuse behavior from a **Local Entrypoint**, but exposes a remote app function contract for workflows.
 - A **Shared Schema** may be imported by app and workflow modules, but it must not import app or workflow modules.
+- An **App Configuration Schema** lives in `biomodals.schema` when it is shared across apps.
+- Modal-specific helpers that construct volumes, images, or app objects wrap the **App Configuration Schema** outside `biomodals.schema`.
 - App-specific configuration models remain with their app until they become stable cross-module contracts.
 - An **App-Backed Node** calls one or more **App Functions** and processes their outputs into workflow artifacts.
 - A **Workflow-Native Node** performs lightweight workflow logic without calling a bioinformatics app.
@@ -146,7 +169,7 @@ _Avoid_: temporary scratch, local cache
 
 ## Flagged ambiguities
 
-- "artifact" can mean either inline bytes or remote files. Resolved: a **Workflow Artifact** may hold either storage form, but the **Workflow Runtime** should normalize byte outputs into volume-backed state when the output crosses a workflow step boundary.
+- "artifact" can mean either inline app bytes or remote files. Resolved: an **Inline Byte Output** is a UTF-8 text app output before materialization; a **Workflow Artifact** is durable volume-backed state after materialization.
 - "step" can mean either a semantic workflow operation or one callable remote function. Resolved: use **Workflow Node** for the semantic DAG unit and **App Function** for a Modal remote callable.
 - "app node" can mean either a Modal deployment unit or a DAG vertex backed by that app. Resolved: use **App** for the deployment unit and **App-Backed Node** for the DAG vertex.
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.

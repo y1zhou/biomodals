@@ -5,18 +5,18 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
+from typing import cast
 
 import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.app.constant import MAX_TIMEOUT
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.catalog import BiomodalsApp, get_catalog
 from biomodals.schema import AppRunResult
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.nodes import NodeRunContext, WorkflowNode
-from biomodals.workflow.core.runtime import (
-    WorkflowRuntime,
-)
+from biomodals.workflow.core.runtime import RemoteFunctionCall, WorkflowRuntime
 
 CONF = AppConfig(
     tags={"group": "workflow"},
@@ -28,6 +28,7 @@ CONF = AppConfig(
 )
 OUT_VOLUME = CONF.get_out_volume()
 OUT_VOLUME_NAME = f"{CONF.name}-outputs"
+REMOTE_NODE_FUNCTION_NAME = "WorkflowOrchestrator.run_remote_workflow_node"
 
 runtime_image = patch_image_for_helper(
     modal.Image.debian_slim(python_version=CONF.python_version).env(CONF.default_env)
@@ -41,7 +42,7 @@ def load_workflow_definition(factory_ref: str) -> Workflow:
     if not separator or not module_name or not function_name:
         raise ValueError("workflow factory must use 'module:function' syntax")
 
-    module = importlib.import_module(module_name)
+    module = _import_workflow_factory_module(module_name)
     factory = getattr(module, function_name)
     if not callable(factory):
         raise TypeError(f"Workflow factory is not callable: {factory_ref}")
@@ -50,6 +51,24 @@ def load_workflow_definition(factory_ref: str) -> Workflow:
     if isinstance(workflow_definition, Workflow):
         return workflow_definition
     raise TypeError("Workflow factory must return a Workflow object")
+
+
+def _import_workflow_factory_module(module_name: str) -> object:
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        catalog_module = _catalog_workflow_module(module_name)
+        if catalog_module is None:
+            raise
+        return importlib.import_module(catalog_module)
+
+
+def _catalog_workflow_module(module_name: str) -> str | None:
+    all_workflows = get_catalog("workflow")
+    module_path = Path(module_name).expanduser()
+    if module_name not in all_workflows and not module_path.exists():
+        return None
+    return BiomodalsApp(module_name, all_workflows).module
 
 
 def submit_workflow_run(
@@ -75,16 +94,12 @@ def submit_workflow_run(
     return str(getattr(function_call, "object_id", function_call))
 
 
-class _ModalRemoteNodeRunner:
-    """Spawn remote node work through a Modal class method."""
-
-    function_name = "WorkflowOrchestrator.run_remote_workflow_node"
-
-    def __init__(self, remote_method: modal.Function):
-        self.remote_method = remote_method
-
-    def __call__(self, node: WorkflowNode, context: NodeRunContext) -> object:
-        return self.remote_method.spawn(node, context)
+def _spawn_remote_workflow_node(
+    remote_method: modal.Function,
+    node: WorkflowNode,
+    context: NodeRunContext,
+) -> RemoteFunctionCall:
+    return cast(RemoteFunctionCall, remote_method.spawn(node, context))
 
 
 @app.cls(
@@ -111,15 +126,25 @@ class WorkflowOrchestrator:
     ) -> AppRunResult:
         """Run one workflow definition through the workflow runtime."""
         orchestrator_handle = WorkflowOrchestrator()
+
+        def remote_node_runner(
+            node: WorkflowNode,
+            context: NodeRunContext,
+        ) -> RemoteFunctionCall:
+            return _spawn_remote_workflow_node(
+                orchestrator_handle.run_remote_workflow_node,
+                node,
+                context,
+            )
+
         runtime = WorkflowRuntime.from_definition(
             workflow_name=workflow_name,
             workflow_definition=workflow_definition,
             volume_root=Path(CONF.output_volume_mountpoint),
             workflow_volume_name=OUT_VOLUME_NAME,
             workflow_volume=OUT_VOLUME,
-            remote_node_runner=_ModalRemoteNodeRunner(
-                orchestrator_handle.run_remote_workflow_node
-            ),
+            remote_node_runner=remote_node_runner,
+            remote_node_function_name=REMOTE_NODE_FUNCTION_NAME,
             function_call_resolver=modal.FunctionCall.from_id,
         )
         return runtime.run(run_id=run_id, force=force)
@@ -162,6 +187,7 @@ def submit_workflow_orchestrator_task(
         force: Replace an existing run ledger instead of resuming it.
         wait: Wait locally for the remote orchestrator result. Disable to print
             the Modal function call id for asynchronous collection.
+
     """
     workflow_definition = load_workflow_definition(workflow_factory)
     resolved_workflow_name = workflow_name or workflow_definition.name

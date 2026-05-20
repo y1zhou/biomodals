@@ -5,6 +5,7 @@
 import sys
 import types
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -37,8 +38,8 @@ class FakeVolume:
         self.reload_count += 1
 
 
-def _raw_orchestrator() -> tuple[type, object]:
-    raw_cls = orchestrator.WorkflowOrchestrator._get_user_cls()
+def _raw_orchestrator() -> tuple[Any, Any]:
+    raw_cls = cast(Any, orchestrator.WorkflowOrchestrator)._get_user_cls()
     return raw_cls, raw_cls()
 
 
@@ -56,6 +57,7 @@ def test_orchestrator_method_uses_runtime_from_definition(monkeypatch) -> None:
             workflow_volume_name: str,
             workflow_volume=None,
             remote_node_runner=None,
+            remote_node_function_name=None,
             function_call_resolver=None,
         ):
             calls["workflow_name"] = workflow_name
@@ -64,6 +66,7 @@ def test_orchestrator_method_uses_runtime_from_definition(monkeypatch) -> None:
             calls["workflow_volume_name"] = workflow_volume_name
             calls["workflow_volume"] = workflow_volume
             calls["remote_node_runner"] = remote_node_runner
+            calls["remote_node_function_name"] = remote_node_function_name
             calls["function_call_resolver"] = function_call_resolver
             return cls()
 
@@ -91,6 +94,7 @@ def test_orchestrator_method_uses_runtime_from_definition(monkeypatch) -> None:
         "workflow_volume_name": "WorkflowOrchestrator-outputs",
         "workflow_volume": orchestrator.OUT_VOLUME,
         "remote_node_runner": calls["remote_node_runner"],
+        "remote_node_function_name": orchestrator.REMOTE_NODE_FUNCTION_NAME,
         "function_call_resolver": calls["function_call_resolver"],
         "run_id": "run-1",
         "force": True,
@@ -115,9 +119,11 @@ def test_orchestrator_method_passes_remote_node_runner_and_resolver(
             workflow_volume_name: str,
             workflow_volume=None,
             remote_node_runner=None,
+            remote_node_function_name=None,
             function_call_resolver=None,
         ):
             calls["remote_node_runner"] = remote_node_runner
+            calls["remote_node_function_name"] = remote_node_function_name
             calls["function_call_resolver"] = function_call_resolver
             return cls()
 
@@ -136,6 +142,7 @@ def test_orchestrator_method_passes_remote_node_runner_and_resolver(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert calls["remote_node_runner"] is not None
+    assert calls["remote_node_function_name"] == orchestrator.REMOTE_NODE_FUNCTION_NAME
     assert callable(calls["function_call_resolver"])
 
 
@@ -174,7 +181,7 @@ def test_submit_workflow_run_waits_for_remote_result() -> None:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
     result = orchestrator.submit_workflow_run(
-        orchestrator_function=FakeOrchestratorFunction(),
+        orchestrator_function=cast(Any, FakeOrchestratorFunction()),
         workflow_name="demo",
         run_id="run-1",
         workflow_definition={"nodes": []},
@@ -202,7 +209,7 @@ def test_submit_workflow_run_can_spawn_without_waiting() -> None:
             return FakeCall()
 
     function_call_id = orchestrator.submit_workflow_run(
-        orchestrator_function=FakeOrchestratorFunction(),
+        orchestrator_function=cast(Any, FakeOrchestratorFunction()),
         workflow_name="demo",
         run_id="run-1",
         workflow_definition={"nodes": []},
@@ -223,6 +230,20 @@ def test_load_workflow_definition_rejects_serialized_dict_factory(
 
     with pytest.raises(TypeError, match="must return a Workflow"):
         orchestrator.load_workflow_definition("fake_workflow_factory:build")
+
+
+def test_load_workflow_definition_accepts_importable_module_factory(
+    monkeypatch,
+) -> None:
+    workflow = Workflow("demo")
+    module = types.ModuleType("importable_workflow_factory")
+    setattr(module, "build", lambda: workflow)
+    monkeypatch.setitem(sys.modules, "importable_workflow_factory", module)
+
+    assert (
+        orchestrator.load_workflow_definition("importable_workflow_factory:build")
+        is workflow
+    )
 
 
 def test_runtime_from_definition_accepts_python_workflow(tmp_path: Path) -> None:

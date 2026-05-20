@@ -65,6 +65,7 @@ class WorkflowRuntime:
         workflow_volume_name: str,
         workflow_volume: WorkflowVolume | None = None,
         remote_node_runner: RemoteNodeRunner | None = None,
+        remote_node_function_name: str | None = None,
         function_call_resolver: FunctionCallResolver | None = None,
         remote_call_poll_timeout: float | int = 0,
         max_ready_workers: int = 32,
@@ -75,6 +76,7 @@ class WorkflowRuntime:
         self.workflow_volume_name = workflow_volume_name
         self.workflow_volume = workflow_volume
         self.remote_node_runner = remote_node_runner
+        self.remote_node_function_name = remote_node_function_name
         self.function_call_resolver = function_call_resolver
         self.remote_call_poll_timeout = remote_call_poll_timeout
         self.max_ready_workers = max_ready_workers
@@ -91,6 +93,7 @@ class WorkflowRuntime:
         workflow_volume_name: str | None = None,
         workflow_volume: WorkflowVolume | None = None,
         remote_node_runner: RemoteNodeRunner | None = None,
+        remote_node_function_name: str | None = None,
         function_call_resolver: FunctionCallResolver | None = None,
     ) -> WorkflowRuntime:
         """Create a runtime from a Python workflow definition."""
@@ -107,6 +110,7 @@ class WorkflowRuntime:
                 ),
                 workflow_volume=workflow_volume,
                 remote_node_runner=remote_node_runner,
+                remote_node_function_name=remote_node_function_name,
                 function_call_resolver=function_call_resolver,
             )
         raise NotImplementedError(
@@ -232,13 +236,15 @@ class WorkflowRuntime:
                 except Exception as exc:  # noqa: BLE001
                     self.ledger.mark_node_failed(node_id, str(exc))
                     self._commit_volume()
-                    results.append((
-                        node_id,
-                        AppRunResult(
-                            status=AppRunStatus.FAILED,
-                            warnings=[str(exc)],
-                        ),
-                    ))
+                    results.append(
+                        (
+                            node_id,
+                            AppRunResult(
+                                status=AppRunStatus.FAILED,
+                                warnings=[str(exc)],
+                            ),
+                        )
+                    )
         return results
 
     def _run_node(self, node_id: str) -> AppRunResult:
@@ -509,6 +515,8 @@ class WorkflowRuntime:
         return modal.FunctionCall.from_id(call_id)
 
     def _remote_function_name(self, node: WorkflowNode) -> str:
+        if self.remote_node_function_name is not None:
+            return self.remote_node_function_name
         if self.remote_node_runner is not None:
             function_name = getattr(self.remote_node_runner, "function_name", None)
             if function_name is not None:

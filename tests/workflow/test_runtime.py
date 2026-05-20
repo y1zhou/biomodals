@@ -130,14 +130,16 @@ def test_completed_nodes_are_skipped(tmp_path: Path) -> None:
     workflow.add_node(ExplodingNode(), id="done")
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts([
-        WorkflowArtifact(
-            artifact_id="artifact-1",
-            producing_node_id="done",
-            kind=ArtifactKind.REPORT,
-            storage=VolumePath(volume_name="Workflow-outputs", path="done"),
-        )
-    ])
+    ledger.record_artifacts(
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(volume_name="Workflow-outputs", path="done"),
+            )
+        ]
+    )
     ledger.mark_node_succeeded("done", ["artifact-1"])
 
     runtime = WorkflowRuntime(
@@ -193,14 +195,16 @@ def test_independent_ready_nodes_run_in_same_scheduler_wave(
     )
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts([
-        WorkflowArtifact(
-            artifact_id="design-artifact",
-            producing_node_id="design",
-            kind=ArtifactKind.STRUCTURES,
-            storage=VolumePath(volume_name="Workflow-outputs", path="design"),
-        )
-    ])
+    ledger.record_artifacts(
+        [
+            WorkflowArtifact(
+                artifact_id="design-artifact",
+                producing_node_id="design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(volume_name="Workflow-outputs", path="design"),
+            )
+        ]
+    )
     ledger.mark_node_succeeded("design", ["design-artifact"])
 
     runtime = WorkflowRuntime(
@@ -444,6 +448,35 @@ def test_remote_placement_records_function_call_before_waiting(
     assert final_status == "succeeded"
 
 
+def test_remote_placement_records_configured_function_name(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    workflow.add_node(RemoteOnlyNode(), id="remote")
+
+    def remote_runner(node, context):
+        return FakeRemoteCall(
+            object_id="fc-named",
+            result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+        )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        remote_node_runner=remote_runner,
+        remote_node_function_name="WorkflowOrchestrator.run_remote_workflow_node",
+    )
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    with sqlite3.connect(tmp_path / "demo" / "run-1" / "ledger.sqlite3") as conn:
+        function_name = conn.execute(
+            "SELECT function_name FROM remote_calls WHERE call_id = 'fc-named'"
+        ).fetchone()[0]
+    assert function_name == "WorkflowOrchestrator.run_remote_workflow_node"
+
+
 def test_remote_call_failure_after_timeout_is_recorded(tmp_path: Path) -> None:
     workflow = Workflow("demo")
     workflow.add_node(RemoteOnlyNode(), id="remote")
@@ -595,17 +628,19 @@ def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     )
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts([
-        WorkflowArtifact(
-            artifact_id="design-structures",
-            producing_node_id="design",
-            kind=ArtifactKind.STRUCTURES,
-            storage=VolumePath(
-                volume_name="Workflow-outputs",
-                path="demo/run-1/nodes/design/outputs",
-            ),
-        )
-    ])
+    ledger.record_artifacts(
+        [
+            WorkflowArtifact(
+                artifact_id="design-structures",
+                producing_node_id="design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="demo/run-1/nodes/design/outputs",
+                ),
+            )
+        ]
+    )
     ledger.mark_node_succeeded("design", ["design-structures"])
 
     runtime = WorkflowRuntime(

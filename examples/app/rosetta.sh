@@ -6,7 +6,7 @@ fi
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 BIOMODALS_ROOT=$(realpath "${SCRIPT_DIR}/../../")
-ENTRY_BIN=$(realpath "${BIOMODALS_ROOT}/run.sh")
+ENTRY_BIN=$(realpath "${BIOMODALS_ROOT}/biomodals")
 
 pembro_pdb="${SCRIPT_DIR}/../data/5B8C.pdb.gz"
 

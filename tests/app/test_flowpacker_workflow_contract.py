@@ -44,7 +44,7 @@ def test_flowpacker_workflow_result_stores_archive_in_volume(
     assert len(result.outputs) == 1
     output = result.outputs[0]
     assert output.name == "flowpacker_outputs"
-    assert output.kind == ArtifactKind.STRUCTURES
+    assert output.kind == ArtifactKind.ARCHIVE
     assert output.storage == VolumePath(
         volume_name=flowpacker_app.OUT_VOLUME_NAME,
         path="workflow/packed/packed.tar.zst",

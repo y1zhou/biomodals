@@ -110,16 +110,17 @@ OUT_VOLUME = CONF.get_out_volume()
 OUT_VOLUME_NAME = OUT_VOLUME.name or f"{CONF.name}-outputs"
 
 runtime_image = patch_image_for_helper(
-    modal.Image
-    .debian_slim(python_version=CONF.python_version)
+    modal.Image.debian_slim(python_version=CONF.python_version)
     .apt_install("git", "git-lfs", "build-essential")
     .env(CONF.default_env | {"GIT_LFS_SKIP_SMUDGE": "1"})
     .run_commands(
-        " && ".join((
-            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
-            f"cd {CONF.git_clone_dir}",
-            f"git checkout {CONF.repo_commit_hash}",
-        ))
+        " && ".join(
+            (
+                f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+                f"cd {CONF.git_clone_dir}",
+                f"git checkout {CONF.repo_commit_hash}",
+            )
+        )
     )
     .workdir(str(CONF.git_clone_dir))
     .uv_pip_install(
@@ -386,7 +387,7 @@ def run_flowpacker_workflow(
         outputs=[
             AppOutput(
                 name="flowpacker_outputs",
-                kind=ArtifactKind.STRUCTURES,
+                kind=ArtifactKind.ARCHIVE,
                 storage=VolumePath(
                     volume_name=OUT_VOLUME_NAME,
                     path=archive_path.relative_to(volume_root).as_posix(),
@@ -467,6 +468,7 @@ def submit_flowpacker_task(
         seed: Random seed for FlowPacker inference.
         download_models: Download FlowPacker checkpoints and exit without inference.
         force_redownload: Force checkpoint redownload even when cached files exist.
+
     """
     if model_name not in APP_INFO.supported_models:
         raise ValueError(

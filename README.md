@@ -2,6 +2,8 @@
 
 Bioinformatics tools running on modal.
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/y1zhou/biomodals)
+
 ## Installation
 
 ```bash

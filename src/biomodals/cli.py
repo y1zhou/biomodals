@@ -10,17 +10,18 @@ from rich.markdown import Markdown
 from rich.table import Table
 
 from biomodals.app.catalog import (
-    APP_HOME,
-    WORKFLOW_HOME,
     AppNotFoundError,
     BiomodalsApp,
-    get_all_apps,
+    CatalogType,
+    get_catalog,
 )
 from biomodals.helper.shell import run_command
 
 # ruff: noqa: S603
 
 app = typer.Typer()
+app_commands = typer.Typer(no_args_is_help=True)
+workflow_commands = typer.Typer(no_args_is_help=True)
 console = Console()
 
 
@@ -33,45 +34,55 @@ def callback():
     ...
 
 
+app.add_typer(app_commands, name="app", help="Discover and run Biomodals apps.")
+app.add_typer(
+    workflow_commands,
+    name="workflow",
+    help="Discover Biomodals workflow entrypoints.",
+)
+
+
 ##########################################
 # CLI Commands
 ##########################################
 def _catalog_for_list_type(
-    list_type: Literal["app", "workflow"],
+    list_type: CatalogType,
     *,
     use_absolute_paths: bool,
 ) -> dict[str, Path]:
     """Return the catalog for either app scripts or workflow scripts."""
-    return get_all_apps(
-        use_absolute_paths=use_absolute_paths,
-        app_home=APP_HOME if list_type == "app" else WORKFLOW_HOME,
-        suffix=list_type,
-    )
+    return get_catalog(list_type, use_absolute_paths=use_absolute_paths)
 
 
-def _combined_app_and_workflow_catalog(*, use_absolute_paths: bool) -> dict[str, Path]:
-    """Return a catalog that resolves both app and workflow names."""
-    apps = _catalog_for_list_type("app", use_absolute_paths=use_absolute_paths)
-    workflows = _catalog_for_list_type(
-        "workflow",
-        use_absolute_paths=use_absolute_paths,
-    )
-    return apps | workflows
-
-
-def _load_app(name: str) -> BiomodalsApp:
-    """Load a biomodals app by name or path."""
+def _load_catalog_entry(list_type: CatalogType, name: str) -> BiomodalsApp:
+    """Load a biomodals app or workflow by name or path."""
     try:
         return BiomodalsApp(
             name,
-            all_apps=_combined_app_and_workflow_catalog(use_absolute_paths=True),
+            all_apps=get_catalog(
+                list_type,
+                use_absolute_paths=True,
+                include_compat_aliases=list_type == "workflow",
+            ),
         )
     except AppNotFoundError as e:
-        console.print(f"[bold red]Error[/bold red] failed to find app '{name}': {e}")
+        console.print(
+            f"[bold red]Error[/bold red] failed to find {list_type} '{name}': {e}"
+        )
         raise typer.Exit(code=1) from e
     except ImportError as e:
         console.print(f"[bold red]Error[/bold red] Failed to import '{name}': {e}")
         raise typer.Exit(code=1) from e
+
+
+def _load_app(name: str) -> BiomodalsApp:
+    """Load a biomodals app by name or path."""
+    return _load_catalog_entry("app", name)
+
+
+def _load_workflow(name: str) -> BiomodalsApp:
+    """Load a biomodals workflow by name or path."""
+    return _load_catalog_entry("workflow", name)
 
 
 def _print_title(title: str) -> None:
@@ -86,14 +97,86 @@ def _print_title(title: str) -> None:
 ##########################################
 # CLI Commands
 ##########################################
-@app.command(
+def _list_available_entries(
+    list_type: CatalogType,
+    *,
+    use_absolute_paths: bool,
+    sort_by: Literal["name", "category", "group", "path"],
+    reverse: bool,
+    short: bool,
+) -> dict[str, Path]:
+    """Show a list of available biomodals apps or workflows."""
+    noun = "application" if list_type == "app" else "workflow"
+    title = "App" if list_type == "app" else "Workflow"
+    table_headers = [f"{title} name", "Category", f"{title} path"]
+    available_apps = _catalog_for_list_type(
+        list_type,
+        use_absolute_paths=use_absolute_paths,
+    )
+    table_rows: list[tuple[str, str, str]] = []
+    for app_name, app_path in available_apps.items():
+        app_category = app_path.parent.name
+        table_rows.append((
+            f"[green]{app_name}[/green]",
+            app_category,
+            str(app_path),
+        ))
+    match sort_by:
+        case "name":
+            sort_by_idx = 0
+        case "category" | "group":
+            sort_by_idx = 1
+        case "path":
+            sort_by_idx = 2
+        case _:
+            raise ValueError(f"Invalid sort key: {sort_by}")
+    table_rows.sort(key=lambda x: x[sort_by_idx], reverse=reverse)
+    if short:
+        for r in table_rows:
+            console.print(r[0])
+        return available_apps
+
+    table = Table(*table_headers)
+    for r in table_rows:
+        table.add_row(*r)
+
+    if list_type == "app":
+        console.print(
+            "\n:dna: To see help for an application, use:\n"
+            "     [bold]biomodals app help <[green]app-name-or-path[/green]>[/bold]"
+        )
+        console.print(
+            "\n:dna: To run an application on [link=https://modal.com]modal.com[/link], use:\n"
+            r"     [bold]biomodals app run <[green]app-name-or-path[/green]>[/bold] -- [gray]\[OPTIONS][/gray]"
+        )
+        console.print(
+            "\n:dna: If an app contains multiple local entrypoints, use it as:\n"
+            "     [bold]<[green]app-name-or-path[/green]>::<[green]function-name[/green]>[/bold]\n"
+        )
+    else:
+        console.print(
+            "\n:dna: To see help for a workflow, use:\n"
+            "     [bold]biomodals workflow help <[green]workflow-name-or-path[/green]>[/bold]"
+        )
+    console.print(f"\n:dna: [bold]Available biomodals {noun}s:[/bold]")
+    console.print(table)
+    return available_apps
+
+
+@app_commands.command(
     name="list",
     help="Show a list of all available biomodals applications (aliases: ls, l).",
 )
-@app.command(name="ls", hidden=True)
-@app.command(name="l", hidden=True)
+@app_commands.command(name="ls", hidden=True)
+@app_commands.command(name="l", hidden=True)
+@app.command(
+    name="list",
+    help="Deprecated alias for 'biomodals app list'.",
+    deprecated=True,
+)
+@app.command(name="ls", hidden=True, deprecated=True)
+@app.command(name="l", hidden=True, deprecated=True)
 def list_available_apps(
-    list_type: Annotated[Literal["app", "workflow"], typer.Argument()] = "app",
     use_absolute_paths: Annotated[
         bool,
         typer.Option("--absolute", "-a", help="Use absolute paths for app locations."),
@@ -123,84 +206,79 @@ def list_available_apps(
     ] = False,
 ) -> dict[str, Path]:
     """Show a list of all available biomodals applications."""
-    table_headers = ["App name", "Category", "App path"]
-    available_apps = _catalog_for_list_type(
-        list_type,
+    return _list_available_entries(
+        "app",
         use_absolute_paths=use_absolute_paths,
+        sort_by=sort_by,
+        reverse=reverse,
+        short=short,
     )
-    table_rows: list[tuple[str, str, str]] = []
-    for app_name, app_path in available_apps.items():
-        app_category = app_path.parent.name
-        table_rows.append((
-            f"[green]{app_name}[/green]",
-            app_category,
-            str(app_path),
-        ))
-    match sort_by:
-        case "name":
-            sort_by_idx = table_headers.index("App name")
-        case "category" | "group":
-            sort_by_idx = table_headers.index("Category")
-        case "path":
-            sort_by_idx = table_headers.index("App path")
-        case _:
-            raise ValueError(f"Invalid sort key: {sort_by}")
-    table_rows.sort(key=lambda x: x[sort_by_idx], reverse=reverse)
-    if short:
-        for r in table_rows:
-            console.print(r[0])
-        return available_apps
-
-    table = Table(*table_headers)
-    for r in table_rows:
-        table.add_row(*r)
-
-    console.print(
-        "\n:dna: To see help for an application, use:\n"
-        "     [bold]biomodals help <[green]app-name-or-path[/green]>[/bold]"
-    )
-    console.print(
-        "\n:dna: To run an application on [link=https://modal.com]modal.com[/link], use:\n"
-        r"     [bold]biomodals run <[green]app-name-or-path[/green]>[/bold] -- [gray]\[OPTIONS][/gray]"
-    )
-    console.print(
-        "\n:dna: If an app contains multiple local entrypoints, use it as:\n"
-        "     [bold]<[green]app-name-or-path[/green]>::<[green]function-name[/green]>[/bold]\n"
-    )
-    console.print("\n:dna: [bold]Available biomodals applications:[/bold]")
-    console.print(table)
-    return available_apps
 
 
-@app.command(
-    name="help",
-    no_args_is_help=True,
-    help="Show help for a specific biomodals application (alias: h).",
+@workflow_commands.command(
+    name="list",
+    help="Show a list of all available biomodals workflows (aliases: ls, l).",
 )
-@app.command(name="h", no_args_is_help=True, hidden=True)
-def show_app_help(
-    app_name: Annotated[
-        str, typer.Argument(help="Name or path of the app to show help for.")
-    ],
-    verbose: Annotated[
+@workflow_commands.command(name="ls", hidden=True)
+@workflow_commands.command(name="l", hidden=True)
+def list_available_workflows(
+    use_absolute_paths: Annotated[
         bool,
-        typer.Option("--verbose", "-v", help="Show detailed help for all functions."),
+        typer.Option(
+            "--absolute", "-a", help="Use absolute paths for workflow locations."
+        ),
     ] = False,
-):
-    """Show help for a specific biomodals application.
+    sort_by: Annotated[
+        Literal["name", "category", "group", "path"],
+        typer.Option(
+            "--sort-by",
+            "-s",
+            help="Key to sort the workflows by in the table display.",
+            case_sensitive=False,
+        ),
+    ] = "path",
+    reverse: Annotated[
+        bool,
+        typer.Option(
+            "--reverse", "-r", help="Reverse the sorting order in the table display."
+        ),
+    ] = False,
+    short: Annotated[
+        bool,
+        typer.Option(
+            "--short",
+            help="Only show workflow names without paths or additional info.",
+            is_flag=True,
+        ),
+    ] = False,
+) -> dict[str, Path]:
+    """Show a list of all available biomodals workflows."""
+    return _list_available_entries(
+        "workflow",
+        use_absolute_paths=use_absolute_paths,
+        sort_by=sort_by,
+        reverse=reverse,
+        short=short,
+    )
 
-    If unsure which app to use, run `biomodals list` to see available apps.
-    If you would like to see help for a local entrypoint or Modal function,
-    add `::<function-name>` to the app name to show help for that specific function.
-    """
-    app = _load_app(app_name)
-    if app._entrypoint is not None:
+
+def _show_entry_help(
+    list_type: CatalogType,
+    entry_name: str,
+    *,
+    verbose: bool,
+) -> None:
+    """Show help for a specific biomodals app or workflow."""
+    noun = "application" if list_type == "app" else "workflow"
+    catalog_entry = _load_catalog_entry(list_type, entry_name)
+    if catalog_entry._entrypoint is not None:
         # When an entrypoint name is specified, show only its docstring
-        f = app[app._entrypoint]
+        f = catalog_entry[catalog_entry._entrypoint]
         console.print(
             f"[bold]Help for {f.func_type} function"
             f"'[green]{f.name}[/green]'"
-            f" in app '[green]{app.name}[/green]' ({app.category}):[/bold]\n"
+            f" in {noun} '[green]{catalog_entry.name}[/green]'"
+            f" ({catalog_entry.category}):[/bold]\n"
         )
         console.print(f.docstring or "No documentation available.")
         if table_rows := f.args_table:
@@ -210,16 +288,19 @@ def show_app_help(
 
     # When no entrypoint is specified, show the app help
     console.print(
-        "[bold]Help for application"
-        f" '[green]{app.name}[/green]' ({app.category}):[/bold]"
+        f"[bold]Help for {noun}"
+        f" '[green]{catalog_entry.name}[/green]'"
+        f" ({catalog_entry.category}):[/bold]"
     )
-    if app.module_doc:
+    if catalog_entry.module_doc:
         _print_title("Module documentation")
-        console.print(Markdown(app.module_doc))
-    if app._remote_modal_func_idx:
-        remote_modal_functions = [app[x] for x in app._remote_modal_func_idx]
+        console.print(Markdown(catalog_entry.module_doc))
+    if catalog_entry._remote_modal_func_idx:
+        remote_modal_functions = [
+            catalog_entry[x] for x in catalog_entry._remote_modal_func_idx
+        ]
 
-        _print_title("Remote Modal functions in this app")
+        _print_title(f"Remote Modal functions in this {noun}")
         remote_func_names = ", ".join([x.name for x in remote_modal_functions])
         console.print(f"[green]{remote_func_names}[/green]\n")
         if verbose:
@@ -228,10 +309,10 @@ def show_app_help(
                     console.print(f"\n[bold green]{f.name}[/bold green]")
                     console.print(Markdown(f.docstring))
 
-    if f_indices := app._local_entrypoint_idx:
-        _print_title("Local entrypoint(s) in this app")
+    if f_indices := catalog_entry._local_entrypoint_idx:
+        _print_title(f"Local entrypoint(s) in this {noun}")
         for f_idx in f_indices:
-            f = app[f_idx]
+            f = catalog_entry[f_idx]
 
             if f.args_table:
                 console.print(f"[bold green]{f.name}[/bold green] CLI flags:\n")
@@ -241,12 +322,69 @@ def show_app_help(
                 console.print(Markdown(f.docstring))
 
 
+@app_commands.command(
+    name="help",
+    no_args_is_help=True,
+    help="Show help for a specific biomodals application (alias: h).",
+)
+@app_commands.command(name="h", no_args_is_help=True, hidden=True)
 @app.command(
+    name="help",
+    no_args_is_help=True,
+    help="Deprecated alias for 'biomodals app help'.",
+    deprecated=True,
+)
+@app.command(name="h", no_args_is_help=True, hidden=True, deprecated=True)
+def show_app_help(
+    app_name: Annotated[
+        str, typer.Argument(help="Name or path of the app to show help for.")
+    ],
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Show detailed help for all functions."),
+    ] = False,
+) -> None:
+    """Show help for a specific biomodals application.
+
+    If unsure which app to use, run `biomodals app list` to see available apps.
+    If you would like to see help for a local entrypoint or Modal function,
+    add `::<function-name>` to the app name to show help for that specific function.
+    """
+    _show_entry_help("app", app_name, verbose=verbose)
+
+
+@workflow_commands.command(
+    name="help",
+    no_args_is_help=True,
+    help="Show help for a specific biomodals workflow (alias: h).",
+)
+@workflow_commands.command(name="h", no_args_is_help=True, hidden=True)
+def show_workflow_help(
+    workflow_name: Annotated[
+        str, typer.Argument(help="Name or path of the workflow to show help for.")
+    ],
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Show detailed help for all functions."),
+    ] = False,
+) -> None:
+    """Show help for a specific biomodals workflow."""
+    _show_entry_help("workflow", workflow_name, verbose=verbose)
+
+
+@app_commands.command(
     name="run",
     no_args_is_help=True,
     help="Run a biomodals application on Modal (alias: r).",
 )
-@app.command(name="r", no_args_is_help=True, hidden=True)
+@app_commands.command(name="r", no_args_is_help=True, hidden=True)
+@app.command(
+    name="run",
+    no_args_is_help=True,
+    help="Deprecated alias for 'biomodals app run'.",
+    deprecated=True,
+)
+@app.command(name="r", no_args_is_help=True, hidden=True, deprecated=True)
 def run_modal_app(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to run.")
@@ -313,9 +451,9 @@ def run_modal_app(
             env["TIMEOUT"] = str(timeout)
         run_command([*cmd, *flags], env=env)
     elif app._entrypoint is not None:
-        run_command(["biomodals", "help", str(full_app)], try_rich_print=True)
+        run_command(["biomodals", "app", "help", str(full_app)], try_rich_print=True)
     else:
-        run_command(["biomodals", "help", str(app.path)], try_rich_print=True)
+        run_command(["biomodals", "app", "help", str(app.path)], try_rich_print=True)
 
 
 @app.command(

@@ -12,6 +12,7 @@ import modal
 APP_HOME = Path(__file__).parent.resolve()
 BIOMODALS_HOME = APP_HOME.parent
 WORKFLOW_HOME = BIOMODALS_HOME / "workflow"
+CatalogType = Literal["app", "workflow"]
 
 
 class AppNotFoundError(ValueError):
@@ -45,6 +46,62 @@ def get_all_apps(
             app_name = f"workflow-{app_name}"
         available_apps[app_name] = app_path
     return available_apps
+
+
+def get_app_catalog(
+    use_absolute_paths: bool = False,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, Path]:
+    """Retrieve available Biomodals app scripts."""
+    return get_all_apps(
+        use_absolute_paths=use_absolute_paths,
+        app_home=APP_HOME,
+        cwd=cwd,
+        suffix="app",
+    )
+
+
+def get_workflow_catalog(
+    use_absolute_paths: bool = False,
+    *,
+    cwd: Path | None = None,
+    include_compat_aliases: bool = False,
+) -> dict[str, Path]:
+    """Retrieve available workflow scripts keyed by natural workflow name."""
+    legacy_workflows = get_all_apps(
+        use_absolute_paths=use_absolute_paths,
+        app_home=WORKFLOW_HOME,
+        cwd=cwd,
+        suffix="workflow",
+    )
+    workflows = {
+        name.removeprefix("workflow-"): path for name, path in legacy_workflows.items()
+    }
+    if include_compat_aliases:
+        workflows |= legacy_workflows
+    return workflows
+
+
+def get_catalog(
+    catalog_type: CatalogType,
+    *,
+    use_absolute_paths: bool = False,
+    cwd: Path | None = None,
+    include_compat_aliases: bool = False,
+) -> dict[str, Path]:
+    """Retrieve app or workflow catalog entries."""
+    match catalog_type:
+        case "app":
+            return get_app_catalog(use_absolute_paths=use_absolute_paths, cwd=cwd)
+        case "workflow":
+            return get_workflow_catalog(
+                use_absolute_paths=use_absolute_paths,
+                cwd=cwd,
+                include_compat_aliases=include_compat_aliases,
+            )
+        case _:
+            raise ValueError(f"Unknown catalog type: {catalog_type}")
 
 
 @dataclass(frozen=True)
@@ -125,7 +182,7 @@ class BiomodalsApp:
         app_path = Path(app_name_or_path).expanduser()
         if not app_path.exists():
             raise AppNotFoundError(app_name_or_path)
-        return app_path.stem.removesuffix("_app"), app_path
+        return app_path.stem.removesuffix("_app").removesuffix("_workflow"), app_path
 
     @staticmethod
     def app_path_to_module_path(app_path: Path) -> str:

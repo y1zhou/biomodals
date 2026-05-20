@@ -338,16 +338,17 @@ Target authoring API:
 
 ```python
 from biomodals.workflow import Workflow
+from biomodals.workflow.ppiflow_v2 import PPIFlowWorkflowNode
 
 workflow = Workflow("ppiflow")
 
 designs = workflow.add_node(
-    PPIFlowDesignNode(stage=1),
+    PPIFlowWorkflowNode("PPIFlowStep", {"stage": 1}),
     id="designs",
 )
 
 packed = workflow.add_node(
-    LigandMPNNNode(model_type="soluble_mpnn"),
+    PPIFlowWorkflowNode("MPNNStep_stage1", {"model_type": "soluble_mpnn"}),
     id="packed",
     inputs={
         "structures": designs.outputs(
@@ -358,7 +359,7 @@ packed = workflow.add_node(
 )
 
 scores = workflow.add_node(
-    AF3ScoreNode(max_batches=10),
+    PPIFlowWorkflowNode("AF3scoreStep_stage1", {"max_batches": 10}),
     id="scores",
     inputs={
         "structures": packed.outputs(
@@ -381,7 +382,7 @@ filtered = workflow.add_node(
 Builder rules:
 
 - Node ids are unique and sanitized.
-- Dependencies are inferred from `NodeOutputRef`s used in node inputs.
+- Dependencies are inferred from `ArtifactSelector`s returned by `NodeHandle.outputs(...)` and used in node inputs.
 - `depends_on=[ranked]` adds control edges without artifact passage.
 - Artifact selectors can filter by producing node, artifact kind, file role, glob pattern, and metadata.
 - The DAG must be acyclic.
@@ -389,555 +390,74 @@ Builder rules:
 
 ## Task Plan
 
-### Task 1: Add Shared Schema Package
-
-**Files:**
-
-- Create: `src/biomodals/schema/__init__.py`
-
-- Create: `src/biomodals/schema/storage.py`
-
-- Create: `src/biomodals/schema/app.py`
-
-- Modify: `src/biomodals/app/config.py`
-
-- Create: `src/biomodals/schema/workflow.py`
-
-- Modify: `pyproject.toml`
-
-- Create: `tests/schema/test_workflow_schemas.py`
-
-- [x] **Step 1: Write schema tests**
-
-Create tests covering:
-
-```python
-from biomodals.schema import (
-    AppOutput,
-    AppRunResult,
-    AppRunStatus,
-    ArtifactKind,
-    InlineBytes,
-    StorageKind,
-    VolumePath,
-    WorkflowArtifact,
-)
-
-
-def test_inline_bytes_round_trip():
-    result = AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            AppOutput(
-                name="summary",
-                kind=ArtifactKind.REPORT,
-                storage=InlineBytes(
-                    data=b"summary text",
-                    filename="summary.txt",
-                    media_type="text/plain",
-                ),
-            )
-        ],
-    )
-    dumped = result.model_dump()
-    loaded = AppRunResult.model_validate(dumped)
-    assert loaded.outputs[0].storage.kind == StorageKind.INLINE_BYTES
-    assert loaded.outputs[0].storage.filename == "summary.txt"
-
-
-def test_workflow_artifact_is_volume_backed():
-    artifact = WorkflowArtifact(
-        artifact_id="art-packed",
-        producing_node_id="packed",
-        kind=ArtifactKind.STRUCTURES,
-        storage=VolumePath(
-            volume_name="Workflow-outputs",
-            path="ppiflow/run-1/artifacts/art-packed",
-        )
-    )
-    assert artifact.storage.path == "ppiflow/run-1/artifacts/art-packed"
-```
-
-- [x] **Step 2: Run tests to confirm failure**
-
-Run:
-
-```bash
-rtk uv run pytest tests/schema/test_workflow_schemas.py -q
-```
-
-Expected: failure because `biomodals.schema` does not exist.
-
-- [x] **Step 3: Implement schemas**
-
-Implement the schema sketch above. Move pure Pydantic `AppConfig` fields and validators into `schema/app.py`, export it from `biomodals.schema`, and keep `biomodals.app.config.AppConfig` as a compatibility import. Move Modal helpers such as `get_out_volume()` out of the schema model. Include `NodeExecutionPolicy`, `NodePlacement`, `NodeStatus`, `RunStatus`, `ArtifactFile`, `ArtifactSelector`, and `ControlEdge` in `workflow.py`. Add `pytest` to the `dev` dependency group in `pyproject.toml`.
-
-- [x] **Step 4: Run schema tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/schema/test_workflow_schemas.py -q
-```
-
-Expected: all tests pass.
-
-### Task 2: Add Artifact Materialization
-
-**Files:**
-
-- Create: `src/biomodals/workflow/core/artifacts.py`
-
-- Create: `tests/workflow/test_artifacts.py`
-
-- [x] **Step 1: Write materialization tests**
-
-Cover these cases:
-
-- `InlineBytes(filename="out.txt")` accepts UTF-8 text bytes and writes `raw_outputs/out.txt`.
-
-- Binary archives are rejected as `InlineBytes`; archive outputs use `VolumePath` storage and record archive metadata on the `AppOutput` or resulting `WorkflowArtifact`.
-
-- `VolumePath` app outputs are copied or referenced according to an explicit materialization mode.
-
-- Materialization returns `WorkflowArtifact` objects with volume-backed storage.
-
-- [x] **Step 2: Implement materialization helpers**
-
-Add these functions:
-
-```python
-def materialize_app_run_result(
-    *,
-    result: AppRunResult,
-    workflow_volume_name: str,
-    attempt_dir: Path,
-    artifact_dir: Path,
-    producing_node_id: str,
-) -> list[WorkflowArtifact]:
-    """Write app outputs into the workflow volume and return artifact manifests."""
-    raise NotImplementedError("Task 2 implements artifact materialization")
-```
-
-Use existing archive helper behavior from `src/biomodals/app/helper/shell.py` and extraction behavior from `ppiflow_workflow.py` as references.
-
-- [x] **Step 3: Run artifact tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/workflow/test_artifacts.py -q
-```
-
-Expected: all tests pass.
-
-### Task 3: Add Durable Ledger Utilities
-
-**Files:**
-
-- Create: `src/biomodals/workflow/core/ledger.py`
-
-- Create: `tests/workflow/test_ledger.py`
-
-- [x] **Step 1: Write ledger tests**
-
-Cover:
-
-- Creating a run ledger creates `ledger.sqlite3` and inserts `runs`.
-
-- Marking a node running upserts `nodes` and inserts `attempts`.
-
-- Recording a remote submission inserts `remote_calls` before waiting for the Modal function call.
-
-- Restart recovery reattaches to existing `remote_calls` with `modal.FunctionCall.from_id(...)` before scheduling replacement work.
-
-- Recording artifacts inserts `artifacts`, `artifact_files`, and `node_outputs`.
-
-- A completed node is detected from `nodes.status`, `node_outputs`, and matching artifact/file rows.
-
-- [x] **Step 2: Implement ledger**
-
-Implement a `WorkflowLedger` class that accepts a mounted volume root path, creates or opens `<workflow-name>/<run-id>/ledger.sqlite3`, and never imports app modules. The orchestrator owns write access. Tests should assert the documented tables exist and that rows are readable with raw SQL for manual debugging. Ledger updates mutate SQLite rows directly; do not preserve obsolete Pydantic status-copy patterns such as `model_copy(update=...)` for ledger state.
-
-Required methods:
-
-```python
-create_run(run: WorkflowRun) -> WorkflowRun
-load_run(workflow_name: str, run_id: str) -> WorkflowRun
-mark_node_pending(node_id: str) -> NodeStatusRecord
-mark_node_running(node_id: str, attempt_id: str) -> NodeStatusRecord
-mark_node_succeeded(node_id: str, artifact_ids: list[str]) -> NodeStatusRecord
-mark_node_failed(node_id: str, error: str) -> NodeStatusRecord
-record_attempt_started(node_id: str, attempt_id: str) -> AttemptRecord
-record_remote_call(call_id: str, node_id: str, attempt_id: str, function_name: str, call_kind: str) -> None
-record_task(task_id: str, node_id: str, attempt_id: str, status: str, ...) -> None
-record_app_result(node_id: str, attempt_id: str, result: AppRunResult) -> Path
-record_artifacts(artifacts: list[WorkflowArtifact]) -> None
-node_is_complete(node_id: str) -> bool
-```
-
-- [x] **Step 3: Run ledger tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/workflow/test_ledger.py -q
-```
-
-Expected: all tests pass.
-
-### Task 4: Add Workflow Builder and DAG Validation
-
-**Files:**
-
-- Create: `src/biomodals/workflow/core/builder.py`
-
-- Create: `src/biomodals/workflow/core/nodes.py`
-
-- Modify: `src/biomodals/workflow/__init__.py`
-
-- Create: `tests/workflow/test_builder.py`
-
-- [x] **Step 1: Write builder tests**
-
-Cover:
-
-- Adding two nodes with a selector creates one data dependency.
-
-- `depends_on` creates a control edge.
-
-- Duplicate node ids raise `ValueError`.
-
-- Cycles raise `ValueError`.
-
-- Two nodes depending on the same upstream node are both ready after the upstream succeeds.
-
-- [x] **Step 2: Implement node contracts**
-
-Define:
-
-```python
-class WorkflowNode(Protocol):
-    id: str
-    execution_policy: NodeExecutionPolicy
-    placement: NodePlacement
-
-    def run(self, context: NodeRunContext) -> AppRunResult:
-        """Execute node implementation and return app-compatible outputs."""
-        raise NotImplementedError
-```
-
-Define `AppBackedNode` and `WorkflowNativeNode` base classes for common behavior, but keep app-specific logic out of the runtime.
-
-`AppBackedNode.load_app_function()` returns `modal.Function`. `AppBackedNode.app_function` and any node function resolver should be typed as `modal.Function`, not `Any` or a generic `Callable`; app-backed nodes do not invoke ordinary Python callables except in unit-test fakes that model the Modal boundary.
-
-- [x] **Step 3: Implement builder**
-
-Expose:
-
-```python
-Workflow(name: str)
-Workflow.add_node(node, *, id: str, inputs=None, depends_on=None)
-NodeHandle.outputs(kind: ArtifactKind, pattern: str | None = None, role: str | None = None)
-Workflow.validate()
-Workflow.ready_nodes(completed_node_ids: set[str])
-```
-
-- [x] **Step 4: Run builder tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/workflow/test_builder.py -q
-```
-
-Expected: all tests pass.
-
-### Task 5: Add Runtime Scheduler
-
-**Files:**
-
-- Create: `src/biomodals/workflow/core/runtime.py`
-
-- Create: `tests/workflow/test_runtime.py`
-
-- [x] **Step 1: Write runtime tests with fake nodes**
-
-Cover:
-
-- Completed nodes are skipped.
-
-- Independent ready nodes run in parallel or are submitted in the same scheduler wave.
-
-- A failed required node prevents downstream nodes from running.
-
-- `RERUN` reruns incomplete nodes.
-
-- `RESUME` calls node code with durable cache paths available in the context.
-
-- [x] **Step 2: Implement runtime**
-
-Implement scheduler waves:
-
-```text
-load ledger
-find completed nodes
-find ready nodes
-run ready nodes by placement
-materialize outputs
-record artifacts
-repeat until all nodes complete or a failure stops the run
-```
-
-For local unit tests, use fake node implementations and a temporary directory as the ledger root.
-
-- [x] **Step 3: Run runtime tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/workflow/test_runtime.py -q
-```
-
-Expected: all tests pass.
-
-### Task 6: Add Modal Orchestrator
-
-**Files:**
-
-- Create: `src/biomodals/workflow/core/orchestrator.py`
-
-- Modify: `src/biomodals/workflow/__init__.py`
-
-- Create: `tests/workflow/test_orchestrator.py`
-
-- [x] **Step 1: Create workflow AppConfig**
-
-Use the app-development conventions where they apply to Modal code:
-
-```python
-CONF = AppConfig(
-    tags={"group": "workflow"},
-    name="WorkflowOrchestrator",
-    package_name="biomodals-workflow-orchestrator",
-    version="0.1.0",
-    python_version="3.13",
-    timeout=int(os.environ.get("TIMEOUT", str(MAX_TIMEOUT))),
-)
-```
-
-- [x] **Step 2: Add remote orchestrator class**
-
-Add:
-
-```python
-@app.cls(
-    cpu=(1.125, 16.125),
-    memory=(1024, 65536),
-    timeout=MAX_TIMEOUT,
-    volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
-)
-class WorkflowOrchestrator:
-    @modal.enter()
-    def enter(self) -> None:
-        OUT_VOLUME.reload()
-
-    @modal.method()
-    def run(
-        self,
-        workflow_name: str,
-        run_id: str,
-        workflow_definition: Workflow,
-        force: bool = False,
-    ) -> AppRunResult:
-        runtime = WorkflowRuntime.from_definition(
-            workflow_name=workflow_name,
-            workflow_definition=workflow_definition,
-            volume_root=Path(CONF.output_volume_mountpoint),
-            workflow_volume=OUT_VOLUME,
-        )
-        return runtime.run(run_id=run_id, force=force)
-
-    @modal.exit()
-    def exit(self) -> None:
-        OUT_VOLUME.commit()
-```
-
-The orchestrator class should live in `orchestrator.py`; do not create a separate `orchestrator_app.py`. It should instantiate `WorkflowRuntime`, run it against the mounted output volume, commit volume writes after state changes, and return an `AppRunResult` or final workflow artifact manifest list.
-
-- [x] **Step 3: Add local submission helper**
-
-Keep this helper CLI-facing and minimal: stage local inputs, submit the remote orchestrator, and optionally download final outputs. It should not become a second scheduler. Expose it under the `biomodals workflow ...` namespace when it becomes user-facing.
-
-- [x] **Step 4: Write mocked orchestrator boundary tests**
-
-Use pytest `monkeypatch` to replace `WorkflowRuntime.from_definition` with a fake runtime that records `workflow_name`, `workflow_definition`, `volume_root`, `run_id`, and `force`. Call the class method body directly and assert it returns the fake `AppRunResult`. Do not call `.remote()`, `.spawn()`, or any live Modal API.
-
-- [x] **Step 5: Run orchestrator tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/workflow/test_orchestrator.py -q
-```
-
-Expected: mocked orchestrator tests pass without contacting Modal.
-
-- [x] **Step 6: Run discovery smoke tests**
-
-Run:
-
-```bash
-rtk uv run biomodals app list
-rtk uv run biomodals workflow list
-rtk uv run biomodals workflow help ppiflow
-```
-
-Expected: app discovery works, workflow discovery exposes executable workflow scripts, and runtime-only orchestrator internals stay under `biomodals.workflow.core` and are not listed as user workflows. Temporary deprecated aliases (`biomodals list`, `biomodals help`, and `biomodals run`) may remain for app commands during one transition period.
-
-### Task 7: Add Worker Pool Helpers
-
-**Files:**
-
-- Create: `src/biomodals/workflow/core/workers.py`
-
-- Create: `tests/workflow/test_workers.py`
-
-- [x] **Step 1: Write worker-pool tests**
-
-Cover queue naming, deterministic task ids, worker count calculation, and completion status aggregation using fake queue objects.
-
-- [x] **Step 2: Implement worker-pool helper API**
-
-Expose:
-
-```python
-def build_worker_pool_name(workflow_name: str, run_id: str, node_id: str) -> str:
-    parts = [workflow_name, run_id, node_id, "workers"]
-    return "-".join(sanitize_filename(part) for part in parts)
-
-def bounded_worker_count(max_workers: int, task_count: int) -> int:
-    if task_count < 1:
-        return 0
-    return max(1, min(max_workers, task_count))
-```
-
-Keep the Modal `Queue` and `FunctionCall.gather` calls in thin integration functions so pure unit tests can exercise most behavior.
-
-- [x] **Step 3: Run worker tests**
-
-Run:
-
-```bash
-rtk uv run pytest tests/workflow/test_workers.py -q
-```
-
-Expected: all tests pass.
-
-### Task 8: Add First Workflow-Compatible App Function
-
-**Files:**
-
-- Modify the first narrow app: `src/biomodals/app/fold/flowpacker_app.py`
-
-- Create `tests/app/test_flowpacker_workflow_contract.py`
-
-- Update `examples/app/` only if user-facing invocation changes
-
-- [x] **Step 1: Read app development standards**
-
-Read:
-
-```text
-.agents/skills/biomodals-app-development/SKILL.md
-.agents/skills/biomodals-app-development/references/app-development.md
-docs/agents/app-development.md
-```
-
-- [x] **Step 2: Add a workflow-compatible remote app function**
-
-The function should:
-
-- Accept workflow-friendly primitive/Pydantic inputs.
-
-- Call the same core behavior used by the existing local entrypoint or existing remote run function.
-
-- Return `AppRunResult`.
-
-- Preserve the existing local entrypoint behavior and return value.
-
-- Inline trivial result construction into `run_flowpacker_workflow` instead of adding a helper that only wraps return values.
-
-- [x] **Step 3: Add a focused app contract test**
-
-Use pytest to call the workflow contract helper with fake inputs and monkeypatched app-function dependencies. Assert the returned `AppRunResult` contains expected `AppOutput` names, kinds, and storage metadata. Do not call `.remote()`, `.spawn()`, `modal.Function.from_name(...)`, or deployed Modal apps.
-
-- [x] **Step 4: Run the focused app test**
-
-Run:
-
-```bash
-rtk uv run pytest tests/app/test_flowpacker_workflow_contract.py -q
-```
-
-Expected: the app contract test passes without contacting Modal.
-
-- [x] **Step 5: Smoke test app discovery**
-
-Run:
-
-```bash
-rtk uv run biomodals app list
-rtk uv run biomodals app help flowpacker
-rtk prek run --files src/biomodals/app/fold/flowpacker_app.py tests/app/test_flowpacker_workflow_contract.py src/biomodals/schema/app.py src/biomodals/schema/storage.py src/biomodals/schema/workflow.py
-```
-
-Expected: discovery and pre-commit checks pass.
-
-### Task 9: Documentation and Verification
-
-**Files:**
-
-- Modify: `docs/agents/app-development.md` if workflow-compatible app function standards become app-development standards.
-
-- Create: `docs/agents/workflow-development.md`
-
-- Modify: `AGENTS.md` only if repo-wide agent instructions need a pointer to workflow-development docs.
-
-- [x] **Step 1: Document workflow-development rules**
-
-Include:
-
-- Workflow vocabulary.
-
-- Schema boundaries.
-
-- Node execution policies.
-
-- Node placement.
-
-- Ledger layout.
-
-- Modal preemption requirements.
-
-- Worker pool and barriered fan-out behavior.
-
-- App local entrypoint versus workflow-compatible app function split.
-
-- CLI namespace split between `biomodals app ...` and `biomodals workflow ...`.
-
-- [x] **Step 2: Run verification**
-
-Run:
-
-```bash
-rtk uv run pytest tests -q
-rtk prek run --files PLAN.md CONTEXT.md src/biomodals/schema/__init__.py src/biomodals/schema/storage.py src/biomodals/schema/app.py src/biomodals/schema/workflow.py src/biomodals/workflow/__init__.py
-rtk uv run biomodals app list
-rtk uv run biomodals workflow list
-```
-
-Expected: unit tests pass, pre-commit passes for changed files, and CLI app/workflow discovery still works.
+The first implementation slice is now in code. Finished tasks are summarized here
+instead of restating implementation details that can be read from the files and
+tests.
+
+### Completed Implementation Summary
+
+- **Shared schemas:** `biomodals.schema` now exports storage, app, and workflow
+  Pydantic contracts. `biomodals.app.config.AppConfig` remains a compatibility
+  import plus Modal-specific helpers outside the schema package. Schema tests
+  cover round trips, schema import boundaries, and inline-byte constraints.
+- **Artifact materialization:** `workflow.core.artifacts` materializes
+  `AppRunResult` outputs and logs into workflow artifacts, validates UTF-8
+  `InlineBytes`, supports volume-path reference/copy modes, and writes artifact
+  manifests.
+- **Workflow ledger:** `workflow.core.ledger.WorkflowLedger` owns the per-run
+  SQLite layout, run/node/attempt/remote-call/task/artifact tables, deterministic
+  run paths, and raw-SQL-debuggable state transitions.
+- **Builder and node contracts:** `workflow.core.builder` provides the
+  Python-first `Workflow` API, data/control dependency inference, cycle checks,
+  and node handles that return `ArtifactSelector`s directly. `workflow.core.nodes`
+  provides node context plus native and app-backed node contracts.
+- **Runtime scheduler:** `workflow.core.runtime.WorkflowRuntime` validates DAGs,
+  skips completed nodes, schedules ready nodes in waves, dispatches remote
+  placement through an injected runner, records Modal call ids with an explicit
+  remote function name before waiting, materializes outputs, and handles
+  `RERUN`/`RESUME` state.
+- **Modal orchestrator:** `workflow.core.orchestrator` defines the Modal-hosted
+  `WorkflowOrchestrator`, local submission helper, runtime wiring, volume
+  reload/commit hooks, documented `module:function` workflow factory loading,
+  and mocked boundary tests.
+- **Worker helpers:** `workflow.core.workers` covers worker-pool naming,
+  deterministic task ids, queue enqueueing, spawn/gather adapters, and result
+  summaries.
+- **First workflow-compatible app function:** `flowpacker_app.py` now exposes
+  `run_flowpacker_workflow(...) -> AppRunResult` while preserving the existing
+  local entrypoint behavior.
+- **Workflow discovery and docs:** `biomodals app ...` / `biomodals workflow ...`
+  discovery is wired, workflow development guidance lives in
+  `docs/agents/workflow-development.md`, and app-development guidance points to
+  the repo-local skill.
+- **Definition-only PPIFlow DAG:** `ppiflow_v2.py` now uses the data-driven
+  `PPIFlowWorkflowNode` for app-backed steps and keeps semantic identity in
+  `step_name` until individual steps own distinct behavior.
+
+### Current Verification Status
+
+- `rtk uv run pytest -q -W error::DeprecationWarning` passes: 96 passed.
+- `rtk uv run ty check <changed-python-files>` passes for the workflow files and
+  tests touched by these fixes.
+- `rtk prek run --files <changed files>` passes.
+
+### Further Tasks
+
+- [ ] **Make the PPIFlow v2 definition executable deliberately.** Wire real
+  workflow-compatible app functions into app-backed nodes, implement
+  `build_app_function_kwargs(...)`, and replace placeholder native filter/report
+  nodes with implementations that emit durable `WorkflowArtifact`s.
+- [ ] **Add workflow-compatible scoring outputs.** Decide whether DockQ and
+  AF3Score should expose `AppRunResult` workflow functions directly or be called
+  through adapter nodes, then add focused contract tests that avoid live Modal
+  calls.
+- [ ] **Strengthen runtime recovery tests.** Add coverage for resumed remote
+  calls that write output files before the orchestrator finalizes them, failed
+  remote calls with preserved logs, and copied empty `VolumePath` directories.
+- [ ] **Keep CLI namespace transition explicit.** Before making workflow runs
+  user-facing, add or document `biomodals workflow run` semantics separately
+  from `biomodals app run`, and decide when deprecated top-level app aliases can
+  be removed.
 
 ## Deferred Decisions
 

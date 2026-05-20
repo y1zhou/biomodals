@@ -7,6 +7,7 @@ import pytest
 from biomodals.workflow.ppiflow_v2 import (
     PPI_FLOW_OUTPUT_LAYOUT,
     PPI_FLOW_V2_EXECUTION_STATUS,
+    PPIFlowWorkflowNode,
     build_ppiflow_workflow,
 )
 
@@ -63,6 +64,22 @@ def test_binder_workflow_models_stage_dependencies() -> None:
         "stage2-filter",
         "stage2-dockq",
     }
+
+
+def test_app_backed_steps_use_data_driven_node_class() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(gentype="binder"),
+        steps_yaml_bytes=b"PPIFlowStep:\n  samples_per_target: 1\n",
+    )
+
+    definition = workflow.validate()
+    ppiflow_node = definition.nodes["stage1-ppiflow-design"].node
+    mpnn_node = definition.nodes["stage1-ligandmpnn"].node
+
+    assert type(ppiflow_node) is PPIFlowWorkflowNode
+    assert ppiflow_node.step_name == "PPIFlowStep"
+    assert type(mpnn_node) is PPIFlowWorkflowNode
+    assert mpnn_node.step_name == "MPNNStep_stage1"
 
 
 def test_antibody_workflow_uses_abmpnn_nodes() -> None:

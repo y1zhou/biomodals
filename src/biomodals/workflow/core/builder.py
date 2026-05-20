@@ -11,31 +11,9 @@ from biomodals.workflow.core.nodes import WorkflowNode
 
 
 @dataclass(frozen=True)
-class NodeOutputRef:
-    """Reference to artifacts produced by a workflow node."""
-
-    producing_node_id: str
-    kind: ArtifactKind | None = None
-    pattern: str | None = None
-    role: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_selector(self) -> ArtifactSelector:
-        """Convert this output reference into an artifact selector."""
-        return ArtifactSelector(
-            producing_node_id=self.producing_node_id,
-            kind=self.kind,
-            pattern=self.pattern,
-            role=self.role,
-            metadata=self.metadata,
-        )
-
-
-@dataclass(frozen=True)
 class NodeHandle:
     """Stable handle returned after adding a node to a workflow."""
 
-    workflow: Workflow
     node_id: str
 
     def outputs(
@@ -46,13 +24,13 @@ class NodeHandle:
         metadata: dict[str, Any] | None = None,
     ) -> ArtifactSelector:
         """Select artifacts produced by this node."""
-        return NodeOutputRef(
+        return ArtifactSelector(
             producing_node_id=self.node_id,
             kind=kind,
             pattern=pattern,
             role=role,
             metadata=metadata or {},
-        ).to_selector()
+        )
 
 
 @dataclass
@@ -105,7 +83,7 @@ class Workflow:
             inputs=inputs or {},
             control_dependencies=control_dependencies,
         )
-        return NodeHandle(workflow=self, node_id=node_id)
+        return NodeHandle(node_id=node_id)
 
     def add_control_edge(
         self,

@@ -3,7 +3,6 @@
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeHandle,
-    NodeOutputRef,
     NodeRunContext,
     Workflow,
     WorkflowDefinition,
@@ -15,7 +14,6 @@ from biomodals.workflow.core import (
 __all__ = [
     "AppBackedNode",
     "NodeHandle",
-    "NodeOutputRef",
     "NodeRunContext",
     "Workflow",
     "WorkflowDefinition",

@@ -43,56 +43,6 @@ class PPIFlowWorkflowNode(AppBackedNode):
 
 
 @dataclass
-class PPIFlowDesignNode(PPIFlowWorkflowNode):
-    """Run the initial PPIFlow design step."""
-
-
-@dataclass
-class LigandMPNNNode(PPIFlowWorkflowNode):
-    """Run LigandMPNN for binder design."""
-
-
-@dataclass
-class AbMPNNNode(PPIFlowWorkflowNode):
-    """Run antibody/nanobody MPNN design."""
-
-
-@dataclass
-class FlowPackerNode(PPIFlowWorkflowNode):
-    """Run FlowPacker side-chain packing."""
-
-
-@dataclass
-class AF3ScoreNode(PPIFlowWorkflowNode):
-    """Run AF3Score on packed structures."""
-
-
-@dataclass
-class RosettaFixNode(PPIFlowWorkflowNode):
-    """Run Rosetta preprocessing before partial PPIFlow."""
-
-
-@dataclass
-class PartialPPIFlowNode(PPIFlowWorkflowNode):
-    """Run PPIFlow partial design."""
-
-
-@dataclass
-class AlphaFold3RefoldNode(PPIFlowWorkflowNode):
-    """Run AlphaFold3 refolding on filtered structures."""
-
-
-@dataclass
-class RosettaRelaxNode(PPIFlowWorkflowNode):
-    """Run Rosetta relaxation on filtered structures."""
-
-
-@dataclass
-class DockQNode(PPIFlowWorkflowNode):
-    """Run DockQ against refolded/reference structure pairs."""
-
-
-@dataclass
 class FilterStructuresNode(WorkflowNativeNode):
     """Filter structures using score artifacts."""
 
@@ -164,31 +114,28 @@ def _add_stage1_nodes(
     tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
         tail = workflow.add_node(
-            PPIFlowDesignNode("PPIFlowStep", _step_cfg(steps, "PPIFlowStep")),
+            _app_step_node(steps, "PPIFlowStep"),
             id="stage1-ppiflow-design",
         )
 
     mpnn_step = None
     if gentype == "binder" and _step_enabled(enabled, "MPNNStep_stage1"):
-        mpnn_step = ("stage1-ligandmpnn", "MPNNStep_stage1", LigandMPNNNode)
+        mpnn_step = ("stage1-ligandmpnn", "MPNNStep_stage1")
     elif gentype in {"antibody", "nanobody"} and _step_enabled(
         enabled, "AbMPNNStep_stage1"
     ):
-        mpnn_step = ("stage1-abmpnn", "AbMPNNStep_stage1", AbMPNNNode)
+        mpnn_step = ("stage1-abmpnn", "AbMPNNStep_stage1")
     if mpnn_step is not None:
-        node_id, step_name, node_type = mpnn_step
+        node_id, step_name = mpnn_step
         tail = workflow.add_node(
-            node_type(step_name, _step_cfg(steps, step_name)),
+            _app_step_node(steps, step_name),
             id=node_id,
             inputs=_structure_inputs(tail),
         )
 
     if _step_enabled(enabled, "FlowpackerStep_stage1"):
         tail = workflow.add_node(
-            FlowPackerNode(
-                "FlowpackerStep_stage1",
-                _step_cfg(steps, "FlowpackerStep_stage1"),
-            ),
+            _app_step_node(steps, "FlowpackerStep_stage1"),
             id="stage1-flowpacker",
             inputs=_structure_inputs(tail),
         )
@@ -196,10 +143,7 @@ def _add_stage1_nodes(
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage1"):
         score = workflow.add_node(
-            AF3ScoreNode(
-                "AF3scoreStep_stage1",
-                _step_cfg(steps, "AF3scoreStep_stage1"),
-            ),
+            _app_step_node(steps, "AF3scoreStep_stage1"),
             id="stage1-af3score",
             inputs=_structure_inputs(tail),
         )
@@ -230,39 +174,36 @@ def _add_stage2_nodes(
     tail = upstream
     if _step_enabled(enabled, "RosettaFixStep"):
         tail = workflow.add_node(
-            RosettaFixNode("RosettaFixStep", _step_cfg(steps, "RosettaFixStep")),
+            _app_step_node(steps, "RosettaFixStep"),
             id="stage2-rosetta-fix",
             inputs=_structure_inputs(tail),
         )
 
     if _step_enabled(enabled, "PartialStep"):
         tail = workflow.add_node(
-            PartialPPIFlowNode("PartialStep", _step_cfg(steps, "PartialStep")),
+            _app_step_node(steps, "PartialStep"),
             id="stage2-partial-ppiflow",
             inputs=_structure_inputs(tail),
         )
 
     mpnn_step = None
     if gentype == "binder" and _step_enabled(enabled, "MPNNStep_stage2"):
-        mpnn_step = ("stage2-ligandmpnn", "MPNNStep_stage2", LigandMPNNNode)
+        mpnn_step = ("stage2-ligandmpnn", "MPNNStep_stage2")
     elif gentype in {"antibody", "nanobody"} and _step_enabled(
         enabled, "AbMPNNStep_stage2"
     ):
-        mpnn_step = ("stage2-abmpnn", "AbMPNNStep_stage2", AbMPNNNode)
+        mpnn_step = ("stage2-abmpnn", "AbMPNNStep_stage2")
     if mpnn_step is not None:
-        node_id, step_name, node_type = mpnn_step
+        node_id, step_name = mpnn_step
         tail = workflow.add_node(
-            node_type(step_name, _step_cfg(steps, step_name)),
+            _app_step_node(steps, step_name),
             id=node_id,
             inputs=_structure_inputs(tail),
         )
 
     if _step_enabled(enabled, "FlowpackerStep_stage2"):
         tail = workflow.add_node(
-            FlowPackerNode(
-                "FlowpackerStep_stage2",
-                _step_cfg(steps, "FlowpackerStep_stage2"),
-            ),
+            _app_step_node(steps, "FlowpackerStep_stage2"),
             id="stage2-flowpacker",
             inputs=_structure_inputs(tail),
         )
@@ -270,10 +211,7 @@ def _add_stage2_nodes(
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage2"):
         score = workflow.add_node(
-            AF3ScoreNode(
-                "AF3scoreStep_stage2",
-                _step_cfg(steps, "AF3scoreStep_stage2"),
-            ),
+            _app_step_node(steps, "AF3scoreStep_stage2"),
             id="stage2-af3score",
             inputs=_structure_inputs(tail),
         )
@@ -295,17 +233,14 @@ def _add_stage2_nodes(
     refold = None
     if _step_enabled(enabled, "ReFoldStep"):
         refold = workflow.add_node(
-            AlphaFold3RefoldNode("ReFoldStep", _step_cfg(steps, "ReFoldStep")),
+            _app_step_node(steps, "ReFoldStep"),
             id="stage2-alphafold3-refold",
             inputs=_structure_inputs(filtered),
         )
 
     if _step_enabled(enabled, "RosettaRelaxStep"):
         workflow.add_node(
-            RosettaRelaxNode(
-                "RosettaRelaxStep",
-                _step_cfg(steps, "RosettaRelaxStep"),
-            ),
+            _app_step_node(steps, "RosettaRelaxStep"),
             id="stage2-rosetta-relax",
             inputs=_structure_inputs(filtered),
         )
@@ -316,7 +251,7 @@ def _add_stage2_nodes(
         if refold is not None:
             inputs["models"] = refold.outputs(kind=ArtifactKind.STRUCTURES)
         dockq = workflow.add_node(
-            DockQNode("DockQStep", _step_cfg(steps, "DockQStep")),
+            _app_step_node(steps, "DockQStep"),
             id="stage2-dockq",
             inputs=inputs,
         )
@@ -336,6 +271,10 @@ def _structure_inputs(upstream) -> dict[str, Any]:
     if upstream is None:
         return {}
     return {"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)}
+
+
+def _app_step_node(steps: dict[str, Any], step_name: str) -> PPIFlowWorkflowNode:
+    return PPIFlowWorkflowNode(step_name, _step_cfg(steps, step_name))
 
 
 def _load_yaml_bytes(data: bytes) -> dict[str, Any]:

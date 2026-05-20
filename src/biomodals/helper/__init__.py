@@ -34,6 +34,7 @@ def patch_image_for_helper(image: Image, copy_patch_files: bool = False) -> Imag
             "biomodals.helper",
             "biomodals.app.constant",
             "biomodals.app.config",
+            "biomodals.schema",
             copy=copy_patch_files,
         )
     )

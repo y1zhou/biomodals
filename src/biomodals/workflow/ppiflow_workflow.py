@@ -17,7 +17,6 @@ packages a local ``.tar.zst`` containing the canonical upstream layout:
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -30,6 +29,7 @@ from typing import Any
 from uuid import uuid4
 
 import modal
+import orjson
 import polars as pl
 import yaml
 from modal.exception import NotFoundError
@@ -398,7 +398,9 @@ def _ensure_layout(run_root: Path) -> None:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_bytes(
+        orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS)
+    )
 
 
 def _write_warning(path: Path, message: str) -> None:
@@ -575,7 +577,7 @@ def _collect_local_inputs(
         safe_key = sanitize_filename(key)
         if safe_key in staged:
             raise ValueError(f"Duplicate staged input path: {safe_key}")
-        staged[key] = candidate.read_bytes()
+        staged[safe_key] = candidate.read_bytes()
     return sorted(staged.items())
 
 

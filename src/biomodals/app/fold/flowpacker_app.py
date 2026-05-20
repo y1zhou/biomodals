@@ -46,13 +46,17 @@ from biomodals.helper.io import (
     resolve_local_output_dir,
     write_local_tarball,
 )
-from biomodals.helper.shell import package_outputs, run_command_with_log
+from biomodals.helper.shell import (
+    package_outputs,
+    run_command_with_log,
+    sanitize_filename,
+)
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
-    InlineBytes,
+    VolumePath,
 )
 
 ##########################################
@@ -102,6 +106,8 @@ class AppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
+OUT_VOLUME = CONF.get_out_volume()
+OUT_VOLUME_NAME = OUT_VOLUME.name or f"{CONF.name}-outputs"
 
 runtime_image = patch_image_for_helper(
     modal.Image
@@ -123,6 +129,14 @@ runtime_image = patch_image_for_helper(
     )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+
+def _safe_flowpacker_run_name(run_name: str) -> str:
+    """Return a filesystem-safe FlowPacker sample name."""
+    safe_run_name = sanitize_filename(run_name)
+    if not safe_run_name:
+        raise ValueError("run_name must contain at least one safe path component")
+    return safe_run_name
 
 
 ##########################################
@@ -273,6 +287,7 @@ def run_flowpacker(
 
     _ensure_checkpoint_symlink()
 
+    run_name = _safe_flowpacker_run_name(run_name)
     input_dir = Path(mkdtemp(prefix="flowpacker_inputs_"))
     sample_dir = CONF.git_clone_dir / "samples" / run_name
     if sample_dir.exists():
@@ -322,35 +337,15 @@ def run_flowpacker(
     return package_outputs(sample_dir)
 
 
-def _flowpacker_app_run_result(
-    *,
-    run_name: str,
-    tarball_bytes: bytes,
-) -> AppRunResult:
-    """Wrap FlowPacker archive bytes in the standard app result schema."""
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            AppOutput(
-                name="flowpacker_outputs",
-                kind=ArtifactKind.STRUCTURES,
-                storage=InlineBytes(
-                    data=tarball_bytes,
-                    filename=f"{run_name}.tar.zst",
-                    media_type="application/zstd",
-                    archive_format="tar.zst",
-                ),
-            )
-        ],
-    )
-
-
 @app.function(
     gpu=CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    volumes={
+        CONF.model_volume_mountpoint: MODEL_VOLUME,
+        CONF.output_volume_mountpoint: OUT_VOLUME,
+    },
 )
 def run_flowpacker_workflow(
     input_files: list[tuple[str, bytes]],
@@ -366,9 +361,10 @@ def run_flowpacker_workflow(
     seed: int = 42,
 ) -> AppRunResult:
     """Run FlowPacker and return a workflow-compatible app result."""
+    safe_run_name = _safe_flowpacker_run_name(run_name)
     tarball_bytes = run_flowpacker.get_raw_f()(
         input_files=input_files,
-        run_name=run_name,
+        run_name=safe_run_name,
         model_name=model_name,
         use_confidence=use_confidence,
         n_samples=n_samples,
@@ -379,9 +375,29 @@ def run_flowpacker_workflow(
         save_traj=save_traj,
         seed=seed,
     )
-    return _flowpacker_app_run_result(
-        run_name=run_name,
-        tarball_bytes=tarball_bytes,
+    archive_filename = f"{safe_run_name}.tar.zst"
+    volume_root = Path(CONF.output_volume_mountpoint)
+    archive_path = volume_root / "workflow" / safe_run_name / archive_filename
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(tarball_bytes)
+    OUT_VOLUME.commit()
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="flowpacker_outputs",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name=OUT_VOLUME_NAME,
+                    path=archive_path.relative_to(volume_root).as_posix(),
+                    media_type="application/zstd",
+                ),
+                metadata={
+                    "archive_format": "tar.zst",
+                    "filename": archive_filename,
+                },
+            )
+        ],
     )
 
 
@@ -475,14 +491,18 @@ def submit_flowpacker_task(
         run_name = (
             resolved_input.stem if resolved_input.is_file() else resolved_input.name
         )
+    safe_run_name = _safe_flowpacker_run_name(run_name)
 
     local_out_dir = resolve_local_output_dir(out_dir)
-    out_file = build_local_output_path(local_out_dir, run_name=run_name)
+    out_file = build_local_output_path(local_out_dir, run_name=safe_run_name)
 
-    print(f"🧬 Submitting FlowPacker run '{run_name}' with {len(input_files)} input(s)")
+    print(
+        f"🧬 Submitting FlowPacker run '{safe_run_name}' "
+        f"with {len(input_files)} input(s)"
+    )
     tarball_bytes = run_flowpacker.remote(
         input_files=input_files,
-        run_name=run_name,
+        run_name=safe_run_name,
         model_name=model_name,
         use_confidence=use_confidence,
         n_samples=n_samples,

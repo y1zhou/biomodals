@@ -498,7 +498,7 @@ def predict_structures(
     # Collect results as they become available
     failures: list[tuple[int, Exception]] = []
     while inference_func_calls:
-        for i, fc in inference_func_calls.items():
+        for i, fc in inference_func_calls.copy().items():
             try:
                 tarball_content = fc.get(timeout=poll_timeout)
             except TimeoutError:

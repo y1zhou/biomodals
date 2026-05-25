@@ -144,6 +144,7 @@ def _resolve_volume_child(root: Path, path: str) -> Path:
 
     resolved_path = raw_path.resolve()
     try:
+        # Validate-only: reject paths that resolve outside the mounted volume.
         resolved_path.relative_to(resolved_root)
     except ValueError as exc:
         raise ValueError("VolumePath.path escapes the mounted volume root") from exc

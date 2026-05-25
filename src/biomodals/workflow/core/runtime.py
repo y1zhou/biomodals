@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+import traceback
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Protocol
 
 import orjson
+from pydantic import BaseModel
 
 from biomodals.schema import (
     AppRunResult,
@@ -195,7 +198,9 @@ class WorkflowRuntime:
             for node_id, node_result in self._run_ready_nodes(ready):
                 if node_result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
                     error = self._node_error_message(node_result)
-                    self.ledger.mark_node_failed(node_id, error)
+                    node_status = self.ledger.load_node_status(node_id)
+                    if node_status.status != NodeStatus.FAILED or not node_status.error:
+                        self.ledger.mark_node_failed(node_id, error)
                     self.ledger.mark_run_status(RunStatus.FAILED)
                     self._commit_volume()
                     return AppRunResult(
@@ -234,17 +239,18 @@ class WorkflowRuntime:
                 try:
                     results.append((node_id, future.result()))
                 except Exception as exc:  # noqa: BLE001
-                    self.ledger.mark_node_failed(node_id, str(exc))
-                    self._commit_volume()
-                    results.append(
-                        (
-                            node_id,
-                            AppRunResult(
-                                status=AppRunStatus.FAILED,
-                                warnings=[str(exc)],
-                            ),
-                        )
+                    error = "".join(
+                        traceback.format_exception(type(exc), exc, exc.__traceback__)
                     )
+                    self.ledger.mark_node_failed(node_id, error)
+                    self._commit_volume()
+                    results.append((
+                        node_id,
+                        AppRunResult(
+                            status=AppRunStatus.FAILED,
+                            warnings=[str(exc)],
+                        ),
+                    ))
         return results
 
     def _run_node(self, node_id: str) -> AppRunResult:
@@ -556,7 +562,6 @@ class WorkflowRuntime:
         encoded = orjson.dumps(
             payload,
             option=orjson.OPT_SORT_KEYS,
-            default=str,
         )
         return hashlib.sha256(encoded).hexdigest()
 
@@ -564,12 +569,47 @@ class WorkflowRuntime:
     def _node_hash_payload(node: WorkflowNode) -> dict[str, object]:
         payload: dict[str, object] = {
             "class": f"{node.__class__.__module__}.{node.__class__.__qualname__}",
-            "execution_policy": node.execution_policy,
-            "placement": node.placement,
+            "execution_policy": node.execution_policy.value,
+            "placement": node.placement.value,
         }
         if is_dataclass(node):
-            payload["dataclass"] = asdict(cast(Any, node))
+            payload["dataclass"] = WorkflowRuntime._stable_json_value(node)
         return payload
+
+    @staticmethod
+    def _stable_json_value(value: object) -> object:
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode="json", round_trip=True)
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, Path):
+            return value.as_posix()
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                field.name: WorkflowRuntime._stable_json_value(
+                    getattr(value, field.name)
+                )
+                for field in fields(value)
+            }
+        if isinstance(value, Mapping):
+            return {
+                str(key): WorkflowRuntime._stable_json_value(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple)):
+            return [WorkflowRuntime._stable_json_value(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            stable_items = [WorkflowRuntime._stable_json_value(item) for item in value]
+            return sorted(
+                stable_items,
+                key=lambda item: orjson.dumps(item, option=orjson.OPT_SORT_KEYS),
+            )
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise TypeError(
+            f"Unsupported DAG hash value type: {type(value).__module__}."
+            f"{type(value).__qualname__}"
+        )
 
     def _next_attempt_id(self, node_id: str) -> str:
         return self.ledger.next_attempt_id(node_id)
@@ -590,6 +630,10 @@ class WorkflowRuntime:
     def _reload_volume(self) -> None:
         if self.workflow_volume is not None:
             self.workflow_volume.reload()
+
+    def close(self) -> None:
+        """Close durable local resources owned by the runtime."""
+        self.ledger.close()
 
 
 class _RemoteCallExpired(RuntimeError):

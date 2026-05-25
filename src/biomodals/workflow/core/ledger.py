@@ -161,6 +161,10 @@ class WorkflowLedger:
         )
         return row is not None and row["status"] == NodeStatus.RUNNING.value
 
+    def load_node_status(self, node_id: str) -> NodeStatusRecord:
+        """Load a node status row or return the default pending state."""
+        return self._load_node_status_or_default(node_id)
+
     def reset_node(self, node_id: str) -> None:
         """Remove durable state for one workflow node."""
         artifact_ids = [
@@ -771,12 +775,22 @@ class WorkflowLedger:
 
     def next_attempt_id(self, node_id: str) -> str:
         """Return the next deterministic attempt id for one node."""
-        row = self._fetch_one(
-            "SELECT COUNT(*) AS count FROM attempts WHERE node_id = ?",
+        rows = self._fetch_all(
+            "SELECT attempt_id FROM attempts WHERE node_id = ?",
             (node_id,),
         )
-        attempt_count = 0 if row is None else int(row["count"])
-        return f"attempt-{attempt_count + 1}"
+        max_suffix = 0
+        prefix = "attempt-"
+        for row in rows:
+            attempt_id = str(row["attempt_id"])
+            suffix = attempt_id.removeprefix(prefix)
+            if suffix != attempt_id and suffix.isdecimal():
+                max_suffix = max(max_suffix, int(suffix))
+        return f"attempt-{max_suffix + 1}"
+
+    def close(self) -> None:
+        """Close the active SQLite connection, if one is open."""
+        self._close()
 
     @staticmethod
     def _artifact_matches_selector(

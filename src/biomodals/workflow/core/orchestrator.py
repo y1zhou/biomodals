@@ -99,7 +99,10 @@ def _spawn_remote_workflow_node(
     node: WorkflowNode,
     context: NodeRunContext,
 ) -> RemoteFunctionCall:
-    return cast(RemoteFunctionCall, remote_method.spawn(node, context))
+    function_call = remote_method.spawn(node, context)
+    if not hasattr(function_call, "object_id") or not hasattr(function_call, "get"):
+        raise TypeError("Remote workflow node spawn did not return a FunctionCall")
+    return cast(RemoteFunctionCall, function_call)
 
 
 @app.cls(
@@ -114,6 +117,7 @@ class WorkflowOrchestrator:
     @modal.enter()
     def enter(self) -> None:
         """Refresh the workflow volume before serving orchestrator methods."""
+        self._close_runtime()
         OUT_VOLUME.reload()
 
     @modal.method()
@@ -147,7 +151,11 @@ class WorkflowOrchestrator:
             remote_node_function_name=REMOTE_NODE_FUNCTION_NAME,
             function_call_resolver=modal.FunctionCall.from_id,
         )
-        return runtime.run(run_id=run_id, force=force)
+        self._runtime = runtime
+        try:
+            return runtime.run(run_id=run_id, force=force)
+        finally:
+            self._close_runtime()
 
     @modal.method()
     def run_remote_workflow_node(
@@ -165,7 +173,16 @@ class WorkflowOrchestrator:
     @modal.exit()
     def exit(self) -> None:
         """Persist any pending workflow volume writes on container shutdown."""
+        self._close_runtime()
         OUT_VOLUME.commit()
+
+    def _close_runtime(self) -> None:
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None:
+            close = getattr(runtime, "close", None)
+            if close is not None:
+                close()
+            self._runtime = None
 
 
 @app.local_entrypoint()

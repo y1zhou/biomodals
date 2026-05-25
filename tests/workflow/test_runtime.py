@@ -3,10 +3,12 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError
 
 import pytest
+from pydantic import BaseModel, Field
 
 from biomodals.schema import (
     AppOutput,
@@ -125,21 +127,33 @@ class FakeVolume:
         self.reload_count += 1
 
 
+class HashSettings(BaseModel):
+    visible: str
+    hidden: str = Field(repr=False)
+
+
+@dataclass
+class ConfiguredNode(WorkflowNativeNode):
+    settings: HashSettings
+    output_path: Path
+
+    def run(self, context):
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
 def test_completed_nodes_are_skipped(tmp_path: Path) -> None:
     workflow = Workflow("demo")
     workflow.add_node(ExplodingNode(), id="done")
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts(
-        [
-            WorkflowArtifact(
-                artifact_id="artifact-1",
-                producing_node_id="done",
-                kind=ArtifactKind.REPORT,
-                storage=VolumePath(volume_name="Workflow-outputs", path="done"),
-            )
-        ]
-    )
+    ledger.record_artifacts([
+        WorkflowArtifact(
+            artifact_id="artifact-1",
+            producing_node_id="done",
+            kind=ArtifactKind.REPORT,
+            storage=VolumePath(volume_name="Workflow-outputs", path="done"),
+        )
+    ])
     ledger.mark_node_succeeded("done", ["artifact-1"])
 
     runtime = WorkflowRuntime(
@@ -195,16 +209,14 @@ def test_independent_ready_nodes_run_in_same_scheduler_wave(
     )
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts(
-        [
-            WorkflowArtifact(
-                artifact_id="design-artifact",
-                producing_node_id="design",
-                kind=ArtifactKind.STRUCTURES,
-                storage=VolumePath(volume_name="Workflow-outputs", path="design"),
-            )
-        ]
-    )
+    ledger.record_artifacts([
+        WorkflowArtifact(
+            artifact_id="design-artifact",
+            producing_node_id="design",
+            kind=ArtifactKind.STRUCTURES,
+            storage=VolumePath(volume_name="Workflow-outputs", path="design"),
+        )
+    ])
     ledger.mark_node_succeeded("design", ["design-artifact"])
 
     runtime = WorkflowRuntime(
@@ -302,7 +314,43 @@ def test_single_node_exception_marks_node_and_run_failed(tmp_path: Path) -> None
     assert runtime.ledger.load_run("demo", "run-1").status == RunStatus.FAILED
     status = runtime.ledger._load_node_status_or_default("fail")
     assert status.status == NodeStatus.FAILED
-    assert status.error == "fail exploded"
+    assert status.error is not None
+    assert "Traceback" in status.error
+    assert "RuntimeError: fail exploded" in status.error
+
+
+def test_runtime_dag_hash_uses_stable_json_for_dataclass_node_config() -> None:
+    first_workflow = Workflow("demo")
+    first_workflow.add_node(
+        ConfiguredNode(
+            settings=HashSettings(visible="same", hidden="one"),
+            output_path=Path("outputs/report.txt"),
+        ),
+        id="configured",
+    )
+    second_workflow = Workflow("demo")
+    second_workflow.add_node(
+        ConfiguredNode(
+            settings=HashSettings(visible="same", hidden="two"),
+            output_path=Path("outputs/report.txt"),
+        ),
+        id="configured",
+    )
+    repeated_workflow = Workflow("demo")
+    repeated_workflow.add_node(
+        ConfiguredNode(
+            settings=HashSettings(visible="same", hidden="one"),
+            output_path=Path("outputs/report.txt"),
+        ),
+        id="configured",
+    )
+
+    first_hash = WorkflowRuntime._dag_hash(first_workflow.validate())
+    second_hash = WorkflowRuntime._dag_hash(second_workflow.validate())
+    repeated_hash = WorkflowRuntime._dag_hash(repeated_workflow.validate())
+
+    assert first_hash != second_hash
+    assert first_hash == repeated_hash
 
 
 def test_running_node_without_recoverable_call_is_not_duplicated(
@@ -628,19 +676,17 @@ def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     )
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts(
-        [
-            WorkflowArtifact(
-                artifact_id="design-structures",
-                producing_node_id="design",
-                kind=ArtifactKind.STRUCTURES,
-                storage=VolumePath(
-                    volume_name="Workflow-outputs",
-                    path="demo/run-1/nodes/design/outputs",
-                ),
-            )
-        ]
-    )
+    ledger.record_artifacts([
+        WorkflowArtifact(
+            artifact_id="design-structures",
+            producing_node_id="design",
+            kind=ArtifactKind.STRUCTURES,
+            storage=VolumePath(
+                volume_name="Workflow-outputs",
+                path="demo/run-1/nodes/design/outputs",
+            ),
+        )
+    ])
     ledger.mark_node_succeeded("design", ["design-structures"])
 
     runtime = WorkflowRuntime(

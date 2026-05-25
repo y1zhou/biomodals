@@ -180,6 +180,15 @@ def test_record_app_result_stores_pydantic_inline_bytes_json(tmp_path: Path) -> 
     assert isinstance(data["outputs"][0]["storage"]["data"], str)
 
 
+def test_next_attempt_id_uses_highest_numeric_suffix(tmp_path: Path) -> None:
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="ppiflow", run_id="run-1"))
+    ledger.record_attempt_started("design", "attempt-2")
+    ledger.record_attempt_started("design", "attempt-uuid")
+
+    assert ledger.next_attempt_id("design") == "attempt-3"
+
+
 def test_remote_call_rows_are_human_debuggable(tmp_path: Path) -> None:
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="ppiflow", run_id="run-1"))

@@ -146,6 +146,51 @@ def test_orchestrator_method_passes_remote_node_runner_and_resolver(
     assert callable(calls["function_call_resolver"])
 
 
+def test_orchestrator_enter_closes_stale_runtime_before_reload(monkeypatch) -> None:
+    volume = FakeVolume()
+    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    raw_cls, instance = _raw_orchestrator()
+    runtime = FakeRuntime()
+    instance._runtime = runtime
+
+    raw_cls.enter._get_raw_f()(instance)
+
+    assert runtime.close_count == 1
+    assert instance._runtime is None
+    assert volume.reload_count == 1
+
+
+def test_spawn_remote_workflow_node_rejects_non_function_call(
+    tmp_path: Path,
+) -> None:
+    class BadRemoteMethod:
+        def spawn(self, *args):
+            return object()
+
+    context = NodeRunContext(
+        run_id="run-1",
+        node_id="remote",
+        attempt_id="attempt-1",
+        cache_dir=tmp_path / "cache",
+        inputs={},
+    )
+
+    with pytest.raises(TypeError, match="FunctionCall"):
+        orchestrator._spawn_remote_workflow_node(
+            cast(Any, BadRemoteMethod()),
+            SucceedNode(),
+            context,
+        )
+
+
 def test_orchestrator_remote_node_method_commits_after_exception(
     tmp_path: Path,
     monkeypatch,
@@ -225,7 +270,7 @@ def test_load_workflow_definition_rejects_serialized_dict_factory(
     monkeypatch,
 ) -> None:
     module = types.ModuleType("fake_workflow_factory")
-    setattr(module, "build", lambda: {"nodes": []})
+    module.build = lambda: {"nodes": []}
     monkeypatch.setitem(sys.modules, "fake_workflow_factory", module)
 
     with pytest.raises(TypeError, match="must return a Workflow"):
@@ -237,7 +282,7 @@ def test_load_workflow_definition_accepts_importable_module_factory(
 ) -> None:
     workflow = Workflow("demo")
     module = types.ModuleType("importable_workflow_factory")
-    setattr(module, "build", lambda: workflow)
+    module.build = lambda: workflow
     monkeypatch.setitem(sys.modules, "importable_workflow_factory", module)
 
     assert (

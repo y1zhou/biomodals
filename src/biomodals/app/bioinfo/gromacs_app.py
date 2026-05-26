@@ -350,8 +350,19 @@ def prepare_tpr_cpu(
     timeout=CONF.timeout,
     volumes={CONF.output_volume_mountpoint: OUTPUTS_VOLUME},
 )
-def find_traj_last_step(traj_file: str) -> int:
-    """Calculated simulated steps from the simulation time (in ps) in a trajectory."""
+def find_traj_last_time_ns(traj_file: str) -> float:
+    """Calculate the last-readable simulation time (ns) in a trajectory.
+
+    In our setup, dt=2fs=0.002ps; `gmx check` normally reports the simulation
+    time in ps, so we can convert it to #steps by dividing by `dt=0.002`.
+
+    Because we setup the simulation by inputting the expected nanoseconds,
+    #steps = ns * 500000.
+
+    When the simulation was interrupted, `gmx check` may only report the #frames
+    and timestep size, so we need to manually calculate the closest last step
+    that is within the trajectory bounds.
+    """
     import shutil
 
     traj_path = Path(traj_file)
@@ -365,13 +376,27 @@ def find_traj_last_step(traj_file: str) -> int:
     cmd = [gmx, "check", "-f", str(traj_path)]
     result = run_command(cmd, cwd=traj_path.parent, verbose=False)
 
-    last_time = None
     for line in result:
+        # Last frame      20000 time 200000.000
         if line.startswith("Last frame"):
-            last_time = float(line.strip().split(" ")[-1])
-    if last_time is None:
-        raise ValueError("Last frame time not found in trajectory")
-    return int(last_time / 0.002)  # dt=2 fs, which is 0.002 ps
+            last_time_ps = float(line.strip().split(" ")[-1])
+            return last_time_ps * 0.001
+
+    # Be robust in case the run was interrupted
+    # Item        #frames Timestep (ps)
+    # Step         20001    10
+    header_line_idx = -1
+    header_cols = ["Item", "#frames", "Timestep", "(ps)"]
+    for i, line in enumerate(result):
+        if line.startswith("Item") and line.strip().split() == header_cols:
+            header_line_idx = i
+            break
+    if header_line_idx != -1:
+        readable_line = result[header_line_idx + 1].strip()
+        _, frames, timestep_ps = readable_line.split()
+        return float((int(frames) - 1) * float(timestep_ps)) * 0.001
+
+    raise ValueError("Last frame time not found in trajectory")
 
 
 @app.function(
@@ -399,11 +424,10 @@ def production_run_gpu(
     # Pick up exisiting trajectory and continue simulation when checkpoint exists
     traj_file_path = work_path / f"{deffnm}.xtc"
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
-    nsteps = -2  # default: find nsteps from the mdp file
+    nsteps = -1  # default: find nsteps from the mdp file
     if traj_file_path.exists() and checkpoint_file_path.exists():
-        simulated_steps = find_traj_last_step.remote(str(traj_file_path))
-        total_steps = simulation_time_ns * 500000  # 2 fs timestep
-        nsteps = total_steps - simulated_steps
+        simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
+        nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep
         if nsteps <= 0:
             print("✅ Production run already completed, skipping.")
             return str(work_path)
@@ -469,11 +493,10 @@ def production_run_cpu(
     # Pick up exisiting trajectory and continue simulation when checkpoint exists
     traj_file_path = work_path / f"{deffnm}.xtc"
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
-    nsteps = -2  # default: find nsteps from the mdp file
+    nsteps = -1  # default: find nsteps from the mdp file
     if traj_file_path.exists() and checkpoint_file_path.exists():
-        simulated_steps = find_traj_last_step.remote(str(traj_file_path))
-        total_steps = simulation_time_ns * 500000  # 2 fs timestep
-        nsteps = total_steps - simulated_steps
+        simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
+        nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep
         if nsteps <= 0:
             print("✅ Production run already completed, skipping.")
             return str(work_path)

@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from biomodals.workflow.ppiflow_workflow import _collect_local_inputs
+from biomodals.workflow.ppiflow_workflow import (
+    _collect_local_inputs,
+    build_local_output_path,
+)
 
 
 def test_collect_local_inputs_rejects_sanitized_name_collisions(
@@ -64,3 +67,14 @@ def test_collect_local_inputs_stages_steps_yaml_references(
     )
 
     assert staged == [("constraints.csv", b"chain,pos\nA,1\n")]
+
+
+def test_build_local_output_path_allows_blank_optional_parts(tmp_path: Path) -> None:
+    out_path = build_local_output_path(
+        tmp_path,
+        run_name="demo",
+        prefix=" ",
+        suffix="",
+    )
+
+    assert out_path == tmp_path / "demo.tar.zst"

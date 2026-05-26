@@ -146,7 +146,10 @@ def resolve_local_output_dir(out_dir: str | Path | None) -> Path:
 def _clean_filename_part(value: str | Path | None) -> str:
     if value is None:
         return ""
-    cleaned = sanitize_filename(str(value))
+    raw_value = str(value)
+    if not raw_value.strip():
+        return ""
+    cleaned = sanitize_filename(raw_value)
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
     return re.sub(r"_+", "_", cleaned).strip("._-")
 
@@ -537,18 +540,16 @@ def _iter_file_refs(obj: Any) -> list[str]:
             key_text = str(key).lower()
             if isinstance(value, str):
                 suffix = Path(value).suffix.lower()
-                if suffix in LOCAL_INPUT_SUFFIXES or key_text.endswith(
-                    (
-                        "pdb",
-                        "cif",
-                        "csv",
-                        "json",
-                        "yaml",
-                        "yml",
-                        "file",
-                        "path",
-                    )
-                ):
+                if suffix in LOCAL_INPUT_SUFFIXES or key_text.endswith((
+                    "pdb",
+                    "cif",
+                    "csv",
+                    "json",
+                    "yaml",
+                    "yml",
+                    "file",
+                    "path",
+                )):
                     refs.append(value)
             else:
                 refs.extend(_iter_file_refs(value))
@@ -643,9 +644,9 @@ def _call_ppiflow(
     ppiflow_fn = _remote_function(state.app_names, "ppiflow", "ppiflow_run")
     from biomodals.app.design.ppiflow_app import PPIFlowArgs
 
-    ppiflow_args = PPIFlowArgs.model_validate(
-        {"args": _rewrite_config_paths(config, staged_paths)}
-    )
+    ppiflow_args = PPIFlowArgs.model_validate({
+        "args": _rewrite_config_paths(config, staged_paths)
+    })
     remote_workdir = ppiflow_fn.remote(ppiflow_args, volume_run)
     remote_prefix = _mounted_path_to_volume_path(remote_workdir)
     _copy_volume_tree(ppiflow_volume, remote_prefix, out_dir / volume_run)
@@ -849,13 +850,11 @@ def _collect_mpnn_sequences(mpnn_out: Path, output_csv: Path) -> None:
         if parts:
             seqs.append("".join(parts))
         for idx, seq in enumerate(seqs[1:] or seqs):
-            rows.append(
-                {
-                    "link_name": f"{fasta.stem}.pdb".lower(),
-                    "sequence_dict": str({"A": seq.split("/")[0]}),
-                    "seq_idx": idx,
-                }
-            )
+            rows.append({
+                "link_name": f"{fasta.stem}.pdb".lower(),
+                "sequence_dict": str({"A": seq.split("/")[0]}),
+                "seq_idx": idx,
+            })
     _write_csv_rows(output_csv, ["link_name", "sequence_dict", "seq_idx"], rows)
 
 
@@ -908,18 +907,14 @@ def _run_mpnn_stage(
     tasks: list[dict[str, Any]] = []
     for idx, pdb_path in enumerate(copied_pdbs, start=1):
         fixed_residues = fixed_map.get(pdb_path.stem.lower())
-        tasks.append(
-            {
-                "kind": "ligandmpnn",
-                "run_name": f"{state.run_name}-{step_name}-{idx}",
-                "input_path": str(pdb_path),
-                "output_dir": str(mpnn_out / pdb_path.stem),
-                "seeds": _seeds_from_cfg(cfg),
-                "cli_args": _ligandmpnn_cli_args(
-                    state, cfg, fixed_residues=fixed_residues
-                ),
-            }
-        )
+        tasks.append({
+            "kind": "ligandmpnn",
+            "run_name": f"{state.run_name}-{step_name}-{idx}",
+            "input_path": str(pdb_path),
+            "output_dir": str(mpnn_out / pdb_path.stem),
+            "seeds": _seeds_from_cfg(cfg),
+            "cli_args": _ligandmpnn_cli_args(state, cfg, fixed_residues=fixed_residues),
+        })
     _run_queue(state, step_name.lower(), tasks)
     _collect_mpnn_sequences(mpnn_out, mpnn_pdbs_dir / "mpnn_seqs.csv")
     mpnn_pdbs = _collect_pdb_files(mpnn_out)
@@ -1197,20 +1192,18 @@ def _rosetta_jobs(
 ) -> list[dict[str, object]]:
     jobs: list[dict[str, object]] = []
     for idx, pdb_path in enumerate(pdbs, start=1):
-        jobs.append(
-            {
-                "index": idx,
-                "pdb_name": pdb_path.name,
-                "pdb_bytes": pdb_path.read_bytes(),
-                "binary": str(
-                    cfg.get("binary") or cfg.get("rosetta_binary") or binary_default
-                ),
-                "rosetta_script_text": cfg.get("rosetta_script_text"),
-                "rosetta_script_name": cfg.get("rosetta_script_name", "protocol.xml"),
-                "flags_text": cfg.get("flags_text"),
-                "flags_name": cfg.get("flags_name", "flags.txt"),
-            }
-        )
+        jobs.append({
+            "index": idx,
+            "pdb_name": pdb_path.name,
+            "pdb_bytes": pdb_path.read_bytes(),
+            "binary": str(
+                cfg.get("binary") or cfg.get("rosetta_binary") or binary_default
+            ),
+            "rosetta_script_text": cfg.get("rosetta_script_text"),
+            "rosetta_script_name": cfg.get("rosetta_script_name", "protocol.xml"),
+            "flags_text": cfg.get("flags_text"),
+            "flags_name": cfg.get("flags_name", "flags.txt"),
+        })
     return jobs
 
 
@@ -1270,15 +1263,13 @@ def _run_rosetta_jobs_with_volume(
                         f"/{remote_flags}",
                     )
 
-                queue.put(
-                    {
-                        "index": job_idx,
-                        "binary": job["binary"],
-                        "pdb": remote_pdb,
-                        "rosetta_script": remote_script,
-                        "flags_file": remote_flags,
-                    }
-                )
+                queue.put({
+                    "index": job_idx,
+                    "binary": job["binary"],
+                    "pdb": remote_pdb,
+                    "rosetta_script": remote_script,
+                    "flags_file": remote_flags,
+                })
 
         rosetta_fn = _remote_function(app_names, "rosetta", "run_rosetta")
         package_fn = _remote_function(app_names, "rosetta", "package_outputs_helper")
@@ -1414,12 +1405,10 @@ def _pdb_to_sequences(path: Path) -> list[tuple[str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        residues.setdefault(chain, []).append(
-            (
-                (res_id, resname),
-                AA3_TO_1.get(resname, "X"),
-            )
-        )
+        residues.setdefault(chain, []).append((
+            (res_id, resname),
+            AA3_TO_1.get(resname, "X"),
+        ))
     return [
         (chain, "".join(aa for _, aa in chain_residues))
         for chain, chain_residues in residues.items()
@@ -1453,32 +1442,28 @@ def _run_refold_and_relax(state: WorkflowState, source_pdbs: list[Path]) -> None
             json_path = output_dir / "input.json"
             json_path.parent.mkdir(parents=True, exist_ok=True)
             json_path.write_bytes(_af3_json_for_pdb(pdb_path, refold_cfg))
-            tasks.append(
-                {
-                    "kind": "af3_refold",
-                    "run_name": f"{state.run_name}-refold-{idx}",
-                    "input_path": str(pdb_path),
-                    "output_dir": str(output_dir),
-                    "json_path": str(json_path),
-                    "recycle": _as_int(refold_cfg.get("recycle"), 10),
-                    "sample": _as_int(
-                        refold_cfg.get("sample", refold_cfg.get("seed_num")), 5
-                    ),
-                }
-            )
+            tasks.append({
+                "kind": "af3_refold",
+                "run_name": f"{state.run_name}-refold-{idx}",
+                "input_path": str(pdb_path),
+                "output_dir": str(output_dir),
+                "json_path": str(json_path),
+                "recycle": _as_int(refold_cfg.get("recycle"), 10),
+                "sample": _as_int(
+                    refold_cfg.get("sample", refold_cfg.get("seed_num")), 5
+                ),
+            })
     if _step_enabled(state.enabled, "RosettaRelaxStep"):
         for idx, pdb_path in enumerate(source_pdbs, start=1):
-            tasks.append(
-                {
-                    "kind": "rosetta_relax",
-                    "run_name": f"{state.run_name}-relax-{idx}",
-                    "input_path": str(pdb_path),
-                    "output_dir": str(
-                        state.stage2_dir / "rosetta_relax_output" / pdb_path.stem
-                    ),
-                    "rosetta_cfg": relax_cfg,
-                }
-            )
+            tasks.append({
+                "kind": "rosetta_relax",
+                "run_name": f"{state.run_name}-relax-{idx}",
+                "input_path": str(pdb_path),
+                "output_dir": str(
+                    state.stage2_dir / "rosetta_relax_output" / pdb_path.stem
+                ),
+                "rosetta_cfg": relax_cfg,
+            })
     _run_queue(state, "refold-relax", tasks)
 
 
@@ -1505,15 +1490,13 @@ def _pair_refold_models(
         )
         if ref is None:
             continue
-        pairs.append(
-            {
-                "id": f"{ref.stem}_{idx}",
-                "model_name": model.name,
-                "model_bytes": model.read_bytes(),
-                "reference_name": ref.name,
-                "reference_bytes": ref.read_bytes(),
-            }
-        )
+        pairs.append({
+            "id": f"{ref.stem}_{idx}",
+            "model_name": model.name,
+            "model_bytes": model.read_bytes(),
+            "reference_name": ref.name,
+            "reference_bytes": ref.read_bytes(),
+        })
     return pairs
 
 
@@ -1584,17 +1567,15 @@ def _rank_and_report(state: WorkflowState, filtered_pdbs: list[Path]) -> None:
         dockq_row = dockq_by_ref.get(pdb_path.stem.lower()) or dockq_by_id.get(
             pdb_path.stem, {}
         )
-        ranked_rows.append(
-            {
-                "design": pdb_path.stem,
-                "pdb": str(pdb_path.relative_to(state.run_root)),
-                "iptm": af_row.get("iptm", af_row.get("ranking_score", "")),
-                "dockq": dockq_row.get("dockq", ""),
-                "irmsd": dockq_row.get("irmsd", ""),
-                "lrmsd": dockq_row.get("lrmsd", ""),
-                "fnat": dockq_row.get("fnat", ""),
-            }
-        )
+        ranked_rows.append({
+            "design": pdb_path.stem,
+            "pdb": str(pdb_path.relative_to(state.run_root)),
+            "iptm": af_row.get("iptm", af_row.get("ranking_score", "")),
+            "dockq": dockq_row.get("dockq", ""),
+            "irmsd": dockq_row.get("irmsd", ""),
+            "lrmsd": dockq_row.get("lrmsd", ""),
+            "fnat": dockq_row.get("fnat", ""),
+        })
 
     ranked_rows.sort(
         key=lambda row: (_safe_float(row.get("dockq")), _safe_float(row.get("iptm"))),

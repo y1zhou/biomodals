@@ -3,7 +3,7 @@
 ## Repository expectations
 
 - This is a Python 3.12+ project for running bioinformatics tools on Modal.
-- Prefer `uv run ...` for project commands and `biomodals` CLI smoke tests.
+- Prefer `uv run ...` for project commands and `biomodals` CLI smoke tests. Never run `python ...` directly.
 - Use `polars` for tabular data parsing and writing in Python code; avoid new
   `csv` or `pandas` parsing unless an upstream tool API specifically requires it.
 - Use `orjson` for non-Pydantic JSON serialization and deserialization. For
@@ -12,6 +12,7 @@
 - CI runs `prek` against `.pre-commit-config.yaml`; after code edits, run `prek run --files <changed files>` when practical.
 - For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` when practical.
 - Keep generated archives, large run outputs, Modal result directories, and local test data out of commits unless the user explicitly asks for them.
+- Avoid extracting trivial helper functions that are only a couple of lines and used once or twice; inline the logic and add comments when that is clearer.
 
 ## Instruction maintenance
 

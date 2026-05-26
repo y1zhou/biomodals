@@ -30,7 +30,10 @@ Keep app code compatible with `biomodals help` and app discovery:
 - Use module-level `CONF = AppConfig(...)` for new apps; pin `repo_commit_hash` or `version`.
 - Let `gpu` and `timeout` be overridden from `os.environ`.
 - Build runtime images through `patch_image_for_helper(...)`.
-- Prefer helpers from `biomodals.helper` and `biomodals.helper.shell` instead of open-coded shell, archive, copy, download, hashing, or warmup logic.
+- Before adding app or workflow helpers, check `biomodals.helper` first.
+  Reuse existing helper APIs for local output paths, shell, archive, copy,
+  download, hashing, warmup, and serialization behavior; only define local
+  helpers when the behavior is app-specific and no shared helper fits.
 - Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals help <app>` renders flags.
 - Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
 - Keep Modal function return values primitive when practical: `int`, `str`,

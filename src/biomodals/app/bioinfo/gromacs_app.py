@@ -424,7 +424,7 @@ def production_run_gpu(
     # Pick up exisiting trajectory and continue simulation when checkpoint exists
     traj_file_path = work_path / f"{deffnm}.xtc"
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
-    nsteps = -1  # default: find nsteps from the mdp file
+    nsteps = -2  # default: use nsteps from the prepared TPR
     if traj_file_path.exists() and checkpoint_file_path.exists():
         simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
         nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep
@@ -493,7 +493,7 @@ def production_run_cpu(
     # Pick up exisiting trajectory and continue simulation when checkpoint exists
     traj_file_path = work_path / f"{deffnm}.xtc"
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
-    nsteps = -1  # default: find nsteps from the mdp file
+    nsteps = -2  # default: use nsteps from the prepared TPR
     if traj_file_path.exists() and checkpoint_file_path.exists():
         simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
         nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep

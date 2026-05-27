@@ -605,6 +605,7 @@ def submit_alphafold3_task(
     local_out_dir = resolve_local_output_dir(out_dir)
 
     new_conf = _load_conf_from_bytes(json_bytes)
+    new_conf.name = run_name
     new_conf.modelSeeds = conf.modelSeeds
     num_seeds = len(new_conf.modelSeeds)
     num_containers = max(1, min(max_num_gpus, num_seeds))

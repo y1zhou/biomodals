@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+import shutil
 from pathlib import Path
 
 from biomodals.app.bioinfo import gromacs_app
@@ -66,3 +67,41 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
             {"run_name": "single", "save_processed_traj": True},
         ),
     ]
+
+
+def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> None:
+    work_path = tmp_path / "fresh"
+    work_path.mkdir()
+    work_path.joinpath("production_fresh.tpr").write_text("tpr\n", encoding="utf-8")
+    captured = {}
+
+    class FakeVolume:
+        def __init__(self) -> None:
+            self.commit_count = 0
+
+        def commit(self) -> None:
+            self.commit_count += 1
+
+    volume = FakeVolume()
+    monkeypatch.setattr(gromacs_app.CONF, "output_volume_mountpoint", str(tmp_path))
+    monkeypatch.setattr(gromacs_app, "OUTPUTS_VOLUME", volume)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gmx")
+
+    def fake_run_command(cmd, *, cwd, env):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["env"] = env
+        return []
+
+    monkeypatch.setattr(gromacs_app, "run_command", fake_run_command)
+
+    result = gromacs_app.production_run_cpu.get_raw_f()(
+        run_name="fresh",
+        simulation_time_ns=2,
+    )
+
+    nsteps_index = captured["cmd"].index("-nsteps")
+    assert captured["cmd"][nsteps_index + 1] == "-2"
+    assert captured["cwd"] == str(work_path)
+    assert result == str(work_path)
+    assert volume.commit_count == 1

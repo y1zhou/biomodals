@@ -22,7 +22,7 @@ For new apps, ask the user which data-flow class applies before choosing archite
 
 ## Implementation Rules
 
-Keep app code compatible with `biomodals help` and app discovery:
+Keep app code compatible with `biomodals app help` and app discovery:
 
 - Name files `<toolname>_app.py` under `src/biomodals/app/<category>/`.
 - Use a user-facing module docstring with upstream links, prerequisites, and output behavior.
@@ -34,7 +34,7 @@ Keep app code compatible with `biomodals help` and app discovery:
   Reuse existing helper APIs for local output paths, shell, archive, copy,
   download, hashing, warmup, and serialization behavior; only define local
   helpers when the behavior is app-specific and no shared helper fits.
-- Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals help <app>` renders flags.
+- Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals app help <app>` renders flags.
 - Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
 - Keep Modal function return values primitive when practical: `int`, `str`,
   `float`, `bool`, `bytes`, `list`, `dict`, or `None`. Return complex objects
@@ -57,7 +57,7 @@ When reviewing or finishing an app change, check:
   or dataclasses.
 - Output safety: local output directories are created, existing tarballs are not overwritten accidentally, and final paths or Modal volume locations are printed.
 - CLI docs: local entrypoint docstrings use exact Google-style `Args:` formatting with continuation indentation.
-- Verification: run `prek run --files <changed files>` when practical, plus `uv run biomodals list` and `uv run biomodals help <app-name>` for CLI or discovery changes.
+- Verification: run `prek run --files <changed files>` when practical, plus `uv run biomodals app list` and `uv run biomodals app help <app-name>` for CLI or discovery changes.
 
 ## Reference
 

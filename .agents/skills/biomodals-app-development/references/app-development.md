@@ -6,9 +6,9 @@ This reference is the maintained app-development standard for files under `src/b
 
 Biomodals apps are self-contained Modal applications wrapping bioinformatics tools. They live under `src/biomodals/app/<category>/`.
 
-- Name app files `<toolname>_app.py`; the `_app.py` suffix is how `cli.py` discovers apps with `APP_HOME.glob("*/*_app.py")`.
+- Name app files `<toolname>_app.py`; the `_app.py` suffix is how `biomodals.helper.catalog` discovers apps by scanning `src/biomodals/app/<category>/*_app.py`.
 - Place apps in an appropriate category such as `fold/`, `design/`, `score/`, or `bioinfo/`.
-- The CLI app name is the filename stem with `_app` stripped, for example `protenix_app.py` becomes `protenix`.
+- The catalog entry name is the filename stem with `_app` stripped, for example `protenix_app.py` becomes `protenix`.
 - Use section banners to keep modules scan-friendly:
   - module docstring
   - imports
@@ -20,7 +20,7 @@ Biomodals apps are self-contained Modal applications wrapping bioinformatics too
 
 ## Module Docstring
 
-The module docstring is rendered verbatim by `biomodals help <app>` as Markdown. Keep it user-facing and include the upstream source URL, important prerequisites, caveats, and output behavior.
+The module docstring is rendered verbatim by `biomodals app help <app>` as Markdown. Keep it user-facing and include the upstream source URL, important prerequisites, caveats, and output behavior.
 
 Typical shape:
 
@@ -48,6 +48,12 @@ Use optional configuration tables only when the local entrypoint docstring is in
 
 New apps should define module-level `CONF = AppConfig(...)`.
 
+The pure Pydantic schema lives in `biomodals.schema.app.AppConfig`. Import the
+Modal-compatible wrapper from `biomodals.app.config` when you need volume or
+image helpers; otherwise import the schema directly. The wrapper adds
+`get_out_volume()` but keeps the same fields, computed properties, and
+validators as the schema.
+
 ```python
 from biomodals.app.config import AppConfig
 
@@ -62,6 +68,7 @@ CONF = AppConfig(
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "3600")),
+    depends_on_apps=("gromacs",),  # only for workflows that compose other apps
 )
 ```
 
@@ -71,6 +78,7 @@ Rules:
 - Let `gpu` and `timeout` be overridden by environment variables with sensible defaults.
 - Use `CONF.default_env` when setting image environment variables. It provides standard UV, Hugging Face, Torch, and torch backend environment.
 - Use `CONF.model_dir`, `CONF.git_clone_dir`, `CONF.model_volume_mountpoint`, and related fields instead of hardcoded paths.
+- Set `depends_on_apps` only for workflow apps that compose other Biomodals apps; standalone apps should leave it empty.
 
 Use an `AppInfo` dataclass only when grouping several related app constants improves readability. For a few simple constants, module-level constants such as `OUT_VOLUME` or `OUTPUTS_DIR` are acceptable.
 
@@ -97,7 +105,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 ## Volumes
 
-- Import shared volumes from `biomodals.app.constant`, such as `MODEL_VOLUME` or `MSA_CACHE_VOLUME`.
+- Import shared volumes from `biomodals.helper.constant`, such as `MODEL_VOLUME` or `MSA_CACHE_VOLUME`.
 - Mount model weights read-only for inference when the function only reads model artifacts.
 - Use `CONF.model_volume_mountpoint` for model volume mount paths.
 - Commit volume changes explicitly after writes with `VOLUME.commit()`.
@@ -164,7 +172,7 @@ The `@app.local_entrypoint()` function is the user-facing orchestration layer on
 - Write returned tarball bytes locally.
 - Print final local path or Modal volume location.
 
-Docstring rules for `biomodals help`:
+Docstring rules for `biomodals app help`:
 
 - Use Google-style docstrings with an `Args:` section.
 - Put `Args:` on its own line.
@@ -203,10 +211,10 @@ Older apps can use raw constants such as `GPU`, `TIMEOUT`, and `APP_NAME`. When 
 
 ## Examples And Verification
 
-- When app development changes invocation or adds a new app, add or update an example bash script under `examples/app/` using `biomodals run`.
+- When app development changes invocation or adds a new app, add or update an example bash script under `examples/app/` using `biomodals app run`.
 - Use small example inputs under `examples/data/` only when existing data is insufficient.
 - For Modal functions, verify returned payloads are primitive or otherwise
   intentionally complex and `cloudpickle`-serializable; convert returned paths to
   strings.
 - After edits, run `prek run --files <changed files>` when practical.
-- For CLI or app discovery changes, smoke test `uv run biomodals list` and `uv run biomodals help <app-name>` when practical.
+- For CLI or app discovery changes, smoke test `uv run biomodals app list` and `uv run biomodals app help <app-name>` when practical.

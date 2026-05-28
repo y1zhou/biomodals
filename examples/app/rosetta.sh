@@ -15,6 +15,6 @@ cd "${temp_dir}" || exit 1
 
 gunzip -c "${pembro_pdb}" > "${temp_dir}/5B8C.pdb"
 cp -an "${SCRIPT_DIR}/../data/rosetta_example.csv" "${temp_dir}/rosetta_example.csv"
-"${ENTRY_BIN}" r rosetta -- \
+"${ENTRY_BIN}" app r rosetta -- \
     --input-csv "${temp_dir}/rosetta_example.csv" \
     --max-num-pods 2

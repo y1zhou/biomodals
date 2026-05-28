@@ -16,5 +16,5 @@ cd "${temp_dir}" || exit 1
 
 gunzip -c "${pembro_pdb}" > "${temp_dir}/5B8C.pdb"
 gunzip -c "${vhh_pdb}" > "${temp_dir}/7eow_nanobody_framework.pdb"
-"${ENTRY_BIN}" r ppiflow -- \
+"${ENTRY_BIN}" app r ppiflow -- \
     --input-yaml "${SCRIPT_DIR}/../data/ppiflow_vhh.yaml"

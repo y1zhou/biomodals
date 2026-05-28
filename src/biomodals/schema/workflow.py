@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from biomodals.schema.storage import VolumePath
+
+# < Python 3.11 guards
+try:
+    from datetime import UTC
+    from enum import StrEnum
+except ImportError:
+    from datetime import timezone
+
+    from backports.strenum import StrEnum  # noqa: UP035
+
+    UTC = timezone.utc  # noqa: UP017
 
 
 class ArtifactKind(StrEnum):

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+try:
+    from enum import StrEnum
+except ImportError:
+    from backports.strenum import StrEnum  # noqa: UP035
 
 
 class StorageKind(StrEnum):

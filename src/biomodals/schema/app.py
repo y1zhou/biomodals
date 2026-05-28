@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,11 @@ from pydantic import BaseModel, Field, computed_field, model_validator
 
 from biomodals.schema.storage import InlineBytes, VolumePath
 from biomodals.schema.workflow import ArtifactKind
+
+try:
+    from enum import StrEnum
+except ImportError:
+    from backports.strenum import StrEnum  # noqa: UP035
 
 APP_CONFIG_MAX_TIMEOUT = 86_400
 

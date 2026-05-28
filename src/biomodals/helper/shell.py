@@ -105,8 +105,15 @@ def run_command_with_log(
     """Run a shell command and log output to a file."""
     import shlex
     import subprocess as sp
-    from datetime import UTC, datetime, timedelta
+    from datetime import datetime, timedelta
     from time import time
+
+    try:
+        from datetime import UTC
+    except ImportError:
+        from datetime import timezone
+
+        UTC = timezone.utc  # noqa: UP017
 
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
@@ -317,7 +324,7 @@ def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
     for p in subprocesses:
         _, p_stderr = p.communicate()
         if p.returncode != 0:
-            p_cmd = shlex.join(p.args)
+            p_cmd = shlex.join(p.args)  # type: ignore[ty:invalid-argument-type]
             p_err_msg = p_stderr.decode().strip()
             err_msgs.append(
                 f"'{p_cmd}' failed with return code {p.returncode}: {p_err_msg}"

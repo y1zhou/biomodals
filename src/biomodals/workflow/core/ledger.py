@@ -6,7 +6,7 @@ import shutil
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from threading import RLock
@@ -27,6 +27,13 @@ from biomodals.schema import (
     WorkflowArtifact,
     WorkflowRun,
 )
+
+try:
+    from datetime import UTC
+except ImportError:
+    from datetime import timezone
+
+    UTC = timezone.utc  # noqa: UP017
 
 LEDGER_FILENAME = "ledger.sqlite3"
 LEDGER_TABLES = (

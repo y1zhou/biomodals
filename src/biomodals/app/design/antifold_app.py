@@ -54,7 +54,8 @@ runtime_image = (
         find_links=f"https://data.pyg.org/whl/torch-2.2.0+{CONF.cuda_version}.html",
         extra_options="--no-build-isolation",  # https://github.com/astral-sh/uv/issues/5040
     )
-    .pipe(patch_image_for_helper)
+    .uv_pip_install("backports.strenum")  # <3.11
+    .pipe(patch_image_for_helper, skip_deps=["uniaf3"])
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

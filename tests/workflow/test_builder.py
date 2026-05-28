@@ -77,22 +77,3 @@ def test_cycles_raise_value_error() -> None:
 
     with pytest.raises(ValueError, match="cycle"):
         workflow.validate()
-
-
-def test_sibling_nodes_are_ready_after_shared_upstream_completes() -> None:
-    workflow = Workflow("demo")
-    upstream = workflow.add_node(DummyNode(), id="design")
-    workflow.add_node(
-        DummyNode(),
-        id="score-a",
-        inputs={"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)},
-    )
-    workflow.add_node(
-        DummyNode(),
-        id="score-b",
-        inputs={"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)},
-    )
-
-    ready = workflow.ready_nodes(completed_node_ids={"design"})
-
-    assert ready == ["score-a", "score-b"]

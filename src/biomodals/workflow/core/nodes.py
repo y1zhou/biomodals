@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
-
-import modal
+from typing import Protocol
 
 from biomodals.schema import (
     AppRunResult,
@@ -51,43 +49,9 @@ class WorkflowNativeNode:
 class AppBackedNode:
     """Base class for workflow nodes implemented by calling app functions."""
 
-    app_name: str | None = None
-    function_name: str | None = None
-    app_function: modal.Function | None = None
     execution_policy = NodeExecutionPolicy.RERUN
     placement = NodePlacement.REMOTE
 
     def run(self, context: NodeRunContext) -> AppRunResult:
-        """Load and call the backing Modal function."""
-        app_function = self.load_app_function()
-        raw_result = self.invoke_app_function(
-            app_function,
-            self.build_app_function_kwargs(context),
-        )
-        return AppRunResult.model_validate(raw_result)
-
-    def load_app_function(self) -> modal.Function:
-        """Load the backing Modal function lazily."""
-        if self.app_function is not None:
-            return self.app_function
-        if self.app_name is None or self.function_name is None:
-            raise NotImplementedError(
-                "App-backed nodes must define app_name/function_name or override "
-                "load_app_function()"
-            )
-
-        return modal.Function.from_name(self.app_name, self.function_name)
-
-    def build_app_function_kwargs(self, context: NodeRunContext) -> dict[str, Any]:
-        """Build keyword arguments for the backing Modal function."""
-        return {}
-
-    def invoke_app_function(
-        self,
-        app_function: modal.Function,
-        kwargs: dict[str, Any],
-    ) -> object:
-        """Call a loaded Modal function."""
-        if not hasattr(app_function, "remote"):
-            raise TypeError("App-backed nodes require a Modal function with remote()")
-        return app_function.remote(**kwargs)
+        """Execute the app-backed node implementation."""
+        raise NotImplementedError

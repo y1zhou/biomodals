@@ -34,7 +34,6 @@ LEDGER_TABLES = (
     "nodes",
     "attempts",
     "remote_calls",
-    "node_tasks",
     "artifacts",
     "artifact_files",
     "node_inputs",
@@ -201,7 +200,6 @@ class WorkflowLedger:
                 )
             conn.execute("DELETE FROM node_inputs WHERE node_id = ?", (node_id,))
             conn.execute("DELETE FROM node_outputs WHERE node_id = ?", (node_id,))
-            conn.execute("DELETE FROM node_tasks WHERE node_id = ?", (node_id,))
             conn.execute("DELETE FROM remote_calls WHERE node_id = ?", (node_id,))
             conn.execute("DELETE FROM attempts WHERE node_id = ?", (node_id,))
             conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
@@ -1049,21 +1047,6 @@ class WorkflowLedger:
                 metadata_json TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS node_tasks (
-                task_id TEXT PRIMARY KEY,
-                node_id TEXT NOT NULL,
-                attempt_id TEXT,
-                status TEXT NOT NULL,
-                input_artifact_id TEXT,
-                output_artifact_id TEXT,
-                remote_call_id TEXT,
-                claimed_by TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                error TEXT,
-                metadata_json TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS artifacts (
                 artifact_id TEXT PRIMARY KEY,
                 producing_node_id TEXT NOT NULL,
@@ -1104,8 +1087,6 @@ class WorkflowLedger:
                 ON attempts(node_id);
             CREATE INDEX IF NOT EXISTS idx_remote_calls_node_status
                 ON remote_calls(node_id, status);
-            CREATE INDEX IF NOT EXISTS idx_node_tasks_node_status
-                ON node_tasks(node_id, status);
             CREATE INDEX IF NOT EXISTS idx_artifacts_producing_node
                 ON artifacts(producing_node_id);
             """

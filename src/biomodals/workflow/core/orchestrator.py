@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import cast
 
 import modal
 
@@ -39,17 +38,6 @@ runtime_image = patch_image_for_helper(
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
-def _spawn_remote_workflow_node(
-    remote_method: modal.Function,
-    node: WorkflowNode,
-    context: NodeRunContext,
-) -> RemoteFunctionCall:
-    function_call = remote_method.spawn(node, context)
-    if not hasattr(function_call, "object_id") or not hasattr(function_call, "get"):
-        raise TypeError("Remote workflow node spawn did not return a FunctionCall")
-    return cast(RemoteFunctionCall, function_call)
-
-
 @app.cls(
     cpu=(1.125, 16.125),
     memory=(1024, 65536),
@@ -82,12 +70,18 @@ class WorkflowOrchestrator:
             node: WorkflowNode,
             context: NodeRunContext,
         ) -> RemoteFunctionCall:
-            return _spawn_remote_workflow_node(self.run_node, node, context)
+            function_call = self.run_node.spawn(node, context)
+            if not hasattr(function_call, "object_id") or not hasattr(
+                function_call, "get"
+            ):
+                raise TypeError(
+                    "Remote workflow node spawn did not return a FunctionCall"
+                )
+            return function_call
 
         OUT_VOLUME.reload()
-        self._runtime = WorkflowRuntime.from_definition(
-            workflow_name=workflow.name,
-            workflow_definition=workflow,
+        self._runtime = WorkflowRuntime(
+            workflow=workflow,
             volume_root=Path(CONF.output_volume_mountpoint),
             workflow_volume_name=OUT_VOLUME_NAME,
             workflow_volume=OUT_VOLUME,

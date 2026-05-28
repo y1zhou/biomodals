@@ -89,43 +89,6 @@ class WorkflowRuntime:
         self._active_remote_calls: dict[str, RemoteFunctionCall] = {}
         self._active_remote_calls_lock = RLock()
 
-    @classmethod
-    def from_definition(
-        cls,
-        *,
-        workflow_name: str,
-        workflow_definition: Workflow | dict[str, object],
-        volume_root: str | Path,
-        workflow_volume_name: str | None = None,
-        workflow_volume: WorkflowVolume | None = None,
-        remote_node_runner: RemoteNodeRunner | None = None,
-        remote_node_function_name: str | None = None,
-        function_call_resolver: FunctionCallResolver | None = None,
-        max_ready_workers: int = 32,
-    ) -> WorkflowRuntime:
-        """Create a runtime from a Python workflow definition."""
-        if isinstance(workflow_definition, Workflow):
-            if workflow_definition.name != workflow_name:
-                raise ValueError(
-                    "workflow_name must match the supplied Workflow definition"
-                )
-            return cls(
-                workflow=workflow_definition,
-                volume_root=volume_root,
-                workflow_volume_name=(
-                    workflow_volume_name or f"{workflow_name}-outputs"
-                ),
-                workflow_volume=workflow_volume,
-                remote_node_runner=remote_node_runner,
-                remote_node_function_name=remote_node_function_name,
-                function_call_resolver=function_call_resolver,
-                max_ready_workers=max_ready_workers,
-            )
-        raise NotImplementedError(
-            "Serialized workflow definition dictionaries are deferred; pass a "
-            "Python Workflow object to the first runtime"
-        )
-
     def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
         """Run the workflow until every node succeeds or no progress is possible."""
         definition = self.workflow.validate()
@@ -135,7 +98,9 @@ class WorkflowRuntime:
             f"with {len(definition.nodes)} node(s)",
             flush=True,
         )
-        print("[workflow] DAG graph:", flush=True)
+        print(
+            "[workflow] DAG graph: node_id [placement; class] <- dependency", flush=True
+        )
         for node_id, spec in definition.nodes.items():
             dependencies = sorted(definition.dependencies[node_id])
             dependency_text = ", ".join(dependencies) if dependencies else "-"
@@ -619,10 +584,6 @@ class WorkflowRuntime:
             if function_name is not None:
                 return str(function_name)
         node_name = f"{node.__class__.__module__}.{node.__class__.__qualname__}"
-        app_name = getattr(node, "app_name", None)
-        app_function = getattr(node, "function_name", None)
-        if app_name is not None and app_function is not None:
-            return f"{app_name}.{app_function}"
         return node_name
 
     @staticmethod

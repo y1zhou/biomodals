@@ -115,16 +115,6 @@ class Workflow:
             dependencies=dependencies,
         )
 
-    def ready_nodes(self, completed_node_ids: set[str]) -> list[str]:
-        """Return node ids whose dependencies are all completed."""
-        definition = self.validate()
-        return [
-            node_id
-            for node_id, dependencies in definition.dependencies.items()
-            if node_id not in completed_node_ids
-            and dependencies.issubset(completed_node_ids)
-        ]
-
     def _dependencies(self) -> dict[str, set[str]]:
         dependencies: dict[str, set[str]] = {}
         for node_id, spec in self._nodes.items():

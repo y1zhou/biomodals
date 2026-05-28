@@ -18,7 +18,6 @@ Use this guide when creating or changing files under
 - **Workflow Orchestrator**: the Modal-hosted coordinator class hosting the runtime for one workflow run.
 - **Workflow Artifact**: durable data passed between workflow nodes.
 - **Artifact Selector**: a named reference to upstream artifacts.
-- **Worker Pool**: fixed-size remote workers for one node's fan-out tasks.
 
 Avoid the terms `app node`, `runner node`, `engine`, and `workflow
 entrypoint`; they are ambiguous in this codebase.
@@ -113,9 +112,8 @@ The first durable run layout is:
 ```
 
 The workflow ledger is one SQLite database per run. The orchestrator is the only
-ledger writer. Remote nodes and workers write deterministic output files and
-logs, then the orchestrator reloads the volume, reconciles those files, and
-updates the ledger.
+ledger writer. Remote nodes write deterministic output files and logs, then the
+orchestrator reloads the volume, reconciles those files, and updates the ledger.
 
 Ledger updates mutate SQLite rows directly. Do not preserve obsolete
 Pydantic-status update patterns such as `model_copy(update=...)` for ledger
@@ -127,12 +125,11 @@ run with a different DAG hash fails unless the run is forced, because stale node
 state cannot safely be reused across workflow definition changes.
 
 Record a Modal `FunctionCall.object_id` in `remote_calls` immediately after
-submitting remote node or worker work. On orchestrator startup or restart,
-reattach with `modal.FunctionCall.from_id(call_id)` and poll before launching
-replacement work. Reconcile existing pending, succeeded, failed, or expired
-calls and their deterministic output files before applying `RERUN` or `RESUME`.
-Do not blindly resubmit work while an older call may still be writing the same
-node outputs.
+submitting remote node work. On orchestrator startup or restart, reattach with
+`modal.FunctionCall.from_id(call_id)` and poll before launching replacement
+work. Reconcile existing pending, succeeded, failed, or expired calls and their
+deterministic output files before applying `RERUN` or `RESUME`. Do not blindly
+resubmit work while an older call may still be writing the same node outputs.
 
 Use these tables for the first ledger schema:
 
@@ -141,7 +138,6 @@ runs(run_id, workflow_name, dag_hash, status, created_at, updated_at, metadata_j
 nodes(node_id, status, execution_policy, placement, current_attempt_id, error, started_at, completed_at, updated_at)
 attempts(attempt_id, node_id, status, started_at, completed_at, app_result_json, error, metadata_json)
 remote_calls(call_id, node_id, attempt_id, function_name, call_kind, status, submitted_at, completed_at, error, metadata_json)
-node_tasks(task_id, node_id, attempt_id, status, input_artifact_id, output_artifact_id, remote_call_id, claimed_by, started_at, completed_at, error, metadata_json)
 artifacts(artifact_id, producing_node_id, kind, volume_name, storage_path, source_app_output_name, created_at, metadata_json)
 artifact_files(artifact_id, path, role, media_type, size_bytes, metadata_json)
 node_inputs(node_id, input_name, artifact_id)
@@ -153,8 +149,7 @@ metadata JSON text with `orjson`. Store Pydantic payload snapshots with
 `model_dump_json()` and load them with `model_validate_json(...)`. A human
 should be able to debug a run with `sqlite3` by
 checking `runs.status`, stalled rows in `nodes`, outstanding `remote_calls`,
-fan-out progress in `node_tasks`, and artifact paths in `artifacts` plus
-`artifact_files`.
+and artifact paths in `artifacts` plus `artifact_files`.
 
 ## Modal Preemption
 
@@ -170,26 +165,17 @@ Remote workflow code should:
 - use deterministic output paths from run and node identifiers;
 - leave enough artifacts and logs to reconcile after restart.
 
-## Fan-Out And Worker Pools
+## Fan-Out
 
-The first workflow runtime supports static DAGs with dynamic task fan-out.
-The DAG shape is fixed, but a node may derive a runtime task list from upstream
-artifacts.
+The first workflow runtime supports static DAG fan-out. Build one node per known
+unit of work during DAG construction, as ShortMD does for per-PDB preparation
+and per-replicate production runs.
 
 Use barriered fan-out first: a node starts only after all declared upstream
 dependencies are complete. Streaming between nodes is deferred.
 
-A fan-out node may spawn a fixed-size worker pool. Workers process that node's
-task queue until empty, then expose deterministic outputs that let the
-orchestrator write one completion status.
-
 Independent ready nodes may run in parallel when all dependencies for each node
 are satisfied.
-
-Keep worker-pool naming, task ids, queue enqueueing, and result aggregation in
-pure helpers. Keep Modal queue creation, worker spawning, and
-`FunctionCall.gather` calls in thin integration helpers so unit tests can use
-fake queues and fake function calls.
 
 ## Orchestrator Submission
 

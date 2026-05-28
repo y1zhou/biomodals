@@ -109,7 +109,7 @@ APP_INFO = AppInfo()
 OUT_VOLUME = CONF.get_out_volume()
 OUT_VOLUME_NAME = OUT_VOLUME.name or f"{CONF.name}-outputs"
 
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "git-lfs", "build-essential")
@@ -127,6 +127,7 @@ runtime_image = patch_image_for_helper(
         find_links=f"https://data.pyg.org/whl/torch-2.3.0+{CONF.cuda_version}.html",
         extra_options=f"--exclude-newer {APP_INFO.dependency_cutoff}",
     )
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

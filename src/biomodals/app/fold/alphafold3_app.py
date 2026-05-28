@@ -89,7 +89,7 @@ class AppInfo:
 APP_INFO = AppInfo()
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "zstd", "zlib1g-dev", "wget")
@@ -132,6 +132,7 @@ runtime_image = patch_image_for_helper(
     .uv_pip_install(str(CONF.git_clone_dir))
     .run_commands("build_data")  # installed in the previous step
     .env({"PATH": "/hmmer/bin:$PATH"})
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

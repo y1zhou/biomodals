@@ -41,13 +41,11 @@ class AppInfo:
 ##########################################
 APP_INFO = AppInfo()
 runtime_image = (
-    patch_image_for_helper(
-        modal.Image
-        .debian_slim(python_version=CONF.python_version)
-        .apt_install("git", "build-essential", "libgl1-mesa-glx", "libglib2.0-0")
-        .env(CONF.default_env),
-        copy_patch_files=True,
-    )
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .apt_install("git", "build-essential", "libgl1-mesa-glx", "libglib2.0-0")
+    .env(CONF.default_env)
+    .pipe(patch_image_for_helper, copy_patch_files=True)
     .uv_pip_install(
         "paddlepaddle-gpu==3.2.1",
         index_url=f"https://www.paddlepaddle.org.cn/packages/stable/{CONF.cuda_version}/",

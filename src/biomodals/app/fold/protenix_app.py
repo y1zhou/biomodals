@@ -111,7 +111,7 @@ class AppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .from_registry(f"nvidia/cuda:{APP_INFO.cuda_tag}", add_python=CONF.python_version)
     .entrypoint([])  # remove verbose logging in the base image
@@ -134,6 +134,7 @@ runtime_image = patch_image_for_helper(
         gpu=CONF.gpu,
         env={"LAYERNORM_TYPE": "fast_layernorm"},  # default, but just in case
     )
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

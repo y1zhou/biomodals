@@ -63,7 +63,7 @@ class AppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install(
@@ -89,6 +89,7 @@ runtime_image = patch_image_for_helper(
     .workdir(str(CONF.git_clone_dir))
     .uv_pip_install(str(CONF.git_clone_dir), "biopython", "h5py", "pandas")
     .run_commands("build_data")
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

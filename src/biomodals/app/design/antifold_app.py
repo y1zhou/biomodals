@@ -42,7 +42,7 @@ MODEL_DIR = CONF.model_dir
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget")
@@ -54,6 +54,7 @@ runtime_image = patch_image_for_helper(
         find_links=f"https://data.pyg.org/whl/torch-2.2.0+{CONF.cuda_version}.html",
         extra_options="--no-build-isolation",  # https://github.com/astral-sh/uv/issues/5040
     )
+    .pipe(patch_image_for_helper)
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

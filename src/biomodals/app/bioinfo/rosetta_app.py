@@ -109,10 +109,11 @@ def _normalize_volume_rosetta_job(
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
-    modal.Image.from_registry(
-        "rosettacommons/rosetta:serial-420", add_python=CONF.python_version
-    )
+runtime_image = (
+    modal.Image
+    .from_registry("rosettacommons/rosetta:serial-420", add_python=CONF.python_version)
+    .env(CONF.default_env)
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

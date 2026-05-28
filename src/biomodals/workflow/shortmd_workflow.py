@@ -54,9 +54,11 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", str(MAX_TIMEOUT))),
 )
 
-runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version).env(CONF.default_env),
-    include_workflow_modules=True,
+runtime_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .env(CONF.default_env)
+    .pipe(patch_image_for_helper, include_workflow_modules=True)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True

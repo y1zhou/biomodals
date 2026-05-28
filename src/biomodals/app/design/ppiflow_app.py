@@ -37,7 +37,7 @@ SCRIPTS_DIR = CONF.git_clone_dir / "tool" / "PPIFlow"
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
@@ -119,6 +119,7 @@ runtime_image = patch_image_for_helper(
         find_links=f"https://data.pyg.org/whl/torch-2.10.0+{CONF.cuda_version}.html",
     )
     .workdir(str(SCRIPTS_DIR))
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

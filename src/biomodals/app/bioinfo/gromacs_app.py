@@ -56,7 +56,7 @@ APP_INFO = AppInfo()
 OUTPUTS_VOLUME = CONF.get_out_volume()
 OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
 
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .from_registry(
         "nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python=CONF.python_version
@@ -173,13 +173,15 @@ runtime_image = patch_image_for_helper(
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
     .add_local_dir(Path(__file__).parent / "gromacs", APP_INFO.gmx_scripts, copy=True)
+    .pipe(patch_image_for_helper)
 )
 
-biotite_image = patch_image_for_helper(
+biotite_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
     .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
+    .pipe(patch_image_for_helper)
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

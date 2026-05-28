@@ -31,9 +31,11 @@ OUT_VOLUME = WORKFLOW_ORCHESTRATOR_VOLUME
 OUT_VOLUME_NAME = WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 REMOTE_NODE_FUNCTION_NAME = "run_node"
 
-runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version).env(CONF.default_env),
-    include_workflow_modules=True,
+runtime_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .env(CONF.default_env)
+    .pipe(patch_image_for_helper, include_workflow_modules=True)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

@@ -78,7 +78,7 @@ OUTPUTS_VOLUME = CONF.get_out_volume()
 OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name
 OUTPUTS_DIR = CONF.output_volume_mountpoint
 
-download_image = patch_image_for_helper(
+download_image = (
     modal.Image
     .debian_slim()
     .uv_pip_install("huggingface_hub>=1.10")
@@ -89,9 +89,10 @@ download_image = patch_image_for_helper(
             "BOLTZ_CACHE": str(BoltzConf.model_dir),
         }
     )
+    .pipe(patch_image_for_helper)
 )
 
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim()
     .apt_install("git", "build-essential")
@@ -125,6 +126,7 @@ runtime_image = patch_image_for_helper(
     .env({"PATH": f"{APP_INFO.abcfold_dir}/.venv/bin:$PATH"})
     .apt_install("kalign")  # for Chai templates
     .workdir(APP_INFO.abcfold_dir)
+    .pipe(patch_image_for_helper)
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

@@ -55,12 +55,13 @@ CONF = AppConfig(
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("zstd")
     .env(CONF.default_env)
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}", "pandas")
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 

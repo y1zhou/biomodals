@@ -50,7 +50,7 @@ OUTPUTS_DIR = CONF.output_volume_mountpoint
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "zstd", "fd-find")
@@ -58,6 +58,7 @@ runtime_image = patch_image_for_helper(
     .uv_pip_install("polars[pandas,numpy,calamine,xlsxwriter]", "tqdm")
     .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}")
     .workdir(str(CONF.git_clone_dir))
+    .pipe(patch_image_for_helper)
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

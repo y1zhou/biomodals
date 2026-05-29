@@ -26,6 +26,7 @@ from biomodals.helper.shell import (
     sanitize_filename,
     warmup_directory,
 )
+from biomodals.helper.volume_run import volume_path_from_mount_path
 
 ##########################################
 # Modal configs
@@ -41,11 +42,6 @@ CONF = AppConfig(
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "L40S"),
 )
-
-# Volumes to be mounted
-OUTPUTS_VOLUME = CONF.get_out_volume()
-OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
-OUTPUTS_DIR = CONF.output_volume_mountpoint
 
 ##########################################
 # Image and app definitions
@@ -71,7 +67,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    volumes=CONF.mounts(output_volume=True),
     image=runtime_image,
 )
 def package_outputs_helper(
@@ -194,7 +190,7 @@ class YAMLReferenceLoader:
 # Fetch model weights
 ##########################################
 @app.function(
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    volumes=CONF.mounts(model_volume=True, model_ro=False, is_huggingface=True),
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=MAX_TIMEOUT,
 )
@@ -214,12 +210,12 @@ def boltzgen_download(force: bool = False) -> None:
 ##########################################
 # Inference functions
 ##########################################
-@app.function(timeout=CONF.timeout, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME})
+@app.function(timeout=CONF.timeout, volumes=CONF.mounts(output_volume=True))
 def prepare_boltzgen_run(
     yaml_content: bytes, run_name: str, additional_files: dict[str, bytes]
 ) -> None:
     """Prepare BoltzGen input and output directories."""
-    workdir = Path(OUTPUTS_DIR) / run_name
+    workdir = Path(CONF.output_volume_mountpoint) / run_name
     for d in ("inputs", "outputs"):
         (workdir / d).mkdir(parents=True, exist_ok=True)
 
@@ -234,10 +230,10 @@ def prepare_boltzgen_run(
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(content)
 
-    OUTPUTS_VOLUME.commit()
+    CONF.output_volume.commit()
 
 
-@app.function(timeout=CONF.timeout, volumes={OUTPUTS_DIR: OUTPUTS_VOLUME})
+@app.function(timeout=CONF.timeout, volumes=CONF.mounts(output_volume=True))
 def get_run_ids(
     run_name: str,
     num_parallel_runs: int,
@@ -250,8 +246,8 @@ def get_run_ids(
     from datetime import UTC, datetime
     from uuid import uuid4
 
-    OUTPUTS_VOLUME.reload()
-    outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
+    CONF.output_volume.reload()
+    outdir = Path(CONF.output_volume_mountpoint) / run_name / "outputs"
 
     if not salvage_mode:
         today: str = datetime.now(UTC).strftime("%Y%m%d")
@@ -283,7 +279,7 @@ def get_run_ids(
 @app.function(
     memory=(128, 65536),  # reserve 128MB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    volumes=CONF.mounts(output_volume=True),
 )
 def collect_boltzgen_data(
     run_name: str,
@@ -297,8 +293,9 @@ def collect_boltzgen_data(
     filter_rmsd_threshold: float = 4.0,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
-    OUTPUTS_VOLUME.reload()
-    outdir = Path(OUTPUTS_DIR) / run_name / "outputs"
+    out_vol = CONF.output_volume
+    out_vol.reload()
+    outdir = Path(CONF.output_volume_mountpoint) / run_name / "outputs"
     config_dir = outdir.parent / "inputs" / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,15 +325,18 @@ def collect_boltzgen_data(
     else:
         print("💊 All planned BoltzGen runs are already complete; skipping relaunch.")
 
-    OUTPUTS_VOLUME.reload()
+    out_vol.reload()
+    vol_path = volume_path_from_mount_path(
+        outdir, CONF.output_volume_mountpoint, CONF.output_volume_name
+    )
     if filter_results:
         # Rerun BoltzGen filters on all run IDs, and only download the designs
         # that passed all filters (also limited by the `budget`)
-        print("💊 Collecting BoltzGen outputs...")
+        print(f"💊 Collecting BoltzGen outputs in {vol_path}...")
         combine_multiple_runs.remote(run_name, run_ids)
         print("💊 Filtering combined BoltzGen designs...")
         refilter_designs.remote(run_name, budget, filter_rmsd_threshold)
-        OUTPUTS_VOLUME.reload()
+        out_vol.reload()
 
         print("💊 Packaging filtered BoltzGen outputs...")
         tarball_bytes = package_outputs_helper.remote(
@@ -349,12 +349,10 @@ def collect_boltzgen_data(
             ],
         )
         return tarball_bytes
-    else:
-        print("💊 Skipping refiltering of BoltzGen outputs.")
-        print(
-            f"💊 Results are available at: '{outdir.relative_to(OUTPUTS_DIR)}' in volume '{OUTPUTS_VOLUME_NAME}'."
-        )
-        return run_ids
+
+    print("💊 Skipping refiltering of BoltzGen outputs.")
+    print(f"💊 Results are available at: {vol_path}.")
+    return run_ids
 
 
 @app.cls(
@@ -362,10 +360,7 @@ def collect_boltzgen_data(
     cpu=1.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
-    },
+    volumes=CONF.mounts(output_volume=True, model_volume=True, is_huggingface=True),
 )
 class BoltzGenRunner:
     """Class to run BoltzGen on a YAML specification."""
@@ -410,10 +405,10 @@ class BoltzGenRunner:
         if lock_dir.exists() and (lock_dir.stat().st_mtime < (time.time() - 24 * 3600)):
             print(f"💊 Removing stale lock for {out_dir}.")
             lock_dir.rmdir()
-            OUTPUTS_VOLUME.commit()
+            CONF.output_volume.commit()
         try:
             lock_dir.mkdir(exist_ok=False)
-            OUTPUTS_VOLUME.commit()
+            CONF.output_volume.commit()
         except FileExistsError:
             print(
                 f"💊 Another worker is already running BoltzGen for {out_dir}; skipping."
@@ -453,13 +448,13 @@ class BoltzGenRunner:
         if self.lock_dir.exists():
             print(f"💊 Cleaning up lock directory {self.lock_dir}")
             self.lock_dir.rmdir()
-        OUTPUTS_VOLUME.commit()
+        CONF.output_volume.commit()
 
 
 @app.function(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    volumes=CONF.mounts(output_volume=True),
 )
 def combine_multiple_runs(run_name: str, run_ids: list[str]):
     """Combine outputs from multiple BoltzGen runs into a single table."""
@@ -469,10 +464,10 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
     import polars as pl
     from tqdm import tqdm
 
-    workdir = Path(OUTPUTS_DIR) / run_name / "outputs"
-    out_dir = Path(OUTPUTS_DIR) / run_name / "combined-outputs"
+    workdir = Path(CONF.output_volume_mountpoint) / run_name / "outputs"
+    out_dir = Path(CONF.output_volume_mountpoint) / run_name / "combined-outputs"
     (out_dir / "refold_cif").mkdir(parents=True, exist_ok=True)
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
 
     metrics_dfs: list[pl.DataFrame] = []
     ca_coords_seqs_dfs: list[pl.DataFrame] = []
@@ -535,7 +530,7 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
 @app.function(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
-    volumes={OUTPUTS_DIR: OUTPUTS_VOLUME},
+    volumes=CONF.mounts(output_volume=True),
 )
 def refilter_designs(
     run_name: str,
@@ -547,7 +542,7 @@ def refilter_designs(
     import polars as pl
     from boltzgen.task.filter.filter import Filter  # type: ignore[ty:unresolved-import]
 
-    workdir = Path(OUTPUTS_DIR) / run_name
+    workdir = Path(CONF.output_volume_mountpoint) / run_name
     warmup_directory(workdir / "combined-outputs")
 
     filter_task = Filter(
@@ -772,7 +767,7 @@ def submit_boltzgen_task(
                         "modal",
                         "volume",
                         "get",
-                        OUTPUTS_VOLUME_NAME,
+                        CONF.output_volume_name,
                         f"{remote_root_dir}/{subdir}",
                     ],
                     cwd=run_out_dir,

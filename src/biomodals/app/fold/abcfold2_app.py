@@ -73,11 +73,6 @@ class AppInfo:
 ##########################################
 APP_INFO = AppInfo()
 
-# Volumes
-OUTPUTS_VOLUME = CONF.get_out_volume()
-OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name
-OUTPUTS_DIR = CONF.output_volume_mountpoint
-
 download_image = (
     modal.Image
     .debian_slim()
@@ -85,8 +80,8 @@ download_image = (
     .env(
         CONF.default_env
         | {
-            "CHAI_DOWNLOADS_DIR": str(ChaiConf.model_dir),
-            "BOLTZ_CACHE": str(BoltzConf.model_dir),
+            "CHAI_DOWNLOADS_DIR": ChaiConf.model_volume_mountpoint,
+            "BOLTZ_CACHE": BoltzConf.model_volume_mountpoint,
         }
     )
     .pipe(patch_image_for_helper)
@@ -99,8 +94,8 @@ runtime_image = (
     .env(
         CONF.default_env
         | {
-            "CHAI_DOWNLOADS_DIR": str(ChaiConf.model_dir),
-            "BOLTZ_CACHE": str(BoltzConf.model_dir),
+            "CHAI_DOWNLOADS_DIR": ChaiConf.model_volume_mountpoint,
+            "BOLTZ_CACHE": BoltzConf.model_volume_mountpoint,
         }
     )
     .run_commands(
@@ -136,7 +131,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 # Fetch model weights
 ##########################################
 @app.function(
-    volumes={str(BoltzConf.model_volume_mountpoint): MODEL_VOLUME},
+    volumes=BoltzConf.mounts(model_volume=True, model_ro=False, is_huggingface=True),
     timeout=CONF.timeout,
     image=download_image,
 )
@@ -149,23 +144,24 @@ def download_boltz_models(force: bool = False) -> None:
 
     from huggingface_hub import snapshot_download  # type: ignore[ty:unresolved-import]
 
+    boltz_download_dir = Path(BoltzConf.model_volume_mountpoint)
     snapshot_download(
         repo_id="boltz-community/boltz-2",
         revision=APP_INFO.boltz_model_hash,
-        local_dir=BoltzConf.model_dir,
+        local_dir=boltz_download_dir,
         force_download=force,
     )
-    boltz_download_dir = BoltzConf.model_dir
+    MODEL_VOLUME.commit()
+
     tar_mols = boltz_download_dir / "mols.tar"
     if not (boltz_download_dir / "mols").exists():
         with tarfile.open(str(tar_mols), "r") as tar:
             tar.extractall(boltz_download_dir)  # noqa: S202
-
     MODEL_VOLUME.commit()
 
 
 @app.function(
-    volumes={str(ChaiConf.model_volume_mountpoint): MODEL_VOLUME},
+    volumes=ChaiConf.mounts(model_volume=True, model_ro=False),
     timeout=CONF.timeout,
     image=download_image,
 )
@@ -184,11 +180,12 @@ async def download_chai_models(force=False):
     ]
 
     # launch downloads concurrently
-    chai_model_dir = ChaiConf.model_dir
+    chai_model_dir = Path(ChaiConf.model_volume_mountpoint)
     download_tasks = {
         f"{base_url}{dep}": chai_model_dir / dep for dep in inference_dependencies
     }
     download_files(download_tasks, progress_bar_desc="Downloading Chai models")
+    MODEL_VOLUME.commit()
 
     # Special treatment for ESM
     esm2_path = chai_model_dir / "esm2" / "traced_sdpa_esm2_t36_3B_UR50D_fp16.pt"
@@ -239,10 +236,7 @@ def get_run_id(yaml_str: bytes) -> str:
 @app.function(
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        BoltzConf.model_volume_mountpoint: MODEL_VOLUME,
-    },
+    volumes=CONF.mounts(output_volume=True) | BoltzConf.mounts(model_volume=True),
 )
 def prepare_abcfold2(
     yaml_str: bytes, search_templates: bool, msa_chains: str | None = None
@@ -260,7 +254,8 @@ def prepare_abcfold2(
     run_id: str = get_run_id.local(yaml_str=yaml_str)
     if not search_templates:
         run_id = f"{run_id}-no-tmpl"
-    out_dir_full: Path = Path(OUTPUTS_DIR) / run_id[:2] / run_id
+    out_root = Path(CONF.output_volume_mountpoint)
+    out_dir_full: Path = out_root / run_id[:2] / run_id
     out_dir_full.mkdir(parents=True, exist_ok=True)
 
     # Check if MSA and templates were already generated for a previous run with same ID
@@ -279,21 +274,21 @@ def prepare_abcfold2(
                 force=True,
                 chains=msa_chains,
                 search_templates=search_templates,
-                template_cache_dir=Path(OUTPUTS_DIR) / ".cache" / "rcsb",
+                template_cache_dir=out_root / ".cache" / "rcsb",
             )
-            OUTPUTS_VOLUME.commit()
+            CONF.output_volume.commit()
 
     # Generate inputs for Boltz and Chai
     if not (out_dir_full / "boltz_models" / f"{run_id}.yaml").exists():
         _ = prepare_boltz(conf_file=yaml_path, out_dir=out_dir_full)
-        OUTPUTS_VOLUME.commit()
+        CONF.output_volume.commit()
     if not (out_dir_full / "chai_models" / f"{run_id}.yaml").exists():
         _ = prepare_chai(
             conf_file=yaml_path,
             out_dir=out_dir_full,
-            ccd_lib_dir=BoltzConf.model_dir / "mols",
+            ccd_lib_dir=Path(BoltzConf.model_volume_mountpoint) / "mols",
         )
-        OUTPUTS_VOLUME.commit()
+        CONF.output_volume.commit()
 
     # Pull run parameters from YAML
     conf = load_params_from_run_yaml(yaml_path)
@@ -308,10 +303,7 @@ def prepare_abcfold2(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        BoltzConf.model_volume_mountpoint: MODEL_VOLUME,
-    },
+    volumes=CONF.mounts(output_volume=True) | BoltzConf.mounts(model_volume=True),
 )
 def collect_abcfold2_boltz_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
@@ -323,7 +315,7 @@ def collect_abcfold2_boltz_data(
     run_id = run_conf["run_id"]
     work_path = work_path / "boltz_models"
     boltz_conf_path = work_path / f"{run_id}.yaml"
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
 
     if not boltz_conf_path.exists():
         raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
@@ -345,7 +337,7 @@ def collect_abcfold2_boltz_data(
         for boltz_run_dir in run_abcfold2_boltz.map(seeds_to_run, kwargs=run_conf):
             print(f"Boltz run complete: {boltz_run_dir}")
 
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
     print("💊 Packaging Boltz results...")
     boltz_tarball_bytes = package_outputs(
         work_path,
@@ -368,10 +360,7 @@ def collect_abcfold2_boltz_data(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        BoltzConf.model_volume_mountpoint: MODEL_VOLUME,
-    },
+    volumes=CONF.mounts(output_volume=True) | BoltzConf.mounts(model_volume=True),
 )
 def run_abcfold2_boltz(
     seed: int,
@@ -388,7 +377,7 @@ def run_abcfold2_boltz(
         run_boltz,
     )
 
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
     work_path = Path(workdir).expanduser().resolve()
     work_path = work_path / "boltz_models"
     boltz_conf_path = work_path / f"{run_id}.yaml"
@@ -404,7 +393,7 @@ def run_abcfold2_boltz(
         num_diffn_samples=num_diffn_samples,
         boltz_additional_cli_args=boltz_additional_cli_args,
     )
-    OUTPUTS_VOLUME.commit()
+    CONF.output_volume.commit()
     return str(boltz_run_dir)
 
 
@@ -413,10 +402,7 @@ def run_abcfold2_boltz(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        ChaiConf.model_volume_mountpoint: MODEL_VOLUME,
-    },
+    volumes=CONF.mounts(output_volume=True) | ChaiConf.mounts(model_volume=True),
 )
 def collect_abcfold2_chai_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
@@ -428,7 +414,7 @@ def collect_abcfold2_chai_data(
     run_id = run_conf["run_id"]
     work_path = work_path / "chai_models"
     chai_conf_path = work_path / f"{run_id}.yaml"
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
 
     if not chai_conf_path.exists():
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
@@ -450,7 +436,7 @@ def collect_abcfold2_chai_data(
         for chai_run_dir in run_abcfold2_chai.map(seeds_to_run, kwargs=run_conf):
             print(f"Chai run complete: {chai_run_dir}")
 
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
     print("💊 Packaging Chai results...")
     chai_tarball_bytes = package_outputs(work_path)
     return chai_tarball_bytes
@@ -461,10 +447,7 @@ def collect_abcfold2_chai_data(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={
-        OUTPUTS_DIR: OUTPUTS_VOLUME,
-        ChaiConf.model_volume_mountpoint: MODEL_VOLUME,
-    },
+    volumes=CONF.mounts(output_volume=True) | ChaiConf.mounts(model_volume=True),
 )
 def run_abcfold2_chai(
     seed: int,
@@ -481,7 +464,7 @@ def run_abcfold2_chai(
         run_chai,
     )
 
-    OUTPUTS_VOLUME.reload()
+    CONF.output_volume.reload()
     work_path = Path(workdir).expanduser().resolve()
     chai_work_path = work_path / "chai_models"
     chai_conf_path = chai_work_path / f"{run_id}.yaml"
@@ -502,7 +485,7 @@ def run_abcfold2_chai(
         num_diffn_samples=num_diffn_samples,
         num_trunk_samples=num_trunk_samples,
     )
-    OUTPUTS_VOLUME.commit()
+    CONF.output_volume.commit()
     return str(chai_run_dir)
 
 

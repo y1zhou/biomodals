@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 try:
     from enum import StrEnum
 except ImportError:
-    from backports.strenum import StrEnum  # noqa: UP035
+    from backports.strenum import StrEnum  # type: ignore[ty:unresolved-import] # noqa: UP035,I001
 
 
 class StorageKind(StrEnum):
@@ -25,7 +25,7 @@ class InlineBytes(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal[StorageKind.INLINE_BYTES] = StorageKind.INLINE_BYTES
+    kind: Literal[StorageKind] = StorageKind.INLINE_BYTES
     data: bytes
     filename: str
     media_type: str | None = None
@@ -65,3 +65,11 @@ class VolumePath(BaseModel):
         if "\\" in value:
             raise ValueError("VolumePath.path must use POSIX separators")
         return value
+
+    def at_mountpoint(self, mountpoint: str | Path) -> Path:
+        """Return the path of this volume on the given mountpoint."""
+        return Path(mountpoint) / self.path
+
+    def __str__(self) -> str:
+        """Return a human-readable string representation of this volume path."""
+        return f"'{self.path}' from volume '{self.volume_name}'"

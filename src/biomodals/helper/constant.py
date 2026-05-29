@@ -15,8 +15,9 @@ PROTENIX_MSA_DB_VOLUME = Volume.from_name(
 )
 
 # Volume for caching MSA search results.
+MSA_CACHE_VOLUME_NAME = "biomodals-msa-cache"
 MSA_CACHE_VOLUME = Volume.from_name(
-    "biomodals-msa-cache", create_if_missing=True, version=2
+    MSA_CACHE_VOLUME_NAME, create_if_missing=True, version=2
 )
 
 # Durable workflow-orchestrator output ledger/artifact volume.

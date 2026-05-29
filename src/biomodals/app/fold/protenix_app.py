@@ -37,7 +37,12 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MSA_CACHE_VOLUME
+from biomodals.helper.constant import (
+    MAX_TIMEOUT,
+    MODEL_VOLUME,
+    MSA_CACHE_VOLUME,
+    MSA_CACHE_VOLUME_NAME,
+)
 from biomodals.helper.io import (
     build_local_output_path,
     resolve_local_output_dir,
@@ -79,9 +84,7 @@ class AppInfo:
     cuda_tag = f"{CONF.cuda_version_numeric}-devel-ubuntu24.04"
 
     # Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
-    msa_cache_dir: str = "/protenix-msa"
-    # Volume for prediction outputs (enables skip/resume across interrupted runs)
-    model_dir: Path = CONF.model_dir
+    msa_cache_volume_subdir: str = f"/{CONF.name}"
 
     # Base URL for downloading checkpoints and data caches
     # https://github.com/bytedance/Protenix/blob/main/protenix/web_service/dependency_url.py
@@ -120,8 +123,10 @@ runtime_image = (
         CONF.default_env
         | {
             "PYTHONUNBUFFERED": "1",
-            "PROTENIX_ROOT_DIR": str(CONF.model_dir),
-            "PROTENIX_CHECKPOINT_DIR": str(CONF.model_dir / "checkpoint"),
+            "PROTENIX_ROOT_DIR": CONF.model_volume_mountpoint,
+            "PROTENIX_CHECKPOINT_DIR": str(
+                Path(CONF.model_volume_mountpoint) / "checkpoint"
+            ),
         }
     )
     .uv_pip_install(
@@ -143,7 +148,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 # Fetch model weights and data caches
 ##########################################
 @app.function(
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME}, timeout=CONF.timeout
+    volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=CONF.timeout
 )
 def download_protenix_data(
     model_name: str = "protenix_base_default_v1.0.0",
@@ -158,7 +163,7 @@ def download_protenix_data(
         include_templates: Also download template-related data files.
 
     """
-    data_root = CONF.model_dir
+    data_root = Path(CONF.model_volume_mountpoint)
     files_to_download: dict[str, str | Path] = {}
 
     # Download common data caches
@@ -193,7 +198,14 @@ def download_protenix_data(
 ##########################################
 # Inference functions
 ##########################################
-@app.function(timeout=CONF.timeout, volumes={APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME})
+@app.function(
+    timeout=CONF.timeout,
+    volumes={
+        MSA_CACHE_VOLUME_NAME: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        )
+    },
+)
 def query_protenix_msa_server(
     query_command: str, input_json_path: str, output_dir: str, msa_server_mode: str
 ) -> None:
@@ -248,7 +260,14 @@ def query_protenix_msa_server(
     MSA_CACHE_VOLUME.commit()
 
 
-@app.function(timeout=CONF.timeout, volumes={APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME})
+@app.function(
+    timeout=CONF.timeout,
+    volumes={
+        MSA_CACHE_VOLUME_NAME: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        )
+    },
+)
 def prepare_protenix_inputs(
     input_bytes: bytes,
     msa_server_mode: str = "protenix",
@@ -301,11 +320,7 @@ def prepare_protenix_inputs(
             else hash_string(":".join(protein_seqs))
         )
         cache_dir = (
-            Path(APP_INFO.msa_cache_dir)
-            / CONF.name
-            / msa_server_mode
-            / hash_key[:2]
-            / hash_key
+            Path(MSA_CACHE_VOLUME_NAME) / msa_server_mode / hash_key[:2] / hash_key
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
         output_dirs.append(str(cache_dir))
@@ -351,9 +366,11 @@ def prepare_protenix_inputs(
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes={
-        CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME,
+    volumes=CONF.mounts(model_volume=True)
+    | {
+        MSA_CACHE_VOLUME_NAME: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        )
     },
 )
 def run_protenix(
@@ -444,8 +461,8 @@ def run_protenix(
         input_seqs = struct2seq(input_file)
         cache_key = hash_string(":".join(x[1] for x in input_seqs))
         score_msa_cache_dir = (
-            Path(APP_INFO.msa_cache_dir)
-            / f"{CONF.name}_score"
+            Path(MSA_CACHE_VOLUME_NAME)
+            / "score"
             / msa_server_mode
             / cache_key[:2]
             / cache_key

@@ -41,8 +41,8 @@ from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
-    MODEL_VOLUME,
     MSA_CACHE_VOLUME,
+    MSA_CACHE_VOLUME_NAME,
 )
 from biomodals.helper.io import (
     build_local_output_path,
@@ -80,7 +80,8 @@ class AppInfo:
     # Volume mount path for genetic search databases
     msa_db_dir: str = f"/{CONF.name}-msa-db"
     # Volume mount path for MSA output cache
-    msa_cache_dir: str = "/biomodals-msa-cache"
+    msa_cache_dir: str = f"/{MSA_CACHE_VOLUME_NAME}"
+    msa_cache_volume_subdir: str = f"/{CONF.name}"
 
 
 ##########################################
@@ -245,10 +246,12 @@ def _af3_sanitised_name(name: str) -> str:
     # mmCIF templates .tar.zst: 57.6GiB
     # ephemeral_disk=1024 * round(304.8 + 5),  # MiB, billed by memory at 20:1 ratio
     timeout=CONF.timeout,
-    volumes={
-        CONF.model_volume_mountpoint: MODEL_VOLUME,
+    volumes=CONF.mounts(model_volume=True)
+    | {
         APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME,
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        ),
     },
 )
 def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
@@ -257,7 +260,7 @@ def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
     from tempfile import mkdtemp
 
     # Try to fill config with cached MSA
-    msa_cache_dir = Path(APP_INFO.msa_cache_dir) / CONF.name
+    msa_cache_dir = Path(APP_INFO.msa_cache_dir)
     conf = _load_conf_from_bytes(json_bytes)
     MSA_CACHE_VOLUME.reload()
     conf = _cache_conf_unpaired_msa(conf, msa_cache_dir)
@@ -321,7 +324,7 @@ def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
         "--run_inference=false",
         f"--json_path={input_json_path}",
         f"--output_dir={temp_dir}",
-        f"--model_dir={CONF.model_dir}",
+        f"--model_dir={CONF.model_volume_mountpoint}",
         *(f"--db_dir={d}" for d in msa_db_dir),
         "--jackhmmer_n_cpu=8",
         "--nhmmer_n_cpu=8",
@@ -387,9 +390,12 @@ def search_msa_and_templates(
     cpu=(0.125, 16.125),  # burst for tar compression
     memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
     timeout=MAX_TIMEOUT,
-    volumes={
-        CONF.model_volume_mountpoint: MODEL_VOLUME,  # JAX cache
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.read_only(),
+    # Writable model dir because AlphaFold3 writes its JAX cache next to weights
+    volumes=CONF.mounts(model_volume=True, model_ro=False)
+    | {
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
+        )
     },
 )
 def run_inference_pipeline(
@@ -415,6 +421,7 @@ def run_inference_pipeline(
         print(f"💊 Running inference for {run_name} with seeds {model_seeds}")
 
         out_dir = temp_path / run_name
+        model_dir = Path(CONF.model_volume_mountpoint)
         cmd = [
             sys.executable,
             str(CONF.git_clone_dir / "run_alphafold.py"),
@@ -422,8 +429,8 @@ def run_inference_pipeline(
             "--run_data_pipeline=false",
             f"--json_path={input_json_path}",
             f"--output_dir={out_dir}",
-            f"--model_dir={CONF.model_dir}",
-            f"--jax_compilation_cache_dir={CONF.model_dir / 'jax_cache'}",
+            f"--model_dir={model_dir}",
+            f"--jax_compilation_cache_dir={model_dir / 'jax_cache'}",
             f"--num_recycles={recycle}",
             f"--num_diffusion_samples={sample}",
         ]

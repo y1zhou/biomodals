@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from functools import cached_property
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from biomodals.schema.storage import InlineBytes, VolumePath
 from biomodals.schema.workflow import ArtifactKind
@@ -15,13 +14,15 @@ from biomodals.schema.workflow import ArtifactKind
 try:
     from enum import StrEnum
 except ImportError:
-    from backports.strenum import StrEnum  # noqa: UP035
+    from backports.strenum import StrEnum  # type: ignore[ty:unresolved-import] # noqa: UP035,I001
 
 APP_CONFIG_MAX_TIMEOUT = 86_400
 
 
 class AppConfig(BaseModel):
     """Base configuration model for Biomodals apps."""
+
+    model_config = ConfigDict(frozen=True)
 
     # Metadata
     name: str
@@ -47,7 +48,7 @@ class AppConfig(BaseModel):
     # https://modal.com/docs/guide/cuda
     cuda_version: str = "cu128"
     # Default execution timeout in seconds (https://modal.com/docs/guide/timeouts)
-    timeout: int = int(os.environ.get("TIMEOUT", "1800"))
+    timeout: int = 1800
     # Location to cache model weights and other large artifacts
     model_volume_mountpoint: str = "/biomodals-store"
     # Location to mount output volume (if in use)
@@ -68,9 +69,13 @@ class AppConfig(BaseModel):
 
     @computed_field
     @cached_property
-    def model_dir(self) -> Path:
-        """Directory to store model weights."""
-        return Path(self.model_volume_mountpoint) / self.name
+    def model_volume_subdir(self) -> str:
+        """Subdirectory in the Modal volume to store model weights.
+
+        Note: do not use this if the weights are managed using HuggingFace.
+        Instead, use "/huggingface" directly.
+        """
+        return f"/{self.name}"
 
     @computed_field
     @cached_property
@@ -152,7 +157,10 @@ class AppConfig(BaseModel):
     def ensure_timeout_within_range(self):
         """Ensure that the specified timeout is within a reasonable range."""
         # between 1 second and 24 hours
-        self.timeout = max(1, min(self.timeout, APP_CONFIG_MAX_TIMEOUT))
+        if self.timeout != max(1, min(self.timeout, APP_CONFIG_MAX_TIMEOUT)):
+            raise ValueError(
+                f"Timeout must be between 1 and {APP_CONFIG_MAX_TIMEOUT} seconds."
+            )
         return self
 
 

@@ -14,9 +14,9 @@ try:
     from datetime import UTC
     from enum import StrEnum
 except ImportError:
-    from datetime import timezone
+    from datetime import timezone  # noqa: I001
 
-    from backports.strenum import StrEnum  # noqa: UP035
+    from backports.strenum import StrEnum  # type: ignore[ty:unresolved-import] # noqa: UP035,I001
 
     UTC = timezone.utc  # noqa: UP017
 

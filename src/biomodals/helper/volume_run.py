@@ -11,7 +11,7 @@ from biomodals.schema import VolumePath
 
 
 def volume_path_from_mount_path(
-    remote_path: str, mount_root: str, volume_name: str
+    remote_path: str | Path, mount_root: str | Path, volume_name: str
 ) -> VolumePath:
     """Convert an app mount path into a volume-relative workflow storage path."""
     resolved_remote_path = PurePosixPath(remote_path)

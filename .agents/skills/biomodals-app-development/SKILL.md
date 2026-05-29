@@ -34,6 +34,10 @@ Keep app code compatible with `biomodals app help` and app discovery:
   Reuse existing helper APIs for local output paths, shell, archive, copy,
   download, hashing, warmup, and serialization behavior; only define local
   helpers when the behavior is app-specific and no shared helper fits.
+- Import shared volumes from `biomodals.helper.constant`. When a function only
+  needs an app-specific model or cache subtree, mount that subtree with
+  `Volume.with_mount_options(sub_path=...)`; combine read-only and subpath
+  options in one call with `with_mount_options(read_only=True, sub_path=...)`.
 - Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals app help <app>` renders flags.
 - Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
 - Keep Modal function return values primitive when practical: `int`, `str`,
@@ -50,7 +54,7 @@ When reviewing or finishing an app change, check:
 - Discovery: path, filename, app name, and local entrypoint name match CLI expectations.
 - Reproducibility: upstream version or commit is pinned.
 - Runtime boundaries: dependencies used only inside Modal images stay lazily imported.
-- Volumes: model volumes are read-only for inference unless the tool writes caches there; writable volumes are committed after writes.
+- Volumes: model/cache mounts use app-specific subdirectories when practical; inference mounts are read-only unless the tool writes caches there; writable volumes are committed after writes.
 - Data flow: quick jobs return `.tar.zst` bytes via `package_outputs(...)`; persistent, resumable, or batch jobs use `CONF.get_out_volume()` or shared volumes.
 - Modal return payloads: prefer primitive, `cloudpickle`-serializable values;
   avoid returning `Path` objects directly or nested inside tuples, lists, dicts,

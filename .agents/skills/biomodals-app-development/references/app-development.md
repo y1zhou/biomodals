@@ -106,10 +106,27 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ## Volumes
 
 - Import shared volumes from `biomodals.helper.constant`, such as `MODEL_VOLUME` or `MSA_CACHE_VOLUME`.
-- Mount model weights read-only for inference when the function only reads model artifacts.
-- Use `CONF.model_volume_mountpoint` for model volume mount paths.
+- Mount only the subdirectory a function needs when a shared volume contains
+  app-specific data. For model weights under `MODEL_VOLUME`, the usual pattern
+  is mounting `sub_path=f"/{CONF.name}"` at `CONF.model_dir`.
+- Mount model weights read-only for inference when the function only reads
+  model artifacts. If both read-only and subpath behavior are needed, use
+  `MODEL_VOLUME.with_mount_options(read_only=True, sub_path=f"/{CONF.name}")`.
+  Do not chain `MODEL_VOLUME.read_only().with_mount_options(...)`; Modal rejects
+  adding mount options after a read-only wrapper has already been created.
+- Use `CONF.model_dir` for app-specific model directories and
+  `CONF.model_volume_mountpoint` when the tool relies on cache paths in
+  `CONF.default_env`, such as `HF_HOME` or `TORCH_HOME`, under the model volume
+  root.
+- When upstream code expects a hardcoded cache path, mount the app-specific
+  shared-volume subdirectory at that path rather than changing unrelated app
+  logic. PaddleOCR, AbNatiV, and AntiFold are examples of this pattern.
+- Shared cache volumes such as `MSA_CACHE_VOLUME` should also use subpath mounts
+  when an app only needs its own namespace. Shared database volumes that expose a
+  complete database root can stay mounted whole.
 - Commit volume changes explicitly after writes with `VOLUME.commit()`.
-- Use `CONF.get_out_volume()` for app-specific persistent outputs.
+- Use `CONF.get_out_volume()` for app-specific persistent outputs; output
+  volumes are normally mounted whole.
 
 ## Remote Functions
 
@@ -139,7 +156,12 @@ Resource pattern:
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=MAX_TIMEOUT,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
+    volumes={
+        CONF.model_dir: MODEL_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path=f"/{CONF.name}",
+        )
+    },
 )
 ```
 

@@ -42,12 +42,16 @@ def test_app_config_is_exported_from_schema_and_app_compatibility_module() -> No
     )
 
     assert issubclass(CompatAppConfig, AppConfig)
-    assert compat_config.model_dump() == schema_config.model_dump()
-    assert compat_config.model_dir == Path("/biomodals-store/demo")
+    assert (
+        compat_config.model_dump(exclude={"output_volume", "output_volume_name"})
+        == schema_config.model_dump()
+    )
+    assert compat_config.model_volume_subdir == "/demo"
     assert compat_config.git_clone_dir == Path("/opt/demo")
     assert compat_config.cuda_version_numeric == "12.8.0"
     assert compat_config.default_env["UV_TORCH_BACKEND"] == "cu128"
-    assert hasattr(compat_config, "get_out_volume")
+    assert compat_config.output_volume_name == "demo-outputs"
+    assert hasattr(compat_config, "mounts")
 
 
 def test_app_config_validates_source_reproducibility_and_runtime_bounds() -> None:
@@ -63,8 +67,11 @@ def test_app_config_validates_source_reproducibility_and_runtime_bounds() -> Non
     with pytest.raises(ValidationError, match="CUDA 12.x"):
         _valid_app_config(gpu="B200+", cuda_version="cu128")
 
-    assert _valid_app_config(timeout=0).timeout == 1
-    assert _valid_app_config(timeout=999_999).timeout == 86_400
+    with pytest.raises(ValidationError, match="Timeout must be between"):
+        _valid_app_config(timeout=0)
+
+    with pytest.raises(ValidationError, match="Timeout must be between"):
+        _valid_app_config(timeout=999_999)
 
 
 def test_app_config_records_dependency_apps_without_modal_imports() -> None:

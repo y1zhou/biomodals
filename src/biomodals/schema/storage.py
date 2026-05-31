@@ -25,7 +25,7 @@ class InlineBytes(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal[StorageKind] = StorageKind.INLINE_BYTES
+    kind: Literal[StorageKind.INLINE_BYTES] = StorageKind.INLINE_BYTES
     data: bytes
     filename: str
     media_type: str | None = None

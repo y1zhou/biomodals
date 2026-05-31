@@ -11,7 +11,10 @@ from biomodals.schema import VolumePath
 
 
 def volume_path_from_mount_path(
-    remote_path: str | Path, mount_root: str | Path, volume_name: str
+    remote_path: str,
+    mount_root: str,
+    volume_name: str,
+    media_type: str | None = None,
 ) -> VolumePath:
     """Convert an app mount path into a volume-relative workflow storage path."""
     resolved_remote_path = PurePosixPath(remote_path)
@@ -26,7 +29,11 @@ def volume_path_from_mount_path(
         raise ValueError(
             f"Remote path must be below mounted volume root {mount_root}: {remote_path}"
         )
-    return VolumePath(volume_name=volume_name, path=str(relative_path))
+    return VolumePath(
+        volume_name=volume_name,
+        path=str(relative_path),
+        media_type=media_type,
+    )
 
 
 def build_volume_run_paths(

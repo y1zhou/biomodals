@@ -17,6 +17,20 @@ def test_volume_path_from_mount_path_returns_relative_volume_path() -> None:
     ) == VolumePath(volume_name="Gromacs-outputs", path="run-1/production")
 
 
+def test_volume_path_from_mount_path_preserves_media_type() -> None:
+    """Optional media type is preserved on the returned storage object."""
+    assert volume_path_from_mount_path(
+        remote_path="/outputs/run-1/archive.tar.zst",
+        mount_root="/outputs",
+        volume_name="FlowPacker-outputs",
+        media_type="application/zstd",
+    ) == VolumePath(
+        volume_name="FlowPacker-outputs",
+        path="run-1/archive.tar.zst",
+        media_type="application/zstd",
+    )
+
+
 def test_volume_path_from_mount_path_rejects_paths_outside_mount_root() -> None:
     """Paths outside the mounted volume root are rejected."""
     with pytest.raises(ValueError, match="outside mounted volume root"):

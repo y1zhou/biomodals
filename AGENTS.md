@@ -64,4 +64,4 @@ When developing new apps that must violate the skill's conventions for good reas
 
 The detailed workflow-development standards are consolidated in `.agents/skills/biomodals-workflow-development/`.
 
-Use `src/biomodals/workflow/shortmd_workflow.py` as the current executable workflow reference. Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now because it is expected to be refactored.
+Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end workflow reference. Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now because it is expected to be refactored.

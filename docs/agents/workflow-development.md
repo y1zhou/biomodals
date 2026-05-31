@@ -11,10 +11,10 @@ skill:
 
 - Invoke or read the `biomodals-workflow-development` skill before creating,
   editing, or reviewing Biomodals workflow code.
-- Treat `src/biomodals/workflow/shortmd_workflow.py` as the current executable
+- Treat `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
   reference workflow.
-- Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for
-  now because it is expected to be refactored.
+- Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern
+  for now because it is expected to be refactored.
 - When adding workflow-compatible app functions under `src/biomodals/app/`, also
   follow `docs/agents/app-development.md`.
 

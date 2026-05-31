@@ -13,9 +13,10 @@ workflow schemas, and workflow-compatible app integration points.
 Before making non-trivial workflow changes, read
 `references/workflow-development.md` for the maintained standards.
 
-Use `src/biomodals/workflow/shortmd_workflow.py` as the current executable
-example for app-composed workflows. Ignore `ppiflow_workflow.py` as a reference
-pattern for now; it is expected to be refactored.
+Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
+example for app-composed workflows. Ignore
+`src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now; it
+is expected to be refactored.
 
 ## Working Rules
 
@@ -34,6 +35,10 @@ pattern for now; it is expected to be refactored.
 - Store hydrated Modal functions/classes in a small `*ModalNamespace` dataclass
   typed as `modal.Function` or `modal.Cls`, and exclude that namespace from DAG
   hashing with `repr=False`, `compare=False`, and `metadata={"dag_hash": False}`.
+- Define workflow-specific remote file-management functions as top-level
+  `@app.function`s in the workflow module and put their hydrated handles in the
+  workflow's `*ModalNamespace`. Do not make ordinary node methods Modal
+  functions.
 - Import app-owned volume handles, volume names, and mountpoints from source app
   modules. Avoid duplicating volume strings in workflow scripts.
 - Use `volume_path_from_mount_path(...)` to convert mounted app paths into

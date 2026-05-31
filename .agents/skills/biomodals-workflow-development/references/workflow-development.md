@@ -4,10 +4,9 @@ Use this guide when creating or changing files under
 `src/biomodals/workflow/` or shared workflow contracts under
 `src/biomodals/schema/`.
 
-Use `src/biomodals/workflow/shortmd_workflow.py` as the current executable
+Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
 workflow example. Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a
-reference pattern for now because it is not up to date with the current
-included-app workflow design.
+reference pattern for now; it is expected to be refactored.
 
 ## Vocabulary
 
@@ -26,6 +25,32 @@ included-app workflow design.
 
 Avoid the terms `app node`, `runner node`, `engine`, and `workflow
 entrypoint`; they are ambiguous in this codebase.
+
+## ShortMD Reference Pattern
+
+ShortMD is the current reference for executable workflow apps. Its data flow is:
+
+1. The local entrypoint discovers local `.pdb` files, sanitizes the workflow
+   `run_id`, reads PDB bytes, builds a static `Workflow`, and submits that
+   object to the included `WorkflowOrchestrator`.
+2. The workflow app composes the shared orchestrator and the GROMACS app with
+   `modal.App(...).include(orchestrator.app)` plus
+   `include_dependency_apps(app, CONF.depends_on_apps)`.
+3. `ShortMDModalNamespace` carries the hydrated GROMACS functions and
+   workflow-native remote functions across the orchestrator boundary.
+4. `ShortMDPrepNode` prepares one input PDB once through the GROMACS app.
+5. `ShortMDCloneNode` clones prepared production inputs into per-replicate
+   directories. This file management is workflow-native because the standalone
+   GROMACS app does not need it.
+6. `ShortMDReplicateNode` runs each production replicate through the GROMACS app
+   and collects trajectory stats.
+7. `ShortMDSummaryNode` emits a Markdown report from completed production
+   artifacts.
+
+Follow this structure for new app-composed workflows: stage local inputs before
+DAG construction, build a static fan-out DAG, keep app-specific runtime work in
+included app functions, keep workflow-only adapters in the workflow module, and
+return durable artifacts as `AppRunResult` outputs.
 
 ## Schema Boundaries
 

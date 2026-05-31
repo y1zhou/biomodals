@@ -15,6 +15,7 @@ from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.helper.shell import run_command_with_log, sanitize_filename
 from biomodals.helper.volume_run import volume_path_from_mount_path
+from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
 
 ##########################################
 # Modal configs
@@ -328,6 +329,38 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     return str(workdir)
 
 
+@app.function(
+    gpu=CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def ppiflow_run_workflow(args: PPIFlowArgs, run_name: str) -> AppRunResult:
+    """Run PPIFlow and return a workflow-compatible app result."""
+    safe_run_name = sanitize_filename(run_name)
+    remote_workdir = ppiflow_run.get_raw_f()(args=args, run_name=safe_run_name)
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="ppiflow_outputs",
+                kind=ArtifactKind.DIRECTORY,
+                storage=volume_path_from_mount_path(
+                    str(remote_workdir),
+                    CONF.output_volume_mountpoint,
+                    CONF.output_volume_name,
+                ),
+                metadata={
+                    "run_name": safe_run_name,
+                    "script_name": args.script_name,
+                    "model_weights_name": args.model_weights_name,
+                },
+            )
+        ],
+    )
+
+
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
@@ -393,7 +426,7 @@ def submit_ppiflow_task(
 
     # NOTE: make sure names are unique for different inputs
     remote_dir = volume_path_from_mount_path(
-        remote_workdir, CONF.output_volume_mountpoint, CONF.output_volume_name
+        str(remote_workdir), CONF.output_volume_mountpoint, CONF.output_volume_name
     )
     with CONF.output_volume.batch_upload() as batch:
         for file in files_to_upload:

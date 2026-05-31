@@ -51,9 +51,10 @@ def test_shortmd_uses_gromacs_app_volume_metadata() -> None:
         shortmd_workflow.GROMACS_OUTPUT_MOUNTPOINT
         == gromacs_app.CONF.output_volume_mountpoint
     )
-    assert shortmd_workflow.GROMACS_OUTPUT_VOLUME is gromacs_app.OUTPUTS_VOLUME
+    assert shortmd_workflow.GROMACS_OUTPUT_VOLUME is gromacs_app.CONF.output_volume
     assert (
-        shortmd_workflow.GROMACS_OUTPUT_VOLUME_NAME == gromacs_app.OUTPUTS_VOLUME_NAME
+        shortmd_workflow.GROMACS_OUTPUT_VOLUME_NAME
+        == gromacs_app.CONF.output_volume_name
     )
 
 
@@ -246,7 +247,7 @@ def test_shortmd_prep_node_runs_gromacs_prepare_and_returns_artifact(
     assert result.outputs[0].name == "prepared_gromacs_run"
     assert result.outputs[0].kind == ArtifactKind.DIRECTORY
     assert result.outputs[0].storage == VolumePath(
-        volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+        volume_name=gromacs_app.CONF.output_volume_name,
         path="prepared/source",
     )
     assert result.outputs[0].metadata == {"stage": "prep", "run_name": "source"}
@@ -389,7 +390,7 @@ def test_shortmd_clone_node_clones_prepared_run_and_returns_artifact(
                         producing_node_id="prep-source",
                         kind=ArtifactKind.DIRECTORY,
                         storage=VolumePath(
-                            volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+                            volume_name=gromacs_app.CONF.output_volume_name,
                             path="prepared/source",
                         ),
                         metadata={"stage": "prep", "run_name": "source"},
@@ -409,7 +410,7 @@ def test_shortmd_clone_node_clones_prepared_run_and_returns_artifact(
     assert result.outputs[0].name == "cloned_gromacs_run"
     assert result.outputs[0].kind == ArtifactKind.DIRECTORY
     assert result.outputs[0].storage == VolumePath(
-        volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+        volume_name=gromacs_app.CONF.output_volume_name,
         path="source-r001",
     )
     assert result.outputs[0].metadata == {
@@ -476,7 +477,7 @@ def test_shortmd_replicate_node_runs_gromacs_production(
                         producing_node_id="clone-source-r001",
                         kind=ArtifactKind.DIRECTORY,
                         storage=VolumePath(
-                            volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+                            volume_name=gromacs_app.CONF.output_volume_name,
                             path="source-r001",
                         ),
                         metadata={
@@ -506,7 +507,7 @@ def test_shortmd_replicate_node_runs_gromacs_production(
     assert result.outputs[0].name == "gromacs_production"
     assert result.outputs[0].kind == ArtifactKind.DIRECTORY
     assert result.outputs[0].storage == VolumePath(
-        volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+        volume_name=gromacs_app.CONF.output_volume_name,
         path="production/source-r001",
     )
     assert result.outputs[0].metadata["run_name"] == "source-r001"
@@ -527,7 +528,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
                     producing_node_id="replicate-alpha-r001",
                     kind=ArtifactKind.DIRECTORY,
                     storage=VolumePath(
-                        volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+                        volume_name=gromacs_app.CONF.output_volume_name,
                         path="alpha-r001",
                     ),
                     metadata={
@@ -542,7 +543,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
                     producing_node_id="replicate-alpha-r002",
                     kind=ArtifactKind.DIRECTORY,
                     storage=VolumePath(
-                        volume_name=gromacs_app.OUTPUTS_VOLUME_NAME,
+                        volume_name=gromacs_app.CONF.output_volume_name,
                         path="alpha-r002",
                     ),
                     metadata={
@@ -565,11 +566,11 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
     report = output.storage.data.decode("utf-8")
     assert "# ShortMD Workflow Summary" in report
     assert (
-        f"| alpha | alpha-r001 | {gromacs_app.OUTPUTS_VOLUME_NAME} | alpha-r001 |"
+        f"| alpha | alpha-r001 | {gromacs_app.CONF.output_volume_name} | alpha-r001 |"
         in report
     )
     assert (
-        f"| alpha | alpha-r002 | {gromacs_app.OUTPUTS_VOLUME_NAME} | alpha-r002 |"
+        f"| alpha | alpha-r002 | {gromacs_app.CONF.output_volume_name} | alpha-r002 |"
         in report
     )
 

@@ -64,8 +64,8 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
 app = include_dependency_apps(app, CONF.depends_on_apps)
-GROMACS_OUTPUT_VOLUME = gromacs_app.OUTPUTS_VOLUME
-GROMACS_OUTPUT_VOLUME_NAME = gromacs_app.OUTPUTS_VOLUME_NAME
+GROMACS_OUTPUT_VOLUME = gromacs_app.CONF.output_volume
+GROMACS_OUTPUT_VOLUME_NAME = gromacs_app.CONF.output_volume_name
 GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
 
 

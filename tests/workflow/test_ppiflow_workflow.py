@@ -20,6 +20,7 @@ from biomodals.workflow.core import NodeRunContext
 from biomodals.workflow.ppiflow_workflow import (
     CONF,
     PPIFlowModalNamespace,
+    _active_ppiflow_app_steps,
     _stage_ppiflow_app_inputs,
     build_ppiflow_workflow,
 )
@@ -173,9 +174,149 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         }
     }
 
-    staged = _stage_ppiflow_app_inputs(steps_doc=steps_doc, run_id="run-1")
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=("PPIFlowStep",),
+    )
 
     assert staged["PPIFlowStep"]["args"]["input_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/input.pdb"
+        "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input.pdb")]
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+
+
+def test_ppiflow_staging_uses_active_stage_steps(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    uploaded = []
+
+    class FakeBatch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, local_path, remote_path):
+            uploaded.append((Path(local_path), remote_path))
+
+    class FakeVolume:
+        def batch_upload(self):
+            return FakeBatch()
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint="/biomodals-outputs",
+            output_volume_name="PPIFlow-outputs",
+        ),
+    )
+    task_doc = {
+        "steps": {
+            "PPIFlowStep": True,
+            "PartialStep": True,
+        }
+    }
+    steps_doc = {
+        "PPIFlowStep": {
+            "args": {
+                "name": "demo",
+                "specified_hotspots": "A1",
+                "input_pdb": str(input_pdb),
+                "binder_chain": "B",
+            }
+        },
+        "PartialStep": {
+            "args": {
+                "name": "demo-partial",
+                "specified_hotspots": "A1",
+                "input_pdb": str(tmp_path / "stage2-not-local.pdb"),
+                "fixed_positions": "B1",
+                "start_t": 0.5,
+            }
+        },
+    }
+
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=_active_ppiflow_app_steps(task_doc, stage=1),
+    )
+
+    assert staged["PPIFlowStep"]["args"]["input_pdb"].endswith(
+        "/PPIFlowStep/input_pdb/input.pdb"
+    )
+    assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+
+
+def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    antigen_pdb = tmp_path / "antigen" / "input.pdb"
+    framework_pdb = tmp_path / "framework" / "input.pdb"
+    antigen_pdb.parent.mkdir()
+    framework_pdb.parent.mkdir()
+    antigen_pdb.write_text("ATOM antigen\n", encoding="utf-8")
+    framework_pdb.write_text("ATOM framework\n", encoding="utf-8")
+    uploaded = []
+
+    class FakeBatch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, local_path, remote_path):
+            uploaded.append((Path(local_path), remote_path))
+
+    class FakeVolume:
+        def batch_upload(self):
+            return FakeBatch()
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint="/biomodals-outputs",
+            output_volume_name="PPIFlow-outputs",
+        ),
+    )
+    steps_doc = {
+        "PPIFlowStep": {
+            "args": {
+                "name": "demo",
+                "specified_hotspots": "A1",
+                "antigen_pdb": str(antigen_pdb),
+                "antigen_chain": "A",
+                "framework_pdb": str(framework_pdb),
+                "heavy_chain": "H",
+            }
+        }
+    }
+
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=("PPIFlowStep",),
+    )
+
+    assert staged["PPIFlowStep"]["args"]["antigen_pdb"] == (
+        "/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/input.pdb"
+    )
+    assert staged["PPIFlowStep"]["args"]["framework_pdb"] == (
+        "/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/input.pdb"
+    )
+    assert uploaded == [
+        (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
+        (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
+    ]

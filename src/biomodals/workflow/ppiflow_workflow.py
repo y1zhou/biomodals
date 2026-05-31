@@ -415,17 +415,33 @@ def _ppiflow_input_fields(args: object) -> tuple[str, ...]:
     raise TypeError(f"Unsupported PPIFlow args type: {type(args).__name__}")
 
 
+def _active_ppiflow_app_steps(
+    task_doc: dict[str, Any], stage: int | None
+) -> tuple[str, ...]:
+    """Return PPIFlow app steps that should be staged for the selected run."""
+    if stage not in {None, 1, 2}:
+        raise ValueError("stage must be omitted, 1, or 2")
+    enabled = _enabled_section(task_doc)
+    active_steps: list[str] = []
+    if stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep"):
+        active_steps.append("PPIFlowStep")
+    if stage in {None, 2} and _step_enabled(enabled, "PartialStep"):
+        active_steps.append("PartialStep")
+    return tuple(active_steps)
+
+
 def _stage_ppiflow_app_inputs(
     *,
     steps_doc: dict[str, Any],
     run_id: str,
+    app_steps: tuple[str, ...],
 ) -> dict[str, Any]:
     """Upload local PPIFlow app inputs and rewrite step args to mounted paths."""
     staged_steps = deepcopy(steps_doc)
     uploads: list[tuple[Path, str]] = []
     volume_root = Path(ppiflow_app.CONF.output_volume_mountpoint)
 
-    for step_name in PPI_FLOW_APP_STEPS:
+    for step_name in app_steps:
         if step_name not in staged_steps:
             continue
         cfg = _step_cfg(staged_steps, step_name)
@@ -450,6 +466,7 @@ def _stage_ppiflow_app_inputs(
             remote_rel = (
                 Path(run_id)
                 / sanitize_filename(step_name)
+                / sanitize_filename(field_name)
                 / sanitize_filename(local_path.name)
             )
             raw_args[field_name] = str(volume_root / remote_rel)
@@ -501,9 +518,11 @@ def submit_ppiflow_workflow(
     steps_yaml_path = Path(steps_yaml).expanduser().resolve()
     resolved_run_id = sanitize_filename(run_id or task_yaml_path.stem)
     task_yaml_bytes = task_yaml_path.read_bytes()
+    task_doc = _load_yaml_bytes(task_yaml_bytes)
     steps_doc = _stage_ppiflow_app_inputs(
         steps_doc=_load_yaml_bytes(steps_yaml_path.read_bytes()),
         run_id=resolved_run_id,
+        app_steps=_active_ppiflow_app_steps(task_doc, stage),
     )
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=task_yaml_bytes,

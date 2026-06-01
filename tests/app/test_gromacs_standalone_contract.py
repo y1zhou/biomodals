@@ -44,7 +44,11 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
     monkeypatch.setattr(gromacs_app.modal, "FunctionCall", FakeFunctionCall)
 
-    gromacs_app.submit_gromacs_task.info.raw_f(
+    submit_task_info = gromacs_app.submit_gromacs_task.info
+    assert submit_task_info is not None
+    submit_task_raw_f = submit_task_info.raw_f
+    assert submit_task_raw_f is not None
+    submit_task_raw_f(
         input_pdb=str(pdb_path),
         run_name="single",
         simulation_time_ns=3,

@@ -41,7 +41,11 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
 
     monkeypatch.setattr(alphafold3_app, "predict_structures", fake_predict_structures)
 
-    alphafold3_app.submit_alphafold3_task.info.raw_f(
+    submit_task_info = alphafold3_app.submit_alphafold3_task.info
+    assert submit_task_info is not None
+    submit_task_raw_f = submit_task_info.raw_f
+    assert submit_task_raw_f is not None
+    submit_task_raw_f(
         input_json=str(input_json),
         out_dir=str(tmp_path),
         run_name="renamed",

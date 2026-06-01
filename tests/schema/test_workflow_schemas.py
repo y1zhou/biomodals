@@ -4,6 +4,7 @@
 
 import ast
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -22,7 +23,7 @@ from biomodals.schema import (
 
 
 def _valid_app_config(**overrides: object) -> AppConfig:
-    values = {
+    values: dict[str, Any] = {
         "name": "demo",
         "package_name": "demo-package",
         "version": "1.0.0",
@@ -137,7 +138,7 @@ def test_inline_bytes_rejects_binary_data_and_archive_metadata() -> None:
         InlineBytes(data=b"\xff\x00", filename="binary.bin")
 
     with pytest.raises(ValidationError, match="archive_format"):
-        InlineBytes(data=b"text", filename="archive.zip", archive_format="zip")
+        InlineBytes(data=b"text", filename="archive.zip", archive_format="zip")  # type: ignore[ty:unknown-argument]
 
 
 def test_volume_path_rejects_absolute_and_traversal_paths() -> None:

@@ -28,8 +28,8 @@ from pathlib import Path
 import modal
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MODEL_VOLUME
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import resolve_local_output_dir
 from biomodals.helper.shell import (
     run_command,
@@ -49,7 +49,7 @@ CONF = AppConfig(
     repo_commit_hash="6b1bd91abdf6785d9bbf59c51d6e0c8880aceb8a",
     package_name="iggm",
     python_version="3.11",
-    cuda_version="cu121",
+    cuda_version="cu117",
     gpu=os.environ.get("GPU", "A10G"),
     timeout=int(os.environ.get("TIMEOUT", "18000")),
 )
@@ -60,7 +60,7 @@ class AppInfo:
     """Container for IgGM-specific information and configurations."""
 
     repo_dir: Path = CONF.git_clone_dir
-    outputs_volume: modal.Volume = field(default_factory=CONF.get_out_volume)
+    outputs_volume: modal.Volume = field(default_factory=lambda: CONF.output_volume)
     outputs_dir: str = CONF.output_volume_mountpoint
     model_names: tuple[str, ...] = (
         "esm_ppi_650m_ab",
@@ -78,14 +78,12 @@ class AppInfo:
             "igso3_buffer": "8963fa425002a5a65c0b13ddaa443e9e",
         }
     )
-    valid_tasks: frozenset[str] = frozenset(
-        {
-            "design",
-            "inverse_design",
-            "affinity_maturation",
-            "fr_design",
-        }
-    )
+    valid_tasks: frozenset[str] = frozenset({
+        "design",
+        "inverse_design",
+        "affinity_maturation",
+        "fr_design",
+    })
     merge_chains_task: str = "merge_chains"
     checkpoints_dir: Path = CONF.git_clone_dir / "checkpoints"
     model_volume_sub_path: str = f"/{CONF.name}"
@@ -93,7 +91,7 @@ class AppInfo:
     @property
     def outputs_volume_name(self) -> str:
         """Name of the persisted IgGM output volume."""
-        return self.outputs_volume.name or f"{CONF.name}-outputs"
+        return CONF.output_volume_name
 
 
 APP_INFO = AppInfo()
@@ -102,12 +100,13 @@ APP_INFO = AppInfo()
 # Image and app definitions
 ##########################################
 runtime_image = patch_image_for_helper(
-    modal.Image.debian_slim(python_version=CONF.python_version)
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "wget", "build-essential", "zstd")
     .env(CONF.default_env)
     .uv_pip_install(
-        "torch==2.1.2",
-        "torchvision==0.16.2",
+        "torch==2.0.1",
+        "torchvision==0.15.2",
     )
     .uv_pip_install(
         "torch_geometric==2.5.2",
@@ -116,7 +115,7 @@ runtime_image = patch_image_for_helper(
         "torch_sparse",
         "torch_cluster",
         "torch_spline_conv",
-        find_links=f"https://data.pyg.org/whl/torch-2.1.0+{CONF.cuda_version}.html",
+        find_links=f"https://data.pyg.org/whl/torch-2.0.1+{CONF.cuda_version}.html",
     )
     .uv_pip_install(
         "numpy==1.23.5",
@@ -137,15 +136,6 @@ runtime_image = patch_image_for_helper(
     .run_commands(
         f"git clone {CONF.repo_url} {APP_INFO.repo_dir}",
         f"cd {APP_INFO.repo_dir} && git checkout {CONF.repo_commit_hash}",
-        # Biopython atom coordinates are numpy arrays, but torch.from_numpy can
-        # fail in this runtime with "expected np.ndarray (got numpy.ndarray)"
-        # when NumPy/PyTorch extension ABIs do not line up. Constructing a
-        # float32 tensor directly avoids that strict zero-copy conversion path.
-        "cd "
-        f"{APP_INFO.repo_dir} && sed -i "
-        "'s/torch.from_numpy(residue\\[atom_name\\].get_coord())/"
-        "torch.tensor(residue[atom_name].get_coord(), dtype=torch.float32)/' "
-        "IgGM/protein/parser/pdb_parser.py",
     )
 )
 
@@ -173,7 +163,12 @@ def _md5_matches(path: Path, expected_md5: str) -> bool:
 @app.function(
     cpu=(0.125, 8.125),
     timeout=CONF.timeout,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    volumes={
+        APP_INFO.checkpoints_dir: MODEL_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=APP_INFO.model_volume_sub_path,
+        )
+    },
     image=runtime_image,
 )
 def download_iggm_models(force: bool = False) -> None:
@@ -181,7 +176,7 @@ def download_iggm_models(force: bool = False) -> None:
     MODEL_VOLUME.reload()
     model_urls = {}
     for name in APP_INFO.model_names:
-        path = CONF.model_dir / f"{name}.pth"
+        path = APP_INFO.checkpoints_dir / f"{name}.pth"
         if path.exists() and not force:
             if _md5_matches(path, APP_INFO.model_md5[name]):
                 continue
@@ -206,9 +201,9 @@ def download_iggm_models(force: bool = False) -> None:
                     f"expected {APP_INFO.model_md5[name]}"
                 )
     else:
-        print(f"💊 IgGM model weights already exist under {CONF.model_dir}")
+        print(f"💊 IgGM model weights already exist under {APP_INFO.checkpoints_dir}")
     MODEL_VOLUME.commit()
-    print(f"💊 IgGM model weights are available under {CONF.model_dir}")
+    print(f"💊 IgGM model weights are available under {APP_INFO.checkpoints_dir}")
 
 
 def _download_remote_run(remote_run_dir: str, out_dir: str, label: str) -> None:

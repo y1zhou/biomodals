@@ -2,14 +2,17 @@
 
 import importlib
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import modal
 
-APP_HOME = Path(__file__).parent.resolve()
+BIOMODALS_HOME = Path(__file__).parent.parent.resolve()
+APP_HOME = BIOMODALS_HOME / "app"
+WORKFLOW_HOME = BIOMODALS_HOME / "workflow"
+CatalogType = Literal["app", "workflow"]
 
 
 class AppNotFoundError(ValueError):
@@ -21,24 +24,80 @@ class AppNotFoundError(ValueError):
         super().__init__(f"Application '{app_name}' not found.")
 
 
-def get_all_apps(
-    use_absolute_paths: bool = False,
+def get_all_scripts(
+    root_dir: Path,
+    glob_prefix: str,
+    glob_suffix: str,
     *,
-    app_home: Path = APP_HOME,
+    use_absolute_paths: bool = False,
     cwd: Path | None = None,
 ) -> dict[str, Path]:
     """Retrieve all available biomodals applications."""
     available_apps: dict[str, Path] = {}
     base_cwd = Path.cwd() if cwd is None else cwd
-    for app_file in app_home.glob("*/*_app.py"):
+    glob_pattern = f"{glob_prefix}*{glob_suffix}.py"
+    for app_file in root_dir.glob(glob_pattern):
         app_path = (
             app_file.resolve()
             if use_absolute_paths
             else app_file.relative_to(base_cwd, walk_up=True)
         )
-        app_name = app_file.stem.replace("_app", "")
+        app_name = app_file.stem.removesuffix(glob_suffix)
         available_apps[app_name] = app_path
     return available_apps
+
+
+def get_catalog(
+    catalog_type: CatalogType,
+    *,
+    use_absolute_paths: bool = False,
+    cwd: Path | None = None,
+) -> dict[str, Path]:
+    """Retrieve app or workflow catalog entries."""
+    match catalog_type:
+        case "app":
+            return get_all_scripts(
+                APP_HOME, "*/", "_app", use_absolute_paths=use_absolute_paths, cwd=cwd
+            )
+        case "workflow":
+            return get_all_scripts(
+                WORKFLOW_HOME,
+                "",
+                "_workflow",
+                use_absolute_paths=use_absolute_paths,
+                cwd=cwd,
+            )
+        case _:
+            raise ValueError(f"Unknown catalog type: {catalog_type}")
+
+
+def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> modal.App:
+    """Include catalog app definitions into an existing Modal app."""
+    all_apps = get_catalog("app", use_absolute_paths=True)
+    for dependency in dependencies:
+        dependency_metadata = BiomodalsApp(dependency, all_apps=all_apps)
+        dependency_module = importlib.import_module(dependency_metadata.module)
+        dependency_app = getattr(dependency_module, "app", None)
+        if not isinstance(dependency_app, modal.App):
+            raise TypeError(
+                f"Dependency app '{dependency}' does not expose a modal.App named app"
+            )
+
+        function_collisions = set(app._local_state.functions) & set(
+            dependency_app._local_state.functions
+        )
+        class_collisions = set(app._local_state.classes) & set(
+            dependency_app._local_state.classes
+        )
+        duplicate_tags = sorted(function_collisions | class_collisions)
+        if duplicate_tags:
+            duplicate_list = ", ".join(duplicate_tags)
+            raise ValueError(
+                f"Dependency app '{dependency}' has Modal tag collisions: "
+                f"{duplicate_list}"
+            )
+        app.include(dependency_app, inherit_tags=False)
+    return app
 
 
 @dataclass(frozen=True)
@@ -66,6 +125,7 @@ class BiomodalsApp:
         _func_idx (dict[str, int]): A mapping of function names to their index in the functions list.
         _local_entrypoint_idx (list[int]): A list of indices of local entrypoint functions in the functions list.
         _remote_modal_func_idx (list[int]): A list of indices of remote Modal functions in the functions list.
+
     """
 
     def __init__(
@@ -79,9 +139,7 @@ class BiomodalsApp:
             self._entrypoint = entrypoint_name
 
         # Normalize app name & path
-        self._all_apps = all_apps or get_all_apps(
-            use_absolute_paths=True, app_home=APP_HOME
-        )
+        self._all_apps = all_apps or get_catalog("app", use_absolute_paths=True)
         self.name, self.path = self.resolve_app_path(name_or_path)
         self.category = self.path.parent.name
         self.module = self.app_path_to_module_path(self.path)
@@ -121,19 +179,29 @@ class BiomodalsApp:
         app_path = Path(app_name_or_path).expanduser()
         if not app_path.exists():
             raise AppNotFoundError(app_name_or_path)
-        return app_path.stem.removesuffix("_app"), app_path
+        return app_path.stem.removesuffix("_app").removesuffix("_workflow"), app_path
 
     @staticmethod
     def app_path_to_module_path(app_path: Path) -> str:
         """Convert an app path to a module path."""
+        resolved_path = app_path.resolve()
+        if resolved_path.is_relative_to(APP_HOME):
+            module_path = (
+                str(resolved_path.relative_to(APP_HOME))
+                .replace("/", ".")
+                .replace("\\", ".")
+                .replace(".py", "")
+                .replace("-", "_")
+            )
+            return f"biomodals.app.{module_path}"
         module_path = (
-            str(app_path.resolve().relative_to(APP_HOME))
+            str(resolved_path.relative_to(BIOMODALS_HOME))
             .replace("/", ".")
             .replace("\\", ".")
             .replace(".py", "")
             .replace("-", "_")
         )
-        return f"biomodals.app.{module_path}"
+        return f"biomodals.{module_path}"
 
     def populate_functions(self):
         """Collect all functions within the app."""

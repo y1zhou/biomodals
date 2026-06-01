@@ -1,0 +1,4 @@
+interface:
+  display_name: "Biomodals Workflow Development"
+  short_description: "Build ShortMD-style Biomodals workflows"
+  default_prompt: "Use $biomodals-workflow-development to update a Biomodals workflow while following the ShortMD reference pattern."

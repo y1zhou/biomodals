@@ -3,12 +3,16 @@
 ## Repository expectations
 
 - This is a Python 3.12+ project for running bioinformatics tools on Modal.
-- Prefer `uv run ...` for project commands and `biomodals` CLI smoke tests.
+- Prefer `uv run ...` for project commands and `biomodals` CLI smoke tests. Never run `python ...` directly.
 - Use `polars` for tabular data parsing and writing in Python code; avoid new
   `csv` or `pandas` parsing unless an upstream tool API specifically requires it.
+- Use `orjson` for non-Pydantic JSON serialization and deserialization. For
+  Pydantic models, serialize with `model_dump_json()` and parse JSON bytes or
+  strings with `model_validate_json(...)`.
 - CI runs `prek` against `.pre-commit-config.yaml`; after code edits, run `prek run --files <changed files>` when practical.
-- For CLI or app-discovery changes, smoke test with `uv run biomodals list` and `uv run biomodals help <app-name>` when practical.
+- For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` when practical.
 - Keep generated archives, large run outputs, Modal result directories, and local test data out of commits unless the user explicitly asks for them.
+- Avoid extracting trivial helper functions that are only a couple of lines and used once or twice; inline the logic and add comments when that is clearer.
 
 ## Instruction maintenance
 
@@ -37,6 +41,13 @@ This repo is built on Modal, a serverless cloud platform for running Python code
 
 When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, use the repo-local `biomodals-app-development` skill. See `docs/agents/app-development.md`.
 
+### Workflow development
+
+When creating or editing reusable workflow runtime code under
+`src/biomodals/workflow/` or shared workflow schemas under
+`src/biomodals/schema/`, use the repo-local `biomodals-workflow-development`
+skill. See `docs/agents/workflow-development.md`.
+
 ## Biomodals app development
 
 The detailed app-development standards are consolidated in `.agents/skills/biomodals-app-development/`.
@@ -48,3 +59,9 @@ Use these apps as current implementation references:
 - `src/biomodals/app/design/boltzgen_app.py`
 
 When developing new apps that must violate the skill's conventions for good reason, document the reason for the deviation in `docs/agents/` and link that note from `docs/agents/app-development.md`.
+
+## Biomodals workflow development
+
+The detailed workflow-development standards are consolidated in `.agents/skills/biomodals-workflow-development/`.
+
+Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end workflow reference. Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now because it is expected to be refactored.

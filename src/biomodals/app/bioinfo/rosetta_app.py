@@ -12,7 +12,6 @@ See <https://docs.rosettacommons.org/docs/latest/Home> for documentation.
 
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -22,7 +21,8 @@ import polars as pl
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.shell import package_outputs
+from biomodals.helper.shell import package_outputs, warmup_directory
+from biomodals.helper.volume_run import volume_path_from_mount_path
 
 ##########################################
 # Modal configs
@@ -36,83 +36,17 @@ CONF = AppConfig(
     python_version="3.12",
     timeout=int(os.environ.get("TIMEOUT", "14400")),
 )
-OUT_VOLUME = CONF.get_out_volume()
 ROSETTA_DIR = Path(__file__).parent / "rosetta"
-
-
-@dataclass(frozen=True)
-class _RosettaCommandJob:
-    index: str
-    binary: str
-    pdb_path: Path
-    out_dir: Path
-    rosetta_script_path: Path | None = None
-    flags_path: Path | None = None
-
-
-def _build_rosetta_command(
-    *,
-    binary: str,
-    pdb_path: Path,
-    out_dir: Path,
-    rosetta_script_path: Path | None = None,
-    flags_path: Path | None = None,
-) -> list[str]:
-    cmd = [binary]
-    if rosetta_script_path is not None:
-        cmd.extend(["-parser:protocol", str(rosetta_script_path)])
-    if flags_path is not None:
-        cmd.append(f"@{flags_path}")
-    cmd.extend(["-s", str(pdb_path), "-out:path:all", str(out_dir)])
-    return cmd
-
-
-def _command_for_rosetta_job(job: _RosettaCommandJob) -> list[str]:
-    return _build_rosetta_command(
-        binary=job.binary,
-        pdb_path=job.pdb_path,
-        out_dir=job.out_dir,
-        rosetta_script_path=job.rosetta_script_path,
-        flags_path=job.flags_path,
-    )
-
-
-def _required_rosetta_job_value(job_spec: dict[str, object], key: str) -> object:
-    value = job_spec[key]
-    if value is None:
-        raise ValueError(f"Rosetta job is missing {key!r}")
-    return value
-
-
-def _optional_mounted_path(mount_dir: Path, path: object) -> Path | None:
-    if path is None:
-        return None
-    return mount_dir / str(path)
-
-
-def _normalize_volume_rosetta_job(
-    job_spec: dict[str, object], *, mount_dir: Path, workdir: Path
-) -> _RosettaCommandJob:
-    task_idx = str(_required_rosetta_job_value(job_spec, "index"))
-    return _RosettaCommandJob(
-        index=task_idx,
-        binary=str(_required_rosetta_job_value(job_spec, "binary")),
-        pdb_path=mount_dir / str(_required_rosetta_job_value(job_spec, "pdb")),
-        out_dir=workdir / task_idx,
-        rosetta_script_path=_optional_mounted_path(
-            mount_dir, job_spec.get("rosetta_script")
-        ),
-        flags_path=_optional_mounted_path(mount_dir, job_spec.get("flags_file")),
-    )
 
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
-    modal.Image.from_registry(
-        "rosettacommons/rosetta:serial-420", add_python=CONF.python_version
-    )
+runtime_image = (
+    modal.Image
+    .from_registry("rosettacommons/rosetta:serial-420", add_python=CONF.python_version)
+    .env(CONF.default_env)
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -124,7 +58,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     cpu=(0.125, 30.125),  # Each pod can run 1-30 jobs
     memory=(1024, 43008),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
-    volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
+    volumes=CONF.mounts(output_volume=True),
 )
 def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
     """Run Rosetta scripts."""
@@ -141,15 +75,29 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
                 print(f"💊 No more jobs in queue for worker {worker_idx}")
                 return
 
-            job = _normalize_volume_rosetta_job(
-                job_spec,
-                mount_dir=mount_dir,
-                workdir=workdir,
-            )
-            run_command_with_log(
-                _command_for_rosetta_job(job), log_file=job.out_dir / "rosetta.log"
-            )
-            OUT_VOLUME.commit()
+            task_idx = str(job_spec["index"])
+            binary = job_spec["binary"]
+            pdb_path = job_spec["pdb"]
+            if binary is None or pdb_path is None:
+                raise ValueError(f"Rosetta job is missing required values: {job_spec}")
+
+            out_dir = workdir / task_idx
+            cmd = [str(binary)]
+            if job_spec.get("rosetta_script") is not None:
+                cmd.extend([
+                    "-parser:protocol",
+                    str(mount_dir / str(job_spec["rosetta_script"])),
+                ])
+            if job_spec.get("flags_file") is not None:
+                cmd.append(f"@{mount_dir / str(job_spec['flags_file'])}")
+            cmd.extend([
+                "-s",
+                str(mount_dir / str(pdb_path)),
+                "-out:path:all",
+                str(out_dir),
+            ])
+            run_command_with_log(cmd, log_file=out_dir / "rosetta.log")
+            CONF.output_volume.commit()
 
     # Run workers in parallel within the pod
     from concurrent.futures import ThreadPoolExecutor
@@ -164,7 +112,7 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
-    volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
+    volumes=CONF.mounts(output_volume=True),
 )
 def package_outputs_helper(
     root: str | Path,
@@ -173,6 +121,7 @@ def package_outputs_helper(
     num_threads: int = 16,
 ) -> bytes:
     """Modal runner to package directories into a tar.zst archive and return as bytes."""
+    warmup_directory(root)
     return package_outputs(
         root,
         paths_to_bundle=paths_to_bundle,
@@ -392,7 +341,7 @@ def submit_rosetta_task(
     print(f"🧬 Preparing queue for {run_name} tasks...")
     queue = modal.Queue.from_name(f"{CONF.name}-queue-{run_id}", create_if_missing=True)
     uploaded_files = set()
-    with OUT_VOLUME.batch_upload() as batch:
+    with CONF.output_volume.batch_upload() as batch:
         for r in tasks_df.iter_rows(named=True):
             # Structure file should always be present
             local_pdb = Path(r["pdb"]).expanduser().resolve()
@@ -446,14 +395,13 @@ def submit_rosetta_task(
     modal.Queue.objects.delete(f"{CONF.name}-queue-{run_id}")
 
     # Save results locally
-    out_vol_name = OUT_VOLUME.name or f"{CONF.name}-outputs"
-    remote_data_dir = f"/{run_name}-{run_id}"
-
+    out_vol = volume_path_from_mount_path(
+        f"{CONF.output_volume_mountpoint}/{run_name}-{run_id}",
+        CONF.output_volume_mountpoint,
+        CONF.output_volume_name,
+    )
     if out_dir is None:
-        print(
-            f"🧬 {CONF.name} run complete!\n"
-            f"Results saved to Modal volume '{out_vol_name}' at '{remote_data_dir}'"
-        )
+        print(f"🧬 {CONF.name} run complete!\nResults saved to {out_vol}")
         return
 
     local_out_dir = Path(out_dir).expanduser().resolve()

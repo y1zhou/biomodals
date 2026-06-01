@@ -120,7 +120,7 @@ mkdir -p "${out_dir}"
 ##########################################
 # Extract protein trajectory, center, and remove PBC
 ##########################################
-if [ ! -f "${output_stem}_centered.pdb" ]; then
+if [ ! -f "${output_file}" ]; then
 
 # 1. make molecules whole
 printf "Protein\nProtein\n" | \
@@ -157,6 +157,9 @@ printf "Protein\nProtein\n" | \
     -f "${output_file}.fit1st.xtc" -o "${output_file}" \
     -center -ur compact -pbc mol -boxcenter tric && \
     rm "${output_file}.fit1st.xtc"
+fi
+
+if [ ! -f "${output_stem}_centered.pdb" ]; then
 
 echo 'Protein' | "${GROMACS}" trjconv -s "${tpr_file}" -f "${output_file}" -dump 0 -o "${output_stem}_centered.gro"
 echo 'Protein' | "${GROMACS}" trjconv -s "${tpr_file}" -f "${output_file}" -dump 0 -o "${output_stem}_centered.pdb"

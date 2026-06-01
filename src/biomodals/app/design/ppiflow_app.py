@@ -11,9 +11,11 @@ import modal
 from pydantic import BaseModel, computed_field, model_validator
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.helper.shell import run_command_with_log, sanitize_filename
+from biomodals.helper.volume_run import volume_path_from_mount_path
+from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
 
 ##########################################
 # Modal configs
@@ -29,15 +31,12 @@ CONF = AppConfig(
     gpu=os.environ.get("GPU", "L40S"),
 )
 
-# Volumes to be mounted
-OUTPUTS_VOLUME = CONF.get_out_volume()
-OUTPUTS_VOLUME_NAME = OUTPUTS_VOLUME.name or f"{CONF.name}-outputs"
 SCRIPTS_DIR = CONF.git_clone_dir / "tool" / "PPIFlow"
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
@@ -119,6 +118,7 @@ runtime_image = patch_image_for_helper(
         find_links=f"https://data.pyg.org/whl/torch-2.10.0+{CONF.cuda_version}.html",
     )
     .workdir(str(SCRIPTS_DIR))
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -262,10 +262,12 @@ class PPIFlowArgs(BaseModel):
 ##########################################
 # Fetch model weights
 ##########################################
-@app.function(volumes={CONF.model_volume_mountpoint: MODEL_VOLUME}, timeout=MAX_TIMEOUT)
+@app.function(
+    volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=MAX_TIMEOUT
+)
 def fetch_model_weights(force: bool = False) -> None:
     """Download PPIFlow models into the mounted volume."""
-    model_dir = CONF.model_dir
+    model_dir = Path(CONF.model_volume_mountpoint)
     base_url = "https://drive.google.com/uc?export=download&confirm=t&id="
     tasks = {
         f"{base_url}1WBSjCTEtia9S1hJ54mYH1PZdDqpLVsgw": model_dir / "antibody.ckpt",
@@ -295,10 +297,7 @@ def fetch_model_weights(force: bool = False) -> None:
     cpu=(0.125, 16.125),
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes={
-        CONF.output_volume_mountpoint: OUTPUTS_VOLUME,
-        CONF.model_volume_mountpoint: MODEL_VOLUME.read_only(),
-    },
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
 def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     """Actual remote runner of PPIFlow."""
@@ -311,7 +310,7 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
         return str(workdir)
 
     # Build command
-    model_weights_path = CONF.model_dir / args.model_weights_name
+    model_weights_path = Path(CONF.model_volume_mountpoint) / args.model_weights_name
     arg_fields = args.args.model_dump(exclude_none=True)
     cmd = [
         sys.executable,
@@ -326,8 +325,40 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     print(f"💊 Running {CONF.name}, saving logs to {log_path}")
     run_command_with_log(cmd, log_file=log_path)
 
-    OUTPUTS_VOLUME.commit()
+    CONF.output_volume.commit()
     return str(workdir)
+
+
+@app.function(
+    gpu=CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def ppiflow_run_workflow(args: PPIFlowArgs, run_name: str) -> AppRunResult:
+    """Run PPIFlow and return a workflow-compatible app result."""
+    safe_run_name = sanitize_filename(run_name)
+    remote_workdir = ppiflow_run.get_raw_f()(args=args, run_name=safe_run_name)
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="ppiflow_outputs",
+                kind=ArtifactKind.DIRECTORY,
+                storage=volume_path_from_mount_path(
+                    str(remote_workdir),
+                    CONF.output_volume_mountpoint,
+                    CONF.output_volume_name,
+                ),
+                metadata={
+                    "run_name": safe_run_name,
+                    "script_name": args.script_name,
+                    "model_weights_name": args.model_weights_name,
+                },
+            )
+        ],
+    )
 
 
 ##########################################
@@ -394,10 +425,12 @@ def submit_ppiflow_task(
             raise ValueError(f"Unsupported design_mode: {design_mode}")
 
     # NOTE: make sure names are unique for different inputs
-
-    with OUTPUTS_VOLUME.batch_upload() as batch:
+    remote_dir = volume_path_from_mount_path(
+        str(remote_workdir), CONF.output_volume_mountpoint, CONF.output_volume_name
+    )
+    with CONF.output_volume.batch_upload() as batch:
         for file in files_to_upload:
-            print(f"🧬 Uploading '{file}' to volume {OUTPUTS_VOLUME_NAME}...")
+            print(f"🧬 Uploading '{file}' to {remote_dir}...")
             batch.put_file(file, f"{run_name}/{Path(file).name}")
 
     print(f"🧬 Submitting PPIFlow task with run name: {run_name}")

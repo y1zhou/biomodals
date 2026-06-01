@@ -13,14 +13,14 @@ pembro_pdb="${SCRIPT_DIR}/../data/5B8C.pdb.gz"
 temp_dir=$(mktemp -d)
 
 gunzip -c "${pembro_pdb}" > "${temp_dir}/5B8C.pdb"
-"${ENTRY_BIN}" r ligandmpnn -- \
+"${ENTRY_BIN}" app r ligandmpnn -- \
     --run-name biomodals_ligandmpnn_score_example \
     --input-pdb "${temp_dir}/5B8C.pdb" \
     --out-dir "${temp_dir}" \
     --script-mode score \
     --model-type ligand_mpnn
 
-"${ENTRY_BIN}" r ligandmpnn -- \
+"${ENTRY_BIN}" app r ligandmpnn -- \
     --run-name biomodals_ligandmpnn_design_example \
     --input-pdb "${temp_dir}/5B8C.pdb" \
     --out-dir "${temp_dir}" \

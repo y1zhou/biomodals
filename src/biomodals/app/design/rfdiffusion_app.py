@@ -71,6 +71,7 @@ from biomodals.helper.shell import (
     run_command,
     warmup_directory,
 )
+from biomodals.helper.volume_run import volume_path_from_mount_path
 
 # -------------------------
 # Modal configs
@@ -80,7 +81,8 @@ TIMEOUT = int(os.environ.get("TIMEOUT", "36000"))
 APP_NAME = os.environ.get("MODAL_APP", "RFdiffusion")
 
 RFD_VOLUME = Volume.from_name("rfdiffusion-models", create_if_missing=True)
-RFD_OUT_VOLUME = Volume.from_name("rfdiffusion-outputs", create_if_missing=True)
+RFD_OUT_VOLUME_NAME = "rfdiffusion-outputs"
+RFD_OUT_VOLUME = Volume.from_name(RFD_OUT_VOLUME_NAME, create_if_missing=True)
 
 RFD_REPO_DIR = "/root/RFdiffusion"
 RFD_MODELS_DIR = f"{RFD_REPO_DIR}/models"
@@ -107,7 +109,7 @@ RFD_CHECKPOINT_URLS: dict[str, str] = {
 # For an example of a newer, modern CUDA/PyTorch-style Docker environment, see:
 # https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile
 # The runtime image below is defined directly with Modal and is not built from that Dockerfile.
-runtime_image = patch_image_for_helper(
+runtime_image = (
     Image
     .debian_slim(python_version="3.10")
     .apt_install(
@@ -162,6 +164,7 @@ runtime_image = patch_image_for_helper(
         "python -m pip install --no-cache-dir -r requirements.txt && "
         "python setup.py install"
     )
+    .pipe(patch_image_for_helper)
 )
 
 
@@ -259,7 +262,7 @@ async def download_rfdiffusion_models(force: bool = False) -> None:
     timeout=TIMEOUT,
     image=runtime_image,
     volumes={
-        RFD_MODELS_DIR: RFD_VOLUME.read_only(),
+        RFD_MODELS_DIR: RFD_VOLUME.with_mount_options(read_only=True),
         # output cache volume.
         RFD_OUT_DIR: RFD_OUT_VOLUME,
     },
@@ -323,6 +326,12 @@ def rfdiffusion_infer(
 
         # ---- commit cached outputs ----
         RFD_OUT_VOLUME.commit()
+        remote_run_dir = volume_path_from_mount_path(
+            str(cached_run_dir),
+            RFD_OUT_DIR,
+            RFD_OUT_VOLUME_NAME,
+        )
+        print(f"RFdiffusion cached outputs: {remote_run_dir}", flush=True)
 
         # ---- bundle outputs for return ----
         warmup_directory(run_dir)
@@ -348,39 +357,29 @@ def submit_rfdiffusion_task(
 ):
     """Submit an RFdiffusion inference job to Modal.
 
-    Parameters
-    ----------
-    run_name : str
-        Unique name for this run. Used as the output-volume cache key and as part
-        of the returned output archive filename.
-    input_pdb : str
-        Path to the input PDB file on the local machine. The file will be uploaded
-        to the Modal worker before inference starts.
-    contigs : str | None
-        Convenience wrapper for `contigmap.contigs` (Hydra override). This argument
-        simplifies common RFdiffusion use cases such as binder or scaffold design.
-    num_designs : int
-        Convenience wrapper for `inference.num_designs` (Hydra override).
-    hotspot_res : str | None
-        Convenience wrapper for `ppi.hotspot_res` (Hydra override), typically used
-        for binder design.
-    rfd_args : str
-        Raw RFdiffusion Hydra overrides passed directly to the inference script.
-        This acts as an escape hatch for advanced or unsupported options.
-    download_models : bool
-        If set, download RFdiffusion checkpoint weights into the persistent models
-        volume and exit without running inference.
-    force_redownload : bool
-        Force re-download checkpoint weights even if they already exist in the
-        models volume.
-    out_dir : str | None
-        Optional local directory where the output `.tar.zst` archive will be written.
-        Defaults to the current working directory.
+    Args:
+        run_name: Unique name for this run. Used as the output-volume cache key
+            and as part of the returned output archive filename.
+        input_pdb: Path to the input PDB file on the local machine. The file
+            will be uploaded to the Modal worker before inference starts.
+        contigs: Convenience wrapper for `contigmap.contigs` (Hydra override).
+            This simplifies common RFdiffusion use cases such as binder or
+            scaffold design.
+        num_designs: Convenience wrapper for `inference.num_designs`.
+        hotspot_res: Convenience wrapper for `ppi.hotspot_res`, typically used
+            for binder design.
+        rfd_args: Raw RFdiffusion Hydra overrides passed directly to the
+            inference script. This is an escape hatch for advanced options.
+        download_models: If set, download RFdiffusion checkpoint weights into
+            the persistent models volume and exit without running inference.
+        force_redownload: Force re-download checkpoint weights even if they
+            already exist in the models volume.
+        out_dir: Optional local directory where the output `.tar.zst` archive
+            will be written. Defaults to the current working directory.
 
     Notes:
-    -----
-    - For longer jobs, increase TIMEOUT via environment variable:
-        TIMEOUT=360000 modal run rfdiffusion_app.py ...
+        For longer jobs, increase `TIMEOUT` via environment variable:
+        `TIMEOUT=360000 modal run rfdiffusion_app.py ...`.
     """
     if download_models:
         download_rfdiffusion_models.remote(force=force_redownload)
@@ -389,7 +388,7 @@ def submit_rfdiffusion_task(
     if run_name is None:
         raise ValueError("Missing required --run-name")
 
-        run_name = validate_run_name(run_name)
+    run_name = validate_run_name(run_name)
 
     if input_pdb is None:
         raise ValueError("Missing required --input-pdb (path to local .pdb)")

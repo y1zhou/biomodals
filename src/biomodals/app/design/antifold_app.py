@@ -20,7 +20,6 @@ from pathlib import Path
 import modal
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MODEL_VOLUME
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.shell import package_outputs, run_command
 
@@ -36,13 +35,16 @@ CONF = AppConfig(
     python_version="3.10",
     cuda_version="cu121",
     gpu=os.environ.get("GPU", "A10G"),
+    # AntiFold hard-coded the download logic to look for models in
+    # ./models/model.pt
+    # sys.exec_prefix points to /usr/local
+    model_volume_mountpoint="/usr/local/lib/python3.10/site-packages/models",
 )
-MODEL_DIR = CONF.model_dir
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget")
@@ -54,6 +56,8 @@ runtime_image = patch_image_for_helper(
         find_links=f"https://data.pyg.org/whl/torch-2.2.0+{CONF.cuda_version}.html",
         extra_options="--no-build-isolation",  # https://github.com/astral-sh/uv/issues/5040
     )
+    .uv_pip_install("backports.strenum")  # <3.11
+    .pipe(patch_image_for_helper, skip_deps=["uniaf3"])
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
@@ -68,7 +72,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     image=runtime_image,
     timeout=CONF.timeout,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    volumes=CONF.mounts(model_volume=True, model_ro=False),
 )
 def antifold_inference(
     struct_bytes: bytes,
@@ -88,20 +92,6 @@ def antifold_inference(
 ) -> bytes:
     """Manage AntiFold runs and return all inference results."""
     from tempfile import TemporaryDirectory
-
-    # AntiFold hard-coded the download logic to look for models in ./models/model.pt
-    model_path = (
-        Path(sys.exec_prefix)
-        / "lib"
-        / f"python{CONF.python_version}"
-        / "site-packages"
-        / "models"
-        / "model.pt"
-    )
-    cache_model_path = MODEL_DIR / "model.pt"
-    if cache_model_path.exists():
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        model_path.symlink_to(cache_model_path)
 
     with TemporaryDirectory() as tmpdir:
         work_path = Path(tmpdir) / f"{output_id}_antifold"
@@ -147,13 +137,6 @@ def antifold_inference(
 
         print("💊 Packaging results...")
         tarball_bytes = package_outputs(work_path)
-
-    if not cache_model_path.exists():
-        # Cache the model for future runs
-        import shutil
-
-        shutil.copyfile(model_path, cache_model_path)
-        MODEL_VOLUME.commit()
 
     return tarball_bytes
 

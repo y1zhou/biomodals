@@ -217,3 +217,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Zed editor
+.zed/
+
+# Agent-generated local files
+PLAN.md
+.claude/settings.local.json

@@ -19,8 +19,8 @@ from typing import Any
 import modal
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
@@ -43,7 +43,6 @@ CONF = AppConfig(
     cuda_version="cu121",
     gpu=os.environ.get("GPU", "A10G"),
 )
-REPO_DIR = CONF.git_clone_dir
 
 AVAILABLE_MODELS = {
     # ProteinMPNN
@@ -80,22 +79,13 @@ AVAILABLE_MODELS = {
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget")
     .env(CONF.default_env)
-    # .run_commands(
-    #     " && ".join(
-    #         (
-    #             f"git clone {CONF.repo_url} {REPO_DIR}",
-    #             f"cd {REPO_DIR}",
-    #             f"git checkout {CONF.repo_commit_hash}",
-    #             "uv pip install --system -r requirements.txt",
-    #         )
-    #     )
-    # )
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
+    .pipe(patch_image_for_helper)
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
@@ -131,8 +121,7 @@ def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
 # Fetch model weights
 ##########################################
 @app.function(
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
-    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=MAX_TIMEOUT
 )
 def download_weights() -> None:
     """Download ProteinMPNN models into the mounted volume.
@@ -141,12 +130,13 @@ def download_weights() -> None:
     AbMPNN ref: https://zenodo.org/records/8164693
     """
     base_url = "https://files.ipd.uw.edu/pub/ligandmpnn"
+    model_dir = Path(CONF.model_volume_mountpoint)
     ligandmpnn_weights = {
-        f"{base_url}/{model_name}": CONF.model_dir / "model_params" / model_name
+        f"{base_url}/{model_name}": model_dir / "model_params" / model_name
         for model_name in AVAILABLE_MODELS
     }
     abmpnn_dict = {
-        "https://zenodo.org/records/8164693/files/abmpnn.pt?download=1": CONF.model_dir
+        "https://zenodo.org/records/8164693/files/abmpnn.pt?download=1": model_dir
         / "model_params"
         / "abmpnn.pt"
     }
@@ -214,7 +204,7 @@ def build_base_command(
     gpu=CONF.gpu,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=86400,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
+    volumes=CONF.mounts(model_volume=True),
 )
 def ligandmpnn_run(
     run_name: str,
@@ -242,6 +232,7 @@ def ligandmpnn_run(
         omit_aa_per_residue_bytes,
     )
 
+    model_dir = Path(CONF.model_volume_mountpoint)
     log_path = workdir / "ligandmpnn-run.log"
     print(f"💊 Running LigandMPNN, saving logs to {log_path}")
     for seed in tqdm(seeds, desc="Inference seeds"):
@@ -251,7 +242,7 @@ def ligandmpnn_run(
             "--out_folder",
             str(workdir / "outputs" / f"seed-{seed}"),
         ]
-        run_command_with_log(cmd, log_file=log_path, cwd=CONF.model_dir)
+        run_command_with_log(cmd, log_file=log_path, cwd=model_dir)
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")
@@ -439,7 +430,7 @@ def submit_ligandmpnn_task(
         cli_args[f"--checkpoint_{model_type}"] = checkpoint
     elif model_type == "abmpnn":
         cli_args["--checkpoint_protein_mpnn"] = str(
-            CONF.model_dir / "model_params" / "abmpnn.pt"
+            Path(CONF.model_volume_mountpoint) / "model_params" / "abmpnn.pt"
         )
     if fixed_residues is not None:
         cli_args["--fixed_residues"] = fixed_residues
@@ -516,8 +507,4 @@ def submit_ligandmpnn_task(
 
     print(f"🧬 Downloading results for {run_name}...")
     (local_out_dir / f"{run_name}-{script_mode}.tar.zst").write_bytes(res_bytes)
-    # run_command(
-    #     ["modal", "volume", "get", OUTPUTS_VOLUME_NAME, str(remote_results_dir)],
-    #     cwd=local_out_dir,
-    # )
     print(f"🧬 Results saved to: {local_out_dir.resolve()}")

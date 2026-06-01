@@ -6,8 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiofiles>=25.1.0",
-    "modal>=1.2.1",
+    "modal>=1.4.3",
     "niquests>=3.18.4",
+    "orjson>=3.11.8",
     "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
     "rich>=14.2.0",
@@ -26,4 +27,31 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "ipykernel>=7.2.0",
+    "pytest>=9.0.3",
 ]
+
+[tool.ruff]
+extend-exclude = ["logs/*", "data/*"]
+extend-include = ["*.ipynb"]
+line-length = 88
+
+[tool.ruff.format]
+preview = true
+
+[tool.ruff.lint]
+extend-ignore = ["E501"]
+select = [
+    "D",
+    "E",
+    "F",
+    "W",
+    "I",
+    "S",
+    "UP",
+    "B"
+]
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]

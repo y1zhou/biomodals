@@ -15,9 +15,9 @@ from pathlib import Path
 import modal
 
 from biomodals.app.config import AppConfig
-from biomodals.app.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.shell import package_outputs, run_command, softlink_dir
+from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.helper.shell import package_outputs, run_command
 
 ##########################################
 # Modal configs
@@ -31,15 +31,14 @@ CONF = AppConfig(
     python_version="3.12",
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "A10G"),
+    model_volume_mountpoint="/root/.abnativ/models/pretrained_models",
 )
 
-# AbNatiV hard-coded cache directory for model weights
-ABNATIV_MODEL_DIR = "/root/.abnativ/models/pretrained_models"
 
 ##########################################
 # Image and app definitions
 ##########################################
-runtime_image = patch_image_for_helper(
+runtime_image = (
     modal.Image
     .micromamba(python_version=CONF.python_version)
     .apt_install("git", "build-essential", "wget", "zstd")
@@ -47,6 +46,7 @@ runtime_image = patch_image_for_helper(
     .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
     .micromamba_install(["anarci"], channels=["bioconda"])
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
+    .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -56,14 +56,11 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ##########################################
 @app.function(
     cpu=(1.125, 16.125),
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME},
+    volumes=CONF.mounts(model_volume=True, model_ro=False),
     timeout=MAX_TIMEOUT,
 )
 def download_abnativ_models(force: bool = False) -> None:
     """Download AbNatiV models into the mounted volume."""
-    # Make soft link from AbNatiV's expected model directory to the mounted volume
-    softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
-
     # Download all artifacts
     print(f"💊 Downloading {CONF.name} models...")
     cmd = ["abnativ", "init"]
@@ -83,7 +80,7 @@ def download_abnativ_models(force: bool = False) -> None:
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
+    volumes=CONF.mounts(model_volume=True),
 )
 def abnativ_score_unpaired(
     fasta_bytes: bytes,
@@ -97,8 +94,6 @@ def abnativ_score_unpaired(
 ):
     """Manage AbNatiV runs and return all score results."""
     from tempfile import TemporaryDirectory
-
-    softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
 
     with TemporaryDirectory() as tmpdir:
         work_path = Path(tmpdir) / f"{output_id}_abnativ_{nativeness_type}"
@@ -141,7 +136,7 @@ def abnativ_score_unpaired(
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=CONF.timeout,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
+    volumes=CONF.mounts(model_volume=True),
 )
 def abnativ_score_paired(
     csv_bytes: bytes,
@@ -153,8 +148,6 @@ def abnativ_score_paired(
 ):
     """Manage AbNatiV runs and return all score results."""
     from tempfile import TemporaryDirectory
-
-    softlink_dir(CONF.model_dir, ABNATIV_MODEL_DIR)
 
     with TemporaryDirectory() as tmpdir:
         work_path = Path(tmpdir) / f"{output_id}_abnativ_paired"

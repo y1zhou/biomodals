@@ -17,7 +17,10 @@ def _clean_filename_part(value: str | Path | None) -> str:
     """Return one clean filename component."""
     if value is None:
         return ""
-    cleaned = sanitize_filename(str(value))
+    raw_value = str(value)
+    if not raw_value.strip():
+        return ""
+    cleaned = sanitize_filename(raw_value)
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
     cleaned = re.sub(r"_+", "_", cleaned).strip("._-")
     return cleaned
@@ -45,13 +48,7 @@ def build_local_output_path(
 ) -> Path:
     """Build a clean local output path and raise if it would overwrite a file."""
     parts = [
-        part
-        for part in (
-            _clean_filename_part(prefix),
-            _clean_filename_part(run_name),
-            _clean_filename_part(suffix),
-        )
-        if part
+        p for part in (prefix, run_name, suffix) if (p := _clean_filename_part(part))
     ]
     if not parts:
         raise ValueError(

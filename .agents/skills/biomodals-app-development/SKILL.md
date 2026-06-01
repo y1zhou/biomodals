@@ -22,7 +22,7 @@ For new apps, ask the user which data-flow class applies before choosing archite
 
 ## Implementation Rules
 
-Keep app code compatible with `biomodals help` and app discovery:
+Keep app code compatible with `biomodals app help` and app discovery:
 
 - Name files `<toolname>_app.py` under `src/biomodals/app/<category>/`.
 - Use a user-facing module docstring with upstream links, prerequisites, and output behavior.
@@ -30,8 +30,18 @@ Keep app code compatible with `biomodals help` and app discovery:
 - Use module-level `CONF = AppConfig(...)` for new apps; pin `repo_commit_hash` or `version`.
 - Let `gpu` and `timeout` be overridden from `os.environ`.
 - Build runtime images through `patch_image_for_helper(...)`.
-- Prefer helpers from `biomodals.helper` and `biomodals.helper.shell` instead of open-coded shell, archive, copy, download, hashing, or warmup logic.
-- Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals help <app>` renders flags.
+- Before adding app or workflow helpers, check `biomodals.helper` first.
+  Reuse existing helper APIs for local output paths, shell, archive, copy,
+  download, hashing, warmup, and serialization behavior; only define local
+  helpers when the behavior is app-specific and no shared helper fits.
+- Prefer `CONF.mounts(...)` for model and output volumes. Import shared volumes
+  from `biomodals.helper.constant` only when a function needs a nonstandard
+  mountpoint, a shared database/cache volume, or an explicit `commit()`.
+  When using `Volume.with_mount_options(...)` directly, combine read-only and
+  subpath options in one call.
+- Avoid extracting trivial two- or three-line helpers that are used only once or
+  twice. Inline them and add a short comment when the intent is not obvious.
+- Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals app help <app>` renders flags.
 - Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
 - Keep Modal function return values primitive when practical: `int`, `str`,
   `float`, `bool`, `bytes`, `list`, `dict`, or `None`. Return complex objects
@@ -47,14 +57,14 @@ When reviewing or finishing an app change, check:
 - Discovery: path, filename, app name, and local entrypoint name match CLI expectations.
 - Reproducibility: upstream version or commit is pinned.
 - Runtime boundaries: dependencies used only inside Modal images stay lazily imported.
-- Volumes: model volumes are read-only for inference unless the tool writes caches there; writable volumes are committed after writes.
-- Data flow: quick jobs return `.tar.zst` bytes via `package_outputs(...)`; persistent, resumable, or batch jobs use `CONF.get_out_volume()` or shared volumes.
+- Volumes: model/cache mounts use app-specific subdirectories when practical; inference mounts are read-only unless the tool writes caches there; writable volumes are committed after writes; mounted volume paths are logged or returned as `VolumePath` when they cross app/workflow boundaries.
+- Data flow: quick jobs return `.tar.zst` bytes via `package_outputs(...)`; persistent, resumable, or batch jobs use `CONF.output_volume`, `CONF.mounts(output_volume=True)`, or shared volumes.
 - Modal return payloads: prefer primitive, `cloudpickle`-serializable values;
   avoid returning `Path` objects directly or nested inside tuples, lists, dicts,
   or dataclasses.
 - Output safety: local output directories are created, existing tarballs are not overwritten accidentally, and final paths or Modal volume locations are printed.
 - CLI docs: local entrypoint docstrings use exact Google-style `Args:` formatting with continuation indentation.
-- Verification: run `prek run --files <changed files>` when practical, plus `uv run biomodals list` and `uv run biomodals help <app-name>` for CLI or discovery changes.
+- Verification: run `prek run --files <changed files>` when practical, plus `uv run biomodals app list` and `uv run biomodals app help <app-name>` for CLI or discovery changes.
 
 ## Reference
 

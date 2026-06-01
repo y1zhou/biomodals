@@ -6,9 +6,9 @@ This reference is the maintained app-development standard for files under `src/b
 
 Biomodals apps are self-contained Modal applications wrapping bioinformatics tools. They live under `src/biomodals/app/<category>/`.
 
-- Name app files `<toolname>_app.py`; the `_app.py` suffix is how `cli.py` discovers apps with `APP_HOME.glob("*/*_app.py")`.
+- Name app files `<toolname>_app.py`; the `_app.py` suffix is how `biomodals.helper.catalog` discovers apps by scanning `src/biomodals/app/<category>/*_app.py`.
 - Place apps in an appropriate category such as `fold/`, `design/`, `score/`, or `bioinfo/`.
-- The CLI app name is the filename stem with `_app` stripped, for example `protenix_app.py` becomes `protenix`.
+- The catalog entry name is the filename stem with `_app` stripped, for example `protenix_app.py` becomes `protenix`.
 - Use section banners to keep modules scan-friendly:
   - module docstring
   - imports
@@ -20,7 +20,7 @@ Biomodals apps are self-contained Modal applications wrapping bioinformatics too
 
 ## Module Docstring
 
-The module docstring is rendered verbatim by `biomodals help <app>` as Markdown. Keep it user-facing and include the upstream source URL, important prerequisites, caveats, and output behavior.
+The module docstring is rendered verbatim by `biomodals app help <app>` as Markdown. Keep it user-facing and include the upstream source URL, important prerequisites, caveats, and output behavior.
 
 Typical shape:
 
@@ -48,6 +48,12 @@ Use optional configuration tables only when the local entrypoint docstring is in
 
 New apps should define module-level `CONF = AppConfig(...)`.
 
+The pure Pydantic schema lives in `biomodals.schema.app.AppConfig`. Import the
+Modal-compatible wrapper from `biomodals.app.config` when you need volume or
+image helpers; otherwise import the schema directly. The wrapper adds
+`output_volume`, `output_volume_name`, and `mounts(...)` helpers while keeping
+the same schema fields and validators.
+
 ```python
 from biomodals.app.config import AppConfig
 
@@ -62,6 +68,7 @@ CONF = AppConfig(
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "3600")),
+    depends_on_apps=("gromacs",),  # only for workflows that compose other apps
 )
 ```
 
@@ -70,9 +77,11 @@ Rules:
 - Pin either `repo_commit_hash` or `version`, or both.
 - Let `gpu` and `timeout` be overridden by environment variables with sensible defaults.
 - Use `CONF.default_env` when setting image environment variables. It provides standard UV, Hugging Face, Torch, and torch backend environment.
-- Use `CONF.model_dir`, `CONF.git_clone_dir`, `CONF.model_volume_mountpoint`, and related fields instead of hardcoded paths.
+- Use `CONF.git_clone_dir`, `CONF.model_volume_mountpoint`,
+  `CONF.model_volume_subdir`, and related fields instead of hardcoded paths.
+- Set `depends_on_apps` only for workflow apps that compose other Biomodals apps; standalone apps should leave it empty.
 
-Use an `AppInfo` dataclass only when grouping several related app constants improves readability. For a few simple constants, module-level constants such as `OUT_VOLUME` or `OUTPUTS_DIR` are acceptable.
+Use an `AppInfo` dataclass only when grouping several related app constants improves readability. Prefer `CONF.output_volume`, `CONF.output_volume_name`, and `CONF.mounts(...)` over module-level output-volume aliases in new code.
 
 ## Image Construction
 
@@ -97,11 +106,41 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 ## Volumes
 
-- Import shared volumes from `biomodals.app.constant`, such as `MODEL_VOLUME` or `MSA_CACHE_VOLUME`.
-- Mount model weights read-only for inference when the function only reads model artifacts.
-- Use `CONF.model_volume_mountpoint` for model volume mount paths.
-- Commit volume changes explicitly after writes with `VOLUME.commit()`.
-- Use `CONF.get_out_volume()` for app-specific persistent outputs.
+- Import shared volumes from `biomodals.helper.constant`, such as `MODEL_VOLUME` or `MSA_CACHE_VOLUME`.
+- Prefer `CONF.mounts(...)` for standard app model and output mounts. Use raw
+  `Volume.with_mount_options(...)` only for nonstandard mountpoints, shared
+  database/cache volumes, or code that must explicitly access a volume object.
+- Mount only the subdirectory a function needs when a shared volume contains
+  app-specific data. For model weights under `MODEL_VOLUME`, the usual pattern
+  is `CONF.mounts(model_volume=True)`, which mounts `CONF.model_volume_subdir`
+  at `CONF.model_volume_mountpoint`.
+- Mount model weights read-only for inference when the function only reads
+  model artifacts. If both read-only and subpath behavior are needed, use
+  `CONF.mounts(model_volume=True)`, or
+  `MODEL_VOLUME.with_mount_options(read_only=True, sub_path=...)` for custom
+  mountpoints.
+  Do not chain `MODEL_VOLUME.read_only().with_mount_options(...)`; Modal rejects
+  adding mount options after a read-only wrapper has already been created.
+- Use `CONF.model_volume_mountpoint` for app-specific model directories. Use
+  `CONF.mounts(model_volume=True, is_huggingface=True)` only when the tool
+  stores Hugging Face-managed artifacts under `CONF.default_env` paths such as
+  `HF_HOME`.
+- When upstream code expects a hardcoded cache path, mount the app-specific
+  shared-volume subdirectory at that path rather than changing unrelated app
+  logic. PaddleOCR, AbNatiV, and AntiFold are examples of this pattern.
+- Shared cache volumes such as `MSA_CACHE_VOLUME` should also use subpath mounts
+  when an app only needs its own namespace. Shared database volumes that expose a
+  complete database root can stay mounted whole.
+- For download/setup functions that populate model volumes, use
+  `CONF.mounts(model_volume=True, model_ro=False)` and commit the backing shared
+  volume after writes.
+- Commit output or cache volume changes explicitly after writes with
+  `VOLUME.commit()`.
+- Use `CONF.output_volume` and `CONF.mounts(output_volume=True)` for
+  app-specific persistent outputs; output volumes are normally mounted whole.
+- Use `volume_path_from_mount_path(...)` when printing or returning remote
+  volume paths so logs show a validated `VolumePath` instead of an ambiguous
+  absolute container path.
 
 ## Remote Functions
 
@@ -117,6 +156,9 @@ Always specify a timeout with `CONF.timeout` or `MAX_TIMEOUT`. Add resource hint
   `float`, `bool`, `bytes`, `list`, `dict`, or `None`. Return complex objects
   only when they provide much more benefit than a primitive representation, and
   the returned type must be serializable by `cloudpickle`.
+- Workflow-compatible app functions are the main exception to the primitive
+  preference: return `AppRunResult` from `biomodals.schema` so workflows can
+  materialize `AppOutput` artifacts consistently.
 - Keep `Path` objects internal to the local process or Modal container. Return
   file paths, volume paths, and relative output paths as `str(path)`, including
   paths nested inside tuples, lists, dicts, or dataclasses. Convert back with
@@ -131,7 +173,7 @@ Resource pattern:
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=MAX_TIMEOUT,
-    volumes={CONF.model_volume_mountpoint: MODEL_VOLUME.read_only()},
+    volumes=CONF.mounts(model_volume=True),
 )
 ```
 
@@ -152,6 +194,11 @@ Prefer existing helpers instead of reimplementing common behavior:
 - `hash_string(s)` from `biomodals.helper` for cache keys.
 - `patch_image_for_helper(image)` from `biomodals.helper` for Modal images.
 
+Avoid extracting trivial two- or three-line helpers that are used once or twice.
+Inline those operations with a short comment when that reads better. Add a
+local helper only when the behavior is app-specific, repeated enough to clarify
+the module, or absent from `biomodals.helper`.
+
 ## Local Entrypoint
 
 The `@app.local_entrypoint()` function is the user-facing orchestration layer on the local machine.
@@ -164,7 +211,7 @@ The `@app.local_entrypoint()` function is the user-facing orchestration layer on
 - Write returned tarball bytes locally.
 - Print final local path or Modal volume location.
 
-Docstring rules for `biomodals help`:
+Docstring rules for `biomodals app help`:
 
 - Use Google-style docstrings with an `Args:` section.
 - Put `Args:` on its own line.
@@ -187,6 +234,9 @@ Choose architecture by job type:
 - Short-lived inference usually sends local input bytes to remote functions and returns tarball bytes directly.
 - Long-running apps should cache intermediate and final results in Modal volumes.
 - Parallel or interruptible runs should use queues, locks, stable run IDs, and resumable runners where possible.
+- Workflow-compatible app functions should reuse existing remote app behavior
+  where practical, preserve standalone local entrypoints unchanged, and return
+  `AppRunResult` with `VolumePath` storage for durable outputs.
 
 Before choosing data flow for a new app, ask whether it is short-lived inference, long-running/cached, or parallel/resumable unless already clear from the request.
 
@@ -203,10 +253,10 @@ Older apps can use raw constants such as `GPU`, `TIMEOUT`, and `APP_NAME`. When 
 
 ## Examples And Verification
 
-- When app development changes invocation or adds a new app, add or update an example bash script under `examples/app/` using `biomodals run`.
+- When app development changes invocation or adds a new app, add or update an example bash script under `examples/app/` using `biomodals app run`.
 - Use small example inputs under `examples/data/` only when existing data is insufficient.
 - For Modal functions, verify returned payloads are primitive or otherwise
   intentionally complex and `cloudpickle`-serializable; convert returned paths to
   strings.
 - After edits, run `prek run --files <changed files>` when practical.
-- For CLI or app discovery changes, smoke test `uv run biomodals list` and `uv run biomodals help <app-name>` when practical.
+- For CLI or app discovery changes, smoke test `uv run biomodals app list` and `uv run biomodals app help <app-name>` when practical.

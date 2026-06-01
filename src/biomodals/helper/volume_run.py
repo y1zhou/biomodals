@@ -5,7 +5,35 @@ semantics stay owned by the app code unless a caller explicitly moves to a
 Modal-supported atomic primitive.
 """
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from biomodals.schema import VolumePath
+
+
+def volume_path_from_mount_path(
+    remote_path: str,
+    mount_root: str,
+    volume_name: str,
+    media_type: str | None = None,
+) -> VolumePath:
+    """Convert an app mount path into a volume-relative workflow storage path."""
+    resolved_remote_path = PurePosixPath(remote_path)
+    resolved_mount_root = PurePosixPath(mount_root)
+    try:
+        relative_path = resolved_remote_path.relative_to(resolved_mount_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Remote path is outside mounted volume root {mount_root}: {remote_path}"
+        ) from exc
+    if str(relative_path) == ".":
+        raise ValueError(
+            f"Remote path must be below mounted volume root {mount_root}: {remote_path}"
+        )
+    return VolumePath(
+        volume_name=volume_name,
+        path=str(relative_path),
+        media_type=media_type,
+    )
 
 
 def build_volume_run_paths(

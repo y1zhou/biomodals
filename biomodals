@@ -12,7 +12,7 @@ if [ $# -eq 0 ] || { [ $# -eq 1 ] && [[ "$1" == "${DEFAULT_BIN_NAME}" ]] ; }; th
   uv run --project "${SCRIPT_DIR}" "${DEFAULT_BIN_NAME}" --help
 
 # Run the subcommand if the first argument matches a known subcommand
-elif [ $# -gt 0 ] && [[ "$1" =~ ^(list|ls|l|run|r|help|h|deploy|d)$ ]]; then
+elif [ $# -gt 0 ] && [[ "$1" =~ ^(app|workflow|list|ls|l|run|r|help|h|deploy|d)$ ]]; then
   uv run --project "${SCRIPT_DIR}" "${DEFAULT_BIN_NAME}" "$@"
 
 # Otherwise, run the command as-is within the uv environment

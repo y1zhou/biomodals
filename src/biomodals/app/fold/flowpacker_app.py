@@ -47,9 +47,11 @@ from biomodals.helper.io import (
     write_local_tarball,
 )
 from biomodals.helper.shell import (
+    copy_files,
     package_outputs,
     run_command_with_log,
     sanitize_filename,
+    softlink_dir,
 )
 from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.schema import (
@@ -72,7 +74,6 @@ CONF = AppConfig(
     cuda_version="cu121",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "3600")),
-    model_volume_mountpoint="/opt/FlowPacker/checkpoints",
 )
 
 
@@ -131,22 +132,9 @@ runtime_image = (
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
-def _safe_flowpacker_run_name(run_name: str) -> str:
-    """Return a filesystem-safe FlowPacker sample name."""
-    safe_run_name = sanitize_filename(run_name)
-    if not safe_run_name:
-        raise ValueError("run_name must contain at least one safe path component")
-    return safe_run_name
-
-
 ##########################################
 # Fetch model weights
 ##########################################
-def _checkpoint_path(name: str) -> Path:
-    """Return the shared-volume path for a FlowPacker checkpoint."""
-    return Path(CONF.model_volume_mountpoint) / f"{name}.pth"
-
-
 @app.function(
     cpu=(0.125, 8.125),
     timeout=CONF.timeout,
@@ -156,27 +144,36 @@ def download_flowpacker_checkpoints(force: bool = False) -> None:
     """Download FlowPacker Git LFS checkpoints into the model volume."""
     from biomodals.helper.shell import run_command
 
-    checkpoint_dir = Path(CONF.model_volume_mountpoint)
-    wanted = [checkpoint_dir / f"{name}.pth" for name in APP_INFO.checkpoint_names]
-    if not force and all(
-        path.exists() and path.stat().st_size > 1024 for path in wanted
-    ):
+    cache_dir = Path(CONF.model_volume_mountpoint)
+    all_checkpoints = [cache_dir / f"{name}.pth" for name in APP_INFO.checkpoint_names]
+    missing_checkpoints = [
+        f for f in all_checkpoints if not (f.exists() and f.stat().st_size > 1024)
+    ]
+    if not force and len(missing_checkpoints) == 0:
         print("💊 FlowPacker checkpoints already exist in the model volume")
         return
 
     if force:
-        _ = [path.unlink(missing_ok=True) for path in wanted]
+        _ = [path.unlink(missing_ok=True) for path in all_checkpoints]
+        missing_checkpoints = all_checkpoints
 
-    include_paths = (f"checkpoints/{name}.pth" for name in APP_INFO.checkpoint_names)
-    include_paths_str = ",".join(
-        f for f in include_paths if not (checkpoint_dir / Path(f).name).exists()
-    )
+    include_paths = ",".join(f"checkpoints/{f.name}" for f in missing_checkpoints)
     run_command(["git", "lfs", "install", "--skip-repo"], cwd=CONF.git_clone_dir)
     run_command(
-        ["git", "lfs", "pull", "--include", include_paths_str],
+        ["git", "lfs", "pull", "--include", include_paths],
         cwd=CONF.git_clone_dir,
         env={"GIT_LFS_SKIP_SMUDGE": "0"},
     )
+    checkpoint_dir = CONF.git_clone_dir / "checkpoints"
+    files_to_copy: dict[str | Path, str | Path] = {}
+    for f in missing_checkpoints:
+        source_path = checkpoint_dir / f.name
+        if not source_path.exists():
+            raise FileNotFoundError(
+                f"FlowPacker Git LFS checkpoint was not downloaded: {source_path}"
+            )
+        files_to_copy[source_path] = f
+    copy_files(files_to_copy)
     MODEL_VOLUME.commit()
     print("💊 FlowPacker checkpoint download complete")
 
@@ -184,6 +181,11 @@ def download_flowpacker_checkpoints(force: bool = False) -> None:
 ##########################################
 # Inference functions
 ##########################################
+def _checkpoint_path(checkpoint_name: str) -> Path:
+    """Get the path to the checkpoint file in the Git LFS directory."""
+    return CONF.git_clone_dir / "checkpoints" / f"{checkpoint_name}.pth"
+
+
 def _write_flowpacker_config(
     config_path: Path,
     *,
@@ -197,7 +199,7 @@ def _write_flowpacker_config(
     """Write the upstream FlowPacker inference config for one Modal run."""
     import yaml
 
-    conf_ckpt = "./checkpoints/confidence.pth" if use_confidence else None
+    conf_ckpt = str(_checkpoint_path("confidence")) if use_confidence else None
     config = {
         "mode": "vf",
         "data": {
@@ -211,7 +213,7 @@ def _write_flowpacker_config(
             "max_radius": 16.0,
             "max_neighbors": 30,
         },
-        "ckpt": f"./checkpoints/{model_name}.pth",
+        "ckpt": str(_checkpoint_path(model_name)),
         "conf_ckpt": conf_ckpt,
         "sample": {
             "batch_size": 1,
@@ -232,7 +234,7 @@ def _write_flowpacker_config(
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
-    # Cannot mount as ro as FlowPacker mkdirs there for whatever reason
+    # Cannot mount as read-only because FlowPacker runs mkdir for some reason
     volumes=CONF.mounts(model_volume=True, model_ro=False),
 )
 def run_flowpacker(
@@ -256,6 +258,10 @@ def run_flowpacker(
         raise ValueError(
             f"Unsupported model '{model_name}'. Choose one of: {APP_INFO.supported_models}"
         )
+    ckpt_dir = CONF.git_clone_dir / "checkpoints"
+    if ckpt_dir.exists() and not ckpt_dir.is_symlink():
+        shutil.rmtree(ckpt_dir)
+        softlink_dir(CONF.model_volume_mountpoint, ckpt_dir)
     ckpt_path = _checkpoint_path(model_name)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"FlowPacker checkpoint is missing: {ckpt_path}")
@@ -266,7 +272,7 @@ def run_flowpacker(
             f"FlowPacker confidence checkpoint is missing: {confidence_ckpt_path}"
         )
 
-    run_name = _safe_flowpacker_run_name(run_name)
+    run_name = sanitize_filename(run_name)
     input_dir = Path(mkdtemp(prefix="flowpacker_inputs_"))
     sample_dir = CONF.git_clone_dir / "samples" / run_name
     if sample_dir.exists():
@@ -287,14 +293,7 @@ def run_flowpacker(
         sample_coeff=sample_coeff,
     )
 
-    cmd = [
-        sys.executable,
-        "sampler_pdb.py",
-        "biomodals",
-        run_name,
-        "--seed",
-        str(seed),
-    ]
+    cmd = [sys.executable, "sampler_pdb.py", "biomodals", run_name, "--seed", str(seed)]
     if save_traj:
         cmd.extend(["--save_traj", "True"])
     if use_gt_masks:
@@ -337,7 +336,7 @@ def run_flowpacker_workflow(
     seed: int = 42,
 ) -> AppRunResult:
     """Run FlowPacker and return a workflow-compatible app result."""
-    safe_run_name = _safe_flowpacker_run_name(run_name)
+    safe_run_name = sanitize_filename(run_name)
     tarball_bytes = run_flowpacker.get_raw_f()(
         input_files=input_files,
         run_name=safe_run_name,
@@ -469,7 +468,7 @@ def submit_flowpacker_task(
         run_name = (
             resolved_input.stem if resolved_input.is_file() else resolved_input.name
         )
-    safe_run_name = _safe_flowpacker_run_name(run_name)
+    safe_run_name = sanitize_filename(run_name)
 
     local_out_dir = resolve_local_output_dir(out_dir)
     out_file = build_local_output_path(local_out_dir, run_name=safe_run_name)

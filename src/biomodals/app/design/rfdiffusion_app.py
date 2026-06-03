@@ -1,31 +1,10 @@
 r"""RFdiffusion source repo: <https://github.com/RosettaCommons/RFdiffusion>.
 
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--run-name` | **Required** | Unique name used for output tarball name and output-volume cache key. |
-| `--input-pdb` | **Required** | Local path to the input PDB file (uploaded to the Modal worker). |
-| `--out-dir` | `$CWD` | Optional local output directory for the returned `.tar.zst` bundle. |
-| `--contigs` | `None` | Convenience wrapper for `contigmap.contigs` (Hydra override). Example: `"100-150/0 E333-526"`. |
-| `--num-designs` | `1` | Convenience wrapper for `inference.num_designs` (Hydra override). |
-| `--hotspot-res` | `None` | Convenience wrapper for `ppi.hotspot_res` (Hydra override). Example: `"E405,E408"`. |
-| `--rfd-args` | `""` | Additional Hydra overrides as a raw string (escape hatch / backward-compatible). |
-| `--download-models`/`--no-download-models` | `--no-download-models` | Whether to download checkpoint weights and skip running inference. |
-| `--force-redownload`/`--no-force-redownload` | `--no-force-redownload` | Force re-download checkpoints even if they already exist in the models volume. |
-
-For a complete set of RFdiffusion Hydra override keys, see RFdiffusion docs and `scripts/run_inference.py`.
-
-| Environment variable | Default | Description |
-|----------------------|---------|-------------|
-| `MODAL_APP` | `RFdiffusion` | Name of the Modal app to use. |
-| `GPU` | `A100` | Type of GPU to use. See https://modal.com/pricing for details. |
-| `TIMEOUT` | `36000` | Timeout for the inference Modal function in seconds. |
-
 ## Notes
 
 * Checkpoint URLs are hardcoded from the upstream script:
   https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
+* For a complete set of RFdiffusion Hydra override keys, see RFdiffusion docs and `scripts/run_inference.py`.
 * Checkpoints are stored in a persistent Modal volume (`rfdiffusion-models`).
 * Outputs are cached in a persistent Modal volume (`rfdiffusion-outputs`) under:
   `/root/rfdiffusion_outputs/<run-name>/`
@@ -58,87 +37,59 @@ modal run rfdiffusion_app.py \
 from __future__ import annotations
 
 import os
-import re
 import shlex
+import sys
 from pathlib import Path
 
-from modal import App, Image, Volume
+from modal import App, Image
 
+from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
     run_command,
+    sanitize_filename,
     warmup_directory,
 )
 from biomodals.helper.volume_run import volume_path_from_mount_path
+from biomodals.helper.web import download_files
 
 # -------------------------
 # Modal configs
 # -------------------------
-GPU = os.environ.get("GPU", "A100")
-TIMEOUT = int(os.environ.get("TIMEOUT", "36000"))
-APP_NAME = os.environ.get("MODAL_APP", "RFdiffusion")
-
-RFD_VOLUME = Volume.from_name("rfdiffusion-models", create_if_missing=True)
-RFD_OUT_VOLUME_NAME = "rfdiffusion-outputs"
-RFD_OUT_VOLUME = Volume.from_name(RFD_OUT_VOLUME_NAME, create_if_missing=True)
-
-RFD_REPO_DIR = "/root/RFdiffusion"
-RFD_MODELS_DIR = f"{RFD_REPO_DIR}/models"
-RFD_OUT_DIR = "/root/rfdiffusion_outputs"
-
-# -------------------------
-# RFdiffusion checkpoints (hardcoded from upstream download_models.sh)
-# https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
-# -------------------------
-RFD_CHECKPOINT_URLS: dict[str, str] = {
-    "Base_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/6f5902ac237024bdd0c176cb93063dc4/Base_ckpt.pt",
-    "Complex_base_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/e29311f6f1bf1af907f9ef9f44b8328b/Complex_base_ckpt.pt",
-    "Complex_Fold_base_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/60f09a193fb5e5ccdc4980417708dbab/Complex_Fold_base_ckpt.pt",
-    "InpaintSeq_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/74f51cfb8b440f50d70878e05361d8f0/InpaintSeq_ckpt.pt",
-    "InpaintSeq_Fold_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/76d00716416567174cdb7ca96e208296/InpaintSeq_Fold_ckpt.pt",
-    "ActiveSite_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/5532d2e1f3a4738decd58b19d633b3c3/ActiveSite_ckpt.pt",
-    "Base_epoch8_ckpt.pt": "http://files.ipd.uw.edu/pub/RFdiffusion/12fc204edeae5b57713c5ad7dcb97d39/Base_epoch8_ckpt.pt",
-}
+CONF = AppConfig(
+    tags={"group": Path(__file__).parent.name},
+    name="RFdiffusion",
+    repo_url="https://github.com/RosettaCommons/RFdiffusion",
+    repo_commit_hash="2d0c003df46b9db41d119321f15403dec3716cd9",
+    python_version="3.10",
+    cuda_version="cu121",
+    gpu=os.environ.get("GPU", "L40S"),
+    timeout=int(os.environ.get("TIMEOUT", "36000")),
+    model_volume_mountpoint="/opt/RFdiffusion/models",
+)
 
 # -------------------------
 # Image definition
 # -------------------------
-# NOTE:
-# For an example of a newer, modern CUDA/PyTorch-style Docker environment, see:
+# Ref: example of a newer, modern CUDA/PyTorch-style Docker environment, see:
 # https://github.com/JMB-Scripts/RFdiffusion-dockerfile-nvidia-RTX5090/blob/main/RTX-5090.dockerfile
-# The runtime image below is defined directly with Modal and is not built from that Dockerfile.
 runtime_image = (
     Image
-    .debian_slim(python_version="3.10")
-    .apt_install(
-        "git",
-        "wget",
-        "curl",
-        "build-essential",
-        "ca-certificates",
-        "zstd",
-        "tar",
-        "fd-find",  # prefer fd over find
-    )
-    .run_commands("ln -s /usr/bin/fdfind /usr/local/bin/fd")
+    .debian_slim(python_version=CONF.python_version)
+    .apt_install("git", "build-essential")
     .run_commands(
-        f"git clone --depth 1 https://github.com/RosettaCommons/RFdiffusion.git {RFD_REPO_DIR}"
+        " && ".join((
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+        ))
     )
-    .env({
-        "PYTHONPATH": RFD_REPO_DIR,
-        "PYTHONUNBUFFERED": "1",
-        "DGLBACKEND": "pytorch",
-        "UV_TORCH_BACKEND": "cu121",
-    })
-    # install CUDA-enabled PyTorch from official index (avoid accidental CPU-only wheels).
+    .env(CONF.default_env | {"DGLBACKEND": "pytorch"})
     # Pin torch < 2.6 to avoid the torch.load(weights_only=...) default behavior change.
-    .uv_pip_install(
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        "torchaudio==2.5.1",
-    )
+    .uv_pip_install("torch==2.5.1", "torchvision==0.20.1", "torchaudio==2.5.1")
     .uv_pip_install(
         "numpy",
         "scipy",
@@ -152,134 +103,71 @@ runtime_image = (
         "opt_einsum",
         "dm-tree",
         "pyrsistent",  # RFdiffusion symmetry
-        "aiohttp",  # async checkpoint download
         "torchdata>=0.7",  # DGL / datapipes support
         "dgl==1.1.3",  # DGL CUDA wheel
         # Where to find the CUDA wheels for DGL
-        find_links="https://data.dgl.ai/wheels/cu121/repo.html",
+        find_links=f"https://data.dgl.ai/wheels/{CONF.cuda_version}/repo.html",
     )
     .run_commands(
         # build/install NVIDIA SE3Transformer in one chained step.
-        f"cd {RFD_REPO_DIR}/env/SE3Transformer && "
-        "python -m pip install --no-cache-dir -r requirements.txt && "
-        "python setup.py install"
+        " && ".join((
+            f"cd {CONF.git_clone_dir}/env/SE3Transformer",
+            "uv pip install --system --no-build-isolation --no-cache-dir -r requirements.txt",
+            "python setup.py install",
+        ))
     )
-    .pipe(patch_image_for_helper)
+    .workdir(str(CONF.git_clone_dir))
+    .env({"PYTHONPATH": str(CONF.git_clone_dir)})
+    .pipe(patch_image_for_helper, skip_deps=["uniaf3"])
 )
+app = App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
-app = App(APP_NAME, image=runtime_image)
+@app.function(
+    timeout=CONF.timeout, volumes=CONF.mounts(model_volume=True, model_ro=False)
+)
+def download_rfdiffusion_models(force: bool = False) -> None:
+    """Download RFdiffusion checkpoints into the persistent models Volume."""
+    # RFdiffusion checkpoints (hardcoded from upstream)
+    # https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
+    base_url = "http://files.ipd.uw.edu/pub/RFdiffusion"
+    checkpoint_urls: dict[str, str] = {
+        "Base_ckpt.pt": f"{base_url}/6f5902ac237024bdd0c176cb93063dc4/Base_ckpt.pt",
+        "Complex_base_ckpt.pt": f"{base_url}/e29311f6f1bf1af907f9ef9f44b8328b/Complex_base_ckpt.pt",
+        "Complex_Fold_base_ckpt.pt": f"{base_url}/60f09a193fb5e5ccdc4980417708dbab/Complex_Fold_base_ckpt.pt",
+        "InpaintSeq_ckpt.pt": f"{base_url}/74f51cfb8b440f50d70878e05361d8f0/InpaintSeq_ckpt.pt",
+        "InpaintSeq_Fold_ckpt.pt": f"{base_url}/76d00716416567174cdb7ca96e208296/InpaintSeq_Fold_ckpt.pt",
+        "ActiveSite_ckpt.pt": f"{base_url}/5532d2e1f3a4738decd58b19d633b3c3/ActiveSite_ckpt.pt",
+        "Base_epoch8_ckpt.pt": f"{base_url}/12fc204edeae5b57713c5ad7dcb97d39/Base_epoch8_ckpt.pt",
+    }
 
-
-# -------------------------
-# Helpers
-# -------------------------
-_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-
-
-def validate_run_name(run_name: str) -> str:
-    """Validate run_name to prevent path traversal and keep filenames predictable.
-
-    Allowed: [A-Za-z0-9][A-Za-z0-9._-]{0,63}
-    - must start with alnum
-    - max length 64
-    - no slashes, whitespace, or ".."
-    """
-    if not _RUN_NAME_RE.match(run_name):
-        raise ValueError(
-            "Invalid --run-name. Use 1-64 chars of letters/digits plus . _ - "
-            "(must start with a letter/digit)."
+    model_dir = Path(CONF.model_volume_mountpoint)
+    try:
+        download_files(
+            {v: model_dir / k for k, v in checkpoint_urls.items()},
+            force=force,
+            progress_bar_desc="💊 RFD checkpoints",
         )
-    if ".." in run_name:
-        raise ValueError("Invalid --run-name: '..' is not allowed.")
-    return run_name
+    finally:
+        MODEL_VOLUME.commit()
 
-
-def collect_outputs_for_bundle(root_dir: str | Path) -> list[str]:
-    """Collect the output artifacts we typically want to download."""
-    exts = "|".join(("pdb", "trb", "json", "yaml", "yml", "log", "txt", "csv"))
-    return find_with_fd(root_dir, rf"\.{exts}$", ["-tf"])
-
-
-# -------------------------
-# Step 1: download model weights into the models Volume
-# -------------------------
-async def _download_file(session, url: str, local_path: Path) -> None:
-    """Download a file asynchronously via aiohttp streaming."""
-    async with session.get(url) as response:
-        response.raise_for_status()
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(local_path, "wb") as f:
-            while True:
-                chunk = await response.content.read(8192)
-                if not chunk:
-                    break
-                f.write(chunk)
+    print("💊 RFdiffusion checkpoints downloaded and committed.")
 
 
 @app.function(
-    timeout=TIMEOUT * 2,
-    volumes={RFD_MODELS_DIR: RFD_VOLUME},
-)
-async def download_rfdiffusion_models(force: bool = False) -> None:
-    """Download RFdiffusion checkpoints into the persistent models Volume.
-
-    URLs are copied verbatim from:
-    https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
-    """
-    import asyncio
-
-    import aiohttp
-
-    headers = {"User-Agent": "Mozilla/5.0"}
-    model_dir = Path(RFD_MODELS_DIR)
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        tasks = []
-        for fname, url in RFD_CHECKPOINT_URLS.items():
-            dst = model_dir / fname
-            if force or not dst.exists():
-                print(f"downloading {fname} -> {dst}")
-                tasks.append(_download_file(session, url, dst))
-
-        if tasks:
-            await asyncio.gather(*tasks)
-        else:
-            print("All RFdiffusion checkpoints already present; nothing to download.")
-
-    # Commit so checkpoints are visible immediately for remote inference jobs.
-    RFD_VOLUME.commit()
-    print("RFdiffusion checkpoints downloaded and committed.")
-
-
-# -------------------------
-# Step 2: inference function (remote GPU job)
-# -------------------------
-@app.function(
-    gpu=GPU,
-    cpu=(2, 4),
-    memory=(4096, 65536),
-    timeout=TIMEOUT,
-    image=runtime_image,
-    volumes={
-        RFD_MODELS_DIR: RFD_VOLUME.with_mount_options(read_only=True),
-        # output cache volume.
-        RFD_OUT_DIR: RFD_OUT_VOLUME,
-    },
+    gpu=CONF.gpu,
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
 def rfdiffusion_infer(
-    input_pdb_bytes: bytes,
-    input_pdb_name: str,
-    run_name: str,
-    hydra_overrides: str,
+    input_pdb_bytes: bytes, input_pdb_name: str, run_name: str, hydra_overrides: str
 ) -> bytes:
     """Run RFdiffusion inference inside the container and return a .tar.zst bundle.
 
-    - Outputs are written directly to /root/rfdiffusion_outputs/<run_name> on a persistent Volume.
-      Partial results are preserved if the run is interrupted.
+    - Partial results are preserved if the run is interrupted.
     - A SUCCESS marker file is written only after successful completion.
     """
-    import shlex
     from tempfile import TemporaryDirectory
 
     with TemporaryDirectory() as tmpdir:
@@ -290,53 +178,47 @@ def rfdiffusion_infer(
         input_pdb.write_bytes(input_pdb_bytes)
 
         # ---- cached output dir (persistent volume) ----
-        cached_run_dir = Path(RFD_OUT_DIR) / run_name
+        cached_run_dir = Path(CONF.output_volume_mountpoint) / run_name
         cached_run_dir.mkdir(parents=True, exist_ok=True)
 
         # optional: keep actual RFdiffusion outputs in a subdir
         run_dir = cached_run_dir / "run"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        run_infer_py = f"{RFD_REPO_DIR}/scripts/run_inference.py"
+        run_dir.mkdir(exist_ok=True)
 
         # hydra overrides are passed as a single string, split safely.
-        extra_tokens = shlex.split(hydra_overrides) if hydra_overrides else []
-
         out_prefix = run_dir / "rfout"
-
         cmd = [
-            "python",
-            run_infer_py,
+            sys.executable,
+            f"{CONF.git_clone_dir}/scripts/run_inference.py",
             f"inference.input_pdb={input_pdb}",
             f"inference.output_prefix={out_prefix}",
-            *extra_tokens,
         ]
+        if hydra_overrides:
+            cmd.extend(shlex.split(hydra_overrides))
 
         # ---- run inference (writes directly into cache volume) ----
-        run_command(cmd, cwd=RFD_REPO_DIR)
+        try:
+            CONF.output_volume.commit()
+            run_command(cmd, cwd=CONF.git_clone_dir)
+            # NOTE:
+            # This SUCCESS marker is intentionally not consumed by the current code path.
+            # It serves as a lightweight completion flag for external inspection
+            # (e.g. humans, debugging, or future cache-reuse logic) to distinguish
+            # completed runs from partial or interrupted ones.
+            # ---- mark success (only reached if inference didn't error) ----
+            (cached_run_dir / "SUCCESS").mkdir()
+        finally:
+            CONF.output_volume.commit()
 
-        # NOTE:
-        # This SUCCESS marker is intentionally not consumed by the current code path.
-        # It serves as a lightweight completion flag for external inspection
-        # (e.g. humans, debugging, or future cache-reuse logic) to distinguish
-        # completed runs from partial or interrupted ones.
-        # ---- mark success (only reached if inference didn't error) ----
-        success_marker = cached_run_dir / "SUCCESS"
-        success_marker.write_text("ok\n", encoding="utf-8")
-
-        # ---- commit cached outputs ----
-        RFD_OUT_VOLUME.commit()
-        remote_run_dir = volume_path_from_mount_path(
-            str(cached_run_dir),
-            RFD_OUT_DIR,
-            RFD_OUT_VOLUME_NAME,
-        )
-        print(f"RFdiffusion cached outputs: {remote_run_dir}", flush=True)
-
-        # ---- bundle outputs for return ----
-        warmup_directory(run_dir)
-        selected = collect_outputs_for_bundle(run_dir)
-        return package_outputs(run_dir, paths_to_bundle=selected)
+    # ---- bundle outputs for return ----
+    remote_run_dir = volume_path_from_mount_path(
+        str(cached_run_dir), CONF.output_volume_mountpoint, CONF.output_volume_name
+    )
+    print(f"💊 RFdiffusion cached outputs: {remote_run_dir}", flush=True)
+    warmup_directory(run_dir)
+    exts = "|".join(("pdb", "trb", "json", "yaml", "yml", "log", "txt", "csv"))
+    selected = find_with_fd(run_dir, rf"\.({exts})$", "-tf")
+    return package_outputs(run_dir, paths_to_bundle=selected)
 
 
 # -------------------------
@@ -349,7 +231,6 @@ def submit_rfdiffusion_task(
     contigs: str | None = None,
     num_designs: int = 1,
     hotspot_res: str | None = None,
-    # Backwards-compatible "raw overrides" input (deprecated, but kept for convenience).
     rfd_args: str = "",
     download_models: bool = False,
     force_redownload: bool = False,
@@ -362,12 +243,12 @@ def submit_rfdiffusion_task(
             and as part of the returned output archive filename.
         input_pdb: Path to the input PDB file on the local machine. The file
             will be uploaded to the Modal worker before inference starts.
-        contigs: Convenience wrapper for `contigmap.contigs` (Hydra override).
-            This simplifies common RFdiffusion use cases such as binder or
-            scaffold design.
+        contigs: Convenience wrapper for `contigmap.contigs` (Hydra override),
+            e.g. `"100-150/0 E333-526"`. This simplifies common RFdiffusion
+            use cases such as binder or scaffold design.
         num_designs: Convenience wrapper for `inference.num_designs`.
-        hotspot_res: Convenience wrapper for `ppi.hotspot_res`, typically used
-            for binder design.
+        hotspot_res: Convenience wrapper for `ppi.hotspot_res`,
+            e.g. `"E405,E408"`. Typically used for binder design.
         rfd_args: Raw RFdiffusion Hydra overrides passed directly to the
             inference script. This is an escape hatch for advanced options.
         download_models: If set, download RFdiffusion checkpoint weights into
@@ -377,9 +258,6 @@ def submit_rfdiffusion_task(
         out_dir: Optional local directory where the output `.tar.zst` archive
             will be written. Defaults to the current working directory.
 
-    Notes:
-        For longer jobs, increase `TIMEOUT` via environment variable:
-        `TIMEOUT=360000 modal run rfdiffusion_app.py ...`.
     """
     if download_models:
         download_rfdiffusion_models.remote(force=force_redownload)
@@ -388,7 +266,7 @@ def submit_rfdiffusion_task(
     if run_name is None:
         raise ValueError("Missing required --run-name")
 
-    run_name = validate_run_name(run_name)
+    run_name = sanitize_filename(run_name)
 
     if input_pdb is None:
         raise ValueError("Missing required --input-pdb (path to local .pdb)")
@@ -401,7 +279,7 @@ def submit_rfdiffusion_task(
     overrides: list[str] = []
 
     if contigs:
-        overrides.append(f'contigmap.contigs="[{contigs}]"')  # keep as a single token
+        overrides.append(f"contigmap.contigs=[{contigs}]")  # keep as a single token
     if num_designs:
         overrides.append(f"inference.num_designs={int(num_designs)}")
     if hotspot_res:
@@ -413,8 +291,7 @@ def submit_rfdiffusion_task(
     if rfd_args.strip():
         overrides.extend(shlex.split(rfd_args))
 
-    hydra_overrides = " ".join(overrides)
-
+    hydra_overrides = shlex.join(overrides)
     pdb_bytes = input_path.read_bytes()
 
     local_out = Path(out_dir).expanduser().resolve() if out_dir else Path.cwd()
@@ -430,4 +307,4 @@ def submit_rfdiffusion_task(
         hydra_overrides=hydra_overrides,
     )
     out_file.write_bytes(tar_bytes)
-    print(f"Done. Saved: {out_file}")
+    print(f"🧬 Done. Saved: {out_file}")

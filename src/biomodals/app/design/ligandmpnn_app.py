@@ -172,7 +172,7 @@ def build_base_command(
     import tempfile
     from pathlib import Path
 
-    workdir = Path(tempfile.gettempdir()) / f"{run_name}-{script_mode}"
+    workdir = Path(tempfile.gettempdir()) / run_name
     for d in ("inputs", "outputs"):
         (workdir / d).mkdir(parents=True, exist_ok=True)
 
@@ -509,12 +509,10 @@ def submit_ligandmpnn_task(
         omit_AA_per_residue_bytes,
     )
     local_out_dir = (
-        Path(out_dir).expanduser()
-        if out_dir is not None
-        else Path.cwd() / f"{run_name}-{script_mode}"
+        Path(out_dir).expanduser() if out_dir is not None else Path.cwd() / run_name
     )
     local_out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"🧬 Downloading results for {run_name}...")
-    (local_out_dir / f"{run_name}-{script_mode}.tar.zst").write_bytes(res_bytes)
+    (local_out_dir / f"{run_name}.tar.zst").write_bytes(res_bytes)
     print(f"🧬 Results saved to: {local_out_dir.resolve()}")

@@ -51,6 +51,7 @@ from biomodals.helper.shell import (
     package_outputs,
     run_command_with_log,
     sanitize_filename,
+    softlink_dir,
     warmup_directory,
 )
 from biomodals.helper.volume_run import volume_path_from_mount_path
@@ -68,7 +69,6 @@ CONF = AppConfig(
     cuda_version="cu121",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "36000")),
-    model_volume_mountpoint="/opt/RFdiffusion/models",
 )
 
 # -------------------------
@@ -141,7 +141,7 @@ def download_rfdiffusion_models(force: bool = False) -> None:
         "Base_epoch8_ckpt.pt": f"{base_url}/12fc204edeae5b57713c5ad7dcb97d39/Base_epoch8_ckpt.pt",
     }
 
-    model_dir = Path(CONF.model_volume_mountpoint)
+    model_dir = Path(CONF.model_volume_mountpoint) / "models"
     try:
         download_files(
             {v: model_dir / k for k, v in checkpoint_urls.items()},
@@ -170,7 +170,8 @@ def _bundle_outputs(run_dir: str) -> bytes:
     gpu=CONF.gpu,
     memory=(1024, 32768),
     timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True, model_volume=True),
+    # Do not mount as read-only because we may need to write IGSO3 cache
+    volumes=CONF.mounts(output_volume=True, model_volume=True, model_ro=False),
 )
 def rfdiffusion_infer(
     input_pdb_bytes: bytes, input_pdb_name: str, run_name: str, hydra_overrides: str
@@ -218,6 +219,12 @@ def rfdiffusion_infer(
             f"inference.output_prefix={out_prefix}",
             *shlex.split(hydra_overrides),
         ]
+
+        # Symlink to model and IGSO3 cache directories
+        for subdir in ("models", "schedules"):
+            softlink_dir(
+                Path(CONF.model_volume_mountpoint) / subdir, CONF.git_clone_dir / subdir
+            )
 
         # ---- run inference (writes directly into cache volume) ----
         try:

@@ -161,7 +161,8 @@ def _bundle_outputs(run_dir: str) -> bytes:
     )
     print(f"💊 RFdiffusion cached outputs: {remote_run_dir}", flush=True)
     warmup_directory(run_dir)
-    exts = "|".join(("pdb", "trb", "json", "yaml", "yml", "log", "txt", "csv"))
+
+    exts = "|".join(("pdb", "trb", "log", "tar.zst"))
     selected = find_with_fd(run_dir, rf"\.({exts})$", "-tf")
     return package_outputs(run_dir, paths_to_bundle=selected or None)
 
@@ -181,6 +182,7 @@ def rfdiffusion_infer(
     - Partial results are preserved if the run is interrupted.
     - A SUCCESS marker file is written only after successful completion.
     """
+    import shutil
     from tempfile import TemporaryDirectory
 
     # ---- cached output dir (persistent volume) ----
@@ -234,6 +236,16 @@ def rfdiffusion_infer(
                 verbose=True,
                 cwd=CONF.git_clone_dir,
             )
+            CONF.output_volume.commit()
+
+            # If trajectories are generated, compress them to save space
+            traj_dir = rfd_out_dir / "traj"
+            traj_tarball = traj_dir.with_suffix(".tar.zst")
+            if not traj_tarball.exists() and traj_dir.exists():
+                traj_tarball.write_bytes(package_outputs(traj_dir))
+            if traj_tarball.exists() and traj_dir.exists():
+                shutil.rmtree(traj_dir)
+
             success_marker.write_text(input_hash)
         finally:
             CONF.output_volume.commit()

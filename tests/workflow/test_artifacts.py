@@ -386,10 +386,10 @@ def test_materialize_volume_path_copy_rejects_symlink_path_component(
 def test_materialize_inline_bytes_rejects_non_utf8_bytes(
     tmp_path: Path,
 ) -> None:
-    result = AppRunResult(
+    result = AppRunResult.model_construct(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            AppOutput.model_construct(
                 name="archive",
                 kind=ArtifactKind.REPORT,
                 storage=InlineBytes.model_construct(
@@ -408,6 +408,53 @@ def test_materialize_inline_bytes_rejects_non_utf8_bytes(
             artifact_dir=tmp_path / "artifacts",
             producing_node_id="pack",
         )
+
+
+def test_materialize_inline_zstd_archive_preserves_binary_bytes(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="archive",
+                kind=ArtifactKind.ARCHIVE,
+                storage=InlineBytes(
+                    data=b"\xff\x00",
+                    filename="archive.tar.zst",
+                    media_type="application/zstd",
+                ),
+                metadata={"archive_format": "tar.zst"},
+            )
+        ],
+    )
+
+    artifacts = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        attempt_dir=tmp_path / "attempt",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="pack",
+        volume_root=tmp_path,
+    )
+
+    raw_path = tmp_path / "attempt" / "raw_outputs" / "archive.tar.zst"
+    materialized_path = (
+        tmp_path
+        / "attempt"
+        / "materialized_outputs"
+        / "pack-archive"
+        / "archive.tar.zst"
+    )
+    assert raw_path.read_bytes() == b"\xff\x00"
+    assert materialized_path.read_bytes() == b"\xff\x00"
+    assert artifacts[0].kind == ArtifactKind.ARCHIVE
+    assert artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="attempt/materialized_outputs/pack-archive",
+        media_type="application/zstd",
+    )
+    assert artifacts[0].metadata == {"archive_format": "tar.zst"}
 
 
 def test_archive_outputs_use_volume_path_metadata(tmp_path: Path) -> None:

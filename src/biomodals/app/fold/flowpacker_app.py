@@ -60,6 +60,7 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactKind,
 )
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 ##########################################
 # Modal configs
@@ -366,12 +367,9 @@ def run_flowpacker_workflow(
                     remote_path=str(archive_path),
                     mount_root=str(volume_root),
                     volume_name=CONF.output_volume_name,
-                    media_type="application/zstd",
+                    media_type=ZSTD_MEDIA_TYPE,
                 ),
-                metadata={
-                    "archive_format": "tar.zst",
-                    "filename": archive_filename,
-                },
+                metadata={"archive_format": "tar.zst", "filename": archive_filename},
             )
         ],
     )

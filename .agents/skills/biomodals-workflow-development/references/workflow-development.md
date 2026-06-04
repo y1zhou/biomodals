@@ -65,10 +65,11 @@ the transition from `biomodals.app.config`.
 
 Workflow-compatible app functions return `AppRunResult`. The workflow runtime
 materializes each `AppOutput` into one or more `WorkflowArtifact` manifests.
-Inline byte outputs are for UTF-8 text bytes only. They must be written into the
-workflow run volume before they cross a node boundary. Binary outputs, archives,
-and other non-text bytes must be written to deterministic volume paths and
-returned as `VolumePath` storage.
+Inline byte outputs are for UTF-8 text bytes or small zstd archives with
+`media_type="application/zstd"`. They are materialized into the workflow run
+volume when the runtime records workflow artifacts. Other binary outputs,
+large archives, and non-text bytes must be written to deterministic volume paths
+and returned as `VolumePath` storage.
 
 `AppRunResult.logs` are durable workflow artifacts too. The runtime writes log
 outputs under `nodes/<node-id>/attempts/<attempt-id>/logs/` and records
@@ -402,8 +403,9 @@ filenames may appear across workflow runs.
 
 Summary/report nodes should usually be `WorkflowNativeNode` instances with
 `ORCHESTRATOR` placement when they only aggregate manifests or emit text
-reports. Return reports as UTF-8 `InlineBytes`; return binary files,
-directories, and archives as durable `VolumePath` outputs.
+reports. Return reports as UTF-8 `InlineBytes`; return small zstd archives as
+`InlineBytes` with `media_type="application/zstd"`; return other binary files,
+directories, and large archives as durable `VolumePath` outputs.
 
 When adding a workflow-compatible app function, keep existing local entrypoint
 behavior unchanged and add a focused pytest contract test that does not call

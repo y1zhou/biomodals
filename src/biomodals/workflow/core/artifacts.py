@@ -19,6 +19,7 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 
 def _artifact_id(producing_node_id: str, output_name: str) -> str:
@@ -61,10 +62,12 @@ def _artifact_files(root: Path) -> list[ArtifactFile]:
 def _validate_inline_text_bytes(
     storage: InlineBytes, output_kind: ArtifactKind
 ) -> None:
+    if storage.media_type == ZSTD_MEDIA_TYPE:
+        return
     if output_kind == ArtifactKind.ARCHIVE or getattr(storage, "archive_format", None):
         raise ValueError(
-            "InlineBytes outputs are UTF-8 text only; archive outputs must use "
-            "VolumePath storage"
+            f"InlineBytes archive outputs must use media_type='{ZSTD_MEDIA_TYPE}' "
+            "or VolumePath storage"
         )
     try:
         storage.data.decode("utf-8")
@@ -110,6 +113,7 @@ def _materialize_inline_bytes(
         storage=VolumePath(
             volume_name=workflow_volume_name,
             path=_volume_path(materialized_dir, volume_root),
+            media_type=storage.media_type,
         ),
         files=_artifact_files(materialized_dir),
         source_app_output_name=source_app_output_name or output_name,

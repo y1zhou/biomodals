@@ -6,7 +6,7 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 if sys.version_info >= (3, 11):  # noqa: UP036
     from enum import StrEnum
@@ -21,27 +21,36 @@ class StorageKind(StrEnum):
     VOLUME_PATH = "volume_path"
 
 
-class InlineBytes(BaseModel):
-    """UTF-8 text returned directly before workflow materialization."""
+ZSTD_MEDIA_TYPE = "application/zstd"
 
-    model_config = ConfigDict(extra="forbid")
+
+class InlineBytes(BaseModel):
+    """Inline app output bytes before workflow materialization."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+    )
 
     kind: Literal[StorageKind.INLINE_BYTES] = StorageKind.INLINE_BYTES
     data: bytes
     filename: str
     media_type: str | None = None
 
-    @field_validator("data")
-    @classmethod
-    def ensure_utf8_text(cls, value: bytes) -> bytes:
-        """Reject non-text inline payloads."""
+    @model_validator(mode="after")
+    def ensure_supported_bytes(self) -> InlineBytes:
+        """Reject binary inline payloads unless they are zstd archives."""
+        if self.media_type == ZSTD_MEDIA_TYPE:
+            return self
         try:
-            value.decode("utf-8")
+            self.data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(
-                "InlineBytes.data must be UTF-8 text; use VolumePath for binary data."
+                "InlineBytes.data must be UTF-8 text unless media_type is "
+                f"{ZSTD_MEDIA_TYPE!r}."
             ) from exc
-        return value
+        return self
 
 
 class VolumePath(BaseModel):

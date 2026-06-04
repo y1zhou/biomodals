@@ -37,6 +37,7 @@ CONF = AppConfig(
     python_version="3.11",
     cuda_version="cu121",
     gpu=os.environ.get("GPU", "A10G"),
+    model_volume_mountpoint="/opt/LigandMPNN/model_params",
 )
 
 AVAILABLE_MODELS = {
@@ -137,12 +138,11 @@ def download_weights(force: bool) -> None:
     base_url = "https://files.ipd.uw.edu/pub/ligandmpnn"
     model_dir = Path(CONF.model_volume_mountpoint)
     ligandmpnn_weights = {
-        f"{base_url}/{model_name}": model_dir / "model_params" / model_name
+        f"{base_url}/{model_name}": model_dir / model_name
         for model_name in AVAILABLE_MODELS
     }
     abmpnn_dict = {
         "https://zenodo.org/records/8164693/files/abmpnn.pt?download=1": model_dir
-        / "model_params"
         / "abmpnn.pt"
     }
 
@@ -241,17 +241,17 @@ def ligandmpnn_run(
         omit_aa_per_residue_bytes,
     )
 
-    model_dir = Path(CONF.model_volume_mountpoint)
-    log_path = workdir / "ligandmpnn-run.log"
+    log_path = workdir / "ligandmpnn.log"
     print(f"💊 Running LigandMPNN, saving logs to {log_path}")
     for seed in tqdm(seeds, desc="Inference seeds"):
-        cmd = base_cmd + [
+        cmd = [
+            *base_cmd,
             "--seed",
             str(seed),
             "--out_folder",
             str(workdir / "outputs" / f"seed-{seed}"),
         ]
-        run_command_with_log(cmd, log_file=log_path, cwd=model_dir)
+        run_command_with_log(cmd, log_file=log_path, cwd=CONF.git_clone_dir)
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")
@@ -439,7 +439,7 @@ def submit_ligandmpnn_task(
         cli_args[f"--checkpoint_{model_type}"] = checkpoint
     elif model_type == "abmpnn":
         cli_args["--checkpoint_protein_mpnn"] = str(
-            Path(CONF.model_volume_mountpoint) / "model_params" / "abmpnn.pt"
+            Path(CONF.model_volume_mountpoint) / "abmpnn.pt"
         )
     if fixed_residues is not None:
         cli_args["--fixed_residues"] = fixed_residues

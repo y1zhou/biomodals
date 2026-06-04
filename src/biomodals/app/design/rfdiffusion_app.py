@@ -44,12 +44,12 @@ from pathlib import Path
 from modal import App, Image
 
 from biomodals.app.config import AppConfig
-from biomodals.helper import patch_image_for_helper
+from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
-    run_command,
+    run_command_with_log,
     sanitize_filename,
     warmup_directory,
 )
@@ -154,6 +154,18 @@ def download_rfdiffusion_models(force: bool = False) -> None:
     print("💊 RFdiffusion checkpoints downloaded and committed.")
 
 
+def _bundle_outputs(run_dir: str) -> bytes:
+    """Bundle the outputs of the run into a .tar.zst archive."""
+    remote_run_dir = volume_path_from_mount_path(
+        run_dir, CONF.output_volume_mountpoint, CONF.output_volume_name
+    )
+    print(f"💊 RFdiffusion cached outputs: {remote_run_dir}", flush=True)
+    warmup_directory(run_dir)
+    exts = "|".join(("pdb", "trb", "json", "yaml", "yml", "log", "txt", "csv"))
+    selected = find_with_fd(run_dir, rf"\.({exts})$", "-tf")
+    return package_outputs(run_dir, paths_to_bundle=selected or None)
+
+
 @app.function(
     gpu=CONF.gpu,
     memory=(1024, 32768),
@@ -170,55 +182,56 @@ def rfdiffusion_infer(
     """
     from tempfile import TemporaryDirectory
 
-    with TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+    # ---- cached output dir (persistent volume) ----
+    cached_run_dir = Path(CONF.output_volume_mountpoint) / run_name
+    cached_run_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- compute hash based on all inputs ----
+    input_hash = hash_string(
+        ":".join((
+            input_pdb_bytes.decode("utf-8"),
+            hydra_overrides,
+        ))
+    )
+    success_marker = cached_run_dir / "SUCCESS"
+    if success_marker.exists():
+        marker_hash = success_marker.read_text().strip()
+        if marker_hash == input_hash:
+            print(f"💊 Found RFdiffusion cached output: hash={marker_hash}")
+            return _bundle_outputs(str(cached_run_dir))
+
+    # optional: keep actual RFdiffusion outputs in a subdir
+    rfd_out_dir = cached_run_dir / "rfd-scaffolds"
+    rfd_out_dir.mkdir(exist_ok=True)
+    out_prefix = rfd_out_dir / run_name
+
+    with TemporaryDirectory() as tmpdir:
         # ---- input pdb (tmp is fine) ----
-        input_pdb = tmp / input_pdb_name
+        input_pdb = Path(tmpdir) / input_pdb_name
         input_pdb.write_bytes(input_pdb_bytes)
 
-        # ---- cached output dir (persistent volume) ----
-        cached_run_dir = Path(CONF.output_volume_mountpoint) / run_name
-        cached_run_dir.mkdir(parents=True, exist_ok=True)
-
-        # optional: keep actual RFdiffusion outputs in a subdir
-        run_dir = cached_run_dir / "run"
-        run_dir.mkdir(exist_ok=True)
-
         # hydra overrides are passed as a single string, split safely.
-        out_prefix = run_dir / "rfout"
         cmd = [
             sys.executable,
             f"{CONF.git_clone_dir}/scripts/run_inference.py",
             f"inference.input_pdb={input_pdb}",
             f"inference.output_prefix={out_prefix}",
+            *shlex.split(hydra_overrides),
         ]
-        if hydra_overrides:
-            cmd.extend(shlex.split(hydra_overrides))
 
         # ---- run inference (writes directly into cache volume) ----
         try:
-            CONF.output_volume.commit()
-            run_command(cmd, cwd=CONF.git_clone_dir)
-            # NOTE:
-            # This SUCCESS marker is intentionally not consumed by the current code path.
-            # It serves as a lightweight completion flag for external inspection
-            # (e.g. humans, debugging, or future cache-reuse logic) to distinguish
-            # completed runs from partial or interrupted ones.
-            # ---- mark success (only reached if inference didn't error) ----
-            (cached_run_dir / "SUCCESS").mkdir()
+            run_command_with_log(
+                cmd,
+                log_file=cached_run_dir / f"{run_name}-{CONF.name}.log",
+                verbose=True,
+                cwd=CONF.git_clone_dir,
+            )
+            success_marker.write_text(input_hash)
         finally:
             CONF.output_volume.commit()
 
-    # ---- bundle outputs for return ----
-    remote_run_dir = volume_path_from_mount_path(
-        str(cached_run_dir), CONF.output_volume_mountpoint, CONF.output_volume_name
-    )
-    print(f"💊 RFdiffusion cached outputs: {remote_run_dir}", flush=True)
-    warmup_directory(run_dir)
-    exts = "|".join(("pdb", "trb", "json", "yaml", "yml", "log", "txt", "csv"))
-    selected = find_with_fd(run_dir, rf"\.({exts})$", "-tf")
-    return package_outputs(run_dir, paths_to_bundle=selected)
+    return _bundle_outputs(str(cached_run_dir))
 
 
 # -------------------------
@@ -291,6 +304,10 @@ def submit_rfdiffusion_task(
     if rfd_args.strip():
         overrides.extend(shlex.split(rfd_args))
 
+    if not overrides:
+        raise ValueError(
+            "At least one of 'contigs', 'num_designs', 'hotspot_res' or 'rfd_args' is required"
+        )
     hydra_overrides = shlex.join(overrides)
     pdb_bytes = input_path.read_bytes()
 

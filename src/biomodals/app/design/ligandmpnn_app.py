@@ -247,7 +247,8 @@ def ligandmpnn_run(
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")
     torch_files = find_with_fd(workdir / "outputs", r"\.pt$")
-    for f in torch_files:
+    for torch_file in torch_files:
+        f = workdir / "outputs" / torch_file
         np_dict = torch_to_numpy(f)
         f_path = Path(f)
         npz_path = f_path.with_suffix(".npz")

@@ -5,33 +5,13 @@ r"""RFdiffusion source repo: <https://github.com/RosettaCommons/RFdiffusion>.
 * Checkpoint URLs are hardcoded from the upstream script:
   https://github.com/RosettaCommons/RFdiffusion/blob/main/scripts/download_models.sh
 * For a complete set of RFdiffusion Hydra override keys, see RFdiffusion docs and `scripts/run_inference.py`.
-* Checkpoints are stored in a persistent Modal volume (`rfdiffusion-models`).
-* Outputs are cached in a persistent Modal volume (`rfdiffusion-outputs`) under:
-  `/root/rfdiffusion_outputs/<run-name>/`
-* The returned tarball bundles only “useful” artifacts by default (e.g. `.pdb`, `.trb`, `.log`, `.json`, `.yaml/.yml`, `.csv`).
-  If the selection step yields nothing, it falls back to bundling the entire local output directory.
 
 ## Outputs
 
 * A `.tar.zst` archive will be written to `--out-dir` (or `$CWD`) named:
-  `<run-name>_rfdiffusion_outputs.tar.zst`.
+  `<run-name>_RFdiffusion.tar.zst`.
 * The same run outputs are cached on the output volume for later inspection/reuse
   under the run name key.
-
-## Typical usage:
-
-```bash
-# 1) Download checkpoints into the persistent models volume (run once)
-modal run rfdiffusion_app.py --download-models --force-redownload
-
-# 2) Run inference (binder design / scaffold etc.)
-modal run rfdiffusion_app.py \
-    --run-name demo1 \
-    --input-pdb ~/outputs/rfdiffusion_app/RBD_wt.pdb \
-    --contigs "100-150/0 E333-526" \
-    --num-designs 2 \
-    --hotspot-res "E405,E408"
-```
 """
 
 from __future__ import annotations
@@ -56,6 +36,13 @@ from biomodals.helper.shell import (
 )
 from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.helper.web import download_files
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    VolumePath,
+)
 
 # -------------------------
 # Modal configs
@@ -154,34 +141,10 @@ def download_rfdiffusion_models(force: bool = False) -> None:
     print("💊 RFdiffusion checkpoints downloaded and committed.")
 
 
-def _bundle_outputs(run_dir: str) -> bytes:
-    """Bundle the outputs of the run into a .tar.zst archive."""
-    remote_run_dir = volume_path_from_mount_path(
-        run_dir, CONF.output_volume_mountpoint, CONF.output_volume_name
-    )
-    print(f"💊 RFdiffusion cached outputs: {remote_run_dir}", flush=True)
-    warmup_directory(run_dir)
-
-    exts = "|".join(("pdb", "trb", "log", "tar.zst"))
-    selected = find_with_fd(run_dir, rf"\.({exts})$", "-tf")
-    return package_outputs(run_dir, paths_to_bundle=selected or None)
-
-
-@app.function(
-    gpu=CONF.gpu,
-    memory=(1024, 32768),
-    timeout=CONF.timeout,
-    # Do not mount as read-only because we may need to write IGSO3 cache
-    volumes=CONF.mounts(output_volume=True, model_volume=True, model_ro=False),
-)
-def rfdiffusion_infer(
+def _rfdiffusion_infer(
     input_pdb_bytes: bytes, input_pdb_name: str, run_name: str, hydra_overrides: str
-) -> bytes:
-    """Run RFdiffusion inference inside the container and return a .tar.zst bundle.
-
-    - Partial results are preserved if the run is interrupted.
-    - A SUCCESS marker file is written only after successful completion.
-    """
+) -> str:
+    """Run RFdiffusion inference and return the cached output directory."""
     import shutil
     from tempfile import TemporaryDirectory
 
@@ -191,17 +154,14 @@ def rfdiffusion_infer(
 
     # ---- compute hash based on all inputs ----
     input_hash = hash_string(
-        ":".join((
-            input_pdb_bytes.decode("utf-8"),
-            hydra_overrides,
-        ))
+        ":".join((input_pdb_bytes.decode("utf-8"), hydra_overrides))
     )
     success_marker = cached_run_dir / "SUCCESS"
     if success_marker.exists():
         marker_hash = success_marker.read_text().strip()
         if marker_hash == input_hash:
             print(f"💊 Found RFdiffusion cached output: hash={marker_hash}")
-            return _bundle_outputs(str(cached_run_dir))
+            return str(cached_run_dir)
 
     # optional: keep actual RFdiffusion outputs in a subdir
     rfd_out_dir = cached_run_dir / "rfd-scaffolds"
@@ -240,7 +200,7 @@ def rfdiffusion_infer(
 
             # If trajectories are generated, compress them to save space
             traj_dir = rfd_out_dir / "traj"
-            traj_tarball = traj_dir.with_suffix(".tar.zst")
+            traj_tarball = rfd_out_dir / f"{run_name}_traj.tar.zst"
             if not traj_tarball.exists() and traj_dir.exists():
                 traj_tarball.write_bytes(package_outputs(traj_dir))
             if traj_tarball.exists() and traj_dir.exists():
@@ -250,7 +210,68 @@ def rfdiffusion_infer(
         finally:
             CONF.output_volume.commit()
 
-    return _bundle_outputs(str(cached_run_dir))
+    return str(cached_run_dir)
+
+
+@app.function(
+    gpu=CONF.gpu,
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    # Do not mount as read-only because we may need to write IGSO3 cache
+    volumes=CONF.mounts(output_volume=True, model_volume=True, model_ro=False),
+)
+def rfdiffusion_infer(
+    input_pdb_bytes: bytes, input_pdb_name: str, run_name: str, hydra_overrides: str
+) -> AppRunResult:
+    """Run RFdiffusion and return a workflow-compatible output directory."""
+    safe_run_name = sanitize_filename(run_name)
+    run_dir = _rfdiffusion_infer(
+        input_pdb_bytes=input_pdb_bytes,
+        input_pdb_name=input_pdb_name,
+        run_name=safe_run_name,
+        hydra_overrides=hydra_overrides,
+    )
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name=f"{CONF.name}_outputs",
+                kind=ArtifactKind.DIRECTORY,
+                storage=volume_path_from_mount_path(
+                    remote_path=f"{run_dir}/rfd-scaffolds",
+                    mount_root=CONF.output_volume_mountpoint,
+                    volume_name=CONF.output_volume_name,
+                ),
+                metadata={"run_name": safe_run_name},
+            )
+        ],
+        logs=[
+            AppOutput(
+                name=f"{CONF.name}_log",
+                kind=ArtifactKind.LOGS,
+                storage=volume_path_from_mount_path(
+                    remote_path=f"{run_dir}/{safe_run_name}-{CONF.name}.log",
+                    mount_root=CONF.output_volume_mountpoint,
+                    volume_name=CONF.output_volume_name,
+                ),
+            )
+        ],
+    )
+
+
+@app.function(timeout=CONF.timeout, volumes=CONF.mounts(output_volume=True))
+def bundle_rfdiffusion_outputs(run_name: str) -> bytes:
+    """Bundle an RFdiffusion output directory from the app output volume."""
+    run_dir = Path(CONF.output_volume_mountpoint) / run_name
+    remote_run_dir = volume_path_from_mount_path(
+        str(run_dir), CONF.output_volume_mountpoint, CONF.output_volume_name
+    )
+    print(f"💊 RFdiffusion cached outputs: {remote_run_dir}", flush=True)
+    warmup_directory(run_dir)
+
+    exts = "|".join(("pdb", "trb", "log", "tar.zst"))
+    selected = find_with_fd(run_dir, rf"\.({exts})$", "-tf")
+    return package_outputs(run_dir, paths_to_bundle=selected or None)
 
 
 # -------------------------
@@ -338,15 +359,23 @@ def submit_rfdiffusion_task(
 
     local_out = Path(out_dir).expanduser().resolve() if out_dir else Path.cwd()
     local_out.mkdir(parents=True, exist_ok=True)
-    out_file = local_out / f"{run_name}_rfdiffusion_outputs.tar.zst"
+    out_file = local_out / f"{run_name}_{CONF.name}.tar.zst"
     if out_file.exists():
         raise FileExistsError(f"Output already exists: {out_file}")
 
-    tar_bytes = rfdiffusion_infer.remote(
-        input_pdb_bytes=pdb_bytes,
-        input_pdb_name=input_path.name,
-        run_name=run_name,
-        hydra_overrides=hydra_overrides,
+    result = AppRunResult.model_validate(
+        rfdiffusion_infer.remote(
+            input_pdb_bytes=pdb_bytes,
+            input_pdb_name=input_path.name,
+            run_name=run_name,
+            hydra_overrides=hydra_overrides,
+        )
     )
+    output = next(
+        output for output in result.outputs if output.name == f"{CONF.name}_outputs"
+    )
+    if not isinstance(output.storage, VolumePath):
+        raise TypeError(f"{CONF.name} outputs should use volume path storage")
+    tar_bytes = bundle_rfdiffusion_outputs.remote(run_name=output.metadata["run_name"])
     out_file.write_bytes(tar_bytes)
     print(f"🧬 Done. Saved: {out_file}")

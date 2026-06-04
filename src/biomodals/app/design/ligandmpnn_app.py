@@ -21,11 +21,7 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
-from biomodals.helper.shell import (
-    find_with_fd,
-    package_outputs,
-    run_command_with_log,
-)
+from biomodals.helper.shell import find_with_fd, package_outputs, run_command_with_log
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -36,7 +32,6 @@ CONF = AppConfig(
     name="LigandMPNN",
     repo_url="https://github.com/dauparas/LigandMPNN",
     repo_commit_hash="26ec57ac976ade5379920dbd43c7f97a91cf82de",
-    # https://github.com/dauparas/LigandMPNN/pull/45
     package_name="ligandmpnn",
     version="0.1.2",
     python_version="3.11",
@@ -82,9 +77,19 @@ AVAILABLE_MODELS = {
 runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
-    .apt_install("git", "build-essential", "wget")
+    .apt_install("git", "build-essential")
     .env(CONF.default_env)
+    # https://github.com/dauparas/LigandMPNN/pull/45
+    # hardcodes the checkpoint paths, so we can't add paths for AbMPNN
     .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
+    .run_commands(
+        " && ".join((
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+        ))
+    )
+    .env({"PYTHONPATH": str(CONF.git_clone_dir)})
     .pipe(patch_image_for_helper)
 )
 
@@ -123,7 +128,7 @@ def torch_to_numpy(pt_file: str | Path) -> dict[str, Any]:
 @app.function(
     volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=MAX_TIMEOUT
 )
-def download_weights() -> None:
+def download_weights(force: bool) -> None:
     """Download ProteinMPNN models into the mounted volume.
 
     Ref: https://github.com/dauparas/LigandMPNN/blob/main/get_model_params.sh
@@ -141,8 +146,12 @@ def download_weights() -> None:
         / "abmpnn.pt"
     }
 
-    print(f"💊 Downloading {CONF.name} models...")
-    download_files(ligandmpnn_weights | abmpnn_dict)
+    print(f"💊 Checking {CONF.name} models...")
+    download_files(
+        ligandmpnn_weights | abmpnn_dict,
+        force=force,
+        progress_bar_desc="Checkpoint download",
+    )
     MODEL_VOLUME.commit()
     print("💊 Model download complete")
 
@@ -185,12 +194,12 @@ def build_base_command(
             f.write(omit_aa_per_residue_bytes)
             cli_args["--omit_AA_per_residue"] = str(omit_aa_per_res_file)
 
-    mod_name = (
-        f"{CONF.package_name}.{script_mode}"
-        if script_mode == "run"
-        else f"{CONF.package_name}.utils.{script_mode}"
-    )
-    cmd = [sys.executable, "-m", mod_name]
+    # mod_name = (
+    #     f"{CONF.package_name}.{script_mode}"
+    #     if script_mode == "run"
+    #     else f"{CONF.package_name}.utils.{script_mode}"
+    # ) ligandmpnn PyPI package
+    cmd = [sys.executable, str(CONF.git_clone_dir / f"{script_mode}.py")]
     for arg, val in cli_args.items():
         if isinstance(val, bool):
             cmd.extend([str(arg), str(int(val))])
@@ -265,7 +274,6 @@ def ligandmpnn_run(
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
-# https://github.com/copilot/share/423a1120-4ba0-8023-9113-00096484408d
 @app.local_entrypoint()
 def submit_ligandmpnn_task(
     # Input and output
@@ -273,7 +281,7 @@ def submit_ligandmpnn_task(
     script_mode: str,
     out_dir: str | None = None,
     run_name: str | None = None,
-    download_models: bool = False,
+    force_download_models: bool = False,
     # Model configuration
     model_type: str = "soluble_mpnn",
     checkpoint: str | None = None,
@@ -317,7 +325,7 @@ def submit_ligandmpnn_task(
         script_mode: One of `run` or `score`
         out_dir: Local output directory; defaults to $PWD
         run_name: Name for this run; defaults to input structure stem
-        download_models: Whether to download model weights and skip running
+        force_download_models: Whether to download model weights even if they exist
 
         model_type: One of: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn,
             global_label_membrane_mpnn, soluble_mpnn, and abmpnn
@@ -376,12 +384,6 @@ def submit_ligandmpnn_task(
         single_aa_score: This only applies when using `script_mode` "score"!
             Run single amino acid scoring function: p(AA_i|backbone, AA_{all except ith one})
     """
-    from pathlib import Path
-
-    if download_models:
-        download_weights.remote()
-        return
-
     print("🧬 Checking input arguments...")
     input_path = Path(input_pdb).expanduser()
     if not input_path.exists():
@@ -401,13 +403,19 @@ def submit_ligandmpnn_task(
         "--model_type": "protein_mpnn" if model_type == "abmpnn" else model_type,
         "--batch_size": str(batch_size),
         "--number_of_batches": str(number_of_batches),
-        # 0/1 flags
-        "--ligand_mpnn_use_atom_context": ligand_mpnn_use_atom_context,
-        "--ligand_mpnn_cutoff_for_score": str(ligand_mpnn_cutoff_for_score),
-        "--ligand_mpnn_use_side_chain_context": ligand_mpnn_use_side_chain_context,
-        "--global_transmembrane_label": global_transmembrane_label,
         "--parse_atoms_with_zero_occupancy": parse_atoms_with_zero_occupancy,
     }
+    # 0/1 flags for specific models
+    if model_type == "ligand_mpnn":
+        cli_args |= {
+            "--ligand_mpnn_use_atom_context": ligand_mpnn_use_atom_context,
+            "--ligand_mpnn_cutoff_for_score": str(ligand_mpnn_cutoff_for_score),
+            "--ligand_mpnn_use_side_chain_context": ligand_mpnn_use_side_chain_context,
+        }
+    if model_type == "global_label_membrane_mpnn":
+        cli_args |= {
+            "--global_transmembrane_label": global_transmembrane_label,
+        }
     # Mode-specific args
     if score_mode:
         cli_args |= {
@@ -416,16 +424,16 @@ def submit_ligandmpnn_task(
             "--single_aa_score": single_aa_score,
         }
     else:
-        cli_args |= {
-            "--temperature": str(temperature),
-            "--save_stats": "1",
-            "--pack_side_chains": pack_side_chains,
-            "--number_of_packs_per_design": str(number_of_packs_per_design),
-            "--sc_num_denoising_steps": str(sc_num_denoising_steps),
-            "--sc_num_samples": str(sc_num_samples),
-            "--repack_everything": repack_everything,
-            "--pack_with_ligand_context": pack_with_ligand_context,
-        }
+        cli_args |= {"--temperature": str(temperature), "--save_stats": "1"}
+        if pack_side_chains:
+            cli_args |= {
+                "--pack_side_chains": pack_side_chains,
+                "--number_of_packs_per_design": str(number_of_packs_per_design),
+                "--repack_everything": repack_everything,
+                "--pack_with_ligand_context": pack_with_ligand_context,
+                "--sc_num_denoising_steps": str(sc_num_denoising_steps),
+                "--sc_num_samples": str(sc_num_samples),
+            }
     # Non-default args
     if checkpoint is not None:
         cli_args[f"--checkpoint_{model_type}"] = checkpoint
@@ -488,6 +496,7 @@ def submit_ligandmpnn_task(
             )
         omit_AA_per_residue_bytes = omit_AA_per_res_path.read_bytes()
 
+    download_weights.remote(force=force_download_models)
     print("🧬 Running LigandMPNN...")
     struct_bytes = input_path.read_bytes()
     res_bytes = ligandmpnn_run.remote(

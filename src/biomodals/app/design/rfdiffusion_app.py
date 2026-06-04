@@ -244,6 +244,8 @@ def submit_rfdiffusion_task(
     contigs: str | None = None,
     num_designs: int = 1,
     hotspot_res: str | None = None,
+    noise_scale_ca: float = 1.0,
+    noise_scale_frame: float = 1.0,
     rfd_args: str = "",
     download_models: bool = False,
     force_redownload: bool = False,
@@ -262,6 +264,8 @@ def submit_rfdiffusion_task(
         num_designs: Convenience wrapper for `inference.num_designs`.
         hotspot_res: Convenience wrapper for `ppi.hotspot_res`,
             e.g. `"E405,E408"`. Typically used for binder design.
+        noise_scale_ca: Convenience wrapper for `denoiser.noise_scale_ca`.
+        noise_scale_frame: Convenience wrapper for `denoiser.noise_scale_frame`.
         rfd_args: Raw RFdiffusion Hydra overrides passed directly to the
             inference script. This is an escape hatch for advanced options.
         download_models: If set, download RFdiffusion checkpoint weights into
@@ -289,12 +293,14 @@ def submit_rfdiffusion_task(
         raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
 
     # Build Hydra overrides string from structured arguments.
-    overrides: list[str] = []
+    overrides: list[str] = [
+        f"inference.num_designs={int(num_designs)}",
+        f"denoiser.noise_scale_ca={noise_scale_ca}",
+        f"denoiser.noise_scale_frame={noise_scale_frame}",
+    ]
 
     if contigs:
         overrides.append(f"contigmap.contigs=[{contigs}]")  # keep as a single token
-    if num_designs:
-        overrides.append(f"inference.num_designs={int(num_designs)}")
     if hotspot_res:
         # Accept "E405,E408" or "E405 E408"
         hs = hotspot_res.replace(" ", ",")

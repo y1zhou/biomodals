@@ -59,7 +59,7 @@ def test_materialize_inline_bytes_writes_one_attempt_artifact_copy(
     assert output_path.read_bytes() == b"ok\n"
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="nodes/summary/attempts/1/summary-summary",
+        path="nodes/summary/attempts/1/summary-summary/summary.txt",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage
     assert artifacts[0].files[0].path == "summary.txt"
@@ -92,7 +92,9 @@ def test_materialized_inline_artifact_path_is_volume_relative(
 
     assert materialized.artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path=("demo/run-1/nodes/summary/attempts/attempt-1/summary-summary"),
+        path=(
+            "demo/run-1/nodes/summary/attempts/attempt-1/summary-summary/summary.txt"
+        ),
     )
 
 
@@ -157,7 +159,7 @@ def test_materialize_app_run_result_persists_log_outputs_under_attempt_logs(
     assert artifacts[0].metadata == {"stream": "stderr"}
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="attempt/logs/node-logs-stderr",
+        path="attempt/logs/node-logs-stderr/stderr.log",
     )
     assert materialized.result.logs[0].storage == artifacts[0].storage
     assert (tmp_path / "artifacts" / "node-logs-stderr.json").exists()
@@ -446,7 +448,7 @@ def test_materialize_inline_zstd_archive_preserves_binary_bytes(
     assert artifacts[0].kind == ArtifactKind.ARCHIVE
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="attempt/pack-archive",
+        path="attempt/pack-archive/archive.tar.zst",
         media_type="application/zstd",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage

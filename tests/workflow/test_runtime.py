@@ -871,11 +871,11 @@ def test_remote_success_records_materialized_app_result(
     assert storage == {
         "kind": "volume_path",
         "volume_name": "Workflow-outputs",
-        "path": "demo/run-1/nodes/remote/attempts/attempt-1/remote-archive",
+        "path": "demo/run-1/nodes/remote/attempts/attempt-1/remote-archive/archive.tar.zst",
         "media_type": "application/zstd",
     }
     assert "data" not in storage
-    assert (tmp_path / storage["path"] / "archive.tar.zst").read_bytes() == b"ok"
+    assert (tmp_path / storage["path"]).read_bytes() == b"ok"
 
 
 def test_remote_success_reloads_volume_before_materializing_outputs(

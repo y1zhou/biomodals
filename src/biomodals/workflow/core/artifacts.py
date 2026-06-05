@@ -117,7 +117,8 @@ def _materialize_inline_bytes(
     artifact_parent = artifact_parent or attempt_dir
     materialized_dir = artifact_parent / artifact_id
     materialized_dir.mkdir(parents=True, exist_ok=True)
-    materialized_dir.joinpath(safe_filename).write_bytes(storage.data)
+    materialized_file = materialized_dir.joinpath(safe_filename)
+    materialized_file.write_bytes(storage.data)
 
     return WorkflowArtifact(
         artifact_id=artifact_id,
@@ -125,10 +126,10 @@ def _materialize_inline_bytes(
         kind=output_kind,
         storage=VolumePath(
             volume_name=workflow_volume_name,
-            path=_volume_path(materialized_dir, volume_root),
+            path=_volume_path(materialized_file, volume_root),
             media_type=storage.media_type,
         ),
-        files=_artifact_files(materialized_dir),
+        files=_artifact_files(materialized_file),
         source_app_output_name=source_app_output_name or output_name,
         metadata=metadata or {},
     )

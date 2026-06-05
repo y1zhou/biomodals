@@ -584,7 +584,7 @@ def test_rfd_ligandmpnn_summary_reports_design_artifacts(tmp_path: Path) -> None
         kind=ArtifactKind.ARCHIVE,
         storage=VolumePath(
             volume_name="Workflow-outputs",
-            path="attempt/materialized_outputs/mpnn-output",
+            path="attempt/mpnn-output",
             media_type=ZSTD_MEDIA_TYPE,
         ),
         metadata={

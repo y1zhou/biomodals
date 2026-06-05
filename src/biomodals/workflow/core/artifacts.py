@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import (
+    AppOutput,
     AppRunResult,
     ArtifactFile,
     ArtifactKind,
@@ -26,19 +28,26 @@ def _artifact_id(producing_node_id: str, output_name: str) -> str:
     return sanitize_filename(f"{producing_node_id}-{output_name}")
 
 
+@dataclass(frozen=True)
+class MaterializedAppRunResult:
+    """Workflow artifacts plus the ledger-safe app result that produced them."""
+
+    artifacts: list[WorkflowArtifact]
+    result: AppRunResult
+
+
 def _write_json(path: Path, payload: object) -> None:
+    from tempfile import TemporaryDirectory
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    if isinstance(payload, BaseModel):
-        tmp_path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
-    else:
-        tmp_path.write_bytes(
-            orjson.dumps(
-                payload,
-                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
-            )
-        )
-    tmp_path.replace(path)
+
+    with TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir) / path.name
+        if isinstance(payload, BaseModel):
+            tmp_path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
+        else:
+            tmp_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
+        tmp_path.replace(path)
 
 
 def _artifact_files(root: Path) -> list[ArtifactFile]:
@@ -87,8 +96,7 @@ def _materialize_inline_bytes(
     metadata: dict[str, Any] | None = None,
     artifact_output_name: str | None = None,
     source_app_output_name: str | None = None,
-    raw_dir: Path | None = None,
-    materialized_parent: Path | None = None,
+    artifact_parent: Path | None = None,
 ) -> WorkflowArtifact:
     artifact_id = _artifact_id(
         producing_node_id,
@@ -96,13 +104,9 @@ def _materialize_inline_bytes(
     )
     _validate_inline_text_bytes(storage, output_kind)
     safe_filename = sanitize_filename(storage.filename)
-    raw_dir = raw_dir or attempt_dir / "raw_outputs"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = raw_dir / safe_filename
-    raw_path.write_bytes(storage.data)
 
-    materialized_parent = materialized_parent or attempt_dir / "materialized_outputs"
-    materialized_dir = materialized_parent / artifact_id
+    artifact_parent = artifact_parent or attempt_dir
+    materialized_dir = artifact_parent / artifact_id
     materialized_dir.mkdir(parents=True, exist_ok=True)
     materialized_dir.joinpath(safe_filename).write_bytes(storage.data)
 
@@ -203,7 +207,7 @@ def _materialize_volume_path_copy(
     volume_roots: Mapping[str, Path],
     artifact_output_name: str | None = None,
     source_app_output_name: str | None = None,
-    materialized_parent: Path | None = None,
+    artifact_parent: Path | None = None,
 ) -> WorkflowArtifact:
     artifact_id = _artifact_id(
         producing_node_id,
@@ -218,8 +222,8 @@ def _materialize_volume_path_copy(
     if not source_path.exists():
         raise FileNotFoundError(f"Volume output path not found: {source_path}")
 
-    materialized_parent = materialized_parent or attempt_dir / "materialized_outputs"
-    materialized_dir = materialized_parent / artifact_id
+    artifact_parent = artifact_parent or attempt_dir
+    materialized_dir = artifact_parent / artifact_id
     _copy_volume_path_tree(
         source_path=source_path,
         materialized_dir=materialized_dir,
@@ -251,24 +255,25 @@ def materialize_app_run_result(
     volume_root: Path | None = None,
     volume_path_mode: Literal["reference", "copy"] = "reference",
     volume_roots: Mapping[str, Path] | None = None,
-) -> list[WorkflowArtifact]:
+) -> MaterializedAppRunResult:
     """Write app outputs into local workflow volume paths and return manifests."""
     artifacts: list[WorkflowArtifact] = []
+    persisted_outputs: list[AppOutput] = []
+    persisted_logs: list[AppOutput] = []
 
     def materialize_output(
         output,
         *,
         artifact_output_name: str | None = None,
         source_app_output_name: str | None = None,
-        raw_dir: Path | None = None,
-        materialized_parent: Path | None = None,
-    ) -> WorkflowArtifact:
+        artifact_parent: Path | None = None,
+    ) -> tuple[WorkflowArtifact, AppOutput]:
         artifact_id = _artifact_id(
             producing_node_id,
             artifact_output_name or output.name,
         )
         if isinstance(output.storage, InlineBytes):
-            return _materialize_inline_bytes(
+            artifact = _materialize_inline_bytes(
                 storage=output.storage,
                 output_name=output.name,
                 output_kind=output.kind,
@@ -279,12 +284,12 @@ def materialize_app_run_result(
                 metadata=output.metadata,
                 artifact_output_name=artifact_output_name,
                 source_app_output_name=source_app_output_name,
-                raw_dir=raw_dir,
-                materialized_parent=materialized_parent,
+                artifact_parent=artifact_parent,
             )
+            return artifact, _persisted_output(output, artifact.storage)
 
         if volume_path_mode == "copy":
-            return _materialize_volume_path_copy(
+            artifact = _materialize_volume_path_copy(
                 storage=output.storage,
                 output_name=output.name,
                 output_kind=output.kind,
@@ -296,9 +301,10 @@ def materialize_app_run_result(
                 volume_roots=volume_roots or {},
                 artifact_output_name=artifact_output_name,
                 source_app_output_name=source_app_output_name,
-                materialized_parent=materialized_parent,
+                artifact_parent=artifact_parent,
             )
-        return WorkflowArtifact(
+            return artifact, _persisted_output(output, artifact.storage)
+        artifact = WorkflowArtifact(
             artifact_id=artifact_id,
             producing_node_id=producing_node_id,
             kind=output.kind,
@@ -306,20 +312,35 @@ def materialize_app_run_result(
             source_app_output_name=source_app_output_name or output.name,
             metadata=output.metadata,
         )
+        return artifact, _persisted_output(output, artifact.storage)
 
     for output in result.outputs:
-        artifact = materialize_output(output)
+        artifact, persisted_output = materialize_output(output)
         _write_json(artifact_dir / f"{artifact.artifact_id}.json", artifact)
         artifacts.append(artifact)
+        persisted_outputs.append(persisted_output)
 
     for log_output in result.logs:
-        artifact = materialize_output(
+        artifact, persisted_log = materialize_output(
             log_output,
             artifact_output_name=f"logs-{log_output.name}",
             source_app_output_name=log_output.name,
-            raw_dir=attempt_dir / "logs" / "raw_outputs",
-            materialized_parent=attempt_dir / "logs",
+            artifact_parent=attempt_dir / "logs",
         )
         _write_json(artifact_dir / f"{artifact.artifact_id}.json", artifact)
         artifacts.append(artifact)
-    return artifacts
+        persisted_logs.append(persisted_log)
+    return MaterializedAppRunResult(
+        artifacts=artifacts,
+        result=result.model_copy(
+            update={
+                "outputs": persisted_outputs,
+                "logs": persisted_logs,
+            },
+        ),
+    )
+
+
+def _persisted_output(output: AppOutput, storage: VolumePath) -> AppOutput:
+    """Return an app output with durable workflow-volume storage."""
+    return output.model_copy(update={"storage": storage})

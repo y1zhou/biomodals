@@ -19,6 +19,7 @@ from biomodals.schema import (
     AppRunResult,
     ArtifactSelector,
     AttemptRecord,
+    InlineBytes,
     NodeExecutionPolicy,
     NodePlacement,
     NodeStatus,
@@ -47,6 +48,20 @@ LEDGER_TABLES = (
     "node_inputs",
     "node_outputs",
 )
+
+
+def _raise_for_inline_bytes_result(result: AppRunResult) -> None:
+    """Reject app result JSON that would inline bytes in SQLite."""
+    inline_outputs = [
+        output.name
+        for output in [*result.outputs, *result.logs]
+        if isinstance(output.storage, InlineBytes)
+    ]
+    if inline_outputs:
+        raise ValueError(
+            "AppRunResult must be materialized before ledger storage; "
+            f"InlineBytes outputs: {', '.join(sorted(inline_outputs))}"
+        )
 
 
 class WorkflowLedger:
@@ -447,7 +462,8 @@ class WorkflowLedger:
     def record_app_result(
         self, node_id: str, attempt_id: str, result: AppRunResult
     ) -> Path:
-        """Record the raw app result for one node attempt in SQLite."""
+        """Record a materialized app result for one node attempt in SQLite."""
+        _raise_for_inline_bytes_result(result)
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -486,6 +502,8 @@ class WorkflowLedger:
     ) -> AttemptRecord:
         """Record terminal status for one node attempt."""
         now = _now_json()
+        if result is not None:
+            _raise_for_inline_bytes_result(result)
         app_result_json = result.model_dump_json() if result is not None else None
         with self._transaction() as conn:
             conn.execute(

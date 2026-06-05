@@ -295,34 +295,7 @@ class WorkflowRuntime:
         attempt_dir: Path,
         result: AppRunResult,
     ) -> AppRunResult:
-        self.ledger.record_app_result(node_id, attempt_id, result)
-        if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
-            print(
-                f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
-                f"{self._node_error_message(result)}",
-                flush=True,
-            )
-            if result.logs:
-                log_artifacts = materialize_app_run_result(
-                    result=AppRunResult(status=result.status, logs=result.logs),
-                    workflow_volume_name=self.workflow_volume_name,
-                    attempt_dir=attempt_dir,
-                    artifact_dir=self.ledger.run_root / "artifacts",
-                    producing_node_id=node_id,
-                    volume_root=self.volume_root,
-                )
-                self.ledger.record_artifacts(log_artifacts)
-            self.ledger.record_attempt_completed(
-                node_id,
-                attempt_id,
-                NodeStatus.FAILED,
-                result=result,
-                error=self._node_error_message(result),
-            )
-            self._commit_volume()
-            return result
-
-        artifacts = materialize_app_run_result(
+        materialized = materialize_app_run_result(
             result=result,
             workflow_volume_name=self.workflow_volume_name,
             attempt_dir=attempt_dir,
@@ -330,6 +303,25 @@ class WorkflowRuntime:
             producing_node_id=node_id,
             volume_root=self.volume_root,
         )
+        persisted_result = materialized.result
+        if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
+            print(
+                f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
+                f"{self._node_error_message(result)}",
+                flush=True,
+            )
+            self.ledger.record_artifacts(materialized.artifacts)
+            self.ledger.record_attempt_completed(
+                node_id,
+                attempt_id,
+                NodeStatus.FAILED,
+                result=persisted_result,
+                error=self._node_error_message(result),
+            )
+            self._commit_volume()
+            return result
+
+        artifacts = materialized.artifacts
         self.ledger.record_artifacts(artifacts)
         self.ledger.mark_node_succeeded(
             node_id,
@@ -339,7 +331,7 @@ class WorkflowRuntime:
             node_id,
             attempt_id,
             NodeStatus.SUCCEEDED,
-            result=result,
+            result=persisted_result,
         )
         self._commit_volume()
         print(
@@ -541,12 +533,6 @@ class WorkflowRuntime:
         remote_call_metadata = {}
         if remote_call is not None:
             remote_call_metadata = self._remote_call_metadata(remote_call)
-            self.ledger.record_app_result(
-                str(remote_call["node_id"]),
-                str(remote_call["attempt_id"]),
-                result,
-            )
-            self._commit_volume()
         self.ledger.mark_remote_call_status(
             call_id,
             "succeeded",

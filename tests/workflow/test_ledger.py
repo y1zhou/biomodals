@@ -5,7 +5,7 @@
 import sqlite3
 from pathlib import Path
 
-import orjson
+import pytest
 
 from biomodals.schema import (
     AppOutput,
@@ -186,7 +186,7 @@ def test_node_is_not_complete_when_artifact_row_is_missing(tmp_path: Path) -> No
     assert not ledger.node_is_complete("design")
 
 
-def test_record_app_result_stores_pydantic_inline_bytes_json(tmp_path: Path) -> None:
+def test_record_app_result_rejects_unmaterialized_inline_bytes(tmp_path: Path) -> None:
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="ppiflow", run_id="run-1"))
     ledger.mark_node_running("node-1", "attempt-1")
@@ -202,19 +202,8 @@ def test_record_app_result_stores_pydantic_inline_bytes_json(tmp_path: Path) -> 
         ],
     )
 
-    ledger.record_app_result("node-1", "attempt-1", result)
-
-    with _connect(tmp_path) as conn:
-        row = conn.execute(
-            """
-            SELECT app_result_json
-            FROM attempts
-            WHERE node_id = 'node-1' AND attempt_id = 'attempt-1'
-            """
-        ).fetchone()
-
-    data = orjson.loads(row["app_result_json"])
-    assert isinstance(data["outputs"][0]["storage"]["data"], str)
+    with pytest.raises(ValueError, match="InlineBytes"):
+        ledger.record_app_result("node-1", "attempt-1", result)
 
 
 def test_next_attempt_id_uses_highest_numeric_suffix(tmp_path: Path) -> None:

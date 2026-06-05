@@ -823,7 +823,7 @@ def test_runtime_cleanup_cancels_in_flight_remote_function_call(
     assert results[0].status == AppRunStatus.FAILED
 
 
-def test_remote_success_records_app_result_before_succeeded_status(
+def test_remote_success_records_materialized_app_result(
     tmp_path: Path,
 ) -> None:
     workflow = Workflow("demo")
@@ -831,7 +831,20 @@ def test_remote_success_records_app_result_before_succeeded_status(
         DirectSubmitNode(
             call=FakeRemoteCall(
                 object_id="fc-success",
-                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+                result=AppRunResult(
+                    status=AppRunStatus.SUCCEEDED,
+                    outputs=[
+                        AppOutput(
+                            name="archive",
+                            kind=ArtifactKind.ARCHIVE,
+                            storage=InlineBytes(
+                                data=b"ok",
+                                filename="archive.tar.zst",
+                                media_type="application/zstd",
+                            ),
+                        )
+                    ],
+                ),
             )
         ),
         id="remote",
@@ -853,7 +866,16 @@ def test_remote_success_records_app_result_before_succeeded_status(
             WHERE node_id = 'remote' AND attempt_id = 'attempt-1'
             """
         ).fetchone()
-    assert row[0] == AppRunResult(status=AppRunStatus.SUCCEEDED).model_dump_json()
+    data = orjson.loads(row[0])
+    storage = data["outputs"][0]["storage"]
+    assert storage == {
+        "kind": "volume_path",
+        "volume_name": "Workflow-outputs",
+        "path": "demo/run-1/nodes/remote/attempts/attempt-1/remote-archive",
+        "media_type": "application/zstd",
+    }
+    assert "data" not in storage
+    assert (tmp_path / storage["path"] / "archive.tar.zst").read_bytes() == b"ok"
 
 
 def test_remote_success_reloads_volume_before_materializing_outputs(
@@ -963,7 +985,10 @@ def test_remote_recovery_processes_direct_submission_metadata(
                 AppOutput(
                     name="output",
                     kind=ArtifactKind.REPORT,
-                    storage=InlineBytes(data=b"ok", filename="output.txt"),
+                    storage=VolumePath(
+                        volume_name="Workflow-outputs",
+                        path="demo/run-1/nodes/remote/attempts/attempt-old/remote-output",
+                    ),
                     metadata={"selected": "B5"},
                 )
             ],

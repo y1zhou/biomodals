@@ -54,6 +54,10 @@ because it is expected to be refactored.
   modules. Avoid duplicating volume strings in workflow scripts.
 - Use `volume_path_from_mount_path(...)` to convert mounted app paths into
   `VolumePath` workflow storage references.
+- Materialize inline workflow outputs once under
+  `nodes/<node-id>/attempts/<attempt-id>/<artifact-id>/` and store materialized
+  `VolumePath` app-result JSON in the ledger; do not persist base64
+  `InlineBytes` payloads in SQLite.
 - User-facing workflow local entrypoints should accept `dry_run: bool = False`.
   When set, build the workflow, call `print_workflow_dag(workflow.validate())`,
   and return before constructing or submitting the orchestrator. The workflow

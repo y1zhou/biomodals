@@ -181,17 +181,22 @@ The first durable run layout is:
       attempts/
         <attempt-id>/
           logs/
-          raw_outputs/
-          materialized_outputs/
+            <log-artifact-id>/
+          <artifact-id>/
       cache/
   artifacts/
-    <artifact-id>/
+    <artifact-id>.json
   final/
 ```
 
 The workflow ledger is one SQLite database per run. The orchestrator is the only
 ledger writer. Remote nodes write deterministic output files and logs, then the
 orchestrator reloads the volume, reconciles those files, and updates the ledger.
+Inline byte outputs are materialized once into
+`nodes/<node-id>/attempts/<attempt-id>/<artifact-id>/`. Inline logs are
+materialized once under `nodes/<node-id>/attempts/<attempt-id>/logs/<artifact-id>/`.
+Store only materialized `VolumePath` app-result JSON in `attempts.app_result_json`;
+do not store base64 `InlineBytes` payloads in SQLite.
 
 Ledger updates mutate SQLite rows directly. Do not preserve obsolete
 Pydantic-status update patterns such as `model_copy(update=...)` for ledger

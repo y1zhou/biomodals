@@ -24,6 +24,9 @@ skill:
 - Keep shared schemas pure Pydantic. For inline bytes, use Pydantic
   `ser_json_bytes` / `val_json_bytes` config for JSON byte handling and enforce
   text-vs-zstd archive policy in workflow runtime materialization code.
+- Materialize inline workflow outputs once under the node attempt directory and
+  store materialized `VolumePath` app-result JSON in the ledger, not base64
+  `InlineBytes` payloads.
 - Every runtime-managed `REMOTE` node must submit its own direct
   `RemoteNodeSubmission`; the orchestrator does not provide a generic per-node
   execution wrapper. `process_remote_result(...)` is part of the node contract

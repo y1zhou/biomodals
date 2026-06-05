@@ -47,7 +47,16 @@ def _write_json(path: Path, payload: object) -> None:
             tmp_path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
         else:
             tmp_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
-        tmp_path.replace(path)
+
+        try:
+            # Attempt an efficient, atomic move on the same filesystem
+            tmp_path.replace(path)
+        except OSError as e:
+            # Check for the cross-device link error code (Errno 18)
+            if e.errno == 18:
+                shutil.move(tmp_path, path)
+            else:
+                raise
 
 
 def _artifact_files(root: Path) -> list[ArtifactFile]:

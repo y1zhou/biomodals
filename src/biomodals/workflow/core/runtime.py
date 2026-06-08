@@ -90,6 +90,7 @@ class WorkflowRuntime:
         self.executed_waves: list[list[str]] = []
         self._active_remote_calls: dict[str, RemoteFunctionCall] = {}
         self._active_remote_calls_lock = RLock()
+        self._workflow_volume_access_lock = RLock()
 
     def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
         """Run the workflow until every node succeeds or no progress is possible."""
@@ -242,8 +243,7 @@ class WorkflowRuntime:
             and self.ledger.node_has_state(node_id)
             and not self.ledger.node_is_complete(node_id)
         ):
-            self.ledger.reset_node(node_id)
-            self._commit_volume()
+            self._reset_node_for_rerun(node_id)
         attempt_id = self._next_attempt_id(node_id)
         inputs = self._resolve_inputs(spec.inputs)
         input_artifact_ids = [
@@ -251,24 +251,25 @@ class WorkflowRuntime:
             for artifacts in inputs.values()
             for artifact in artifacts
         ]
-        self.ledger.mark_node_running(
-            node_id,
-            attempt_id,
-            input_artifact_ids=input_artifact_ids,
-            execution_policy=spec.node.execution_policy,
-            placement=spec.node.placement,
-        )
-        print(
-            f"[workflow] Node started: {node_id} attempt={attempt_id} "
-            f"placement={spec.node.placement.value}",
-            flush=True,
-        )
-        self.ledger.record_node_inputs(node_id, inputs)
-        attempt = self.ledger.record_attempt_started(node_id, attempt_id)
-        attempt_dir = self._attempt_dir(attempt)
-        cache_dir = self.ledger.run_root / "nodes" / node_id / "cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        self._commit_volume()
+        with self._workflow_volume_access_lock:
+            self.ledger.mark_node_running(
+                node_id,
+                attempt_id,
+                input_artifact_ids=input_artifact_ids,
+                execution_policy=spec.node.execution_policy,
+                placement=spec.node.placement,
+            )
+            print(
+                f"[workflow] Node started: {node_id} attempt={attempt_id} "
+                f"placement={spec.node.placement.value}",
+                flush=True,
+            )
+            self.ledger.record_node_inputs(node_id, inputs)
+            attempt = self.ledger.record_attempt_started(node_id, attempt_id)
+            attempt_dir = self._attempt_dir(attempt)
+            cache_dir = self.ledger.run_root / "nodes" / node_id / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self._commit_volume()
 
         result = self._dispatch_node(
             spec.node,
@@ -287,6 +288,11 @@ class WorkflowRuntime:
             result=result,
         )
 
+    def _reset_node_for_rerun(self, node_id: str) -> None:
+        with self._workflow_volume_access_lock:
+            self.ledger.reset_node(node_id)
+            self._commit_volume()
+
     def _finalize_node_result(
         self,
         *,
@@ -295,45 +301,49 @@ class WorkflowRuntime:
         attempt_dir: Path,
         result: AppRunResult,
     ) -> AppRunResult:
-        materialized = materialize_app_run_result(
-            result=result,
-            workflow_volume_name=self.workflow_volume_name,
-            attempt_dir=attempt_dir,
-            artifact_dir=self.ledger.run_root / "artifacts",
-            producing_node_id=node_id,
-            volume_root=self.volume_root,
-        )
-        persisted_result = materialized.result
-        if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
-            print(
-                f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
-                f"{self._node_error_message(result)}",
-                flush=True,
+        with self._workflow_volume_access_lock:
+            # Materialization writes files under the mounted workflow volume. Keep
+            # it serialized with reload/commit so scheduler workers cannot observe
+            # a partially synchronized volume view.
+            materialized = materialize_app_run_result(
+                result=result,
+                workflow_volume_name=self.workflow_volume_name,
+                attempt_dir=attempt_dir,
+                artifact_dir=self.ledger.run_root / "artifacts",
+                producing_node_id=node_id,
+                volume_root=self.volume_root,
             )
-            self.ledger.record_artifacts(materialized.artifacts)
+            persisted_result = materialized.result
+            if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
+                print(
+                    f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
+                    f"{self._node_error_message(result)}",
+                    flush=True,
+                )
+                self.ledger.record_artifacts(materialized.artifacts)
+                self.ledger.record_attempt_completed(
+                    node_id,
+                    attempt_id,
+                    NodeStatus.FAILED,
+                    result=persisted_result,
+                    error=self._node_error_message(result),
+                )
+                self._commit_volume()
+                return result
+
+            artifacts = materialized.artifacts
+            self.ledger.record_artifacts(artifacts)
+            self.ledger.mark_node_succeeded(
+                node_id,
+                [artifact.artifact_id for artifact in artifacts],
+            )
             self.ledger.record_attempt_completed(
                 node_id,
                 attempt_id,
-                NodeStatus.FAILED,
+                NodeStatus.SUCCEEDED,
                 result=persisted_result,
-                error=self._node_error_message(result),
             )
             self._commit_volume()
-            return result
-
-        artifacts = materialized.artifacts
-        self.ledger.record_artifacts(artifacts)
-        self.ledger.mark_node_succeeded(
-            node_id,
-            [artifact.artifact_id for artifact in artifacts],
-        )
-        self.ledger.record_attempt_completed(
-            node_id,
-            attempt_id,
-            NodeStatus.SUCCEEDED,
-            result=persisted_result,
-        )
-        self._commit_volume()
         print(
             f"[workflow] Node succeeded: {node_id} attempt={attempt_id} "
             f"artifacts={len(artifacts)}",
@@ -356,7 +366,8 @@ class WorkflowRuntime:
     ) -> AppRunResult:
         if node.placement == NodePlacement.REMOTE:
             return self._run_remote_node(node, context)
-        return node.run(context)
+        with self._workflow_volume_access_lock:
+            return node.run(context)
 
     def _run_remote_node(
         self, node: WorkflowNode, context: NodeRunContext
@@ -367,16 +378,17 @@ class WorkflowRuntime:
         with self._active_remote_calls_lock:
             self._active_remote_calls[call_id] = submission.function_call
         try:
-            self.ledger.record_remote_call(
-                call_id=call_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-                function_name=submission.function_name
-                or self._remote_function_name(node),
-                call_kind="node",
-                metadata=submission.metadata,
-            )
-            self._commit_volume()
+            with self._workflow_volume_access_lock:
+                self.ledger.record_remote_call(
+                    call_id=call_id,
+                    node_id=context.node_id,
+                    attempt_id=context.attempt_id,
+                    function_name=submission.function_name
+                    or self._remote_function_name(node),
+                    call_kind="node",
+                    metadata=submission.metadata,
+                )
+                self._commit_volume()
             raw_result = self._collect_remote_call(call_id, submission.function_call)
             self._reload_volume()
             try:
@@ -672,13 +684,15 @@ class WorkflowRuntime:
 
     def _commit_volume(self) -> None:
         if self.workflow_volume is not None:
-            with self.ledger.closed_for_volume_sync():
-                self.workflow_volume.commit()
+            with self._workflow_volume_access_lock:
+                with self.ledger.closed_for_volume_sync():
+                    self.workflow_volume.commit()
 
     def _reload_volume(self) -> None:
         if self.workflow_volume is not None:
-            with self.ledger.closed_for_volume_sync():
-                self.workflow_volume.reload()
+            with self._workflow_volume_access_lock:
+                with self.ledger.closed_for_volume_sync():
+                    self.workflow_volume.reload()
 
     def close(self) -> None:
         """Close durable local resources owned by the runtime."""

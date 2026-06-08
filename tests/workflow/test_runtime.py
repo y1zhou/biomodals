@@ -166,6 +166,21 @@ class FakeVolume:
         self.reload_count += 1
 
 
+class SnapshotVolume(FakeVolume):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.committed_paths: set[str] = set()
+
+    def commit(self) -> None:
+        super().commit()
+        self.committed_paths = {
+            path.relative_to(self.root).as_posix()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+
+
 class HashSettings(BaseModel):
     visible: str
     hidden: str = Field(repr=False)
@@ -275,6 +290,28 @@ def test_force_replaces_existing_run_ledger_and_reruns_completed_nodes(
     assert not stale_file.exists()
 
 
+def test_force_reset_commits_deleted_run_before_recreate(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = SnapshotVolume(tmp_path)
+    workflow.add_node(FakeNode(), id="one")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+
+    assert runtime.run(run_id="run-1").status == AppRunStatus.SUCCEEDED
+    stale_path = tmp_path / "demo" / "run-1" / "nodes" / "stale.txt"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text("stale\n", encoding="utf-8")
+    runtime._commit_volume()
+    assert "demo/run-1/nodes/stale.txt" in volume.committed_paths
+
+    assert runtime.run(run_id="run-1", force=True).status == AppRunStatus.SUCCEEDED
+    assert "demo/run-1/nodes/stale.txt" not in volume.committed_paths
+
+
 def test_independent_ready_nodes_run_in_same_scheduler_wave(
     tmp_path: Path,
 ) -> None:
@@ -314,20 +351,36 @@ def test_independent_ready_nodes_run_in_same_scheduler_wave(
     assert runtime.executed_waves == [["score-a", "score-b"]]
 
 
-def test_independent_ready_nodes_execute_concurrently(tmp_path: Path) -> None:
+def test_independent_remote_nodes_execute_concurrently(tmp_path: Path) -> None:
     barrier = Barrier(2, timeout=0.5)
     workflow = Workflow("demo")
 
-    class BarrierNode(WorkflowNativeNode):
-        def run(self, context):
+    class BarrierRemoteCall(FakeRemoteCall):
+        def get(self, timeout=None):
             try:
                 barrier.wait()
             except BrokenBarrierError:
                 return AppRunResult(status=AppRunStatus.FAILED)
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+            return super().get(timeout=timeout)
 
-    workflow.add_node(BarrierNode(), id="one")
-    workflow.add_node(BarrierNode(), id="two")
+    workflow.add_node(
+        DirectSubmitNode(
+            call=BarrierRemoteCall(
+                object_id="fc-one",
+                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
+        ),
+        id="one",
+    )
+    workflow.add_node(
+        DirectSubmitNode(
+            call=BarrierRemoteCall(
+                object_id="fc-two",
+                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
+        ),
+        id="two",
+    )
 
     runtime = WorkflowRuntime(
         workflow=workflow,
@@ -602,6 +655,89 @@ def test_runtime_commits_node_start_before_node_execution(tmp_path: Path) -> Non
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert node.commit_count_at_run >= 3
+
+
+def test_downstream_node_sees_committed_inline_artifact(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = SnapshotVolume(tmp_path)
+    upstream = workflow.add_node(
+        FakeNode(
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="report",
+                        kind=ArtifactKind.REPORT,
+                        storage=InlineBytes(data=b"ok\n", filename="report.txt"),
+                    )
+                ],
+            )
+        ),
+        id="upstream",
+    )
+
+    class CommittedReaderNode(WorkflowNativeNode):
+        def run(self, context):
+            artifacts = context.inputs["report"]
+            storage_path = artifacts[0].storage.path
+            assert storage_path in volume.committed_paths
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    workflow.add_node(
+        CommittedReaderNode(),
+        id="downstream",
+        inputs={"report": upstream.outputs(kind=ArtifactKind.REPORT)},
+    )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+
+
+def test_failed_node_logs_are_committed_before_run_returns(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = SnapshotVolume(tmp_path)
+    workflow.add_node(
+        FakeNode(
+            result=AppRunResult(
+                status=AppRunStatus.FAILED,
+                logs=[
+                    AppOutput(
+                        name="stderr",
+                        kind=ArtifactKind.LOGS,
+                        storage=InlineBytes(
+                            data=b"missing input\n",
+                            filename="stderr.log",
+                        ),
+                    )
+                ],
+                warnings=["remote file not found"],
+            )
+        ),
+        id="failed",
+    )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.FAILED
+    assert (
+        "demo/run-1/nodes/failed/attempts/attempt-1/logs/failed-logs-stderr/stderr.log"
+    ) in volume.committed_paths
+    assert "demo/run-1/artifacts/failed-logs-stderr.json" in volume.committed_paths
 
 
 def test_remote_placement_requires_direct_submission(tmp_path: Path) -> None:
@@ -903,6 +1039,61 @@ def test_remote_success_reloads_volume_before_materializing_outputs(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert volume.reload_count >= 2
+
+
+def test_remote_reload_waits_for_orchestrator_node_volume_access(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    local_running = Event()
+    local_can_finish = Event()
+    local_finished = Event()
+    reload_happened_while_local_running = False
+
+    class GuardedVolume(FakeVolume):
+        def reload(self) -> None:
+            nonlocal reload_happened_while_local_running
+            if local_running.is_set() and not local_finished.is_set():
+                reload_happened_while_local_running = True
+                local_can_finish.set()
+            super().reload()
+
+    class SlowLocalNode(WorkflowNativeNode):
+        def run(self, context):
+            local_running.set()
+            local_can_finish.wait(timeout=1)
+            local_finished.set()
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    class FinishingRemoteCall(FakeRemoteCall):
+        def get(self, timeout=None):
+            local_running.wait(timeout=1)
+            return super().get(timeout=timeout)
+
+    volume = GuardedVolume()
+    workflow.add_node(SlowLocalNode(), id="local")
+    workflow.add_node(
+        DirectSubmitNode(
+            call=FinishingRemoteCall(
+                object_id="fc-remote",
+                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
+        ),
+        id="remote",
+    )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+        max_ready_workers=2,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert reload_happened_while_local_running is False
 
 
 def test_remote_recovery_reattaches_existing_call_before_rerun(

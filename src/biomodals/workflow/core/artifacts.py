@@ -169,6 +169,124 @@ def _resolve_volume_child(root: Path, path: str) -> Path:
     return resolved_path
 
 
+def _resolve_artifact_file(root: Path, path: str) -> Path:
+    relative = PurePosixPath(path)
+    if path == "" or path == ".":
+        raise ValueError("ArtifactFile.path must be a non-empty relative path")
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError("ArtifactFile.path must be relative and must not traverse")
+    if "\\" in path:
+        raise ValueError("ArtifactFile.path must use POSIX separators")
+
+    resolved_root = root.resolve()
+    raw_path = resolved_root / Path(*relative.parts)
+    current = resolved_root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("ArtifactFile.path must not contain symlinks")
+
+    resolved_path = raw_path.resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("ArtifactFile.path escapes artifact root") from exc
+    return resolved_path
+
+
+def workflow_artifact_availability_errors(
+    artifact: WorkflowArtifact,
+    *,
+    workflow_volume_name: str,
+    volume_root: Path,
+) -> list[str]:
+    """Return missing-file errors for workflow-volume artifacts.
+
+    Artifacts stored in app-owned volumes are intentionally treated as unknown:
+    the workflow runtime cannot validate volumes it has not mounted.
+    """
+    if artifact.storage.volume_name != workflow_volume_name:
+        return []
+
+    try:
+        artifact_path = _resolve_volume_child(volume_root, artifact.storage.path)
+    except ValueError as exc:
+        return [
+            f"{artifact.artifact_id}: invalid workflow artifact path "
+            f"{artifact.storage.path!r}: {exc}"
+        ]
+
+    if not artifact_path.exists():
+        return [
+            f"{artifact.artifact_id}: missing workflow artifact path "
+            f"{artifact.storage.path}"
+        ]
+    if not artifact.files:
+        return []
+
+    if artifact_path.is_file():
+        if len(artifact.files) != 1 or artifact.files[0].path != artifact_path.name:
+            return [
+                f"{artifact.artifact_id}: artifact storage path is a file but "
+                "manifest file entries do not match it"
+            ]
+        return _artifact_file_metadata_errors(
+            artifact_id=artifact.artifact_id,
+            file_path=artifact_path,
+            file=artifact.files[0],
+        )
+
+    if not artifact_path.is_dir():
+        return [
+            f"{artifact.artifact_id}: workflow artifact path is not a file or "
+            f"directory: {artifact.storage.path}"
+        ]
+
+    errors: list[str] = []
+    for file in artifact.files:
+        try:
+            file_path = _resolve_artifact_file(artifact_path, file.path)
+        except ValueError as exc:
+            errors.append(
+                f"{artifact.artifact_id}: invalid workflow artifact file "
+                f"{file.path!r}: {exc}"
+            )
+            continue
+        if not file_path.is_file():
+            errors.append(
+                f"{artifact.artifact_id}: missing workflow artifact file "
+                f"{artifact.storage.path}/{file.path}"
+            )
+            continue
+        errors.extend(
+            _artifact_file_metadata_errors(
+                artifact_id=artifact.artifact_id,
+                file_path=file_path,
+                file=file,
+            )
+        )
+    return errors
+
+
+def _artifact_file_metadata_errors(
+    *,
+    artifact_id: str,
+    file_path: Path,
+    file: ArtifactFile,
+) -> list[str]:
+    if file.size_bytes is None:
+        return []
+    actual_size = file_path.stat().st_size
+    if actual_size == file.size_bytes:
+        return []
+    return [
+        f"{artifact_id}: workflow artifact file {file.path} has size "
+        f"{actual_size}, expected {file.size_bytes}"
+    ]
+
+
 def _copy_volume_path_tree(
     *,
     source_path: Path,
@@ -296,6 +414,7 @@ def materialize_app_run_result(
                 source_app_output_name=source_app_output_name,
                 artifact_parent=artifact_parent,
             )
+            raise_for_unavailable_workflow_artifact(artifact)
             return artifact, _persisted_output(output, artifact.storage)
 
         if volume_path_mode == "copy":
@@ -313,6 +432,7 @@ def materialize_app_run_result(
                 source_app_output_name=source_app_output_name,
                 artifact_parent=artifact_parent,
             )
+            raise_for_unavailable_workflow_artifact(artifact)
             return artifact, _persisted_output(output, artifact.storage)
         artifact = WorkflowArtifact(
             artifact_id=artifact_id,
@@ -322,7 +442,23 @@ def materialize_app_run_result(
             source_app_output_name=source_app_output_name or output.name,
             metadata=output.metadata,
         )
+        raise_for_unavailable_workflow_artifact(artifact)
         return artifact, _persisted_output(output, artifact.storage)
+
+    def raise_for_unavailable_workflow_artifact(artifact: WorkflowArtifact) -> None:
+        if volume_root is None:
+            return
+        errors = workflow_artifact_availability_errors(
+            artifact,
+            workflow_volume_name=workflow_volume_name,
+            volume_root=volume_root,
+        )
+        if not errors:
+            return
+        raise FileNotFoundError(
+            "Workflow artifact is unavailable:\n"
+            + "\n".join(f"- {error}" for error in errors)
+        )
 
     for output in result.outputs:
         artifact, persisted_output = materialize_output(output)

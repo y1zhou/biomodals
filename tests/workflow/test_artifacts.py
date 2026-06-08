@@ -10,11 +10,16 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     VolumePath,
+    WorkflowArtifact,
 )
-from biomodals.workflow.core.artifacts import materialize_app_run_result
+from biomodals.workflow.core.artifacts import (
+    materialize_app_run_result,
+    workflow_artifact_availability_errors,
+)
 
 
 def test_materialize_inline_bytes_writes_one_attempt_artifact_copy(
@@ -64,6 +69,111 @@ def test_materialize_inline_bytes_writes_one_attempt_artifact_copy(
     assert materialized.result.outputs[0].storage == artifacts[0].storage
     assert artifacts[0].files[0].path == "summary.txt"
     assert (tmp_path / "artifacts" / "summary-summary.json").exists()
+
+
+def test_workflow_artifact_availability_accepts_existing_workflow_file(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "run" / "summary.txt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("ok\n", encoding="utf-8")
+    artifact = WorkflowArtifact(
+        artifact_id="summary-report",
+        producing_node_id="summary",
+        kind=ArtifactKind.REPORT,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/summary.txt",
+        ),
+        files=[
+            ArtifactFile(
+                path="summary.txt",
+                size_bytes=output_path.stat().st_size,
+            )
+        ],
+    )
+
+    assert (
+        workflow_artifact_availability_errors(
+            artifact,
+            workflow_volume_name="Workflow-outputs",
+            volume_root=tmp_path,
+        )
+        == []
+    )
+
+
+def test_workflow_artifact_availability_reports_missing_workflow_file(
+    tmp_path: Path,
+) -> None:
+    artifact = WorkflowArtifact(
+        artifact_id="summary-report",
+        producing_node_id="summary",
+        kind=ArtifactKind.REPORT,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/summary.txt",
+        ),
+    )
+
+    errors = workflow_artifact_availability_errors(
+        artifact,
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "summary-report" in errors[0]
+    assert "run/summary.txt" in errors[0]
+
+
+def test_workflow_artifact_availability_reports_missing_manifest_child(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "run" / "outputs"
+    output_dir.mkdir(parents=True)
+    artifact = WorkflowArtifact(
+        artifact_id="design-structures",
+        producing_node_id="design",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/outputs",
+        ),
+        files=[ArtifactFile(path="model.pdb")],
+    )
+
+    errors = workflow_artifact_availability_errors(
+        artifact,
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "model.pdb" in errors[0]
+
+
+def test_workflow_artifact_availability_skips_unmounted_external_volumes(
+    tmp_path: Path,
+) -> None:
+    artifact = WorkflowArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    assert (
+        workflow_artifact_availability_errors(
+            artifact,
+            workflow_volume_name="Workflow-outputs",
+            volume_root=tmp_path,
+        )
+        == []
+    )
 
 
 def test_materialized_inline_artifact_path_is_volume_relative(
@@ -196,6 +306,34 @@ def test_materialize_volume_path_references_existing_remote_output(
     )
     assert materialized.result.outputs[0].storage == materialized.artifacts[0].storage
     assert (tmp_path / "artifacts" / "score-scores.json").exists()
+
+
+def test_materialize_volume_path_rejects_missing_workflow_volume_reference(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1/summary.md",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(FileNotFoundError, match="summary-summary"):
+        materialize_app_run_result(
+            result=result,
+            workflow_volume_name="Workflow-outputs",
+            attempt_dir=tmp_path / "attempt",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="summary",
+            volume_root=tmp_path,
+        )
 
 
 def test_materialize_volume_path_can_copy_from_mounted_volume(

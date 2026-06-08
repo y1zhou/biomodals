@@ -28,7 +28,10 @@ from biomodals.schema import (
     WorkflowArtifact,
     WorkflowRun,
 )
-from biomodals.workflow.core.artifacts import materialize_app_run_result
+from biomodals.workflow.core.artifacts import (
+    materialize_app_run_result,
+    workflow_artifact_availability_errors,
+)
 from biomodals.workflow.core.builder import Workflow, WorkflowDefinition
 from biomodals.workflow.core.ledger import WorkflowLedger
 from biomodals.workflow.core.nodes import (
@@ -199,12 +202,10 @@ class WorkflowRuntime:
                     )
 
     def _completed_nodes(self, node_ids) -> set[str]:
-        return {
-            node_id for node_id in node_ids if self.ledger.node_is_complete(node_id)
-        }
+        return {node_id for node_id in node_ids if self._node_is_complete(node_id)}
 
     def _node_can_make_progress(self, node_id: str) -> bool:
-        if self.ledger.node_is_complete(node_id):
+        if self._node_is_complete(node_id):
             return False
         if not self.ledger.node_is_running(node_id):
             return True
@@ -250,13 +251,20 @@ class WorkflowRuntime:
     def _run_node(self, node_id: str) -> AppRunResult:
         definition = self.workflow.validate()
         spec = definition.nodes[node_id]
+        if (
+            spec.node.execution_policy == NodeExecutionPolicy.RERUN
+            and self.ledger.node_has_state(node_id)
+            and not self.ledger.node_is_running(node_id)
+            and not self._node_is_complete(node_id)
+        ):
+            self._reset_node_for_rerun(node_id)
         recovered = self._recover_remote_node_if_possible(node_id, spec.node)
         if recovered is not None:
             return recovered
         if (
             spec.node.execution_policy == NodeExecutionPolicy.RERUN
             and self.ledger.node_has_state(node_id)
-            and not self.ledger.node_is_complete(node_id)
+            and not self._node_is_complete(node_id)
         ):
             self._reset_node_for_rerun(node_id)
         attempt_id = self._next_attempt_id(node_id)
@@ -371,10 +379,58 @@ class WorkflowRuntime:
         selectors: dict[str, ArtifactSelector],
     ) -> dict[str, list[WorkflowArtifact]]:
         self._reload_volume()
-        return {
+        inputs = {
             input_name: self.ledger.select_artifacts(selector)
             for input_name, selector in selectors.items()
         }
+        errors = [
+            error
+            for artifacts in inputs.values()
+            for artifact in artifacts
+            for error in self._artifact_availability_errors(artifact)
+        ]
+        if errors:
+            raise FileNotFoundError(
+                "Workflow input artifacts are unavailable:\n"
+                + "\n".join(f"- {error}" for error in errors)
+            )
+        return inputs
+
+    def _node_is_complete(self, node_id: str) -> bool:
+        if not self.ledger.node_is_complete(node_id):
+            return False
+        errors = [
+            error
+            for artifact in self.ledger.load_node_output_artifacts(node_id)
+            for error in self._artifact_availability_errors(artifact)
+        ]
+        if not errors:
+            return True
+        _workflow_print(
+            "[workflow] Node output artifacts unavailable: "
+            f"{node_id}: {'; '.join(errors)}",
+            style="yellow",
+        )
+        return False
+
+    def _artifact_availability_errors(self, artifact: WorkflowArtifact) -> list[str]:
+        errors: list[str] = []
+        manifest_path = (
+            self.ledger.run_root / "artifacts" / f"{artifact.artifact_id}.json"
+        )
+        if not manifest_path.is_file():
+            errors.append(
+                f"{artifact.artifact_id}: missing workflow artifact manifest "
+                f"artifacts/{artifact.artifact_id}.json"
+            )
+        errors.extend(
+            workflow_artifact_availability_errors(
+                artifact,
+                workflow_volume_name=self.workflow_volume_name,
+                volume_root=self.volume_root,
+            )
+        )
+        return errors
 
     def _dispatch_node(
         self, node: WorkflowNode, context: NodeRunContext

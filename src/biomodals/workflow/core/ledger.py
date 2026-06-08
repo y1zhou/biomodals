@@ -763,6 +763,21 @@ class WorkflowLedger:
             raise FileNotFoundError(f"Workflow artifact not found: {artifact_id}")
         return self._artifact_from_row(row)
 
+    def load_node_output_artifacts(self, node_id: str) -> list[WorkflowArtifact]:
+        """Load artifacts currently recorded as outputs for one node."""
+        return [
+            self.load_artifact(row["artifact_id"])
+            for row in self._fetch_all(
+                """
+                SELECT artifact_id
+                FROM node_outputs
+                WHERE node_id = ?
+                ORDER BY artifact_id
+                """,
+                (node_id,),
+            )
+        ]
+
     def select_artifacts(self, selector: ArtifactSelector) -> list[WorkflowArtifact]:
         """Return artifacts matching one upstream selector."""
         return [

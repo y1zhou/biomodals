@@ -9,6 +9,7 @@ import modal
 import pytest
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
@@ -880,7 +881,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert calls["spawn"]["run_id"] == "shortmd-run"
     assert calls["spawn"]["force"] is False
     assert calls["spawn"]["max_ready_workers"] == 3
-    stdout = capsys.readouterr().out
+    stdout = strip_ansi(capsys.readouterr().out)
     assert "Submitting ShortMD workflow 'shortmd-run'" in stdout
     assert "1 input PDB(s)" in stdout
     assert "1 replicate(s)" in stdout

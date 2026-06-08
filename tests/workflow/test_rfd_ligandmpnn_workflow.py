@@ -12,6 +12,7 @@ import modal
 import pytest
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
+from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -664,7 +665,7 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert calls["spawn"]["run_id"] == "demo"
     assert calls["spawn"]["force"] is False
     assert calls["spawn"]["max_ready_workers"] == 3
-    stdout = capsys.readouterr().out
+    stdout = strip_ansi(capsys.readouterr().out)
     assert "Submitting RFDLigandMPNNWorkflow 'demo'" in stdout
     assert "1 RFdiffusion trajector" in stdout
 

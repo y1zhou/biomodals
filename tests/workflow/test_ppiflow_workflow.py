@@ -9,6 +9,7 @@ from typing import cast
 import modal
 
 from biomodals.app.design import ppiflow_app
+from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -197,7 +198,7 @@ PPIFlowStep:
         dry_run=True,
     )
 
-    stdout = capsys.readouterr().out
+    stdout = strip_ansi(capsys.readouterr().out)
     assert "[workflow] DAG graph: node_id [placement; class] <- dependency" in stdout
     assert (
         "[workflow]   stage1-ppiflow-design [remote; PPIFlowWorkflowNode] <- -"

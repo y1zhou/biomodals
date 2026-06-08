@@ -13,6 +13,7 @@ import orjson
 import pytest
 from pydantic import BaseModel, Field
 
+from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -474,16 +475,20 @@ def test_runtime_logs_dag_and_node_state_transitions(
 
     assert result.status == AppRunStatus.SUCCEEDED
     stdout = capsys.readouterr().out
-    assert "[workflow] Starting workflow 'demo' run 'run-1'" in stdout
-    assert "[workflow] DAG graph: node_id [placement; class] <- dependency" in stdout
-    assert "[workflow]   prepare [orchestrator; FakeNode] <- -" in stdout
-    assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in stdout
-    assert "tests.workflow.test_runtime.FakeNode" not in stdout
-    assert "<- prepare" in stdout
-    assert "[workflow] Node started: prepare attempt=attempt-1" in stdout
-    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in stdout
-    assert "[workflow] Node started: produce attempt=attempt-1" in stdout
-    assert "[workflow] Node succeeded: produce attempt=attempt-1" in stdout
+    assert "\x1b[" not in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "[workflow] Starting workflow 'demo' run 'run-1'" in plain_stdout
+    assert (
+        "[workflow] DAG graph: node_id [placement; class] <- dependency" in plain_stdout
+    )
+    assert "[workflow]   prepare [orchestrator; FakeNode] <- -" in plain_stdout
+    assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in plain_stdout
+    assert "tests.workflow.test_runtime.FakeNode" not in plain_stdout
+    assert "<- prepare" in plain_stdout
+    assert "[workflow] Node started: prepare attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node started: produce attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node succeeded: produce attempt=attempt-1" in plain_stdout
 
 
 def test_runtime_logs_failed_node_transition(
@@ -506,17 +511,18 @@ def test_runtime_logs_failed_node_transition(
 
     assert result.status == AppRunStatus.FAILED
     stdout = capsys.readouterr().out
-    assert "[workflow] Node started: fail attempt=attempt-1" in stdout
-    assert "[workflow] Node failed: fail attempt=attempt-1" in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "[workflow] Node started: fail attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node failed: fail attempt=attempt-1" in plain_stdout
 
 
-def test_runtime_colorizes_node_state_transitions_by_default(
+def test_runtime_colorizes_node_state_transitions_when_forced(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.delenv("BIOMODALS_WORKFLOW_COLOR", raising=False)
+    monkeypatch.setenv("BIOMODALS_WORKFLOW_COLOR", "1")
     workflow = Workflow("demo")
     first = workflow.add_node(FakeNode(), id="prepare")
     workflow.add_node(FakeNode(), id="produce", depends_on=[first])
@@ -531,10 +537,13 @@ def test_runtime_colorizes_node_state_transitions_by_default(
 
     assert result.status == AppRunStatus.SUCCEEDED
     stdout = capsys.readouterr().out
-    assert "\x1b[34m[workflow] Node started: prepare" in stdout
-    assert "\x1b[32m[workflow] Node succeeded: prepare" in stdout
-    assert "\x1b[1;34m[workflow] Starting workflow 'demo'" in stdout
-    assert "\x1b[35m[workflow]   produce [orchestrator; FakeNode] <- prepare" in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "\x1b[" in stdout
+    assert "[workflow] Node started: prepare" in plain_stdout
+    assert "[workflow] Node succeeded: prepare" in plain_stdout
+    assert "[workflow] Starting workflow 'demo'" in plain_stdout
+    assert "[workflow]   prepare [orchestrator; FakeNode] <- -" in plain_stdout
+    assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in plain_stdout
 
 
 def test_runtime_color_can_be_disabled_with_no_color(
@@ -557,8 +566,9 @@ def test_runtime_color_can_be_disabled_with_no_color(
     assert result.status == AppRunStatus.SUCCEEDED
     stdout = capsys.readouterr().out
     assert "\x1b[" not in stdout
-    assert "[workflow] Node started: prepare attempt=attempt-1" in stdout
-    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "[workflow] Node started: prepare attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in plain_stdout
 
 
 def test_runtime_dag_hash_uses_stable_json_for_dataclass_node_config() -> None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import traceback
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +15,7 @@ from typing import Any, Protocol
 import orjson
 from pydantic import BaseModel
 
+from biomodals.helper.styling import print_rich, styled_text
 from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
@@ -40,60 +40,32 @@ from biomodals.workflow.core.nodes import (
 
 FunctionCallResolver = Callable[[str], RemoteFunctionCall]
 
-_ANSI_RESET = "\033[0m"
-_ANSI_BOLD = "1"
-_ANSI_DIM = "2"
-_ANSI_RED = "31"
-_ANSI_GREEN = "32"
-_ANSI_BLUE = "34"
-_ANSI_MAGENTA = "35"
-_ANSI_CYAN = "36"
-_ANSI_YELLOW = "33"
 
-
-def _workflow_color_enabled() -> bool:
-    if "NO_COLOR" in os.environ:
-        return False
-    color_setting = os.environ.get("BIOMODALS_WORKFLOW_COLOR", "").strip().lower()
-    if color_setting in {"0", "false", "no", "off", "never"}:
-        return False
-    return True
-
-
-def _workflow_style(text: str, *codes: str) -> str:
-    if not codes or not _workflow_color_enabled():
-        return text
-    return f"\033[{';'.join(codes)}m{text}{_ANSI_RESET}"
-
-
-def _workflow_print(text: str, *codes: str) -> None:
-    print(_workflow_style(text, *codes), flush=True)
+def _workflow_print(renderable: object, *, style: str | None = None) -> None:
+    print_rich(renderable, style=style, color_env_var="BIOMODALS_WORKFLOW_COLOR")
 
 
 def print_workflow_dag(definition: WorkflowDefinition) -> None:
     """Print a compact workflow DAG graph."""
     _workflow_print(
         "[workflow] DAG graph: node_id [placement; class] <- dependency",
-        _ANSI_BOLD,
-        _ANSI_BLUE,
+        style="bold blue",
     )
     for node_id, spec in definition.nodes.items():
         dependencies = sorted(definition.dependencies[node_id])
         dependency_text = ", ".join(dependencies) if dependencies else "-"
         node_class = spec.node.__class__.__qualname__
-        line_style = (
-            (_ANSI_MAGENTA,)
-            if dependencies
-            else (
-                (_ANSI_CYAN,)
-                if spec.node.placement == NodePlacement.REMOTE
-                else (_ANSI_DIM,)
-            )
-        )
         _workflow_print(
-            f"[workflow]   {node_id} "
-            f"[{spec.node.placement.value}; {node_class}] <- {dependency_text}",
-            *line_style,
+            styled_text(
+                ("[workflow]   ", "grey50"),
+                (node_id, "yellow" if dependencies else "bold yellow"),
+                (" [", "grey50"),
+                (spec.node.placement.value, "bold"),
+                ("; ", "grey50"),
+                (node_class, "bold"),
+                ("] <- ", "grey50"),
+                (dependency_text, "grey50"),
+            )
         )
 
 
@@ -142,8 +114,7 @@ class WorkflowRuntime:
         _workflow_print(
             f"[workflow] Starting workflow '{definition.name}' run '{run_id}' "
             f"with {len(definition.nodes)} node(s)",
-            _ANSI_BOLD,
-            _ANSI_BLUE,
+            style="bold cyan",
         )
         print_workflow_dag(definition)
         self._reload_volume()
@@ -263,7 +234,7 @@ class WorkflowRuntime:
                     )
                     _workflow_print(
                         f"[workflow] Node failed: {node_id}: {exc}",
-                        _ANSI_RED,
+                        style="red",
                     )
                     self.ledger.mark_node_failed(node_id, error)
                     self._commit_volume()
@@ -306,7 +277,7 @@ class WorkflowRuntime:
             _workflow_print(
                 f"[workflow] Node started: {node_id} attempt={attempt_id} "
                 f"placement={spec.node.placement.value}",
-                _ANSI_BLUE,
+                style="yellow",
             )
             self.ledger.record_node_inputs(node_id, inputs)
             attempt = self.ledger.record_attempt_started(node_id, attempt_id)
@@ -362,7 +333,7 @@ class WorkflowRuntime:
                 _workflow_print(
                     f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
                     f"{self._node_error_message(result)}",
-                    _ANSI_RED,
+                    style="red",
                 )
                 self.ledger.record_artifacts(materialized.artifacts)
                 self.ledger.record_attempt_completed(
@@ -391,7 +362,7 @@ class WorkflowRuntime:
         _workflow_print(
             f"[workflow] Node succeeded: {node_id} attempt={attempt_id} "
             f"artifacts={len(artifacts)}",
-            _ANSI_GREEN,
+            style="green",
         )
         return result
 
@@ -479,14 +450,14 @@ class WorkflowRuntime:
         _workflow_print(
             "[workflow] Cancelling "
             f"{len(active_remote_calls)} in-flight remote call(s)",
-            _ANSI_YELLOW,
+            style="yellow",
         )
         for call_id, function_call in active_remote_calls.items():
             cancel = getattr(function_call, "cancel", None)
             if cancel is None:
                 _workflow_print(
                     f"[workflow] Remote call cannot be cancelled: {call_id}",
-                    _ANSI_YELLOW,
+                    style="yellow",
                 )
                 continue
             try:
@@ -494,13 +465,13 @@ class WorkflowRuntime:
             except Exception as exc:  # noqa: BLE001
                 _workflow_print(
                     f"[workflow] Remote call cancellation failed: {call_id}: {exc}",
-                    _ANSI_RED,
+                    style="red",
                 )
                 continue
 
             _workflow_print(
                 f"[workflow] Remote call cancelled: {call_id}",
-                _ANSI_YELLOW,
+                style="yellow",
             )
             try:
                 self.ledger.mark_remote_call_status(
@@ -513,7 +484,7 @@ class WorkflowRuntime:
                 _workflow_print(
                     "[workflow] Remote call cancellation status could not be "
                     f"recorded: {call_id}: {exc}",
-                    _ANSI_RED,
+                    style="red",
                 )
 
     def _recover_remote_node_if_possible(

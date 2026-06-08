@@ -510,6 +510,57 @@ def test_runtime_logs_failed_node_transition(
     assert "[workflow] Node failed: fail attempt=attempt-1" in stdout
 
 
+def test_runtime_colorizes_node_state_transitions_by_default(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("BIOMODALS_WORKFLOW_COLOR", raising=False)
+    workflow = Workflow("demo")
+    first = workflow.add_node(FakeNode(), id="prepare")
+    workflow.add_node(FakeNode(), id="produce", depends_on=[first])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    stdout = capsys.readouterr().out
+    assert "\x1b[34m[workflow] Node started: prepare" in stdout
+    assert "\x1b[32m[workflow] Node succeeded: prepare" in stdout
+    assert "\x1b[1;34m[workflow] Starting workflow 'demo'" in stdout
+    assert "\x1b[35m[workflow]   produce [orchestrator; FakeNode] <- prepare" in stdout
+
+
+def test_runtime_color_can_be_disabled_with_no_color(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    workflow = Workflow("demo")
+    workflow.add_node(FakeNode(), id="prepare")
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    stdout = capsys.readouterr().out
+    assert "\x1b[" not in stdout
+    assert "[workflow] Node started: prepare attempt=attempt-1" in stdout
+    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in stdout
+
+
 def test_runtime_dag_hash_uses_stable_json_for_dataclass_node_config() -> None:
     first_workflow = Workflow("demo")
     first_workflow.add_node(

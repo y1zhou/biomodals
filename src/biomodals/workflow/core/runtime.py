@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import traceback
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,18 +40,60 @@ from biomodals.workflow.core.nodes import (
 
 FunctionCallResolver = Callable[[str], RemoteFunctionCall]
 
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD = "1"
+_ANSI_DIM = "2"
+_ANSI_RED = "31"
+_ANSI_GREEN = "32"
+_ANSI_BLUE = "34"
+_ANSI_MAGENTA = "35"
+_ANSI_CYAN = "36"
+_ANSI_YELLOW = "33"
+
+
+def _workflow_color_enabled() -> bool:
+    if "NO_COLOR" in os.environ:
+        return False
+    color_setting = os.environ.get("BIOMODALS_WORKFLOW_COLOR", "").strip().lower()
+    if color_setting in {"0", "false", "no", "off", "never"}:
+        return False
+    return True
+
+
+def _workflow_style(text: str, *codes: str) -> str:
+    if not codes or not _workflow_color_enabled():
+        return text
+    return f"\033[{';'.join(codes)}m{text}{_ANSI_RESET}"
+
+
+def _workflow_print(text: str, *codes: str) -> None:
+    print(_workflow_style(text, *codes), flush=True)
+
 
 def print_workflow_dag(definition: WorkflowDefinition) -> None:
     """Print a compact workflow DAG graph."""
-    print("[workflow] DAG graph: node_id [placement; class] <- dependency", flush=True)
+    _workflow_print(
+        "[workflow] DAG graph: node_id [placement; class] <- dependency",
+        _ANSI_BOLD,
+        _ANSI_BLUE,
+    )
     for node_id, spec in definition.nodes.items():
         dependencies = sorted(definition.dependencies[node_id])
         dependency_text = ", ".join(dependencies) if dependencies else "-"
         node_class = spec.node.__class__.__qualname__
-        print(
+        line_style = (
+            (_ANSI_MAGENTA,)
+            if dependencies
+            else (
+                (_ANSI_CYAN,)
+                if spec.node.placement == NodePlacement.REMOTE
+                else (_ANSI_DIM,)
+            )
+        )
+        _workflow_print(
             f"[workflow]   {node_id} "
             f"[{spec.node.placement.value}; {node_class}] <- {dependency_text}",
-            flush=True,
+            *line_style,
         )
 
 
@@ -96,10 +139,11 @@ class WorkflowRuntime:
         """Run the workflow until every node succeeds or no progress is possible."""
         definition = self.workflow.validate()
         dag_hash = self._dag_hash(definition)
-        print(
+        _workflow_print(
             f"[workflow] Starting workflow '{definition.name}' run '{run_id}' "
             f"with {len(definition.nodes)} node(s)",
-            flush=True,
+            _ANSI_BOLD,
+            _ANSI_BLUE,
         )
         print_workflow_dag(definition)
         self._reload_volume()
@@ -217,9 +261,9 @@ class WorkflowRuntime:
                     error = "".join(
                         traceback.format_exception(type(exc), exc, exc.__traceback__)
                     )
-                    print(
+                    _workflow_print(
                         f"[workflow] Node failed: {node_id}: {exc}",
-                        flush=True,
+                        _ANSI_RED,
                     )
                     self.ledger.mark_node_failed(node_id, error)
                     self._commit_volume()
@@ -259,10 +303,10 @@ class WorkflowRuntime:
                 execution_policy=spec.node.execution_policy,
                 placement=spec.node.placement,
             )
-            print(
+            _workflow_print(
                 f"[workflow] Node started: {node_id} attempt={attempt_id} "
                 f"placement={spec.node.placement.value}",
-                flush=True,
+                _ANSI_BLUE,
             )
             self.ledger.record_node_inputs(node_id, inputs)
             attempt = self.ledger.record_attempt_started(node_id, attempt_id)
@@ -315,10 +359,10 @@ class WorkflowRuntime:
             )
             persisted_result = materialized.result
             if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
-                print(
+                _workflow_print(
                     f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
                     f"{self._node_error_message(result)}",
-                    flush=True,
+                    _ANSI_RED,
                 )
                 self.ledger.record_artifacts(materialized.artifacts)
                 self.ledger.record_attempt_completed(
@@ -344,10 +388,10 @@ class WorkflowRuntime:
                 result=persisted_result,
             )
             self._commit_volume()
-        print(
+        _workflow_print(
             f"[workflow] Node succeeded: {node_id} attempt={attempt_id} "
             f"artifacts={len(artifacts)}",
-            flush=True,
+            _ANSI_GREEN,
         )
         return result
 
@@ -432,29 +476,32 @@ class WorkflowRuntime:
         if not active_remote_calls:
             return
 
-        print(
+        _workflow_print(
             "[workflow] Cancelling "
             f"{len(active_remote_calls)} in-flight remote call(s)",
-            flush=True,
+            _ANSI_YELLOW,
         )
         for call_id, function_call in active_remote_calls.items():
             cancel = getattr(function_call, "cancel", None)
             if cancel is None:
-                print(
+                _workflow_print(
                     f"[workflow] Remote call cannot be cancelled: {call_id}",
-                    flush=True,
+                    _ANSI_YELLOW,
                 )
                 continue
             try:
                 cancel(terminate_containers=terminate_containers)
             except Exception as exc:  # noqa: BLE001
-                print(
+                _workflow_print(
                     f"[workflow] Remote call cancellation failed: {call_id}: {exc}",
-                    flush=True,
+                    _ANSI_RED,
                 )
                 continue
 
-            print(f"[workflow] Remote call cancelled: {call_id}", flush=True)
+            _workflow_print(
+                f"[workflow] Remote call cancelled: {call_id}",
+                _ANSI_YELLOW,
+            )
             try:
                 self.ledger.mark_remote_call_status(
                     call_id,
@@ -463,10 +510,10 @@ class WorkflowRuntime:
                 )
                 self._commit_volume()
             except Exception as exc:  # noqa: BLE001
-                print(
+                _workflow_print(
                     "[workflow] Remote call cancellation status could not be "
                     f"recorded: {call_id}: {exc}",
-                    flush=True,
+                    _ANSI_RED,
                 )
 
     def _recover_remote_node_if_possible(

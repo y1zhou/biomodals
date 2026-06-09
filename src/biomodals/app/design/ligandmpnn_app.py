@@ -24,7 +24,7 @@ from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
-    run_command_with_log,
+    run_command,
     sanitize_filename,
 )
 from biomodals.helper.web import download_files
@@ -263,7 +263,12 @@ def _ligandmpnn_run(
             "--out_folder",
             str(workdir / "outputs" / f"seed-{seed}"),
         ]
-        run_command_with_log(cmd, log_file=log_path, cwd=CONF.git_clone_dir)
+        run_command(
+            cmd,
+            output_mode="capture",
+            log_file=log_path,
+            cwd=CONF.git_clone_dir,
+        )
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")

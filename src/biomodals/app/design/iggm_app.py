@@ -32,7 +32,7 @@ from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import resolve_local_output_dir
-from biomodals.helper.shell import run_command, run_command_with_log, sanitize_filename
+from biomodals.helper.shell import run_command, sanitize_filename
 from biomodals.helper.volume_run import (
     build_volume_run_paths,
     volume_path_from_mount_path,
@@ -133,7 +133,7 @@ def _md5_matches(path: str | Path, expected_md5: str) -> bool:
         checksum_path = Path(tmpdir) / "checksums.md5"
         checksum_path.write_text(f"{expected_md5}  {path}\n")
         try:
-            run_command(["md5sum", "-c", str(checksum_path)], verbose=False)
+            run_command(["md5sum", "-c", str(checksum_path)], output_mode="capture")
         except sp.CalledProcessError:
             return False
     return True
@@ -233,9 +233,7 @@ def merge_pdb_chains(
     CONF.output_volume.commit()
     print("💊 Merging IgGM antigen chains...")
     try:
-        run_command_with_log(
-            cmd, log_file=log_path, verbose=True, cwd=CONF.git_clone_dir
-        )
+        run_command(cmd, output_mode="tee", log_file=log_path, cwd=CONF.git_clone_dir)
     finally:
         CONF.output_volume.commit()
 
@@ -308,9 +306,7 @@ def iggm_inference(
     CONF.output_volume.commit()
     print("💊 Running IgGM...")
     try:
-        run_command_with_log(
-            cmd, log_file=log_path, verbose=True, cwd=CONF.git_clone_dir
-        )
+        run_command(cmd, output_mode="tee", log_file=log_path, cwd=CONF.git_clone_dir)
     finally:
         CONF.output_volume.commit()
 

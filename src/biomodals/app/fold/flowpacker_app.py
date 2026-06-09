@@ -49,7 +49,7 @@ from biomodals.helper.io import (
 from biomodals.helper.shell import (
     copy_files,
     package_outputs,
-    run_command_with_log,
+    run_command,
     sanitize_filename,
     softlink_dir,
 )
@@ -306,7 +306,12 @@ def run_flowpacker(
         f"💊 Running FlowPacker with model '{model_name}' on {len(input_files)} input(s)"
     )
     log_path = sample_dir / "flowpacker.log"
-    run_command_with_log(cmd, log_file=log_path, cwd=CONF.git_clone_dir, verbose=True)
+    run_command(
+        cmd,
+        output_mode="tee",
+        log_file=log_path,
+        cwd=CONF.git_clone_dir,
+    )
 
     if not sample_dir.exists():
         raise RuntimeError(

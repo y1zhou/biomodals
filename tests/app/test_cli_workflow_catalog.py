@@ -104,6 +104,20 @@ class _SingleEntrypointWorkflow:
         self.functions = []
 
 
+@dataclass
+class _SingleEntrypointApp:
+    name: str = "rosetta"
+    path: Path = Path("src/biomodals/app/bioinfo/rosetta_app.py")
+    _entrypoint: str | None = "main"
+
+
+@dataclass
+class _NoEntrypointApp:
+    name: str = "rosetta"
+    path: Path = Path("src/biomodals/app/bioinfo/rosetta_app.py")
+    _entrypoint: str | None = None
+
+
 def test_workflow_run_requires_entrypoint_for_multiple_local_entrypoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -161,3 +175,50 @@ def test_workflow_run_dry_run_forwards_entrypoint_flag(
         "--replicates",
         "1",
     ]
+    assert calls["kwargs"]["output_mode"] == "inherit"
+
+
+def test_app_run_uses_inherited_output_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {}
+
+    def fake_run_command(command, **kwargs):
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry", lambda *_args: _SingleEntrypointApp()
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(app, ["app", "run", "rosetta", "--", "--example"])
+
+    assert result.exit_code == 0
+    assert calls["command"][-1] == "--example"
+    assert calls["kwargs"]["output_mode"] == "inherit"
+
+
+def test_app_run_without_entrypoint_renders_help_without_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {}
+
+    def fake_run_command(*_args, **_kwargs):
+        calls["run_command"] = True
+
+    def fake_show_entry_help(*args, **kwargs):
+        calls["show_entry_help"] = (args, kwargs)
+
+    monkeypatch.setattr("biomodals.cli._load_entry", lambda *_args: _NoEntrypointApp())
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr("biomodals.cli._show_entry_help", fake_show_entry_help)
+
+    result = runner.invoke(app, ["app", "run", "rosetta"])
+
+    assert result.exit_code == 0
+    assert "run_command" not in calls
+    assert calls["show_entry_help"] == (
+        ("app", "src/biomodals/app/bioinfo/rosetta_app.py"),
+        {"verbose": False},
+    )

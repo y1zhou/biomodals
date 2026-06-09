@@ -22,7 +22,7 @@ def console_color_enabled(
 ) -> bool:
     """Return whether Biomodals console output may use color."""
     environ = os.environ if environ is None else environ
-    if "NO_COLOR" in environ:
+    if "BIOMODALS_NO_COLOR" in environ:
         return False
     color_setting = environ.get(color_env_var, "").strip().lower()
     return color_setting not in _FALSE_COLOR_VALUES
@@ -35,7 +35,7 @@ def _console_force_terminal(
 ) -> bool | None:
     """Return Rich force-terminal mode from Biomodals color environment settings."""
     environ = os.environ if environ is None else environ
-    if "NO_COLOR" in environ:
+    if "BIOMODALS_NO_COLOR" in environ:
         return False
     color_setting = environ.get(color_env_var, "").strip().lower()
     if color_setting in _FALSE_COLOR_VALUES:

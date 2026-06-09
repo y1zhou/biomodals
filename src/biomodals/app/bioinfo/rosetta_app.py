@@ -62,7 +62,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 )
 def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
     """Run Rosetta scripts."""
-    from biomodals.helper.shell import run_command_with_log
+    from biomodals.helper.shell import run_command
 
     mount_dir = Path(CONF.output_volume_mountpoint)
     workdir = mount_dir / f"{run_name}-{run_id}"
@@ -96,7 +96,7 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
                 "-out:path:all",
                 str(out_dir),
             ])
-            run_command_with_log(cmd, log_file=out_dir / "rosetta.log")
+            run_command(cmd, output_mode="capture", log_file=out_dir / "rosetta.log")
             CONF.output_volume.commit()
 
     # Run workers in parallel within the pod

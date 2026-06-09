@@ -61,10 +61,7 @@ def _load_entry(entry_type: CatalogType, name: str) -> BiomodalsApp:
             raise typer.Exit(code=1)
 
     try:
-        return BiomodalsApp(
-            name,
-            all_apps=all_entries,
-        )
+        return BiomodalsApp(name, all_apps=all_entries)
     except AppNotFoundError as e:
         console.print(
             f"[bold red]Error[/bold red] failed to find {entry_type} '{name}': {e}"
@@ -429,11 +426,11 @@ def run_modal_app(
         env["TIMEOUT"] = str(timeout)
 
     if flags:
-        run_command([*cmd, *flags], env=env)
+        run_command([*cmd, *flags], env=env, output_mode="inherit")
     elif app._entrypoint is not None:
-        run_command(cmd, env=env)
+        run_command(cmd, env=env, output_mode="inherit")
     else:
-        run_command(["biomodals", "app", "help", str(app.path)], try_rich_print=True)
+        _show_entry_help("app", str(app.path), verbose=False)
 
 
 def _resolve_workflow_entrypoint(workflow: BiomodalsApp) -> str:
@@ -541,7 +538,7 @@ def run_workflow(
     if dry_run and "--dry-run" not in entrypoint_flags:
         entrypoint_flags.insert(0, "--dry-run")
 
-    run_command([*cmd, *entrypoint_flags], env=env)
+    run_command([*cmd, *entrypoint_flags], env=env, output_mode="inherit")
 
 
 @app_commands.command(
@@ -577,7 +574,7 @@ def deploy_app(
     if tag:
         cmd.extend(["--tag", tag])
     cmd.append(str(app.path))
-    run_command(cmd)
+    run_command(cmd, output_mode="inherit")
 
 
 if __name__ == "__main__":

@@ -375,7 +375,7 @@ def find_traj_last_time_ns(traj_file: str) -> float:
         raise RuntimeError("Gromacs executable not found")
 
     cmd = [gmx, "check", "-f", str(traj_path)]
-    result = run_command(cmd, cwd=traj_path.parent, verbose=False)
+    result = run_command(cmd, cwd=traj_path.parent, output_mode="capture")
 
     for line in result:
         # Last frame      20000 time 200000.000
@@ -574,7 +574,7 @@ def postprocess_traj(
         cmd,
         cwd=str(Path(processed_traj_file).parent),
         env={"OMP_NUM_THREADS": None},
-        verbose=False,
+        output_mode="capture",
     )
     CONF.output_volume.commit()
 

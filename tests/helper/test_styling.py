@@ -14,9 +14,10 @@ from biomodals.helper.styling import (
 )
 
 
-def test_console_color_enabled_honors_no_color() -> None:
-    """Color settings should honor NO_COLOR and the requested env var."""
-    assert console_color_enabled({"NO_COLOR": "1"}) is False
+def test_console_color_enabled_honors_biomodals_no_color() -> None:
+    """Color settings should honor BIOMODALS_NO_COLOR and color env vars."""
+    assert console_color_enabled({"NO_COLOR": "1"}) is True
+    assert console_color_enabled({"BIOMODALS_NO_COLOR": "1"}) is False
     assert (
         console_color_enabled(
             {"BIOMODALS_WORKFLOW_COLOR": "false"},
@@ -59,29 +60,46 @@ def test_print_rich_emits_ansi_when_color_is_forced() -> None:
     assert strip_ansi(output) == "workflow ok\n"
 
 
-def test_print_rich_suppresses_ansi_when_no_color_is_set() -> None:
-    """NO_COLOR should suppress ANSI escapes for string renderables."""
+def test_print_rich_ignores_no_color_when_biomodals_color_is_forced() -> None:
+    """Global NO_COLOR should not suppress forced Biomodals ANSI escapes."""
     stream = StringIO()
 
     print_rich(
         "workflow ok",
         style="green",
         file=stream,
-        environ={"NO_COLOR": "1"},
+        environ={"NO_COLOR": "1", "BIOMODALS_WORKFLOW_COLOR": "1"},
+        color_env_var="BIOMODALS_WORKFLOW_COLOR",
+    )
+
+    output = stream.getvalue()
+    assert "\x1b[" in output
+    assert strip_ansi(output) == "workflow ok\n"
+
+
+def test_print_rich_suppresses_ansi_when_biomodals_no_color_is_set() -> None:
+    """BIOMODALS_NO_COLOR should suppress ANSI escapes for string renderables."""
+    stream = StringIO()
+
+    print_rich(
+        "workflow ok",
+        style="green",
+        file=stream,
+        environ={"BIOMODALS_NO_COLOR": "1"},
         color_env_var="BIOMODALS_WORKFLOW_COLOR",
     )
 
     assert stream.getvalue() == "workflow ok\n"
 
 
-def test_print_rich_suppresses_text_segment_styles_when_no_color_is_set() -> None:
-    """NO_COLOR should suppress ANSI escapes for styled text renderables."""
+def test_print_rich_suppresses_text_segment_styles_with_biomodals_no_color() -> None:
+    """BIOMODALS_NO_COLOR should suppress styles for styled text renderables."""
     stream = StringIO()
 
     print_rich(
         styled_text(("node-a", "bold yellow"), (" <- node-b", "grey50")),
         file=stream,
-        environ={"NO_COLOR": "1"},
+        environ={"BIOMODALS_NO_COLOR": "1"},
         color_env_var="BIOMODALS_WORKFLOW_COLOR",
     )
 

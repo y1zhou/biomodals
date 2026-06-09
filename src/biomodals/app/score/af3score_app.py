@@ -28,7 +28,6 @@ from biomodals.helper import patch_image_for_helper
 from biomodals.helper.shell import (
     copy_files,
     run_command,
-    run_command_with_log,
     sanitize_filename,
 )
 from biomodals.helper.volume_run import (
@@ -334,7 +333,7 @@ def af3score_run(
         bucket = batch_name.rsplit("_", 1)[-1]
         out_dir = paths["output_dir"]
         print(f"💊 [RUN] Starting AF3Score batch '{batch_name}'")
-        run_command_with_log(
+        run_command(
             [
                 sys.executable,
                 str(CONF.git_clone_dir / "run_af3score.py"),
@@ -355,6 +354,7 @@ def af3score_run(
                 "--write_terms_of_use_file=false",
                 "--write_fold_input_json_file=false",
             ],
+            output_mode="capture",
             log_file=out_dir / f"{batch_name}.log",
         )
         CONF.output_volume.commit()

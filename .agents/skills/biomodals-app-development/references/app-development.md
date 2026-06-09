@@ -191,7 +191,8 @@ Resource pattern:
 Prefer existing helpers instead of reimplementing common behavior:
 
 - `run_command(cmd)` from `biomodals.helper.shell` for streaming shell commands.
-- `run_command_with_log(cmd, log_file)` for command logging.
+- `run_command(cmd, output_mode="capture" | "tee", log_file=path)` for command
+  logging.
 - `run_background_command(cmd)` for non-blocking subprocesses.
 - `package_outputs(root)` for `.tar.zst` bytes.
 - `copy_files(mapping)` for parallel file copying.

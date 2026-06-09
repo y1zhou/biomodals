@@ -653,7 +653,7 @@ def test_runtime_colorizes_node_state_transitions_when_forced(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setenv("BIOMODALS_WORKFLOW_COLOR", "1")
     workflow = Workflow("demo")
     first = workflow.add_node(FakeNode(), id="prepare")
@@ -678,12 +678,12 @@ def test_runtime_colorizes_node_state_transitions_when_forced(
     assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in plain_stdout
 
 
-def test_runtime_color_can_be_disabled_with_no_color(
+def test_runtime_color_can_be_disabled_with_biomodals_no_color(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("BIOMODALS_NO_COLOR", "1")
     workflow = Workflow("demo")
     workflow.add_node(FakeNode(), id="prepare")
 

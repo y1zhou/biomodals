@@ -29,7 +29,7 @@ from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
-    run_command_with_log,
+    run_command,
     sanitize_filename,
     softlink_dir,
     warmup_directory,
@@ -190,10 +190,10 @@ def _rfdiffusion_infer(
 
         # ---- run inference (writes directly into cache volume) ----
         try:
-            run_command_with_log(
+            run_command(
                 cmd,
+                output_mode="tee",
                 log_file=cached_run_dir / f"{run_name}-{CONF.name}.log",
-                verbose=True,
                 cwd=CONF.git_clone_dir,
             )
             CONF.output_volume.commit()

@@ -22,7 +22,6 @@ from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.shell import (
     package_outputs,
     run_command,
-    run_command_with_log,
     sanitize_filename,
     warmup_directory,
 )
@@ -448,7 +447,7 @@ class BoltzGenRunner:
         )
         print(f"💊 Running BoltzGen, saving logs to {log_vol_path}")
         try:
-            run_command_with_log(cmd, log_file=log_path, cwd=out_path)
+            run_command(cmd, output_mode="capture", log_file=log_path, cwd=out_path)
         finally:
             CONF.output_volume.commit()
         return str(out_dir)

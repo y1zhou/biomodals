@@ -29,6 +29,7 @@ from biomodals.schema import (
     WorkflowRun,
 )
 from biomodals.workflow import Workflow
+from biomodals.workflow.core._runtime import hashing
 from biomodals.workflow.core.ledger import WorkflowLedger
 from biomodals.workflow.core.nodes import RemoteNodeSubmission, WorkflowNativeNode
 from biomodals.workflow.core.runtime import WorkflowRuntime
@@ -244,11 +245,11 @@ def test_volume_sync_closes_open_ledger_connection(tmp_path: Path) -> None:
     volume.on_reload = assert_ledger_closed
     volume.on_commit = assert_ledger_closed
 
-    runtime._reload_volume()
+    runtime._volume_sync.reload()
     runtime.ledger.load_run("demo", "run-1")
     assert runtime.ledger._connection is not None
 
-    runtime._commit_volume()
+    runtime._volume_sync.commit()
 
     assert volume.reload_count == 1
     assert volume.commit_count == 1
@@ -433,7 +434,7 @@ def test_force_reset_commits_deleted_run_before_recreate(tmp_path: Path) -> None
     stale_path = tmp_path / "demo" / "run-1" / "nodes" / "stale.txt"
     stale_path.parent.mkdir(parents=True, exist_ok=True)
     stale_path.write_text("stale\n", encoding="utf-8")
-    runtime._commit_volume()
+    runtime._volume_sync.commit()
     assert "demo/run-1/nodes/stale.txt" in volume.committed_paths
 
     assert runtime.run(run_id="run-1", force=True).status == AppRunStatus.SUCCEEDED
@@ -729,9 +730,9 @@ def test_runtime_dag_hash_uses_stable_json_for_dataclass_node_config() -> None:
         id="configured",
     )
 
-    first_hash = WorkflowRuntime._dag_hash(first_workflow.validate())
-    second_hash = WorkflowRuntime._dag_hash(second_workflow.validate())
-    repeated_hash = WorkflowRuntime._dag_hash(repeated_workflow.validate())
+    first_hash = hashing.dag_hash(first_workflow.validate())
+    second_hash = hashing.dag_hash(second_workflow.validate())
+    repeated_hash = hashing.dag_hash(repeated_workflow.validate())
 
     assert first_hash != second_hash
     assert first_hash == repeated_hash
@@ -747,9 +748,9 @@ def test_runtime_dag_hash_supports_bytes_in_dataclass_node_config() -> None:
         BytesConfiguredNode(payload=b"ATOM 1\n"), id="configured"
     )
 
-    first_hash = WorkflowRuntime._dag_hash(first_workflow.validate())
-    second_hash = WorkflowRuntime._dag_hash(second_workflow.validate())
-    repeated_hash = WorkflowRuntime._dag_hash(repeated_workflow.validate())
+    first_hash = hashing.dag_hash(first_workflow.validate())
+    second_hash = hashing.dag_hash(second_workflow.validate())
+    repeated_hash = hashing.dag_hash(repeated_workflow.validate())
 
     assert first_hash != second_hash
     assert first_hash == repeated_hash
@@ -761,8 +762,8 @@ def test_runtime_dag_hash_skips_dataclass_fields_marked_excluded() -> None:
     second_workflow = Workflow("demo")
     second_workflow.add_node(RuntimeHandleNode(handle=object()), id="node")
 
-    assert WorkflowRuntime._dag_hash(first_workflow.validate()) == (
-        WorkflowRuntime._dag_hash(second_workflow.validate())
+    assert hashing.dag_hash(first_workflow.validate()) == (
+        hashing.dag_hash(second_workflow.validate())
     )
 
 
@@ -782,8 +783,8 @@ def test_runtime_dag_hash_ignores_internal_node_placement() -> None:
     second_workflow = Workflow("demo")
     second_workflow.add_node(remote_node, id="configured")
 
-    assert WorkflowRuntime._dag_hash(first_workflow.validate()) == (
-        WorkflowRuntime._dag_hash(second_workflow.validate())
+    assert hashing.dag_hash(first_workflow.validate()) == (
+        hashing.dag_hash(second_workflow.validate())
     )
 
 

@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import traceback
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import fields, is_dataclass
-from enum import Enum
 from pathlib import Path
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any
 
 import orjson
-from pydantic import BaseModel
 
 import biomodals.workflow.core.display as workflow_display
 from biomodals.schema import (
@@ -28,11 +24,13 @@ from biomodals.schema import (
     WorkflowArtifact,
     WorkflowRun,
 )
-from biomodals.workflow.core.artifacts import (
-    materialize_app_run_result,
-    workflow_artifact_availability_errors,
+from biomodals.workflow.core._runtime import availability, hashing, scheduler
+from biomodals.workflow.core._runtime.volume_sync import (
+    WorkflowVolume,
+    WorkflowVolumeSync,
 )
-from biomodals.workflow.core.builder import Workflow, WorkflowDefinition
+from biomodals.workflow.core.artifacts import materialize_app_run_result
+from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.ledger import WorkflowLedger
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
@@ -42,16 +40,6 @@ from biomodals.workflow.core.nodes import (
 )
 
 FunctionCallResolver = Callable[[str], RemoteFunctionCall]
-
-
-class WorkflowVolume(Protocol):
-    """Minimal Modal Volume boundary used by the workflow runtime."""
-
-    def commit(self) -> object:
-        """Persist pending writes to the mounted volume."""
-
-    def reload(self) -> object:
-        """Refresh local view of writes made by other containers."""
 
 
 class WorkflowRuntime:
@@ -83,29 +71,33 @@ class WorkflowRuntime:
         self.executed_waves: list[list[str]] = []
         self._active_remote_calls: dict[str, RemoteFunctionCall] = {}
         self._active_remote_calls_lock = RLock()
-        self._workflow_volume_access_lock = RLock()
+        self._volume_sync = WorkflowVolumeSync(
+            workflow_volume=self.workflow_volume,
+            ledger=self.ledger,
+        )
+        self._workflow_volume_access_lock = self._volume_sync.lock
 
     def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
         """Run the workflow until every node succeeds or no progress is possible."""
         definition = self.workflow.validate()
-        dag_hash = self._dag_hash(definition)
+        dag_hash = hashing.dag_hash(definition)
         workflow_display.print_workflow_message(
             f"[workflow] Starting workflow '{definition.name}' run '{run_id}' "
             f"with {len(definition.nodes)} node(s)",
             style="bold cyan",
         )
         workflow_display.print_workflow_dag(definition)
-        self._reload_volume()
+        self._volume_sync.reload()
         run_exists = self.ledger.run_exists(definition.name, run_id)
         if run_exists and force:
             self.ledger.reset_run(definition.name, run_id)
-            self._commit_volume()
+            self._volume_sync.commit()
             self.ledger.create_run(
                 WorkflowRun(
                     workflow_name=definition.name, run_id=run_id, dag_hash=dag_hash
                 )
             )
-            self._commit_volume()
+            self._volume_sync.commit()
         elif run_exists:
             existing_run = self.ledger.load_run(definition.name, run_id)
             if existing_run.dag_hash is not None and existing_run.dag_hash != dag_hash:
@@ -120,77 +112,49 @@ class WorkflowRuntime:
                     dag_hash=dag_hash,
                 )
             )
-            self._commit_volume()
+            self._volume_sync.commit()
         self.ledger.mark_run_status(RunStatus.RUNNING)
-        self._commit_volume()
+        self._volume_sync.commit()
 
         while True:
-            completed = self._completed_nodes(definition.nodes.keys())
-            if len(completed) == len(definition.nodes):
+            decision = scheduler.evaluate_progress(
+                definition,
+                ledger=self.ledger,
+                node_is_complete=self._node_is_complete,
+            )
+            if decision.status == scheduler.SchedulerDecisionStatus.SUCCEEDED:
                 self.ledger.mark_run_status(RunStatus.SUCCEEDED)
-                self._commit_volume()
+                self._volume_sync.commit()
                 return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
-            ready = [
-                node_id
-                for node_id, dependencies in definition.dependencies.items()
-                if node_id not in completed
-                and dependencies.issubset(completed)
-                and self._node_can_make_progress(node_id)
-            ]
-            if not ready:
-                running = [
-                    node_id
-                    for node_id, dependencies in definition.dependencies.items()
-                    if node_id not in completed
-                    and dependencies.issubset(completed)
-                    and self.ledger.node_is_running(node_id)
-                ]
-                if running:
-                    self._commit_volume()
-                    return AppRunResult(
-                        status=AppRunStatus.PARTIAL,
-                        warnings=[
-                            "Workflow has in-flight nodes without a recoverable "
-                            f"remote call: {', '.join(sorted(running))}"
-                        ],
-                    )
-                self.ledger.mark_run_status(RunStatus.FAILED)
-                self._commit_volume()
+            if decision.status == scheduler.SchedulerDecisionStatus.BLOCKED_RUNNING:
+                self._volume_sync.commit()
                 return AppRunResult(
-                    status=AppRunStatus.FAILED,
-                    warnings=["No runnable workflow nodes remain"],
+                    status=AppRunStatus.PARTIAL,
+                    warnings=decision.warnings,
                 )
 
-            self.executed_waves.append(ready)
-            for node_id, node_result in self._run_ready_nodes(ready):
+            if decision.status == scheduler.SchedulerDecisionStatus.FAILED_NO_PROGRESS:
+                self.ledger.mark_run_status(RunStatus.FAILED)
+                self._volume_sync.commit()
+                return AppRunResult(
+                    status=AppRunStatus.FAILED,
+                    warnings=decision.warnings,
+                )
+
+            self.executed_waves.append(decision.ready)
+            for node_id, node_result in self._run_ready_nodes(decision.ready):
                 if node_result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
                     error = self._node_error_message(node_result)
                     node_status = self.ledger.load_node_status(node_id)
                     if node_status.status != NodeStatus.FAILED or not node_status.error:
                         self.ledger.mark_node_failed(node_id, error)
                     self.ledger.mark_run_status(RunStatus.FAILED)
-                    self._commit_volume()
+                    self._volume_sync.commit()
                     return AppRunResult(
                         status=node_result.status,
                         warnings=node_result.warnings or [error],
                     )
-
-    def _completed_nodes(self, node_ids) -> set[str]:
-        return {node_id for node_id in node_ids if self._node_is_complete(node_id)}
-
-    def _node_can_make_progress(self, node_id: str) -> bool:
-        if self._node_is_complete(node_id):
-            return False
-        if not self.ledger.node_is_running(node_id):
-            return True
-        return (
-            self.ledger.latest_remote_call(
-                node_id,
-                statuses=("submitted", "running", "succeeded"),
-            )
-            is not None
-        )
 
     def _run_ready_nodes(self, node_ids: list[str]) -> list[tuple[str, AppRunResult]]:
         results: list[tuple[str, AppRunResult]] = []
@@ -213,7 +177,7 @@ class WorkflowRuntime:
                         style="red",
                     )
                     self.ledger.mark_node_failed(node_id, error)
-                    self._commit_volume()
+                    self._volume_sync.commit()
                     results.append((
                         node_id,
                         AppRunResult(
@@ -267,7 +231,7 @@ class WorkflowRuntime:
             attempt_dir = self._attempt_dir(attempt)
             cache_dir = self.ledger.run_root / "nodes" / node_id / "cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
-            self._commit_volume()
+            self._volume_sync.commit()
 
         result = self._dispatch_node(
             spec.node,
@@ -289,7 +253,7 @@ class WorkflowRuntime:
     def _reset_node_for_rerun(self, node_id: str) -> None:
         with self._workflow_volume_access_lock:
             self.ledger.reset_node(node_id)
-            self._commit_volume()
+            self._volume_sync.commit()
 
     def _finalize_node_result(
         self,
@@ -326,7 +290,7 @@ class WorkflowRuntime:
                     result=persisted_result,
                     error=self._node_error_message(result),
                 )
-                self._commit_volume()
+                self._volume_sync.commit()
                 return result
 
             artifacts = materialized.artifacts
@@ -341,7 +305,7 @@ class WorkflowRuntime:
                 NodeStatus.SUCCEEDED,
                 result=persisted_result,
             )
-            self._commit_volume()
+            self._volume_sync.commit()
         workflow_display.print_workflow_message(
             f"[workflow] Node succeeded: {node_id} attempt={attempt_id} "
             f"artifacts={len(artifacts)}",
@@ -353,7 +317,7 @@ class WorkflowRuntime:
         self,
         selectors: dict[str, ArtifactSelector],
     ) -> dict[str, list[WorkflowArtifact]]:
-        self._reload_volume()
+        self._volume_sync.reload()
         inputs = {
             input_name: self.ledger.select_artifacts(selector)
             for input_name, selector in selectors.items()
@@ -389,23 +353,14 @@ class WorkflowRuntime:
         return False
 
     def _artifact_availability_errors(self, artifact: WorkflowArtifact) -> list[str]:
-        errors: list[str] = []
-        manifest_path = (
-            self.ledger.run_root / "artifacts" / f"{artifact.artifact_id}.json"
-        )
-        if not manifest_path.is_file():
-            errors.append(
-                f"{artifact.artifact_id}: missing workflow artifact manifest "
-                f"artifacts/{artifact.artifact_id}.json"
-            )
-        errors.extend(
-            workflow_artifact_availability_errors(
+        return availability.format_artifact_availability_errors(
+            availability.artifact_availability_errors(
                 artifact,
                 workflow_volume_name=self.workflow_volume_name,
                 volume_root=self.volume_root,
+                run_root=self.ledger.run_root,
             )
         )
-        return errors
 
     def _dispatch_node(
         self, node: WorkflowNode, context: NodeRunContext
@@ -434,9 +389,9 @@ class WorkflowRuntime:
                     call_kind="node",
                     metadata=submission.metadata,
                 )
-                self._commit_volume()
+                self._volume_sync.commit()
             raw_result = self._collect_remote_call(call_id, submission.function_call)
-            self._reload_volume()
+            self._volume_sync.reload()
             try:
                 result = self._process_remote_node_result(
                     node,
@@ -510,7 +465,7 @@ class WorkflowRuntime:
                     "cancelled",
                     completed=True,
                 )
-                self._commit_volume()
+                self._volume_sync.commit()
             except Exception as exc:  # noqa: BLE001
                 workflow_display.print_workflow_message(
                     "[workflow] Remote call cancellation status could not be "
@@ -531,7 +486,7 @@ class WorkflowRuntime:
                 str(succeeded_call["attempt_id"]),
             )
             if result is not None:
-                self._reload_volume()
+                self._volume_sync.reload()
                 return self._finalize_node_result(
                     node_id=node_id,
                     attempt_id=str(succeeded_call["attempt_id"]),
@@ -555,7 +510,7 @@ class WorkflowRuntime:
             result = self._collect_remote_call(call_id, function_call)
         except _RemoteCallExpired:
             return None
-        self._reload_volume()
+        self._volume_sync.reload()
         result = self._process_remote_node_result(
             node,
             result,
@@ -581,7 +536,7 @@ class WorkflowRuntime:
                 raw_result = function_call.get(timeout=self.remote_call_poll_timeout)
             except TimeoutError:
                 self.ledger.mark_remote_call_status(call_id, "running")
-                self._commit_volume()
+                self._volume_sync.commit()
                 raw_result = function_call.get()
         except Exception as exc:
             self._record_remote_call_exception(call_id, exc)
@@ -600,7 +555,7 @@ class WorkflowRuntime:
             completed=True,
             metadata=remote_call_metadata | {"result_status": result.status.value},
         )
-        self._commit_volume()
+        self._volume_sync.commit()
 
     def _record_remote_call_exception(self, call_id: str, exc: Exception) -> None:
         if exc.__class__.__name__ == "OutputExpiredError":
@@ -610,7 +565,7 @@ class WorkflowRuntime:
                 error=str(exc),
                 completed=True,
             )
-            self._commit_volume()
+            self._volume_sync.commit()
             raise _RemoteCallExpired(str(exc)) from exc
         self.ledger.mark_remote_call_status(
             call_id,
@@ -618,7 +573,7 @@ class WorkflowRuntime:
             error=str(exc),
             completed=True,
         )
-        self._commit_volume()
+        self._volume_sync.commit()
 
     def _resolve_function_call(self, call_id: str) -> RemoteFunctionCall:
         if self.function_call_resolver is not None:
@@ -647,77 +602,6 @@ class WorkflowRuntime:
             return "Node returned partial status"
         return "Node returned failed status"
 
-    @staticmethod
-    def _dag_hash(definition: WorkflowDefinition) -> str:
-        payload = {
-            "name": definition.name,
-            "nodes": {
-                node_id: WorkflowRuntime._node_hash_payload(spec.node)
-                | {
-                    "inputs": {
-                        input_name: selector.model_dump(mode="json")
-                        for input_name, selector in sorted(spec.inputs.items())
-                    },
-                    "control_dependencies": sorted(spec.control_dependencies),
-                    "dependencies": sorted(definition.dependencies[node_id]),
-                }
-                for node_id, spec in sorted(definition.nodes.items())
-            },
-        }
-        encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
-        return hashlib.sha256(encoded).hexdigest()
-
-    @staticmethod
-    def _node_hash_payload(node: WorkflowNode) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "class": f"{node.__class__.__module__}.{node.__class__.__qualname__}",
-            "execution_policy": node.execution_policy.value,
-        }
-        if is_dataclass(node):
-            payload["dataclass"] = WorkflowRuntime._stable_json_value(node)
-        return payload
-
-    @staticmethod
-    def _stable_json_value(value: object) -> object:
-        if isinstance(value, BaseModel):
-            return value.model_dump(mode="json", round_trip=True)
-        if isinstance(value, Enum):
-            return value.value
-        if isinstance(value, bytes):
-            return {
-                "bytes_sha256": hashlib.sha256(value).hexdigest(),
-                "size_bytes": len(value),
-            }
-        if isinstance(value, Path):
-            return value.as_posix()
-        if is_dataclass(value) and not isinstance(value, type):
-            return {
-                field.name: WorkflowRuntime._stable_json_value(
-                    getattr(value, field.name)
-                )
-                for field in fields(value)
-                if field.metadata.get("dag_hash") is not False
-            }
-        if isinstance(value, Mapping):
-            return {
-                str(key): WorkflowRuntime._stable_json_value(item)
-                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            }
-        if isinstance(value, (list, tuple)):
-            return [WorkflowRuntime._stable_json_value(item) for item in value]
-        if isinstance(value, (set, frozenset)):
-            stable_items = [WorkflowRuntime._stable_json_value(item) for item in value]
-            return sorted(
-                stable_items,
-                key=lambda item: orjson.dumps(item, option=orjson.OPT_SORT_KEYS),
-            )
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        raise TypeError(
-            f"Unsupported DAG hash value type: {type(value).__module__}."
-            f"{type(value).__qualname__}"
-        )
-
     def _next_attempt_id(self, node_id: str) -> str:
         return self.ledger.next_attempt_id(node_id)
 
@@ -729,18 +613,6 @@ class WorkflowRuntime:
             / "attempts"
             / attempt.attempt_id
         )
-
-    def _commit_volume(self) -> None:
-        if self.workflow_volume is not None:
-            with self._workflow_volume_access_lock:
-                with self.ledger.closed_for_volume_sync():
-                    self.workflow_volume.commit()
-
-    def _reload_volume(self) -> None:
-        if self.workflow_volume is not None:
-            with self._workflow_volume_access_lock:
-                with self.ledger.closed_for_volume_sync():
-                    self.workflow_volume.reload()
 
     def close(self) -> None:
         """Close durable local resources owned by the runtime."""

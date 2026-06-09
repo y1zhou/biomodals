@@ -15,7 +15,7 @@ from typing import Any, Protocol
 import orjson
 from pydantic import BaseModel
 
-from biomodals.helper.styling import print_rich, styled_text
+import biomodals.workflow.core.display as workflow_display
 from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
@@ -42,34 +42,6 @@ from biomodals.workflow.core.nodes import (
 )
 
 FunctionCallResolver = Callable[[str], RemoteFunctionCall]
-
-
-def _workflow_print(renderable: object, *, style: str | None = None) -> None:
-    print_rich(renderable, style=style, color_env_var="BIOMODALS_WORKFLOW_COLOR")
-
-
-def print_workflow_dag(definition: WorkflowDefinition) -> None:
-    """Print a compact workflow DAG graph."""
-    _workflow_print(
-        "[workflow] DAG graph: node_id [placement; class] <- dependency",
-        style="bold blue",
-    )
-    for node_id, spec in definition.nodes.items():
-        dependencies = sorted(definition.dependencies[node_id])
-        dependency_text = ", ".join(dependencies) if dependencies else "-"
-        node_class = spec.node.__class__.__qualname__
-        _workflow_print(
-            styled_text(
-                ("[workflow]   ", "grey50"),
-                (node_id, "yellow" if dependencies else "bold yellow"),
-                (" [", "grey50"),
-                (spec.node.placement.value, "bold"),
-                ("; ", "grey50"),
-                (node_class, "bold"),
-                ("] <- ", "grey50"),
-                (dependency_text, "grey50"),
-            )
-        )
 
 
 class WorkflowVolume(Protocol):
@@ -105,6 +77,9 @@ class WorkflowRuntime:
         self.remote_call_poll_timeout = remote_call_poll_timeout
         self.max_ready_workers = max_ready_workers
         self.ledger = WorkflowLedger(self.volume_root)
+        # TODO: Replace this debug-only wave history with structured scheduling
+        # diagnostics that can record ready/completed/blocked reasons and timing
+        # without expanding the public workflow API.
         self.executed_waves: list[list[str]] = []
         self._active_remote_calls: dict[str, RemoteFunctionCall] = {}
         self._active_remote_calls_lock = RLock()
@@ -114,12 +89,12 @@ class WorkflowRuntime:
         """Run the workflow until every node succeeds or no progress is possible."""
         definition = self.workflow.validate()
         dag_hash = self._dag_hash(definition)
-        _workflow_print(
+        workflow_display.print_workflow_message(
             f"[workflow] Starting workflow '{definition.name}' run '{run_id}' "
             f"with {len(definition.nodes)} node(s)",
             style="bold cyan",
         )
-        print_workflow_dag(definition)
+        workflow_display.print_workflow_dag(definition)
         self._reload_volume()
         run_exists = self.ledger.run_exists(definition.name, run_id)
         if run_exists and force:
@@ -233,7 +208,7 @@ class WorkflowRuntime:
                     error = "".join(
                         traceback.format_exception(type(exc), exc, exc.__traceback__)
                     )
-                    _workflow_print(
+                    workflow_display.print_workflow_message(
                         f"[workflow] Node failed: {node_id}: {exc}",
                         style="red",
                     )
@@ -282,7 +257,7 @@ class WorkflowRuntime:
                 execution_policy=spec.node.execution_policy,
                 placement=spec.node.placement,
             )
-            _workflow_print(
+            workflow_display.print_workflow_message(
                 f"[workflow] Node started: {node_id} attempt={attempt_id} "
                 f"placement={spec.node.placement.value}",
                 style="yellow",
@@ -338,7 +313,7 @@ class WorkflowRuntime:
             )
             persisted_result = materialized.result
             if result.status in {AppRunStatus.FAILED, AppRunStatus.PARTIAL}:
-                _workflow_print(
+                workflow_display.print_workflow_message(
                     f"[workflow] Node failed: {node_id} attempt={attempt_id}: "
                     f"{self._node_error_message(result)}",
                     style="red",
@@ -367,7 +342,7 @@ class WorkflowRuntime:
                 result=persisted_result,
             )
             self._commit_volume()
-        _workflow_print(
+        workflow_display.print_workflow_message(
             f"[workflow] Node succeeded: {node_id} attempt={attempt_id} "
             f"artifacts={len(artifacts)}",
             style="green",
@@ -406,7 +381,7 @@ class WorkflowRuntime:
         ]
         if not errors:
             return True
-        _workflow_print(
+        workflow_display.print_workflow_message(
             "[workflow] Node output artifacts unavailable: "
             f"{node_id}: {'; '.join(errors)}",
             style="yellow",
@@ -503,7 +478,7 @@ class WorkflowRuntime:
         if not active_remote_calls:
             return
 
-        _workflow_print(
+        workflow_display.print_workflow_message(
             "[workflow] Cancelling "
             f"{len(active_remote_calls)} in-flight remote call(s)",
             style="yellow",
@@ -511,7 +486,7 @@ class WorkflowRuntime:
         for call_id, function_call in active_remote_calls.items():
             cancel = getattr(function_call, "cancel", None)
             if cancel is None:
-                _workflow_print(
+                workflow_display.print_workflow_message(
                     f"[workflow] Remote call cannot be cancelled: {call_id}",
                     style="yellow",
                 )
@@ -519,13 +494,13 @@ class WorkflowRuntime:
             try:
                 cancel(terminate_containers=terminate_containers)
             except Exception as exc:  # noqa: BLE001
-                _workflow_print(
+                workflow_display.print_workflow_message(
                     f"[workflow] Remote call cancellation failed: {call_id}: {exc}",
                     style="red",
                 )
                 continue
 
-            _workflow_print(
+            workflow_display.print_workflow_message(
                 f"[workflow] Remote call cancelled: {call_id}",
                 style="yellow",
             )
@@ -537,7 +512,7 @@ class WorkflowRuntime:
                 )
                 self._commit_volume()
             except Exception as exc:  # noqa: BLE001
-                _workflow_print(
+                workflow_display.print_workflow_message(
                     "[workflow] Remote call cancellation status could not be "
                     f"recorded: {call_id}: {exc}",
                     style="red",
@@ -697,7 +672,6 @@ class WorkflowRuntime:
         payload: dict[str, object] = {
             "class": f"{node.__class__.__module__}.{node.__class__.__qualname__}",
             "execution_policy": node.execution_policy.value,
-            "placement": node.placement.value,
         }
         if is_dataclass(node):
             payload["dataclass"] = WorkflowRuntime._stable_json_value(node)

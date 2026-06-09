@@ -6,6 +6,7 @@ from biomodals.workflow.core.builder import (
     WorkflowDefinition,
     WorkflowNodeSpec,
 )
+from biomodals.workflow.core.display import print_workflow_dag
 from biomodals.workflow.core.nodes import (
     AppBackedNode,
     NodeRunContext,
@@ -14,7 +15,6 @@ from biomodals.workflow.core.nodes import (
     WorkflowNativeNode,
     WorkflowNode,
 )
-from biomodals.workflow.core.runtime import print_workflow_dag
 
 __all__ = [
     "AppBackedNode",

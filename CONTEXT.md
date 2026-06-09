@@ -130,11 +130,15 @@ _Avoid_: temporary scratch, local cache
 
 - A **Workflow Builder** defines a workflow DAG in Python code.
 - A **Workflow Builder** connects nodes through named **Artifact Selectors** and optional **Control Edges**.
+- A **Workflow Builder** and **Workflow Orchestrator** form the stable workflow authoring surface; users should not need to understand scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization internals to run a workflow.
 - A **Workflow Node** declares a **Node Execution Policy**.
 - A **Workflow Node** declares **Node Placement**.
 - A **Workflow Node** may use **Dynamic Task Fan-Out** without changing the workflow DAG shape.
 - A **Workflow Node** may use a **Worker Pool** to process dynamically fanned-out tasks.
 - A **Workflow Runtime** schedules **Workflow Nodes** and does not contain tool-specific biological logic.
+- A **Workflow Runtime** is an internal orchestration component; workflow users should not instantiate it directly or depend on its scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization interfaces.
+- Internal workflow runtime modules may live under a private `_runtime` package so the stable workflow authoring surface stays limited to the **Workflow Builder**, package-development node contracts, and **Workflow Orchestrator**.
+- The `WorkflowRuntime` class should remain a thin internal facade around private runtime collaborators rather than a broad service object with many callable behaviors.
 - A **Workflow Runtime** may run independent ready nodes in parallel when all of each node's dependencies are satisfied.
 - A **Workflow Orchestrator** runs the **Workflow Runtime** remotely on Modal and is responsible for run-level lifecycle recovery.
 - A **Workflow Orchestrator** is the only writer to the **Workflow Ledger**.
@@ -163,11 +167,18 @@ _Avoid_: temporary scratch, local cache
 - App-specific configuration models remain with their app until they become stable cross-module contracts.
 - An **App-Backed Node** calls one or more **App Functions** and processes their outputs into workflow artifacts.
 - A **Workflow-Native Node** performs lightweight workflow logic without calling a bioinformatics app.
+- **Workflow Node**, **App-Backed Node**, and **Workflow-Native Node** contracts are package-development APIs for maintainers implementing reusable workflows; routine workflow users should work through the **Workflow Builder** and **Workflow Orchestrator** instead of runtime node internals.
 - A long-running **Workflow Node** must use a **Durable Node Cache** so interruption and restart do not corrupt outputs or repeat unsafe work.
 - A short-running **Workflow Node** may choose a rerun-on-restart policy when recomputation is cheaper than durable checkpointing.
 - A lightweight **Workflow-Native Node** may run inline in the **Workflow Orchestrator** when remote execution overhead is not justified.
 - A long-running or failure-isolated **Workflow Node** should run as a separate remote Modal function.
+- **Node Placement** is an internal runtime and package-development decision for performance and failure isolation; workflow users should normally think in terms of graph nodes rather than Modal execution sites because both inline and remote nodes run under the Modal-hosted workflow.
+- **Node Placement** is not part of semantic workflow DAG identity and should not force a new workflow run when the graph and node configuration are otherwise unchanged.
 - Every **Workflow Node** checks durable run state before execution and skips work when completed artifacts already exist.
+- A **Workflow Runtime** verifies workflow-volume artifact availability by default before treating completed nodes as reusable; app-owned volume artifact checks are opt-in because the checking function must have those volumes mounted.
+- External app-owned artifact verification is a run-level strictness option on the **Workflow Orchestrator**, not a routine per-node user setting.
+- When external app-owned artifact verification is enabled, the **Workflow Runtime** derives expected volume checks from recorded **Workflow Artifact** locations rather than from workflow node classes.
+- When strict external app-owned artifact verification finds missing expected files, the producing **Workflow Node** is treated as incomplete so normal workflow recovery can rerun it.
 - A **Workflow** may compose **App Functions** from any Modal app when those functions can be described by node input and output contracts.
 
 ## Example dialogue

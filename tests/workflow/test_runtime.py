@@ -766,6 +766,27 @@ def test_runtime_dag_hash_skips_dataclass_fields_marked_excluded() -> None:
     )
 
 
+def test_runtime_dag_hash_ignores_internal_node_placement() -> None:
+    orchestrator_node = ConfiguredNode(
+        settings=HashSettings(visible="same", hidden="same"),
+        output_path=Path("outputs/report.txt"),
+    )
+    remote_node = ConfiguredNode(
+        settings=HashSettings(visible="same", hidden="same"),
+        output_path=Path("outputs/report.txt"),
+    )
+    remote_node.placement = NodePlacement.REMOTE
+
+    first_workflow = Workflow("demo")
+    first_workflow.add_node(orchestrator_node, id="configured")
+    second_workflow = Workflow("demo")
+    second_workflow.add_node(remote_node, id="configured")
+
+    assert WorkflowRuntime._dag_hash(first_workflow.validate()) == (
+        WorkflowRuntime._dag_hash(second_workflow.validate())
+    )
+
+
 def test_running_node_without_recoverable_call_is_not_duplicated(
     tmp_path: Path,
 ) -> None:

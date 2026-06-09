@@ -460,9 +460,10 @@ def predict_structures(
     json_bytes = conf.to_json().encode()
     model_seeds = conf.modelSeeds
     if num_containers == 1:
-        tarball_content = run_inference_pipeline.remote(
+        fc = run_inference_pipeline.spawn(
             json_bytes, recycle=recycle, sample=sample, model_seeds=model_seeds
         )
+        tarball_content = fc.get()
         write_local_tarball(out_file, tarball_content)
         return out_file
 

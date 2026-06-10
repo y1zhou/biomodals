@@ -26,14 +26,16 @@ If `--out-dir` is provided, a packaged `.tar.zst` copy is downloaded locally.
 import os
 import sys
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import modal
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import build_local_output_path, write_local_tarball
 from biomodals.helper.shell import (
     package_outputs,
@@ -49,10 +51,6 @@ from biomodals.helper.volume_run import (
 ##########################################
 # Modal configs
 ##########################################
-STRUCTURE_SUFFIXES = (".pdb", ".pdb.gz", ".cif", ".mmcif")
-VALID_TASKS = frozenset({"design", "ensemble_design"})
-DESIGN_MODEL_BY_TASK = {"design": "soluble_caliby_v1", "ensemble_design": "caliby"}
-
 CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
     name="Caliby",
@@ -65,16 +63,41 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", "86400")),
 )
 
-# Caliby pipeline defaults kept out of the public CLI.
-DEFAULT_BATCH_SIZE = 4
-DEFAULT_NUM_WORKERS = 2
-DEFAULT_ENSEMBLE_BATCH_SIZE = 8
-DEFAULT_NUM_SAMPLES_PER_PDB = 32
-DEFAULT_MAX_NUM_CONFORMERS = 32
-DEFAULT_INCLUDE_PRIMARY_CONFORMER = True
-DEFAULT_SCORE_BASELINE = True
-DEFAULT_SAMPLING_YAML_PATH = None
-DEFAULT_SEED = 0
+
+@dataclass(frozen=True, slots=True)
+class AppInfo:
+    """Container for Caliby-specific information and defaults."""
+
+    structure_suffixes: tuple[str, ...] = (".pdb", ".cif")
+    valid_tasks: frozenset[str] = frozenset({"design", "ensemble_design"})
+    design_model_by_task: Mapping[str, str] = field(
+        default_factory=lambda: {
+            "design": "soluble_caliby_v1",
+            "ensemble_design": "caliby",
+        }
+    )
+    default_batch_size: int = 4
+    default_num_workers: int = 2
+    default_ensemble_batch_size: int = 8
+    default_num_samples_per_pdb: int = 32
+    default_max_num_conformers: int = 32
+    default_include_primary_conformer: bool = True
+    default_score_baseline: bool = True
+    default_sampling_yaml_path: str | None = None
+    default_seed: int = 0
+    remote_path_prefix: str = "remote:"
+    caliby_model_params_mount: Path = Path("/mnt/caliby-model-params")
+    full_model_volume_mount: Path = Path("/mnt/biomodals-store")
+    proteinmpnn_model_source: Path = Path("/mnt/biomodals-store/LigandMPNN")
+    protpardelle_model_source: Path = Path(
+        "/mnt/biomodals-store/Caliby/protpardelle-1c"
+    )
+    protpardelle_sampling_yaml_path: str = (
+        "caliby/configs/protpardelle-1c/multichain_backbone_partial_diffusion.yaml"
+    )
+
+
+APP_INFO = AppInfo()
 
 ##########################################
 # Image and app definitions
@@ -111,7 +134,7 @@ class CalibyCommonConfig(BaseModel):
     num_seqs_per_pdb: int = Field(default=16, gt=0)
     pos_constraint_csv: str | None = None
     pdb_name_list: str | None = None
-    score_baseline: bool = DEFAULT_SCORE_BASELINE
+    score_baseline: bool = APP_INFO.default_score_baseline
     sampling_cfg_overrides: dict[str, object] = Field(default_factory=dict)
 
 
@@ -124,28 +147,19 @@ class CalibyDesignConfig(CalibyCommonConfig):
 class CalibyEnsembleDesignConfig(CalibyCommonConfig):
     """YAML schema for Caliby ensemble-conditioned sequence design."""
 
-    input_path: str | None = None
-    conformer_dir: str | None = None
-    num_samples_per_pdb: int = Field(default=DEFAULT_NUM_SAMPLES_PER_PDB, gt=0)
-    max_num_conformers: int = Field(default=DEFAULT_MAX_NUM_CONFORMERS, gt=0)
-    include_primary_conformer: bool = DEFAULT_INCLUDE_PRIMARY_CONFORMER
-    sampling_yaml_path: str | None = DEFAULT_SAMPLING_YAML_PATH
-    seed: int = DEFAULT_SEED
-
-    @model_validator(mode="after")
-    def validate_input_mode(self):
-        """Require exactly one ensemble input mode."""
-        if bool(self.input_path) == bool(self.conformer_dir):
-            msg = "Exactly one of input_path or conformer_dir is required."
-            raise ValueError(msg)
-        return self
+    input_path: str
+    num_samples_per_pdb: int = Field(default=APP_INFO.default_num_samples_per_pdb, gt=0)
+    max_num_conformers: int = Field(default=APP_INFO.default_max_num_conformers, gt=0)
+    include_primary_conformer: bool = APP_INFO.default_include_primary_conformer
+    sampling_yaml_path: str | None = APP_INFO.default_sampling_yaml_path
+    seed: int = APP_INFO.default_seed
 
 
 def discover_structure_files(input_path: str | Path) -> list[Path]:
     """Return sorted local PDB/CIF-like structure files."""
     root = Path(input_path).expanduser().resolve()
     if root.is_file():
-        if root.name.endswith(STRUCTURE_SUFFIXES):
+        if root.name.endswith(APP_INFO.structure_suffixes):
             return [root]
         msg = f"Unsupported structure file suffix: {root.name}"
         raise ValueError(msg)
@@ -155,7 +169,7 @@ def discover_structure_files(input_path: str | Path) -> list[Path]:
     paths = [
         path.resolve()
         for path in sorted(root.iterdir())
-        if path.is_file() and path.name.endswith(STRUCTURE_SUFFIXES)
+        if path.is_file() and path.name.endswith(APP_INFO.structure_suffixes)
     ]
     if not paths:
         msg = f"No PDB/CIF structure files found under {root}"
@@ -243,12 +257,24 @@ def stage_optional_local_file(
     run_name: str,
     input_subdir: str,
 ) -> str | None:
-    """Upload a local optional config file, or return a remote/repo path as-is."""
+    """Upload a local optional config file, or return an explicit remote path."""
     if file_path is None:
         return None
+    raw_path = str(file_path)
+    if raw_path.startswith(APP_INFO.remote_path_prefix):
+        remote_path = raw_path.removeprefix(APP_INFO.remote_path_prefix)
+        if not remote_path:
+            msg = f"Remote {input_subdir} path is empty."
+            raise ValueError(msg)
+        return remote_path
     path = Path(file_path).expanduser()
     if not path.exists():
-        return str(file_path)
+        msg = (
+            f"Local {input_subdir} file does not exist: {file_path}. "
+            f"Use '{APP_INFO.remote_path_prefix}<path>' for an existing remote or "
+            "container path."
+        )
+        raise FileNotFoundError(msg)
     source = path.resolve()
     if not source.is_file():
         msg = f"Expected a file for {input_subdir}: {source}"
@@ -262,6 +288,46 @@ def stage_optional_local_file(
         )
         batch.put_file(source, f"/{volume_path.path}")
     return str(dest)
+
+
+def validate_task_config(payload: dict, task: str):
+    """Validate one Caliby YAML payload against the requested task schema."""
+    schema_by_task = {
+        "design": CalibyDesignConfig,
+        "ensemble_design": CalibyEnsembleDesignConfig,
+    }
+    try:
+        return schema_by_task[task].model_validate(payload)
+    except ValidationError as exc:
+        invalid_fields = sorted({
+            str(error["loc"][0])
+            for error in exc.errors()
+            if error.get("type") == "extra_forbidden" and error.get("loc")
+        })
+        if invalid_fields:
+            other_task = next(
+                candidate for candidate in APP_INFO.valid_tasks if candidate != task
+            )
+            field_list = ", ".join(invalid_fields)
+            msg = (
+                f"Input YAML does not match task='{task}'. This YAML contains "
+                f"fields that are not valid for this task: {field_list}. "
+                f"Use --task {other_task} if this is a {other_task} YAML, or "
+                f"pass a YAML file for task='{task}'."
+            )
+            raise ValidationError.from_exception_data(
+                title=exc.title,
+                line_errors=[
+                    {
+                        "type": "value_error",
+                        "loc": ("input_yaml",),
+                        "msg": msg,
+                        "input": payload,
+                        "ctx": {"error": ValueError(msg)},
+                    }
+                ],
+            ) from exc
+        raise
 
 
 ##########################################
@@ -490,9 +556,12 @@ def run_caliby_score_ensemble(
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
-    volumes=CONF.mounts(
-        output_volume=True, model_volume=True, model_mount_subdir=False
-    ),
+    volumes=CONF.mounts(output_volume=True)
+    | {
+        str(APP_INFO.full_model_volume_mount): MODEL_VOLUME.with_mount_options(
+            read_only=True
+        )
+    },
 )
 def run_caliby_generate_ensembles(
     run_name: str,
@@ -512,33 +581,26 @@ def run_caliby_generate_ensembles(
     if not input_dir.is_dir():
         msg = f"Caliby ensemble-generation input directory is missing: {input_dir}"
         raise FileNotFoundError(msg)
-    model_params_dir = Path("/tmp/caliby-model-params")  # noqa: S108
-    model_volume_root = Path(CONF.model_volume_mountpoint)
-    # Upstream generate_ensembles sets PROTEINMPNN_WEIGHTS and
-    # PROTPARDELLE_MODEL_PARAMS from fixed children of model_params_path.
-    # Biomodals stores those weights in shared volume namespaces, so this local
-    # symlink layout adapts the pinned upstream path contract without copying
-    # model artifacts into the container.
     model_links = {
-        model_params_dir / "proteinmpnn": model_volume_root / "LigandMPNN",
-        model_params_dir / "protpardelle-1c": model_volume_root
-        / CONF.name
+        APP_INFO.proteinmpnn_model_source: APP_INFO.caliby_model_params_mount
+        / "proteinmpnn",
+        APP_INFO.protpardelle_model_source: APP_INFO.caliby_model_params_mount
         / "protpardelle-1c",
     }
-    for link_path, source_dir in model_links.items():
+    for source_dir, link_path in model_links.items():
         if not source_dir.is_dir():
             msg = f"Caliby ensemble model directory is missing: {source_dir}"
             raise FileNotFoundError(msg)
+        # Modal rejects mounting the same volume twice in one function, so the
+        # shared model volume is mounted once and adapted to Caliby's expected
+        # Protpardelle model_params_path layout with local symlinks.
         softlink_dir(source_dir, link_path)
-    yaml_path = (
-        sampling_yaml_path
-        or "caliby/configs/protpardelle-1c/multichain_backbone_partial_diffusion.yaml"
-    )
+    yaml_path = sampling_yaml_path or APP_INFO.protpardelle_sampling_yaml_path
     cmd = [
         sys.executable,
         "-m",
         "caliby.eval.sampling.generate_ensembles",
-        f"model_params_path={model_params_dir}",
+        f"model_params_path={APP_INFO.caliby_model_params_mount}",
         f"sampling_yaml_path={yaml_path}",
         f"input_cfg.pdb_dir={input_dir}",
         f"num_samples_per_pdb={num_samples_per_pdb}",
@@ -650,14 +712,16 @@ def submit_caliby_task(
     Args:
         input_yaml: Path to a YAML file validated by `CalibyDesignConfig` when
             `task` is `design`, or `CalibyEnsembleDesignConfig` when `task` is
-            `ensemble_design`.
+            `ensemble_design`. Local optional files referenced by the YAML fail
+            fast when missing; use `remote:<path>` for existing remote/container
+            files.
         task: One of `design` or `ensemble_design`.
         out_dir: Optional local directory for packaged results. Defaults to the
             current directory. Set to an empty value from Python to leave results
             only in the Modal volume.
     """
-    if task not in VALID_TASKS:
-        raise ValueError(f"task must be one of {sorted(VALID_TASKS)}.")
+    if task not in APP_INFO.valid_tasks:
+        raise ValueError(f"task must be one of {sorted(APP_INFO.valid_tasks)}.")
 
     import yaml
 
@@ -666,10 +730,7 @@ def submit_caliby_task(
     if not isinstance(payload, dict):
         msg = f"Caliby input YAML must contain a mapping: {input_yaml}"
         raise ValueError(msg)
-    if task == "design":
-        config = CalibyDesignConfig.model_validate(payload)
-    else:
-        config = CalibyEnsembleDesignConfig.model_validate(payload)
+    config = validate_task_config(payload, task)
     run_name = sanitize_filename(config.run_name)
     remote_pos_constraint_csv = stage_optional_local_file(
         config.pos_constraint_csv,
@@ -688,10 +749,10 @@ def submit_caliby_task(
         stage_local_structures(config.input_path, run_name)
         run_caliby_seq_des.remote(
             run_name=run_name,
-            ckpt_name=DESIGN_MODEL_BY_TASK["design"],
+            ckpt_name=APP_INFO.design_model_by_task["design"],
             num_seqs_per_pdb=config.num_seqs_per_pdb,
-            batch_size=DEFAULT_BATCH_SIZE,
-            num_workers=DEFAULT_NUM_WORKERS,
+            batch_size=APP_INFO.default_batch_size,
+            num_workers=APP_INFO.default_num_workers,
             pos_constraint_csv=remote_pos_constraint_csv,
             pdb_name_list=remote_pdb_name_list,
             sampling_cfg_overrides=config.sampling_cfg_overrides,
@@ -699,54 +760,37 @@ def submit_caliby_task(
         if config.score_baseline:
             run_caliby_score.remote(
                 run_name=run_name,
-                ckpt_name=DESIGN_MODEL_BY_TASK["design"],
-                num_workers=DEFAULT_NUM_WORKERS,
+                ckpt_name=APP_INFO.design_model_by_task["design"],
+                num_workers=APP_INFO.default_num_workers,
                 pdb_name_list=remote_pdb_name_list,
             )
 
     if task == "ensemble_design":
         if not isinstance(config, CalibyEnsembleDesignConfig):
             raise TypeError("ensemble_design task requires CalibyEnsembleDesignConfig.")
-        conformer_dir = config.conformer_dir
-        input_path = config.input_path
-        if conformer_dir is None:
-            stage_local_structures(input_path, run_name)
-            clean_result = run_caliby_clean_pdbs.remote(
-                run_name=run_name,
-                num_workers=DEFAULT_NUM_WORKERS,
-                pdb_name_list=remote_pdb_name_list,
-            )
-            generate_result = run_caliby_generate_ensembles.remote(
-                run_name=run_name,
-                pdb_dir=clean_result["cleaned_structures_dir"],
-                num_samples_per_pdb=config.num_samples_per_pdb,
-                batch_size=DEFAULT_ENSEMBLE_BATCH_SIZE,
-                sampling_yaml_path=config.sampling_yaml_path,
-                seed=config.seed,
-                pdb_name_list=remote_pdb_name_list,
-            )
-            conformer_dir = generate_result["conformer_dir"]
-        else:
-            conformer_path = Path(conformer_dir).expanduser()
-            if conformer_path.exists():
-                dest = build_run_paths(run_name)["inputs_dir"] / "conformers"
-                with CONF.output_volume.batch_upload(force=True) as batch:
-                    volume_path = volume_path_from_mount_path(
-                        str(dest),
-                        str(CONF.output_volume_mountpoint),
-                        CONF.output_volume_name,
-                    )
-                    batch.put_directory(
-                        conformer_path.resolve(), f"/{volume_path.path}"
-                    )
-                conformer_dir = str(dest)
+        stage_local_structures(config.input_path, run_name)
+        clean_result = run_caliby_clean_pdbs.remote(
+            run_name=run_name,
+            num_workers=APP_INFO.default_num_workers,
+            pdb_name_list=remote_pdb_name_list,
+        )
+        generate_result = run_caliby_generate_ensembles.remote(
+            run_name=run_name,
+            pdb_dir=clean_result["cleaned_structures_dir"],
+            num_samples_per_pdb=config.num_samples_per_pdb,
+            batch_size=APP_INFO.default_ensemble_batch_size,
+            sampling_yaml_path=config.sampling_yaml_path,
+            seed=config.seed,
+            pdb_name_list=remote_pdb_name_list,
+        )
+        conformer_dir = generate_result["conformer_dir"]
         run_caliby_seq_des_ensemble.remote(
             run_name=run_name,
             conformer_dir=conformer_dir,
-            ckpt_name=DESIGN_MODEL_BY_TASK["ensemble_design"],
+            ckpt_name=APP_INFO.design_model_by_task["ensemble_design"],
             num_seqs_per_pdb=config.num_seqs_per_pdb,
-            batch_size=DEFAULT_BATCH_SIZE,
-            num_workers=DEFAULT_NUM_WORKERS,
+            batch_size=APP_INFO.default_batch_size,
+            num_workers=APP_INFO.default_num_workers,
             max_num_conformers=config.max_num_conformers,
             include_primary_conformer=config.include_primary_conformer,
             pos_constraint_csv=remote_pos_constraint_csv,
@@ -757,8 +801,8 @@ def submit_caliby_task(
             run_caliby_score_ensemble.remote(
                 run_name=run_name,
                 conformer_dir=conformer_dir,
-                ckpt_name=DESIGN_MODEL_BY_TASK["ensemble_design"],
-                num_workers=DEFAULT_NUM_WORKERS,
+                ckpt_name=APP_INFO.design_model_by_task["ensemble_design"],
+                num_workers=APP_INFO.default_num_workers,
                 max_num_conformers=config.max_num_conformers,
                 include_primary_conformer=config.include_primary_conformer,
                 pdb_name_list=remote_pdb_name_list,

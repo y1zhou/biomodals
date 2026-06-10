@@ -19,10 +19,9 @@ from biomodals.schema import (
 )
 from biomodals.workflow.core._runtime import availability
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
-from biomodals.workflow.core._runtime.volume_sync import WorkflowVolumeSync
+from biomodals.workflow.core._runtime.services import RuntimeServices
 from biomodals.workflow.core.artifacts import materialize_app_run_result
 from biomodals.workflow.core.builder import WorkflowDefinition
-from biomodals.workflow.core.ledger import WorkflowLedger
 from biomodals.workflow.core.nodes import NodeRunContext, WorkflowNode
 
 
@@ -32,18 +31,15 @@ class NodeRunner:
     def __init__(
         self,
         *,
-        ledger: WorkflowLedger,
-        volume_root: Path,
-        workflow_volume_name: str,
-        volume_sync: WorkflowVolumeSync,
+        services: RuntimeServices,
         remote_calls: RemoteCallManager,
         node_is_complete: Callable[[str], bool],
         max_ready_workers: int,
     ) -> None:
-        self.ledger = ledger
-        self.volume_root = volume_root
-        self.workflow_volume_name = workflow_volume_name
-        self.volume_sync = volume_sync
+        self.ledger = services.ledger
+        self.volume_root = services.volume_root
+        self.workflow_volume_name = services.workflow_volume_name
+        self.volume_sync = services.volume_sync
         self.remote_calls = remote_calls
         self.node_is_complete = node_is_complete
         self.max_ready_workers = max_ready_workers

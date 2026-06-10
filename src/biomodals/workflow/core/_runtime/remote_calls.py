@@ -12,8 +12,7 @@ import orjson
 
 import biomodals.workflow.core.display as workflow_display
 from biomodals.schema import AppRunResult
-from biomodals.workflow.core._runtime.volume_sync import WorkflowVolumeSync
-from biomodals.workflow.core.ledger import WorkflowLedger
+from biomodals.workflow.core._runtime.services import RuntimeServices
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
     RemoteFunctionCall,
@@ -39,13 +38,12 @@ class RemoteCallManager:
     def __init__(
         self,
         *,
-        ledger: WorkflowLedger,
-        volume_sync: WorkflowVolumeSync,
+        services: RuntimeServices,
         function_call_resolver: FunctionCallResolver | None,
         remote_call_poll_timeout: float | int,
     ) -> None:
-        self.ledger = ledger
-        self.volume_sync = volume_sync
+        self.ledger = services.ledger
+        self.volume_sync = services.volume_sync
         self.function_call_resolver = function_call_resolver
         self.remote_call_poll_timeout = remote_call_poll_timeout
         self._active_remote_calls: dict[str, RemoteFunctionCall] = {}

@@ -16,6 +16,7 @@ from biomodals.schema import (
 from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
 from biomodals.workflow.core._runtime.node_runner import NodeRunner
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
+from biomodals.workflow.core._runtime.services import RuntimeServices
 from biomodals.workflow.core._runtime.volume_sync import (
     WorkflowVolume,
     WorkflowVolumeSync,
@@ -45,35 +46,32 @@ class WorkflowRuntime:
     ):
         """Initialize a runtime for one workflow and ledger root."""
         self.workflow = workflow
-        self.volume_root = Path(volume_root)
-        self.workflow_volume_name = workflow_volume_name
-        self.workflow_volume = workflow_volume
-        self.function_call_resolver = function_call_resolver
-        self.remote_call_poll_timeout = remote_call_poll_timeout
-        self.max_ready_workers = max_ready_workers
-        self.ledger = WorkflowLedger(self.volume_root)
+        volume_root_path = Path(volume_root)
+        self.ledger = WorkflowLedger(volume_root_path)
         # TODO: Replace this debug-only wave history with structured scheduling
         # diagnostics that can record ready/completed/blocked reasons and timing
         # without expanding the public workflow API.
         self.executed_waves: list[list[str]] = []
         self._volume_sync = WorkflowVolumeSync(
-            workflow_volume=self.workflow_volume,
+            workflow_volume=workflow_volume,
             ledger=self.ledger,
+        )
+        self._services = RuntimeServices(
+            ledger=self.ledger,
+            volume_root=volume_root_path,
+            workflow_volume_name=workflow_volume_name,
+            volume_sync=self._volume_sync,
         )
         self._remote_calls = RemoteCallManager(
-            ledger=self.ledger,
-            volume_sync=self._volume_sync,
-            function_call_resolver=self.function_call_resolver,
-            remote_call_poll_timeout=self.remote_call_poll_timeout,
+            services=self._services,
+            function_call_resolver=function_call_resolver,
+            remote_call_poll_timeout=remote_call_poll_timeout,
         )
         self._node_runner = NodeRunner(
-            ledger=self.ledger,
-            volume_root=self.volume_root,
-            workflow_volume_name=self.workflow_volume_name,
-            volume_sync=self._volume_sync,
+            services=self._services,
             remote_calls=self._remote_calls,
             node_is_complete=self._node_is_complete,
-            max_ready_workers=self.max_ready_workers,
+            max_ready_workers=max_ready_workers,
         )
 
     def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
@@ -89,8 +87,7 @@ class WorkflowRuntime:
             definition,
             run_id=run_id,
             force=force,
-            ledger=self.ledger,
-            volume_sync=self._volume_sync,
+            services=self._services,
         )
 
         while True:
@@ -157,8 +154,8 @@ class WorkflowRuntime:
         return availability.format_artifact_availability_errors(
             availability.artifact_availability_errors(
                 artifact,
-                workflow_volume_name=self.workflow_volume_name,
-                volume_root=self.volume_root,
+                workflow_volume_name=self._services.workflow_volume_name,
+                volume_root=self._services.volume_root,
                 run_root=self.ledger.run_root,
             )
         )

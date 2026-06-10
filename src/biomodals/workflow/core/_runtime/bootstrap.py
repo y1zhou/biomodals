@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from biomodals.schema import RunStatus, WorkflowRun
 from biomodals.workflow.core._runtime import hashing
-from biomodals.workflow.core._runtime.volume_sync import WorkflowVolumeSync
+from biomodals.workflow.core._runtime.services import RuntimeServices
 from biomodals.workflow.core.builder import WorkflowDefinition
-from biomodals.workflow.core.ledger import WorkflowLedger
 
 
 def start_run(
@@ -14,10 +13,11 @@ def start_run(
     *,
     run_id: str,
     force: bool,
-    ledger: WorkflowLedger,
-    volume_sync: WorkflowVolumeSync,
+    services: RuntimeServices,
 ) -> None:
     """Prepare durable run state before the scheduler loop starts."""
+    ledger = services.ledger
+    volume_sync = services.volume_sync
     dag_hash = hashing.dag_hash(definition)
     volume_sync.reload()
     run_exists = ledger.run_exists(definition.name, run_id)

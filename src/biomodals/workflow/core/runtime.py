@@ -12,9 +12,8 @@ from biomodals.schema import (
     NodeStatus,
     RunStatus,
     WorkflowArtifact,
-    WorkflowRun,
 )
-from biomodals.workflow.core._runtime import availability, hashing, scheduler
+from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
 from biomodals.workflow.core._runtime.node_runner import NodeRunner
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
 from biomodals.workflow.core._runtime.volume_sync import (
@@ -80,41 +79,19 @@ class WorkflowRuntime:
     def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
         """Run the workflow until every node succeeds or no progress is possible."""
         definition = self.workflow.validate()
-        dag_hash = hashing.dag_hash(definition)
         workflow_display.print_workflow_message(
             f"[workflow] Starting workflow '{definition.name}' run '{run_id}' "
             f"with {len(definition.nodes)} node(s)",
             style="bold cyan",
         )
         workflow_display.print_workflow_dag(definition)
-        self._volume_sync.reload()
-        run_exists = self.ledger.run_exists(definition.name, run_id)
-        if run_exists and force:
-            self.ledger.reset_run(definition.name, run_id)
-            self._volume_sync.commit()
-            self.ledger.create_run(
-                WorkflowRun(
-                    workflow_name=definition.name, run_id=run_id, dag_hash=dag_hash
-                )
-            )
-            self._volume_sync.commit()
-        elif run_exists:
-            existing_run = self.ledger.load_run(definition.name, run_id)
-            if existing_run.dag_hash is not None and existing_run.dag_hash != dag_hash:
-                raise ValueError(
-                    "DAG hash does not match existing workflow run; rerun with force"
-                )
-        else:
-            self.ledger.create_run(
-                WorkflowRun(
-                    workflow_name=definition.name,
-                    run_id=run_id,
-                    dag_hash=dag_hash,
-                )
-            )
-            self._volume_sync.commit()
-        self.ledger.mark_run_status(RunStatus.RUNNING)
-        self._volume_sync.commit()
+        bootstrap.start_run(
+            definition,
+            run_id=run_id,
+            force=force,
+            ledger=self.ledger,
+            volume_sync=self._volume_sync,
+        )
 
         while True:
             decision = scheduler.evaluate_progress(

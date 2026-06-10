@@ -12,9 +12,9 @@ from pydantic import BaseModel, computed_field, model_validator
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.helper.shell import run_command, sanitize_filename
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
 
 ##########################################

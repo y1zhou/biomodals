@@ -444,7 +444,7 @@ source app module rather than hardcoding them in the workflow.
 
 When an app function returns an absolute path under its mounted volume, convert
 that path to workflow storage with
-`biomodals.helper.volume_run.volume_path_from_mount_path(...)`. The helper takes
+`biomodals.helper.app_run.volume_path_from_mount_path(...)`. The helper takes
 `str` inputs and returns a single validated `VolumePath`; do not construct a
 `VolumePath` only to extract `.path` and wrap it again.
 

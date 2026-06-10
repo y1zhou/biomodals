@@ -40,6 +40,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
@@ -53,7 +54,6 @@ from biomodals.helper.shell import (
     sanitize_filename,
     softlink_dir,
 )
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.schema import (
     AppOutput,
     AppRunResult,

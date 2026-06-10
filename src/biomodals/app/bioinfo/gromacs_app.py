@@ -18,9 +18,9 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
-from biomodals.helper.volume_run import volume_path_from_mount_path
 
 ##########################################
 # Modal configs

@@ -1,13 +1,49 @@
-"""Pure helpers for Modal volume-backed run state.
+"""Helpers for Biomodals app run paths and volume-backed artifacts.
 
-These helpers intentionally cover only path and completion policies. Locking
-semantics stay owned by the app code unless a caller explicitly moves to a
+These helpers intentionally cover only path and completion policies. Locking and
+queue semantics stay owned by app code unless a caller explicitly moves to a
 Modal-supported atomic primitive.
 """
 
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from biomodals.schema import VolumePath
+
+
+@dataclass(frozen=True)
+class AppRunLayout:
+    """Standard directory contract for one Biomodals app run.
+
+    The layout only describes paths and never creates directories. Callers can
+    use the same contract for container-local scratch directories and mounted
+    Modal output volumes.
+    """
+
+    run_root: Path
+    inputs_dir: Path
+    prep_dir: Path
+    outputs_dir: Path
+    logs_dir: Path
+    failures_dir: Path
+    metrics_dir: Path
+    markers_dir: Path
+
+    @classmethod
+    def from_run_root(cls, run_root: str | Path) -> "AppRunLayout":
+        """Build the standard layout below a resolved per-run root directory."""
+        root = Path(run_root)
+        outputs_dir = root / "outputs"
+        return cls(
+            run_root=root,
+            inputs_dir=root / "inputs",
+            prep_dir=root / "prepare",
+            outputs_dir=outputs_dir,
+            logs_dir=root / "logs",
+            failures_dir=outputs_dir / "failed_records",
+            metrics_dir=root / "metrics",
+            markers_dir=root / ".markers",
+        )
 
 
 def volume_path_from_mount_path(
@@ -40,26 +76,25 @@ def build_volume_run_paths(
     *,
     metrics_filename: str | None = None,
 ) -> dict[str, Path]:
-    """Return standard volume run paths without creating directories.
+    """Return legacy volume run path keys without creating directories.
 
-    The returned keys match the current AF3Score run-state policy:
+    The returned keys match the current AF3Score and IgGM run-state policy:
     ``mount_root``, ``run_root``, ``inputs_dir``, ``prep_dir``, ``output_dir``,
     ``failed_dir``, and optionally ``metrics_csv`` when ``metrics_filename`` is
     provided.
     """
     mount_root_path = Path(mount_root)
-    run_root = mount_root_path / run_name
-    output_dir = run_root / "outputs"
+    layout = AppRunLayout.from_run_root(mount_root_path / run_name)
     paths = {
         "mount_root": mount_root_path,
-        "run_root": run_root,
-        "inputs_dir": run_root / "inputs",
-        "prep_dir": run_root / "prepare",
-        "output_dir": output_dir,
-        "failed_dir": output_dir / "failed_records",
+        "run_root": layout.run_root,
+        "inputs_dir": layout.inputs_dir,
+        "prep_dir": layout.prep_dir,
+        "output_dir": layout.outputs_dir,
+        "failed_dir": layout.failures_dir,
     }
     if metrics_filename is not None:
-        paths["metrics_csv"] = run_root / metrics_filename
+        paths["metrics_csv"] = layout.run_root / metrics_filename
     return paths
 
 

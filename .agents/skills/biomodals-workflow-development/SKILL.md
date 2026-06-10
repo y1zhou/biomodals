@@ -52,8 +52,8 @@ because it is expected to be refactored.
   functions.
 - Import app-owned volume handles, volume names, and mountpoints from source app
   modules. Avoid duplicating volume strings in workflow scripts.
-- Use `volume_path_from_mount_path(...)` to convert mounted app paths into
-  `VolumePath` workflow storage references.
+- Use `volume_path_from_mount_path(...)` from `biomodals.helper.app_run` to
+  convert mounted app paths into `VolumePath` workflow storage references.
 - Materialize inline workflow outputs once under
   `nodes/<node-id>/attempts/<attempt-id>/<artifact-id>/` and store materialized
   `VolumePath` app-result JSON in the ledger; do not persist base64

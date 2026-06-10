@@ -138,9 +138,12 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
   `VOLUME.commit()`.
 - Use `CONF.output_volume` and `CONF.mounts(output_volume=True)` for
   app-specific persistent outputs; output volumes are normally mounted whole.
-- Use `volume_path_from_mount_path(...)` when printing or returning remote
-  volume paths so logs show a validated `VolumePath` instead of an ambiguous
-  absolute container path.
+- Use `AppRunLayout` from `biomodals.helper.app_run` for new per-run
+  app output paths so local entrypoints, remote functions, and workflow-compatible
+  functions share the same directory contract.
+- Use `volume_path_from_mount_path(...)` from `biomodals.helper.app_run` when
+  printing or returning remote volume paths so logs show a validated `VolumePath`
+  instead of an ambiguous absolute container path.
 
 ## Remote Functions
 

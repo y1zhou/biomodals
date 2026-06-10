@@ -21,8 +21,8 @@ import polars as pl
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.shell import package_outputs, warmup_directory
-from biomodals.helper.volume_run import volume_path_from_mount_path
 
 ##########################################
 # Modal configs

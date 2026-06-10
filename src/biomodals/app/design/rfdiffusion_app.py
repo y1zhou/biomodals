@@ -25,6 +25,7 @@ from modal import App, Image
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
@@ -34,7 +35,6 @@ from biomodals.helper.shell import (
     softlink_dir,
     warmup_directory,
 )
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.helper.web import download_files
 from biomodals.schema import (
     AppOutput,

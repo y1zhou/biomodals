@@ -74,6 +74,10 @@ _Avoid_: app config, internal model
 The pure Pydantic fields and validators that describe a Biomodals app's metadata and runtime settings.
 _Avoid_: Modal volume factory, image helper
 
+**App Run Layout**:
+A standard per-run directory contract for Biomodals apps that defines where inputs, outputs, logs, failures, metrics, and completion markers live under an app's local scratch directory or mounted output volume.
+_Avoid_: ad hoc workdir, loose output folder, app-specific run paths
+
 **App-Backed Node**:
 A workflow node implemented by calling one or more app functions.
 _Avoid_: app node, runner node
@@ -165,6 +169,8 @@ _Avoid_: temporary scratch, local cache
 - An **App Configuration Schema** lives in `biomodals.schema` when it is shared across apps.
 - Modal-specific helpers that construct volumes, images, or app objects wrap the **App Configuration Schema** outside `biomodals.schema`.
 - App-specific configuration models remain with their app until they become stable cross-module contracts.
+- Every **App** should use an **App Run Layout** for new run-output code so local entrypoints, remote app functions, workflow-compatible app functions, and tests agree on durable path conventions.
+- A **Workflow-Compatible App Function** should return outputs from an **App Run Layout** as `AppRunResult` records with explicit `VolumePath` or `InlineBytes` storage.
 - An **App-Backed Node** calls one or more **App Functions** and processes their outputs into workflow artifacts.
 - A **Workflow-Native Node** performs lightweight workflow logic without calling a bioinformatics app.
 - **Workflow Node**, **App-Backed Node**, and **Workflow-Native Node** contracts are package-development APIs for maintainers implementing reusable workflows; routine workflow users should work through the **Workflow Builder** and **Workflow Orchestrator** instead of runtime node internals.

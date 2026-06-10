@@ -13,10 +13,10 @@ import yaml
 
 from biomodals.app.design import ppiflow_app
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.schema import (
     AppConfig,
     AppRunResult,

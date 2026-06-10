@@ -67,8 +67,15 @@ def run_command(
     """
     import shlex
     import subprocess as sp
-    from datetime import UTC, datetime, timedelta
+    from datetime import datetime, timedelta
     from time import time
+
+    if sys.version_info >= (3, 11):  # noqa: UP036
+        from datetime import UTC
+    else:
+        from datetime import timezone
+
+        UTC = timezone.utc  # noqa: UP017
 
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)

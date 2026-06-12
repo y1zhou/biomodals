@@ -11,6 +11,7 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.app.design import boltzgen_app
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import package_outputs, run_command, warmup_directory
@@ -67,7 +68,10 @@ def compress_one_run(dir_name: str) -> str:
     """Compress a previous BoltzGen run and return the .tar.zst file name."""
     import subprocess
 
-    dir_path = Path(BG_CONF.output_volume_mountpoint) / dir_name
+    layout = AppRunLayout.from_run_root(
+        Path(BG_CONF.output_volume_mountpoint) / dir_name
+    )
+    dir_path = layout.run_root
     if not dir_path.exists():
         raise FileNotFoundError(f"Directory not found: {dir_path}")
 

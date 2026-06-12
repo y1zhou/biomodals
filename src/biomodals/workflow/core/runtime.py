@@ -23,9 +23,7 @@ from biomodals.workflow.core._runtime.volume_sync import (
 )
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.ledger import WorkflowLedger
-from biomodals.workflow.core.nodes import (
-    RemoteFunctionCall,
-)
+from biomodals.workflow.core.nodes import RemoteFunctionCall
 
 FunctionCallResolver = Callable[[str], RemoteFunctionCall]
 

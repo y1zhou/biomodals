@@ -8,7 +8,6 @@ import pytest
 
 from biomodals.helper.app_run import (
     AppRunLayout,
-    build_volume_run_paths,
     has_completed_output_files,
     volume_path_from_mount_path,
 )
@@ -31,25 +30,6 @@ def test_app_run_layout_builds_standard_paths_without_creating_dirs(
     assert layout.metrics_dir == run_root / "metrics"
     assert layout.markers_dir == run_root / ".markers"
     assert not run_root.exists()
-
-
-def test_build_volume_run_paths_preserves_legacy_keys() -> None:
-    """Existing apps can keep their dict-based path access during migration."""
-    paths = build_volume_run_paths(
-        "/outputs",
-        "run-1",
-        metrics_filename="metrics.csv",
-    )
-
-    assert paths == {
-        "mount_root": Path("/outputs"),
-        "run_root": Path("/outputs/run-1"),
-        "inputs_dir": Path("/outputs/run-1/inputs"),
-        "prep_dir": Path("/outputs/run-1/prepare"),
-        "output_dir": Path("/outputs/run-1/outputs"),
-        "failed_dir": Path("/outputs/run-1/outputs/failed_records"),
-        "metrics_csv": Path("/outputs/run-1/metrics.csv"),
-    }
 
 
 def test_has_completed_output_files_checks_required_files(tmp_path: Path) -> None:

@@ -70,34 +70,6 @@ def volume_path_from_mount_path(
     )
 
 
-def build_volume_run_paths(
-    mount_root: str | Path,
-    run_name: str,
-    *,
-    metrics_filename: str | None = None,
-) -> dict[str, Path]:
-    """Return legacy volume run path keys without creating directories.
-
-    The returned keys match the current AF3Score and IgGM run-state policy:
-    ``mount_root``, ``run_root``, ``inputs_dir``, ``prep_dir``, ``output_dir``,
-    ``failed_dir``, and optionally ``metrics_csv`` when ``metrics_filename`` is
-    provided.
-    """
-    mount_root_path = Path(mount_root)
-    layout = AppRunLayout.from_run_root(mount_root_path / run_name)
-    paths = {
-        "mount_root": mount_root_path,
-        "run_root": layout.run_root,
-        "inputs_dir": layout.inputs_dir,
-        "prep_dir": layout.prep_dir,
-        "output_dir": layout.outputs_dir,
-        "failed_dir": layout.failures_dir,
-    }
-    if metrics_filename is not None:
-        paths["metrics_csv"] = layout.run_root / metrics_filename
-    return paths
-
-
 def has_completed_output_files(
     output_dir: str | Path,
     input_id: str,

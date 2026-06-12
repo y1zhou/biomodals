@@ -26,7 +26,7 @@ import modal
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
-    build_volume_run_paths,
+    AppRunLayout,
     has_completed_output_files,
     volume_path_from_mount_path,
 )
@@ -161,15 +161,10 @@ def af3score_manage_lock(run_name: str, acquire: bool = True) -> None:
     """Internal-only remote helper for acquiring or releasing one run-level lock."""
     # TODO: replace with a task queue; mkdir in Volumes may not be atomic
     CONF.output_volume.reload()
-    paths = build_volume_run_paths(
-        CONF.output_volume_mountpoint,
-        run_name,
-        metrics_filename=APP_INFO.metrics_filename,
-    )
-    root_dir = paths["run_root"]
-    lock_dir = root_dir / ".run.lock"
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    lock_dir = layout.run_root / ".run.lock"
     if acquire:
-        root_dir.mkdir(parents=True, exist_ok=True)
+        layout.run_root.mkdir(parents=True, exist_ok=True)
         try:
             lock_dir.mkdir()
         except FileExistsError as exc:
@@ -195,26 +190,22 @@ def af3score_prepare(
 ) -> TaskSpec:
     """Prepare AF3Score batches from staged inputs."""
     CONF.output_volume.reload()
-    paths = build_volume_run_paths(
-        CONF.output_volume_mountpoint,
-        run_name,
-        metrics_filename=APP_INFO.metrics_filename,
-    )
-    staged_dir = paths["inputs_dir"].resolve()
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    staged_dir = layout.inputs_dir.resolve()
     if not staged_dir.exists():
         raise FileNotFoundError(f"Staged input directory not found: {staged_dir}")
 
-    for path in (paths["output_dir"], paths["failed_dir"]):
+    for path in (layout.outputs_dir, layout.failures_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     all_files = [staged_dir / input_name for input_name in input_files]
     input_names = [path.name for path in all_files]
     total_files = len(all_files)
-    print(f"💊 [PREP] Processing {total_files} files in '{paths['run_root']}'")
+    print(f"💊 [PREP] Processing {total_files} files in '{layout.run_root}'")
 
     pending_files: list[Path] = []
     skipped = 0
-    out_dir = paths["output_dir"]
+    out_dir = layout.outputs_dir
     for pdb_file in all_files:
         if has_completed_output_files(
             out_dir,
@@ -234,10 +225,10 @@ def af3score_prepare(
             input_files=input_names,
             chunk_specs=[],
             output_dir=str(out_dir),
-            failed_dir=str(paths["failed_dir"]),
+            failed_dir=str(layout.failures_dir),
         )
 
-    prepare_root = paths["prep_dir"]
+    prepare_root = layout.prep_dir
     pending_input_dir = prepare_root / "pending_inputs"
     batch_dir = prepare_root / "input_batch"
     if prepare_root.exists():
@@ -285,8 +276,8 @@ def af3score_prepare(
         skipped=skipped,
         input_files=input_names,
         chunk_specs=chunk_specs,
-        output_dir=str(paths["output_dir"]),
-        failed_dir=str(paths["failed_dir"]),
+        output_dir=str(layout.outputs_dir),
+        failed_dir=str(layout.failures_dir),
     )
 
 
@@ -304,11 +295,7 @@ def af3score_run(
 ) -> None:
     """Run one AF3Score batch."""
     CONF.output_volume.reload()
-    paths = build_volume_run_paths(
-        CONF.output_volume_mountpoint,
-        run_name,
-        metrics_filename=APP_INFO.metrics_filename,
-    )
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
     af3_weights = Path(CONF.model_volume_mountpoint) / APP_INFO.af3_weights
     if not af3_weights.exists():
         raise FileNotFoundError(f"AlphaFold3 model weights not found: {af3_weights}")
@@ -331,7 +318,7 @@ def af3score_run(
 
         # TODO: this or reuse AlphaFold3 buckets?
         bucket = batch_name.rsplit("_", 1)[-1]
-        out_dir = paths["output_dir"]
+        out_dir = layout.outputs_dir
         print(f"💊 [RUN] Starting AF3Score batch '{batch_name}'")
         run_command(
             [
@@ -369,21 +356,17 @@ def af3score_run(
 def af3score_postprocess(run_name: str, input_files: list[str]) -> dict[str, int | str]:
     """Validate records and collect metrics for all inputs."""
     CONF.output_volume.reload()
-    paths = build_volume_run_paths(
-        CONF.output_volume_mountpoint,
-        run_name,
-        metrics_filename=APP_INFO.metrics_filename,
-    )
-    for path in (paths["output_dir"], paths["failed_dir"]):
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    for path in (layout.outputs_dir, layout.failures_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     processed = 0
     failed = 0
     completed_output_dirs: list[Path] = []
-    out_dir = paths["output_dir"]
+    out_dir = layout.outputs_dir
     for input_name in input_files:
         input_id = Path(input_name).stem
-        failed_record = paths["failed_dir"] / f"{input_id}.err"
+        failed_record = layout.failures_dir / f"{input_id}.err"
         if has_completed_output_files(
             out_dir,
             input_id,
@@ -400,7 +383,7 @@ def af3score_postprocess(run_name: str, input_files: list[str]) -> dict[str, int
             )
             failed += 1
 
-    out_csv_path = paths["metrics_csv"]
+    out_csv_path = layout.run_root / APP_INFO.metrics_filename
     if not completed_output_dirs:
         if out_csv_path.exists():
             out_csv_path.unlink()
@@ -420,7 +403,7 @@ def af3score_postprocess(run_name: str, input_files: list[str]) -> dict[str, int
         run_command([
             sys.executable,
             str(CONF.git_clone_dir / "04_get_metrics.py"),
-            f"--input_pdb_dir={paths['inputs_dir']}",
+            f"--input_pdb_dir={layout.inputs_dir}",
             f"--af3score_output_dir={metrics_view_dir}",
             f"--save_metric_csv={out_csv_path}",
             f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",
@@ -429,12 +412,12 @@ def af3score_postprocess(run_name: str, input_files: list[str]) -> dict[str, int
     with out_csv_path.open(encoding="utf-8") as f:
         metrics_rows = max(0, sum(1 for _ in f) - 1)
 
-    if paths["prep_dir"].exists():
-        shutil.rmtree(paths["prep_dir"])
+    if layout.prep_dir.exists():
+        shutil.rmtree(layout.prep_dir)
     CONF.output_volume.commit()
     return {
         "output_dir": str(out_dir),
-        "failed_dir": str(paths["failed_dir"]),
+        "failed_dir": str(layout.failures_dir),
         "total": len(input_files),
         "processed": processed,
         "failed": failed,
@@ -479,11 +462,9 @@ def submit_af3score_task(
     print(f"🧬 Total files: {num_files} found in '{input_root}'")
 
     run_name = sanitize_filename(run_name)
-    run_paths = build_volume_run_paths(
-        CONF.output_volume_mountpoint,
-        run_name,
-        metrics_filename=APP_INFO.metrics_filename,
-    )
+    mount_root = Path(CONF.output_volume_mountpoint)
+    layout = AppRunLayout.from_run_root(mount_root / run_name)
+    metrics_csv = layout.run_root / APP_INFO.metrics_filename
     if not force:
         for x in CONF.output_volume.iterdir("/"):
             if x.path == run_name:
@@ -491,14 +472,14 @@ def submit_af3score_task(
                     f"Run name '{run_name}' already exists in Modal volume."
                 )
     remote_run_dir = volume_path_from_mount_path(
-        str(run_paths["run_root"]),
+        str(layout.run_root),
         CONF.output_volume_mountpoint,
         CONF.output_volume_name,
     )
     af3score_manage_lock.remote(run_name=run_name, acquire=True)
     try:
         print(f"🧬 Uploading '{input_root}' to {remote_run_dir}")
-        stage_root = run_paths["inputs_dir"].relative_to(run_paths["mount_root"])
+        stage_root = layout.inputs_dir.relative_to(mount_root)
         with CONF.output_volume.batch_upload(force=force) as batch:
             if num_files == 1:
                 f = all_files[0]
@@ -562,7 +543,7 @@ def submit_af3score_task(
             print("🧬 Downloading metrics CSV...")
             with open(local_metrics_csv, "wb") as f:
                 for chunk in CONF.output_volume.read_file(
-                    str(run_paths["metrics_csv"].relative_to(run_paths["mount_root"]))
+                    str(metrics_csv.relative_to(mount_root))
                 ):
                     f.write(chunk)
             print(f"🧬 Local metrics CSV: {local_metrics_csv}")

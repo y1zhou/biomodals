@@ -24,6 +24,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import package_outputs
 from biomodals.helper.web import download_files
@@ -254,8 +255,13 @@ def prepare_abcfold2(
     run_id: str = get_run_id.local(yaml_str=yaml_str)
     if not search_templates:
         run_id = f"{run_id}-no-tmpl"
-    out_root = Path(CONF.output_volume_mountpoint)
-    out_dir_full: Path = out_root / run_id[:2] / run_id
+    layout = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_id[:2] / run_id
+    )
+    # TODO: ABCFold2 upstream writes msa/, boltz_models/, and chai_models/
+    # below the run root. A workflow-compatible wrapper could map these into
+    # inputs/prep/outputs without changing the cached upstream workdir.
+    out_dir_full = layout.run_root
     out_dir_full.mkdir(parents=True, exist_ok=True)
 
     # Check if MSA and templates were already generated for a previous run with same ID
@@ -274,7 +280,9 @@ def prepare_abcfold2(
                 force=True,
                 chains=msa_chains,
                 search_templates=search_templates,
-                template_cache_dir=out_root / ".cache" / "rcsb",
+                template_cache_dir=Path(CONF.output_volume_mountpoint)
+                / ".cache"
+                / "rcsb",
             )
             CONF.output_volume.commit()
 

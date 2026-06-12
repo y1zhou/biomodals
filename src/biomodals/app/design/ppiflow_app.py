@@ -12,7 +12,7 @@ from pydantic import BaseModel, computed_field, model_validator
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import volume_path_from_mount_path
+from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.helper.shell import run_command, sanitize_filename
 from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
@@ -303,11 +303,11 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     """Actual remote runner of PPIFlow."""
     import sys
 
-    workdir = Path(CONF.output_volume_mountpoint) / run_name
-    out_dir = workdir / "outputs"
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    out_dir = layout.outputs_dir
     if out_dir.exists():
         print(f"💊 Output path {out_dir} already exists.")
-        return str(workdir)
+        return str(layout.run_root)
 
     # Build command
     model_weights_path = Path(CONF.model_volume_mountpoint) / args.model_weights_name
@@ -321,12 +321,13 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     ]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = workdir / f"{CONF.name}-run.log"
+    layout.logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = layout.logs_dir / f"{CONF.name}-run.log"
     print(f"💊 Running {CONF.name}, saving logs to {log_path}")
     run_command(cmd, output_mode="capture", log_file=log_path)
 
     CONF.output_volume.commit()
-    return str(workdir)
+    return str(layout.run_root)
 
 
 @app.function(

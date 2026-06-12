@@ -20,6 +20,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
@@ -190,24 +191,23 @@ def build_base_command(
     import tempfile
     from pathlib import Path
 
-    workdir = Path(tempfile.gettempdir()) / run_name
-    for d in ("inputs", "outputs"):
-        (workdir / d).mkdir(parents=True, exist_ok=True)
+    layout = AppRunLayout.from_run_root(Path(tempfile.gettempdir()) / run_name)
+    for path in (layout.inputs_dir, layout.outputs_dir, layout.logs_dir):
+        path.mkdir(parents=True, exist_ok=True)
 
     # Build command
-    # cli_args["--out_folder"] = str(workdir / "outputs")
-    input_pdb_file = workdir / "inputs" / f"{run_name}.pdb"
+    input_pdb_file = layout.inputs_dir / f"{run_name}.pdb"
     with open(input_pdb_file, "wb") as f:
         f.write(struct_bytes)
         cli_args["--pdb_path"] = str(input_pdb_file)
 
     if bias_aa_per_residue_bytes is not None:
-        bias_aa_per_res_file = workdir / "inputs" / "bias_AA_per_residue.json"
+        bias_aa_per_res_file = layout.inputs_dir / "bias_AA_per_residue.json"
         with open(bias_aa_per_res_file, "wb") as f:
             f.write(bias_aa_per_residue_bytes)
             cli_args["--bias_AA_per_residue"] = str(bias_aa_per_res_file)
     if omit_aa_per_residue_bytes is not None:
-        omit_aa_per_res_file = workdir / "inputs" / "omit_AA_per_residue.json"
+        omit_aa_per_res_file = layout.inputs_dir / "omit_AA_per_residue.json"
         with open(omit_aa_per_res_file, "wb") as f:
             f.write(omit_aa_per_residue_bytes)
             cli_args["--omit_AA_per_residue"] = str(omit_aa_per_res_file)
@@ -224,7 +224,7 @@ def build_base_command(
         else:
             cmd.extend([str(arg), str(val)])
 
-    return cmd, workdir
+    return cmd, layout.run_root
 
 
 def _ligandmpnn_run(
@@ -253,7 +253,8 @@ def _ligandmpnn_run(
         omit_aa_per_residue_bytes,
     )
 
-    log_path = workdir / "ligandmpnn.log"
+    layout = AppRunLayout.from_run_root(workdir)
+    log_path = layout.logs_dir / "ligandmpnn.log"
     print(f"💊 Running LigandMPNN, saving logs to {log_path}")
     for seed in tqdm(seeds, desc="Inference seeds"):
         cmd = [
@@ -261,7 +262,7 @@ def _ligandmpnn_run(
             "--seed",
             str(seed),
             "--out_folder",
-            str(workdir / "outputs" / f"seed-{seed}"),
+            str(layout.outputs_dir / f"seed-{seed}"),
         ]
         run_command(
             cmd,
@@ -272,9 +273,9 @@ def _ligandmpnn_run(
 
     # Convert .pt outputs to numpy
     print("💊 Converting .pt outputs to numpy...")
-    torch_files = find_with_fd(workdir / "outputs", r"\.pt$")
+    torch_files = find_with_fd(layout.outputs_dir, r"\.pt$")
     for torch_file in torch_files:
-        f = workdir / "outputs" / torch_file
+        f = layout.outputs_dir / torch_file
         np_dict = torch_to_numpy(f)
         f_path = Path(f)
         npz_path = f_path.with_suffix(".npz")
@@ -284,7 +285,7 @@ def _ligandmpnn_run(
         f_path.unlink()  # remove .pt file
 
     print("💊 Packaging results...")
-    tar_bytes = package_outputs(workdir, paths_to_bundle=["outputs", log_path.name])
+    tar_bytes = package_outputs(workdir, paths_to_bundle=["outputs", "logs"])
     return tar_bytes
 
 

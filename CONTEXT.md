@@ -171,6 +171,7 @@ _Avoid_: temporary scratch, local cache
 - App-specific configuration models remain with their app until they become stable cross-module contracts.
 - Every **App** should use an **App Run Layout** for new run-output code so local entrypoints, remote app functions, workflow-compatible app functions, and tests agree on durable path conventions.
 - A **Workflow-Compatible App Function** should return outputs from an **App Run Layout** as `AppRunResult` records with explicit `VolumePath` or `InlineBytes` storage.
+- A durable **Workflow-Compatible App Function** should report app outputs from the `outputs/` directory and logs from the `logs/` directory in its **App Run Layout**.
 - An **App-Backed Node** calls one or more **App Functions** and processes their outputs into workflow artifacts.
 - A **Workflow-Native Node** performs lightweight workflow logic without calling a bioinformatics app.
 - **Workflow Node**, **App-Backed Node**, and **Workflow-Native Node** contracts are package-development APIs for maintainers implementing reusable workflows; routine workflow users should work through the **Workflow Builder** and **Workflow Orchestrator** instead of runtime node internals.

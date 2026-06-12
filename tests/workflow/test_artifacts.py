@@ -602,7 +602,7 @@ def test_archive_outputs_use_volume_path_metadata(tmp_path: Path) -> None:
                 kind=ArtifactKind.ARCHIVE,
                 storage=VolumePath(
                     volume_name="FlowPacker-outputs",
-                    path="workflow/packed/packed.tar.zst",
+                    path="workflow/packed/outputs/packed.tar.zst",
                     media_type="application/zstd",
                 ),
                 metadata={"archive_format": "tar.zst"},
@@ -621,7 +621,7 @@ def test_archive_outputs_use_volume_path_metadata(tmp_path: Path) -> None:
     artifacts = materialized.artifacts
     assert artifacts[0].storage == VolumePath(
         volume_name="FlowPacker-outputs",
-        path="workflow/packed/packed.tar.zst",
+        path="workflow/packed/outputs/packed.tar.zst",
         media_type="application/zstd",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage

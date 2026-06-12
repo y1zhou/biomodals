@@ -190,7 +190,7 @@ def test_rfdiffusion_node_calls_app_function_with_hydra_overrides(
                             kind=ArtifactKind.DIRECTORY,
                             storage=VolumePath(
                                 volume_name=rfdiffusion_app.CONF.output_volume_name,
-                                path="demo-rfd001/rfd-scaffolds",
+                                path="demo-rfd001/outputs/rfd-scaffolds",
                             ),
                             metadata={"run_name": "demo-rfd001"},
                         )
@@ -270,7 +270,7 @@ def test_select_rfdiffusion_design_reads_pdb_trb_and_infers_redesigned_residues(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scaffolds_dir = tmp_path / "demo-rfd001" / "rfd-scaffolds"
+    scaffolds_dir = tmp_path / "demo-rfd001" / "outputs" / "rfd-scaffolds"
     scaffolds_dir.mkdir(parents=True)
     pdb_bytes = (
         b"ATOM      1  N   GLY A   1      0.000   0.000   0.000  1.00  0.00           N\n"
@@ -305,7 +305,7 @@ def test_select_rfdiffusion_design_reads_pdb_trb_and_infers_redesigned_residues(
     )
 
     selected = select_rfdiffusion_design.get_raw_f()(
-        rfd_output_storage_path="demo-rfd001/rfd-scaffolds",
+        rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
         rfd_run_name="demo-rfd001",
         design_index=0,
     )
@@ -323,7 +323,7 @@ def test_select_rfdiffusion_design_uses_mask_1d_without_complex_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scaffolds_dir = tmp_path / "demo-rfd001" / "rfd-scaffolds"
+    scaffolds_dir = tmp_path / "demo-rfd001" / "outputs" / "rfd-scaffolds"
     scaffolds_dir.mkdir(parents=True)
     pdb_bytes = (
         b"ATOM      1  N   GLY A   1      0.000   0.000   0.000  1.00  0.00           N\n"
@@ -351,7 +351,7 @@ def test_select_rfdiffusion_design_uses_mask_1d_without_complex_metadata(
     )
 
     selected = select_rfdiffusion_design.get_raw_f()(
-        rfd_output_storage_path="demo-rfd001/rfd-scaffolds",
+        rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
         rfd_run_name="demo-rfd001",
         design_index=0,
     )
@@ -423,7 +423,7 @@ def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
         kind=ArtifactKind.DIRECTORY,
         storage=VolumePath(
             volume_name=rfdiffusion_app.CONF.output_volume_name,
-            path="demo-rfd001/rfd-scaffolds",
+            path="demo-rfd001/outputs/rfd-scaffolds",
         ),
         metadata={"run_name": "demo-rfd001"},
     )
@@ -438,7 +438,7 @@ def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert select_calls == {
-        "rfd_output_storage_path": "demo-rfd001/rfd-scaffolds",
+        "rfd_output_storage_path": "demo-rfd001/outputs/rfd-scaffolds",
         "rfd_run_name": "demo-rfd001",
         "design_index": 0,
     }
@@ -506,7 +506,7 @@ def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
         kind=ArtifactKind.DIRECTORY,
         storage=VolumePath(
             volume_name=rfdiffusion_app.CONF.output_volume_name,
-            path="demo-rfd001/rfd-scaffolds",
+            path="demo-rfd001/outputs/rfd-scaffolds",
         ),
         metadata={"run_name": "demo-rfd001"},
     )
@@ -527,7 +527,7 @@ def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
         "redesigned_residues": "A1 A2",
     }
     assert select_calls == {
-        "rfd_output_storage_path": "demo-rfd001/rfd-scaffolds",
+        "rfd_output_storage_path": "demo-rfd001/outputs/rfd-scaffolds",
         "rfd_run_name": "demo-rfd001",
         "design_index": 0,
     }

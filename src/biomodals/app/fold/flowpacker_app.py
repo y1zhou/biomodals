@@ -40,7 +40,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import volume_path_from_mount_path
+from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
@@ -357,8 +357,10 @@ def run_flowpacker_workflow(
         seed=seed,
     )
     archive_filename = f"{safe_run_name}.tar.zst"
-    volume_root = Path(CONF.output_volume_mountpoint)
-    archive_path = volume_root / "workflow" / safe_run_name / archive_filename
+    layout = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / "workflow" / safe_run_name
+    )
+    archive_path = layout.outputs_dir / archive_filename
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     archive_path.write_bytes(tarball_bytes)
     CONF.output_volume.commit()
@@ -370,7 +372,7 @@ def run_flowpacker_workflow(
                 kind=ArtifactKind.ARCHIVE,
                 storage=volume_path_from_mount_path(
                     remote_path=str(archive_path),
-                    mount_root=str(volume_root),
+                    mount_root=CONF.output_volume_mountpoint,
                     volume_name=CONF.output_volume_name,
                     media_type=ZSTD_MEDIA_TYPE,
                 ),

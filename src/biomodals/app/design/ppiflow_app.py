@@ -402,37 +402,39 @@ def submit_ppiflow_task(
             "Input YAML must contain a 'name' field for the design target."
         )
     run_name = sanitize_filename(yaml_dict["name"])
-    remote_workdir = Path(CONF.output_volume_mountpoint) / run_name
+    mount_root = Path(CONF.output_volume_mountpoint)
+    layout = AppRunLayout.from_run_root(mount_root / run_name)
 
     match design_mode:
         case "antibody_nanobody":
             conf = SampleAntibodyNanobodyConfig.model_validate(yaml_dict)
             files_to_upload = [conf.antigen_pdb, conf.framework_pdb]
-            conf.antigen_pdb = remote_workdir / Path(conf.antigen_pdb).name
-            conf.framework_pdb = remote_workdir / Path(conf.framework_pdb).name
+            conf.antigen_pdb = layout.inputs_dir / Path(conf.antigen_pdb).name
+            conf.framework_pdb = layout.inputs_dir / Path(conf.framework_pdb).name
         case "binder":
             conf = SampleBinderConfig.model_validate(yaml_dict)
             files_to_upload = [conf.input_pdb]
-            conf.input_pdb = remote_workdir / Path(conf.input_pdb).name
+            conf.input_pdb = layout.inputs_dir / Path(conf.input_pdb).name
         case "antibody_nanobody_partial":
             conf = SampleAntibodyNanobodyPartialConfig.model_validate(yaml_dict)
             files_to_upload = [conf.complex_pdb]
-            conf.complex_pdb = remote_workdir / Path(conf.complex_pdb).name
+            conf.complex_pdb = layout.inputs_dir / Path(conf.complex_pdb).name
         case "binder_partial":
             conf = SampleBinderPartialConfig.model_validate(yaml_dict)
             files_to_upload = [conf.input_pdb]
-            conf.input_pdb = remote_workdir / Path(conf.input_pdb).name
+            conf.input_pdb = layout.inputs_dir / Path(conf.input_pdb).name
         case _:
             raise ValueError(f"Unsupported design_mode: {design_mode}")
 
     # NOTE: make sure names are unique for different inputs
     remote_dir = volume_path_from_mount_path(
-        str(remote_workdir), CONF.output_volume_mountpoint, CONF.output_volume_name
+        str(layout.run_root), CONF.output_volume_mountpoint, CONF.output_volume_name
     )
+    remote_input_root = layout.inputs_dir.relative_to(mount_root)
     with CONF.output_volume.batch_upload() as batch:
         for file in files_to_upload:
             print(f"🧬 Uploading '{file}' to {remote_dir}...")
-            batch.put_file(file, f"{run_name}/{Path(file).name}")
+            batch.put_file(file, f"/{remote_input_root}/{Path(file).name}")
 
     print(f"🧬 Submitting PPIFlow task with run name: {run_name}")
     res = ppiflow_run.remote(PPIFlowArgs(args=conf), run_name)

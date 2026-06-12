@@ -21,7 +21,7 @@ import polars as pl
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.app_run import volume_path_from_mount_path
+from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.shell import package_outputs, warmup_directory
 
 ##########################################
@@ -64,8 +64,9 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
     """Run Rosetta scripts."""
     from biomodals.helper.shell import run_command
 
-    mount_dir = Path(CONF.output_volume_mountpoint)
-    workdir = mount_dir / f"{run_name}-{run_id}"
+    layout = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / f"{run_name}-{run_id}"
+    )
     queue = modal.Queue.from_name(f"{CONF.name}-queue-{run_id}")
 
     def _worker(worker_idx: int) -> None:
@@ -81,22 +82,28 @@ def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
             if binary is None or pdb_path is None:
                 raise ValueError(f"Rosetta job is missing required values: {job_spec}")
 
-            out_dir = workdir / task_idx
+            out_dir = layout.outputs_dir / task_idx
+            out_dir.mkdir(parents=True, exist_ok=True)
+            layout.logs_dir.mkdir(parents=True, exist_ok=True)
             cmd = [str(binary)]
             if job_spec.get("rosetta_script") is not None:
                 cmd.extend([
                     "-parser:protocol",
-                    str(mount_dir / str(job_spec["rosetta_script"])),
+                    str(layout.run_root / str(job_spec["rosetta_script"])),
                 ])
             if job_spec.get("flags_file") is not None:
-                cmd.append(f"@{mount_dir / str(job_spec['flags_file'])}")
+                cmd.append(f"@{layout.run_root / str(job_spec['flags_file'])}")
             cmd.extend([
                 "-s",
-                str(mount_dir / str(pdb_path)),
+                str(layout.run_root / str(pdb_path)),
                 "-out:path:all",
                 str(out_dir),
             ])
-            run_command(cmd, output_mode="capture", log_file=out_dir / "rosetta.log")
+            run_command(
+                cmd,
+                output_mode="capture",
+                log_file=layout.logs_dir / f"{task_idx}.log",
+            )
             CONF.output_volume.commit()
 
     # Run workers in parallel within the pod
@@ -340,29 +347,33 @@ def submit_rosetta_task(
 
     print(f"🧬 Preparing queue for {run_name} tasks...")
     queue = modal.Queue.from_name(f"{CONF.name}-queue-{run_id}", create_if_missing=True)
+    mount_root = Path(CONF.output_volume_mountpoint)
+    layout = AppRunLayout.from_run_root(mount_root / f"{run_name}-{run_id}")
+    remote_run_root = layout.run_root.relative_to(mount_root)
+    remote_input_root = layout.inputs_dir.relative_to(mount_root)
     uploaded_files = set()
     with CONF.output_volume.batch_upload() as batch:
         for r in tasks_df.iter_rows(named=True):
             # Structure file should always be present
             local_pdb = Path(r["pdb"]).expanduser().resolve()
-            remote_pdb = f"{run_name}-{run_id}/{r['index']}/{local_pdb.name}"
-            batch.put_file(local_pdb, f"/{remote_pdb}")
+            remote_pdb = f"inputs/{r['index']}/{local_pdb.name}"
+            batch.put_file(local_pdb, f"/{remote_run_root}/{remote_pdb}")
 
             # Other files may or may not be present, depending on the input CSV
             remote_script, remote_flags = None, None
             if r["rosetta_script"] is not None:
                 local_script = Path(r["rosetta_script"]).expanduser().resolve()
                 r_script_hash = r["script_hash"]
-                remote_script = f"{run_name}-{run_id}/_script/{r_script_hash}.xml"
+                remote_script = f"inputs/_script/{r_script_hash}.xml"
                 if remote_script not in uploaded_files:
-                    batch.put_file(local_script, f"/{remote_script}")
+                    batch.put_file(local_script, f"/{remote_run_root}/{remote_script}")
                     uploaded_files.add(remote_script)
             if r["flags_file"] is not None:
                 local_flags = Path(r["flags_file"]).expanduser().resolve()
                 r_flags_hash = r["flags_hash"]
-                remote_flags = f"{run_name}-{run_id}/_flags/{r_flags_hash}.flags"
+                remote_flags = f"inputs/_flags/{r_flags_hash}.flags"
                 if remote_flags not in uploaded_files:
-                    batch.put_file(local_flags, f"/{remote_flags}")
+                    batch.put_file(local_flags, f"/{remote_run_root}/{remote_flags}")
                     uploaded_files.add(remote_flags)
 
             queue.put({
@@ -374,7 +385,7 @@ def submit_rosetta_task(
             })
         buffer = BytesIO()
         tasks_df.write_parquet(buffer)
-        batch.put_file(buffer, f"/{run_name}-{run_id}/tasks.parquet")
+        batch.put_file(buffer, f"/{remote_input_root}/tasks.parquet")
 
     # Tune numbers based on total number of tasks
     num_cpu_per_pod = min(30, max(1, tasks_df.height))
@@ -396,7 +407,7 @@ def submit_rosetta_task(
 
     # Save results locally
     out_vol = volume_path_from_mount_path(
-        f"{CONF.output_volume_mountpoint}/{run_name}-{run_id}",
+        str(layout.run_root),
         CONF.output_volume_mountpoint,
         CONF.output_volume_name,
     )
@@ -408,7 +419,7 @@ def submit_rosetta_task(
     local_out_dir.mkdir(parents=True, exist_ok=True)
     out_file = local_out_dir / f"{run_name}-{run_id}.tar.zst"
     tarball_bytes = package_outputs_helper.remote(
-        root=f"{CONF.output_volume_mountpoint}/{run_name}-{run_id}",
+        root=str(layout.run_root),
     )
     out_file.write_bytes(tarball_bytes)
     print(f"🧬 {CONF.name} run complete! Results saved to {out_file}")

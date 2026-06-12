@@ -74,6 +74,59 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     ]
 
 
+def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    scripts_dir.joinpath("prepare-tpr.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    captured = {}
+
+    class FakeVolume:
+        def __init__(self) -> None:
+            self.commit_count = 0
+
+        def commit(self) -> None:
+            self.commit_count += 1
+
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        gromacs_app,
+        "APP_INFO",
+        SimpleNamespace(gmx_scripts=str(scripts_dir)),
+    )
+    monkeypatch.setattr(
+        gromacs_app,
+        "CONF",
+        SimpleNamespace(output_volume_mountpoint=str(tmp_path), output_volume=volume),
+    )
+
+    def fake_run_command(cmd, *, cwd, env):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["env"] = env
+        return []
+
+    monkeypatch.setattr(gromacs_app, "run_command", fake_run_command)
+
+    result = gromacs_app.prepare_tpr_cpu.get_raw_f()(
+        pdb_content=b"ATOM\n",
+        run_name="prep",
+        simulation_time_ns=1,
+        num_threads=2,
+    )
+
+    run_root = tmp_path / "prep"
+    input_path = run_root / "inputs" / "prep.pdb"
+    assert result == str(run_root)
+    assert input_path.read_bytes() == b"ATOM\n"
+    assert captured["cmd"][captured["cmd"].index("-i") + 1] == str(input_path)
+    assert captured["cwd"] == str(run_root)
+    assert captured["env"] == {"OMP_NUM_THREADS": None}
+    assert volume.commit_count == 2
+
+
 def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> None:
     work_path = tmp_path / "fresh"
     work_path.mkdir()

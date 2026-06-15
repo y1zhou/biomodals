@@ -227,6 +227,52 @@ def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
     assert "missing workflow artifact path run/outputs" in errors[0]
 
 
+def test_volume_path_reference_output_records_expected_files_from_metadata(
+    tmp_path: Path,
+) -> None:
+    app_volume = tmp_path / "app-volume"
+    app_output = app_volume / "run" / "outputs"
+    app_output.mkdir(parents=True)
+    app_output.joinpath("model.pdb").write_text("ATOM\n", encoding="utf-8")
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="rfd-output",
+                kind=ArtifactKind.DIRECTORY,
+                storage=VolumePath(
+                    volume_name="RFdiffusion-outputs",
+                    path="run/outputs",
+                ),
+                metadata={"files": [{"path": "model.pdb", "role": "structure"}]},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        attempt_dir=tmp_path / "nodes" / "rfd" / "attempts" / "1",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="rfd",
+        volume_root=tmp_path,
+    )
+
+    artifact = materialized.artifacts[0]
+    assert artifact.files == [ArtifactFile(path="model.pdb", role="structure")]
+
+    app_output.joinpath("model.pdb").unlink()
+    checker = mounted_volume_checker(
+        workflow_volume_name="Workflow-outputs",
+        volume_roots={"RFdiffusion-outputs": app_volume},
+    )
+
+    errors = checker(artifact)
+
+    assert len(errors) == 1
+    assert "missing workflow artifact file run/outputs/model.pdb" in errors[0]
+
+
 def test_materialized_inline_artifact_path_is_volume_relative(
     tmp_path: Path,
 ) -> None:

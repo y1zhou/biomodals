@@ -77,6 +77,29 @@ def _artifact_files(root: Path) -> list[ArtifactFile]:
     ]
 
 
+def _declared_artifact_files(metadata: Mapping[str, Any]) -> list[ArtifactFile]:
+    raw_files = metadata.get("files")
+    if raw_files is None:
+        return []
+    if not isinstance(raw_files, list):
+        raise ValueError("AppOutput.metadata['files'] must be a list")
+
+    files: list[ArtifactFile] = []
+    for raw_file in raw_files:
+        if isinstance(raw_file, ArtifactFile):
+            files.append(raw_file)
+        elif isinstance(raw_file, str):
+            files.append(ArtifactFile(path=raw_file))
+        elif isinstance(raw_file, Mapping):
+            files.append(ArtifactFile.model_validate(raw_file))
+        else:
+            raise ValueError(
+                "AppOutput.metadata['files'] entries must be paths or "
+                "ArtifactFile-compatible mappings"
+            )
+    return files
+
+
 def _validate_inline_text_bytes(
     storage: InlineBytes, output_kind: ArtifactKind
 ) -> None:
@@ -439,6 +462,7 @@ def materialize_app_run_result(
             producing_node_id=producing_node_id,
             kind=output.kind,
             storage=output.storage,
+            files=_declared_artifact_files(output.metadata),
             source_app_output_name=source_app_output_name or output.name,
             metadata=output.metadata,
         )

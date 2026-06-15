@@ -37,6 +37,14 @@ from biomodals.helper.io import (
     write_local_tarball,
 )
 from biomodals.helper.shell import package_outputs, sanitize_filename
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    InlineBytes,
+)
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 ##########################################
 # Modal configs
@@ -238,6 +246,40 @@ def run_dockq_batch(
         return package_outputs(out_dir)
 
 
+@app.function(
+    cpu=(0.125, 16.125),
+    memory=(512, 16384),
+    timeout=CONF.timeout,
+)
+def run_dockq_workflow(
+    pairs: list[dict[str, object]],
+    run_name: str,
+    dockq_args: list[str] | None = None,
+) -> AppRunResult:
+    """Run DockQ and return a workflow-compatible score archive."""
+    safe_run_name = sanitize_filename(run_name)
+    tarball_bytes = run_dockq_batch.get_raw_f()(
+        pairs=pairs,
+        run_name=safe_run_name,
+        dockq_args=dockq_args,
+    )
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="dockq_scores",
+                kind=ArtifactKind.SCORES,
+                storage=InlineBytes(
+                    data=tarball_bytes,
+                    filename=f"{safe_run_name}_dockq.tar.zst",
+                    media_type=ZSTD_MEDIA_TYPE,
+                ),
+                metadata={"archive_format": "tar.zst", "run_name": safe_run_name},
+            )
+        ],
+    )
+
+
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
@@ -304,11 +346,16 @@ def submit_dockq_task(
 
     pairs = _pairs_from_csv(input_path)
     print(f"🧬 Submitting DockQ run '{run_name}' with {len(pairs)} pair(s)")
-    tarball_bytes = run_dockq_batch.remote(
-        pairs=pairs,
-        run_name=run_name,
-        dockq_args=shlex.split(dockq_args),
+    result = AppRunResult.model_validate(
+        run_dockq_workflow.remote(
+            pairs=pairs,
+            run_name=run_name,
+            dockq_args=shlex.split(dockq_args),
+        )
     )
+    output = next(output for output in result.outputs if output.name == "dockq_scores")
+    if not isinstance(output.storage, InlineBytes):
+        raise TypeError("DockQ workflow output should be inline .tar.zst bytes")
 
-    write_local_tarball(out_file, tarball_bytes)
+    write_local_tarball(out_file, output.storage.data)
     print(f"🧬 DockQ run complete! Results saved to {out_file}")

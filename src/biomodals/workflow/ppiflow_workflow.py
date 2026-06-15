@@ -214,7 +214,7 @@ class DockQNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the DockQ app function."""
-        self._unsupported("run_dockq_batch")
+        self._unsupported("run_dockq_workflow")
 
 
 @dataclass
@@ -284,7 +284,7 @@ def build_ppiflow_workflow(
             af3score_prepare=af3score_app.af3score_prepare,
             af3score_run=af3score_app.af3score_run,
             af3score_postprocess=af3score_app.af3score_postprocess,
-            dockq_run=dockq_app.run_dockq_batch,
+            dockq_run=dockq_app.run_dockq_workflow,
             rosetta_run=rosetta_app.run_rosetta,
             rosetta_package_outputs=rosetta_app.package_outputs_helper,
             alphafold3_search_msa=alphafold3_app.search_msa_and_templates,

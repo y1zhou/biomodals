@@ -30,6 +30,7 @@ from biomodals.schema import (
 )
 from biomodals.workflow import Workflow
 from biomodals.workflow.core._runtime import hashing
+from biomodals.workflow.core._runtime.scheduler import SchedulerDecisionStatus
 from biomodals.workflow.core.ledger import WorkflowLedger
 from biomodals.workflow.core.nodes import RemoteNodeSubmission, WorkflowNativeNode
 from biomodals.workflow.core.runtime import WorkflowRuntime
@@ -285,7 +286,7 @@ def test_completed_nodes_are_skipped(tmp_path: Path) -> None:
     result = runtime.run(run_id="run-1")
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert runtime.executed_waves == []
+    assert runtime.diagnostics.scheduled_waves == []
 
 
 def test_completed_node_with_missing_workflow_artifact_is_rerun(
@@ -319,7 +320,7 @@ def test_completed_node_with_missing_workflow_artifact_is_rerun(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert calls == ["done"]
-    assert runtime.executed_waves == [["done"]]
+    assert runtime.diagnostics.scheduled_waves == [["done"]]
 
 
 def test_completed_node_with_missing_external_artifact_is_rerun_when_strict(
@@ -361,7 +362,7 @@ def test_completed_node_with_missing_external_artifact_is_rerun_when_strict(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert calls == ["done"]
-    assert runtime.executed_waves == [["done"]]
+    assert runtime.diagnostics.scheduled_waves == [["done"]]
 
 
 def test_strict_external_artifact_checks_require_checker(tmp_path: Path) -> None:
@@ -536,7 +537,30 @@ def test_independent_ready_nodes_run_in_same_scheduler_wave(
     runtime.run(run_id="run-1")
 
     assert set(calls) == {"score-a", "score-b"}
-    assert runtime.executed_waves == [["score-a", "score-b"]]
+    assert runtime.diagnostics.scheduled_waves == [["score-a", "score-b"]]
+
+
+def test_runtime_records_scheduler_diagnostics(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    workflow.add_node(FakeNode(), id="prepare")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.run_id == "run-1"
+    assert [
+        decision.status for decision in runtime.diagnostics.scheduler_decisions
+    ] == [
+        SchedulerDecisionStatus.READY,
+        SchedulerDecisionStatus.SUCCEEDED,
+    ]
+    assert runtime.diagnostics.scheduler_decisions[0].ready == ("prepare",)
+    assert runtime.diagnostics.scheduler_decisions[-1].completed == ("prepare",)
 
 
 def test_independent_remote_nodes_execute_concurrently(tmp_path: Path) -> None:
@@ -578,7 +602,7 @@ def test_independent_remote_nodes_execute_concurrently(tmp_path: Path) -> None:
     result = runtime.run(run_id="run-1")
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert runtime.executed_waves == [["one", "two"]]
+    assert runtime.diagnostics.scheduled_waves == [["one", "two"]]
 
 
 def test_failed_node_prevents_downstream_nodes_from_running(tmp_path: Path) -> None:
@@ -597,7 +621,7 @@ def test_failed_node_prevents_downstream_nodes_from_running(tmp_path: Path) -> N
     result = runtime.run(run_id="run-1")
 
     assert result.status == AppRunStatus.FAILED
-    assert runtime.executed_waves == [["fail"]]
+    assert runtime.diagnostics.scheduled_waves == [["fail"]]
 
 
 def test_partial_node_marks_run_failed_and_blocks_downstream(tmp_path: Path) -> None:
@@ -620,7 +644,7 @@ def test_partial_node_marks_run_failed_and_blocks_downstream(tmp_path: Path) -> 
     status = runtime.ledger._load_node_status_or_default("partial")
     assert status.status == NodeStatus.FAILED
     assert status.error == "Node returned partial status"
-    assert runtime.executed_waves == [["partial"]]
+    assert runtime.diagnostics.scheduled_waves == [["partial"]]
 
 
 def test_single_node_exception_marks_node_and_run_failed(tmp_path: Path) -> None:

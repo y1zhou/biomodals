@@ -14,6 +14,7 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
+from biomodals.workflow.core._runtime.diagnostics import RuntimeDiagnostics
 from biomodals.workflow.core._runtime.external_availability import (
     ExternalArtifactChecker,
 )
@@ -55,10 +56,7 @@ class WorkflowRuntime:
         self.workflow = workflow
         volume_root_path = Path(volume_root)
         self.ledger = WorkflowLedger(volume_root_path)
-        # TODO: Replace this debug-only wave history with structured scheduling
-        # diagnostics that can record ready/completed/blocked reasons and timing
-        # without expanding the public workflow API.
-        self.executed_waves: list[list[str]] = []
+        self.diagnostics = RuntimeDiagnostics()
         self._volume_sync = WorkflowVolumeSync(
             workflow_volume=workflow_volume,
             ledger=self.ledger,
@@ -86,6 +84,7 @@ class WorkflowRuntime:
 
     def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
         """Run the workflow until every node succeeds or no progress is possible."""
+        self.diagnostics = RuntimeDiagnostics(run_id=run_id)
         definition = self.workflow.validate()
         workflow_display.print_workflow_message(
             f"[workflow] Starting workflow '{definition.name}' run '{run_id}' "
@@ -106,6 +105,7 @@ class WorkflowRuntime:
                 ledger=self.ledger,
                 node_is_complete=self._node_is_complete,
             )
+            self.diagnostics.record_scheduler_decision(decision)
             if decision.status == scheduler.SchedulerDecisionStatus.SUCCEEDED:
                 self.ledger.mark_run_status(RunStatus.SUCCEEDED)
                 self._volume_sync.commit()
@@ -126,7 +126,6 @@ class WorkflowRuntime:
                     warnings=decision.warnings,
                 )
 
-            self.executed_waves.append(decision.ready)
             for node_id, node_result in self._node_runner.run_ready_nodes(
                 definition,
                 decision.ready,

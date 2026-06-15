@@ -14,6 +14,9 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
+from biomodals.workflow.core._runtime.external_availability import (
+    ExternalArtifactChecker,
+)
 from biomodals.workflow.core._runtime.node_runner import NodeRunner
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
 from biomodals.workflow.core._runtime.services import RuntimeServices
@@ -41,8 +44,14 @@ class WorkflowRuntime:
         function_call_resolver: FunctionCallResolver | None = None,
         remote_call_poll_timeout: float | int = 0,
         max_ready_workers: int = 32,
+        strict_external_artifact_checks: bool = False,
+        external_artifact_checker: ExternalArtifactChecker | None = None,
     ):
         """Initialize a runtime for one workflow and ledger root."""
+        if strict_external_artifact_checks and external_artifact_checker is None:
+            raise ValueError(
+                "strict_external_artifact_checks requires external_artifact_checker"
+            )
         self.workflow = workflow
         volume_root_path = Path(volume_root)
         self.ledger = WorkflowLedger(volume_root_path)
@@ -59,6 +68,9 @@ class WorkflowRuntime:
             volume_root=volume_root_path,
             workflow_volume_name=workflow_volume_name,
             volume_sync=self._volume_sync,
+            external_artifact_checker=(
+                external_artifact_checker if strict_external_artifact_checks else None
+            ),
         )
         self._remote_calls = RemoteCallManager(
             services=self._services,
@@ -155,6 +167,7 @@ class WorkflowRuntime:
                 workflow_volume_name=self._services.workflow_volume_name,
                 volume_root=self._services.volume_root,
                 run_root=self.ledger.run_root,
+                external_artifact_checker=(self._services.external_artifact_checker),
             )
         )
 

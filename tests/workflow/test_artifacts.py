@@ -16,6 +16,9 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
+from biomodals.workflow.core._runtime.external_availability import (
+    mounted_volume_checker,
+)
 from biomodals.workflow.core.artifacts import (
     materialize_app_run_result,
     workflow_artifact_availability_errors,
@@ -174,6 +177,54 @@ def test_workflow_artifact_availability_skips_unmounted_external_volumes(
         )
         == []
     )
+
+
+def test_external_mounted_volume_checker_validates_app_volume_artifacts(
+    tmp_path: Path,
+) -> None:
+    app_volume = tmp_path / "app-volume"
+    app_output = app_volume / "run" / "outputs"
+    app_output.mkdir(parents=True)
+    app_output.joinpath("model.pdb").write_text("ATOM\n", encoding="utf-8")
+    checker = mounted_volume_checker(
+        workflow_volume_name="Workflow-outputs",
+        volume_roots={"RFdiffusion-outputs": app_volume},
+    )
+    artifact = WorkflowArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+        files=[ArtifactFile(path="model.pdb")],
+    )
+
+    assert checker(artifact) == []
+
+
+def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
+    tmp_path: Path,
+) -> None:
+    checker = mounted_volume_checker(
+        workflow_volume_name="Workflow-outputs",
+        volume_roots={"RFdiffusion-outputs": tmp_path / "app-volume"},
+    )
+    artifact = WorkflowArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    errors = checker(artifact)
+
+    assert len(errors) == 1
+    assert "missing workflow artifact path run/outputs" in errors[0]
 
 
 def test_materialized_inline_artifact_path_is_volume_relative(

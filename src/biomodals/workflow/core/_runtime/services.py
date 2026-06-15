@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from biomodals.workflow.core._runtime.external_availability import (
+    ExternalArtifactChecker,
+)
 from biomodals.workflow.core._runtime.volume_sync import WorkflowVolumeSync
 from biomodals.workflow.core.ledger import WorkflowLedger
 
@@ -17,3 +20,4 @@ class RuntimeServices:
     volume_root: Path
     workflow_volume_name: str
     volume_sync: WorkflowVolumeSync
+    external_artifact_checker: ExternalArtifactChecker | None = None

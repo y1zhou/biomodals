@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Literal
 
 from biomodals.schema import WorkflowArtifact
+from biomodals.workflow.core._runtime.external_availability import (
+    ExternalArtifactChecker,
+)
 from biomodals.workflow.core.artifacts import workflow_artifact_availability_errors
 
 
@@ -15,7 +18,11 @@ class ArtifactAvailabilityError:
     """A private structured artifact availability error."""
 
     artifact_id: str
-    reason: Literal["missing_manifest", "workflow_artifact_unavailable"]
+    reason: Literal[
+        "missing_manifest",
+        "workflow_artifact_unavailable",
+        "external_artifact_unavailable",
+    ]
     relative_path: str
     detail: str
 
@@ -35,6 +42,7 @@ def artifact_availability_errors(
     workflow_volume_name: str,
     volume_root: Path,
     run_root: Path,
+    external_artifact_checker: ExternalArtifactChecker | None = None,
 ) -> list[ArtifactAvailabilityError]:
     """Return read-only availability errors for one workflow artifact."""
     errors: list[ArtifactAvailabilityError] = []
@@ -65,6 +73,25 @@ def artifact_availability_errors(
             volume_root=volume_root,
         )
     )
+    if (
+        external_artifact_checker is not None
+        and artifact.storage.volume_name != workflow_volume_name
+    ):
+        try:
+            external_errors = external_artifact_checker(artifact)
+        except Exception as exc:  # noqa: BLE001
+            external_errors = [
+                f"{artifact.artifact_id}: external artifact checker failed: {exc}"
+            ]
+        errors.extend(
+            ArtifactAvailabilityError(
+                artifact_id=artifact.artifact_id,
+                reason="external_artifact_unavailable",
+                relative_path=artifact.storage.path,
+                detail=error,
+            )
+            for error in external_errors
+        )
     return errors
 
 

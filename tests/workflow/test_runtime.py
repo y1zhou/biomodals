@@ -322,6 +322,60 @@ def test_completed_node_with_missing_workflow_artifact_is_rerun(
     assert runtime.executed_waves == [["done"]]
 
 
+def test_completed_node_with_missing_external_artifact_is_rerun_when_strict(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/done/outputs",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    def external_checker(artifact: WorkflowArtifact) -> list[str]:
+        return [f"{artifact.artifact_id}: missing external path {artifact.storage}"]
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_artifact_checker=external_checker,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["done"]
+    assert runtime.executed_waves == [["done"]]
+
+
+def test_strict_external_artifact_checks_require_checker(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+
+    with pytest.raises(ValueError, match="external_artifact_checker"):
+        WorkflowRuntime(
+            workflow=workflow,
+            volume_root=tmp_path,
+            workflow_volume_name="Workflow-outputs",
+            strict_external_artifact_checks=True,
+        )
+
+
 def test_completed_node_with_missing_artifact_manifest_is_rerun(
     tmp_path: Path,
 ) -> None:

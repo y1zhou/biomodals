@@ -42,6 +42,7 @@ class NodeRunner:
         self.volume_sync = services.volume_sync
         self.remote_calls = remote_calls
         self.node_is_complete = node_is_complete
+        self.external_artifact_checker = services.external_artifact_checker
         self.max_ready_workers = max_ready_workers
 
     def run_ready_nodes(
@@ -239,6 +240,7 @@ class NodeRunner:
                 workflow_volume_name=self.workflow_volume_name,
                 volume_root=self.volume_root,
                 run_root=self.ledger.run_root,
+                external_artifact_checker=self.external_artifact_checker,
             )
         )
 

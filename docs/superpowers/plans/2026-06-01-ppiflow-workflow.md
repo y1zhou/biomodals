@@ -18,6 +18,8 @@
 - [x] Add tests that assert `CONF.depends_on_apps` contains `ppiflow`, `rosetta`, `flowpacker`, `ligandmpnn`, `dockq`, `af3score`, and `alphafold3`, and that `CONF.tags["depends_on"]` mirrors the tuple order.
 - [x] Add a DAG-shape test for the full binder chain:
   `PPIFlowStep -> MPNNStep_stage1 -> FlowpackerStep_stage1 -> AF3scoreStep_stage1 -> FilterStep_stage1 -> RosettaFixStep -> FixedPositions -> PartialStep -> MPNNStep_stage2 -> FlowpackerStep_stage2 -> AF3scoreStep_stage2 -> FilterStep_stage2 -> ReFoldStep -> DockQStep -> RosettaRelaxStep -> RankStep -> ReportStep`.
+  Current coverage also asserts that those DAG vertices use specific node
+  classes instead of the old generic `PPIFlowWorkflowNode`.
 - [ ] Add adapter tests with fake Modal functions for PPIFlow, LigandMPNN, FlowPacker, AF3Score, DockQ, Rosetta, and AlphaFold3. The tests should assert that app calls are made through the hydrated namespace, not deployed lookup strings. Current coverage includes PPIFlow, AF3Score metrics output, and AlphaFold3/ReFold.
   PartialStep per-PDB PPIFlow app calls are also covered.
 - [x] Run `uv run pytest tests/workflow/test_ppiflow_workflow.py -q` and verify the new tests fail on the current skeleton.
@@ -40,10 +42,13 @@
 
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
 - [x] Extend `PPIFlowModalNamespace` with handles for PPIFlow, LigandMPNN, FlowPacker, AF3Score prepare/run/postprocess/lock, DockQ, Rosetta, Rosetta packaging, and AlphaFold3 data/inference app functions.
-- [ ] Replace `PPIFlowWorkflowNode` with specific node classes:
+- [x] Replace `PPIFlowWorkflowNode` with specific node classes:
   `PPIFlowDesignNode`, `LigandMPNNNode`, `FlowPackerNode`, `AF3ScoreNode`, `FilterStructuresNode`, `RosettaFixNode`, `FixedPositionsNode`, `PPIFlowPartialNode`, `ReFoldNode`, `DockQNode`, `RosettaRelaxNode`, `RankNode`, and `ReportNode`.
-- [ ] Make app-backed nodes `REMOTE`; make lightweight selectors/rank/report nodes `ORCHESTRATOR` unless they must access app volumes.
+- [x] Make app-backed nodes `REMOTE`; make lightweight selectors/rank/report nodes `ORCHESTRATOR` unless they must access app volumes.
 - [ ] Return `AppRunResult` with `VolumePath` outputs for durable directories/tables/reports. Keep binary archives in volume-backed storage, not inline bytes.
+  Structural node classes are in place, but most non-PPIFlow adapters still
+  raise clear `NotImplementedError` messages until their data transforms are
+  wired to app functions.
 
 ### Task 4: Build The Upstream DAG
 
@@ -51,7 +56,7 @@
 
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
 - [ ] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
-- [ ] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, before-partial structure selection, Partial, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report. Static DAG order, fixed-position CSV conversion, before-partial selection, and per-PDB PartialStep app calls are covered; runtime adapters still need other real data transforms outside ReFold/Filter/Partial.
+- [ ] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, before-partial structure selection, Partial, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report. Static DAG order and named node classes are covered; runtime adapters still need real data transforms outside the PPIFlow app-backed design/partial steps.
 - [ ] Preserve stage-only execution behavior while requiring existing upstream artifacts for stage 2-only runs.
 - [ ] Update local input staging to cover initial PPIFlow inputs and preserve mounted paths.
 

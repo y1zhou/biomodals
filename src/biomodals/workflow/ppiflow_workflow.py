@@ -11,7 +11,10 @@ from typing import Any
 import modal
 import yaml
 
-from biomodals.app.design import ppiflow_app
+from biomodals.app.bioinfo import rosetta_app
+from biomodals.app.design import ligandmpnn_app, ppiflow_app
+from biomodals.app.fold import alphafold3_app, flowpacker_app
+from biomodals.app.score import af3score_app, dockq_app
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import volume_path_from_mount_path
 from biomodals.helper.catalog import include_dependency_apps
@@ -43,7 +46,15 @@ PPI_FLOW_OUTPUT_LAYOUT = (
 )
 PPI_FLOW_APP_STEPS = ("PPIFlowStep", "PartialStep")
 
-DEPENDENCY_APPS = ("ppiflow",)
+DEPENDENCY_APPS = (
+    "ppiflow",
+    "rosetta",
+    "flowpacker",
+    "ligandmpnn",
+    "dockq",
+    "af3score",
+    "alphafold3",
+)
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -71,11 +82,22 @@ class PPIFlowModalNamespace:
     """Hydrated Modal objects carried across the orchestrator boundary."""
 
     ppiflow_run: modal.Function
+    ligandmpnn_run: modal.Function
+    flowpacker_run: modal.Function
+    af3score_manage_lock: modal.Function
+    af3score_prepare: modal.Function
+    af3score_run: modal.Function
+    af3score_postprocess: modal.Function
+    dockq_run: modal.Function
+    rosetta_run: modal.Function
+    rosetta_package_outputs: modal.Function
+    alphafold3_search_msa: modal.Function
+    alphafold3_predict_structures: modal.Function
 
 
 @dataclass
-class PPIFlowWorkflowNode(AppBackedNode):
-    """Base class for PPIFlow v2 app-backed workflow nodes."""
+class _ConfiguredAppStepNode(AppBackedNode):
+    """Base class for configured PPIFlow app-backed workflow nodes."""
 
     step_name: str
     modal_namespace: PPIFlowModalNamespace = field(
@@ -87,22 +109,30 @@ class PPIFlowWorkflowNode(AppBackedNode):
     execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RERUN
     placement: NodePlacement = NodePlacement.REMOTE
 
-    def _app_kwargs(self, context: NodeRunContext) -> dict[str, object]:
-        if self.step_name not in PPI_FLOW_APP_STEPS:
-            raise NotImplementedError(
-                f"PPIFlow workflow step {self.step_name!r} does not yet have a "
-                "workflow-compatible app adapter."
-            )
+    def _run_name(self, context: NodeRunContext) -> str:
+        run_name = sanitize_filename(
+            str(self.config.get("run_name") or f"{context.run_id}-{self.step_name}")
+        )
+        return run_name
 
+    def _unsupported(self, function_name: str) -> None:
+        raise NotImplementedError(
+            f"PPIFlow workflow step {self.step_name!r} requires a "
+            f"workflow-compatible {function_name} adapter."
+        )
+
+
+@dataclass
+class _PPIFlowRunNode(_ConfiguredAppStepNode):
+    """App-backed node implemented by the PPIFlow workflow app function."""
+
+    def _app_kwargs(self, context: NodeRunContext) -> dict[str, object]:
         raw_args = self.config.get("args", self.config)
         if not isinstance(raw_args, dict):
             raise ValueError(f"PPIFlow step {self.step_name!r} args must be a mapping")
 
-        run_name = sanitize_filename(
-            str(self.config.get("run_name") or f"{context.run_id}-{self.step_name}")
-        )
         app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
-        return {"args": app_args, "run_name": run_name}
+        return {"args": app_args, "run_name": self._run_name(context)}
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the PPIFlow app function directly from the orchestrator."""
@@ -112,6 +142,79 @@ class PPIFlowWorkflowNode(AppBackedNode):
             ),
             function_name="ppiflow_run",
         )
+
+
+@dataclass
+class PPIFlowDesignNode(_PPIFlowRunNode):
+    """Initial PPIFlow design step."""
+
+
+@dataclass
+class PPIFlowPartialNode(_PPIFlowRunNode):
+    """PPIFlow partial-design step for stage 2."""
+
+
+@dataclass
+class LigandMPNNNode(_ConfiguredAppStepNode):
+    """LigandMPNN or AbMPNN design step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the LigandMPNN app function."""
+        self._unsupported("ligandmpnn_run")
+
+
+@dataclass
+class FlowPackerNode(_ConfiguredAppStepNode):
+    """FlowPacker side-chain packing step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the FlowPacker app function."""
+        self._unsupported("run_flowpacker_workflow")
+
+
+@dataclass
+class AF3ScoreNode(_ConfiguredAppStepNode):
+    """AF3Score structure scoring step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the AF3Score app functions."""
+        self._unsupported("af3score_prepare/af3score_run/af3score_postprocess")
+
+
+@dataclass
+class RosettaFixNode(_ConfiguredAppStepNode):
+    """Rosetta fixed-position analysis step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the Rosetta app functions."""
+        self._unsupported("run_rosetta")
+
+
+@dataclass
+class RosettaRelaxNode(_ConfiguredAppStepNode):
+    """Rosetta relaxation step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the Rosetta app functions."""
+        self._unsupported("run_rosetta")
+
+
+@dataclass
+class ReFoldNode(_ConfiguredAppStepNode):
+    """AlphaFold3 refolding step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the AlphaFold3 app functions."""
+        self._unsupported("alphafold3_search_msa/alphafold3_predict_structures")
+
+
+@dataclass
+class DockQNode(_ConfiguredAppStepNode):
+    """DockQ model/reference scoring step."""
+
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit the DockQ app function."""
+        self._unsupported("run_dockq_batch")
 
 
 @dataclass
@@ -127,14 +230,38 @@ class FilterStructuresNode(WorkflowNativeNode):
 
 
 @dataclass
-class RankAndReportNode(WorkflowNativeNode):
-    """Rank final designs and write report artifacts."""
+class FixedPositionsNode(WorkflowNativeNode):
+    """Convert Rosetta residue energies into fixed-position constraints."""
 
     step_name: str
     config: dict[str, Any] = field(default_factory=dict)
 
     def run(self, context: NodeRunContext) -> AppRunResult:
-        """Execute ranking and report logic."""
+        """Execute fixed-position conversion logic."""
+        raise NotImplementedError
+
+
+@dataclass
+class RankNode(WorkflowNativeNode):
+    """Rank final designs."""
+
+    step_name: str
+    config: dict[str, Any] = field(default_factory=dict)
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Execute ranking logic."""
+        raise NotImplementedError
+
+
+@dataclass
+class ReportNode(WorkflowNativeNode):
+    """Write the final design report."""
+
+    step_name: str
+    config: dict[str, Any] = field(default_factory=dict)
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Execute report generation logic."""
         raise NotImplementedError
 
 
@@ -151,6 +278,17 @@ def build_ppiflow_workflow(
     if modal_namespace is None:
         modal_namespace = PPIFlowModalNamespace(
             ppiflow_run=ppiflow_app.ppiflow_run_workflow,
+            ligandmpnn_run=ligandmpnn_app.ligandmpnn_run,
+            flowpacker_run=flowpacker_app.run_flowpacker_workflow,
+            af3score_manage_lock=af3score_app.af3score_manage_lock,
+            af3score_prepare=af3score_app.af3score_prepare,
+            af3score_run=af3score_app.af3score_run,
+            af3score_postprocess=af3score_app.af3score_postprocess,
+            dockq_run=dockq_app.run_dockq_batch,
+            rosetta_run=rosetta_app.run_rosetta,
+            rosetta_package_outputs=rosetta_app.package_outputs_helper,
+            alphafold3_search_msa=alphafold3_app.search_msa_and_templates,
+            alphafold3_predict_structures=alphafold3_app.predict_structures,
         )
 
     task_doc = _load_yaml_bytes(task_yaml_bytes)
@@ -194,7 +332,11 @@ def _add_stage1_nodes(
     tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
         tail = workflow.add_node(
-            _app_step_node(steps, "PPIFlowStep", modal_namespace),
+            PPIFlowDesignNode(
+                "PPIFlowStep",
+                modal_namespace,
+                _step_cfg(steps, "PPIFlowStep"),
+            ),
             id="stage1-ppiflow-design",
         )
 
@@ -208,14 +350,18 @@ def _add_stage1_nodes(
     if mpnn_step is not None:
         node_id, step_name = mpnn_step
         tail = workflow.add_node(
-            _app_step_node(steps, step_name, modal_namespace),
+            LigandMPNNNode(step_name, modal_namespace, _step_cfg(steps, step_name)),
             id=node_id,
             inputs=_structure_inputs(tail),
         )
 
     if _step_enabled(enabled, "FlowpackerStep_stage1"):
         tail = workflow.add_node(
-            _app_step_node(steps, "FlowpackerStep_stage1", modal_namespace),
+            FlowPackerNode(
+                "FlowpackerStep_stage1",
+                modal_namespace,
+                _step_cfg(steps, "FlowpackerStep_stage1"),
+            ),
             id="stage1-flowpacker",
             inputs=_structure_inputs(tail),
         )
@@ -223,7 +369,11 @@ def _add_stage1_nodes(
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage1"):
         score = workflow.add_node(
-            _app_step_node(steps, "AF3scoreStep_stage1", modal_namespace),
+            AF3ScoreNode(
+                "AF3scoreStep_stage1",
+                modal_namespace,
+                _step_cfg(steps, "AF3scoreStep_stage1"),
+            ),
             id="stage1-af3score",
             inputs=_structure_inputs(tail),
         )
@@ -255,14 +405,31 @@ def _add_stage2_nodes(
     tail = upstream
     if _step_enabled(enabled, "RosettaFixStep"):
         tail = workflow.add_node(
-            _app_step_node(steps, "RosettaFixStep", modal_namespace),
+            RosettaFixNode(
+                "RosettaFixStep",
+                modal_namespace,
+                _step_cfg(steps, "RosettaFixStep"),
+            ),
             id="stage2-rosetta-fix",
+            inputs=_structure_inputs(tail),
+        )
+
+    if _step_enabled(enabled, "RosettaFixStep") and _step_enabled(
+        enabled, "PartialStep"
+    ):
+        tail = workflow.add_node(
+            FixedPositionsNode("FixedPositions", _step_cfg(steps, "FixedPositions")),
+            id="stage2-fixed-positions",
             inputs=_structure_inputs(tail),
         )
 
     if _step_enabled(enabled, "PartialStep"):
         tail = workflow.add_node(
-            _app_step_node(steps, "PartialStep", modal_namespace),
+            PPIFlowPartialNode(
+                "PartialStep",
+                modal_namespace,
+                _step_cfg(steps, "PartialStep"),
+            ),
             id="stage2-partial-ppiflow",
             inputs=_structure_inputs(tail),
         )
@@ -277,14 +444,18 @@ def _add_stage2_nodes(
     if mpnn_step is not None:
         node_id, step_name = mpnn_step
         tail = workflow.add_node(
-            _app_step_node(steps, step_name, modal_namespace),
+            LigandMPNNNode(step_name, modal_namespace, _step_cfg(steps, step_name)),
             id=node_id,
             inputs=_structure_inputs(tail),
         )
 
     if _step_enabled(enabled, "FlowpackerStep_stage2"):
         tail = workflow.add_node(
-            _app_step_node(steps, "FlowpackerStep_stage2", modal_namespace),
+            FlowPackerNode(
+                "FlowpackerStep_stage2",
+                modal_namespace,
+                _step_cfg(steps, "FlowpackerStep_stage2"),
+            ),
             id="stage2-flowpacker",
             inputs=_structure_inputs(tail),
         )
@@ -292,7 +463,11 @@ def _add_stage2_nodes(
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage2"):
         score = workflow.add_node(
-            _app_step_node(steps, "AF3scoreStep_stage2", modal_namespace),
+            AF3ScoreNode(
+                "AF3scoreStep_stage2",
+                modal_namespace,
+                _step_cfg(steps, "AF3scoreStep_stage2"),
+            ),
             id="stage2-af3score",
             inputs=_structure_inputs(tail),
         )
@@ -314,15 +489,12 @@ def _add_stage2_nodes(
     refold = None
     if _step_enabled(enabled, "ReFoldStep"):
         refold = workflow.add_node(
-            _app_step_node(steps, "ReFoldStep", modal_namespace),
+            ReFoldNode(
+                "ReFoldStep",
+                modal_namespace,
+                _step_cfg(steps, "ReFoldStep"),
+            ),
             id="stage2-alphafold3-refold",
-            inputs=_structure_inputs(filtered),
-        )
-
-    if _step_enabled(enabled, "RosettaRelaxStep"):
-        workflow.add_node(
-            _app_step_node(steps, "RosettaRelaxStep", modal_namespace),
-            id="stage2-rosetta-relax",
             inputs=_structure_inputs(filtered),
         )
 
@@ -332,18 +504,46 @@ def _add_stage2_nodes(
         if refold is not None:
             inputs["models"] = refold.outputs(kind=ArtifactKind.STRUCTURES)
         dockq = workflow.add_node(
-            _app_step_node(steps, "DockQStep", modal_namespace),
+            DockQNode(
+                "DockQStep",
+                modal_namespace,
+                _step_cfg(steps, "DockQStep"),
+            ),
             id="stage2-dockq",
             inputs=inputs,
         )
 
-    if _step_enabled(enabled, "RankStep") or _step_enabled(enabled, "ReportStep"):
+    relaxed = None
+    if _step_enabled(enabled, "RosettaRelaxStep"):
         inputs = _structure_inputs(filtered)
         if dockq is not None:
             inputs["dockq"] = dockq.outputs(kind=ArtifactKind.SCORES)
+        relaxed = workflow.add_node(
+            RosettaRelaxNode(
+                "RosettaRelaxStep",
+                modal_namespace,
+                _step_cfg(steps, "RosettaRelaxStep"),
+            ),
+            id="stage2-rosetta-relax",
+            inputs=inputs,
+        )
+
+    rank = None
+    if _step_enabled(enabled, "RankStep"):
+        inputs = _structure_inputs(relaxed or filtered)
+        if dockq is not None:
+            inputs["dockq"] = dockq.outputs(kind=ArtifactKind.SCORES)
+        rank = workflow.add_node(
+            RankNode("RankStep", _step_cfg(steps, "RankStep")),
+            id="stage2-rank",
+            inputs=inputs,
+        )
+
+    if _step_enabled(enabled, "ReportStep"):
+        inputs = _structure_inputs(rank or filtered)
         workflow.add_node(
-            RankAndReportNode("RankAndReportStep", _rank_report_cfg(steps)),
-            id="stage2-rank-report",
+            ReportNode("ReportStep", _step_cfg(steps, "ReportStep")),
+            id="stage2-report",
             inputs=inputs,
         )
 
@@ -352,18 +552,6 @@ def _structure_inputs(upstream) -> dict[str, Any]:
     if upstream is None:
         return {}
     return {"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)}
-
-
-def _app_step_node(
-    steps: dict[str, Any],
-    step_name: str,
-    modal_namespace: PPIFlowModalNamespace,
-) -> PPIFlowWorkflowNode:
-    return PPIFlowWorkflowNode(
-        step_name=step_name,
-        modal_namespace=modal_namespace,
-        config=_step_cfg(steps, step_name),
-    )
 
 
 def _load_yaml_bytes(data: bytes) -> dict[str, Any]:
@@ -398,13 +586,6 @@ def _step_cfg(steps: dict[str, Any], step_name: str) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"steps.yaml entry {step_name!r} must be a mapping")
     return cfg
-
-
-def _rank_report_cfg(steps: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "RankStep": _step_cfg(steps, "RankStep"),
-        "ReportStep": _step_cfg(steps, "ReportStep"),
-    }
 
 
 def _ppiflow_input_fields(args: object) -> tuple[str, ...]:

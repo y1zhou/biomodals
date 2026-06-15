@@ -66,6 +66,26 @@ class _FakePPIFlowFunction:
         return _FakeFunctionCall("fc-ppiflow", self._result())
 
 
+def _fake_namespace(
+    ppiflow_run: _FakePPIFlowFunction | None = None,
+) -> PPIFlowModalNamespace:
+    fake = cast(modal.Function, ppiflow_run or _FakePPIFlowFunction())
+    return PPIFlowModalNamespace(
+        ppiflow_run=fake,
+        ligandmpnn_run=fake,
+        flowpacker_run=fake,
+        af3score_manage_lock=fake,
+        af3score_prepare=fake,
+        af3score_run=fake,
+        af3score_postprocess=fake,
+        dockq_run=fake,
+        rosetta_run=fake,
+        rosetta_package_outputs=fake,
+        alphafold3_search_msa=fake,
+        alphafold3_predict_structures=fake,
+    )
+
+
 def _task_yaml(*, enabled_steps: str) -> bytes:
     return f"""
 task:
@@ -76,15 +96,21 @@ steps:
 
 
 def test_ppiflow_workflow_declares_app_dependency() -> None:
-    assert CONF.depends_on_apps == ("ppiflow",)
-    assert CONF.tags == {"depends_on": "ppiflow"}
+    assert CONF.depends_on_apps == (
+        "ppiflow",
+        "rosetta",
+        "flowpacker",
+        "ligandmpnn",
+        "dockq",
+        "af3score",
+        "alphafold3",
+    )
+    assert CONF.tags == {"depends_on": "-".join(CONF.depends_on_apps)}
 
 
 def test_ppiflow_app_step_uses_included_modal_namespace(tmp_path: Path) -> None:
     fake_function = _FakePPIFlowFunction()
-    namespace = PPIFlowModalNamespace(
-        ppiflow_run=cast(modal.Function, fake_function),
-    )
+    namespace = _fake_namespace(fake_function)
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
         steps_yaml_bytes=b"""
@@ -122,9 +148,7 @@ PPIFlowStep:
 
 def test_ppiflow_app_step_submits_app_function_directly(tmp_path: Path) -> None:
     fake_function = _FakePPIFlowFunction()
-    namespace = PPIFlowModalNamespace(
-        ppiflow_run=cast(modal.Function, fake_function),
-    )
+    namespace = _fake_namespace(fake_function)
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
         steps_yaml_bytes=b"""
@@ -201,20 +225,103 @@ PPIFlowStep:
     stdout = strip_ansi(capsys.readouterr().out)
     assert "[workflow] DAG graph: node_id [placement; class] <- dependency" in stdout
     assert (
-        "[workflow]   stage1-ppiflow-design [remote; PPIFlowWorkflowNode] <- -"
-        in stdout
+        "[workflow]   stage1-ppiflow-design [remote; PPIFlowDesignNode] <- -" in stdout
     )
-    assert "ppiflow_workflow.PPIFlowWorkflowNode" not in stdout
+    assert "ppiflow_workflow.PPIFlowDesignNode" not in stdout
     assert "Submitting PPIFlow workflow" not in stdout
+
+
+def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(
+            enabled_steps="""  PPIFlowStep: true
+  MPNNStep_stage1: true
+  FlowpackerStep_stage1: true
+  AF3scoreStep_stage1: true
+  FilterStep_stage1: true
+  RosettaFixStep: true
+  PartialStep: true
+  MPNNStep_stage2: true
+  FlowpackerStep_stage2: true
+  AF3scoreStep_stage2: true
+  FilterStep_stage2: true
+  ReFoldStep: true
+  DockQStep: true
+  RosettaRelaxStep: true
+  RankStep: true
+  ReportStep: true
+"""
+        ),
+        steps_yaml_bytes=b"{}\n",
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    assert list(definition.nodes) == [
+        "stage1-ppiflow-design",
+        "stage1-ligandmpnn",
+        "stage1-flowpacker",
+        "stage1-af3score",
+        "stage1-filter",
+        "stage2-rosetta-fix",
+        "stage2-fixed-positions",
+        "stage2-partial-ppiflow",
+        "stage2-ligandmpnn",
+        "stage2-flowpacker",
+        "stage2-af3score",
+        "stage2-filter",
+        "stage2-alphafold3-refold",
+        "stage2-dockq",
+        "stage2-rosetta-relax",
+        "stage2-rank",
+        "stage2-report",
+    ]
+    assert [
+        type(definition.nodes[node_id].node).__name__ for node_id in definition.nodes
+    ] == [
+        "PPIFlowDesignNode",
+        "LigandMPNNNode",
+        "FlowPackerNode",
+        "AF3ScoreNode",
+        "FilterStructuresNode",
+        "RosettaFixNode",
+        "FixedPositionsNode",
+        "PPIFlowPartialNode",
+        "LigandMPNNNode",
+        "FlowPackerNode",
+        "AF3ScoreNode",
+        "FilterStructuresNode",
+        "ReFoldNode",
+        "DockQNode",
+        "RosettaRelaxNode",
+        "RankNode",
+        "ReportNode",
+    ]
+    assert definition.dependencies["stage2-fixed-positions"] == {"stage2-rosetta-fix"}
+    assert definition.dependencies["stage2-partial-ppiflow"] == {
+        "stage2-fixed-positions"
+    }
+    assert definition.dependencies["stage2-dockq"] == {
+        "stage2-filter",
+        "stage2-alphafold3-refold",
+    }
+    assert definition.dependencies["stage2-rosetta-relax"] == {
+        "stage2-filter",
+        "stage2-dockq",
+    }
+    assert definition.dependencies["stage2-rank"] == {
+        "stage2-rosetta-relax",
+        "stage2-dockq",
+    }
+    assert definition.dependencies["stage2-report"] == {"stage2-rank"}
 
 
 def test_ppiflow_unsupported_steps_fail_with_clear_adapter_error(
     tmp_path: Path,
 ) -> None:
     fake_function = _FakePPIFlowFunction()
-    namespace = PPIFlowModalNamespace(
-        ppiflow_run=cast(modal.Function, fake_function),
-    )
+    namespace = _fake_namespace(fake_function)
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=_task_yaml(enabled_steps="  FlowpackerStep_stage1: true\n"),
         steps_yaml_bytes=b"FlowpackerStep_stage1: {}\n",
@@ -233,7 +340,7 @@ def test_ppiflow_unsupported_steps_fail_with_clear_adapter_error(
             )
         )
     except NotImplementedError as exc:
-        assert "workflow-compatible app adapter" in str(exc)
+        assert "workflow-compatible run_flowpacker_workflow adapter" in str(exc)
     else:
         raise AssertionError("unsupported PPIFlow step should fail clearly")
 

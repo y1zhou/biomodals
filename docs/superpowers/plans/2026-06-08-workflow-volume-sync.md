@@ -4,6 +4,12 @@
 
 **Goal:** Eliminate intermittent workflow `FileNotFoundError` failures caused by workflow volume writes, commits, reloads, and reads becoming visible in the wrong order across Modal containers.
 
+**Status:** Implemented. The original plan predates the `_runtime` split, so
+some snippets below show the intended behavior in old `WorkflowRuntime` method
+names. Current code implements the same boundaries through
+`_runtime/volume_sync.py`, `_runtime/node_runner.py`, runtime services, and
+focused workflow tests.
+
 **Architecture:** Keep Modal volume ownership at the runtime/orchestrator boundary instead of importing Modal into ledger or artifact helpers. Add tests that model Modal visibility rules, then serialize workflow-volume `commit()`/`reload()` with local workflow-volume file access and ensure artifact materialization plus ledger updates are committed as one visible runtime boundary. Preserve remote-node parallelism where possible, but do not allow `reload()` to run while an orchestrator-local node is reading from or writing to the mounted workflow volume.
 
 **Tech Stack:** Python 3.13 workflow runtime, Modal Volume v2, SQLite workflow ledger, Pydantic app result schemas, `orjson`, `pytest`, `prek`.
@@ -29,7 +35,7 @@ The highest-risk gap is not a simple missing `commit()` after artifact writes: t
 
 - Modify: `tests/workflow/test_runtime.py`
 
-- [ ] **Step 1: Add a fake volume that records committed snapshots**
+- [x] **Step 1: Add a fake volume that records committed snapshots**
 
 Add this helper near the existing `FakeVolume` in `tests/workflow/test_runtime.py`:
 
@@ -49,7 +55,7 @@ class SnapshotVolume(FakeVolume):
         }
 ```
 
-- [ ] **Step 2: Add a downstream node test that only trusts committed artifacts**
+- [x] **Step 2: Add a downstream node test that only trusts committed artifacts**
 
 Add this test in `tests/workflow/test_runtime.py`:
 
@@ -98,7 +104,7 @@ def test_downstream_node_sees_committed_inline_artifact(tmp_path: Path) -> None:
     assert result.status == AppRunStatus.SUCCEEDED
 ```
 
-- [ ] **Step 3: Add a regression test for logs from failed nodes**
+- [x] **Step 3: Add a regression test for logs from failed nodes**
 
 Add this test in `tests/workflow/test_runtime.py`:
 
@@ -140,7 +146,7 @@ def test_failed_node_logs_are_committed_before_run_returns(tmp_path: Path) -> No
     assert "demo/run-1/artifacts/failed-logs-stderr.json" in volume.committed_paths
 ```
 
-- [ ] **Step 4: Add a reload-during-local-node regression test**
+- [x] **Step 4: Add a reload-during-local-node regression test**
 
 Add this test in `tests/workflow/test_runtime.py`. It must fail before the runtime synchronization change because the remote worker can call `reload()` while the orchestrator-local node is still inside `run()`.
 
@@ -200,7 +206,7 @@ def test_remote_reload_waits_for_orchestrator_node_volume_access(
     assert reload_happened_while_local_running is False
 ```
 
-- [ ] **Step 5: Run focused tests and confirm the new reload race test fails**
+- [x] **Step 5: Run focused tests and confirm the new reload race test fails**
 
 Run:
 
@@ -216,7 +222,7 @@ Expected before implementation: the new reload race test fails because `reload_h
 
 - Modify: `src/biomodals/workflow/core/runtime.py`
 
-- [ ] **Step 1: Add a runtime lock for mounted workflow-volume access**
+- [x] **Step 1: Add a runtime lock for mounted workflow-volume access**
 
 In `WorkflowRuntime.__init__`, after `_active_remote_calls_lock`, add:
 
@@ -224,7 +230,7 @@ In `WorkflowRuntime.__init__`, after `_active_remote_calls_lock`, add:
 self._workflow_volume_access_lock = RLock()
 ```
 
-- [ ] **Step 2: Guard orchestrator-local node execution**
+- [x] **Step 2: Guard orchestrator-local node execution**
 
 Replace `_dispatch_node()` with:
 
@@ -240,7 +246,7 @@ def _dispatch_node(
 
 This serializes `ORCHESTRATOR` nodes that may read `context.inputs`, read volume-backed artifacts, or write `context.cache_dir`. Remote node waiting can still run concurrently.
 
-- [ ] **Step 3: Guard Modal commit/reload**
+- [x] **Step 3: Guard Modal commit/reload**
 
 Update `_commit_volume()` and `_reload_volume()`:
 
@@ -260,7 +266,7 @@ def _reload_volume(self) -> None:
 
 The `RLock` is intentional because finalization will hold this lock while calling `_commit_volume()`.
 
-- [ ] **Step 4: Guard materialization plus ledger finalization as one visible boundary**
+- [x] **Step 4: Guard materialization plus ledger finalization as one visible boundary**
 
 Wrap the body of `_finalize_node_result()` in the same lock:
 
@@ -323,7 +329,7 @@ def _finalize_node_result(
 
 Keep the success `print()` outside the lock so the lock only covers filesystem and ledger visibility.
 
-- [ ] **Step 5: Run focused runtime tests**
+- [x] **Step 5: Run focused runtime tests**
 
 Run:
 
@@ -339,7 +345,7 @@ Expected after implementation: all runtime tests pass, including the new reload 
 
 - Modify: `src/biomodals/workflow/core/runtime.py`
 - Modify: `tests/workflow/test_runtime.py`
-- [ ] **Step 1: Add a regression test for forced run reset visibility**
+- [x] **Step 1: Add a regression test for forced run reset visibility**
 
 Add this test in `tests/workflow/test_runtime.py`:
 
@@ -366,7 +372,7 @@ def test_force_reset_commits_deleted_run_before_recreate(tmp_path: Path) -> None
     assert "demo/run-1/nodes/stale.txt" not in volume.committed_paths
 ```
 
-- [ ] **Step 2: Add a helper for reset-and-commit**
+- [x] **Step 2: Add a helper for reset-and-commit**
 
 In `WorkflowRuntime`, add:
 
@@ -390,7 +396,7 @@ with:
 self._reset_node_for_rerun(node_id)
 ```
 
-- [ ] **Step 3: Keep run reset committed before recreate**
+- [x] **Step 3: Keep run reset committed before recreate**
 
 The existing `run()` flow already commits after `reset_run()` and after `create_run()`. Leave that ordering in place. If the test in Step 1 fails, wrap the `reset_run()` plus `_commit_volume()` block in `_workflow_volume_access_lock` the same way as node reset:
 
@@ -400,7 +406,7 @@ with self._workflow_volume_access_lock:
     self._commit_volume()
 ```
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run:
 
@@ -417,7 +423,7 @@ Expected: all tests pass and forced reset removes stale committed files from the
 - Modify: `src/biomodals/workflow/core/artifacts.py`
 - Modify: `src/biomodals/workflow/core/ledger.py`
 - Modify: `src/biomodals/workflow/core/runtime.py`
-- [ ] **Step 1: Do not add Modal imports to `artifacts.py` or `ledger.py`**
+- [x] **Step 1: Do not add Modal imports to `artifacts.py` or `ledger.py`**
 
 Confirm these commands return no output:
 
@@ -425,7 +431,7 @@ Confirm these commands return no output:
 rtk rg -n "import modal|modal\\." src/biomodals/workflow/core/artifacts.py src/biomodals/workflow/core/ledger.py
 ```
 
-- [ ] **Step 2: Add comments only at the caller boundary**
+- [x] **Step 2: Add comments only at the caller boundary**
 
 If needed, add this short comment before `_finalize_node_result()` or inside it, not inside `artifacts.py`:
 
@@ -435,7 +441,7 @@ If needed, add this short comment before `_finalize_node_result()` or inside it,
 # partially synchronized volume view.
 ```
 
-- [ ] **Step 3: Leave app-owned volume commits out of core**
+- [x] **Step 3: Leave app-owned volume commits out of core**
 
 Do not try to commit app-owned output volumes from `core`. `core` only receives `VolumePath` metadata for app outputs and usually does not own the source `modal.Volume` handle. If file-not-found failures point at app-owned paths such as GROMACS or RFdiffusion outputs, fix those app or workflow-specific remote functions separately by calling the app volume `commit()` after writes and `reload()` before reads.
 
@@ -448,7 +454,7 @@ Do not try to commit app-owned output volumes from `core`. `core` only receives 
 - Verify: `src/biomodals/workflow/core/ledger.py`
 - Verify: `tests/workflow/test_runtime.py`
 - Verify: `tests/workflow/test_artifacts.py`
-- [ ] **Step 1: Run focused workflow core tests**
+- [x] **Step 1: Run focused workflow core tests**
 
 Run:
 
@@ -458,7 +464,7 @@ rtk uv run pytest tests/workflow/test_runtime.py tests/workflow/test_artifacts.p
 
 Expected: all selected workflow core tests pass.
 
-- [ ] **Step 2: Run workflow-specific tests that exercise app volume handoffs**
+- [x] **Step 2: Run workflow-specific tests that exercise app volume handoffs**
 
 Run:
 
@@ -468,7 +474,7 @@ rtk uv run pytest tests/workflow/test_shortmd_workflow.py tests/workflow/test_rf
 
 Expected: ShortMD clone tests still show explicit app-volume reload and commit, and RFdiffusion selector tests still show app-volume reload before reads.
 
-- [ ] **Step 3: Run CLI smoke tests**
+- [x] **Step 3: Run CLI smoke tests**
 
 Run:
 
@@ -480,7 +486,7 @@ rtk uv run biomodals workflow help rfd-ligandmpnn
 
 Expected: workflow discovery and help commands complete without import errors.
 
-- [ ] **Step 4: Run pre-commit on changed files**
+- [x] **Step 4: Run pre-commit on changed files**
 
 Run:
 

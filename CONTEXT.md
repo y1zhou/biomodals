@@ -110,6 +110,10 @@ _Avoid_: server pool, runner server
 The reusable library that validates a workflow DAG, schedules workflow nodes, tracks durable run state, and materializes workflow artifacts.
 _Avoid_: engine
 
+**Runtime Diagnostics**:
+In-memory inspection data produced by the workflow runtime for the most recent run, including scheduler decisions and scheduled node waves.
+_Avoid_: public scheduler API, debug-only list
+
 **Workflow Orchestrator**:
 A Modal-hosted coordinator that owns one workflow run, hosts the workflow runtime, records durable run state, and uses Modal lifecycle hooks to reconcile interrupted work.
 _Avoid_: workflow node, runner
@@ -143,6 +147,7 @@ _Avoid_: temporary scratch, local cache
 - A **Workflow Runtime** is an internal orchestration component; workflow users should not instantiate it directly or depend on its scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization interfaces.
 - Internal workflow runtime modules may live under a private `_runtime` package so the stable workflow authoring surface stays limited to the **Workflow Builder**, package-development node contracts, and **Workflow Orchestrator**.
 - The `WorkflowRuntime` class should remain a thin internal facade around private runtime collaborators rather than a broad service object with many callable behaviors.
+- **Runtime Diagnostics** may expose scheduler decision snapshots for tests and debugging, but they are not part of routine workflow authoring.
 - A **Workflow Runtime** may run independent ready nodes in parallel when all of each node's dependencies are satisfied.
 - A **Workflow Orchestrator** runs the **Workflow Runtime** remotely on Modal and is responsible for run-level lifecycle recovery.
 - A **Workflow Orchestrator** is the only writer to the **Workflow Ledger**.

@@ -138,6 +138,25 @@ Forced workflow runs replace the existing run directory before creating a fresh
 ledger. Use force only when discarding previous artifacts, node caches, and
 attempt records is intentional.
 
+## Artifact Availability And Recovery
+
+The runtime verifies workflow-volume artifact availability before reusing a
+previously completed node. If a recorded workflow-volume artifact manifest or
+expected file is missing, the producing node is treated as incomplete and normal
+node recovery decides whether to rerun or resume it.
+
+App-owned volume artifacts are skipped by default because the reusable runtime
+does not own those `modal.Volume` handles. Workflows that need strict recovery
+for app-owned outputs may enable the orchestrator/runtime
+`strict_external_artifact_checks` option and pass one checker that can inspect
+the required mounted app volumes. Keep those checks run-level and derived from
+recorded `WorkflowArtifact` locations; do not add per-node user settings or
+tool-specific logic to workflow core.
+
+The helper in `_runtime.external_availability` is pure Python so workflow
+modules can call it from a lightweight Modal function that mounts the app-owned
+volumes needed for the run.
+
 ## Node Placement
 
 Use `ORCHESTRATOR` placement for lightweight workflow-native logic such as
@@ -278,6 +297,14 @@ All remote orchestration functions should live as methods on
 must not perform deployed app lookups, import workflow app functions by name, or
 handle hydration details for workflow-specific apps. Domain-specific input
 staging and DAG construction belong in top-level workflow scripts.
+
+## Runtime Diagnostics
+
+`WorkflowRuntime.diagnostics` stores in-memory diagnostics for the most recent
+run, including stable scheduler decision snapshots and scheduled node waves.
+Use it in tests or debugging when you need to inspect why the runtime scheduled,
+blocked, or completed nodes. Do not expose private scheduler, ledger, or
+volume-sync collaborators as routine workflow authoring APIs.
 
 Keep the public orchestrator method surface minimal. The intended remote method
 for user-facing submission is `WorkflowOrchestrator.run(...)`. The orchestrator

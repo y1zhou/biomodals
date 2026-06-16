@@ -887,6 +887,46 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert "1 replicate(s)" in stdout
 
 
+def test_submit_shortmd_workflow_can_enable_strict_external_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "pdbs"
+    input_dir.mkdir()
+    input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
+    calls = {}
+
+    class FakeOrchestratorMethod:
+        def remote(self, **kwargs):
+            calls["remote"] = kwargs
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    class FakeWorkflowOrchestrator:
+        def __init__(self) -> None:
+            self.run = FakeOrchestratorMethod()
+
+    monkeypatch.setattr(
+        shortmd_workflow.orchestrator,
+        "WorkflowOrchestrator",
+        FakeWorkflowOrchestrator,
+    )
+
+    raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_dir=str(input_dir),
+        run_id="shortmd-run",
+        replicates=1,
+        wait=True,
+        strict_artifact_checks=True,
+    )
+
+    assert calls["remote"]["strict_external_artifact_checks"] is True
+    checker = calls["remote"]["external_artifact_checker"]
+    assert callable(checker)
+    assert "check_shortmd_external_artifact" in repr(checker)
+
+
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

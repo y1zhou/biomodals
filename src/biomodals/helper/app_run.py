@@ -7,8 +7,16 @@ Modal-supported atomic primitive.
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
-from biomodals.schema import VolumePath
+from biomodals.schema import (
+    AppOutput,
+    ArtifactFile,
+    ArtifactKind,
+    InlineBytes,
+    VolumePath,
+)
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,74 @@ def volume_path_from_mount_path(
         )
     return VolumePath(
         volume_name=volume_name, path=str(relative_path), media_type=media_type
+    )
+
+
+def _file_metadata(files: list[ArtifactFile | str]) -> list[dict[str, Any]]:
+    return [
+        (
+            ArtifactFile(path=file).model_dump(
+                exclude_defaults=True,
+                exclude_none=True,
+            )
+            if isinstance(file, str)
+            else file.model_dump(exclude_defaults=True, exclude_none=True)
+        )
+        for file in files
+    ]
+
+
+def volume_app_output(
+    *,
+    name: str,
+    kind: ArtifactKind,
+    remote_path: str,
+    mount_root: str,
+    volume_name: str,
+    media_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    files: list[ArtifactFile | str] | None = None,
+) -> AppOutput:
+    """Build a workflow-compatible app output backed by a mounted volume path."""
+    output_metadata = dict(metadata or {})
+    if files is not None:
+        if "files" in output_metadata:
+            raise ValueError(
+                "Provide expected files either in metadata or files, not both"
+            )
+        output_metadata["files"] = _file_metadata(files)
+    return AppOutput(
+        name=name,
+        kind=kind,
+        storage=volume_path_from_mount_path(
+            remote_path=remote_path,
+            mount_root=mount_root,
+            volume_name=volume_name,
+            media_type=media_type,
+        ),
+        metadata=output_metadata,
+    )
+
+
+def inline_zstd_output(
+    *,
+    name: str,
+    kind: ArtifactKind,
+    data: bytes,
+    filename: str,
+    metadata: dict[str, Any] | None = None,
+) -> AppOutput:
+    """Build a workflow-compatible inline zstd archive output."""
+    output_metadata = {"archive_format": "tar.zst"} | dict(metadata or {})
+    return AppOutput(
+        name=name,
+        kind=kind,
+        storage=InlineBytes(
+            data=data,
+            filename=filename,
+            media_type=ZSTD_MEDIA_TYPE,
+        ),
+        metadata=output_metadata,
     )
 
 

@@ -9,9 +9,18 @@ import pytest
 from biomodals.helper.app_run import (
     AppRunLayout,
     has_completed_output_files,
+    inline_zstd_output,
+    volume_app_output,
     volume_path_from_mount_path,
 )
-from biomodals.schema import VolumePath
+from biomodals.schema import (
+    AppOutput,
+    ArtifactFile,
+    ArtifactKind,
+    InlineBytes,
+    VolumePath,
+)
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 
 def test_app_run_layout_builds_standard_paths_without_creating_dirs(
@@ -30,6 +39,57 @@ def test_app_run_layout_builds_standard_paths_without_creating_dirs(
     assert layout.metrics_dir == run_root / "metrics"
     assert layout.markers_dir == run_root / ".markers"
     assert not run_root.exists()
+
+
+def test_volume_app_output_builds_storage_and_expected_file_metadata() -> None:
+    """Volume outputs carry storage and expected child-file metadata together."""
+    output = volume_app_output(
+        name="structures",
+        kind=ArtifactKind.STRUCTURES,
+        remote_path="/outputs/run-1/outputs",
+        mount_root="/outputs",
+        volume_name="Design-outputs",
+        metadata={"run_name": "run-1"},
+        files=[
+            ArtifactFile(path="model.pdb", role="structure"),
+            "scores.csv",
+        ],
+    )
+
+    assert output == AppOutput(
+        name="structures",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(volume_name="Design-outputs", path="run-1/outputs"),
+        metadata={
+            "run_name": "run-1",
+            "files": [
+                {"path": "model.pdb", "role": "structure"},
+                {"path": "scores.csv"},
+            ],
+        },
+    )
+
+
+def test_inline_zstd_output_builds_archive_metadata() -> None:
+    """Inline zstd archive outputs use the standard archive metadata."""
+    output = inline_zstd_output(
+        name="scores",
+        kind=ArtifactKind.SCORES,
+        data=b"archive",
+        filename="scores.tar.zst",
+        metadata={"run_name": "run-1"},
+    )
+
+    assert output == AppOutput(
+        name="scores",
+        kind=ArtifactKind.SCORES,
+        storage=InlineBytes(
+            data=b"archive",
+            filename="scores.tar.zst",
+            media_type=ZSTD_MEDIA_TYPE,
+        ),
+        metadata={"archive_format": "tar.zst", "run_name": "run-1"},
+    )
 
 
 def test_has_completed_output_files_checks_required_files(tmp_path: Path) -> None:

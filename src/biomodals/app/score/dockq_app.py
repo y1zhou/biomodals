@@ -31,6 +31,7 @@ import polars as pl
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import inline_zstd_output
 from biomodals.helper.io import (
     build_local_output_path,
     resolve_local_output_dir,
@@ -38,13 +39,11 @@ from biomodals.helper.io import (
 )
 from biomodals.helper.shell import package_outputs, sanitize_filename
 from biomodals.schema import (
-    AppOutput,
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
 )
-from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 ##########################################
 # Modal configs
@@ -266,15 +265,12 @@ def run_dockq_workflow(
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            inline_zstd_output(
                 name="dockq_scores",
                 kind=ArtifactKind.SCORES,
-                storage=InlineBytes(
-                    data=tarball_bytes,
-                    filename=f"{safe_run_name}_dockq.tar.zst",
-                    media_type=ZSTD_MEDIA_TYPE,
-                ),
-                metadata={"archive_format": "tar.zst", "run_name": safe_run_name},
+                data=tarball_bytes,
+                filename=f"{safe_run_name}_dockq.tar.zst",
+                metadata={"run_name": safe_run_name},
             )
         ],
     )

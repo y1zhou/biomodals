@@ -16,6 +16,12 @@ from biomodals.helper.catalog import (
     CatalogType,
     get_catalog,
 )
+from biomodals.helper.cli_command import (
+    build_app_run_command,
+    build_modal_deploy_command,
+    build_workflow_run_command,
+    modal_env_overrides,
+)
 from biomodals.helper.shell import run_command
 
 # ruff: noqa: S603
@@ -396,17 +402,15 @@ def run_modal_app(
     # TODO(workflows): add workflow run semantics separately from Modal app runs
     # so workflow-* names can stage workflow inputs before invoking orchestrators.
     import os
-    import sys
 
     app = _load_entry("app", app_name_or_path)
-
-    full_app = (
-        str(app.path) if app._entrypoint is None else f"{app.path}::{app._entrypoint}"
+    cmd = build_app_run_command(
+        app_path=app.path,
+        entrypoint=app._entrypoint,
+        modal_mode=modal_mode,
+        detach=detach,
+        flags=flags,
     )
-    cmd = [sys.executable, "-m", "modal", modal_mode]
-    if detach:
-        cmd.append("-d")
-    cmd.append(str(full_app))
 
     if modal_mode == "shell":
         console.print(
@@ -420,15 +424,12 @@ def run_modal_app(
     # apps run with the --run-name flag, but with the new AppConfig API
     # this is no longer read.
     env = os.environ.copy()
-    if gpu is not None:
-        env["GPU"] = gpu
-    if timeout is not None:
-        env["TIMEOUT"] = str(timeout)
+    env.update(modal_env_overrides(gpu=gpu, timeout=timeout))
 
     if flags:
-        run_command([*cmd, *flags], env=env, output_mode="inherit")
+        run_command(list(cmd), env=env, output_mode="inherit")
     elif app._entrypoint is not None:
-        run_command(cmd, env=env, output_mode="inherit")
+        run_command(list(cmd), env=env, output_mode="inherit")
     else:
         _show_entry_help("app", str(app.path), verbose=False)
 
@@ -510,16 +511,17 @@ def run_workflow(
     where `[workflow-options]` are passed to the workflow local entrypoint.
     """
     import os
-    import sys
 
     workflow = _load_entry("workflow", workflow_name_or_path)
     entrypoint = _resolve_workflow_entrypoint(workflow)
-    full_workflow = f"{workflow.module}::{entrypoint}"
-
-    cmd = [sys.executable, "-m", "modal", modal_mode]
-    if detach:
-        cmd.append("-d")
-    cmd.extend(["-m", full_workflow])
+    cmd = build_workflow_run_command(
+        workflow_module=workflow.module,
+        entrypoint=entrypoint,
+        modal_mode=modal_mode,
+        detach=detach,
+        dry_run=dry_run,
+        flags=flags,
+    )
 
     if modal_mode == "shell":
         console.print(
@@ -529,16 +531,9 @@ def run_workflow(
         return
 
     env = os.environ.copy()
-    if gpu is not None:
-        env["GPU"] = gpu
-    if timeout is not None:
-        env["TIMEOUT"] = str(timeout)
+    env.update(modal_env_overrides(gpu=gpu, timeout=timeout))
 
-    entrypoint_flags = list(flags or [])
-    if dry_run and "--dry-run" not in entrypoint_flags:
-        entrypoint_flags.insert(0, "--dry-run")
-
-    run_command([*cmd, *entrypoint_flags], env=env, output_mode="inherit")
+    run_command(list(cmd), env=env, output_mode="inherit")
 
 
 @app_commands.command(
@@ -568,13 +563,8 @@ def deploy_app(
 ):
     """Deploy a biomodals application to Modal."""
     app = _load_entry("app", app_name_or_path)
-    cmd = ["modal", "deploy"]
-    if name:
-        cmd.extend(["--name", name])
-    if tag:
-        cmd.extend(["--tag", tag])
-    cmd.append(str(app.path))
-    run_command(cmd, output_mode="inherit")
+    cmd = build_modal_deploy_command(app_path=app.path, name=name, tag=tag)
+    run_command(list(cmd), output_mode="inherit")
 
 
 if __name__ == "__main__":

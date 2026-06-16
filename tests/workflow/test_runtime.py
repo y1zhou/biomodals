@@ -18,6 +18,7 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     NodeExecutionPolicy,
@@ -356,6 +357,48 @@ def test_completed_node_with_missing_external_artifact_is_rerun_when_strict(
         workflow_volume_name="Workflow-outputs",
         strict_external_artifact_checks=True,
         external_artifact_checker=external_checker,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["done"]
+    assert runtime.diagnostics.scheduled_waves == [["done"]]
+
+
+def test_strict_external_artifact_checks_can_use_mounted_volume_roots(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    external_volume = tmp_path / "external-volume"
+    external_volume.joinpath("runs/done/outputs").mkdir(parents=True)
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/done/outputs",
+                ),
+                files=[ArtifactFile(path="model.pdb")],
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_volume_roots={"ExternalApp-outputs": external_volume},
     )
 
     result = runtime.run(run_id="run-1")

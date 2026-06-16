@@ -670,6 +670,53 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert "1 RFdiffusion trajector" in stdout
 
 
+def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    calls: dict[str, object] = {}
+
+    class FakeOrchestratorMethod:
+        def remote(self, **kwargs: object) -> AppRunResult:
+            calls["remote"] = kwargs
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def spawn(self, **kwargs: object) -> str:
+            calls["spawn"] = kwargs
+            return "call-1"
+
+    class FakeWorkflowOrchestrator:
+        def __init__(self) -> None:
+            self.run = FakeOrchestratorMethod()
+
+    monkeypatch.setattr(
+        rfd_ligandmpnn_workflow.orchestrator,
+        "WorkflowOrchestrator",
+        FakeWorkflowOrchestrator,
+    )
+
+    raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdb=str(input_pdb),
+        contigs="100-150/0 E333-526",
+        hotspot_res="E405,E408",
+        run_id="demo",
+        num_rfdiffusion_trajectories=1,
+        num_rfdiffusion_designs=1,
+        wait=False,
+        strict_artifact_checks=True,
+    )
+
+    spawn_kwargs = calls["spawn"]
+    assert spawn_kwargs["strict_external_artifact_checks"] is True
+    checker = spawn_kwargs["external_artifact_checker"]
+    assert callable(checker)
+    assert "check_rfd_ligandmpnn_external_artifact" in repr(checker)
+
+
 def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

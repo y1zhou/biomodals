@@ -25,7 +25,11 @@ from modal import App, Image
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
+from biomodals.helper.app_run import (
+    AppRunLayout,
+    volume_app_output,
+    volume_path_from_mount_path,
+)
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
@@ -37,9 +41,9 @@ from biomodals.helper.shell import (
 )
 from biomodals.helper.web import download_files
 from biomodals.schema import (
-    AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     VolumePath,
 )
@@ -213,6 +217,23 @@ def _rfdiffusion_infer(
     return run_paths
 
 
+def _expected_rfdiffusion_output_files(
+    *, run_name: str, hydra_overrides: str
+) -> list[ArtifactFile]:
+    num_designs = 1
+    for token in shlex.split(hydra_overrides):
+        key, separator, value = token.partition("=")
+        if key == "inference.num_designs" and separator:
+            num_designs = int(value)
+    files: list[ArtifactFile] = []
+    for design_index in range(num_designs):
+        files.extend([
+            ArtifactFile(path=f"{run_name}_{design_index}.pdb", role="structure"),
+            ArtifactFile(path=f"{run_name}_{design_index}.trb", role="metadata"),
+        ])
+    return files
+
+
 @app.function(
     gpu=CONF.gpu,
     memory=(1024, 32768),
@@ -234,26 +255,26 @@ def rfdiffusion_infer(
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            volume_app_output(
                 name=f"{CONF.name}_outputs",
                 kind=ArtifactKind.DIRECTORY,
-                storage=volume_path_from_mount_path(
-                    remote_path=run_paths["outputs_dir"],
-                    mount_root=CONF.output_volume_mountpoint,
-                    volume_name=CONF.output_volume_name,
-                ),
+                remote_path=run_paths["outputs_dir"],
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
                 metadata={"run_name": safe_run_name},
+                files=_expected_rfdiffusion_output_files(
+                    run_name=safe_run_name,
+                    hydra_overrides=hydra_overrides,
+                ),
             )
         ],
         logs=[
-            AppOutput(
+            volume_app_output(
                 name=f"{CONF.name}_log",
                 kind=ArtifactKind.LOGS,
-                storage=volume_path_from_mount_path(
-                    remote_path=run_paths["log_path"],
-                    mount_root=CONF.output_volume_mountpoint,
-                    volume_name=CONF.output_volume_name,
-                ),
+                remote_path=run_paths["log_path"],
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
             )
         ],
     )

@@ -20,7 +20,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.app_run import AppRunLayout, inline_zstd_output
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
@@ -30,13 +30,11 @@ from biomodals.helper.shell import (
 )
 from biomodals.helper.web import download_files
 from biomodals.schema import (
-    AppOutput,
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
 )
-from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 ##########################################
 # Modal configs
@@ -318,15 +316,12 @@ def ligandmpnn_run(
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            inline_zstd_output(
                 name=f"{CONF.name}_outputs",
                 kind=ArtifactKind.ARCHIVE,
-                storage=InlineBytes(
-                    data=tarball_bytes,
-                    filename=f"{safe_run_name}_{CONF.name}.tar.zst",
-                    media_type=ZSTD_MEDIA_TYPE,
-                ),
-                metadata={"archive_format": "tar.zst", "run_name": safe_run_name},
+                data=tarball_bytes,
+                filename=f"{safe_run_name}_{CONF.name}.tar.zst",
+                metadata={"run_name": safe_run_name},
             )
         ],
     )

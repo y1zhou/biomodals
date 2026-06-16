@@ -32,6 +32,7 @@ from biomodals.schema import (
     NodeExecutionPolicy,
     NodePlacement,
     VolumePath,
+    WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
@@ -41,6 +42,9 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+)
+from biomodals.workflow.core._runtime.external_availability import (
+    check_external_artifact_availability,
 )
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
@@ -68,6 +72,25 @@ app = include_dependency_apps(app, CONF.depends_on_apps)
 RFDIFFUSION_OUTPUT_VOLUME = rfdiffusion_app.CONF.output_volume
 RFDIFFUSION_OUTPUT_VOLUME_NAME = rfdiffusion_app.CONF.output_volume_name
 RFDIFFUSION_OUTPUT_MOUNTPOINT = rfdiffusion_app.CONF.output_volume_mountpoint
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    volumes={RFDIFFUSION_OUTPUT_MOUNTPOINT: RFDIFFUSION_OUTPUT_VOLUME},
+)
+def check_rfd_ligandmpnn_external_artifact(
+    artifact: WorkflowArtifact,
+) -> list[str]:
+    """Validate RFdiffusion artifacts referenced by the workflow runtime."""
+    RFDIFFUSION_OUTPUT_VOLUME.reload()
+    return check_external_artifact_availability(
+        artifact,
+        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        volume_roots={RFDIFFUSION_OUTPUT_VOLUME_NAME: RFDIFFUSION_OUTPUT_MOUNTPOINT},
+    )
 
 
 @dataclass(frozen=True)
@@ -516,6 +539,7 @@ def submit_rfd_ligandmpnn_workflow(
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
+    strict_artifact_checks: bool = False,
 ) -> None:
     """Run RFdiffusion trajectories followed by LigandMPNN sequence design.
 
@@ -539,6 +563,8 @@ def submit_rfd_ligandmpnn_workflow(
         wait: Wait locally for the remote workflow result.
         max_parallel: Maximum ready workflow nodes per scheduler wave.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
+        strict_artifact_checks: Validate referenced RFdiffusion volume artifacts
+            before reusing completed workflow nodes.
     """
     input_path = Path(input_pdb).expanduser().resolve()
     if not input_path.exists():
@@ -565,6 +591,17 @@ def submit_rfd_ligandmpnn_workflow(
     if dry_run:
         print_workflow_dag(workflow.validate())
         return
+    orchestrator_kwargs = {
+        "workflow": workflow,
+        "run_id": resolved_run_id,
+        "force": force,
+        "max_ready_workers": max_parallel,
+    }
+    if strict_artifact_checks:
+        orchestrator_kwargs["strict_external_artifact_checks"] = True
+        orchestrator_kwargs["external_artifact_checker"] = (
+            check_rfd_ligandmpnn_external_artifact.remote
+        )
     total_structures = num_rfdiffusion_trajectories * num_rfdiffusion_designs
     print(
         f"Submitting {CONF.name} '{resolved_run_id}' with "
@@ -575,12 +612,7 @@ def submit_rfd_ligandmpnn_workflow(
         flush=True,
     )
     orchestrator_handle = orchestrator.WorkflowOrchestrator()
-    fc = orchestrator_handle.run.spawn(
-        workflow=workflow,
-        run_id=resolved_run_id,
-        force=force,
-        max_ready_workers=max_parallel,
-    )
+    fc = orchestrator_handle.run.spawn(**orchestrator_kwargs)
     if wait:
         result: AppRunResult | str = AppRunResult.model_validate(fc.get())
         print(f"{CONF.name} run finished with status: {result.status}", flush=True)

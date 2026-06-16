@@ -88,7 +88,15 @@ def test_rfdiffusion_workflow_result_references_cached_output_directory(
         volume_name=rfdiffusion_app.CONF.output_volume_name,
         path="rfd-run/outputs/rfd-scaffolds",
     )
-    assert output.metadata == {"run_name": "rfd-run"}
+    assert output.metadata == {
+        "run_name": "rfd-run",
+        "files": [
+            {"path": "rfd-run_0.pdb", "role": "structure"},
+            {"path": "rfd-run_0.trb", "role": "metadata"},
+            {"path": "rfd-run_1.pdb", "role": "structure"},
+            {"path": "rfd-run_1.trb", "role": "metadata"},
+        ],
+    }
     log = result.logs[0]
     assert log.name == "RFdiffusion_log"
     assert log.kind == ArtifactKind.LOGS

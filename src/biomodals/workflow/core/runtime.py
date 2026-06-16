@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import biomodals.workflow.core.display as workflow_display
@@ -17,6 +17,7 @@ from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
 from biomodals.workflow.core._runtime.diagnostics import RuntimeDiagnostics
 from biomodals.workflow.core._runtime.external_availability import (
     ExternalArtifactChecker,
+    mounted_volume_checker,
 )
 from biomodals.workflow.core._runtime.node_runner import NodeRunner
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
@@ -47,12 +48,22 @@ class WorkflowRuntime:
         max_ready_workers: int = 32,
         strict_external_artifact_checks: bool = False,
         external_artifact_checker: ExternalArtifactChecker | None = None,
+        external_volume_roots: Mapping[str, str | Path] | None = None,
     ):
         """Initialize a runtime for one workflow and ledger root."""
-        if strict_external_artifact_checks and external_artifact_checker is None:
-            raise ValueError(
-                "strict_external_artifact_checks requires external_artifact_checker"
-            )
+        if strict_external_artifact_checks:
+            if external_artifact_checker is None and external_volume_roots is None:
+                raise ValueError(
+                    "strict_external_artifact_checks requires "
+                    "external_artifact_checker or external_volume_roots"
+                )
+            if external_artifact_checker is None and external_volume_roots is not None:
+                external_artifact_checker = mounted_volume_checker(
+                    workflow_volume_name=workflow_volume_name,
+                    volume_roots=external_volume_roots,
+                )
+        else:
+            external_artifact_checker = None
         self.workflow = workflow
         volume_root_path = Path(volume_root)
         self.ledger = WorkflowLedger(volume_root_path)
@@ -66,9 +77,7 @@ class WorkflowRuntime:
             volume_root=volume_root_path,
             workflow_volume_name=workflow_volume_name,
             volume_sync=self._volume_sync,
-            external_artifact_checker=(
-                external_artifact_checker if strict_external_artifact_checks else None
-            ),
+            external_artifact_checker=external_artifact_checker,
         )
         self._remote_calls = RemoteCallManager(
             services=self._services,

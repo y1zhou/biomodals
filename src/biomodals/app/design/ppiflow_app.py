@@ -12,10 +12,14 @@ from pydantic import BaseModel, computed_field, model_validator
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
+from biomodals.helper.app_run import (
+    AppRunLayout,
+    volume_app_output,
+    volume_path_from_mount_path,
+)
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
 from biomodals.helper.shell import run_command, sanitize_filename
-from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
+from biomodals.schema import AppRunResult, AppRunStatus, ArtifactKind
 
 ##########################################
 # Modal configs
@@ -344,14 +348,12 @@ def ppiflow_run_workflow(args: PPIFlowArgs, run_name: str) -> AppRunResult:
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            volume_app_output(
                 name="ppiflow_outputs",
                 kind=ArtifactKind.DIRECTORY,
-                storage=volume_path_from_mount_path(
-                    str(remote_workdir),
-                    CONF.output_volume_mountpoint,
-                    CONF.output_volume_name,
-                ),
+                remote_path=str(remote_workdir),
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
                 metadata={
                     "run_name": safe_run_name,
                     "script_name": args.script_name,

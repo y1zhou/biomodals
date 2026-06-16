@@ -35,6 +35,7 @@ from biomodals.schema import (
     NodeExecutionPolicy,
     NodePlacement,
     VolumePath,
+    WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
@@ -44,6 +45,9 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+)
+from biomodals.workflow.core._runtime.external_availability import (
+    check_external_artifact_availability,
 )
 
 DEPENDENCY_APPS = ("gromacs",)
@@ -70,6 +74,23 @@ app = include_dependency_apps(app, CONF.depends_on_apps)
 GROMACS_OUTPUT_VOLUME = gromacs_app.CONF.output_volume
 GROMACS_OUTPUT_VOLUME_NAME = gromacs_app.CONF.output_volume_name
 GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
+)
+def check_shortmd_external_artifact(artifact: WorkflowArtifact) -> list[str]:
+    """Validate ShortMD artifacts stored in the GROMACS output volume."""
+    GROMACS_OUTPUT_VOLUME.reload()
+    return check_external_artifact_availability(
+        artifact,
+        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        volume_roots={GROMACS_OUTPUT_VOLUME_NAME: GROMACS_OUTPUT_MOUNTPOINT},
+    )
 
 
 @dataclass(frozen=True)
@@ -650,6 +671,7 @@ def submit_shortmd_workflow(
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
+    strict_artifact_checks: bool = False,
 ) -> None:
     """Run ShortMD production replicate workflow for a directory of PDB files.
 
@@ -674,6 +696,8 @@ def submit_shortmd_workflow(
         max_parallel: Maximum number of ready workflow nodes to execute
             concurrently in one scheduler wave.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
+        strict_artifact_checks: Validate referenced GROMACS volume artifacts
+            before reusing completed workflow nodes.
     """
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
@@ -704,6 +728,11 @@ def submit_shortmd_workflow(
         "force": force,
         "max_ready_workers": max_parallel,
     }
+    if strict_artifact_checks:
+        orchestrator_kwargs["strict_external_artifact_checks"] = True
+        orchestrator_kwargs["external_artifact_checker"] = (
+            check_shortmd_external_artifact.remote
+        )
     print(
         f"Submitting ShortMD workflow '{resolved_run_id}' with "
         f"{len(input_pdbs)} input PDB(s), {replicates} replicate(s) each",

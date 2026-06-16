@@ -40,7 +40,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
+from biomodals.helper.app_run import AppRunLayout, volume_app_output
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
@@ -55,7 +55,6 @@ from biomodals.helper.shell import (
     softlink_dir,
 )
 from biomodals.schema import (
-    AppOutput,
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
@@ -367,15 +366,13 @@ def run_flowpacker_workflow(
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            volume_app_output(
                 name="flowpacker_outputs",
                 kind=ArtifactKind.ARCHIVE,
-                storage=volume_path_from_mount_path(
-                    remote_path=str(archive_path),
-                    mount_root=CONF.output_volume_mountpoint,
-                    volume_name=CONF.output_volume_name,
-                    media_type=ZSTD_MEDIA_TYPE,
-                ),
+                remote_path=str(archive_path),
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
+                media_type=ZSTD_MEDIA_TYPE,
                 metadata={"archive_format": "tar.zst", "filename": archive_filename},
             )
         ],

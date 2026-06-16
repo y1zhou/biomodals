@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
+import tarfile
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,17 +20,27 @@ from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
 from biomodals.app.score import af3score_app, dockq_app
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import volume_path_from_mount_path
+from biomodals.helper.app_run import (
+    AppRunLayout,
+    volume_app_output,
+    volume_path_from_mount_path,
+)
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import (
     AppConfig,
+    AppOutput,
     AppRunResult,
+    AppRunStatus,
     ArtifactKind,
+    InlineBytes,
     NodeExecutionPolicy,
     NodePlacement,
+    VolumePath,
+    WorkflowArtifact,
 )
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
@@ -45,6 +59,7 @@ PPI_FLOW_OUTPUT_LAYOUT = (
     "design_output/design_report.md",
 )
 PPI_FLOW_APP_STEPS = ("PPIFlowStep", "PartialStep")
+STRUCTURE_SUFFIXES = {".pdb", ".cif"}
 
 DEPENDENCY_APPS = (
     "ppiflow",
@@ -75,6 +90,382 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
 app = include_dependency_apps(app, CONF.depends_on_apps)
+PPI_FLOW_OUTPUT_VOLUME = ppiflow_app.CONF.output_volume
+PPI_FLOW_OUTPUT_VOLUME_NAME = ppiflow_app.CONF.output_volume_name
+PPI_FLOW_OUTPUT_MOUNTPOINT = ppiflow_app.CONF.output_volume_mountpoint
+FLOWPACKER_OUTPUT_VOLUME = flowpacker_app.CONF.output_volume
+FLOWPACKER_OUTPUT_VOLUME_NAME = flowpacker_app.CONF.output_volume_name
+FLOWPACKER_OUTPUT_MOUNTPOINT = flowpacker_app.CONF.output_volume_mountpoint
+AF3SCORE_OUTPUT_VOLUME = af3score_app.CONF.output_volume
+AF3SCORE_OUTPUT_VOLUME_NAME = af3score_app.CONF.output_volume_name
+AF3SCORE_OUTPUT_MOUNTPOINT = af3score_app.CONF.output_volume_mountpoint
+ROSETTA_OUTPUT_VOLUME = rosetta_app.CONF.output_volume
+ROSETTA_OUTPUT_VOLUME_NAME = rosetta_app.CONF.output_volume_name
+ROSETTA_OUTPUT_MOUNTPOINT = rosetta_app.CONF.output_volume_mountpoint
+WORKFLOW_OUTPUT_VOLUME = orchestrator.OUT_VOLUME
+WORKFLOW_OUTPUT_VOLUME_NAME = orchestrator.OUT_VOLUME_NAME
+WORKFLOW_OUTPUT_MOUNTPOINT = orchestrator.CONF.output_volume_mountpoint
+PPI_FLOW_SOURCE_VOLUME_ROOTS = {
+    PPI_FLOW_OUTPUT_VOLUME_NAME: PPI_FLOW_OUTPUT_MOUNTPOINT,
+    FLOWPACKER_OUTPUT_VOLUME_NAME: FLOWPACKER_OUTPUT_MOUNTPOINT,
+    AF3SCORE_OUTPUT_VOLUME_NAME: AF3SCORE_OUTPUT_MOUNTPOINT,
+    ROSETTA_OUTPUT_VOLUME_NAME: ROSETTA_OUTPUT_MOUNTPOINT,
+    WORKFLOW_OUTPUT_VOLUME_NAME: WORKFLOW_OUTPUT_MOUNTPOINT,
+}
+PPI_FLOW_SOURCE_VOLUME_MOUNTS = {
+    PPI_FLOW_OUTPUT_MOUNTPOINT: PPI_FLOW_OUTPUT_VOLUME,
+    FLOWPACKER_OUTPUT_MOUNTPOINT: FLOWPACKER_OUTPUT_VOLUME,
+    AF3SCORE_OUTPUT_MOUNTPOINT: AF3SCORE_OUTPUT_VOLUME,
+    ROSETTA_OUTPUT_MOUNTPOINT: ROSETTA_OUTPUT_VOLUME,
+    WORKFLOW_OUTPUT_MOUNTPOINT: WORKFLOW_OUTPUT_VOLUME,
+}
+
+
+def _reload_ppiflow_source_volumes() -> None:
+    PPI_FLOW_OUTPUT_VOLUME.reload()
+    FLOWPACKER_OUTPUT_VOLUME.reload()
+    AF3SCORE_OUTPUT_VOLUME.reload()
+    ROSETTA_OUTPUT_VOLUME.reload()
+    WORKFLOW_OUTPUT_VOLUME.reload()
+
+
+def _artifact_mount_path(artifact: WorkflowArtifact) -> Path:
+    mountpoint = PPI_FLOW_SOURCE_VOLUME_ROOTS.get(artifact.storage.volume_name)
+    if mountpoint is None:
+        raise ValueError(
+            "PPIFlow workflow cannot read artifact volume "
+            f"{artifact.storage.volume_name!r}"
+        )
+    return artifact.storage.at_mountpoint(mountpoint)
+
+
+def _matches_structure_pattern(path: str, patterns: Sequence[str] | None) -> bool:
+    import fnmatch
+
+    suffix = Path(path).suffix.lower()
+    if suffix not in STRUCTURE_SUFFIXES:
+        return False
+    if patterns is None:
+        return True
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
+def _safe_selected_file_name(artifact_id: str, member_name: str) -> str:
+    parts = [sanitize_filename(part) for part in Path(member_name).parts if part]
+    return sanitize_filename("__".join([artifact_id, *parts]))
+
+
+def _artifact_is_zstd_archive(artifact: WorkflowArtifact, path: Path) -> bool:
+    return (
+        artifact.kind == ArtifactKind.ARCHIVE
+        or artifact.storage.media_type == ZSTD_MEDIA_TYPE
+        or artifact.metadata.get("archive_format") == "tar.zst"
+        or path.name.endswith(".tar.zst")
+    )
+
+
+def _structure_files_from_tar_zst(
+    artifact: WorkflowArtifact,
+    archive_path: Path,
+    patterns: Sequence[str] | None,
+) -> list[tuple[str, bytes]]:
+    import zstandard as zstd
+
+    selected: list[tuple[str, bytes]] = []
+    with archive_path.open("rb") as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                if not _matches_structure_pattern(member.name, patterns):
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                selected.append((
+                    _safe_selected_file_name(artifact.artifact_id, member.name),
+                    extracted.read(),
+                ))
+    return selected
+
+
+def _structure_files_from_artifact(
+    artifact: WorkflowArtifact,
+    patterns: Sequence[str] | None,
+) -> list[tuple[str, bytes]]:
+    root = _artifact_mount_path(artifact)
+    if not root.exists():
+        raise FileNotFoundError(f"PPIFlow input artifact path not found: {root}")
+    if root.is_file():
+        if _artifact_is_zstd_archive(artifact, root):
+            return _structure_files_from_tar_zst(artifact, root, patterns)
+        if _matches_structure_pattern(root.name, patterns):
+            return [
+                (
+                    _safe_selected_file_name(artifact.artifact_id, root.name),
+                    root.read_bytes(),
+                )
+            ]
+        return []
+
+    files = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if _matches_structure_pattern(relative, patterns):
+            files.append((
+                _safe_selected_file_name(artifact.artifact_id, relative),
+                path.read_bytes(),
+            ))
+    return files
+
+
+def _select_structure_files_from_artifacts(
+    artifacts: Sequence[WorkflowArtifact],
+    *,
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> list[tuple[str, bytes]]:
+    selected = [
+        structure_file
+        for artifact in artifacts
+        for structure_file in _structure_files_from_artifact(artifact, patterns)
+    ]
+    selected.sort(key=lambda item: item[0])
+    if max_files is not None:
+        selected = selected[:max_files]
+    if not selected:
+        raise FileNotFoundError("No PPIFlow structure files were found in inputs")
+    return selected
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def select_ppiflow_structure_files(
+    *,
+    artifacts: list[WorkflowArtifact],
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> list[tuple[str, bytes]]:
+    """Read structure files from mounted PPIFlow workflow artifacts."""
+    _reload_ppiflow_source_volumes()
+    return _select_structure_files_from_artifacts(
+        artifacts,
+        patterns=patterns,
+        max_files=max_files,
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def copy_ppiflow_structure_artifacts(
+    *,
+    artifacts: list[WorkflowArtifact],
+    run_id: str,
+    node_id: str,
+    attempt_id: str,
+    output_name: str,
+    metadata: dict[str, object] | None = None,
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> AppRunResult:
+    """Copy selected structure artifacts into the workflow output volume."""
+    _reload_ppiflow_source_volumes()
+    selected = _select_structure_files_from_artifacts(
+        artifacts=artifacts,
+        patterns=patterns,
+        max_files=max_files,
+    )
+    output_dir = (
+        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
+        / "ppiflow"
+        / sanitize_filename(run_id)
+        / sanitize_filename(node_id)
+        / sanitize_filename(attempt_id)
+        / sanitize_filename(output_name)
+    )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for file_name, file_bytes in selected:
+        (output_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
+    WORKFLOW_OUTPUT_VOLUME.commit()
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name=output_name,
+                kind=ArtifactKind.STRUCTURES,
+                remote_path=str(output_dir),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                metadata={
+                    "structure_count": len(selected),
+                    "files": [file_name for file_name, _ in selected],
+                }
+                | dict(metadata or {}),
+            )
+        ],
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def stage_ppiflow_input_structure(
+    *,
+    artifacts: list[WorkflowArtifact],
+    run_id: str,
+    step_name: str,
+    field_name: str,
+    structure_index: int = 0,
+    patterns: Sequence[str] | None = None,
+) -> str:
+    """Copy one upstream structure into the PPIFlow volume and return its path."""
+    _reload_ppiflow_source_volumes()
+    selected = _select_structure_files_from_artifacts(
+        artifacts=artifacts,
+        patterns=patterns,
+        max_files=None,
+    )
+    if structure_index < 0 or structure_index >= len(selected):
+        raise IndexError(
+            f"PPIFlow input structure index {structure_index} is out of range for "
+            f"{len(selected)} selected structure(s)"
+        )
+    file_name, file_bytes = selected[structure_index]
+    remote_path = (
+        Path(PPI_FLOW_OUTPUT_MOUNTPOINT)
+        / sanitize_filename(run_id)
+        / sanitize_filename(step_name)
+        / sanitize_filename(field_name)
+        / sanitize_filename(file_name)
+    )
+    remote_path.parent.mkdir(parents=True, exist_ok=True)
+    remote_path.write_bytes(file_bytes)
+    PPI_FLOW_OUTPUT_VOLUME.commit()
+    return str(remote_path)
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def stage_af3score_inputs(
+    *,
+    artifacts: list[WorkflowArtifact],
+    run_name: str,
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> list[str]:
+    """Stage selected PDB files into AF3Score's input directory."""
+    _reload_ppiflow_source_volumes()
+    selected = _select_structure_files_from_artifacts(
+        artifacts=artifacts,
+        patterns=patterns,
+        max_files=max_files,
+    )
+    layout = AppRunLayout.from_run_root(
+        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
+    )
+    if layout.inputs_dir.exists():
+        shutil.rmtree(layout.inputs_dir)
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    input_names = []
+    for file_name, file_bytes in selected:
+        pdb_name = sanitize_filename(Path(file_name).with_suffix(".pdb").name)
+        (layout.inputs_dir / pdb_name).write_bytes(file_bytes)
+        input_names.append(pdb_name)
+    AF3SCORE_OUTPUT_VOLUME.commit()
+    return input_names
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def stage_rosetta_inputs(
+    *,
+    artifacts: list[WorkflowArtifact],
+    run_name: str,
+    run_id: str,
+    rosetta_binary: str,
+    rosetta_script: str | None = None,
+    flags_file: str | None = None,
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> dict[str, object]:
+    """Stage selected structures and enqueue Rosetta jobs."""
+    _reload_ppiflow_source_volumes()
+    selected = _select_structure_files_from_artifacts(
+        artifacts=artifacts,
+        patterns=patterns,
+        max_files=max_files,
+    )
+    safe_run_name = sanitize_filename(run_name)
+    safe_run_id = sanitize_filename(run_id)
+    layout = AppRunLayout.from_run_root(
+        Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{safe_run_name}-{safe_run_id}"
+    )
+    if layout.run_root.exists():
+        shutil.rmtree(layout.run_root)
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    remote_script = None
+    if rosetta_script:
+        remote_script = "inputs/_script/workflow.xml"
+        script_path = layout.run_root / remote_script
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(rosetta_script, encoding="utf-8")
+    remote_flags = None
+    if flags_file:
+        remote_flags = "inputs/_flags/workflow.flags"
+        flags_path = layout.run_root / remote_flags
+        flags_path.parent.mkdir(parents=True, exist_ok=True)
+        flags_path.write_text(flags_file, encoding="utf-8")
+
+    queue = modal.Queue.from_name(
+        f"{rosetta_app.CONF.name}-queue-{safe_run_id}",
+        create_if_missing=True,
+    )
+    for index, (file_name, file_bytes) in enumerate(selected, start=1):
+        remote_pdb = f"inputs/{index}/{sanitize_filename(file_name)}"
+        pdb_path = layout.run_root / remote_pdb
+        pdb_path.parent.mkdir(parents=True, exist_ok=True)
+        pdb_path.write_bytes(file_bytes)
+        queue.put({
+            "index": index,
+            "binary": rosetta_binary,
+            "pdb": remote_pdb,
+            "rosetta_script": remote_script,
+            "flags_file": remote_flags,
+        })
+    ROSETTA_OUTPUT_VOLUME.commit()
+    return {
+        "run_name": safe_run_name,
+        "run_id": safe_run_id,
+        "run_root": str(layout.run_root),
+        "num_jobs": len(selected),
+    }
 
 
 @dataclass(frozen=True)
@@ -93,6 +484,11 @@ class PPIFlowModalNamespace:
     rosetta_package_outputs: modal.Function
     alphafold3_search_msa: modal.Function
     alphafold3_predict_structures: modal.Function
+    select_structures: modal.Function
+    copy_structures: modal.Function
+    stage_ppiflow_input: modal.Function
+    stage_af3score_inputs: modal.Function
+    stage_rosetta_inputs: modal.Function
 
 
 @dataclass
@@ -115,10 +511,32 @@ class _ConfiguredAppStepNode(AppBackedNode):
         )
         return run_name
 
-    def _unsupported(self, function_name: str) -> None:
-        raise NotImplementedError(
-            f"PPIFlow workflow step {self.step_name!r} requires a "
-            f"workflow-compatible {function_name} adapter."
+    def _select_structures(
+        self,
+        context: NodeRunContext,
+        *,
+        max_files: int | None = None,
+    ) -> list[tuple[str, bytes]]:
+        artifacts = context.inputs.get("structures") or []
+        if not artifacts:
+            raise ValueError(
+                f"PPIFlow workflow step {self.step_name!r} requires structure inputs"
+            )
+        raw_patterns = self.config.get("structure_patterns") or self.config.get(
+            "patterns"
+        )
+        if isinstance(raw_patterns, str):
+            patterns = tuple(
+                pattern.strip()
+                for pattern in raw_patterns.split(",")
+                if pattern.strip()
+            )
+        else:
+            patterns = raw_patterns
+        return self.modal_namespace.select_structures.remote(
+            artifacts=artifacts,
+            patterns=patterns,
+            max_files=max_files,
         )
 
 
@@ -143,6 +561,17 @@ class _PPIFlowRunNode(_ConfiguredAppStepNode):
             function_name="ppiflow_run",
         )
 
+    def process_remote_result(
+        self, result: AppRunResult, metadata: Mapping[str, object]
+    ) -> AppRunResult:
+        """Expose PPIFlow app output directories as structure artifacts."""
+        result = AppRunResult.model_validate(result)
+        return _result_with_output_kind(
+            result,
+            ArtifactKind.STRUCTURES,
+            {"step_name": self.step_name} | dict(metadata),
+        )
+
 
 @dataclass
 class PPIFlowDesignNode(_PPIFlowRunNode):
@@ -153,6 +582,30 @@ class PPIFlowDesignNode(_PPIFlowRunNode):
 class PPIFlowPartialNode(_PPIFlowRunNode):
     """PPIFlow partial-design step for stage 2."""
 
+    def _app_kwargs(self, context: NodeRunContext) -> dict[str, object]:
+        raw_args = deepcopy(self.config.get("args", self.config))
+        if not isinstance(raw_args, dict):
+            raise ValueError(f"PPIFlow step {self.step_name!r} args must be a mapping")
+        if context.inputs.get("structures"):
+            field_name = "complex_pdb" if "complex_pdb" in raw_args else "input_pdb"
+            raw_args[field_name] = self.modal_namespace.stage_ppiflow_input.remote(
+                artifacts=context.inputs["structures"],
+                run_id=self._run_name(context),
+                step_name=self.step_name,
+                field_name=field_name,
+                structure_index=int(self.config.get("structure_index", 0)),
+                patterns=None,
+            )
+        if "fixed_positions" not in raw_args:
+            for artifact in context.inputs.get("structures", []):
+                fixed_positions = artifact.metadata.get("fixed_positions")
+                if fixed_positions:
+                    raw_args["fixed_positions"] = str(fixed_positions)
+                    break
+
+        app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
+        return {"args": app_args, "run_name": self._run_name(context)}
+
 
 @dataclass
 class LigandMPNNNode(_ConfiguredAppStepNode):
@@ -160,7 +613,53 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the LigandMPNN app function."""
-        self._unsupported("ligandmpnn_run")
+        structure_index = int(self.config.get("structure_index", 0))
+        selected_structures = self._select_structures(
+            context,
+            max_files=self.config.get("max_structures"),
+        )
+        if structure_index < 0 or structure_index >= len(selected_structures):
+            raise IndexError(
+                f"{self.step_name} structure_index {structure_index} is out of "
+                f"range for {len(selected_structures)} selected structure(s)"
+            )
+        selected_name, selected_bytes = selected_structures[structure_index]
+        script_mode = str(self.config.get("script_mode", "run"))
+        model_type = str(
+            self.config.get(
+                "model_type",
+                "abmpnn" if self.step_name.startswith("AbMPNN") else "protein_mpnn",
+            )
+        )
+        cli_kwargs = _ligandmpnn_cli_kwargs(
+            self.config,
+            script_mode=script_mode,
+            model_type=model_type,
+        )
+        return RemoteNodeSubmission(
+            function_call=self.modal_namespace.ligandmpnn_run.spawn(
+                run_name=self._run_name(context),
+                script_mode=script_mode,
+                struct_bytes=selected_bytes,
+                seeds=_parse_seed_values(self.config.get("seeds", [0])),
+                cli_args=ligandmpnn_app.build_ligandmpnn_cli_args(**cli_kwargs),
+                bias_aa_per_residue_bytes=self.config.get("bias_aa_per_residue_bytes"),
+                omit_aa_per_residue_bytes=self.config.get("omit_aa_per_residue_bytes"),
+            ),
+            function_name="ligandmpnn_run",
+            metadata={"selected_structure": selected_name},
+        )
+
+    def process_remote_result(
+        self, result: AppRunResult, metadata: Mapping[str, object]
+    ) -> AppRunResult:
+        """Expose LigandMPNN archives as structure artifacts."""
+        result = AppRunResult.model_validate(result)
+        return _result_with_output_kind(
+            result,
+            ArtifactKind.STRUCTURES,
+            {"step_name": self.step_name} | dict(metadata),
+        )
 
 
 @dataclass
@@ -169,43 +668,267 @@ class FlowPackerNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the FlowPacker app function."""
-        self._unsupported("run_flowpacker_workflow")
+        selected_structures = self._select_structures(
+            context,
+            max_files=self.config.get("max_structures"),
+        )
+        kwargs = {
+            key: self.config[key]
+            for key in (
+                "model_name",
+                "use_confidence",
+                "n_samples",
+                "num_steps",
+                "sample_coeff",
+                "use_gt_masks",
+                "inpaint",
+                "save_traj",
+                "seed",
+            )
+            if key in self.config
+        }
+        return RemoteNodeSubmission(
+            function_call=self.modal_namespace.flowpacker_run.spawn(
+                input_files=selected_structures,
+                run_name=self._run_name(context),
+                **kwargs,
+            ),
+            function_name="run_flowpacker_workflow",
+            metadata={"structure_count": len(selected_structures)},
+        )
+
+    def process_remote_result(
+        self, result: AppRunResult, metadata: Mapping[str, object]
+    ) -> AppRunResult:
+        """Expose FlowPacker archives as structure artifacts."""
+        result = AppRunResult.model_validate(result)
+        return _result_with_output_kind(
+            result,
+            ArtifactKind.STRUCTURES,
+            {"step_name": self.step_name} | dict(metadata),
+        )
 
 
 @dataclass
 class AF3ScoreNode(_ConfiguredAppStepNode):
     """AF3Score structure scoring step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the AF3Score app functions."""
-        self._unsupported("af3score_prepare/af3score_run/af3score_postprocess")
+    placement: NodePlacement = NodePlacement.ORCHESTRATOR
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Run the AF3Score app's prepare/run/postprocess sequence."""
+        run_name = self._run_name(context)
+        input_names = self.modal_namespace.stage_af3score_inputs.remote(
+            artifacts=context.inputs.get("structures") or [],
+            run_name=run_name,
+            patterns=None,
+            max_files=self.config.get("max_structures"),
+        )
+        if not input_names:
+            raise ValueError(f"{self.step_name} requires at least one AF3Score input")
+
+        self.modal_namespace.af3score_manage_lock.remote(
+            run_name=run_name,
+            acquire=True,
+        )
+        try:
+            task_spec = self.modal_namespace.af3score_prepare.remote(
+                run_name=run_name,
+                input_files=input_names,
+                num_jobs=int(
+                    self.config.get("num_jobs", self.config.get("max_batches", 10))
+                ),
+                prepare_workers=int(self.config.get("prepare_workers", 8)),
+            )
+            calls = []
+            chunk_specs = (
+                task_spec.get("chunk_specs", [])
+                if isinstance(task_spec, Mapping)
+                else getattr(task_spec, "chunk_specs", [])
+            )
+            for chunk in chunk_specs:
+                batch_name = (
+                    chunk["batch_name"]
+                    if isinstance(chunk, Mapping)
+                    else chunk.batch_name
+                )
+                batch_json_dir = (
+                    chunk["batch_json_dir"]
+                    if isinstance(chunk, Mapping)
+                    else chunk.batch_json_dir
+                )
+                batch_pdb_dir = (
+                    chunk["batch_pdb_dir"]
+                    if isinstance(chunk, Mapping)
+                    else chunk.batch_pdb_dir
+                )
+                calls.append(
+                    self.modal_namespace.af3score_run.spawn(
+                        run_name=run_name,
+                        batch_name=batch_name,
+                        batch_json_dir=batch_json_dir,
+                        batch_pdb_dir=batch_pdb_dir,
+                    )
+                )
+            for call in calls:
+                call.get()
+            metrics = self.modal_namespace.af3score_postprocess.remote(
+                run_name=run_name,
+                input_files=input_names,
+            )
+        finally:
+            self.modal_namespace.af3score_manage_lock.remote(
+                run_name=run_name,
+                acquire=False,
+            )
+
+        metrics_csv = str(metrics["metrics_csv"])
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="af3score_metrics",
+                    kind=ArtifactKind.SCORES,
+                    storage=volume_path_from_mount_path(
+                        metrics_csv,
+                        AF3SCORE_OUTPUT_MOUNTPOINT,
+                        AF3SCORE_OUTPUT_VOLUME_NAME,
+                    ),
+                    metadata={
+                        "step_name": self.step_name,
+                        "run_name": run_name,
+                    }
+                    | dict(metrics),
+                )
+            ],
+        )
 
 
 @dataclass
-class RosettaFixNode(_ConfiguredAppStepNode):
+class _RosettaNode(_ConfiguredAppStepNode):
+    """Base class for PPIFlow Rosetta steps."""
+
+    placement: NodePlacement = NodePlacement.ORCHESTRATOR
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Stage inputs, run Rosetta workers, and return the output directory."""
+        run_name = self._run_name(context)
+        run_id = sanitize_filename(
+            f"{context.run_id}-{context.node_id}-{context.attempt_id}"
+        )
+        staged = self.modal_namespace.stage_rosetta_inputs.remote(
+            artifacts=context.inputs.get("structures") or [],
+            run_name=run_name,
+            run_id=run_id,
+            rosetta_binary=str(self.config.get("rosetta_binary", "relax")),
+            rosetta_script=self.config.get("rosetta_script"),
+            flags_file=self.config.get("flags_file"),
+            patterns=None,
+            max_files=self.config.get("max_structures"),
+        )
+        num_jobs = int(staged["num_jobs"])
+        if num_jobs < 1:
+            raise ValueError(f"{self.step_name} requires at least one Rosetta input")
+        num_cpu_per_pod = min(30, max(1, num_jobs))
+        max_num_pods = max(1, int(self.config.get("max_num_pods", 1)))
+        num_pods = min(
+            max_num_pods, (num_jobs + num_cpu_per_pod - 1) // num_cpu_per_pod
+        )
+        calls = [
+            self.modal_namespace.rosetta_run.spawn(
+                str(staged["run_name"]),
+                str(staged["run_id"]),
+                num_cpu_per_pod,
+            )
+            for _ in range(num_pods)
+        ]
+        for call in calls:
+            call.get()
+
+        # TODO: add a small workflow helper for best-effort Rosetta queue cleanup
+        # after workers finish. Doing it directly here makes unit tests hit the
+        # Modal control plane instead of the hydrated namespace.
+
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                volume_app_output(
+                    name="rosetta_outputs",
+                    kind=ArtifactKind.STRUCTURES,
+                    remote_path=str(staged["run_root"]),
+                    mount_root=ROSETTA_OUTPUT_MOUNTPOINT,
+                    volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
+                    metadata={
+                        "step_name": self.step_name,
+                        "run_name": str(staged["run_name"]),
+                        "run_id": str(staged["run_id"]),
+                        "num_jobs": num_jobs,
+                    },
+                )
+            ],
+        )
+
+
+@dataclass
+class RosettaFixNode(_RosettaNode):
     """Rosetta fixed-position analysis step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the Rosetta app functions."""
-        self._unsupported("run_rosetta")
-
 
 @dataclass
-class RosettaRelaxNode(_ConfiguredAppStepNode):
+class RosettaRelaxNode(_RosettaNode):
     """Rosetta relaxation step."""
-
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the Rosetta app functions."""
-        self._unsupported("run_rosetta")
 
 
 @dataclass
 class ReFoldNode(_ConfiguredAppStepNode):
     """AlphaFold3 refolding step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the AlphaFold3 app functions."""
-        self._unsupported("alphafold3_search_msa/alphafold3_predict_structures")
+    placement: NodePlacement = NodePlacement.ORCHESTRATOR
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Run AlphaFold3 refolding for one selected structure."""
+        selected = self._select_structures(context, max_files=1)
+        structure_name, structure_bytes = selected[0]
+        run_name = self._run_name(context)
+        conf = _af3_config_for_refold(
+            structure_name=structure_name,
+            structure_bytes=structure_bytes,
+            run_name=run_name,
+            config=self.config,
+        )
+        json_bytes = conf.model_dump_json().encode("utf-8")
+        if bool(self.config.get("search_msa", False)):
+            json_bytes = self.modal_namespace.alphafold3_search_msa.remote(
+                json_bytes=json_bytes,
+                copy_msa_to_ssd=True,
+            )
+        function_call = self.modal_namespace.alphafold3_predict_structures.spawn(
+            json_bytes=json_bytes,
+            recycle=int(self.config.get("recycle", 10)),
+            sample=int(self.config.get("sample", 5)),
+            model_seeds=list(conf.modelSeeds),
+        )
+        tarball_bytes = function_call.get()
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="alphafold3_refolded_structures",
+                    kind=ArtifactKind.STRUCTURES,
+                    storage=InlineBytes(
+                        data=tarball_bytes,
+                        filename=f"{run_name}_alphafold3.tar.zst",
+                        media_type=ZSTD_MEDIA_TYPE,
+                    ),
+                    metadata={
+                        "step_name": self.step_name,
+                        "run_name": run_name,
+                        "source_structure": structure_name,
+                        "archive_format": "tar.zst",
+                    },
+                )
+            ],
+        )
 
 
 @dataclass
@@ -214,7 +937,82 @@ class DockQNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the DockQ app function."""
-        self._unsupported("run_dockq_workflow")
+        references = self._select_structures(context)
+        model_artifacts = context.inputs.get("models") or []
+        if not model_artifacts:
+            raise ValueError(f"{self.step_name} requires model structure inputs")
+        models = self.modal_namespace.select_structures.remote(
+            artifacts=model_artifacts,
+            patterns=None,
+            max_files=self.config.get("max_models"),
+        )
+        pairs = []
+        for pair_idx, (
+            (reference_name, reference_bytes),
+            (model_name, model_bytes),
+        ) in enumerate(
+            zip(references, models, strict=False),
+            start=1,
+        ):
+            pairs.append({
+                "id": f"dockq_pair_{pair_idx}",
+                "model_name": model_name,
+                "model_bytes": model_bytes,
+                "reference_name": reference_name,
+                "reference_bytes": reference_bytes,
+                "mapping": self.config.get("mapping"),
+            })
+        if not pairs:
+            raise ValueError(f"{self.step_name} did not find any DockQ pairs")
+        dockq_args = self.config.get("dockq_args", "--short")
+        if isinstance(dockq_args, str):
+            dockq_args = shlex.split(dockq_args)
+        return RemoteNodeSubmission(
+            function_call=self.modal_namespace.dockq_run.spawn(
+                pairs=pairs,
+                run_name=self._run_name(context),
+                dockq_args=dockq_args,
+            ),
+            function_name="run_dockq_workflow",
+            metadata={"pair_count": len(pairs)},
+        )
+
+    def process_remote_result(
+        self, result: AppRunResult, metadata: Mapping[str, object]
+    ) -> AppRunResult:
+        """Attach DockQ workflow metadata to score outputs."""
+        result = AppRunResult.model_validate(result)
+        return _result_with_output_kind(
+            result,
+            ArtifactKind.SCORES,
+            {"step_name": self.step_name} | dict(metadata),
+        )
+
+
+@dataclass
+class ExistingStructuresNode(WorkflowNativeNode):
+    """Reference existing structures for stage-2-only PPIFlow runs."""
+
+    step_name: str
+    storage: VolumePath
+    config: dict[str, Any] = field(default_factory=dict)
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Return the configured existing structure location as an artifact."""
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="stage2_input_structures",
+                    kind=ArtifactKind.STRUCTURES,
+                    storage=self.storage,
+                    metadata={
+                        "step_name": self.step_name,
+                        "run_name": self.config.get("run_name", context.run_id),
+                    },
+                )
+            ],
+        )
 
 
 @dataclass
@@ -222,11 +1020,30 @@ class FilterStructuresNode(WorkflowNativeNode):
     """Filter structures using score artifacts."""
 
     step_name: str
+    modal_namespace: PPIFlowModalNamespace = field(
+        repr=False,
+        compare=False,
+        metadata={"dag_hash": False},
+    )
     config: dict[str, Any] = field(default_factory=dict)
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute filtering logic."""
-        raise NotImplementedError
+        artifacts = context.inputs.get("structures") or []
+        if not artifacts:
+            raise ValueError(f"{self.step_name} requires structure inputs")
+        return AppRunResult.model_validate(
+            self.modal_namespace.copy_structures.remote(
+                artifacts=artifacts,
+                run_id=context.run_id,
+                node_id=context.node_id,
+                attempt_id=context.attempt_id,
+                output_name="filtered_structures",
+                metadata={"step_name": self.step_name},
+                patterns=None,
+                max_files=self.config.get("max_structures"),
+            )
+        )
 
 
 @dataclass
@@ -234,11 +1051,40 @@ class FixedPositionsNode(WorkflowNativeNode):
     """Convert Rosetta residue energies into fixed-position constraints."""
 
     step_name: str
+    modal_namespace: PPIFlowModalNamespace = field(
+        repr=False,
+        compare=False,
+        metadata={"dag_hash": False},
+    )
     config: dict[str, Any] = field(default_factory=dict)
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute fixed-position conversion logic."""
-        raise NotImplementedError
+        artifacts = context.inputs.get("structures") or []
+        if not artifacts:
+            raise ValueError(f"{self.step_name} requires structure inputs")
+        fixed_positions = str(self.config.get("fixed_positions") or "")
+        if not fixed_positions:
+            for artifact in artifacts:
+                value = artifact.metadata.get("fixed_positions")
+                if value:
+                    fixed_positions = str(value)
+                    break
+        return AppRunResult.model_validate(
+            self.modal_namespace.copy_structures.remote(
+                artifacts=artifacts,
+                run_id=context.run_id,
+                node_id=context.node_id,
+                attempt_id=context.attempt_id,
+                output_name="fixed_position_structures",
+                metadata={
+                    "step_name": self.step_name,
+                    "fixed_positions": fixed_positions,
+                },
+                patterns=None,
+                max_files=self.config.get("max_structures"),
+            )
+        )
 
 
 @dataclass
@@ -250,7 +1096,39 @@ class RankNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute ranking logic."""
-        raise NotImplementedError
+        rows = [
+            "rank,artifact_id,kind,volume,path",
+            *(
+                f"{rank},{artifact.artifact_id},{artifact.kind},"
+                f"{artifact.storage.volume_name},{artifact.storage.path}"
+                for rank, artifact in enumerate(
+                    sorted(
+                        (
+                            artifact
+                            for artifacts in context.inputs.values()
+                            for artifact in artifacts
+                        ),
+                        key=lambda artifact: artifact.artifact_id,
+                    ),
+                    start=1,
+                )
+            ),
+        ]
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="ranked_designs",
+                    kind=ArtifactKind.TABLE,
+                    storage=InlineBytes(
+                        data=("\n".join(rows) + "\n").encode("utf-8"),
+                        filename="ranked_designs.csv",
+                        media_type="text/csv",
+                    ),
+                    metadata={"step_name": self.step_name},
+                )
+            ],
+        )
 
 
 @dataclass
@@ -262,7 +1140,169 @@ class ReportNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute report generation logic."""
-        raise NotImplementedError
+        artifacts = [
+            artifact
+            for artifact_list in context.inputs.values()
+            for artifact in artifact_list
+        ]
+        lines = [
+            "# PPIFlow Workflow Report",
+            "",
+            f"- Step: {self.step_name}",
+            f"- Input artifacts: {len(artifacts)}",
+            "",
+            "| Artifact | Kind | Volume | Path |",
+            "| --- | --- | --- | --- |",
+        ]
+        for artifact in sorted(artifacts, key=lambda item: item.artifact_id):
+            lines.append(
+                f"| {artifact.artifact_id} | {artifact.kind} | "
+                f"{artifact.storage.volume_name} | {artifact.storage.path} |"
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="design_report",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=("\n".join(lines) + "\n").encode("utf-8"),
+                        filename="design_report.md",
+                        media_type="text/markdown",
+                    ),
+                    metadata={"step_name": self.step_name},
+                )
+            ],
+        )
+
+
+def _result_with_output_kind(
+    result: AppRunResult,
+    kind: ArtifactKind,
+    metadata: Mapping[str, object],
+) -> AppRunResult:
+    outputs = [
+        output.model_copy(
+            update={
+                "kind": kind,
+                "metadata": dict(output.metadata) | dict(metadata),
+            }
+        )
+        for output in result.outputs
+    ]
+    return result.model_copy(update={"outputs": outputs})
+
+
+def _parse_seed_values(value: object) -> list[int]:
+    if isinstance(value, str):
+        seeds = [int(part.strip()) for part in value.split(",") if part.strip()]
+    elif isinstance(value, int):
+        seeds = [value]
+    elif isinstance(value, Sequence):
+        seeds = [int(seed) for seed in value]
+    else:
+        raise TypeError("seeds must be an integer, comma-separated string, or sequence")
+    if not seeds:
+        raise ValueError("seeds must contain at least one integer")
+    return seeds
+
+
+def _ligandmpnn_cli_kwargs(
+    config: Mapping[str, object],
+    *,
+    script_mode: str,
+    model_type: str,
+) -> dict[str, object]:
+    excluded = {
+        "run_name",
+        "seeds",
+        "script_mode",
+        "structure_index",
+        "max_structures",
+        "structure_patterns",
+        "patterns",
+        "bias_aa_per_residue_bytes",
+        "omit_aa_per_residue_bytes",
+    }
+    allowed = set(ligandmpnn_app.build_ligandmpnn_cli_args.__annotations__)
+    allowed.discard("return")
+    kwargs = {
+        key: value
+        for key, value in config.items()
+        if key in allowed and key not in excluded
+    }
+    kwargs["script_mode"] = script_mode
+    kwargs["model_type"] = model_type
+    return kwargs
+
+
+def _af3_config_for_refold(
+    *,
+    structure_name: str,
+    structure_bytes: bytes,
+    run_name: str,
+    config: Mapping[str, object],
+):
+    if config.get("af3_config_json") is not None:
+        conf = alphafold3_app.AF3Config.model_validate_json(
+            str(config["af3_config_json"])
+        )
+        conf.name = run_name
+        return conf
+
+    residue_map = {
+        "ALA": "A",
+        "ARG": "R",
+        "ASN": "N",
+        "ASP": "D",
+        "CYS": "C",
+        "GLN": "Q",
+        "GLU": "E",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LEU": "L",
+        "LYS": "K",
+        "MET": "M",
+        "PHE": "F",
+        "PRO": "P",
+        "SER": "S",
+        "THR": "T",
+        "TRP": "W",
+        "TYR": "Y",
+        "VAL": "V",
+    }
+    chains: dict[str, list[str]] = {}
+    seen: set[tuple[str, str]] = set()
+    for line in structure_bytes.decode("utf-8", errors="ignore").splitlines():
+        if not line.startswith("ATOM") or line[12:16].strip() != "CA":
+            continue
+        chain_id = line[21].strip() or "A"
+        residue_id = line[22:27].strip()
+        residue_key = (chain_id, residue_id)
+        if residue_key in seen:
+            continue
+        seen.add(residue_key)
+        residue_name = line[17:20].strip().upper()
+        chains.setdefault(chain_id, []).append(residue_map.get(residue_name, "X"))
+    if not chains:
+        raise ValueError(f"Could not derive AlphaFold3 sequence from {structure_name}")
+
+    return alphafold3_app.AF3Config(
+        name=run_name,
+        modelSeeds=[
+            int(seed) for seed in _parse_seed_values(config.get("model_seeds", [1]))
+        ],
+        sequences=[
+            alphafold3_app.AF3SequenceEntry(
+                protein=alphafold3_app.AF3Protein(
+                    id=chain_id,
+                    sequence="".join(sequence),
+                )
+            )
+            for chain_id, sequence in sorted(chains.items())
+        ],
+    )
 
 
 def build_ppiflow_workflow(
@@ -287,8 +1327,13 @@ def build_ppiflow_workflow(
             dockq_run=dockq_app.run_dockq_workflow,
             rosetta_run=rosetta_app.run_rosetta,
             rosetta_package_outputs=rosetta_app.package_outputs_helper,
-            alphafold3_search_msa=alphafold3_app.search_msa_and_templates,
-            alphafold3_predict_structures=alphafold3_app.predict_structures,
+            alphafold3_search_msa=alphafold3_app.run_data_pipeline,
+            alphafold3_predict_structures=alphafold3_app.run_inference_pipeline,
+            select_structures=select_ppiflow_structure_files,
+            copy_structures=copy_ppiflow_structure_artifacts,
+            stage_ppiflow_input=stage_ppiflow_input_structure,
+            stage_af3score_inputs=stage_af3score_inputs,
+            stage_rosetta_inputs=stage_rosetta_inputs,
         )
 
     task_doc = _load_yaml_bytes(task_yaml_bytes)
@@ -309,12 +1354,18 @@ def build_ppiflow_workflow(
         )
 
     if stage in {None, 2}:
+        stage2_upstream = stage1_tail
+        if stage == 2:
+            stage2_upstream = workflow.add_node(
+                _stage2_input_node(task, steps_doc),
+                id="stage2-existing-input",
+            )
         _add_stage2_nodes(
             workflow=workflow,
             enabled=enabled,
             steps=steps_doc,
             gentype=gentype,
-            upstream=stage1_tail if stage is None else None,
+            upstream=stage2_upstream,
             modal_namespace=modal_namespace,
         )
 
@@ -385,6 +1436,7 @@ def _add_stage1_nodes(
         tail = workflow.add_node(
             FilterStructuresNode(
                 "FilterStep_stage1",
+                modal_namespace,
                 _step_cfg(steps, "FilterStep_stage1"),
             ),
             id="stage1-filter",
@@ -418,7 +1470,11 @@ def _add_stage2_nodes(
         enabled, "PartialStep"
     ):
         tail = workflow.add_node(
-            FixedPositionsNode("FixedPositions", _step_cfg(steps, "FixedPositions")),
+            FixedPositionsNode(
+                "FixedPositions",
+                modal_namespace,
+                _step_cfg(steps, "FixedPositions"),
+            ),
             id="stage2-fixed-positions",
             inputs=_structure_inputs(tail),
         )
@@ -480,6 +1536,7 @@ def _add_stage2_nodes(
         filtered = workflow.add_node(
             FilterStructuresNode(
                 "FilterStep_stage2",
+                modal_namespace,
                 _step_cfg(steps, "FilterStep_stage2"),
             ),
             id="stage2-filter",
@@ -540,7 +1597,11 @@ def _add_stage2_nodes(
         )
 
     if _step_enabled(enabled, "ReportStep"):
-        inputs = _structure_inputs(rank or filtered)
+        inputs = (
+            {"rank": rank.outputs(kind=ArtifactKind.TABLE)}
+            if rank is not None
+            else _structure_inputs(filtered)
+        )
         workflow.add_node(
             ReportNode("ReportStep", _step_cfg(steps, "ReportStep")),
             id="stage2-report",
@@ -552,6 +1613,36 @@ def _structure_inputs(upstream) -> dict[str, Any]:
     if upstream is None:
         return {}
     return {"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)}
+
+
+def _stage2_input_node(
+    task: Mapping[str, Any],
+    steps: Mapping[str, Any],
+) -> ExistingStructuresNode:
+    raw_cfg = steps.get("Stage2Input") or task.get("stage2_input")
+    if not isinstance(raw_cfg, Mapping):
+        raise ValueError(
+            "stage=2 PPIFlow runs require a Stage2Input step config or "
+            "task.stage2_input mapping with an existing structure path"
+        )
+    raw_path = raw_cfg.get("path")
+    if raw_path is None:
+        raise ValueError("Stage2Input requires a 'path' value")
+    volume_name = str(raw_cfg.get("volume_name", PPI_FLOW_OUTPUT_VOLUME_NAME))
+    path = str(raw_path)
+    if path.startswith("/"):
+        for known_volume, mountpoint in PPI_FLOW_SOURCE_VOLUME_ROOTS.items():
+            try:
+                storage = volume_path_from_mount_path(path, mountpoint, known_volume)
+            except ValueError:
+                continue
+            return ExistingStructuresNode("Stage2Input", storage, dict(raw_cfg))
+        raise ValueError(f"Stage2Input path is not under a known mountpoint: {path}")
+    return ExistingStructuresNode(
+        "Stage2Input",
+        VolumePath(volume_name=volume_name, path=path),
+        dict(raw_cfg),
+    )
 
 
 def _load_yaml_bytes(data: bytes) -> dict[str, Any]:

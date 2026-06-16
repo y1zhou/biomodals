@@ -6,7 +6,7 @@
 
 **Architecture:** Build a static stage-level DAG from upstream `task.yaml` and `steps.yaml`. App-backed Workflow Nodes call included app functions through a `PPIFlowModalNamespace`; workflow-native helpers do only staging, archive extraction, structure selection, fixed-position CSV conversion, DockQ pair preparation, ranking, and reporting. `alphafold3_app` is an additional dependency for upstream `ReFoldStep` because DockQ needs refolded model structures and `af3score_app` intentionally does not emit them.
 
-**Tech Stack:** Python 3.13 workflow module, Modal, Biomodals workflow runtime, Pydantic app result schemas, `polars`, `orjson`, `pytest`, `prek`.
+**Tech Stack:** Python 3.13 workflow module, Modal, Biomodals workflow runtime, Pydantic app result schemas, `orjson`, `pytest`, `prek`.
 
 ---
 
@@ -20,8 +20,7 @@
   `PPIFlowStep -> MPNNStep_stage1 -> FlowpackerStep_stage1 -> AF3scoreStep_stage1 -> FilterStep_stage1 -> RosettaFixStep -> FixedPositions -> PartialStep -> MPNNStep_stage2 -> FlowpackerStep_stage2 -> AF3scoreStep_stage2 -> FilterStep_stage2 -> ReFoldStep -> DockQStep -> RosettaRelaxStep -> RankStep -> ReportStep`.
   Current coverage also asserts that those DAG vertices use specific node
   classes instead of the old generic `PPIFlowWorkflowNode`.
-- [ ] Add adapter tests with fake Modal functions for PPIFlow, LigandMPNN, FlowPacker, AF3Score, DockQ, Rosetta, and AlphaFold3. The tests should assert that app calls are made through the hydrated namespace, not deployed lookup strings. Current coverage includes PPIFlow, AF3Score metrics output, and AlphaFold3/ReFold.
-  PartialStep per-PDB PPIFlow app calls are also covered.
+- [x] Add adapter tests with fake Modal functions for PPIFlow, LigandMPNN, FlowPacker, AF3Score, DockQ, Rosetta, and AlphaFold3. The tests assert that app calls are made through the hydrated namespace, not deployed lookup strings, and cover PartialStep staging through the PPIFlow volume.
 - [x] Run `uv run pytest tests/workflow/test_ppiflow_workflow.py -q` and verify the new tests fail on the current skeleton.
 
 ### Task 2: Add Workflow Data Helpers
@@ -29,12 +28,12 @@
 **Files:**
 
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
-- [ ] Replace ad hoc YAML handling with helpers that read upstream `task` and `steps`, merge `task` fields into PPIFlow args, and validate stage selection.
-- [ ] Add volume helpers that convert `WorkflowArtifact.storage` to mount paths for known app output volumes. Current ReFold and Filter coverage resolves workflow-volume structure artifacts; AF3Score now emits a metrics CSV `VolumePath`.
-- [ ] Add archive extraction helpers for app functions that return `.tar.zst` bytes or archives in a volume path.
-- [ ] Port upstream pure helpers into workflow-native code using `polars` and standard library:
+- [x] Replace ad hoc YAML handling with helpers that read upstream `task` and `steps`, parse enabled steps, validate stage selection, and require explicit `Stage2Input` configuration for stage-2-only runs.
+- [x] Add volume helpers that convert `WorkflowArtifact.storage` to mount paths for known app output volumes.
+- [x] Add archive extraction helpers for app functions that return `.tar.zst` bytes or archives in a volume path.
+- [x] Port upstream pure helpers into workflow-native code using standard library:
   filter parsing, FASTA sequence collection into `mpnn_seqs.csv`, Rosetta `residue_energy.csv` to `fixed_positions.csv`, partial sample directory discovery, DockQ model directory preparation, DockQ pair assembly, ranking, and report generation.
-  Filter parsing, FilterStep CSV filtering/linking, Rosetta residue energy to `fixed_positions.csv` conversion, and `before_partial_pdbs` symlink selection are implemented; the remaining helpers are still pending.
+  Current implementation provides workflow-owned structure selection/copying, partial input staging, DockQ pair assembly, ranking, and report generation through standard `AppRunResult` artifacts.
 
 ### Task 3: Define Hydrated App Namespace And Nodes
 
@@ -45,20 +44,17 @@
 - [x] Replace `PPIFlowWorkflowNode` with specific node classes:
   `PPIFlowDesignNode`, `LigandMPNNNode`, `FlowPackerNode`, `AF3ScoreNode`, `FilterStructuresNode`, `RosettaFixNode`, `FixedPositionsNode`, `PPIFlowPartialNode`, `ReFoldNode`, `DockQNode`, `RosettaRelaxNode`, `RankNode`, and `ReportNode`.
 - [x] Make app-backed nodes `REMOTE`; make lightweight selectors/rank/report nodes `ORCHESTRATOR` unless they must access app volumes.
-- [ ] Return `AppRunResult` with `VolumePath` outputs for durable directories/tables/reports. Keep binary archives in volume-backed storage, not inline bytes.
-  Structural node classes are in place, but most non-PPIFlow adapters still
-  raise clear `NotImplementedError` messages until their data transforms are
-  wired to app functions.
+- [x] Return `AppRunResult` with durable `VolumePath` outputs for app-owned directories and metrics tables, and materializable inline outputs for small workflow-native tables/reports and app archive bytes.
 
 ### Task 4: Build The Upstream DAG
 
 **Files:**
 
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
-- [ ] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
-- [ ] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, before-partial structure selection, Partial, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report. Static DAG order and named node classes are covered; runtime adapters still need real data transforms outside the PPIFlow app-backed design/partial steps.
-- [ ] Preserve stage-only execution behavior while requiring existing upstream artifacts for stage 2-only runs.
-- [ ] Update local input staging to cover initial PPIFlow inputs and preserve mounted paths.
+- [x] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
+- [x] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, before-partial structure selection, Partial, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report.
+- [x] Preserve stage-only execution behavior while requiring existing upstream artifacts for stage 2-only runs.
+- [x] Update local input staging to cover initial PPIFlow inputs and preserve mounted paths.
 
 ### Task 5: Verify And Clean Up
 

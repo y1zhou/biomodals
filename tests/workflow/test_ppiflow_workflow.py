@@ -15,7 +15,9 @@ from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
+    InlineBytes,
     VolumePath,
+    WorkflowArtifact,
 )
 from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.core import NodeRunContext
@@ -66,23 +68,98 @@ class _FakePPIFlowFunction:
         return _FakeFunctionCall("fc-ppiflow", self._result())
 
 
+class _FakeModalFunction:
+    def __init__(
+        self,
+        object_id: str,
+        result=None,
+    ) -> None:
+        self.object_id = object_id
+        self.result = result
+        self.args = ()
+        self.kwargs = {}
+
+    def remote(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        return self.result
+
+    def spawn(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        return _FakeFunctionCall(self.object_id, self.result)
+
+
 def _fake_namespace(
     ppiflow_run: _FakePPIFlowFunction | None = None,
+    ligandmpnn_run: _FakeModalFunction | None = None,
+    flowpacker_run: _FakeModalFunction | None = None,
+    af3score_manage_lock: _FakeModalFunction | None = None,
+    af3score_prepare: _FakeModalFunction | None = None,
+    af3score_run: _FakeModalFunction | None = None,
+    af3score_postprocess: _FakeModalFunction | None = None,
+    dockq_run: _FakeModalFunction | None = None,
+    rosetta_run: _FakeModalFunction | None = None,
+    alphafold3_search_msa: _FakeModalFunction | None = None,
+    alphafold3_predict_structures: _FakeModalFunction | None = None,
+    select_structures: _FakeModalFunction | None = None,
+    copy_structures: _FakeModalFunction | None = None,
+    stage_ppiflow_input: _FakeModalFunction | None = None,
+    stage_af3score_inputs: _FakeModalFunction | None = None,
+    stage_rosetta_inputs: _FakeModalFunction | None = None,
 ) -> PPIFlowModalNamespace:
     fake = cast(modal.Function, ppiflow_run or _FakePPIFlowFunction())
+    fake_select = cast(
+        modal.Function,
+        select_structures
+        or _FakeModalFunction("fc-select", [("model.pdb", b"ATOM\n")]),
+    )
     return PPIFlowModalNamespace(
         ppiflow_run=fake,
-        ligandmpnn_run=fake,
-        flowpacker_run=fake,
-        af3score_manage_lock=fake,
-        af3score_prepare=fake,
-        af3score_run=fake,
-        af3score_postprocess=fake,
-        dockq_run=fake,
-        rosetta_run=fake,
+        ligandmpnn_run=cast(modal.Function, ligandmpnn_run or fake),
+        flowpacker_run=cast(modal.Function, flowpacker_run or fake),
+        af3score_manage_lock=cast(modal.Function, af3score_manage_lock or fake),
+        af3score_prepare=cast(modal.Function, af3score_prepare or fake),
+        af3score_run=cast(modal.Function, af3score_run or fake),
+        af3score_postprocess=cast(modal.Function, af3score_postprocess or fake),
+        dockq_run=cast(modal.Function, dockq_run or fake),
+        rosetta_run=cast(modal.Function, rosetta_run or fake),
         rosetta_package_outputs=fake,
-        alphafold3_search_msa=fake,
-        alphafold3_predict_structures=fake,
+        alphafold3_search_msa=cast(modal.Function, alphafold3_search_msa or fake),
+        alphafold3_predict_structures=cast(
+            modal.Function,
+            alphafold3_predict_structures or fake,
+        ),
+        select_structures=fake_select,
+        copy_structures=cast(
+            modal.Function,
+            copy_structures
+            or _FakeModalFunction(
+                "fc-copy", AppRunResult(status=AppRunStatus.SUCCEEDED)
+            ),
+        ),
+        stage_ppiflow_input=cast(
+            modal.Function,
+            stage_ppiflow_input
+            or _FakeModalFunction("fc-stage-ppiflow", "/ppiflow/input.pdb"),
+        ),
+        stage_af3score_inputs=cast(
+            modal.Function,
+            stage_af3score_inputs or _FakeModalFunction("fc-stage-af3", ["model.pdb"]),
+        ),
+        stage_rosetta_inputs=cast(
+            modal.Function,
+            stage_rosetta_inputs
+            or _FakeModalFunction(
+                "fc-stage-rosetta",
+                {
+                    "run_name": "rosetta-run",
+                    "run_id": "rosetta-id",
+                    "run_root": "/rosetta/rosetta-run-rosetta-id",
+                    "num_jobs": 1,
+                },
+            ),
+        ),
     )
 
 
@@ -93,6 +170,15 @@ task:
 steps:
 {enabled_steps}
 """.encode()
+
+
+def _upstream_structure_artifact() -> WorkflowArtifact:
+    return WorkflowArtifact(
+        artifact_id="upstream-structures",
+        producing_node_id="upstream",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(volume_name="source-volume", path="upstream/results"),
+    )
 
 
 def test_ppiflow_workflow_declares_app_dependency() -> None:
@@ -178,6 +264,303 @@ PPIFlowStep:
     assert submission.function_call.object_id == "fc-ppiflow"
     assert fake_function.kwargs["run_name"] == "demo-run"
     assert isinstance(fake_function.kwargs["args"], ppiflow_app.PPIFlowArgs)
+
+
+def test_ligandmpnn_step_selects_structure_and_submits_app_function(
+    tmp_path: Path,
+) -> None:
+    selector = _FakeModalFunction("fc-select", [("selected.pdb", b"ATOM selected\n")])
+    ligandmpnn = _FakeModalFunction(
+        "fc-ligandmpnn",
+        AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="LigandMPNN_outputs",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=InlineBytes(
+                        data=b"archive",
+                        filename="ligandmpnn.tar.zst",
+                        media_type="application/zstd",
+                    ),
+                )
+            ],
+        ),
+    )
+    namespace = _fake_namespace(
+        ligandmpnn_run=ligandmpnn,
+        select_structures=selector,
+    )
+    node = ppiflow_workflow.LigandMPNNNode(
+        "MPNNStep_stage1",
+        namespace,
+        {
+            "run_name": "mpnn-run",
+            "seeds": "1,2",
+            "model_type": "protein_mpnn",
+            "batch_size": 2,
+            "number_of_batches": 3,
+        },
+    )
+    context = NodeRunContext(
+        run_id="run-1",
+        node_id="stage1-ligandmpnn",
+        attempt_id="attempt-1",
+        cache_dir=tmp_path,
+        inputs={"structures": [_upstream_structure_artifact()]},
+    )
+
+    submission = node.submit_remote(context)
+    result = node.process_remote_result(
+        submission.function_call.get(), submission.metadata
+    )
+
+    assert submission.function_name == "ligandmpnn_run"
+    assert selector.kwargs["artifacts"] == [_upstream_structure_artifact()]
+    assert ligandmpnn.kwargs["run_name"] == "mpnn-run"
+    assert ligandmpnn.kwargs["script_mode"] == "run"
+    assert ligandmpnn.kwargs["struct_bytes"] == b"ATOM selected\n"
+    assert ligandmpnn.kwargs["seeds"] == [1, 2]
+    assert ligandmpnn.kwargs["cli_args"]["--model_type"] == "protein_mpnn"
+    assert ligandmpnn.kwargs["cli_args"]["--batch_size"] == "2"
+    assert ligandmpnn.kwargs["cli_args"]["--number_of_batches"] == "3"
+    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+    assert result.outputs[0].metadata["selected_structure"] == "selected.pdb"
+
+
+def test_flowpacker_step_selects_structures_and_submits_app_function(
+    tmp_path: Path,
+) -> None:
+    selected_structures = [
+        ("design-a.pdb", b"ATOM A\n"),
+        ("design-b.pdb", b"ATOM B\n"),
+    ]
+    selector = _FakeModalFunction("fc-select", selected_structures)
+    flowpacker = _FakeModalFunction(
+        "fc-flowpacker",
+        AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="flowpacker_outputs",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name="FlowPacker-outputs",
+                        path="workflow/fp-run/outputs/fp-run.tar.zst",
+                        media_type="application/zstd",
+                    ),
+                )
+            ],
+        ),
+    )
+    namespace = _fake_namespace(
+        flowpacker_run=flowpacker,
+        select_structures=selector,
+    )
+    node = ppiflow_workflow.FlowPackerNode(
+        "FlowpackerStep_stage1",
+        namespace,
+        {"run_name": "fp-run", "n_samples": 2, "seed": 7},
+    )
+    context = NodeRunContext(
+        run_id="run-1",
+        node_id="stage1-flowpacker",
+        attempt_id="attempt-1",
+        cache_dir=tmp_path,
+        inputs={"structures": [_upstream_structure_artifact()]},
+    )
+
+    submission = node.submit_remote(context)
+    result = node.process_remote_result(
+        submission.function_call.get(), submission.metadata
+    )
+
+    assert submission.function_name == "run_flowpacker_workflow"
+    assert selector.kwargs["artifacts"] == [_upstream_structure_artifact()]
+    assert flowpacker.kwargs["input_files"] == selected_structures
+    assert flowpacker.kwargs["run_name"] == "fp-run"
+    assert flowpacker.kwargs["n_samples"] == 2
+    assert flowpacker.kwargs["seed"] == 7
+    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+    assert result.outputs[0].metadata["structure_count"] == 2
+
+
+def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
+    tmp_path: Path,
+) -> None:
+    stage_inputs = _FakeModalFunction("fc-stage-af3", ["model.pdb"])
+    prepare = _FakeModalFunction(
+        "fc-af3-prepare",
+        SimpleNamespace(chunk_specs=[]),
+    )
+    postprocess = _FakeModalFunction(
+        "fc-af3-post",
+        {
+            "metrics_csv": (
+                f"{ppiflow_workflow.AF3SCORE_OUTPUT_MOUNTPOINT}/af3-run/"
+                "af3score_metrics.csv"
+            ),
+            "metrics_rows": 1,
+            "processed": 1,
+            "failed": 0,
+        },
+    )
+    namespace = _fake_namespace(
+        stage_af3score_inputs=stage_inputs,
+        af3score_prepare=prepare,
+        af3score_postprocess=postprocess,
+    )
+    node = ppiflow_workflow.AF3ScoreNode(
+        "AF3scoreStep_stage1",
+        namespace,
+        {"run_name": "af3-run", "num_jobs": 4, "prepare_workers": 2},
+    )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage1-af3score",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
+        )
+    )
+
+    assert stage_inputs.kwargs["artifacts"] == [_upstream_structure_artifact()]
+    assert prepare.kwargs["run_name"] == "af3-run"
+    assert prepare.kwargs["input_files"] == ["model.pdb"]
+    assert prepare.kwargs["num_jobs"] == 4
+    assert prepare.kwargs["prepare_workers"] == 2
+    assert postprocess.kwargs["input_files"] == ["model.pdb"]
+    assert result.outputs[0].kind == ArtifactKind.SCORES
+    assert result.outputs[0].storage == VolumePath(
+        volume_name=ppiflow_workflow.AF3SCORE_OUTPUT_VOLUME_NAME,
+        path="af3-run/af3score_metrics.csv",
+    )
+
+
+def test_rosetta_step_stages_inputs_and_returns_output_directory(
+    tmp_path: Path,
+) -> None:
+    stage_rosetta = _FakeModalFunction(
+        "fc-stage-rosetta",
+        {
+            "run_name": "rosetta-run",
+            "run_id": "rosetta-id",
+            "run_root": f"{ppiflow_workflow.ROSETTA_OUTPUT_MOUNTPOINT}/rosetta-run-rosetta-id",
+            "num_jobs": 1,
+        },
+    )
+    rosetta_run = _FakeModalFunction("fc-rosetta", None)
+    namespace = _fake_namespace(
+        stage_rosetta_inputs=stage_rosetta,
+        rosetta_run=rosetta_run,
+    )
+    node = ppiflow_workflow.RosettaRelaxNode(
+        "RosettaRelaxStep",
+        namespace,
+        {"run_name": "rosetta-run", "rosetta_binary": "relax", "max_num_pods": 1},
+    )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-rosetta-relax",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
+        )
+    )
+
+    assert stage_rosetta.kwargs["rosetta_binary"] == "relax"
+    assert rosetta_run.kwargs == {}
+    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+    assert result.outputs[0].storage == VolumePath(
+        volume_name=ppiflow_workflow.ROSETTA_OUTPUT_VOLUME_NAME,
+        path="rosetta-run-rosetta-id",
+    )
+
+
+def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> None:
+    pdb_bytes = (
+        b"ATOM      1  CA  ALA A   1      0.000   0.000   0.000  1.00  0.00           C\n"
+        b"ATOM      2  CA  CYS A   2      0.000   0.000   0.000  1.00  0.00           C\n"
+    )
+    selector = _FakeModalFunction("fc-select", [("model.pdb", pdb_bytes)])
+    predict = _FakeModalFunction("fc-af3-predict", b"af3-tar-zst")
+    namespace = _fake_namespace(
+        select_structures=selector,
+        alphafold3_predict_structures=predict,
+    )
+    node = ppiflow_workflow.ReFoldNode(
+        "ReFoldStep",
+        namespace,
+        {"run_name": "refold-run", "model_seeds": [3], "recycle": 2, "sample": 1},
+    )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-alphafold3-refold",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
+        )
+    )
+
+    assert predict.kwargs["recycle"] == 2
+    assert predict.kwargs["sample"] == 1
+    assert predict.kwargs["model_seeds"] == [3]
+    assert b'"sequence":"AC"' in predict.kwargs["json_bytes"]
+    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+    assert result.outputs[0].storage.data == b"af3-tar-zst"
+
+
+def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> None:
+    selector = _FakeModalFunction("fc-select", [("structure.pdb", b"ATOM\n")])
+    dockq = _FakeModalFunction(
+        "fc-dockq",
+        AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="dockq_scores",
+                    kind=ArtifactKind.SCORES,
+                    storage=InlineBytes(
+                        data=b"dockq",
+                        filename="dockq.tar.zst",
+                        media_type="application/zstd",
+                    ),
+                )
+            ],
+        ),
+    )
+    namespace = _fake_namespace(select_structures=selector, dockq_run=dockq)
+    node = ppiflow_workflow.DockQNode(
+        "DockQStep",
+        namespace,
+        {"run_name": "dockq-run", "dockq_args": "--short"},
+    )
+    submission = node.submit_remote(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-dockq",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={
+                "structures": [_upstream_structure_artifact()],
+                "models": [_upstream_structure_artifact()],
+            },
+        )
+    )
+    result = node.process_remote_result(
+        submission.function_call.get(), submission.metadata
+    )
+
+    assert submission.function_name == "run_dockq_workflow"
+    assert dockq.kwargs["run_name"] == "dockq-run"
+    assert dockq.kwargs["dockq_args"] == ["--short"]
+    assert dockq.kwargs["pairs"][0]["model_bytes"] == b"ATOM\n"
+    assert dockq.kwargs["pairs"][0]["reference_bytes"] == b"ATOM\n"
+    assert result.outputs[0].kind == ArtifactKind.SCORES
+    assert result.outputs[0].metadata["pair_count"] == 1
 
 
 def test_submit_ppiflow_workflow_dry_run_prints_dag_without_orchestrator(
@@ -317,7 +700,47 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     assert definition.dependencies["stage2-report"] == {"stage2-rank"}
 
 
-def test_ppiflow_unsupported_steps_fail_with_clear_adapter_error(
+def test_ppiflow_stage2_only_requires_existing_input() -> None:
+    try:
+        build_ppiflow_workflow(
+            task_yaml_bytes=_task_yaml(enabled_steps="  RosettaFixStep: true\n"),
+            steps_yaml_bytes=b"{}\n",
+            stage=2,
+            modal_namespace=_fake_namespace(),
+        )
+    except ValueError as exc:
+        assert "stage=2 PPIFlow runs require a Stage2Input" in str(exc)
+    else:
+        raise AssertionError("stage=2 without existing structures should fail")
+
+
+def test_ppiflow_stage2_only_uses_existing_input_node() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(enabled_steps="  RosettaFixStep: true\n"),
+        steps_yaml_bytes=b"""
+Stage2Input:
+  volume_name: source-volume
+  path: existing/stage1-filtered
+RosettaFixStep: {}
+""",
+        stage=2,
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    assert list(definition.nodes) == [
+        "stage2-existing-input",
+        "stage2-rosetta-fix",
+    ]
+    assert isinstance(
+        definition.nodes["stage2-existing-input"].node,
+        ppiflow_workflow.ExistingStructuresNode,
+    )
+    assert definition.dependencies["stage2-rosetta-fix"] == {"stage2-existing-input"}
+
+
+def test_structure_consuming_steps_fail_clearly_without_inputs(
     tmp_path: Path,
 ) -> None:
     fake_function = _FakePPIFlowFunction()
@@ -339,10 +762,10 @@ def test_ppiflow_unsupported_steps_fail_with_clear_adapter_error(
                 inputs={},
             )
         )
-    except NotImplementedError as exc:
-        assert "workflow-compatible run_flowpacker_workflow adapter" in str(exc)
+    except ValueError as exc:
+        assert "requires structure inputs" in str(exc)
     else:
-        raise AssertionError("unsupported PPIFlow step should fail clearly")
+        raise AssertionError("missing PPIFlow inputs should fail clearly")
 
 
 def test_ppiflow_entrypoint_stages_local_app_inputs(

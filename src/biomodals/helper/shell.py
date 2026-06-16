@@ -302,13 +302,16 @@ def package_outputs(
 
 
 @timed_function
-def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
+def copy_files(
+    src_dst_mapping: dict[str | Path, str | Path], cp_args: str = "-an"
+) -> None:
     """Copy files from source to destination paths.
 
     Args:
         src_dst_mapping: A dictionary mapping source file paths to destination file paths.
             Both keys and values can be either strings or Path objects. The function
             will create any necessary parent directories for the destination paths.
+        cp_args: Additional arguments to pass to the cp command. Defaults to "-an".
     """
     import shlex
     import shutil
@@ -326,7 +329,7 @@ def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         subprocesses.append(
             sp.Popen(  # noqa: S603
-                [cp_binary, "-an", str(src_path), str(dst_path)],
+                [cp_binary, cp_args, str(src_path), str(dst_path)],
                 stdout=sp.PIPE,
                 stderr=sp.PIPE,
             )

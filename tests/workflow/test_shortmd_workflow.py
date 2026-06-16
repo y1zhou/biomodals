@@ -275,7 +275,15 @@ def test_shortmd_prep_node_runs_gromacs_prepare_and_returns_artifact(
         volume_name=gromacs_app.CONF.output_volume_name,
         path="prepared/source",
     )
-    assert result.outputs[0].metadata == {"stage": "prep", "run_name": "source"}
+    assert result.outputs[0].metadata == {
+        "stage": "prep",
+        "run_name": "source",
+        "files": [
+            {"path": "source.pdb", "role": "input_structure"},
+            {"path": "production_source.tpr", "role": "production_topology"},
+            {"path": "production.mdp", "role": "production_parameters"},
+        ],
+    }
 
 
 def test_shortmd_prep_node_submits_gromacs_prepare_directly(tmp_path: Path) -> None:
@@ -505,6 +513,14 @@ def test_shortmd_clone_node_clones_prepared_run_and_returns_artifact(
         "stage": "clone",
         "run_name": "source-r001",
         "source_run_name": "source",
+        "files": [
+            {"path": "source-r001.pdb", "role": "input_structure"},
+            {
+                "path": "production_source-r001.tpr",
+                "role": "production_topology",
+            },
+            {"path": "production.mdp", "role": "production_parameters"},
+        ],
     }
 
 
@@ -670,6 +686,20 @@ def test_shortmd_replicate_node_runs_gromacs_production(
     )
     assert result.outputs[0].metadata["run_name"] == "source-r001"
     assert result.outputs[0].metadata["source_run_name"] == "source"
+    assert result.outputs[0].metadata["files"] == [
+        {"path": "production_source-r001.xtc", "role": "trajectory"},
+        {"path": "production_source-r001.tpr", "role": "production_topology"},
+        {
+            "path": "production_source-r001_nopbc_centered.pdb",
+            "role": "centered_structure",
+        },
+        {"path": "rmsd_production_source-r001.csv", "role": "rmsd"},
+        {
+            "path": "rg_production_source-r001.csv",
+            "role": "radius_of_gyration",
+        },
+        {"path": "rmsf_production_source-r001.csv", "role": "rmsf"},
+    ]
 
 
 def test_shortmd_replicate_node_submits_production_directly(tmp_path: Path) -> None:

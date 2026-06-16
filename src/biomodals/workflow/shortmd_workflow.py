@@ -21,7 +21,7 @@ import modal
 
 from biomodals.app.bioinfo import gromacs_app
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import volume_path_from_mount_path
+from biomodals.helper.app_run import volume_app_output
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
@@ -30,6 +30,7 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     NodeExecutionPolicy,
@@ -46,8 +47,9 @@ from biomodals.workflow.core import (
     orchestrator,
     print_workflow_dag,
 )
-from biomodals.workflow.core._runtime.external_availability import (
-    check_external_artifact_availability,
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
 )
 
 DEPENDENCY_APPS = ("gromacs",)
@@ -76,6 +78,28 @@ GROMACS_OUTPUT_VOLUME_NAME = gromacs_app.CONF.output_volume_name
 GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
 
 
+def _prepared_gromacs_files(run_name: str) -> list[ArtifactFile]:
+    """Return expected GROMACS preparation files for a run directory."""
+    return [
+        ArtifactFile(path=f"{run_name}.pdb", role="input_structure"),
+        ArtifactFile(path=f"production_{run_name}.tpr", role="production_topology"),
+        ArtifactFile(path="production.mdp", role="production_parameters"),
+    ]
+
+
+def _production_gromacs_files(run_name: str) -> list[ArtifactFile]:
+    """Return expected ShortMD production and analysis files."""
+    prefix = f"production_{run_name}"
+    return [
+        ArtifactFile(path=f"{prefix}.xtc", role="trajectory"),
+        ArtifactFile(path=f"{prefix}.tpr", role="production_topology"),
+        ArtifactFile(path=f"{prefix}_nopbc_centered.pdb", role="centered_structure"),
+        ArtifactFile(path=f"rmsd_{prefix}.csv", role="rmsd"),
+        ArtifactFile(path=f"rg_{prefix}.csv", role="radius_of_gyration"),
+        ArtifactFile(path=f"rmsf_{prefix}.csv", role="rmsf"),
+    ]
+
+
 @app.function(
     image=runtime_image,
     cpu=0.125,
@@ -83,10 +107,10 @@ GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
     timeout=CONF.timeout,
     volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
 )
-def check_shortmd_external_artifact(artifact: WorkflowArtifact) -> list[str]:
+def check_shortmd_external_artifact(artifact: WorkflowArtifact) -> ArtifactAvailability:
     """Validate ShortMD artifacts stored in the GROMACS output volume."""
     GROMACS_OUTPUT_VOLUME.reload()
-    return check_external_artifact_availability(
+    return check_external_artifact_status(
         artifact,
         workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
         volume_roots={GROMACS_OUTPUT_VOLUME_NAME: GROMACS_OUTPUT_MOUNTPOINT},
@@ -280,15 +304,14 @@ class ShortMDPrepNode(AppBackedNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                AppOutput(
+                volume_app_output(
                     name="prepared_gromacs_run",
                     kind=ArtifactKind.DIRECTORY,
-                    storage=volume_path_from_mount_path(
-                        remote_path=remote_workdir,
-                        mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                        volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    ),
+                    remote_path=remote_workdir,
+                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={"stage": "prep", "run_name": safe_run_name},
+                    files=_prepared_gromacs_files(safe_run_name),
                 )
             ],
         )
@@ -363,19 +386,18 @@ class ShortMDCloneNode(WorkflowNativeNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                AppOutput(
+                volume_app_output(
                     name="cloned_gromacs_run",
                     kind=ArtifactKind.DIRECTORY,
-                    storage=volume_path_from_mount_path(
-                        remote_path=remote_workdir,
-                        mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                        volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    ),
+                    remote_path=remote_workdir,
+                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={
                         "stage": str(metadata["stage"]),
                         "run_name": str(metadata["run_name"]),
                         "source_run_name": str(metadata["source_run_name"]),
                     },
+                    files=_prepared_gromacs_files(str(metadata["run_name"])),
                 )
             ],
         )
@@ -469,19 +491,18 @@ class ShortMDReplicateNode(AppBackedNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                AppOutput(
+                volume_app_output(
                     name="gromacs_production",
                     kind=ArtifactKind.DIRECTORY,
-                    storage=volume_path_from_mount_path(
-                        remote_path=str(remote_workdir),
-                        mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                        volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    ),
+                    remote_path=str(remote_workdir),
+                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={
                         "stage": "production",
                         "run_name": safe_replicate_run_name,
                         "source_run_name": safe_source_run_name,
                     },
+                    files=_production_gromacs_files(safe_replicate_run_name),
                 )
             ],
         )

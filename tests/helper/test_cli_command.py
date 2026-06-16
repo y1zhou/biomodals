@@ -7,6 +7,7 @@ from biomodals.helper.cli_command import (
     build_modal_deploy_command,
     build_workflow_run_command,
     modal_env_overrides,
+    resolve_workflow_entrypoint,
 )
 
 
@@ -63,6 +64,42 @@ def test_build_workflow_run_command_does_not_duplicate_dry_run() -> None:
         flags=["--dry-run", "/inputs"],
         python_executable="python",
     )[-2:] == ("--dry-run", "/inputs")
+
+
+def test_resolve_workflow_entrypoint_uses_explicit_or_single_entrypoint() -> None:
+    assert (
+        resolve_workflow_entrypoint(
+            workflow_name="shortmd",
+            explicit_entrypoint="submit_shortmd_workflow",
+            local_entrypoints=(),
+        )
+        == "submit_shortmd_workflow"
+    )
+    assert (
+        resolve_workflow_entrypoint(
+            workflow_name="shortmd",
+            explicit_entrypoint=None,
+            local_entrypoints=("submit_shortmd_workflow",),
+        )
+        == "submit_shortmd_workflow"
+    )
+
+
+def test_resolve_workflow_entrypoint_reports_ambiguous_workflows() -> None:
+    try:
+        resolve_workflow_entrypoint(
+            workflow_name="ambiguous",
+            explicit_entrypoint=None,
+            local_entrypoints=("first", "second"),
+        )
+    except ValueError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected ambiguous workflow to raise")
+
+    assert "contains multiple local entrypoints" in message
+    assert "ambiguous::first" in message
+    assert "ambiguous::second" in message
 
 
 def test_modal_env_overrides_only_contains_requested_values() -> None:

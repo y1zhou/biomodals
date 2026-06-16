@@ -43,8 +43,9 @@ from biomodals.workflow.core import (
     orchestrator,
     print_workflow_dag,
 )
-from biomodals.workflow.core._runtime.external_availability import (
-    check_external_artifact_availability,
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
 )
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
@@ -83,10 +84,10 @@ RFDIFFUSION_OUTPUT_MOUNTPOINT = rfdiffusion_app.CONF.output_volume_mountpoint
 )
 def check_rfd_ligandmpnn_external_artifact(
     artifact: WorkflowArtifact,
-) -> list[str]:
+) -> ArtifactAvailability:
     """Validate RFdiffusion artifacts referenced by the workflow runtime."""
     RFDIFFUSION_OUTPUT_VOLUME.reload()
-    return check_external_artifact_availability(
+    return check_external_artifact_status(
         artifact,
         workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
         volume_roots={RFDIFFUSION_OUTPUT_VOLUME_NAME: RFDIFFUSION_OUTPUT_MOUNTPOINT},
@@ -161,7 +162,16 @@ def select_rfdiffusion_design(
     trb_metadata = pickle.loads(trb_path.read_bytes())  # noqa: S301
     if not isinstance(trb_metadata, dict):
         raise TypeError(f"RFdiffusion TRB metadata must be a dict: {trb_path}")
-    is_fixed: list[int] = trb_metadata.get("mask_1d", [])
+    try:
+        is_fixed = list(trb_metadata["mask_1d"])
+    except KeyError as exc:
+        raise ValueError(
+            f"RFdiffusion TRB metadata missing mask_1d: {trb_path}"
+        ) from exc
+    except TypeError as exc:
+        raise TypeError(
+            f"RFdiffusion TRB metadata mask_1d must be iterable: {trb_path}"
+        ) from exc
 
     # We use gemmi to parse the PDB and extract residue labels for comparison
     # Also sanity check the B-factors of the perturbed positions
@@ -172,27 +182,34 @@ def select_rfdiffusion_design(
     if len(structure) == 0:
         raise ValueError(f"No model found in RFdiffusion PDB output: {pdb_path}")
 
-    fixed_labels: list[str] = []
-    redesigned_labels: list[str] = []
-    bfactor_mismatches: list[str] = []
-    idx: int = -1
+    residue_records: list[tuple[str, float]] = []
     for chain in structure[0]:
         chain_id = chain.name.strip()
         for residue in chain:
-            idx += 1
             res_idx = residue.seqid.num  # assume icode is empty
             if res_idx is None:
                 raise ValueError(f"Invalid residue ID in chain {chain_id}: {residue}")
             label = f"{chain_id}{res_idx}"
             residue_b_factor = float(max((atom.b_iso for atom in residue), default=0.0))
-            if is_fixed[idx]:
-                fixed_labels.append(label)
-                if residue_b_factor == 0.0:
-                    bfactor_mismatches.append(label)
-                continue
-            if residue_b_factor != 0.0:
+            residue_records.append((label, residue_b_factor))
+    if len(is_fixed) != len(residue_records):
+        raise ValueError(
+            f"RFdiffusion TRB mask_1d length {len(is_fixed)} does not match "
+            f"{len(residue_records)} residue(s) parsed from {pdb_path}: {trb_path}"
+        )
+
+    fixed_labels: list[str] = []
+    redesigned_labels: list[str] = []
+    bfactor_mismatches: list[str] = []
+    for idx, (label, residue_b_factor) in enumerate(residue_records):
+        if is_fixed[idx]:
+            fixed_labels.append(label)
+            if residue_b_factor == 0.0:
                 bfactor_mismatches.append(label)
-            redesigned_labels.append(label)
+            continue
+        if residue_b_factor != 0.0:
+            bfactor_mismatches.append(label)
+        redesigned_labels.append(label)
     if bfactor_mismatches:
         print(
             "💊 RFdiffusion redesign-set B-factor sanity check mismatches: "

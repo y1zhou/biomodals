@@ -1,5 +1,14 @@
 """Reusable workflow runtime internals."""
 
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
+    ArtifactAvailabilityStatus,
+    ExternalArtifactChecker,
+    check_artifact_availability,
+    check_external_artifact_availability,
+    check_external_artifact_status,
+    mounted_volume_checker,
+)
 from biomodals.workflow.core.builder import (
     NodeHandle,
     Workflow,
@@ -18,6 +27,9 @@ from biomodals.workflow.core.nodes import (
 
 __all__ = [
     "AppBackedNode",
+    "ArtifactAvailability",
+    "ArtifactAvailabilityStatus",
+    "ExternalArtifactChecker",
     "NodeHandle",
     "NodeRunContext",
     "RemoteFunctionCall",
@@ -27,5 +39,9 @@ __all__ = [
     "WorkflowNativeNode",
     "WorkflowNode",
     "WorkflowNodeSpec",
+    "check_artifact_availability",
+    "check_external_artifact_availability",
+    "check_external_artifact_status",
+    "mounted_volume_checker",
     "print_workflow_dag",
 ]

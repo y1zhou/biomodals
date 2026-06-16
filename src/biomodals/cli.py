@@ -21,6 +21,7 @@ from biomodals.helper.cli_command import (
     build_modal_deploy_command,
     build_workflow_run_command,
     modal_env_overrides,
+    resolve_workflow_entrypoint,
 )
 from biomodals.helper.shell import run_command
 
@@ -436,32 +437,19 @@ def run_modal_app(
 
 def _resolve_workflow_entrypoint(workflow: BiomodalsApp) -> str:
     """Return the explicit or only local workflow entrypoint."""
-    if workflow._entrypoint is not None:
-        return workflow._entrypoint
-
     local_entrypoints = [
-        workflow[entrypoint_idx] for entrypoint_idx in workflow._local_entrypoint_idx
+        workflow[entrypoint_idx].name
+        for entrypoint_idx in workflow._local_entrypoint_idx
     ]
-    if len(local_entrypoints) == 1:
-        return local_entrypoints[0].name
-
-    if len(local_entrypoints) > 1:
-        entrypoint_names = ", ".join(
-            f"[green]{workflow.name}::{entrypoint.name}[/green]"
-            for entrypoint in local_entrypoints
+    try:
+        return resolve_workflow_entrypoint(
+            workflow_name=workflow.name,
+            explicit_entrypoint=workflow._entrypoint,
+            local_entrypoints=local_entrypoints,
         )
-        console.print(
-            "[bold red]Error[/bold red] Workflow "
-            f"'[green]{workflow.name}[/green]' contains multiple local entrypoints; "
-            f"choose one explicitly: {entrypoint_names}"
-        )
-        raise typer.Exit(code=1)
-
-    console.print(
-        "[bold red]Error[/bold red] Workflow "
-        f"'[green]{workflow.name}[/green]' does not define a local entrypoint."
-    )
-    raise typer.Exit(code=1)
+    except ValueError as exc:
+        console.print(f"[bold red]Error[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @workflow_commands.command(

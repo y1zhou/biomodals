@@ -15,9 +15,7 @@ from biomodals.helper.constant import (
     WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
 )
 from biomodals.schema import AppRunResult
-from biomodals.workflow.core._runtime.external_availability import (
-    ExternalArtifactChecker,
-)
+from biomodals.workflow.core.artifact_availability import ExternalArtifactChecker
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.runtime import WorkflowRuntime
 

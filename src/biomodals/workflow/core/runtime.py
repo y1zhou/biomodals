@@ -15,16 +15,16 @@ from biomodals.schema import (
 )
 from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
 from biomodals.workflow.core._runtime.diagnostics import RuntimeDiagnostics
-from biomodals.workflow.core._runtime.external_availability import (
-    ExternalArtifactChecker,
-    mounted_volume_checker,
-)
 from biomodals.workflow.core._runtime.node_runner import NodeRunner
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
 from biomodals.workflow.core._runtime.services import RuntimeServices
 from biomodals.workflow.core._runtime.volume_sync import (
     WorkflowVolume,
     WorkflowVolumeSync,
+)
+from biomodals.workflow.core.artifact_availability import (
+    ExternalArtifactChecker,
+    mounted_volume_checker,
 )
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.ledger import WorkflowLedger
@@ -160,6 +160,17 @@ class WorkflowRuntime:
             for error in self._artifact_availability_errors(artifact)
         ]
         if not errors:
+            unknown_reasons = [
+                reason
+                for artifact in self.ledger.load_node_output_artifacts(node_id)
+                for reason in self._artifact_availability_unknown_reasons(artifact)
+            ]
+            if unknown_reasons:
+                workflow_display.print_workflow_message(
+                    "[workflow] Node output artifact availability unknown: "
+                    f"{node_id}: {'; '.join(unknown_reasons)}",
+                    style="yellow",
+                )
             return True
         workflow_display.print_workflow_message(
             "[workflow] Node output artifacts unavailable: "
@@ -177,6 +188,16 @@ class WorkflowRuntime:
                 run_root=self.ledger.run_root,
                 external_artifact_checker=(self._services.external_artifact_checker),
             )
+        )
+
+    def _artifact_availability_unknown_reasons(
+        self, artifact: WorkflowArtifact
+    ) -> list[str]:
+        return availability.artifact_availability_unknown_reasons(
+            artifact,
+            workflow_volume_name=self._services.workflow_volume_name,
+            volume_root=self._services.volume_root,
+            external_artifact_checker=self._services.external_artifact_checker,
         )
 
     def cancel_active_remote_calls(self, *, terminate_containers: bool = True) -> None:

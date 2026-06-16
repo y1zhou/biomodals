@@ -231,6 +231,18 @@ class NodeRunner:
                 "Workflow input artifacts are unavailable:\n"
                 + "\n".join(f"- {error}" for error in errors)
             )
+        unknown_reasons = [
+            reason
+            for artifacts in inputs.values()
+            for artifact in artifacts
+            for reason in self._artifact_availability_unknown_reasons(artifact)
+        ]
+        if unknown_reasons:
+            workflow_display.print_workflow_message(
+                "[workflow] Input artifact availability unknown: "
+                + "; ".join(unknown_reasons),
+                style="yellow",
+            )
         return inputs
 
     def _artifact_availability_errors(self, artifact: WorkflowArtifact) -> list[str]:
@@ -242,6 +254,16 @@ class NodeRunner:
                 run_root=self.ledger.run_root,
                 external_artifact_checker=self.external_artifact_checker,
             )
+        )
+
+    def _artifact_availability_unknown_reasons(
+        self, artifact: WorkflowArtifact
+    ) -> list[str]:
+        return availability.artifact_availability_unknown_reasons(
+            artifact,
+            workflow_volume_name=self.workflow_volume_name,
+            volume_root=self.volume_root,
+            external_artifact_checker=self.external_artifact_checker,
         )
 
     def _dispatch_node(

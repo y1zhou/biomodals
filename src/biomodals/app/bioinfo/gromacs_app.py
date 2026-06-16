@@ -241,7 +241,9 @@ def prepare_tpr_gpu(
         return str(work_path)
 
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
-    input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
+    staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
+    input_pdb_path = work_path / f"{run_name}.pdb"
+    staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
     CONF.output_volume.commit()
 
@@ -314,7 +316,9 @@ def prepare_tpr_cpu(
         return str(work_path)
 
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
-    input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
+    staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
+    input_pdb_path = work_path / f"{run_name}.pdb"
+    staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
     CONF.output_volume.commit()
 

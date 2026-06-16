@@ -21,6 +21,13 @@ def test_cli_loads_workflow_namespace_names() -> None:
     assert workflow.category == "workflow"
 
 
+def test_cli_loads_hyphenated_workflow_aliases() -> None:
+    workflow = _load_entry("workflow", "rfd-ligandmpnn")
+
+    assert workflow.name == "rfd_ligandmpnn"
+    assert workflow.module == "biomodals.workflow.rfd_ligandmpnn_workflow"
+
+
 def test_workflow_list_command_shows_workflow_names_without_legacy_prefix() -> None:
     result = runner.invoke(app, ["workflow", "list", "--short"])
 

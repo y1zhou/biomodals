@@ -175,6 +175,9 @@ class BiomodalsApp:
         """Resolve an app name or filesystem path to its name and absolute path."""
         if app_name_or_path in self._all_apps:
             return app_name_or_path, self._all_apps[app_name_or_path]
+        normalized_name = app_name_or_path.replace("-", "_")
+        if normalized_name in self._all_apps:
+            return normalized_name, self._all_apps[normalized_name]
 
         app_path = Path(app_name_or_path).expanduser()
         if not app_path.exists():

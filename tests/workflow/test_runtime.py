@@ -408,6 +408,45 @@ def test_strict_external_artifact_checks_can_use_mounted_volume_roots(
     assert runtime.diagnostics.scheduled_waves == [["done"]]
 
 
+def test_unknown_external_artifact_availability_does_not_rerun_completed_node(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/done/outputs",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_volume_roots={},
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == []
+    assert runtime.diagnostics.scheduled_waves == []
+
+
 def test_strict_external_artifact_checks_require_checker(tmp_path: Path) -> None:
     workflow = Workflow("demo")
 
@@ -1556,6 +1595,104 @@ def test_remote_recovery_processes_direct_submission_metadata(
     assert orjson.loads(artifact_metadata) == {"selected": "B5"}
 
 
+def test_completed_remote_node_with_missing_artifact_does_not_replay_stale_result(
+    tmp_path: Path,
+) -> None:
+    node = DirectSubmitNode(
+        call=FakeRemoteCall(
+            object_id="fc-new",
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="archive",
+                        kind=ArtifactKind.ARCHIVE,
+                        storage=InlineBytes(
+                            data=b"new-archive",
+                            filename="designs.tar.zst",
+                            media_type="application/zstd",
+                        ),
+                    )
+                ],
+            ),
+        )
+    )
+    node.execution_policy = NodeExecutionPolicy.RESUME
+    workflow = Workflow("demo")
+    workflow.add_node(node, id="remote")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    ledger.record_attempt_started("remote", "attempt-old")
+    ledger.record_attempt_completed(
+        "remote",
+        "attempt-old",
+        NodeStatus.SUCCEEDED,
+        result=AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="archive",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name="ExternalApp-outputs",
+                        path="runs/remote/archive.tar.zst",
+                    ),
+                )
+            ],
+        ),
+    )
+    ledger.record_remote_call(
+        call_id="fc-old",
+        node_id="remote",
+        attempt_id="attempt-old",
+        function_name="direct_app_function",
+        call_kind="node",
+        status="succeeded",
+    )
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="remote-archive",
+                producing_node_id="remote",
+                kind=ArtifactKind.ARCHIVE,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/remote/archive.tar.zst",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("remote", ["remote-archive"])
+
+    def external_checker(artifact: WorkflowArtifact) -> list[str]:
+        return [f"{artifact.artifact_id}: missing external path {artifact.storage}"]
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_artifact_checker=external_checker,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert node.submitted_contexts == ["remote"]
+    assert (
+        tmp_path
+        / "demo"
+        / "run-1"
+        / "nodes"
+        / "remote"
+        / "attempts"
+        / "attempt-1"
+        / "remote-archive"
+        / "designs.tar.zst"
+    ).read_bytes() == b"new-archive"
+
+
 def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     tmp_path: Path,
 ) -> None:
@@ -1610,6 +1747,50 @@ def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     }
     status = runtime.ledger._load_node_status_or_default("score")
     assert status.input_artifact_ids == ["design-structures"]
+
+
+def test_runtime_logs_unknown_external_input_artifact_availability(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="design")
+    calls: list[str] = []
+    workflow.add_node(
+        FakeNode(calls=calls),
+        id="score",
+        inputs={"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)},
+    )
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="design-structures",
+                producing_node_id="design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/design/outputs",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("design", ["design-structures"])
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["score"]
+    plain_stdout = strip_ansi(capsys.readouterr().out)
+    assert "Input artifact availability unknown" in plain_stdout
+    assert "external volume 'ExternalApp-outputs' was not checked" in plain_stdout
 
 
 def test_runtime_records_succeeded_run_status(tmp_path: Path) -> None:

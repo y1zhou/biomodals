@@ -89,20 +89,21 @@ class RemoteCallManager:
         self, node_id: str, node: WorkflowNode
     ) -> RecoveredRemoteResult | None:
         """Recover a remote node result from durable remote-call state if possible."""
-        succeeded_call = self.ledger.latest_remote_call(
-            node_id,
-            statuses=("succeeded",),
-        )
-        if succeeded_call is not None:
-            attempt_id = str(succeeded_call["attempt_id"])
-            result = self.ledger.load_attempt_app_result(node_id, attempt_id)
-            if result is not None:
-                self.volume_sync.reload()
-                return RecoveredRemoteResult(
-                    attempt_id=attempt_id,
-                    attempt_dir=self._attempt_dir(node_id, attempt_id),
-                    result=result,
-                )
+        if self.ledger.node_is_running(node_id):
+            succeeded_call = self.ledger.latest_remote_call(
+                node_id,
+                statuses=("succeeded",),
+            )
+            if succeeded_call is not None:
+                attempt_id = str(succeeded_call["attempt_id"])
+                result = self.ledger.load_attempt_app_result(node_id, attempt_id)
+                if result is not None:
+                    self.volume_sync.reload()
+                    return RecoveredRemoteResult(
+                        attempt_id=attempt_id,
+                        attempt_dir=self._attempt_dir(node_id, attempt_id),
+                        result=result,
+                    )
 
         remote_call = self.ledger.latest_remote_call(
             node_id,

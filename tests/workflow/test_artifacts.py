@@ -16,7 +16,9 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
-from biomodals.workflow.core._runtime.external_availability import (
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailabilityStatus,
+    check_artifact_availability,
     mounted_volume_checker,
 )
 from biomodals.workflow.core.artifacts import (
@@ -179,6 +181,32 @@ def test_workflow_artifact_availability_skips_unmounted_external_volumes(
     )
 
 
+def test_typed_artifact_availability_reports_unknown_external_without_checker(
+    tmp_path: Path,
+) -> None:
+    artifact = WorkflowArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    availability = check_artifact_availability(
+        artifact,
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert availability.status == ArtifactAvailabilityStatus.UNKNOWN
+    assert availability.errors == ()
+    assert availability.unknown_reason == (
+        "external volume 'RFdiffusion-outputs' was not checked"
+    )
+
+
 def test_external_mounted_volume_checker_validates_app_volume_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -201,7 +229,10 @@ def test_external_mounted_volume_checker_validates_app_volume_artifacts(
         files=[ArtifactFile(path="model.pdb")],
     )
 
-    assert checker(artifact) == []
+    availability = checker(artifact)
+
+    assert availability.status == ArtifactAvailabilityStatus.AVAILABLE
+    assert availability.errors == ()
 
 
 def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
@@ -221,10 +252,38 @@ def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
         ),
     )
 
-    errors = checker(artifact)
+    availability = checker(artifact)
 
-    assert len(errors) == 1
-    assert "missing workflow artifact path run/outputs" in errors[0]
+    assert availability.status == ArtifactAvailabilityStatus.MISSING
+    assert len(availability.errors) == 1
+    assert "missing workflow artifact path run/outputs" in availability.errors[0]
+
+
+def test_external_mounted_volume_checker_reports_unknown_unmounted_volume(
+    tmp_path: Path,
+) -> None:
+    checker = mounted_volume_checker(
+        workflow_volume_name="Workflow-outputs",
+        volume_roots={},
+    )
+    artifact = WorkflowArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    availability = checker(artifact)
+
+    assert availability.status == ArtifactAvailabilityStatus.UNKNOWN
+    assert availability.errors == ()
+    assert availability.unknown_reason == (
+        "rfd-output: missing mounted volume root for external volume "
+        "'RFdiffusion-outputs'"
+    )
 
 
 def test_volume_path_reference_output_records_expected_files_from_metadata(
@@ -267,10 +326,13 @@ def test_volume_path_reference_output_records_expected_files_from_metadata(
         volume_roots={"RFdiffusion-outputs": app_volume},
     )
 
-    errors = checker(artifact)
+    availability = checker(artifact)
 
-    assert len(errors) == 1
-    assert "missing workflow artifact file run/outputs/model.pdb" in errors[0]
+    assert availability.status == ArtifactAvailabilityStatus.MISSING
+    assert len(availability.errors) == 1
+    assert (
+        "missing workflow artifact file run/outputs/model.pdb" in availability.errors[0]
+    )
 
 
 def test_materialized_inline_artifact_path_is_volume_relative(

@@ -66,6 +66,26 @@ def build_workflow_run_command(
     ])
 
 
+def resolve_workflow_entrypoint(
+    *,
+    workflow_name: str,
+    explicit_entrypoint: str | None,
+    local_entrypoints: list[str] | tuple[str, ...],
+) -> str:
+    """Resolve the workflow local entrypoint to invoke."""
+    if explicit_entrypoint is not None:
+        return explicit_entrypoint
+    if len(local_entrypoints) == 1:
+        return local_entrypoints[0]
+    if len(local_entrypoints) > 1:
+        choices = ", ".join(f"{workflow_name}::{name}" for name in local_entrypoints)
+        raise ValueError(
+            f"Workflow '{workflow_name}' contains multiple local entrypoints; "
+            f"choose one explicitly: {choices}"
+        )
+    raise ValueError(f"Workflow '{workflow_name}' does not define a local entrypoint.")
+
+
 def modal_env_overrides(*, gpu: str | None, timeout: int | None) -> dict[str, str]:
     """Return environment overrides for Modal subprocess commands."""
     env: dict[str, str] = {}

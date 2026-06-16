@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Literal
 
 from biomodals.schema import WorkflowArtifact
-from biomodals.workflow.core._runtime.external_availability import (
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailabilityStatus,
     ExternalArtifactChecker,
+    check_artifact_availability,
 )
-from biomodals.workflow.core.artifacts import workflow_artifact_availability_errors
 
 
 @dataclass(frozen=True)
@@ -60,39 +61,50 @@ def artifact_availability_errors(
                 ),
             )
         )
-    errors.extend(
-        ArtifactAvailabilityError(
-            artifact_id=artifact.artifact_id,
-            reason="workflow_artifact_unavailable",
-            relative_path=artifact.storage.path,
-            detail=error,
-        )
-        for error in workflow_artifact_availability_errors(
-            artifact,
-            workflow_volume_name=workflow_volume_name,
-            volume_root=volume_root,
-        )
+    availability_result = check_artifact_availability(
+        artifact,
+        workflow_volume_name=workflow_volume_name,
+        volume_root=volume_root,
+        external_artifact_checker=external_artifact_checker,
     )
-    if (
-        external_artifact_checker is not None
-        and artifact.storage.volume_name != workflow_volume_name
-    ):
-        try:
-            external_errors = external_artifact_checker(artifact)
-        except Exception as exc:  # noqa: BLE001
-            external_errors = [
-                f"{artifact.artifact_id}: external artifact checker failed: {exc}"
-            ]
+    if availability_result.status == ArtifactAvailabilityStatus.MISSING:
+        reason: Literal[
+            "workflow_artifact_unavailable",
+            "external_artifact_unavailable",
+        ] = (
+            "workflow_artifact_unavailable"
+            if artifact.storage.volume_name == workflow_volume_name
+            else "external_artifact_unavailable"
+        )
         errors.extend(
             ArtifactAvailabilityError(
                 artifact_id=artifact.artifact_id,
-                reason="external_artifact_unavailable",
+                reason=reason,
                 relative_path=artifact.storage.path,
                 detail=error,
             )
-            for error in external_errors
+            for error in availability_result.errors
         )
     return errors
+
+
+def artifact_availability_unknown_reasons(
+    artifact: WorkflowArtifact,
+    *,
+    workflow_volume_name: str,
+    volume_root: Path,
+    external_artifact_checker: ExternalArtifactChecker | None = None,
+) -> list[str]:
+    """Return non-fatal unknown availability reasons for one artifact."""
+    availability_result = check_artifact_availability(
+        artifact,
+        workflow_volume_name=workflow_volume_name,
+        volume_root=volume_root,
+        external_artifact_checker=external_artifact_checker,
+    )
+    if availability_result.status != ArtifactAvailabilityStatus.UNKNOWN:
+        return []
+    return [availability_result.unknown_reason or "artifact availability unknown"]
 
 
 def format_artifact_availability_errors(

@@ -153,9 +153,11 @@ the required mounted app volumes. Keep those checks run-level and derived from
 recorded `WorkflowArtifact` locations; do not add per-node user settings or
 tool-specific logic to workflow core.
 
-The helper in `_runtime.external_availability` is pure Python so workflow
-modules can call it from a lightweight Modal function that mounts the app-owned
-volumes needed for the run.
+The helpers in `workflow.core.artifact_availability` are pure Python so workflow
+modules can call them from a lightweight Modal function that mounts the
+app-owned volumes needed for the run. Use the typed availability contract to
+distinguish `available`, `missing`, and `unknown` app-owned volume state; only
+missing artifacts should drive rerun or resume decisions.
 
 ## Node Placement
 

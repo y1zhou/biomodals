@@ -118,9 +118,11 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
     )
 
     run_root = tmp_path / "prep"
-    input_path = run_root / "inputs" / "prep.pdb"
+    input_path = run_root / "prep.pdb"
+    staged_input_path = run_root / "inputs" / "prep.pdb"
     assert result == str(run_root)
     assert input_path.read_bytes() == b"ATOM\n"
+    assert staged_input_path.read_bytes() == b"ATOM\n"
     assert captured["cmd"][captured["cmd"].index("-i") + 1] == str(input_path)
     assert captured["cwd"] == str(run_root)
     assert captured["env"] == {"OMP_NUM_THREADS": None}

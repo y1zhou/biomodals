@@ -9,6 +9,25 @@ from types import SimpleNamespace
 from biomodals.app.bioinfo import gromacs_app
 
 
+def test_gromacs_declares_workflow_expected_files() -> None:
+    prepared = gromacs_app.prepared_workflow_files("demo")
+    production = gromacs_app.production_workflow_files("demo-rep1")
+
+    assert [(item.path, item.role) for item in prepared] == [
+        ("demo.pdb", "input_structure"),
+        ("production_demo.tpr", "production_topology"),
+        ("production.mdp", "production_parameters"),
+    ]
+    assert [(item.path, item.role) for item in production] == [
+        ("production_demo-rep1.xtc", "trajectory"),
+        ("production_demo-rep1.tpr", "production_topology"),
+        ("production_demo-rep1_nopbc_centered.pdb", "centered_structure"),
+        ("rmsd_production_demo-rep1.csv", "rmsd"),
+        ("rg_production_demo-rep1.csv", "radius_of_gyration"),
+        ("rmsf_production_demo-rep1.csv", "rmsf"),
+    ]
+
+
 def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     tmp_path: Path,
     monkeypatch,

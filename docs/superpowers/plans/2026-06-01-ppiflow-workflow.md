@@ -4,7 +4,7 @@
 
 **Goal:** Rebuild `src/biomodals/workflow/ppiflow_workflow.py` as a ShortMD-style Biomodals workflow that follows upstream PPIFlow stage ordering and uses included Biomodals app functions.
 
-**Architecture:** Build a static stage-level DAG from upstream `task.yaml` and `steps.yaml`. App-backed Workflow Nodes call included app functions through a `PPIFlowModalNamespace`; workflow-native helpers do only staging, archive extraction, structure selection, fixed-position CSV conversion, DockQ pair preparation, ranking, and reporting. `alphafold3_app` is an additional dependency for upstream `ReFoldStep` because DockQ needs refolded model structures and `af3score_app` intentionally does not emit them.
+**Architecture:** Build a static stage-level DAG from upstream `task.yaml` and `steps.yaml`. App-backed Workflow Nodes call included app functions through a `PPIFlowModalNamespace`; workflow-native helpers handle staging, archive extraction, structure selection, and DockQ pair preparation. Score-based filtering, Rosetta residue-energy to fixed-position conversion, score-aware ranking, and final report generation are intentionally incomplete and fail clearly rather than returning misleading placeholder outputs. `alphafold3_app` is an additional dependency for upstream `ReFoldStep` because DockQ needs refolded model structures and `af3score_app` intentionally does not emit them.
 
 **Tech Stack:** Python 3.13 workflow module, Modal, Biomodals workflow runtime, Pydantic app result schemas, `orjson`, `pytest`, `prek`.
 
@@ -31,16 +31,16 @@
 - [x] Replace ad hoc YAML handling with helpers that read upstream `task` and `steps`, parse enabled steps, validate stage selection, and require explicit `Stage2Input` configuration for stage-2-only runs.
 - [x] Add volume helpers that convert `WorkflowArtifact.storage` to mount paths for known app output volumes.
 - [x] Add archive extraction helpers for app functions that return `.tar.zst` bytes or archives in a volume path.
-- [x] Port upstream pure helpers into workflow-native code using standard library:
+- [ ] Port upstream pure helpers into workflow-native code using standard library:
   filter parsing, FASTA sequence collection into `mpnn_seqs.csv`, Rosetta `residue_energy.csv` to `fixed_positions.csv`, partial sample directory discovery, DockQ model directory preparation, DockQ pair assembly, ranking, and report generation.
-  Current implementation provides workflow-owned structure selection/copying, partial input staging, DockQ pair assembly, ranking, and report generation through standard `AppRunResult` artifacts.
+  Current implementation provides workflow-owned structure selection/copying, partial input staging, and DockQ pair assembly through standard `AppRunResult` artifacts. Filter, fixed-position derivation, ranking, and reporting are explicit follow-up work.
 
 ### Task 3: Define Hydrated App Namespace And Nodes
 
 **Files:**
 
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
-- [x] Extend `PPIFlowModalNamespace` with handles for PPIFlow, LigandMPNN, FlowPacker, AF3Score prepare/run/postprocess/lock, DockQ, Rosetta, Rosetta packaging, and AlphaFold3 data/inference app functions.
+- [x] Extend `PPIFlowModalNamespace` with handles for PPIFlow, LigandMPNN, FlowPacker, AF3Score prepare/run/postprocess/lock, DockQ, Rosetta, and AlphaFold3 data/inference app functions.
 - [x] Replace `PPIFlowWorkflowNode` with specific node classes:
   `PPIFlowDesignNode`, `LigandMPNNNode`, `FlowPackerNode`, `AF3ScoreNode`, `FilterStructuresNode`, `RosettaFixNode`, `FixedPositionsNode`, `PPIFlowPartialNode`, `ReFoldNode`, `DockQNode`, `RosettaRelaxNode`, `RankNode`, and `ReportNode`.
 - [x] Make app-backed nodes `REMOTE`; make lightweight selectors/rank/report nodes `ORCHESTRATOR` unless they must access app volumes.
@@ -51,8 +51,8 @@
 **Files:**
 
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
-- [x] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
-- [x] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, before-partial structure selection, Partial, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report.
+- [ ] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
+- [ ] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, before-partial structure selection, Partial, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report.
 - [x] Preserve stage-only execution behavior while requiring existing upstream artifacts for stage 2-only runs.
 - [x] Update local input staging to cover initial PPIFlow inputs and preserve mounted paths.
 
@@ -70,6 +70,6 @@
 
 ### Self-Review
 
-- Coverage: the plan covers every named upstream PPIFlow step and every required app, including the newly approved `alphafold3` dependency for `ReFoldStep`.
-- Placeholder scan: no task is left as an unspecified implementation placeholder; the only remote biological execution details are delegated to the named app functions.
+- Coverage: the DAG covers every named upstream PPIFlow step and every required app, including the newly approved `alphafold3` dependency for `ReFoldStep`.
+- Placeholder scan: unsupported filter/fixed-position/rank/report behavior now raises clear errors. Follow-up implementation should add real score/residue parsers before marking this workflow upstream-equivalent.
 - Type consistency: node names, app function handles, and artifact kinds match Biomodals workflow vocabulary.

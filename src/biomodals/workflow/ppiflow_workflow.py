@@ -50,6 +50,10 @@ from biomodals.workflow.core import (
     orchestrator,
     print_workflow_dag,
 )
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
+)
 
 PPI_FLOW_OUTPUT_LAYOUT = (
     "stage1/",
@@ -59,6 +63,8 @@ PPI_FLOW_OUTPUT_LAYOUT = (
     "design_output/design_report.md",
 )
 PPI_FLOW_APP_STEPS = ("PPIFlowStep", "PartialStep")
+PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = ("outputs/**/*.pdb", "outputs/**/*.cif")
+APP_RUN_OUTPUT_STRUCTURE_PATTERNS = ("outputs/**/*.pdb", "outputs/**/*.cif")
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
 
 DEPENDENCY_APPS = (
@@ -150,6 +156,24 @@ def _matches_structure_pattern(path: str, patterns: Sequence[str] | None) -> boo
     return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
 
 
+def _structure_patterns_from_metadata(
+    artifact: WorkflowArtifact,
+    patterns: Sequence[str] | None,
+) -> Sequence[str] | None:
+    if patterns is not None:
+        return patterns
+    metadata_patterns = artifact.metadata.get("structure_patterns")
+    if isinstance(metadata_patterns, str):
+        return tuple(
+            pattern.strip()
+            for pattern in metadata_patterns.split(",")
+            if pattern.strip()
+        )
+    if isinstance(metadata_patterns, Sequence):
+        return tuple(str(pattern) for pattern in metadata_patterns)
+    return None
+
+
 def _safe_selected_file_name(artifact_id: str, member_name: str) -> str:
     parts = [sanitize_filename(part) for part in Path(member_name).parts if part]
     return sanitize_filename("__".join([artifact_id, *parts]))
@@ -194,6 +218,7 @@ def _structure_files_from_artifact(
     artifact: WorkflowArtifact,
     patterns: Sequence[str] | None,
 ) -> list[tuple[str, bytes]]:
+    patterns = _structure_patterns_from_metadata(artifact, patterns)
     root = _artifact_mount_path(artifact)
     if not root.exists():
         raise FileNotFoundError(f"PPIFlow input artifact path not found: {root}")
@@ -258,6 +283,25 @@ def select_ppiflow_structure_files(
         artifacts,
         patterns=patterns,
         max_files=max_files,
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def check_ppiflow_external_artifact(
+    artifact: WorkflowArtifact,
+) -> ArtifactAvailability:
+    """Validate app-owned artifacts referenced by the PPIFlow workflow."""
+    _reload_ppiflow_source_volumes()
+    return check_external_artifact_status(
+        artifact,
+        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
     )
 
 
@@ -435,13 +479,19 @@ def stage_rosetta_inputs(
         remote_script = "inputs/_script/workflow.xml"
         script_path = layout.run_root / remote_script
         script_path.parent.mkdir(parents=True, exist_ok=True)
-        script_path.write_text(rosetta_script, encoding="utf-8")
+        script_path.write_text(
+            _resolve_rosetta_config_text(rosetta_script, "rosetta_script"),
+            encoding="utf-8",
+        )
     remote_flags = None
     if flags_file:
         remote_flags = "inputs/_flags/workflow.flags"
         flags_path = layout.run_root / remote_flags
         flags_path.parent.mkdir(parents=True, exist_ok=True)
-        flags_path.write_text(flags_file, encoding="utf-8")
+        flags_path.write_text(
+            _resolve_rosetta_config_text(flags_file, "flags_file"),
+            encoding="utf-8",
+        )
 
     queue = modal.Queue.from_name(
         f"{rosetta_app.CONF.name}-queue-{safe_run_id}",
@@ -481,7 +531,6 @@ class PPIFlowModalNamespace:
     af3score_postprocess: modal.Function
     dockq_run: modal.Function
     rosetta_run: modal.Function
-    rosetta_package_outputs: modal.Function
     alphafold3_search_msa: modal.Function
     alphafold3_predict_structures: modal.Function
     select_structures: modal.Function
@@ -516,28 +565,48 @@ class _ConfiguredAppStepNode(AppBackedNode):
         context: NodeRunContext,
         *,
         max_files: int | None = None,
+        default_patterns: Sequence[str] | None = None,
     ) -> list[tuple[str, bytes]]:
         artifacts = context.inputs.get("structures") or []
         if not artifacts:
             raise ValueError(
                 f"PPIFlow workflow step {self.step_name!r} requires structure inputs"
             )
-        raw_patterns = self.config.get("structure_patterns") or self.config.get(
-            "patterns"
+        patterns = _patterns_from_config(
+            self.config,
+            default=default_patterns,
         )
-        if isinstance(raw_patterns, str):
-            patterns = tuple(
-                pattern.strip()
-                for pattern in raw_patterns.split(",")
-                if pattern.strip()
-            )
-        else:
-            patterns = raw_patterns
         return self.modal_namespace.select_structures.remote(
             artifacts=artifacts,
             patterns=patterns,
             max_files=max_files,
         )
+
+    def _select_one_structure(
+        self,
+        context: NodeRunContext,
+        *,
+        default_patterns: Sequence[str] | None = None,
+    ) -> tuple[str, bytes]:
+        selected = self._select_structures(
+            context,
+            max_files=self.config.get("max_structures"),
+            default_patterns=default_patterns,
+        )
+        explicit_index = "structure_index" in self.config
+        if len(selected) > 1 and not explicit_index:
+            raise ValueError(
+                f"{self.step_name} selected {len(selected)} structures; set an "
+                "explicit structure_index or structure_patterns/max_structures "
+                "to avoid silently discarding candidates"
+            )
+        structure_index = int(self.config.get("structure_index", 0))
+        if structure_index < 0 or structure_index >= len(selected):
+            raise IndexError(
+                f"{self.step_name} structure_index {structure_index} is out of "
+                f"range for {len(selected)} selected structure(s)"
+            )
+        return selected[structure_index]
 
 
 @dataclass
@@ -569,7 +638,11 @@ class _PPIFlowRunNode(_ConfiguredAppStepNode):
         return _result_with_output_kind(
             result,
             ArtifactKind.STRUCTURES,
-            {"step_name": self.step_name} | dict(metadata),
+            {
+                "step_name": self.step_name,
+                "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
+            }
+            | dict(metadata),
         )
 
 
@@ -613,17 +686,7 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the LigandMPNN app function."""
-        structure_index = int(self.config.get("structure_index", 0))
-        selected_structures = self._select_structures(
-            context,
-            max_files=self.config.get("max_structures"),
-        )
-        if structure_index < 0 or structure_index >= len(selected_structures):
-            raise IndexError(
-                f"{self.step_name} structure_index {structure_index} is out of "
-                f"range for {len(selected_structures)} selected structure(s)"
-            )
-        selected_name, selected_bytes = selected_structures[structure_index]
+        selected_name, selected_bytes = self._select_one_structure(context)
         script_mode = str(self.config.get("script_mode", "run"))
         model_type = str(
             self.config.get(
@@ -721,7 +784,7 @@ class AF3ScoreNode(_ConfiguredAppStepNode):
         input_names = self.modal_namespace.stage_af3score_inputs.remote(
             artifacts=context.inputs.get("structures") or [],
             run_name=run_name,
-            patterns=None,
+            patterns=_patterns_from_config(self.config, default=("*.pdb",)),
             max_files=self.config.get("max_structures"),
         )
         if not input_names:
@@ -863,6 +926,7 @@ class _RosettaNode(_ConfiguredAppStepNode):
                         "run_name": str(staged["run_name"]),
                         "run_id": str(staged["run_id"]),
                         "num_jobs": num_jobs,
+                        "structure_patterns": APP_RUN_OUTPUT_STRUCTURE_PATTERNS,
                     },
                 )
             ],
@@ -887,8 +951,10 @@ class ReFoldNode(_ConfiguredAppStepNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Run AlphaFold3 refolding for one selected structure."""
-        selected = self._select_structures(context, max_files=1)
-        structure_name, structure_bytes = selected[0]
+        structure_name, structure_bytes = self._select_one_structure(
+            context,
+            default_patterns=("*.pdb",),
+        )
         run_name = self._run_name(context)
         conf = _af3_config_for_refold(
             structure_name=structure_name,
@@ -946,12 +1012,18 @@ class DockQNode(_ConfiguredAppStepNode):
             patterns=None,
             max_files=self.config.get("max_models"),
         )
+        if len(references) != len(models):
+            raise ValueError(
+                f"{self.step_name} requires the same number of reference and model "
+                f"structures; found {len(references)} reference(s) and "
+                f"{len(models)} model(s)"
+            )
         pairs = []
         for pair_idx, (
             (reference_name, reference_bytes),
             (model_name, model_bytes),
         ) in enumerate(
-            zip(references, models, strict=False),
+            zip(references, models, strict=True),
             start=1,
         ):
             pairs.append({
@@ -1029,20 +1101,11 @@ class FilterStructuresNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute filtering logic."""
-        artifacts = context.inputs.get("structures") or []
-        if not artifacts:
-            raise ValueError(f"{self.step_name} requires structure inputs")
-        return AppRunResult.model_validate(
-            self.modal_namespace.copy_structures.remote(
-                artifacts=artifacts,
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-                output_name="filtered_structures",
-                metadata={"step_name": self.step_name},
-                patterns=None,
-                max_files=self.config.get("max_structures"),
-            )
+        _ = context
+        raise NotImplementedError(
+            f"{self.step_name} score-based filtering is not implemented yet; "
+            "disable this step or add a workflow-native score parser before "
+            "using it in production"
         )
 
 
@@ -1070,6 +1133,12 @@ class FixedPositionsNode(WorkflowNativeNode):
                 if value:
                     fixed_positions = str(value)
                     break
+        if not fixed_positions:
+            raise ValueError(
+                f"{self.step_name} requires fixed_positions in step config or "
+                "upstream artifact metadata; Rosetta residue-energy parsing is "
+                "not implemented yet"
+            )
         return AppRunResult.model_validate(
             self.modal_namespace.copy_structures.remote(
                 artifacts=artifacts,
@@ -1096,38 +1165,10 @@ class RankNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute ranking logic."""
-        rows = [
-            "rank,artifact_id,kind,volume,path",
-            *(
-                f"{rank},{artifact.artifact_id},{artifact.kind},"
-                f"{artifact.storage.volume_name},{artifact.storage.path}"
-                for rank, artifact in enumerate(
-                    sorted(
-                        (
-                            artifact
-                            for artifacts in context.inputs.values()
-                            for artifact in artifacts
-                        ),
-                        key=lambda artifact: artifact.artifact_id,
-                    ),
-                    start=1,
-                )
-            ),
-        ]
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="ranked_designs",
-                    kind=ArtifactKind.TABLE,
-                    storage=InlineBytes(
-                        data=("\n".join(rows) + "\n").encode("utf-8"),
-                        filename="ranked_designs.csv",
-                        media_type="text/csv",
-                    ),
-                    metadata={"step_name": self.step_name},
-                )
-            ],
+        _ = context
+        raise NotImplementedError(
+            f"{self.step_name} score-aware ranking is not implemented yet; "
+            "disable this step or add a ranking parser for score artifacts"
         )
 
 
@@ -1140,6 +1181,11 @@ class ReportNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute report generation logic."""
+        if "rank" not in context.inputs:
+            raise NotImplementedError(
+                f"{self.step_name} report generation requires ranked designs; "
+                "score-aware ranking is not implemented yet"
+            )
         artifacts = [
             artifact
             for artifact_list in context.inputs.values()
@@ -1205,6 +1251,50 @@ def _parse_seed_values(value: object) -> list[int]:
     if not seeds:
         raise ValueError("seeds must contain at least one integer")
     return seeds
+
+
+def _patterns_from_config(
+    config: Mapping[str, object],
+    *,
+    default: Sequence[str] | None = None,
+) -> tuple[str, ...] | None:
+    raw_patterns = config.get("structure_patterns") or config.get("patterns")
+    if raw_patterns is None:
+        return tuple(default) if default is not None else None
+    if isinstance(raw_patterns, str):
+        return tuple(
+            pattern.strip() for pattern in raw_patterns.split(",") if pattern.strip()
+        )
+    return tuple(str(pattern) for pattern in raw_patterns)
+
+
+def _resolve_rosetta_config_text(value: str, field_name: str) -> str:
+    config_path = Path(value).expanduser()
+    has_newline = "\n" in value
+    looks_like_path = (
+        config_path.suffix in {".xml", ".flags"} or "/" in value or "\\" in value
+    )
+    if looks_like_path and not has_newline and config_path.exists():
+        return config_path.read_text(encoding="utf-8")
+    if looks_like_path and not has_newline:
+        raise FileNotFoundError(
+            f"Rosetta {field_name} path was not found locally or in the mounted "
+            f"container filesystem: {value}"
+        )
+    return value
+
+
+def _inline_rosetta_config_files(steps_doc: dict[str, Any]) -> dict[str, Any]:
+    staged_steps = deepcopy(steps_doc)
+    for step_name in ("RosettaFixStep", "RosettaRelaxStep"):
+        if step_name not in staged_steps:
+            continue
+        cfg = _step_cfg(staged_steps, step_name)
+        for field_name in ("rosetta_script", "flags_file"):
+            value = cfg.get(field_name)
+            if isinstance(value, str):
+                cfg[field_name] = _resolve_rosetta_config_text(value, field_name)
+    return staged_steps
 
 
 def _ligandmpnn_cli_kwargs(
@@ -1326,7 +1416,6 @@ def build_ppiflow_workflow(
             af3score_postprocess=af3score_app.af3score_postprocess,
             dockq_run=dockq_app.run_dockq_workflow,
             rosetta_run=rosetta_app.run_rosetta,
-            rosetta_package_outputs=rosetta_app.package_outputs_helper,
             alphafold3_search_msa=alphafold3_app.run_data_pipeline,
             alphafold3_predict_structures=alphafold3_app.run_inference_pipeline,
             select_structures=select_ppiflow_structure_files,
@@ -1702,8 +1791,6 @@ def _active_ppiflow_app_steps(
     active_steps: list[str] = []
     if stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep"):
         active_steps.append("PPIFlowStep")
-    if stage in {None, 2} and _step_enabled(enabled, "PartialStep"):
-        active_steps.append("PartialStep")
     return tuple(active_steps)
 
 
@@ -1775,6 +1862,7 @@ def submit_ppiflow_workflow(
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
+    strict_artifact_checks: bool = False,
 ) -> None:
     """Build and submit a PPIFlow workflow from task and step YAML files.
 
@@ -1792,6 +1880,8 @@ def submit_ppiflow_workflow(
         max_parallel: Maximum number of ready workflow nodes to execute
             concurrently in one scheduler wave.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
+        strict_artifact_checks: Validate referenced app-owned volume artifacts
+            before reusing completed workflow nodes.
     """
     task_yaml_path = Path(task_yaml).expanduser().resolve()
     steps_yaml_path = Path(steps_yaml).expanduser().resolve()
@@ -1813,6 +1903,7 @@ def submit_ppiflow_workflow(
         run_id=resolved_run_id,
         app_steps=_active_ppiflow_app_steps(task_doc, stage),
     )
+    steps_doc = _inline_rosetta_config_files(steps_doc)
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=task_yaml_bytes,
         steps_yaml_bytes=yaml.safe_dump(steps_doc).encode("utf-8"),
@@ -1826,6 +1917,11 @@ def submit_ppiflow_workflow(
         "force": force,
         "max_ready_workers": max_parallel,
     }
+    if strict_artifact_checks:
+        orchestrator_kwargs["strict_external_artifact_checks"] = True
+        orchestrator_kwargs["external_artifact_checker"] = (
+            check_ppiflow_external_artifact.remote
+        )
     print(
         f"Submitting PPIFlow workflow '{resolved_run_id}' with "
         f"{len(workflow.validate().nodes)} node(s)",

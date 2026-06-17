@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import modal
+import pytest
 
 from biomodals.app.design import ppiflow_app
 from biomodals.helper.styling import strip_ansi
@@ -25,6 +26,7 @@ from biomodals.workflow.ppiflow_workflow import (
     CONF,
     PPIFlowModalNamespace,
     _active_ppiflow_app_steps,
+    _inline_rosetta_config_files,
     _stage_ppiflow_app_inputs,
     build_ppiflow_workflow,
 )
@@ -124,7 +126,6 @@ def _fake_namespace(
         af3score_postprocess=cast(modal.Function, af3score_postprocess or fake),
         dockq_run=cast(modal.Function, dockq_run or fake),
         rosetta_run=cast(modal.Function, rosetta_run or fake),
-        rosetta_package_outputs=fake,
         alphafold3_search_msa=cast(modal.Function, alphafold3_search_msa or fake),
         alphafold3_predict_structures=cast(
             modal.Function,
@@ -172,12 +173,17 @@ steps:
 """.encode()
 
 
-def _upstream_structure_artifact() -> WorkflowArtifact:
+def _upstream_structure_artifact(
+    *,
+    kind: ArtifactKind = ArtifactKind.STRUCTURES,
+    metadata: dict[str, object] | None = None,
+) -> WorkflowArtifact:
     return WorkflowArtifact(
         artifact_id="upstream-structures",
         producing_node_id="upstream",
-        kind=ArtifactKind.STRUCTURES,
+        kind=kind,
         storage=VolumePath(volume_name="source-volume", path="upstream/results"),
+        metadata=metadata or {},
     )
 
 
@@ -229,6 +235,10 @@ PPIFlowStep:
     assert result.outputs[0].storage == VolumePath(
         volume_name=ppiflow_app.CONF.output_volume_name,
         path="demo-run",
+    )
+    assert result.outputs[0].metadata["structure_patterns"] == (
+        "outputs/**/*.pdb",
+        "outputs/**/*.cif",
     )
 
 
@@ -326,6 +336,34 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
     assert ligandmpnn.kwargs["cli_args"]["--number_of_batches"] == "3"
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert result.outputs[0].metadata["selected_structure"] == "selected.pdb"
+
+
+def test_ligandmpnn_rejects_implicit_multi_structure_selection(
+    tmp_path: Path,
+) -> None:
+    selector = _FakeModalFunction(
+        "fc-select",
+        [
+            ("design-a.pdb", b"ATOM A\n"),
+            ("design-b.pdb", b"ATOM B\n"),
+        ],
+    )
+    node = ppiflow_workflow.LigandMPNNNode(
+        "MPNNStep_stage1",
+        _fake_namespace(select_structures=selector),
+        {"run_name": "mpnn-run"},
+    )
+
+    with pytest.raises(ValueError, match="explicit structure_index"):
+        node.submit_remote(
+            NodeRunContext(
+                run_id="run-1",
+                node_id="stage1-ligandmpnn",
+                attempt_id="attempt-1",
+                cache_dir=tmp_path,
+                inputs={"structures": [_upstream_structure_artifact()]},
+            )
+        )
 
 
 def test_flowpacker_step_selects_structures_and_submits_app_function(
@@ -436,6 +474,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
         volume_name=ppiflow_workflow.AF3SCORE_OUTPUT_VOLUME_NAME,
         path="af3-run/af3score_metrics.csv",
     )
+    assert stage_inputs.kwargs["patterns"] == ("*.pdb",)
 
 
 def test_rosetta_step_stages_inputs_and_returns_output_directory(
@@ -471,6 +510,7 @@ def test_rosetta_step_stages_inputs_and_returns_output_directory(
     )
 
     assert stage_rosetta.kwargs["rosetta_binary"] == "relax"
+    assert rosetta_run.args == ("rosetta-run", "rosetta-id", 1)
     assert rosetta_run.kwargs == {}
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert result.outputs[0].storage == VolumePath(
@@ -511,6 +551,32 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
     assert b'"sequence":"AC"' in predict.kwargs["json_bytes"]
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert result.outputs[0].storage.data == b"af3-tar-zst"
+
+
+def test_refold_rejects_implicit_multi_structure_selection(tmp_path: Path) -> None:
+    selector = _FakeModalFunction(
+        "fc-select",
+        [
+            ("design-a.pdb", b"ATOM A\n"),
+            ("design-b.pdb", b"ATOM B\n"),
+        ],
+    )
+    node = ppiflow_workflow.ReFoldNode(
+        "ReFoldStep",
+        _fake_namespace(select_structures=selector),
+        {"run_name": "refold-run"},
+    )
+
+    with pytest.raises(ValueError, match="explicit structure_index"):
+        node.run(
+            NodeRunContext(
+                run_id="run-1",
+                node_id="stage2-alphafold3-refold",
+                attempt_id="attempt-1",
+                cache_dir=tmp_path,
+                inputs={"structures": [_upstream_structure_artifact()]},
+            )
+        )
 
 
 def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> None:
@@ -561,6 +627,99 @@ def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> No
     assert dockq.kwargs["pairs"][0]["reference_bytes"] == b"ATOM\n"
     assert result.outputs[0].kind == ArtifactKind.SCORES
     assert result.outputs[0].metadata["pair_count"] == 1
+
+
+def test_dockq_rejects_unpaired_structure_counts(tmp_path: Path) -> None:
+    class SequencedSelector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def remote(self, *args, **kwargs):
+            _ = args, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                return [("reference.pdb", b"ATOM REF\n")]
+            return [
+                ("model-a.pdb", b"ATOM A\n"),
+                ("model-b.pdb", b"ATOM B\n"),
+            ]
+
+    selector = cast(modal.Function, SequencedSelector())
+    node = ppiflow_workflow.DockQNode(
+        "DockQStep",
+        _fake_namespace(select_structures=selector),
+        {"run_name": "dockq-run"},
+    )
+
+    with pytest.raises(ValueError, match="same number"):
+        node.submit_remote(
+            NodeRunContext(
+                run_id="run-1",
+                node_id="stage2-dockq",
+                attempt_id="attempt-1",
+                cache_dir=tmp_path,
+                inputs={
+                    "structures": [_upstream_structure_artifact()],
+                    "models": [_upstream_structure_artifact()],
+                },
+            )
+        )
+
+
+def test_filter_step_fails_until_score_filtering_is_supported(tmp_path: Path) -> None:
+    node = ppiflow_workflow.FilterStructuresNode(
+        "FilterStep_stage1",
+        _fake_namespace(),
+        {"score_column": "af3score"},
+    )
+
+    with pytest.raises(NotImplementedError, match="score-based filtering"):
+        node.run(
+            NodeRunContext(
+                run_id="run-1",
+                node_id="stage1-filter",
+                attempt_id="attempt-1",
+                cache_dir=tmp_path,
+                inputs={
+                    "structures": [_upstream_structure_artifact()],
+                    "scores": [_upstream_structure_artifact(kind=ArtifactKind.SCORES)],
+                },
+            )
+        )
+
+
+def test_fixed_positions_requires_explicit_positions(tmp_path: Path) -> None:
+    node = ppiflow_workflow.FixedPositionsNode(
+        "FixedPositions",
+        _fake_namespace(),
+        {},
+    )
+
+    with pytest.raises(ValueError, match="fixed_positions"):
+        node.run(
+            NodeRunContext(
+                run_id="run-1",
+                node_id="stage2-fixed-positions",
+                attempt_id="attempt-1",
+                cache_dir=tmp_path,
+                inputs={"structures": [_upstream_structure_artifact()]},
+            )
+        )
+
+
+def test_rank_step_fails_until_score_ranking_is_supported(tmp_path: Path) -> None:
+    node = ppiflow_workflow.RankNode("RankStep", {})
+
+    with pytest.raises(NotImplementedError, match="score-aware ranking"):
+        node.run(
+            NodeRunContext(
+                run_id="run-1",
+                node_id="stage2-rank",
+                attempt_id="attempt-1",
+                cache_dir=tmp_path,
+                inputs={"structures": [_upstream_structure_artifact()]},
+            )
+        )
 
 
 def test_submit_ppiflow_workflow_dry_run_prints_dag_without_orchestrator(
@@ -892,6 +1051,15 @@ def test_ppiflow_staging_uses_active_stage_steps(
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
     assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
 
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=_active_ppiflow_app_steps(task_doc, stage=2),
+    )
+
+    assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+
 
 def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
     tmp_path: Path,
@@ -957,3 +1125,72 @@ def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
         (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
         (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
     ]
+
+
+def test_ppiflow_rosetta_staging_inlines_local_config_files(tmp_path: Path) -> None:
+    script_path = tmp_path / "protocol.xml"
+    flags_path = tmp_path / "options.flags"
+    script_path.write_text("<ROSETTASCRIPTS />\n", encoding="utf-8")
+    flags_path.write_text("-relax:fast\n", encoding="utf-8")
+
+    staged = _inline_rosetta_config_files({
+        "RosettaRelaxStep": {
+            "rosetta_script": str(script_path),
+            "flags_file": str(flags_path),
+        }
+    })
+
+    assert staged["RosettaRelaxStep"]["rosetta_script"] == "<ROSETTASCRIPTS />\n"
+    assert staged["RosettaRelaxStep"]["flags_file"] == "-relax:fast\n"
+
+
+def test_submit_ppiflow_workflow_can_enable_strict_external_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_yaml = tmp_path / "task.yaml"
+    steps_yaml = tmp_path / "steps.yaml"
+    task_yaml.write_bytes(_task_yaml(enabled_steps="  PPIFlowStep: true\n"))
+    steps_yaml.write_text(
+        f"""
+PPIFlowStep:
+  run_name: demo-run
+  args:
+    name: demo
+    specified_hotspots: A1
+    input_pdb: {ppiflow_app.CONF.output_volume_mountpoint}/inputs/demo.pdb
+    binder_chain: B
+""",
+        encoding="utf-8",
+    )
+    calls = {}
+
+    class FakeOrchestratorMethod:
+        def remote(self, **kwargs):
+            calls["remote"] = kwargs
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    class FakeWorkflowOrchestrator:
+        def __init__(self) -> None:
+            self.run = FakeOrchestratorMethod()
+
+    monkeypatch.setattr(
+        ppiflow_workflow.orchestrator,
+        "WorkflowOrchestrator",
+        FakeWorkflowOrchestrator,
+    )
+
+    raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        task_yaml=str(task_yaml),
+        steps_yaml=str(steps_yaml),
+        run_id="demo",
+        wait=True,
+        strict_artifact_checks=True,
+    )
+
+    assert calls["remote"]["strict_external_artifact_checks"] is True
+    checker = calls["remote"]["external_artifact_checker"]
+    assert callable(checker)
+    assert "check_ppiflow_external_artifact" in repr(checker)

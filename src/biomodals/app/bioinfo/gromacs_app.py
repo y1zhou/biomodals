@@ -21,6 +21,7 @@ from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
+from biomodals.schema import ArtifactFile
 
 ##########################################
 # Modal configs
@@ -54,6 +55,29 @@ class AppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
+
+
+def prepared_workflow_files(run_name: str) -> list[ArtifactFile]:
+    """Return expected workflow files from a GROMACS preparation run."""
+    return [
+        ArtifactFile(path=f"{run_name}.pdb", role="input_structure"),
+        ArtifactFile(path=f"production_{run_name}.tpr", role="production_topology"),
+        ArtifactFile(path="production.mdp", role="production_parameters"),
+    ]
+
+
+def production_workflow_files(run_name: str) -> list[ArtifactFile]:
+    """Return expected workflow files from a GROMACS production run."""
+    prefix = f"production_{run_name}"
+    return [
+        ArtifactFile(path=f"{prefix}.xtc", role="trajectory"),
+        ArtifactFile(path=f"{prefix}.tpr", role="production_topology"),
+        ArtifactFile(path=f"{prefix}_nopbc_centered.pdb", role="centered_structure"),
+        ArtifactFile(path=f"rmsd_{prefix}.csv", role="rmsd"),
+        ArtifactFile(path=f"rg_{prefix}.csv", role="radius_of_gyration"),
+        ArtifactFile(path=f"rmsf_{prefix}.csv", role="rmsf"),
+    ]
+
 
 runtime_image = (
     modal.Image

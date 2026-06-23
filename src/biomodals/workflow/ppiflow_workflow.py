@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import ast
+import html
 import os
 import shlex
 import shutil
-import tarfile
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import modal
+import polars as pl
 import yaml
 
 from biomodals.app.bioinfo import rosetta_app
@@ -54,6 +57,8 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.ppiflow import staging as ppiflow_staging
+from biomodals.workflow.ppiflow import tables as ppiflow_tables
 
 PPI_FLOW_OUTPUT_LAYOUT = (
     "stage1/",
@@ -61,11 +66,16 @@ PPI_FLOW_OUTPUT_LAYOUT = (
     "design_output/",
     "design_output/ranked_designs.csv",
     "design_output/design_report.md",
+    "design_output/design_report.html",
 )
 PPI_FLOW_APP_STEPS = ("PPIFlowStep", "PartialStep")
-PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = ("outputs/**/*.pdb", "outputs/**/*.cif")
-APP_RUN_OUTPUT_STRUCTURE_PATTERNS = ("outputs/**/*.pdb", "outputs/**/*.cif")
-STRUCTURE_SUFFIXES = {".pdb", ".cif"}
+PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
+    "outputs/*.pdb",
+    "outputs/**/*.pdb",
+    "outputs/*.cif",
+    "outputs/**/*.cif",
+)
+APP_RUN_OUTPUT_STRUCTURE_PATTERNS = PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS
 
 DEPENDENCY_APPS = (
     "ppiflow",
@@ -135,135 +145,6 @@ def _reload_ppiflow_source_volumes() -> None:
     WORKFLOW_OUTPUT_VOLUME.reload()
 
 
-def _artifact_mount_path(artifact: WorkflowArtifact) -> Path:
-    mountpoint = PPI_FLOW_SOURCE_VOLUME_ROOTS.get(artifact.storage.volume_name)
-    if mountpoint is None:
-        raise ValueError(
-            "PPIFlow workflow cannot read artifact volume "
-            f"{artifact.storage.volume_name!r}"
-        )
-    return artifact.storage.at_mountpoint(mountpoint)
-
-
-def _matches_structure_pattern(path: str, patterns: Sequence[str] | None) -> bool:
-    import fnmatch
-
-    suffix = Path(path).suffix.lower()
-    if suffix not in STRUCTURE_SUFFIXES:
-        return False
-    if patterns is None:
-        return True
-    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
-
-
-def _structure_patterns_from_metadata(
-    artifact: WorkflowArtifact,
-    patterns: Sequence[str] | None,
-) -> Sequence[str] | None:
-    if patterns is not None:
-        return patterns
-    metadata_patterns = artifact.metadata.get("structure_patterns")
-    if isinstance(metadata_patterns, str):
-        return tuple(
-            pattern.strip()
-            for pattern in metadata_patterns.split(",")
-            if pattern.strip()
-        )
-    if isinstance(metadata_patterns, Sequence):
-        return tuple(str(pattern) for pattern in metadata_patterns)
-    return None
-
-
-def _safe_selected_file_name(artifact_id: str, member_name: str) -> str:
-    parts = [sanitize_filename(part) for part in Path(member_name).parts if part]
-    return sanitize_filename("__".join([artifact_id, *parts]))
-
-
-def _artifact_is_zstd_archive(artifact: WorkflowArtifact, path: Path) -> bool:
-    return (
-        artifact.kind == ArtifactKind.ARCHIVE
-        or artifact.storage.media_type == ZSTD_MEDIA_TYPE
-        or artifact.metadata.get("archive_format") == "tar.zst"
-        or path.name.endswith(".tar.zst")
-    )
-
-
-def _structure_files_from_tar_zst(
-    artifact: WorkflowArtifact,
-    archive_path: Path,
-    patterns: Sequence[str] | None,
-) -> list[tuple[str, bytes]]:
-    import zstandard as zstd
-
-    selected: list[tuple[str, bytes]] = []
-    with archive_path.open("rb") as compressed:
-        reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
-            for member in tar:
-                if not member.isfile():
-                    continue
-                if not _matches_structure_pattern(member.name, patterns):
-                    continue
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    continue
-                selected.append((
-                    _safe_selected_file_name(artifact.artifact_id, member.name),
-                    extracted.read(),
-                ))
-    return selected
-
-
-def _structure_files_from_artifact(
-    artifact: WorkflowArtifact,
-    patterns: Sequence[str] | None,
-) -> list[tuple[str, bytes]]:
-    patterns = _structure_patterns_from_metadata(artifact, patterns)
-    root = _artifact_mount_path(artifact)
-    if not root.exists():
-        raise FileNotFoundError(f"PPIFlow input artifact path not found: {root}")
-    if root.is_file():
-        if _artifact_is_zstd_archive(artifact, root):
-            return _structure_files_from_tar_zst(artifact, root, patterns)
-        if _matches_structure_pattern(root.name, patterns):
-            return [
-                (
-                    _safe_selected_file_name(artifact.artifact_id, root.name),
-                    root.read_bytes(),
-                )
-            ]
-        return []
-
-    files = []
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        relative = path.relative_to(root).as_posix()
-        if _matches_structure_pattern(relative, patterns):
-            files.append((
-                _safe_selected_file_name(artifact.artifact_id, relative),
-                path.read_bytes(),
-            ))
-    return files
-
-
-def _select_structure_files_from_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
-    *,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> list[tuple[str, bytes]]:
-    selected = [
-        structure_file
-        for artifact in artifacts
-        for structure_file in _structure_files_from_artifact(artifact, patterns)
-    ]
-    selected.sort(key=lambda item: item[0])
-    if max_files is not None:
-        selected = selected[:max_files]
-    if not selected:
-        raise FileNotFoundError("No PPIFlow structure files were found in inputs")
-    return selected
-
-
 @app.function(
     image=runtime_image,
     cpu=0.125,
@@ -279,8 +160,9 @@ def select_ppiflow_structure_files(
 ) -> list[tuple[str, bytes]]:
     """Read structure files from mounted PPIFlow workflow artifacts."""
     _reload_ppiflow_source_volumes()
-    return _select_structure_files_from_artifacts(
+    return ppiflow_staging.select_structure_files_from_artifacts(
         artifacts,
+        PPI_FLOW_SOURCE_VOLUME_ROOTS,
         patterns=patterns,
         max_files=max_files,
     )
@@ -325,8 +207,9 @@ def copy_ppiflow_structure_artifacts(
 ) -> AppRunResult:
     """Copy selected structure artifacts into the workflow output volume."""
     _reload_ppiflow_source_volumes()
-    selected = _select_structure_files_from_artifacts(
+    selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts=artifacts,
+        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
         patterns=patterns,
         max_files=max_files,
     )
@@ -370,6 +253,469 @@ def copy_ppiflow_structure_artifacts(
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
 )
+def filter_ppiflow_artifacts(
+    *,
+    structures: list[WorkflowArtifact],
+    scores: list[WorkflowArtifact],
+    config: dict[str, object],
+    run_id: str,
+    node_id: str,
+    attempt_id: str,
+    step_name: str,
+) -> AppRunResult:
+    """Filter structure artifacts using an AF3Score-compatible CSV."""
+    _reload_ppiflow_source_volumes()
+    selected = ppiflow_staging.select_structure_files_from_artifacts(
+        structures,
+        PPI_FLOW_SOURCE_VOLUME_ROOTS,
+    )
+    score_files = [
+        score_file
+        for artifact in scores
+        for score_file in ppiflow_staging.csv_files_from_artifact(
+            artifact,
+            PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        )
+    ]
+    if not score_files:
+        raise FileNotFoundError(f"{step_name} did not find a score CSV")
+    preferred_name = str(config.get("score_csv") or "af3score_metrics.csv")
+    _, score_bytes = next(
+        (
+            score_file
+            for score_file in score_files
+            if Path(score_file[0]).name == preferred_name
+        ),
+        score_files[0],
+    )
+    score_frame = pl.read_csv(BytesIO(score_bytes), infer_schema_length=0)
+    filename_col = str(config.get("filename_col") or "description")
+    if filename_col not in score_frame.columns:
+        for fallback in ("filename", "pdb", "name"):
+            if fallback in score_frame.columns:
+                filename_col = fallback
+                break
+        else:
+            raise ValueError(
+                f"{step_name} score CSV is missing candidate column {filename_col!r}"
+            )
+
+    raw_filters = config.get("filters")
+    if raw_filters is None and config.get("score_column") is not None:
+        raw_filters = {
+            str(config["score_column"]): (
+                f"{config.get('operator', '>=')} {config.get('threshold', 0)}"
+            )
+        }
+    if raw_filters is None:
+        raw_filters = {"iptm": "> 0.7" if "stage1" in step_name.lower() else "> 0.8"}
+    if not isinstance(raw_filters, Mapping) or not raw_filters:
+        raise ValueError(f"{step_name} filters must be a non-empty mapping")
+
+    passing_rows = [
+        row
+        for row in score_frame.iter_rows(named=True)
+        if ppiflow_tables.row_passes_filters(row, raw_filters)
+    ]
+    structures_by_key = {}
+    for name, data in selected:
+        key = ppiflow_tables.candidate_key(name)
+        if key in structures_by_key:
+            raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
+        structures_by_key[key] = (name, data)
+    retained = []
+    retained_rows = []
+    for row in passing_rows:
+        key = ppiflow_tables.candidate_key(str(row.get(filename_col) or ""))
+        structure = structures_by_key.get(key)
+        if structure is not None:
+            retained.append(structure)
+            retained_rows.append(row)
+    if not retained:
+        raise ValueError(f"{step_name} filters rejected every available structure")
+
+    output_dir = (
+        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
+        / "ppiflow"
+        / sanitize_filename(run_id)
+        / sanitize_filename(node_id)
+        / sanitize_filename(attempt_id)
+        / "filtered"
+    )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    structures_dir = output_dir / "structures"
+    structures_dir.mkdir(parents=True)
+    for file_name, file_bytes in retained:
+        (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
+    filtered_csv = output_dir / "filtered_scores.csv"
+    pl.DataFrame(retained_rows, schema=score_frame.schema).write_csv(filtered_csv)
+    WORKFLOW_OUTPUT_VOLUME.commit()
+    metadata = {
+        "step_name": step_name,
+        "input_count": len(selected),
+        "retained_count": len(retained),
+        "files": [name for name, _ in retained],
+        "structure_patterns": ("*.pdb", "*.cif"),
+    }
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name="filtered_structures",
+                kind=ArtifactKind.STRUCTURES,
+                remote_path=str(structures_dir),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                metadata=metadata,
+            ),
+            volume_app_output(
+                name="filtered_scores",
+                kind=ArtifactKind.TABLE,
+                remote_path=str(filtered_csv),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                media_type="text/csv",
+                metadata={"step_name": step_name, "rows": len(retained_rows)},
+            ),
+        ],
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def derive_ppiflow_fixed_positions(
+    *,
+    artifacts: list[WorkflowArtifact],
+    config: dict[str, object],
+    run_id: str,
+    node_id: str,
+    attempt_id: str,
+    step_name: str,
+) -> AppRunResult:
+    """Derive per-structure fixed positions from Rosetta residue energies."""
+    _reload_ppiflow_source_volumes()
+    structures = ppiflow_staging.select_structure_files_from_artifacts(
+        artifacts,
+        PPI_FLOW_SOURCE_VOLUME_ROOTS,
+    )
+    explicit = str(config.get("fixed_positions") or "").strip()
+    fixed_by_structure: dict[str, str] = {}
+    if explicit:
+        fixed_by_structure = {
+            ppiflow_tables.candidate_key(name): explicit for name, _ in structures
+        }
+    else:
+        energy_threshold = float(config.get("energy_threshold", -5))
+        gentype = str(config.get("gentype") or "binder")
+        expected_chains = {
+            "binder": {"interface_energy_A_B": "A"},
+            "nanobody": {"interface_energy_A_C": "A"},
+            "antibody": {
+                "interface_energy_A_C": "A",
+                "interface_energy_B_C": "B",
+            },
+        }.get(gentype)
+        if expected_chains is None:
+            raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}")
+        energies: dict[str, dict[str, dict[int, float]]] = {}
+        energy_files = [
+            csv_file
+            for artifact in artifacts
+            for csv_file in ppiflow_staging.csv_files_from_artifact(
+                artifact,
+                PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            )
+            if Path(csv_file[0]).name == "residue_energy.csv"
+        ]
+        if not energy_files:
+            raise FileNotFoundError(
+                f"{step_name} did not find Rosetta residue_energy.csv outputs"
+            )
+        for csv_name, csv_bytes in energy_files:
+            chain = next(
+                (
+                    chain
+                    for directory, chain in expected_chains.items()
+                    if directory in Path(csv_name).parts
+                ),
+                None,
+            )
+            if chain is None:
+                continue
+            frame = pl.read_csv(BytesIO(csv_bytes), infer_schema_length=0)
+            if "binder_energy" not in frame.columns:
+                raise ValueError(f"{csv_name} is missing binder_energy")
+            for row in frame.iter_rows(named=True):
+                pdb_name = str(row.get("pdbname") or row.get("pdbpath") or "")
+                structure_name = Path(pdb_name).stem
+                parts = structure_name.rsplit("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    structure_name = parts[0]
+                try:
+                    binder_energy = ast.literal_eval(str(row["binder_energy"]))
+                except (SyntaxError, ValueError) as exc:
+                    raise ValueError(
+                        f"Could not parse binder_energy for {pdb_name!r}"
+                    ) from exc
+                if not isinstance(binder_energy, Mapping):
+                    raise ValueError(f"binder_energy for {pdb_name!r} is not a mapping")
+                chain_energies = energies.setdefault(
+                    structure_name.lower(), {}
+                ).setdefault(chain, {})
+                for residue, energy in binder_energy.items():
+                    residue_id = int(residue)
+                    energy_value = float(energy)
+                    chain_energies[residue_id] = min(
+                        chain_energies.get(residue_id, energy_value), energy_value
+                    )
+        for structure_name, chain_energies in energies.items():
+            positions = [
+                f"{chain}{residue}"
+                for chain in sorted(chain_energies)
+                for residue, energy in sorted(chain_energies[chain].items())
+                if energy < energy_threshold
+            ]
+            fixed_by_structure[structure_name] = ",".join(positions) or "NONE"
+
+    rows = [
+        {
+            "filename": name,
+            "fixed_positions": fixed_by_structure.get(
+                ppiflow_tables.candidate_key(name), "NONE"
+            ),
+        }
+        for name, _ in structures
+    ]
+    output_dir = (
+        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
+        / "ppiflow"
+        / sanitize_filename(run_id)
+        / sanitize_filename(node_id)
+        / sanitize_filename(attempt_id)
+        / "fixed_positions"
+    )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    structures_dir = output_dir / "structures"
+    structures_dir.mkdir(parents=True)
+    for file_name, file_bytes in structures:
+        (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
+    positions_csv = output_dir / "fixed_positions.csv"
+    pl.DataFrame(rows).write_csv(positions_csv)
+    WORKFLOW_OUTPUT_VOLUME.commit()
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name="fixed_position_structures",
+                kind=ArtifactKind.STRUCTURES,
+                remote_path=str(structures_dir),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                metadata={
+                    "step_name": step_name,
+                    "fixed_positions": rows[0]["fixed_positions"] if rows else "NONE",
+                    "fixed_positions_by_structure": fixed_by_structure,
+                    "structure_patterns": ("*.pdb", "*.cif"),
+                },
+            ),
+            volume_app_output(
+                name="fixed_positions",
+                kind=ArtifactKind.TABLE,
+                remote_path=str(positions_csv),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                media_type="text/csv",
+                metadata={"step_name": step_name, "rows": len(rows)},
+            ),
+        ],
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def rank_ppiflow_artifacts(
+    *,
+    structures: list[WorkflowArtifact],
+    score_artifacts: list[WorkflowArtifact],
+    config: dict[str, object],
+    run_id: str,
+    node_id: str,
+    attempt_id: str,
+    step_name: str,
+) -> AppRunResult:
+    """Merge available score tables and rank final PPIFlow structures."""
+    _reload_ppiflow_source_volumes()
+    selected_structures = ppiflow_staging.select_structure_files_from_artifacts(
+        structures,
+        PPI_FLOW_SOURCE_VOLUME_ROOTS,
+    )
+    csv_frames = [
+        (name, pl.read_csv(BytesIO(data), infer_schema_length=0))
+        for artifact in [*structures, *score_artifacts]
+        for name, data in ppiflow_staging.csv_files_from_artifact(
+            artifact,
+            PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        )
+    ]
+    dockq_rows = [
+        row
+        for _, frame in csv_frames
+        if "dockq" in frame.columns
+        for row in frame.iter_rows(named=True)
+    ]
+    af3_rows = [
+        row
+        for _, frame in csv_frames
+        if any("iptm" in column.lower() for column in frame.columns)
+        for row in frame.iter_rows(named=True)
+    ]
+    rosetta_rows = [
+        row
+        for _, frame in csv_frames
+        if "interface_score" in frame.columns
+        for row in frame.iter_rows(named=True)
+    ]
+    if not dockq_rows and not af3_rows and not rosetta_rows:
+        raise ValueError(f"{step_name} did not find any supported score tables")
+
+    def row_key(row: Mapping[str, object]) -> str:
+        for column in (
+            "target_name",
+            "reference",
+            "reference_pdb",
+            "pdb_name",
+            "description",
+            "filename",
+            "name",
+            "id",
+        ):
+            if row.get(column):
+                return ppiflow_tables.candidate_key(str(row[column]))
+        return ""
+
+    dockq_by_key = {row_key(row): row for row in dockq_rows}
+    af3_by_key = {row_key(row): row for row in af3_rows}
+    rosetta_by_key = {row_key(row): row for row in rosetta_rows}
+    gentype = str(config.get("gentype") or "binder")
+    rank_columns = (
+        ("iptm", "ranking_score")
+        if gentype == "binder"
+        else ("iptm_A_C", "chain_A_iptm", "iptm", "ranking_score")
+    )
+    dockq_threshold = float(config.get("dockq_threshold", 0.49))
+    ranked = []
+    structure_by_key = {}
+    for name, data in selected_structures:
+        key = ppiflow_tables.candidate_key(name)
+        if key in structure_by_key:
+            raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
+        structure_by_key[key] = (name, data)
+    for key, (file_name, _) in structure_by_key.items():
+        dockq_row = dockq_by_key.get(key, {})
+        af3_row = af3_by_key.get(key, {})
+        rosetta_row = rosetta_by_key.get(key, {})
+        dockq = float(dockq_row["dockq"]) if dockq_row.get("dockq") else None
+        if dockq is not None and dockq <= dockq_threshold:
+            continue
+        rank_metric = next(
+            (
+                float(af3_row[column])
+                for column in rank_columns
+                if af3_row.get(column) not in (None, "")
+            ),
+            None,
+        )
+        interface_score = (
+            float(rosetta_row["interface_score"])
+            if rosetta_row.get("interface_score") not in (None, "")
+            else None
+        )
+        score = (
+            100 * rank_metric - interface_score
+            if rank_metric is not None and interface_score is not None
+            else dockq
+            if dockq is not None
+            else rank_metric
+        )
+        if score is None:
+            continue
+        ranked.append({
+            "design": key,
+            "filename": file_name,
+            "rank_score": score,
+            "dockq": dockq,
+            "iptm": rank_metric,
+            "interface_score": interface_score,
+        })
+    ranked.sort(key=lambda row: float(row["rank_score"]), reverse=True)
+    if not ranked:
+        raise ValueError(f"{step_name} found no structures with usable ranking metrics")
+
+    output_dir = (
+        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
+        / "ppiflow"
+        / sanitize_filename(run_id)
+        / sanitize_filename(node_id)
+        / sanitize_filename(attempt_id)
+        / "ranked"
+    )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    structures_dir = output_dir / "structures"
+    structures_dir.mkdir(parents=True)
+    for row in ranked:
+        file_name, file_bytes = structure_by_key[str(row["design"])]
+        (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
+    ranked_csv = output_dir / str(config.get("output_csv_name") or "ranked_designs.csv")
+    pl.DataFrame(ranked).write_csv(ranked_csv)
+    WORKFLOW_OUTPUT_VOLUME.commit()
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name="ranked_structures",
+                kind=ArtifactKind.STRUCTURES,
+                remote_path=str(structures_dir),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                metadata={
+                    "step_name": step_name,
+                    "structure_count": len(ranked),
+                    "structure_patterns": ("*.pdb", "*.cif"),
+                },
+            ),
+            volume_app_output(
+                name="ranked_designs",
+                kind=ArtifactKind.TABLE,
+                remote_path=str(ranked_csv),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                media_type="text/csv",
+                metadata={"step_name": step_name, "rows": len(ranked)},
+            ),
+        ],
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
 def stage_ppiflow_input_structure(
     *,
     artifacts: list[WorkflowArtifact],
@@ -381,8 +727,9 @@ def stage_ppiflow_input_structure(
 ) -> str:
     """Copy one upstream structure into the PPIFlow volume and return its path."""
     _reload_ppiflow_source_volumes()
-    selected = _select_structure_files_from_artifacts(
+    selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts=artifacts,
+        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
         patterns=patterns,
         max_files=None,
     )
@@ -421,8 +768,9 @@ def stage_af3score_inputs(
 ) -> list[str]:
     """Stage selected PDB files into AF3Score's input directory."""
     _reload_ppiflow_source_volumes()
-    selected = _select_structure_files_from_artifacts(
+    selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts=artifacts,
+        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
         patterns=patterns,
         max_files=max_files,
     )
@@ -461,8 +809,9 @@ def stage_rosetta_inputs(
 ) -> dict[str, object]:
     """Stage selected structures and enqueue Rosetta jobs."""
     _reload_ppiflow_source_volumes()
-    selected = _select_structure_files_from_artifacts(
+    selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts=artifacts,
+        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
         patterns=patterns,
         max_files=max_files,
     )
@@ -535,6 +884,9 @@ class PPIFlowModalNamespace:
     alphafold3_predict_structures: modal.Function
     select_structures: modal.Function
     copy_structures: modal.Function
+    filter_artifacts: modal.Function
+    derive_fixed_positions: modal.Function
+    rank_artifacts: modal.Function
     stage_ppiflow_input: modal.Function
     stage_af3score_inputs: modal.Function
     stage_rosetta_inputs: modal.Function
@@ -661,7 +1013,7 @@ class PPIFlowPartialNode(_PPIFlowRunNode):
             raise ValueError(f"PPIFlow step {self.step_name!r} args must be a mapping")
         if context.inputs.get("structures"):
             field_name = "complex_pdb" if "complex_pdb" in raw_args else "input_pdb"
-            raw_args[field_name] = self.modal_namespace.stage_ppiflow_input.remote(
+            staged_path = self.modal_namespace.stage_ppiflow_input.remote(
                 artifacts=context.inputs["structures"],
                 run_id=self._run_name(context),
                 step_name=self.step_name,
@@ -669,9 +1021,19 @@ class PPIFlowPartialNode(_PPIFlowRunNode):
                 structure_index=int(self.config.get("structure_index", 0)),
                 patterns=None,
             )
+            raw_args[field_name] = staged_path
         if "fixed_positions" not in raw_args:
             for artifact in context.inputs.get("structures", []):
-                fixed_positions = artifact.metadata.get("fixed_positions")
+                fixed_positions_by_structure = artifact.metadata.get(
+                    "fixed_positions_by_structure"
+                )
+                fixed_positions = (
+                    fixed_positions_by_structure.get(
+                        ppiflow_tables.candidate_key(staged_path)
+                    )
+                    if isinstance(fixed_positions_by_structure, Mapping)
+                    else artifact.metadata.get("fixed_positions")
+                )
                 if fixed_positions:
                     raw_args["fixed_positions"] = str(fixed_positions)
                     break
@@ -1101,11 +1463,22 @@ class FilterStructuresNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute filtering logic."""
-        _ = context
-        raise NotImplementedError(
-            f"{self.step_name} score-based filtering is not implemented yet; "
-            "disable this step or add a workflow-native score parser before "
-            "using it in production"
+        structures = context.inputs.get("structures") or []
+        scores = context.inputs.get("scores") or []
+        if not structures:
+            raise ValueError(f"{self.step_name} requires structure inputs")
+        if not scores:
+            raise ValueError(f"{self.step_name} requires score inputs")
+        return AppRunResult.model_validate(
+            self.modal_namespace.filter_artifacts.remote(
+                structures=structures,
+                scores=scores,
+                config=self.config,
+                run_id=context.run_id,
+                node_id=context.node_id,
+                attempt_id=context.attempt_id,
+                step_name=self.step_name,
+            )
         )
 
 
@@ -1126,32 +1499,14 @@ class FixedPositionsNode(WorkflowNativeNode):
         artifacts = context.inputs.get("structures") or []
         if not artifacts:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        fixed_positions = str(self.config.get("fixed_positions") or "")
-        if not fixed_positions:
-            for artifact in artifacts:
-                value = artifact.metadata.get("fixed_positions")
-                if value:
-                    fixed_positions = str(value)
-                    break
-        if not fixed_positions:
-            raise ValueError(
-                f"{self.step_name} requires fixed_positions in step config or "
-                "upstream artifact metadata; Rosetta residue-energy parsing is "
-                "not implemented yet"
-            )
         return AppRunResult.model_validate(
-            self.modal_namespace.copy_structures.remote(
+            self.modal_namespace.derive_fixed_positions.remote(
                 artifacts=artifacts,
+                config=self.config,
                 run_id=context.run_id,
                 node_id=context.node_id,
                 attempt_id=context.attempt_id,
-                output_name="fixed_position_structures",
-                metadata={
-                    "step_name": self.step_name,
-                    "fixed_positions": fixed_positions,
-                },
-                patterns=None,
-                max_files=self.config.get("max_structures"),
+                step_name=self.step_name,
             )
         )
 
@@ -1161,14 +1516,34 @@ class RankNode(WorkflowNativeNode):
     """Rank final designs."""
 
     step_name: str
+    modal_namespace: PPIFlowModalNamespace = field(
+        repr=False,
+        compare=False,
+        metadata={"dag_hash": False},
+    )
     config: dict[str, Any] = field(default_factory=dict)
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute ranking logic."""
-        _ = context
-        raise NotImplementedError(
-            f"{self.step_name} score-aware ranking is not implemented yet; "
-            "disable this step or add a ranking parser for score artifacts"
+        structures = context.inputs.get("structures") or []
+        score_artifacts = [
+            artifact
+            for input_name, artifact_list in context.inputs.items()
+            if input_name != "structures"
+            for artifact in artifact_list
+        ]
+        if not structures:
+            raise ValueError(f"{self.step_name} requires structure inputs")
+        return AppRunResult.model_validate(
+            self.modal_namespace.rank_artifacts.remote(
+                structures=structures,
+                score_artifacts=score_artifacts,
+                config=self.config,
+                run_id=context.run_id,
+                node_id=context.node_id,
+                attempt_id=context.attempt_id,
+                step_name=self.step_name,
+            )
         )
 
 
@@ -1181,30 +1556,58 @@ class ReportNode(WorkflowNativeNode):
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute report generation logic."""
-        if "rank" not in context.inputs:
-            raise NotImplementedError(
-                f"{self.step_name} report generation requires ranked designs; "
-                "score-aware ranking is not implemented yet"
-            )
         artifacts = [
             artifact
             for artifact_list in context.inputs.values()
             for artifact in artifact_list
         ]
+        ranked_rows: list[dict[str, object]] = []
+        for artifact in context.inputs.get("rank", []):
+            path = ppiflow_staging.artifact_mount_path(
+                artifact,
+                PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            )
+            if path.is_file() and path.suffix == ".csv":
+                ranked_rows.extend(
+                    pl.read_csv(path, infer_schema_length=0).iter_rows(named=True)
+                )
         lines = [
             "# PPIFlow Workflow Report",
             "",
             f"- Step: {self.step_name}",
             f"- Input artifacts: {len(artifacts)}",
+            f"- Ranked designs: {len(ranked_rows)}",
             "",
-            "| Artifact | Kind | Volume | Path |",
-            "| --- | --- | --- | --- |",
         ]
-        for artifact in sorted(artifacts, key=lambda item: item.artifact_id):
-            lines.append(
-                f"| {artifact.artifact_id} | {artifact.kind} | "
-                f"{artifact.storage.volume_name} | {artifact.storage.path} |"
-            )
+        if ranked_rows:
+            columns = list(ranked_rows[0])
+            lines.extend([
+                "| " + " | ".join(columns) + " |",
+                "| " + " | ".join("---" for _ in columns) + " |",
+            ])
+            for row in ranked_rows[: int(self.config.get("max_rows", 25))]:
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        str(row.get(column, "")).replace("|", "\\|")
+                        for column in columns
+                    )
+                    + " |"
+                )
+        else:
+            lines.extend([
+                "| Artifact | Kind | Volume | Path |",
+                "| --- | --- | --- | --- |",
+            ])
+            for artifact in sorted(artifacts, key=lambda item: item.artifact_id):
+                lines.append(
+                    f"| {artifact.artifact_id} | {artifact.kind} | "
+                    f"{artifact.storage.volume_name} | {artifact.storage.path} |"
+                )
+        markdown = "\n".join(lines) + "\n"
+        report_filename = str(
+            self.config.get("report_filename") or "design_report.html"
+        )
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -1212,12 +1615,26 @@ class ReportNode(WorkflowNativeNode):
                     name="design_report",
                     kind=ArtifactKind.REPORT,
                     storage=InlineBytes(
-                        data=("\n".join(lines) + "\n").encode("utf-8"),
+                        data=markdown.encode("utf-8"),
                         filename="design_report.md",
                         media_type="text/markdown",
                     ),
                     metadata={"step_name": self.step_name},
-                )
+                ),
+                AppOutput(
+                    name="design_report_html",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=(
+                            "<!doctype html><html><body><pre>"
+                            + html.escape(markdown)
+                            + "</pre></body></html>\n"
+                        ).encode("utf-8"),
+                        filename=report_filename,
+                        media_type="text/html",
+                    ),
+                    metadata={"step_name": self.step_name},
+                ),
             ],
         )
 
@@ -1420,6 +1837,9 @@ def build_ppiflow_workflow(
             alphafold3_predict_structures=alphafold3_app.run_inference_pipeline,
             select_structures=select_ppiflow_structure_files,
             copy_structures=copy_ppiflow_structure_artifacts,
+            filter_artifacts=filter_ppiflow_artifacts,
+            derive_fixed_positions=derive_ppiflow_fixed_positions,
+            rank_artifacts=rank_ppiflow_artifacts,
             stage_ppiflow_input=stage_ppiflow_input_structure,
             stage_af3score_inputs=stage_af3score_inputs,
             stage_rosetta_inputs=stage_rosetta_inputs,
@@ -1562,7 +1982,7 @@ def _add_stage2_nodes(
             FixedPositionsNode(
                 "FixedPositions",
                 modal_namespace,
-                _step_cfg(steps, "FixedPositions"),
+                {"gentype": gentype} | _step_cfg(steps, "FixedPositions"),
             ),
             id="stage2-fixed-positions",
             inputs=_structure_inputs(tail),
@@ -1679,8 +2099,16 @@ def _add_stage2_nodes(
         inputs = _structure_inputs(relaxed or filtered)
         if dockq is not None:
             inputs["dockq"] = dockq.outputs(kind=ArtifactKind.SCORES)
+        if refold is not None:
+            inputs["refold"] = refold.outputs(kind=ArtifactKind.STRUCTURES)
+        if score is not None:
+            inputs["af3scores"] = score.outputs(kind=ArtifactKind.SCORES)
         rank = workflow.add_node(
-            RankNode("RankStep", _step_cfg(steps, "RankStep")),
+            RankNode(
+                "RankStep",
+                modal_namespace,
+                {"gentype": gentype} | _step_cfg(steps, "RankStep"),
+            ),
             id="stage2-rank",
             inputs=inputs,
         )

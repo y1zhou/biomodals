@@ -1,0 +1,315 @@
+"""Tests for PPIFlow staging helpers."""
+
+# ruff: noqa: D103
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from biomodals.app.design import ppiflow_app
+from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
+from biomodals.workflow import ppiflow_workflow
+from biomodals.workflow.ppiflow import staging
+from biomodals.workflow.ppiflow_workflow import (
+    _active_ppiflow_app_steps,
+    _inline_rosetta_config_files,
+    _stage_ppiflow_app_inputs,
+)
+
+
+def _source_artifact(path: str) -> WorkflowArtifact:
+    return WorkflowArtifact(
+        artifact_id="upstream-structures",
+        producing_node_id="upstream",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(volume_name="source-volume", path=path),
+    )
+
+
+def test_select_structure_files_from_artifacts_reads_matching_files(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    structure_dir = source_root / "structures"
+    structure_dir.mkdir(parents=True)
+    (structure_dir / "design-1.pdb").write_text("ATOM 1\n", encoding="utf-8")
+    (structure_dir / "notes.txt").write_text("skip\n", encoding="utf-8")
+
+    selected = staging.select_structure_files_from_artifacts(
+        [_source_artifact("structures")],
+        {"source-volume": str(source_root)},
+    )
+
+    assert selected == [("upstream-structures__design-1.pdb", b"ATOM 1\n")]
+
+
+def test_csv_files_from_artifact_reads_directory_csvs(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    table_dir = source_root / "scores"
+    table_dir.mkdir(parents=True)
+    (table_dir / "metrics.csv").write_text("score\n1\n", encoding="utf-8")
+    (table_dir / "notes.txt").write_text("skip\n", encoding="utf-8")
+    artifact = WorkflowArtifact(
+        artifact_id="scores",
+        producing_node_id="scores",
+        kind=ArtifactKind.SCORES,
+        storage=VolumePath(volume_name="source-volume", path="scores"),
+    )
+
+    assert staging.csv_files_from_artifact(
+        artifact,
+        {"source-volume": str(source_root)},
+    ) == [("metrics.csv", b"score\n1\n")]
+
+
+def test_ppiflow_entrypoint_stages_local_app_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    uploaded = []
+
+    class FakeBatch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, local_path, remote_path):
+            uploaded.append((Path(local_path), remote_path))
+
+    class FakeVolume:
+        def batch_upload(self):
+            return FakeBatch()
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint="/biomodals-outputs",
+            output_volume_name="PPIFlow-outputs",
+        ),
+    )
+
+    steps_doc = {
+        "PPIFlowStep": {
+            "args": {
+                "name": "demo",
+                "specified_hotspots": "A1",
+                "input_pdb": str(input_pdb),
+                "binder_chain": "B",
+            }
+        }
+    }
+
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=("PPIFlowStep",),
+    )
+
+    assert staged["PPIFlowStep"]["args"]["input_pdb"] == (
+        "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
+    )
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+
+
+def test_ppiflow_staging_uses_active_stage_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    uploaded = []
+
+    class FakeBatch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, local_path, remote_path):
+            uploaded.append((Path(local_path), remote_path))
+
+    class FakeVolume:
+        def batch_upload(self):
+            return FakeBatch()
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint="/biomodals-outputs",
+            output_volume_name="PPIFlow-outputs",
+        ),
+    )
+    task_doc = {
+        "steps": {
+            "PPIFlowStep": True,
+            "PartialStep": True,
+        }
+    }
+    steps_doc = {
+        "PPIFlowStep": {
+            "args": {
+                "name": "demo",
+                "specified_hotspots": "A1",
+                "input_pdb": str(input_pdb),
+                "binder_chain": "B",
+            }
+        },
+        "PartialStep": {
+            "args": {
+                "name": "demo-partial",
+                "specified_hotspots": "A1",
+                "input_pdb": str(tmp_path / "stage2-not-local.pdb"),
+                "fixed_positions": "B1",
+                "start_t": 0.5,
+            }
+        },
+    }
+
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=_active_ppiflow_app_steps(task_doc, stage=1),
+    )
+
+    assert staged["PPIFlowStep"]["args"]["input_pdb"].endswith(
+        "/PPIFlowStep/input_pdb/input.pdb"
+    )
+    assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=_active_ppiflow_app_steps(task_doc, stage=2),
+    )
+
+    assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+
+
+def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    antigen_pdb = tmp_path / "antigen" / "input.pdb"
+    framework_pdb = tmp_path / "framework" / "input.pdb"
+    antigen_pdb.parent.mkdir()
+    framework_pdb.parent.mkdir()
+    antigen_pdb.write_text("ATOM antigen\n", encoding="utf-8")
+    framework_pdb.write_text("ATOM framework\n", encoding="utf-8")
+    uploaded = []
+
+    class FakeBatch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, local_path, remote_path):
+            uploaded.append((Path(local_path), remote_path))
+
+    class FakeVolume:
+        def batch_upload(self):
+            return FakeBatch()
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint="/biomodals-outputs",
+            output_volume_name="PPIFlow-outputs",
+        ),
+    )
+    steps_doc = {
+        "PPIFlowStep": {
+            "args": {
+                "name": "demo",
+                "specified_hotspots": "A1",
+                "antigen_pdb": str(antigen_pdb),
+                "antigen_chain": "A",
+                "framework_pdb": str(framework_pdb),
+                "heavy_chain": "H",
+            }
+        }
+    }
+
+    staged = _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=("PPIFlowStep",),
+    )
+
+    assert staged["PPIFlowStep"]["args"]["antigen_pdb"] == (
+        "/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/input.pdb"
+    )
+    assert staged["PPIFlowStep"]["args"]["framework_pdb"] == (
+        "/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/input.pdb"
+    )
+    assert uploaded == [
+        (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
+        (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
+    ]
+
+
+def test_ppiflow_rosetta_staging_inlines_local_config_files(tmp_path: Path) -> None:
+    script_path = tmp_path / "protocol.xml"
+    flags_path = tmp_path / "options.flags"
+    script_path.write_text("<ROSETTASCRIPTS />\n", encoding="utf-8")
+    flags_path.write_text("-relax:fast\n", encoding="utf-8")
+
+    staged = _inline_rosetta_config_files({
+        "RosettaRelaxStep": {
+            "rosetta_script": str(script_path),
+            "flags_file": str(flags_path),
+        }
+    })
+
+    assert staged["RosettaRelaxStep"]["rosetta_script"] == "<ROSETTASCRIPTS />\n"
+    assert staged["RosettaRelaxStep"]["flags_file"] == "-relax:fast\n"
+
+
+def test_report_node_reads_rank_artifact_from_configured_volume_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    ranked_csv = source_root / "ranked.csv"
+    ranked_csv.write_text("design,rank_score\ndesign-1,1.0\n", encoding="utf-8")
+    artifact = WorkflowArtifact(
+        artifact_id="rank",
+        producing_node_id="rank",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(volume_name="source-volume", path="ranked.csv"),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUME_ROOTS",
+        {"source-volume": str(source_root)},
+    )
+
+    result = ppiflow_workflow.ReportNode("ReportStep").run(
+        ppiflow_workflow.NodeRunContext(
+            run_id="run-1",
+            node_id="report",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"rank": [artifact]},
+        )
+    )
+
+    markdown = result.outputs[0].storage.data.decode()
+    assert "Ranked designs: 1" in markdown
+    assert "design-1" in markdown

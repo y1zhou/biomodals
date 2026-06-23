@@ -25,9 +25,6 @@ from biomodals.workflow.core import NodeRunContext
 from biomodals.workflow.ppiflow_workflow import (
     CONF,
     PPIFlowModalNamespace,
-    _active_ppiflow_app_steps,
-    _inline_rosetta_config_files,
-    _stage_ppiflow_app_inputs,
     build_ppiflow_workflow,
 )
 
@@ -106,6 +103,9 @@ def _fake_namespace(
     alphafold3_predict_structures: _FakeModalFunction | None = None,
     select_structures: _FakeModalFunction | None = None,
     copy_structures: _FakeModalFunction | None = None,
+    filter_artifacts: _FakeModalFunction | None = None,
+    derive_fixed_positions: _FakeModalFunction | None = None,
+    rank_artifacts: _FakeModalFunction | None = None,
     stage_ppiflow_input: _FakeModalFunction | None = None,
     stage_af3score_inputs: _FakeModalFunction | None = None,
     stage_rosetta_inputs: _FakeModalFunction | None = None,
@@ -137,6 +137,27 @@ def _fake_namespace(
             copy_structures
             or _FakeModalFunction(
                 "fc-copy", AppRunResult(status=AppRunStatus.SUCCEEDED)
+            ),
+        ),
+        filter_artifacts=cast(
+            modal.Function,
+            filter_artifacts
+            or _FakeModalFunction(
+                "fc-filter", AppRunResult(status=AppRunStatus.SUCCEEDED)
+            ),
+        ),
+        derive_fixed_positions=cast(
+            modal.Function,
+            derive_fixed_positions
+            or _FakeModalFunction(
+                "fc-fixed", AppRunResult(status=AppRunStatus.SUCCEEDED)
+            ),
+        ),
+        rank_artifacts=cast(
+            modal.Function,
+            rank_artifacts
+            or _FakeModalFunction(
+                "fc-rank", AppRunResult(status=AppRunStatus.SUCCEEDED)
             ),
         ),
         stage_ppiflow_input=cast(
@@ -185,6 +206,33 @@ def _upstream_structure_artifact(
         storage=VolumePath(volume_name="source-volume", path="upstream/results"),
         metadata=metadata or {},
     )
+
+
+def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    source_root = tmp_path / "source"
+    workflow_root = tmp_path / "workflow"
+    source_root.mkdir()
+    workflow_root.mkdir()
+    monkeypatch.setattr(
+        ppiflow_workflow, "_reload_ppiflow_source_volumes", lambda: None
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUME_ROOTS",
+        {"source-volume": str(source_root), "workflow-volume": str(workflow_root)},
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow, "WORKFLOW_OUTPUT_MOUNTPOINT", str(workflow_root)
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow, "WORKFLOW_OUTPUT_VOLUME_NAME", "workflow-volume"
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "WORKFLOW_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: None),
+    )
+    return source_root, workflow_root
 
 
 def test_ppiflow_workflow_declares_app_dependency() -> None:
@@ -237,7 +285,9 @@ PPIFlowStep:
         path="demo-run",
     )
     assert result.outputs[0].metadata["structure_patterns"] == (
+        "outputs/*.pdb",
         "outputs/**/*.pdb",
+        "outputs/*.cif",
         "outputs/**/*.cif",
     )
 
@@ -666,60 +716,192 @@ def test_dockq_rejects_unpaired_structure_counts(tmp_path: Path) -> None:
         )
 
 
-def test_filter_step_fails_until_score_filtering_is_supported(tmp_path: Path) -> None:
+def test_filter_step_delegates_score_filtering(tmp_path: Path) -> None:
+    filter_artifacts = _FakeModalFunction(
+        "fc-filter", AppRunResult(status=AppRunStatus.SUCCEEDED)
+    )
     node = ppiflow_workflow.FilterStructuresNode(
         "FilterStep_stage1",
-        _fake_namespace(),
-        {"score_column": "af3score"},
+        _fake_namespace(filter_artifacts=filter_artifacts),
+        {"filters": {"iptm": "> 0.7"}},
     )
 
-    with pytest.raises(NotImplementedError, match="score-based filtering"):
-        node.run(
-            NodeRunContext(
-                run_id="run-1",
-                node_id="stage1-filter",
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
-                inputs={
-                    "structures": [_upstream_structure_artifact()],
-                    "scores": [_upstream_structure_artifact(kind=ArtifactKind.SCORES)],
-                },
-            )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage1-filter",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={
+                "structures": [_upstream_structure_artifact()],
+                "scores": [_upstream_structure_artifact(kind=ArtifactKind.SCORES)],
+            },
         )
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert filter_artifacts.kwargs["step_name"] == "FilterStep_stage1"
+    assert filter_artifacts.kwargs["config"] == {"filters": {"iptm": "> 0.7"}}
 
 
-def test_fixed_positions_requires_explicit_positions(tmp_path: Path) -> None:
+def test_fixed_positions_delegates_residue_energy_parsing(tmp_path: Path) -> None:
+    derive_fixed_positions = _FakeModalFunction(
+        "fc-fixed", AppRunResult(status=AppRunStatus.SUCCEEDED)
+    )
     node = ppiflow_workflow.FixedPositionsNode(
         "FixedPositions",
-        _fake_namespace(),
-        {},
+        _fake_namespace(derive_fixed_positions=derive_fixed_positions),
+        {"gentype": "binder", "energy_threshold": -5},
     )
 
-    with pytest.raises(ValueError, match="fixed_positions"):
-        node.run(
-            NodeRunContext(
-                run_id="run-1",
-                node_id="stage2-fixed-positions",
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
-                inputs={"structures": [_upstream_structure_artifact()]},
-            )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-fixed-positions",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
         )
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert derive_fixed_positions.kwargs["config"] == {
+        "gentype": "binder",
+        "energy_threshold": -5,
+    }
 
 
-def test_rank_step_fails_until_score_ranking_is_supported(tmp_path: Path) -> None:
-    node = ppiflow_workflow.RankNode("RankStep", {})
+def test_rank_step_delegates_score_aware_ranking(tmp_path: Path) -> None:
+    rank_artifacts = _FakeModalFunction(
+        "fc-rank", AppRunResult(status=AppRunStatus.SUCCEEDED)
+    )
+    node = ppiflow_workflow.RankNode(
+        "RankStep",
+        _fake_namespace(rank_artifacts=rank_artifacts),
+        {"gentype": "binder"},
+    )
 
-    with pytest.raises(NotImplementedError, match="score-aware ranking"):
-        node.run(
-            NodeRunContext(
-                run_id="run-1",
-                node_id="stage2-rank",
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
-                inputs={"structures": [_upstream_structure_artifact()]},
-            )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-rank",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
         )
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert rank_artifacts.kwargs["config"] == {"gentype": "binder"}
+
+
+def test_filter_transform_selects_only_passing_structures(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    structures_dir = source_root / "structures"
+    structures_dir.mkdir()
+    (structures_dir / "design-1.pdb").write_text("ATOM 1\n", encoding="utf-8")
+    (structures_dir / "design-2.pdb").write_text("ATOM 2\n", encoding="utf-8")
+    (source_root / "metrics.csv").write_text(
+        "description,iptm\ndesign-1,0.8\ndesign-2,0.6\n",
+        encoding="utf-8",
+    )
+    structure_artifact = _upstream_structure_artifact()
+    structure_artifact.storage.path = "structures"
+
+    result = ppiflow_workflow.filter_ppiflow_artifacts.get_raw_f()(
+        structures=[structure_artifact],
+        scores=[
+            WorkflowArtifact(
+                artifact_id="scores",
+                producing_node_id="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(volume_name="source-volume", path="metrics.csv"),
+            )
+        ],
+        config={"filters": {"iptm": "> 0.7"}},
+        run_id="run-1",
+        node_id="filter",
+        attempt_id="attempt-1",
+        step_name="FilterStep_stage1",
+    )
+
+    output_dir = workflow_root / result.outputs[0].storage.path
+    assert [path.name for path in output_dir.iterdir()] == [
+        "upstream-structures__design-1.pdb"
+    ]
+    assert result.outputs[0].metadata["retained_count"] == 1
+
+
+def test_fixed_position_transform_parses_rosetta_residue_energies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_root, _ = _local_transform_environment(monkeypatch, tmp_path)
+    rosetta_root = source_root / "rosetta"
+    outputs_dir = rosetta_root / "outputs"
+    outputs_dir.mkdir(parents=True)
+    (outputs_dir / "design.pdb").write_text("ATOM\n", encoding="utf-8")
+    energy_dir = rosetta_root / "interface_energy_A_B"
+    energy_dir.mkdir()
+    (energy_dir / "residue_energy.csv").write_text(
+        'pdbname,binder_energy\ndesign_1,"{10: -6.0, 11: -4.0}"\n',
+        encoding="utf-8",
+    )
+    artifact = _upstream_structure_artifact(
+        metadata={"structure_patterns": ("outputs/*.pdb",)}
+    )
+    artifact.storage.path = "rosetta"
+
+    result = ppiflow_workflow.derive_ppiflow_fixed_positions.get_raw_f()(
+        artifacts=[artifact],
+        config={"gentype": "binder", "energy_threshold": -5},
+        run_id="run-1",
+        node_id="fixed",
+        attempt_id="attempt-1",
+        step_name="FixedPositions",
+    )
+
+    assert result.outputs[0].metadata["fixed_positions"] == "A10"
+    assert result.outputs[0].metadata["fixed_positions_by_structure"] == {
+        "design": "A10"
+    }
+
+
+def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    structures_dir = source_root / "structures"
+    structures_dir.mkdir()
+    (structures_dir / "design-1.pdb").write_text("ATOM 1\n", encoding="utf-8")
+    (structures_dir / "design-2.pdb").write_text("ATOM 2\n", encoding="utf-8")
+    (source_root / "dockq.csv").write_text(
+        "reference,dockq\ndesign-1.pdb,0.8\ndesign-2.pdb,0.4\n",
+        encoding="utf-8",
+    )
+    score_artifact = WorkflowArtifact(
+        artifact_id="dockq",
+        producing_node_id="dockq",
+        kind=ArtifactKind.SCORES,
+        storage=VolumePath(volume_name="source-volume", path="dockq.csv"),
+    )
+    structure_artifact = _upstream_structure_artifact()
+    structure_artifact.storage.path = "structures"
+
+    result = ppiflow_workflow.rank_ppiflow_artifacts.get_raw_f()(
+        structures=[structure_artifact],
+        score_artifacts=[score_artifact],
+        config={"gentype": "binder", "dockq_threshold": 0.49},
+        run_id="run-1",
+        node_id="rank",
+        attempt_id="attempt-1",
+        step_name="RankStep",
+    )
+
+    output_dir = workflow_root / result.outputs[0].storage.path
+    assert [path.name for path in output_dir.iterdir()] == [
+        "upstream-structures__design-1.pdb"
+    ]
+    assert result.outputs[1].metadata["rows"] == 1
 
 
 def test_submit_ppiflow_workflow_dry_run_prints_dag_without_orchestrator(
@@ -853,6 +1035,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-dockq",
     }
     assert definition.dependencies["stage2-rank"] == {
+        "stage2-af3score",
+        "stage2-alphafold3-refold",
         "stage2-rosetta-relax",
         "stage2-dockq",
     }
@@ -925,223 +1109,6 @@ def test_structure_consuming_steps_fail_clearly_without_inputs(
         assert "requires structure inputs" in str(exc)
     else:
         raise AssertionError("missing PPIFlow inputs should fail clearly")
-
-
-def test_ppiflow_entrypoint_stages_local_app_inputs(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    input_pdb = tmp_path / "input.pdb"
-    input_pdb.write_text("ATOM\n", encoding="utf-8")
-    uploaded = []
-
-    class FakeBatch:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def put_file(self, local_path, remote_path):
-            uploaded.append((Path(local_path), remote_path))
-
-    class FakeVolume:
-        def batch_upload(self):
-            return FakeBatch()
-
-    monkeypatch.setattr(
-        ppiflow_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=FakeVolume(),
-            output_volume_mountpoint="/biomodals-outputs",
-            output_volume_name="PPIFlow-outputs",
-        ),
-    )
-
-    steps_doc = {
-        "PPIFlowStep": {
-            "args": {
-                "name": "demo",
-                "specified_hotspots": "A1",
-                "input_pdb": str(input_pdb),
-                "binder_chain": "B",
-            }
-        }
-    }
-
-    staged = _stage_ppiflow_app_inputs(
-        steps_doc=steps_doc,
-        run_id="run-1",
-        app_steps=("PPIFlowStep",),
-    )
-
-    assert staged["PPIFlowStep"]["args"]["input_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
-    )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
-
-
-def test_ppiflow_staging_uses_active_stage_steps(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    input_pdb = tmp_path / "input.pdb"
-    input_pdb.write_text("ATOM\n", encoding="utf-8")
-    uploaded = []
-
-    class FakeBatch:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def put_file(self, local_path, remote_path):
-            uploaded.append((Path(local_path), remote_path))
-
-    class FakeVolume:
-        def batch_upload(self):
-            return FakeBatch()
-
-    monkeypatch.setattr(
-        ppiflow_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=FakeVolume(),
-            output_volume_mountpoint="/biomodals-outputs",
-            output_volume_name="PPIFlow-outputs",
-        ),
-    )
-    task_doc = {
-        "steps": {
-            "PPIFlowStep": True,
-            "PartialStep": True,
-        }
-    }
-    steps_doc = {
-        "PPIFlowStep": {
-            "args": {
-                "name": "demo",
-                "specified_hotspots": "A1",
-                "input_pdb": str(input_pdb),
-                "binder_chain": "B",
-            }
-        },
-        "PartialStep": {
-            "args": {
-                "name": "demo-partial",
-                "specified_hotspots": "A1",
-                "input_pdb": str(tmp_path / "stage2-not-local.pdb"),
-                "fixed_positions": "B1",
-                "start_t": 0.5,
-            }
-        },
-    }
-
-    staged = _stage_ppiflow_app_inputs(
-        steps_doc=steps_doc,
-        run_id="run-1",
-        app_steps=_active_ppiflow_app_steps(task_doc, stage=1),
-    )
-
-    assert staged["PPIFlowStep"]["args"]["input_pdb"].endswith(
-        "/PPIFlowStep/input_pdb/input.pdb"
-    )
-    assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
-
-    staged = _stage_ppiflow_app_inputs(
-        steps_doc=steps_doc,
-        run_id="run-1",
-        app_steps=_active_ppiflow_app_steps(task_doc, stage=2),
-    )
-
-    assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
-
-
-def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    antigen_pdb = tmp_path / "antigen" / "input.pdb"
-    framework_pdb = tmp_path / "framework" / "input.pdb"
-    antigen_pdb.parent.mkdir()
-    framework_pdb.parent.mkdir()
-    antigen_pdb.write_text("ATOM antigen\n", encoding="utf-8")
-    framework_pdb.write_text("ATOM framework\n", encoding="utf-8")
-    uploaded = []
-
-    class FakeBatch:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def put_file(self, local_path, remote_path):
-            uploaded.append((Path(local_path), remote_path))
-
-    class FakeVolume:
-        def batch_upload(self):
-            return FakeBatch()
-
-    monkeypatch.setattr(
-        ppiflow_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=FakeVolume(),
-            output_volume_mountpoint="/biomodals-outputs",
-            output_volume_name="PPIFlow-outputs",
-        ),
-    )
-    steps_doc = {
-        "PPIFlowStep": {
-            "args": {
-                "name": "demo",
-                "specified_hotspots": "A1",
-                "antigen_pdb": str(antigen_pdb),
-                "antigen_chain": "A",
-                "framework_pdb": str(framework_pdb),
-                "heavy_chain": "H",
-            }
-        }
-    }
-
-    staged = _stage_ppiflow_app_inputs(
-        steps_doc=steps_doc,
-        run_id="run-1",
-        app_steps=("PPIFlowStep",),
-    )
-
-    assert staged["PPIFlowStep"]["args"]["antigen_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/input.pdb"
-    )
-    assert staged["PPIFlowStep"]["args"]["framework_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/input.pdb"
-    )
-    assert uploaded == [
-        (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
-        (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
-    ]
-
-
-def test_ppiflow_rosetta_staging_inlines_local_config_files(tmp_path: Path) -> None:
-    script_path = tmp_path / "protocol.xml"
-    flags_path = tmp_path / "options.flags"
-    script_path.write_text("<ROSETTASCRIPTS />\n", encoding="utf-8")
-    flags_path.write_text("-relax:fast\n", encoding="utf-8")
-
-    staged = _inline_rosetta_config_files({
-        "RosettaRelaxStep": {
-            "rosetta_script": str(script_path),
-            "flags_file": str(flags_path),
-        }
-    })
-
-    assert staged["RosettaRelaxStep"]["rosetta_script"] == "<ROSETTASCRIPTS />\n"
-    assert staged["RosettaRelaxStep"]["flags_file"] == "-relax:fast\n"
 
 
 def test_submit_ppiflow_workflow_can_enable_strict_external_checks(

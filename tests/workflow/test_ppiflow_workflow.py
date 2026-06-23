@@ -98,6 +98,7 @@ class _FakeModalFunction:
 def _fake_namespace(
     ppiflow_run: _FakePPIFlowFunction | None = None,
     ligandmpnn_run: _FakeModalFunction | None = None,
+    ligandmpnn_stage: _FakeModalFunction | None = None,
     flowpacker_run: _FakeModalFunction | None = None,
     af3score_manage_lock: _FakeModalFunction | None = None,
     af3score_prepare: _FakeModalFunction | None = None,
@@ -126,6 +127,9 @@ def _fake_namespace(
     return PPIFlowModalNamespace(
         ppiflow_run=fake,
         ligandmpnn_run=cast(modal.Function, ligandmpnn_run or fake),
+        ligandmpnn_stage=cast(
+            modal.Function, ligandmpnn_stage or ligandmpnn_run or fake
+        ),
         flowpacker_run=cast(modal.Function, flowpacker_run or fake),
         af3score_manage_lock=cast(modal.Function, af3score_manage_lock or fake),
         af3score_prepare=cast(modal.Function, af3score_prepare or fake),
@@ -354,14 +358,14 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
     tmp_path: Path,
 ) -> None:
     selector = _FakeModalFunction("fc-select", [("selected.pdb", b"ATOM selected\n")])
-    ligandmpnn = _FakeModalFunction(
-        "fc-ligandmpnn",
+    ligandmpnn_stage = _FakeModalFunction(
+        "fc-ligandmpnn-stage",
         AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
                 AppOutput(
                     name="LigandMPNN_outputs",
-                    kind=ArtifactKind.ARCHIVE,
+                    kind=ArtifactKind.STRUCTURES,
                     storage=InlineBytes(
                         data=_tar_zst_bytes({
                             "outputs/seqs/selected.fa": b">selected_design\nACD\n"
@@ -369,12 +373,21 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
                         filename="ligandmpnn.tar.zst",
                         media_type="application/zstd",
                     ),
-                )
+                ),
+                AppOutput(
+                    name="mpnn_seqs",
+                    kind=ArtifactKind.TABLE,
+                    storage=InlineBytes(
+                        data=b"candidate_id,sequence\nselected,ACD\n",
+                        filename="mpnn_seqs.csv",
+                        media_type="text/csv",
+                    ),
+                ),
             ],
         ),
     )
     namespace = _fake_namespace(
-        ligandmpnn_run=ligandmpnn,
+        ligandmpnn_stage=ligandmpnn_stage,
         select_structures=selector,
     )
     node = ppiflow_workflow.LigandMPNNNode(
@@ -401,22 +414,28 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
         submission.function_call.get(), submission.metadata
     )
 
-    assert submission.function_name == "ligandmpnn_run"
+    assert submission.function_name == "run_ppiflow_ligandmpnn_stage"
     assert selector.kwargs["artifacts"] == [_upstream_structure_artifact()]
-    assert ligandmpnn.kwargs["run_name"] == "mpnn-run"
-    assert ligandmpnn.kwargs["script_mode"] == "run"
-    assert ligandmpnn.kwargs["struct_bytes"] == b"ATOM selected\n"
-    assert ligandmpnn.kwargs["seeds"] == [1, 2]
-    assert ligandmpnn.kwargs["cli_args"]["--model_type"] == "protein_mpnn"
-    assert ligandmpnn.kwargs["cli_args"]["--batch_size"] == "2"
-    assert ligandmpnn.kwargs["cli_args"]["--number_of_batches"] == "3"
+    assert ligandmpnn_stage.kwargs["run_name"] == "mpnn-run"
+    assert ligandmpnn_stage.kwargs["script_mode"] == "run"
+    assert ligandmpnn_stage.kwargs["selected_structures"] == [
+        {
+            "candidate_id": "selected",
+            "file_name": "selected.pdb",
+            "data": b"ATOM selected\n",
+            "source_path": "selected.pdb",
+        }
+    ]
+    assert ligandmpnn_stage.kwargs["cli_args"]["--model_type"] == "protein_mpnn"
+    assert ligandmpnn_stage.kwargs["cli_args"]["--batch_size"] == "2"
+    assert ligandmpnn_stage.kwargs["cli_args"]["--number_of_batches"] == "3"
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
-    assert result.outputs[0].metadata["selected_structure"] == "selected.pdb"
+    assert result.outputs[1].kind == ArtifactKind.TABLE
     assert result.outputs[1].name == "mpnn_seqs"
-    assert b"selected_design" in result.outputs[1].storage.data
+    assert b"selected,ACD" in result.outputs[1].storage.data
 
 
-def test_ligandmpnn_rejects_implicit_multi_structure_selection(
+def test_ligandmpnn_processes_multi_structure_selection(
     tmp_path: Path,
 ) -> None:
     selector = _FakeModalFunction(
@@ -426,22 +445,33 @@ def test_ligandmpnn_rejects_implicit_multi_structure_selection(
             ("design-b.pdb", b"ATOM B\n"),
         ],
     )
+    ligandmpnn_stage = _FakeModalFunction(
+        "fc-ligandmpnn-stage",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
+    )
     node = ppiflow_workflow.LigandMPNNNode(
         "MPNNStep_stage1",
-        _fake_namespace(select_structures=selector),
+        _fake_namespace(
+            select_structures=selector,
+            ligandmpnn_stage=ligandmpnn_stage,
+        ),
         {"run_name": "mpnn-run"},
     )
 
-    with pytest.raises(ValueError, match="explicit structure_index"):
-        node.submit_remote(
-            NodeRunContext(
-                run_id="run-1",
-                node_id="stage1-ligandmpnn",
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
-                inputs={"structures": [_upstream_structure_artifact()]},
-            )
+    node.submit_remote(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage1-ligandmpnn",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
         )
+    )
+
+    assert [
+        structure["candidate_id"]
+        for structure in ligandmpnn_stage.kwargs["selected_structures"]
+    ] == ["design-a", "design-b"]
 
 
 def test_flowpacker_step_selects_structures_and_submits_app_function(

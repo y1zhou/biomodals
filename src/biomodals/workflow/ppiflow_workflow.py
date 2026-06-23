@@ -8,7 +8,7 @@ import shlex
 import shutil
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -940,12 +940,99 @@ def stage_rosetta_inputs(
     }
 
 
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 8192),
+    timeout=CONF.timeout,
+)
+def run_ppiflow_ligandmpnn_stage(
+    *,
+    selected_structures: list[dict[str, object]],
+    config: dict[str, object],
+    step_name: str,
+    run_name: str,
+    script_mode: str,
+    model_type: str,
+    cli_args: dict[str, str | int | float | bool],
+) -> AppRunResult:
+    """Run LigandMPNN for every selected PPIFlow candidate."""
+
+    # TODO: tune CPU/memory/timeout once real candidate fan-out telemetry exists.
+    def submit(task: ppiflow_coordinators.CandidateTask):
+        structure = task.payload
+        candidate_run_name = sanitize_filename(f"{run_name}-{task.candidate_id}")
+        try:
+            call = ligandmpnn_app.ligandmpnn_run.spawn(
+                run_name=candidate_run_name,
+                script_mode=script_mode,
+                struct_bytes=structure["data"],
+                seeds=_parse_seed_values(config.get("seeds", [0])),
+                cli_args=cli_args,
+                bias_aa_per_residue_bytes=config.get("bias_aa_per_residue_bytes"),
+                omit_aa_per_residue_bytes=config.get("omit_aa_per_residue_bytes"),
+            )
+            result = AppRunResult.model_validate(call.get())
+            status = result.status
+            outputs = _ligandmpnn_stage_outputs(
+                result,
+                candidate_id=task.candidate_id,
+                step_name=step_name,
+                selected_structure=str(structure["file_name"]),
+            )
+            return ppiflow_coordinators.CandidateOutcome(
+                candidate_id=task.candidate_id,
+                status=status,
+                outputs={"app_outputs": outputs},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ppiflow_coordinators.CandidateOutcome(
+                candidate_id=task.candidate_id,
+                status=AppRunStatus.FAILED,
+                error=str(exc),
+            )
+
+    tasks = [
+        ppiflow_coordinators.CandidateTask(
+            candidate_id=str(structure["candidate_id"]),
+            payload=structure,
+        )
+        for structure in selected_structures
+    ]
+    outcomes = ppiflow_coordinators.run_candidate_tasks(
+        tasks,
+        submit,
+        candidate_concurrency=int(
+            config.get(
+                "candidate_concurrency",
+                ppiflow_coordinators.DEFAULT_CANDIDATE_CONCURRENCY,
+            )
+        ),
+    )
+    outputs = [
+        output
+        for outcome in outcomes
+        for output in outcome.outputs.get("app_outputs", [])
+        if isinstance(output, AppOutput)
+    ]
+    return AppRunResult(
+        status=ppiflow_coordinators.status_from_candidate_outcomes(outcomes),
+        outputs=outputs,
+        warnings=[
+            f"{outcome.candidate_id}: {outcome.error}"
+            for outcome in outcomes
+            if outcome.error
+        ],
+    )
+
+
 @dataclass(frozen=True)
 class PPIFlowModalNamespace:
     """Hydrated Modal objects carried across the orchestrator boundary."""
 
     ppiflow_run: modal.Function
     ligandmpnn_run: modal.Function
+    ligandmpnn_stage: modal.Function
     flowpacker_run: modal.Function
     af3score_manage_lock: modal.Function
     af3score_prepare: modal.Function
@@ -1122,7 +1209,12 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the LigandMPNN app function."""
-        selected_name, selected_bytes = self._select_one_structure(context)
+        selected_structures = ppiflow_staging.candidate_structure_files_from_selected(
+            self._select_structures(
+                context,
+                max_files=self.config.get("max_structures"),
+            )
+        )
         script_mode = str(self.config.get("script_mode", "run"))
         model_type = str(
             self.config.get(
@@ -1136,17 +1228,19 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
             model_type=model_type,
         )
         return RemoteNodeSubmission(
-            function_call=self.modal_namespace.ligandmpnn_run.spawn(
+            function_call=self.modal_namespace.ligandmpnn_stage.spawn(
+                selected_structures=[
+                    asdict(structure) for structure in selected_structures
+                ],
+                config=self.config,
                 run_name=self._run_name(context),
                 script_mode=script_mode,
-                struct_bytes=selected_bytes,
-                seeds=_parse_seed_values(self.config.get("seeds", [0])),
+                model_type=model_type,
                 cli_args=ligandmpnn_app.build_ligandmpnn_cli_args(**cli_kwargs),
-                bias_aa_per_residue_bytes=self.config.get("bias_aa_per_residue_bytes"),
-                omit_aa_per_residue_bytes=self.config.get("omit_aa_per_residue_bytes"),
+                step_name=self.step_name,
             ),
-            function_name="ligandmpnn_run",
-            metadata={"selected_structure": selected_name},
+            function_name="run_ppiflow_ligandmpnn_stage",
+            metadata={"structure_count": len(selected_structures)},
         )
 
     def process_remote_result(
@@ -1154,38 +1248,13 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
     ) -> AppRunResult:
         """Expose LigandMPNN archives as structure artifacts."""
         result = AppRunResult.model_validate(result)
-        adapted = _result_with_output_kind(
+        if any(output.kind == ArtifactKind.TABLE for output in result.outputs):
+            return result
+        return _result_with_output_kind(
             result,
             ArtifactKind.STRUCTURES,
             {"step_name": self.step_name} | dict(metadata),
         )
-        sequence_rows = []
-        for output in adapted.outputs:
-            if not isinstance(output.storage, InlineBytes):
-                continue
-            if output.storage.media_type != ZSTD_MEDIA_TYPE:
-                continue
-            sequence_rows.extend(
-                ppiflow_tables.mpnn_sequence_rows_from_fasta_files(
-                    ppiflow_staging.files_from_tar_zst_bytes(
-                        output.storage.data,
-                        suffixes=(".fa", ".faa", ".fasta"),
-                    ),
-                    stage_name=self.step_name,
-                    parent_candidate_id=str(metadata.get("selected_structure") or ""),
-                )
-            )
-        sequence_output = _inline_csv_table_output(
-            name="mpnn_seqs",
-            filename="mpnn_seqs.csv",
-            rows=sequence_rows,
-            metadata={"step_name": self.step_name},
-        )
-        if sequence_output is not None:
-            return adapted.model_copy(
-                update={"outputs": [*adapted.outputs, sequence_output]}
-            )
-        return adapted
 
 
 @dataclass
@@ -1770,6 +1839,47 @@ def _result_with_output_kind(
     return result.model_copy(update={"outputs": outputs})
 
 
+def _ligandmpnn_stage_outputs(
+    result: AppRunResult,
+    *,
+    candidate_id: str,
+    step_name: str,
+    selected_structure: str,
+) -> list[AppOutput]:
+    adapted = _result_with_output_kind(
+        result,
+        ArtifactKind.STRUCTURES,
+        {
+            "candidate_id": candidate_id,
+            "step_name": step_name,
+            "selected_structure": selected_structure,
+        },
+    )
+    sequence_rows = []
+    for output in adapted.outputs:
+        if not isinstance(output.storage, InlineBytes):
+            continue
+        if output.storage.media_type != ZSTD_MEDIA_TYPE:
+            continue
+        sequence_rows.extend(
+            ppiflow_tables.mpnn_sequence_rows_from_fasta_files(
+                ppiflow_staging.files_from_tar_zst_bytes(
+                    output.storage.data,
+                    suffixes=(".fa", ".faa", ".fasta"),
+                ),
+                stage_name=step_name,
+                parent_candidate_id=candidate_id,
+            )
+        )
+    sequence_output = _inline_csv_table_output(
+        name="mpnn_seqs",
+        filename=f"{sanitize_filename(candidate_id)}_mpnn_seqs.csv",
+        rows=sequence_rows,
+        metadata={"candidate_id": candidate_id, "step_name": step_name},
+    )
+    return [*adapted.outputs, *([sequence_output] if sequence_output else [])]
+
+
 def _inline_csv_table_output(
     *,
     name: str,
@@ -2000,6 +2110,7 @@ def build_ppiflow_workflow(
         modal_namespace = PPIFlowModalNamespace(
             ppiflow_run=ppiflow_app.ppiflow_run_workflow,
             ligandmpnn_run=ligandmpnn_app.ligandmpnn_run,
+            ligandmpnn_stage=run_ppiflow_ligandmpnn_stage,
             flowpacker_run=flowpacker_app.run_flowpacker_workflow,
             af3score_manage_lock=af3score_app.af3score_manage_lock,
             af3score_prepare=af3score_app.af3score_prepare,

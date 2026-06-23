@@ -220,10 +220,10 @@ phase.
 
 **Tasks:**
 
-- [ ] Change `LigandMPNNNode` to process all selected structures by default instead of selecting one structure.
-- [ ] Represent upstream binder MPNN and AbMPNN as configuration modes on the same `LigandMPNNNode`.
-- [ ] Add a separate AbMPNN node only if AbMPNN later needs a distinct app function or output contract.
-- [ ] Change `LigandMPNNNode` to return designed structure artifacts and a PPIFlow-owned `mpnn_seqs.csv` table for every successful candidate.
+- [x] Change `LigandMPNNNode` to process all selected structures by default instead of selecting one structure.
+- [x] Represent upstream binder MPNN and AbMPNN as configuration modes on the same `LigandMPNNNode`.
+- [x] Add a separate AbMPNN node only if AbMPNN later needs a distinct app function or output contract.
+- [x] Change `LigandMPNNNode` to return designed structure artifacts and a PPIFlow-owned `mpnn_seqs.csv` table for every successful candidate.
 - [ ] Change `PPIFlowPartialNode` to process all selected structures by default.
 - [ ] Keep before-partial structure selection inside `PPIFlowPartialNode`.
 - [ ] Change `ReFoldNode` to process all selected structures by default.

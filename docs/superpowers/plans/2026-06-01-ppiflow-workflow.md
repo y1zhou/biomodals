@@ -226,8 +226,8 @@ phase.
 - [x] Change `LigandMPNNNode` to return designed structure artifacts and a PPIFlow-owned `mpnn_seqs.csv` table for every successful candidate.
 - [ ] Change `PPIFlowPartialNode` to process all selected structures by default.
 - [ ] Keep before-partial structure selection inside `PPIFlowPartialNode`.
-- [ ] Change `ReFoldNode` to process all selected structures by default.
-- [ ] Change `ReFoldNode` to return refolded structure artifacts and a `ReFold Quality Metrics` score artifact for every successful candidate.
+- [x] Change `ReFoldNode` to process all selected structures by default.
+- [x] Change `ReFoldNode` to return refolded structure artifacts and a `ReFold Quality Metrics` score artifact for every successful candidate.
 - [ ] Change `AF3ScoreNode` to compare requested input count against `metrics_rows`, `processed`, and `failed` from AF3Score postprocess.
 - [ ] Return `PARTIAL` from `AF3ScoreNode` for mixed success and `FAILED` when no usable metrics are produced.
 - [ ] Update `dockq_app.run_dockq_workflow` so DockQ archives with failed pairs return `PARTIAL` or `FAILED` instead of unconditional `SUCCEEDED`.

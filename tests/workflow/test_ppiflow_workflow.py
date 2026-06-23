@@ -705,34 +705,56 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
     assert predict.kwargs["model_seeds"] == [3]
     assert b'"sequence":"AC"' in predict.kwargs["json_bytes"]
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
-    assert result.outputs[1].name == "refold_quality_metrics"
+    assert result.outputs[1].name == "refold_quality_metrics_model"
     assert b"ranking_score" in result.outputs[1].storage.data
 
 
-def test_refold_rejects_implicit_multi_structure_selection(tmp_path: Path) -> None:
+def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
     selector = _FakeModalFunction(
         "fc-select",
         [
-            ("design-a.pdb", b"ATOM A\n"),
-            ("design-b.pdb", b"ATOM B\n"),
+            (
+                "design-a.pdb",
+                b"ATOM      1  CA  ALA A   1      0.000   0.000   0.000  1.00  0.00           C\n",
+            ),
+            (
+                "design-b.pdb",
+                b"ATOM      1  CA  CYS A   1      0.000   0.000   0.000  1.00  0.00           C\n",
+            ),
         ],
+    )
+    predict = _FakeModalFunction(
+        "fc-af3-predict",
+        _tar_zst_bytes({
+            "outputs/model_summary_confidences.json": b'{"ranking_score":0.7}'
+        }),
     )
     node = ppiflow_workflow.ReFoldNode(
         "ReFoldStep",
-        _fake_namespace(select_structures=selector),
+        _fake_namespace(
+            select_structures=selector,
+            alphafold3_predict_structures=predict,
+        ),
         {"run_name": "refold-run"},
     )
 
-    with pytest.raises(ValueError, match="explicit structure_index"):
-        node.run(
-            NodeRunContext(
-                run_id="run-1",
-                node_id="stage2-alphafold3-refold",
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
-                inputs={"structures": [_upstream_structure_artifact()]},
-            )
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-alphafold3-refold",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
         )
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert [output.name for output in result.outputs] == [
+        "alphafold3_refolded_structures_design-a",
+        "refold_quality_metrics_design-a",
+        "alphafold3_refolded_structures_design-b",
+        "refold_quality_metrics_design-b",
+    ]
 
 
 def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> None:

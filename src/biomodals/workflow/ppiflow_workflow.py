@@ -1487,15 +1487,60 @@ class ReFoldNode(_ConfiguredAppStepNode):
     placement: NodePlacement = NodePlacement.ORCHESTRATOR
 
     def run(self, context: NodeRunContext) -> AppRunResult:
-        """Run AlphaFold3 refolding for one selected structure."""
-        structure_name, structure_bytes = self._select_one_structure(
-            context,
-            default_patterns=("*.pdb",),
+        """Run AlphaFold3 refolding for all selected structures."""
+        selected_structures = ppiflow_staging.candidate_structure_files_from_selected(
+            self._select_structures(
+                context,
+                max_files=self.config.get("max_structures"),
+                default_patterns=("*.pdb",),
+            )
         )
-        run_name = self._run_name(context)
+        base_run_name = self._run_name(context)
+        outputs = []
+        outcomes = []
+        for structure in selected_structures:
+            candidate_run_name = sanitize_filename(
+                f"{base_run_name}-{structure.candidate_id}"
+            )
+            try:
+                candidate_outputs = self._run_one_refold_candidate(
+                    structure,
+                    run_name=candidate_run_name,
+                )
+                outputs.extend(candidate_outputs)
+                outcomes.append(
+                    ppiflow_coordinators.CandidateOutcome(
+                        structure.candidate_id,
+                        AppRunStatus.SUCCEEDED,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append(
+                    ppiflow_coordinators.CandidateOutcome(
+                        structure.candidate_id,
+                        AppRunStatus.FAILED,
+                        error=str(exc),
+                    )
+                )
+        return AppRunResult(
+            status=ppiflow_coordinators.status_from_candidate_outcomes(outcomes),
+            outputs=outputs,
+            warnings=[
+                f"{outcome.candidate_id}: {outcome.error}"
+                for outcome in outcomes
+                if outcome.error
+            ],
+        )
+
+    def _run_one_refold_candidate(
+        self,
+        structure: ppiflow_staging.CandidateStructureFile,
+        *,
+        run_name: str,
+    ) -> list[AppOutput]:
         conf = _af3_config_for_refold(
-            structure_name=structure_name,
-            structure_bytes=structure_bytes,
+            structure_name=structure.file_name,
+            structure_bytes=structure.data,
             run_name=run_name,
             config=self.config,
         )
@@ -1520,14 +1565,18 @@ class ReFoldNode(_ConfiguredAppStepNode):
             stage_name=self.step_name,
         )
         metrics_output = _inline_csv_table_output(
-            name="refold_quality_metrics",
-            filename="refold_quality_metrics.csv",
+            name=f"refold_quality_metrics_{sanitize_filename(structure.candidate_id)}",
+            filename=f"{sanitize_filename(structure.candidate_id)}_refold_quality_metrics.csv",
             rows=metric_rows,
-            metadata={"step_name": self.step_name, "source_structure": structure_name},
+            metadata={
+                "candidate_id": structure.candidate_id,
+                "step_name": self.step_name,
+                "source_structure": structure.file_name,
+            },
         )
         outputs = [
             AppOutput(
-                name="alphafold3_refolded_structures",
+                name=f"alphafold3_refolded_structures_{sanitize_filename(structure.candidate_id)}",
                 kind=ArtifactKind.STRUCTURES,
                 storage=InlineBytes(
                     data=tarball_bytes,
@@ -1537,17 +1586,15 @@ class ReFoldNode(_ConfiguredAppStepNode):
                 metadata={
                     "step_name": self.step_name,
                     "run_name": run_name,
-                    "source_structure": structure_name,
+                    "candidate_id": structure.candidate_id,
+                    "source_structure": structure.file_name,
                     "archive_format": "tar.zst",
                 },
             )
         ]
         if metrics_output is not None:
             outputs.append(metrics_output)
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=outputs,
-        )
+        return outputs
 
 
 @dataclass

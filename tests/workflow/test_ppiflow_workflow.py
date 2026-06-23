@@ -1237,6 +1237,32 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     }
 
 
+def test_ppiflow_candidate_concurrency_is_copied_to_node_configs() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=b"""
+task:
+  gentype: binder
+  candidate_concurrency: 3
+steps:
+  MPNNStep_stage1: true
+  AF3scoreStep_stage1: true
+""",
+        steps_yaml_bytes=b"""
+MPNNStep_stage1:
+  candidate_concurrency: 2
+AF3scoreStep_stage1: {}
+""",
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    assert (
+        definition.nodes["stage1-ligandmpnn"].node.config["candidate_concurrency"] == 2
+    )
+    assert definition.nodes["stage1-af3score"].node.config["candidate_concurrency"] == 3
+
+
 def test_ppiflow_stage2_only_requires_existing_input() -> None:
     try:
         build_ppiflow_workflow(

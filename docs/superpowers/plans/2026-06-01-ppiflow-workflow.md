@@ -181,15 +181,15 @@ phase.
 
 **Tasks:**
 
-- [ ] Add reusable candidate-wide coordinator logic that loads the incoming manifest, verifies reusable completed candidates, submits missing candidates, and writes updated manifests.
-- [ ] Add bounded child-call concurrency with shared `candidate_concurrency` default of 4 and per-stage overrides.
-- [ ] Parse shared PPIFlow `candidate_concurrency` from task/steps YAML and copy the resolved value into candidate-wide node configs during DAG construction.
-- [ ] Do not add a workflow runtime or orchestrator flag for PPIFlow candidate concurrency.
-- [ ] Normalize candidate-wide node status: all requested candidates succeeded -> `SUCCEEDED`; some succeeded and some failed -> `PARTIAL`; none succeeded -> `FAILED`.
-- [ ] Preserve successful outputs, failed candidate records, diagnostic logs, and candidate manifests for `PARTIAL` and `FAILED` results.
+- [x] Add reusable candidate-wide coordinator logic that loads the incoming manifest, verifies reusable completed candidates, submits missing candidates, and writes updated manifests.
+- [x] Add bounded child-call concurrency with shared `candidate_concurrency` default of 4 and per-stage overrides.
+- [x] Parse shared PPIFlow `candidate_concurrency` from task/steps YAML and copy the resolved value into candidate-wide node configs during DAG construction.
+- [x] Do not add a workflow runtime or orchestrator flag for PPIFlow candidate concurrency.
+- [x] Normalize candidate-wide node status: all requested candidates succeeded -> `SUCCEEDED`; some succeeded and some failed -> `PARTIAL`; none succeeded -> `FAILED`.
+- [x] Preserve successful outputs, failed candidate records, diagnostic logs, and candidate manifests for `PARTIAL` and `FAILED` results.
 - [ ] Ensure `PARTIAL` does not unblock downstream nodes.
 - [ ] Make each remote stage coordinator consult its manifest before submitting child app calls.
-- [ ] Make completed manifest rows reusable only after expected-output availability checks pass.
+- [x] Make completed manifest rows reusable only after expected-output availability checks pass.
 - [ ] Ensure every candidate-wide node returns the current candidate manifest as an output artifact alongside structures, scores, logs, or reports.
 - [ ] Move candidate-wide `AF3ScoreNode`, `RosettaFixNode`, `RosettaRelaxNode`, `ReFoldNode`, `LigandMPNNNode`, and `PPIFlowPartialNode` coordination into remote workflow-node execution.
 - [ ] Keep one recoverable Modal call id per candidate-wide stage.
@@ -205,9 +205,9 @@ phase.
   memory, timeout, GPU, or mount-scope adjustments once real telemetry exists.
 - [ ] Add tests or static assertions that stage wrappers declare only the volume
   mounts their stage needs.
-- [ ] Add tests that candidate-wide stage coordinators respect configured child app-call concurrency limits.
-- [ ] Add tests that retries reuse manifests and skip only candidates with available expected outputs.
-- [ ] Add tests that mixed candidate success returns `PARTIAL` and blocks downstream execution.
+- [x] Add tests that candidate-wide stage coordinators respect configured child app-call concurrency limits.
+- [x] Add tests that retries reuse manifests and skip only candidates with available expected outputs.
+- [x] Add tests that mixed candidate success returns `PARTIAL` and blocks downstream execution.
 
 ## Phase 6: Stage-Specific Node Refactors
 

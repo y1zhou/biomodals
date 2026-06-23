@@ -56,6 +56,7 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.ppiflow import coordinators as ppiflow_coordinators
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
@@ -2024,6 +2025,10 @@ def build_ppiflow_workflow(
     task = _task_section(task_doc)
     enabled = _enabled_section(task_doc)
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
+    candidate_concurrency = ppiflow_coordinators.candidate_concurrency_from_config(
+        task,
+        steps_doc,
+    )
     workflow = Workflow("ppiflow-v2")
     report_table_inputs: dict[str, Any] = {}
 
@@ -2036,6 +2041,7 @@ def build_ppiflow_workflow(
             gentype=gentype,
             modal_namespace=modal_namespace,
             report_table_inputs=report_table_inputs,
+            candidate_concurrency=candidate_concurrency,
         )
 
     if stage in {None, 2}:
@@ -2053,6 +2059,7 @@ def build_ppiflow_workflow(
             upstream=stage2_upstream,
             modal_namespace=modal_namespace,
             report_table_inputs=report_table_inputs,
+            candidate_concurrency=candidate_concurrency,
         )
 
     return workflow
@@ -2066,6 +2073,7 @@ def _add_stage1_nodes(
     gentype: str,
     modal_namespace: PPIFlowModalNamespace,
     report_table_inputs: dict[str, Any],
+    candidate_concurrency: int,
 ):
     tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
@@ -2073,7 +2081,11 @@ def _add_stage1_nodes(
             PPIFlowDesignNode(
                 "PPIFlowStep",
                 modal_namespace,
-                _step_cfg(steps, "PPIFlowStep"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "PPIFlowStep",
+                    candidate_concurrency,
+                ),
             ),
             id="stage1-ppiflow-design",
         )
@@ -2088,7 +2100,15 @@ def _add_stage1_nodes(
     if mpnn_step is not None:
         node_id, step_name = mpnn_step
         tail = workflow.add_node(
-            LigandMPNNNode(step_name, modal_namespace, _step_cfg(steps, step_name)),
+            LigandMPNNNode(
+                step_name,
+                modal_namespace,
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    step_name,
+                    candidate_concurrency,
+                ),
+            ),
             id=node_id,
             inputs=_structure_inputs(tail),
         )
@@ -2099,7 +2119,11 @@ def _add_stage1_nodes(
             FlowPackerNode(
                 "FlowpackerStep_stage1",
                 modal_namespace,
-                _step_cfg(steps, "FlowpackerStep_stage1"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "FlowpackerStep_stage1",
+                    candidate_concurrency,
+                ),
             ),
             id="stage1-flowpacker",
             inputs=_structure_inputs(tail),
@@ -2111,7 +2135,11 @@ def _add_stage1_nodes(
             AF3ScoreNode(
                 "AF3scoreStep_stage1",
                 modal_namespace,
-                _step_cfg(steps, "AF3scoreStep_stage1"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "AF3scoreStep_stage1",
+                    candidate_concurrency,
+                ),
             ),
             id="stage1-af3score",
             inputs=_structure_inputs(tail),
@@ -2125,7 +2153,11 @@ def _add_stage1_nodes(
             FilterStructuresNode(
                 "FilterStep_stage1",
                 modal_namespace,
-                _step_cfg(steps, "FilterStep_stage1"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "FilterStep_stage1",
+                    candidate_concurrency,
+                ),
             ),
             id="stage1-filter",
             inputs=inputs,
@@ -2145,6 +2177,7 @@ def _add_stage2_nodes(
     upstream,
     modal_namespace: PPIFlowModalNamespace,
     report_table_inputs: dict[str, Any],
+    candidate_concurrency: int,
 ) -> None:
     tail = upstream
     if _step_enabled(enabled, "RosettaFixStep"):
@@ -2152,7 +2185,11 @@ def _add_stage2_nodes(
             RosettaFixNode(
                 "RosettaFixStep",
                 modal_namespace,
-                _step_cfg(steps, "RosettaFixStep"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "RosettaFixStep",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-rosetta-fix",
             inputs=_structure_inputs(tail),
@@ -2176,7 +2213,11 @@ def _add_stage2_nodes(
             PPIFlowPartialNode(
                 "PartialStep",
                 modal_namespace,
-                _step_cfg(steps, "PartialStep"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "PartialStep",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-partial-ppiflow",
             inputs=_structure_inputs(tail),
@@ -2192,7 +2233,15 @@ def _add_stage2_nodes(
     if mpnn_step is not None:
         node_id, step_name = mpnn_step
         tail = workflow.add_node(
-            LigandMPNNNode(step_name, modal_namespace, _step_cfg(steps, step_name)),
+            LigandMPNNNode(
+                step_name,
+                modal_namespace,
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    step_name,
+                    candidate_concurrency,
+                ),
+            ),
             id=node_id,
             inputs=_structure_inputs(tail),
         )
@@ -2203,7 +2252,11 @@ def _add_stage2_nodes(
             FlowPackerNode(
                 "FlowpackerStep_stage2",
                 modal_namespace,
-                _step_cfg(steps, "FlowpackerStep_stage2"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "FlowpackerStep_stage2",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-flowpacker",
             inputs=_structure_inputs(tail),
@@ -2215,7 +2268,11 @@ def _add_stage2_nodes(
             AF3ScoreNode(
                 "AF3scoreStep_stage2",
                 modal_namespace,
-                _step_cfg(steps, "AF3scoreStep_stage2"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "AF3scoreStep_stage2",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-af3score",
             inputs=_structure_inputs(tail),
@@ -2230,7 +2287,11 @@ def _add_stage2_nodes(
             FilterStructuresNode(
                 "FilterStep_stage2",
                 modal_namespace,
-                _step_cfg(steps, "FilterStep_stage2"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "FilterStep_stage2",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-filter",
             inputs=inputs,
@@ -2243,7 +2304,11 @@ def _add_stage2_nodes(
             ReFoldNode(
                 "ReFoldStep",
                 modal_namespace,
-                _step_cfg(steps, "ReFoldStep"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "ReFoldStep",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-alphafold3-refold",
             inputs=_structure_inputs(filtered),
@@ -2259,7 +2324,11 @@ def _add_stage2_nodes(
             DockQNode(
                 "DockQStep",
                 modal_namespace,
-                _step_cfg(steps, "DockQStep"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "DockQStep",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-dockq",
             inputs=inputs,
@@ -2274,7 +2343,11 @@ def _add_stage2_nodes(
             RosettaRelaxNode(
                 "RosettaRelaxStep",
                 modal_namespace,
-                _step_cfg(steps, "RosettaRelaxStep"),
+                _step_cfg_with_candidate_concurrency(
+                    steps,
+                    "RosettaRelaxStep",
+                    candidate_concurrency,
+                ),
             ),
             id="stage2-rosetta-relax",
             inputs=inputs,
@@ -2407,6 +2480,16 @@ def _step_cfg(steps: dict[str, Any], step_name: str) -> dict[str, Any]:
         return {}
     if not isinstance(cfg, dict):
         raise ValueError(f"steps.yaml entry {step_name!r} must be a mapping")
+    return cfg
+
+
+def _step_cfg_with_candidate_concurrency(
+    steps: dict[str, Any],
+    step_name: str,
+    candidate_concurrency: int,
+) -> dict[str, Any]:
+    cfg = dict(_step_cfg(steps, step_name))
+    cfg.setdefault("candidate_concurrency", candidate_concurrency)
     return cfg
 
 

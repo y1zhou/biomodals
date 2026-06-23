@@ -22,7 +22,9 @@ import os
 import re
 import shlex
 import subprocess
+import tarfile
 from collections.abc import Iterable
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -209,6 +211,52 @@ def _write_results_csv(rows: Iterable[dict[str, str]], csv_path: Path) -> None:
     ).write_csv(csv_path)
 
 
+def _workflow_status_from_archive(
+    archive_bytes: bytes,
+    *,
+    requested_count: int,
+) -> tuple[AppRunStatus, dict[str, int]]:
+    """Classify DockQ workflow success from packaged result rows."""
+    import zstandard as zstd
+
+    with BytesIO(archive_bytes) as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile() or Path(member.name).name != "dockq_results.csv":
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    break
+                frame = pl.read_csv(BytesIO(extracted.read()), infer_schema_length=0)
+                usable_rows = frame.filter(
+                    (pl.col("returncode") == "0") & (pl.col("dockq") != "")
+                ).height
+                failed_rows = max(0, requested_count - usable_rows)
+                if requested_count > 0 and usable_rows == requested_count:
+                    return AppRunStatus.SUCCEEDED, {
+                        "pair_count": requested_count,
+                        "usable_rows": usable_rows,
+                        "failed": 0,
+                    }
+                if usable_rows > 0:
+                    return AppRunStatus.PARTIAL, {
+                        "pair_count": requested_count,
+                        "usable_rows": usable_rows,
+                        "failed": failed_rows,
+                    }
+                return AppRunStatus.FAILED, {
+                    "pair_count": requested_count,
+                    "usable_rows": 0,
+                    "failed": failed_rows,
+                }
+    return AppRunStatus.FAILED, {
+        "pair_count": requested_count,
+        "usable_rows": 0,
+        "failed": requested_count,
+    }
+
+
 ##########################################
 # Inference functions
 ##########################################
@@ -262,15 +310,19 @@ def run_dockq_workflow(
         run_name=safe_run_name,
         dockq_args=dockq_args,
     )
+    status, metrics = _workflow_status_from_archive(
+        tarball_bytes,
+        requested_count=len(pairs),
+    )
     return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
+        status=status,
         outputs=[
             inline_zstd_output(
                 name="dockq_scores",
                 kind=ArtifactKind.SCORES,
                 data=tarball_bytes,
                 filename=f"{safe_run_name}_dockq.tar.zst",
-                metadata={"run_name": safe_run_name},
+                metadata={"run_name": safe_run_name} | metrics,
             )
         ],
     )

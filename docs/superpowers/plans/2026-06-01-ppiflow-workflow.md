@@ -228,10 +228,10 @@ phase.
 - [ ] Keep before-partial structure selection inside `PPIFlowPartialNode`.
 - [x] Change `ReFoldNode` to process all selected structures by default.
 - [x] Change `ReFoldNode` to return refolded structure artifacts and a `ReFold Quality Metrics` score artifact for every successful candidate.
-- [ ] Change `AF3ScoreNode` to compare requested input count against `metrics_rows`, `processed`, and `failed` from AF3Score postprocess.
-- [ ] Return `PARTIAL` from `AF3ScoreNode` for mixed success and `FAILED` when no usable metrics are produced.
-- [ ] Update `dockq_app.run_dockq_workflow` so DockQ archives with failed pairs return `PARTIAL` or `FAILED` instead of unconditional `SUCCEEDED`.
-- [ ] Update `DockQNode` to preserve DockQ diagnostic CSVs/logs for `PARTIAL` and `FAILED` results.
+- [x] Change `AF3ScoreNode` to compare requested input count against `metrics_rows`, `processed`, and `failed` from AF3Score postprocess.
+- [x] Return `PARTIAL` from `AF3ScoreNode` for mixed success and `FAILED` when no usable metrics are produced.
+- [x] Update `dockq_app.run_dockq_workflow` so DockQ archives with failed pairs return `PARTIAL` or `FAILED` instead of unconditional `SUCCEEDED`.
+- [x] Update `DockQNode` to preserve DockQ diagnostic CSVs/logs for `PARTIAL` and `FAILED` results.
 - [ ] Make `RosettaFixNode` and `RosettaRelaxNode` remote coordinators own Modal queue creation, worker submission, queue cleanup, expected-output verification, and Rosetta job manifest updates through the hydrated namespace.
 - [ ] Ensure RosettaFix/RosettaRelax diagnostic logs and failed candidate records are materialized for `PARTIAL` and `FAILED` results.
 - [ ] Change `FilterStructuresNode` to expose retained structures, filtered scores, retained candidate manifest, and filter audit table.

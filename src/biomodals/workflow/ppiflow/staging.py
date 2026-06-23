@@ -5,13 +5,28 @@ from __future__ import annotations
 import fnmatch
 import tarfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from biomodals.helper.shell import sanitize_filename
-from biomodals.schema import ArtifactKind, WorkflowArtifact
+from biomodals.schema import AppRunStatus, ArtifactKind, WorkflowArtifact
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
+from biomodals.workflow.ppiflow import manifests
 
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
+
+
+@dataclass(frozen=True)
+class SelectedStructureFile:
+    """One selected structure file with enough provenance for manifest rows."""
+
+    artifact_id: str
+    file_name: str
+    artifact_file_path: str
+    app_volume_path: str
+    volume_name: str
+    size_bytes: int | None = None
+    media_type: str | None = None
 
 
 def artifact_mount_path(
@@ -98,6 +113,136 @@ def structure_files_from_tar_zst(
                     extracted.read(),
                 ))
     return selected
+
+
+def selected_structure_file_records_from_artifact(
+    artifact: WorkflowArtifact,
+    patterns: Sequence[str] | None,
+    volume_roots: Mapping[str, str],
+) -> list[SelectedStructureFile]:
+    """Return selected structure files without loading their bytes."""
+    patterns = structure_patterns_from_metadata(artifact, patterns)
+    root = artifact_mount_path(artifact, volume_roots)
+    if not root.exists():
+        raise FileNotFoundError(f"PPIFlow input artifact path not found: {root}")
+
+    if root.is_file():
+        if artifact_is_zstd_archive(artifact, root):
+            return _selected_structure_file_records_from_tar_zst(
+                artifact, root, patterns
+            )
+        if not matches_structure_pattern(root.name, patterns):
+            return []
+        return [
+            SelectedStructureFile(
+                artifact_id=artifact.artifact_id,
+                file_name=safe_selected_file_name(artifact.artifact_id, root.name),
+                artifact_file_path=root.name,
+                app_volume_path=artifact.storage.path,
+                volume_name=artifact.storage.volume_name,
+                size_bytes=root.stat().st_size,
+                media_type=artifact.storage.media_type,
+            )
+        ]
+
+    selected = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if not matches_structure_pattern(relative, patterns):
+            continue
+        selected.append(
+            SelectedStructureFile(
+                artifact_id=artifact.artifact_id,
+                file_name=safe_selected_file_name(artifact.artifact_id, relative),
+                artifact_file_path=relative,
+                app_volume_path=str(Path(artifact.storage.path) / relative),
+                volume_name=artifact.storage.volume_name,
+                size_bytes=path.stat().st_size,
+                media_type=artifact.storage.media_type,
+            )
+        )
+    return selected
+
+
+def _selected_structure_file_records_from_tar_zst(
+    artifact: WorkflowArtifact,
+    archive_path: Path,
+    patterns: Sequence[str] | None,
+) -> list[SelectedStructureFile]:
+    import zstandard as zstd
+
+    selected = []
+    archive_size = archive_path.stat().st_size
+    with archive_path.open("rb") as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile() or not matches_structure_pattern(
+                    member.name, patterns
+                ):
+                    continue
+                selected.append(
+                    SelectedStructureFile(
+                        artifact_id=artifact.artifact_id,
+                        file_name=safe_selected_file_name(
+                            artifact.artifact_id, member.name
+                        ),
+                        artifact_file_path=member.name,
+                        app_volume_path=artifact.storage.path,
+                        volume_name=artifact.storage.volume_name,
+                        size_bytes=archive_size,
+                        media_type=artifact.storage.media_type or ZSTD_MEDIA_TYPE,
+                    )
+                )
+    return selected
+
+
+def stage2_input_manifest_rows(
+    artifact: WorkflowArtifact,
+    volume_roots: Mapping[str, str],
+    *,
+    patterns: Sequence[str] | None = None,
+    stage_name: str = "Stage2Input",
+) -> list[dict[str, object]]:
+    """Build synthetic Stage2Input candidate rows from a structure location."""
+    selected = selected_structure_file_records_from_artifact(
+        artifact,
+        patterns,
+        volume_roots,
+    )
+    if not selected:
+        raise FileNotFoundError("Stage2Input did not find any structure files")
+
+    rows = []
+    for index, structure in enumerate(
+        sorted(selected, key=lambda item: item.app_volume_path),
+        start=1,
+    ):
+        rows.append(
+            manifests.candidate_manifest_row(
+                candidate_id=manifests.stage2_input_candidate_id(index),
+                stage_name=stage_name,
+                stage_role="stage2_input",
+                operation_mode="existing_structures",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                source_artifact_id=structure.artifact_id,
+                source_path=structure.app_volume_path,
+                derived_path=structure.app_volume_path,
+                files=[
+                    manifests.candidate_file_record(
+                        role="structure",
+                        volume_name=structure.volume_name,
+                        app_volume_path=structure.app_volume_path,
+                        path=structure.artifact_file_path,
+                        media_type=structure.media_type,
+                        size_bytes=structure.size_bytes,
+                        expected=True,
+                    )
+                ],
+                summary={"file_name": structure.file_name},
+            )
+        )
+    return rows
 
 
 def structure_files_from_artifact(

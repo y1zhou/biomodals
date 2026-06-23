@@ -57,6 +57,7 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
 
@@ -242,6 +243,111 @@ def copy_ppiflow_structure_artifacts(
                 }
                 | dict(metadata or {}),
             )
+        ],
+    )
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+)
+def normalize_ppiflow_stage2_input(
+    *,
+    storage: VolumePath,
+    config: dict[str, object],
+    run_id: str,
+    node_id: str,
+    attempt_id: str,
+    step_name: str,
+) -> AppRunResult:
+    """Normalize Stage2Input structures into a workflow-owned manifest."""
+    _reload_ppiflow_source_volumes()
+    structure_artifact = WorkflowArtifact(
+        artifact_id=f"{sanitize_filename(node_id)}-stage2-input-structures",
+        producing_node_id=node_id,
+        kind=ArtifactKind.STRUCTURES,
+        storage=storage,
+        metadata={
+            "step_name": step_name,
+            "run_name": config.get("run_name", run_id),
+        },
+    )
+    output_dir = (
+        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
+        / "ppiflow"
+        / sanitize_filename(run_id)
+        / sanitize_filename(node_id)
+        / sanitize_filename(attempt_id)
+        / "stage2_input"
+    )
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
+
+    manifest_storage = _stage2_manifest_storage_from_config(
+        config,
+        default_volume_name=storage.volume_name,
+    )
+    if manifest_storage is not None:
+        frame = ppiflow_manifests.read_manifest_volume_path(
+            storage=manifest_storage,
+            volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        )
+        ppiflow_manifests.write_manifest(frame.to_dicts(), manifest_path)
+        row_count = frame.height
+    else:
+        rows = ppiflow_staging.stage2_input_manifest_rows(
+            structure_artifact,
+            PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            patterns=_patterns_from_config(config),
+            stage_name=step_name,
+        )
+        ppiflow_manifests.write_manifest(rows, manifest_path)
+        row_count = len(rows)
+
+    structure_path = storage.at_mountpoint(
+        PPI_FLOW_SOURCE_VOLUME_ROOTS[storage.volume_name]
+    )
+    if structure_path.is_file():
+        structure_files = [structure_path.name]
+    else:
+        manifest_frame = ppiflow_manifests.read_manifest(manifest_path)
+        structure_files = sorted({
+            str(file_record["path"])
+            for row in manifest_frame.iter_rows(named=True)
+            for file_record in row["files"]
+            if file_record.get("path")
+        })
+
+    WORKFLOW_OUTPUT_VOLUME.commit()
+    structure_metadata = {
+        "step_name": step_name,
+        "run_name": config.get("run_name", run_id),
+        "structure_count": row_count,
+        "files": structure_files,
+    }
+    patterns = _patterns_from_config(config)
+    if patterns is not None:
+        structure_metadata["structure_patterns"] = patterns
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="stage2_input_structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=storage,
+                metadata=structure_metadata,
+            ),
+            ppiflow_manifests.manifest_artifact_output(
+                manifest_path=manifest_path,
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                stage_name=step_name,
+                row_count=row_count,
+            ),
         ],
     )
 
@@ -887,6 +993,7 @@ class PPIFlowModalNamespace:
     filter_artifacts: modal.Function
     derive_fixed_positions: modal.Function
     rank_artifacts: modal.Function
+    stage2_input_manifest: modal.Function
     stage_ppiflow_input: modal.Function
     stage_af3score_inputs: modal.Function
     stage_rosetta_inputs: modal.Function
@@ -1428,24 +1535,27 @@ class ExistingStructuresNode(WorkflowNativeNode):
     """Reference existing structures for stage-2-only PPIFlow runs."""
 
     step_name: str
+    modal_namespace: PPIFlowModalNamespace = field(
+        repr=False,
+        compare=False,
+        metadata={"dag_hash": False},
+    )
     storage: VolumePath
     config: dict[str, Any] = field(default_factory=dict)
+    placement: NodePlacement = NodePlacement.REMOTE
 
-    def run(self, context: NodeRunContext) -> AppRunResult:
-        """Return the configured existing structure location as an artifact."""
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="stage2_input_structures",
-                    kind=ArtifactKind.STRUCTURES,
-                    storage=self.storage,
-                    metadata={
-                        "step_name": self.step_name,
-                        "run_name": self.config.get("run_name", context.run_id),
-                    },
-                )
-            ],
+    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
+        """Submit Stage2Input normalization as a remote workflow adapter."""
+        return RemoteNodeSubmission(
+            function_call=self.modal_namespace.stage2_input_manifest.spawn(
+                storage=self.storage,
+                config=self.config,
+                run_id=context.run_id,
+                node_id=context.node_id,
+                attempt_id=context.attempt_id,
+                step_name=self.step_name,
+            ),
+            function_name="normalize_ppiflow_stage2_input",
         )
 
 
@@ -1840,6 +1950,7 @@ def build_ppiflow_workflow(
             filter_artifacts=filter_ppiflow_artifacts,
             derive_fixed_positions=derive_ppiflow_fixed_positions,
             rank_artifacts=rank_ppiflow_artifacts,
+            stage2_input_manifest=normalize_ppiflow_stage2_input,
             stage_ppiflow_input=stage_ppiflow_input_structure,
             stage_af3score_inputs=stage_af3score_inputs,
             stage_rosetta_inputs=stage_rosetta_inputs,
@@ -1866,7 +1977,7 @@ def build_ppiflow_workflow(
         stage2_upstream = stage1_tail
         if stage == 2:
             stage2_upstream = workflow.add_node(
-                _stage2_input_node(task, steps_doc),
+                _stage2_input_node(task, steps_doc, modal_namespace),
                 id="stage2-existing-input",
             )
         _add_stage2_nodes(
@@ -2129,12 +2240,16 @@ def _add_stage2_nodes(
 def _structure_inputs(upstream) -> dict[str, Any]:
     if upstream is None:
         return {}
-    return {"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)}
+    return {
+        "structures": upstream.outputs(kind=ArtifactKind.STRUCTURES),
+        "candidate_manifest": upstream.outputs(kind=ArtifactKind.TABLE),
+    }
 
 
 def _stage2_input_node(
     task: Mapping[str, Any],
     steps: Mapping[str, Any],
+    modal_namespace: PPIFlowModalNamespace,
 ) -> ExistingStructuresNode:
     raw_cfg = steps.get("Stage2Input") or task.get("stage2_input")
     if not isinstance(raw_cfg, Mapping):
@@ -2146,20 +2261,42 @@ def _stage2_input_node(
     if raw_path is None:
         raise ValueError("Stage2Input requires a 'path' value")
     volume_name = str(raw_cfg.get("volume_name", PPI_FLOW_OUTPUT_VOLUME_NAME))
-    path = str(raw_path)
+    storage = _volume_path_from_stage_config(str(raw_path), volume_name=volume_name)
+    return ExistingStructuresNode(
+        "Stage2Input",
+        modal_namespace,
+        storage,
+        dict(raw_cfg),
+    )
+
+
+def _stage2_manifest_storage_from_config(
+    config: Mapping[str, object],
+    *,
+    default_volume_name: str,
+) -> VolumePath | None:
+    raw_path = config.get("manifest_path")
+    if raw_path is None:
+        return None
+    return _volume_path_from_stage_config(
+        str(raw_path),
+        volume_name=str(
+            config.get("manifest_volume_name")
+            or config.get("volume_name")
+            or default_volume_name
+        ),
+    )
+
+
+def _volume_path_from_stage_config(path: str, *, volume_name: str) -> VolumePath:
     if path.startswith("/"):
         for known_volume, mountpoint in PPI_FLOW_SOURCE_VOLUME_ROOTS.items():
             try:
-                storage = volume_path_from_mount_path(path, mountpoint, known_volume)
+                return volume_path_from_mount_path(path, mountpoint, known_volume)
             except ValueError:
                 continue
-            return ExistingStructuresNode("Stage2Input", storage, dict(raw_cfg))
         raise ValueError(f"Stage2Input path is not under a known mountpoint: {path}")
-    return ExistingStructuresNode(
-        "Stage2Input",
-        VolumePath(volume_name=volume_name, path=path),
-        dict(raw_cfg),
-    )
+    return VolumePath(volume_name=volume_name, path=path)
 
 
 def _load_yaml_bytes(data: bytes) -> dict[str, Any]:

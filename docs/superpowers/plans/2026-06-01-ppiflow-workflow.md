@@ -89,31 +89,31 @@ phase.
 
 **Tasks:**
 
-- [ ] Keep candidate manifest schema/constants/helpers workflow-local to PPIFlow; do not add shared `biomodals.schema` models yet.
-- [ ] Store manifests as Parquet `ArtifactKind.TABLE` workflow artifacts in the workflow run volume.
-- [ ] Use Polars `read_parquet`/`write_parquet` for manifests.
-- [ ] Store one Parquet row per candidate with a nested `files` list of structs.
-- [ ] Include `candidate_id`, `parent_candidate_id`, `stage_name`, `stage_role`, `operation_mode`, `candidate_status`, `source_artifact_id`, `source_path`, `derived_path`, and summary/error fields.
-- [ ] Include workflow-relative artifact paths, app-volume names, app-volume paths, file roles, media types, size metadata when available, and expected-file flags in nested file records.
-- [ ] Add deterministic candidate-id helpers: initial candidates hash producing stage, source artifact id/path, and normalized basename.
-- [ ] Add derived candidate-id helpers: derived candidates hash parent candidate id, stage name, operation mode, and derived basename.
-- [ ] Keep synthetic stage-2 convenience candidate ids sequential (`stage2_input_000001`, etc.) while preserving source-path provenance.
-- [ ] Ensure generated candidate ids and manifests do not enter workflow DAG hash payloads unless user-facing node configuration changes.
-- [ ] Write node metadata only as summary counts and manifest artifact ids, not as the only manifest copy.
-- [ ] Add explicit `Stage2Input` manifest loading and validation.
-- [ ] Add `Stage2Input` path normalization that scans a user-provided structure location and emits a minimal candidate manifest with synthetic candidate ids.
-- [ ] Change `ExistingStructuresNode` so stage-2-only runs return both the configured structure artifact and the normalized candidate manifest artifact.
-- [ ] Add strict candidate-id join helpers that fail on missing required candidates unless explicit inspection/debug config enables missing-candidate tolerance.
-- [ ] Before skipping a completed candidate on retry, verify expected output files recorded in the manifest are still available.
-- [ ] Route expected-file checks through workflow-volume paths for materialized artifacts and app-volume paths plus `volume_name` for app-owned outputs.
-- [ ] Add tests for deterministic candidate ids across reruns.
-- [ ] Add tests that candidate ids change only when provenance-relevant inputs change.
-- [ ] Add tests that candidate-id helper internals and generated manifests do not affect DAG hash payloads.
-- [ ] Add tests that manifest outputs are materialized as Parquet `ArtifactKind.TABLE` artifacts.
-- [ ] Add tests that downstream nodes consume manifest artifacts rather than node metadata.
-- [ ] Add tests that stage-2-only runs support explicit manifest loading and path-to-manifest normalization.
-- [ ] Add tests that retry-skip verifies expected candidate output files and does not trust manifest completion rows alone.
-- [ ] Add tests that strict candidate joins fail on missing required candidates and only drop candidates when explicitly configured.
+- [x] Keep candidate manifest schema/constants/helpers workflow-local to PPIFlow; do not add shared `biomodals.schema` models yet.
+- [x] Store manifests as Parquet `ArtifactKind.TABLE` workflow artifacts in the workflow run volume.
+- [x] Use Polars `read_parquet`/`write_parquet` for manifests.
+- [x] Store one Parquet row per candidate with a nested `files` list of structs.
+- [x] Include `candidate_id`, `parent_candidate_id`, `stage_name`, `stage_role`, `operation_mode`, `candidate_status`, `source_artifact_id`, `source_path`, `derived_path`, and summary/error fields.
+- [x] Include workflow-relative artifact paths, app-volume names, app-volume paths, file roles, media types, size metadata when available, and expected-file flags in nested file records.
+- [x] Add deterministic candidate-id helpers: initial candidates hash producing stage, source artifact id/path, and normalized basename.
+- [x] Add derived candidate-id helpers: derived candidates hash parent candidate id, stage name, operation mode, and derived basename.
+- [x] Keep synthetic stage-2 convenience candidate ids sequential (`stage2_input_000001`, etc.) while preserving source-path provenance.
+- [x] Ensure generated candidate ids and manifests do not enter workflow DAG hash payloads unless user-facing node configuration changes.
+- [x] Write node metadata only as summary counts and manifest artifact ids, not as the only manifest copy.
+- [x] Add explicit `Stage2Input` manifest loading and validation.
+- [x] Add `Stage2Input` path normalization that scans a user-provided structure location and emits a minimal candidate manifest with synthetic candidate ids.
+- [x] Change `ExistingStructuresNode` so stage-2-only runs return both the configured structure artifact and the normalized candidate manifest artifact.
+- [x] Add strict candidate-id join helpers that fail on missing required candidates unless explicit inspection/debug config enables missing-candidate tolerance.
+- [x] Before skipping a completed candidate on retry, verify expected output files recorded in the manifest are still available.
+- [x] Route expected-file checks through workflow-volume paths for materialized artifacts and app-volume paths plus `volume_name` for app-owned outputs.
+- [x] Add tests for deterministic candidate ids across reruns.
+- [x] Add tests that candidate ids change only when provenance-relevant inputs change.
+- [x] Add tests that candidate-id helper internals and generated manifests do not affect DAG hash payloads.
+- [x] Add tests that manifest outputs are materialized as Parquet `ArtifactKind.TABLE` artifacts.
+- [x] Add tests that downstream nodes consume manifest artifacts rather than node metadata.
+- [x] Add tests that stage-2-only runs support explicit manifest loading and path-to-manifest normalization.
+- [x] Add tests that retry-skip verifies expected candidate output files and does not trust manifest completion rows alone.
+- [x] Add tests that strict candidate joins fail on missing required candidates and only drop candidates when explicitly configured.
 
 ## Phase 3: Table And Report Helpers
 

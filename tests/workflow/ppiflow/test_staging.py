@@ -10,7 +10,7 @@ import pytest
 from biomodals.app.design import ppiflow_app
 from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
 from biomodals.workflow import ppiflow_workflow
-from biomodals.workflow.ppiflow import staging
+from biomodals.workflow.ppiflow import manifests, staging
 from biomodals.workflow.ppiflow_workflow import (
     _active_ppiflow_app_steps,
     _inline_rosetta_config_files,
@@ -61,6 +61,34 @@ def test_csv_files_from_artifact_reads_directory_csvs(tmp_path: Path) -> None:
         artifact,
         {"source-volume": str(source_root)},
     ) == [("metrics.csv", b"score\n1\n")]
+
+
+def test_stage2_input_manifest_rows_scan_structure_directory(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    structure_dir = source_root / "existing"
+    structure_dir.mkdir(parents=True)
+    (structure_dir / "design-b.pdb").write_text("ATOM B\n", encoding="utf-8")
+    (structure_dir / "design-a.pdb").write_text("ATOM A\n", encoding="utf-8")
+
+    rows = staging.stage2_input_manifest_rows(
+        _source_artifact("existing"),
+        {"source-volume": str(source_root)},
+        patterns=("*.pdb",),
+    )
+
+    assert [row["candidate_id"] for row in rows] == [
+        manifests.stage2_input_candidate_id(1),
+        manifests.stage2_input_candidate_id(2),
+    ]
+    assert [row["source_path"] for row in rows] == [
+        "existing/design-a.pdb",
+        "existing/design-b.pdb",
+    ]
+    assert rows[0]["files"][0]["volume_name"] == "source-volume"
+    assert rows[0]["files"][0]["app_volume_path"] == "existing/design-a.pdb"
+    assert rows[0]["files"][0]["expected"] is True
 
 
 def test_ppiflow_entrypoint_stages_local_app_inputs(

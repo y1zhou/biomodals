@@ -22,6 +22,8 @@ from biomodals.schema import (
 )
 from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.core import NodeRunContext
+from biomodals.workflow.core._runtime import hashing
+from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow_workflow import (
     CONF,
     PPIFlowModalNamespace,
@@ -106,6 +108,7 @@ def _fake_namespace(
     filter_artifacts: _FakeModalFunction | None = None,
     derive_fixed_positions: _FakeModalFunction | None = None,
     rank_artifacts: _FakeModalFunction | None = None,
+    stage2_input_manifest: _FakeModalFunction | None = None,
     stage_ppiflow_input: _FakeModalFunction | None = None,
     stage_af3score_inputs: _FakeModalFunction | None = None,
     stage_rosetta_inputs: _FakeModalFunction | None = None,
@@ -158,6 +161,13 @@ def _fake_namespace(
             rank_artifacts
             or _FakeModalFunction(
                 "fc-rank", AppRunResult(status=AppRunStatus.SUCCEEDED)
+            ),
+        ),
+        stage2_input_manifest=cast(
+            modal.Function,
+            stage2_input_manifest
+            or _FakeModalFunction(
+                "fc-stage2-input", AppRunResult(status=AppRunStatus.SUCCEEDED)
             ),
         ),
         stage_ppiflow_input=cast(
@@ -1081,6 +1091,207 @@ RosettaFixStep: {}
         ppiflow_workflow.ExistingStructuresNode,
     )
     assert definition.dependencies["stage2-rosetta-fix"] == {"stage2-existing-input"}
+    assert (
+        definition.nodes["stage2-rosetta-fix"].inputs["candidate_manifest"].kind
+        == ArtifactKind.TABLE
+    )
+    assert (
+        definition.nodes["stage2-existing-input"].node.placement
+        == ppiflow_workflow.NodePlacement.REMOTE
+    )
+
+
+def test_stage2_input_node_returns_structures_and_manifest(tmp_path: Path) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="stage2_input_structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(volume_name="source-volume", path="existing"),
+            ),
+            AppOutput(
+                name="candidate_manifest",
+                kind=ArtifactKind.TABLE,
+                storage=VolumePath(
+                    volume_name="workflow-volume",
+                    path="ppiflow/run/node/attempt/stage2_input/candidate_manifest.parquet",
+                    media_type=ppiflow_manifests.MANIFEST_MEDIA_TYPE,
+                ),
+            ),
+        ],
+    )
+    stage2_input = _FakeModalFunction("fc-stage2-input", result)
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(enabled_steps="  RosettaFixStep: true\n"),
+        steps_yaml_bytes=b"""
+Stage2Input:
+  volume_name: source-volume
+  path: existing
+RosettaFixStep: {}
+""",
+        stage=2,
+        modal_namespace=_fake_namespace(stage2_input_manifest=stage2_input),
+    )
+    spec = workflow.validate().nodes["stage2-existing-input"]
+
+    node_result = spec.node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id=spec.node_id,
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={},
+        )
+    )
+
+    assert node_result.outputs[0].kind == ArtifactKind.STRUCTURES
+    assert node_result.outputs[1].kind == ArtifactKind.TABLE
+    assert stage2_input.kwargs["storage"] == VolumePath(
+        volume_name="source-volume",
+        path="existing",
+    )
+    assert stage2_input.kwargs["step_name"] == "Stage2Input"
+
+
+def test_stage2_input_generated_manifest_does_not_affect_dag_hash() -> None:
+    namespace_a = _fake_namespace(
+        stage2_input_manifest=_FakeModalFunction(
+            "fc-stage2-input-a",
+            AppRunResult(status=AppRunStatus.SUCCEEDED),
+        )
+    )
+    namespace_b = _fake_namespace(
+        stage2_input_manifest=_FakeModalFunction(
+            "fc-stage2-input-b",
+            AppRunResult(status=AppRunStatus.FAILED),
+        )
+    )
+    task_yaml = _task_yaml(enabled_steps="  RosettaFixStep: true\n")
+    steps_yaml = b"""
+Stage2Input:
+  volume_name: source-volume
+  path: existing
+RosettaFixStep: {}
+"""
+
+    first_hash = hashing.dag_hash(
+        build_ppiflow_workflow(
+            task_yaml_bytes=task_yaml,
+            steps_yaml_bytes=steps_yaml,
+            stage=2,
+            modal_namespace=namespace_a,
+        ).validate()
+    )
+    repeated_hash = hashing.dag_hash(
+        build_ppiflow_workflow(
+            task_yaml_bytes=task_yaml,
+            steps_yaml_bytes=steps_yaml,
+            stage=2,
+            modal_namespace=namespace_b,
+        ).validate()
+    )
+    changed_hash = hashing.dag_hash(
+        build_ppiflow_workflow(
+            task_yaml_bytes=task_yaml,
+            steps_yaml_bytes=b"""
+Stage2Input:
+  volume_name: source-volume
+  path: other-existing
+RosettaFixStep: {}
+""",
+            stage=2,
+            modal_namespace=namespace_a,
+        ).validate()
+    )
+
+    assert first_hash == repeated_hash
+    assert first_hash != changed_hash
+
+
+def test_stage2_input_normalization_scans_path_and_writes_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    existing_dir = source_root / "existing"
+    existing_dir.mkdir()
+    (existing_dir / "design-a.pdb").write_text("ATOM A\n", encoding="utf-8")
+    (existing_dir / "design-b.pdb").write_text("ATOM B\n", encoding="utf-8")
+
+    result = ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
+        storage=VolumePath(volume_name="source-volume", path="existing"),
+        config={"run_name": "stage2-run", "structure_patterns": "*.pdb"},
+        run_id="run-1",
+        node_id="stage2-existing-input",
+        attempt_id="attempt-1",
+        step_name="Stage2Input",
+    )
+
+    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+    assert result.outputs[0].metadata["structure_count"] == 2
+    assert result.outputs[1].kind == ArtifactKind.TABLE
+    assert result.outputs[1].storage.media_type == ppiflow_manifests.MANIFEST_MEDIA_TYPE
+    manifest_path = workflow_root / result.outputs[1].storage.path
+    frame = ppiflow_manifests.read_manifest(manifest_path)
+    assert frame.get_column("candidate_id").to_list() == [
+        "stage2_input_000001",
+        "stage2_input_000002",
+    ]
+    assert frame.get_column("source_path").to_list() == [
+        "existing/design-a.pdb",
+        "existing/design-b.pdb",
+    ]
+
+
+def test_stage2_input_normalization_accepts_explicit_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    existing_dir = source_root / "existing"
+    existing_dir.mkdir()
+    (existing_dir / "design-a.pdb").write_text("ATOM A\n", encoding="utf-8")
+    explicit_manifest = workflow_root / "provided" / "candidate_manifest.parquet"
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="provided-candidate",
+                stage_name="Stage2Input",
+                stage_role="stage2_input",
+                operation_mode="provided_manifest",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                source_artifact_id="provided",
+                source_path="existing/design-a.pdb",
+                derived_path="existing/design-a.pdb",
+                files=[
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        volume_name="source-volume",
+                        app_volume_path="existing/design-a.pdb",
+                    )
+                ],
+            )
+        ],
+        explicit_manifest,
+    )
+
+    result = ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
+        storage=VolumePath(volume_name="source-volume", path="existing"),
+        config={
+            "manifest_volume_name": "workflow-volume",
+            "manifest_path": "provided/candidate_manifest.parquet",
+        },
+        run_id="run-1",
+        node_id="stage2-existing-input",
+        attempt_id="attempt-1",
+        step_name="Stage2Input",
+    )
+
+    frame = ppiflow_manifests.read_manifest(
+        workflow_root / result.outputs[1].storage.path
+    )
+    assert frame.get_column("candidate_id").to_list() == ["provided-candidate"]
 
 
 def test_structure_consuming_steps_fail_clearly_without_inputs(

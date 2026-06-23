@@ -157,18 +157,18 @@ phase.
 
 **Tasks:**
 
-- [ ] Keep volume helpers that convert `WorkflowArtifact.storage` to mount paths for known app output volumes.
-- [ ] Keep archive extraction helpers for app functions that return `.tar.zst` bytes or archives in a volume path.
-- [ ] Update structure-selection helpers to return candidate-keyed selections instead of unkeyed `(name, bytes)` lists.
-- [ ] Keep candidate narrowing available only through explicit stage configuration such as `structure_index`, `max_structures`, or a future candidate selector.
-- [ ] Fold upstream before-partial structure selection into `PPIFlowPartialNode` staging.
-- [ ] Add partial sample directory discovery for PPIFlow stage 2.
-- [ ] Add candidate-wide DockQ model/reference pair preparation by candidate id.
-- [ ] Add Rosetta staging helpers that create PPIFlow-owned Rosetta job manifests with queue entries, command parameters, candidate ids, expected output paths, worker logs, and candidate outcomes.
-- [ ] Add tests for candidate-keyed archive extraction and app-volume staging.
-- [ ] Add tests for before-partial structure selection inside Partial staging.
-- [ ] Add tests for candidate-wide DockQ pair preparation.
-- [ ] Add tests for Rosetta job manifest staging.
+- [x] Keep volume helpers that convert `WorkflowArtifact.storage` to mount paths for known app output volumes.
+- [x] Keep archive extraction helpers for app functions that return `.tar.zst` bytes or archives in a volume path.
+- [x] Update structure-selection helpers to return candidate-keyed selections instead of unkeyed `(name, bytes)` lists.
+- [x] Keep candidate narrowing available only through explicit stage configuration such as `structure_index`, `max_structures`, or a future candidate selector.
+- [x] Fold upstream before-partial structure selection into `PPIFlowPartialNode` staging.
+- [x] Add partial sample directory discovery for PPIFlow stage 2.
+- [x] Add candidate-wide DockQ model/reference pair preparation by candidate id.
+- [x] Add Rosetta staging helpers that create PPIFlow-owned Rosetta job manifests with queue entries, command parameters, candidate ids, expected output paths, worker logs, and candidate outcomes.
+- [x] Add tests for candidate-keyed archive extraction and app-volume staging.
+- [x] Add tests for before-partial structure selection inside Partial staging.
+- [x] Add tests for candidate-wide DockQ pair preparation.
+- [x] Add tests for Rosetta job manifest staging.
 
 ## Phase 5: Candidate-Wide Remote Coordinators
 

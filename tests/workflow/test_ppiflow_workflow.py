@@ -777,7 +777,7 @@ def test_dockq_rejects_unpaired_structure_counts(tmp_path: Path) -> None:
         {"run_name": "dockq-run"},
     )
 
-    with pytest.raises(ValueError, match="same number"):
+    with pytest.raises(ValueError, match="pairing mismatch"):
         node.submit_remote(
             NodeRunContext(
                 run_id="run-1",

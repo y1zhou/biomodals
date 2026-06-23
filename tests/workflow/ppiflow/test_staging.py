@@ -5,6 +5,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import polars as pl
 import pytest
 
 from biomodals.app.design import ppiflow_app
@@ -89,6 +90,104 @@ def test_stage2_input_manifest_rows_scan_structure_directory(
     assert rows[0]["files"][0]["volume_name"] == "source-volume"
     assert rows[0]["files"][0]["app_volume_path"] == "existing/design-a.pdb"
     assert rows[0]["files"][0]["expected"] is True
+
+
+def test_candidate_structure_files_use_manifest_candidate_ids() -> None:
+    manifest = pl.DataFrame({
+        "candidate_id": ["candidate-a"],
+        "source_path": ["inputs/design-a.pdb"],
+        "derived_path": ["inputs/design-a.pdb"],
+        "files": [[{"path": "design-a.pdb"}]],
+    })
+
+    selected = staging.candidate_structure_files_from_selected(
+        [("artifact__design-a.pdb", b"ATOM\n")],
+        manifest_frame=manifest,
+    )
+
+    assert selected == [
+        staging.CandidateStructureFile(
+            candidate_id="candidate-a",
+            file_name="artifact__design-a.pdb",
+            data=b"ATOM\n",
+            source_path="artifact__design-a.pdb",
+        )
+    ]
+
+
+def test_prepare_dockq_pairs_by_candidate_matches_ids() -> None:
+    pairs = staging.prepare_dockq_pairs_by_candidate(
+        references=[
+            staging.CandidateStructureFile("b", "b-ref.pdb", b"REF B"),
+            staging.CandidateStructureFile("a", "a-ref.pdb", b"REF A"),
+        ],
+        models=[
+            staging.CandidateStructureFile("a", "a-model.pdb", b"MODEL A"),
+            staging.CandidateStructureFile("b", "b-model.pdb", b"MODEL B"),
+        ],
+        mapping="A:B",
+    )
+
+    assert [pair["candidate_id"] for pair in pairs] == ["a", "b"]
+    assert pairs[0]["reference_name"] == "a-ref.pdb"
+    assert pairs[0]["model_name"] == "a-model.pdb"
+    assert pairs[0]["mapping"] == "A:B"
+
+
+def test_prepare_dockq_pairs_by_candidate_rejects_missing_pairs() -> None:
+    with pytest.raises(ValueError, match="pairing mismatch"):
+        staging.prepare_dockq_pairs_by_candidate(
+            references=[staging.CandidateStructureFile("a", "a-ref.pdb", b"REF")],
+            models=[staging.CandidateStructureFile("b", "b-model.pdb", b"MODEL")],
+        )
+
+
+def test_discover_partial_sample_dirs(tmp_path: Path) -> None:
+    sample_dir = tmp_path / "stage2" / "partial" / "sample_0"
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "model.pdb").write_text("ATOM\n", encoding="utf-8")
+    other_dir = tmp_path / "stage2" / "other"
+    other_dir.mkdir()
+    (other_dir / "model.pdb").write_text("ATOM\n", encoding="utf-8")
+
+    assert staging.discover_partial_sample_dirs(tmp_path) == [sample_dir]
+
+
+def test_rosetta_job_manifest_rows_and_writer(tmp_path: Path) -> None:
+    rows = staging.rosetta_job_manifest_rows(
+        [
+            staging.CandidateStructureFile(
+                "candidate-a",
+                "design-a.pdb",
+                b"ATOM\n",
+            )
+        ],
+        rosetta_binary="relax",
+        rosetta_script="workflow.xml",
+        flags_file="workflow.flags",
+    )
+
+    assert rows == [
+        {
+            "candidate_id": "candidate-a",
+            "index": 1,
+            "status": "pending",
+            "binary": "relax",
+            "pdb": "inputs/1/design-a.pdb",
+            "rosetta_script": "workflow.xml",
+            "flags_file": "workflow.flags",
+            "expected_output_dir": "outputs/1",
+            "expected_score_file": "outputs/1/score.sc",
+            "worker_log": "logs/1.log",
+        }
+    ]
+    manifest_path = staging.write_rosetta_job_manifest(
+        rows,
+        tmp_path / "rosetta_job_manifest.csv",
+    )
+    assert pl.read_csv(manifest_path).get_column("candidate_id").to_list() == [
+        "candidate-a"
+    ]
 
 
 def test_ppiflow_entrypoint_stages_local_app_inputs(

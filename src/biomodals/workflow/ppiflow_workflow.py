@@ -872,6 +872,9 @@ def stage_rosetta_inputs(
         patterns=patterns,
         max_files=max_files,
     )
+    candidate_structures = ppiflow_staging.candidate_structure_files_from_selected(
+        selected
+    )
     safe_run_name = sanitize_filename(run_name)
     safe_run_id = sanitize_filename(run_id)
     layout = AppRunLayout.from_run_root(
@@ -903,24 +906,36 @@ def stage_rosetta_inputs(
         f"{rosetta_app.CONF.name}-queue-{safe_run_id}",
         create_if_missing=True,
     )
-    for index, (file_name, file_bytes) in enumerate(selected, start=1):
-        remote_pdb = f"inputs/{index}/{sanitize_filename(file_name)}"
+    rosetta_rows = ppiflow_staging.rosetta_job_manifest_rows(
+        candidate_structures,
+        rosetta_binary=rosetta_binary,
+        rosetta_script=remote_script,
+        flags_file=remote_flags,
+    )
+    for row, structure in zip(rosetta_rows, candidate_structures, strict=True):
+        remote_pdb = str(row["pdb"])
         pdb_path = layout.run_root / remote_pdb
         pdb_path.parent.mkdir(parents=True, exist_ok=True)
-        pdb_path.write_bytes(file_bytes)
+        pdb_path.write_bytes(structure.data)
         queue.put({
-            "index": index,
-            "binary": rosetta_binary,
+            "index": int(row["index"]),
+            "candidate_id": str(row["candidate_id"]),
+            "binary": str(row["binary"]),
             "pdb": remote_pdb,
             "rosetta_script": remote_script,
             "flags_file": remote_flags,
         })
+    job_manifest = ppiflow_staging.write_rosetta_job_manifest(
+        rosetta_rows,
+        layout.run_root / "rosetta_job_manifest.csv",
+    )
     ROSETTA_OUTPUT_VOLUME.commit()
     return {
         "run_name": safe_run_name,
         "run_id": safe_run_id,
         "run_root": str(layout.run_root),
         "num_jobs": len(selected),
+        "job_manifest": str(job_manifest),
     }
 
 
@@ -1471,37 +1486,24 @@ class DockQNode(_ConfiguredAppStepNode):
 
     def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
         """Submit the DockQ app function."""
-        references = self._select_structures(context)
+        references = ppiflow_staging.candidate_structure_files_from_selected(
+            self._select_structures(context)
+        )
         model_artifacts = context.inputs.get("models") or []
         if not model_artifacts:
             raise ValueError(f"{self.step_name} requires model structure inputs")
-        models = self.modal_namespace.select_structures.remote(
-            artifacts=model_artifacts,
-            patterns=None,
-            max_files=self.config.get("max_models"),
-        )
-        if len(references) != len(models):
-            raise ValueError(
-                f"{self.step_name} requires the same number of reference and model "
-                f"structures; found {len(references)} reference(s) and "
-                f"{len(models)} model(s)"
+        models = ppiflow_staging.candidate_structure_files_from_selected(
+            self.modal_namespace.select_structures.remote(
+                artifacts=model_artifacts,
+                patterns=None,
+                max_files=self.config.get("max_models"),
             )
-        pairs = []
-        for pair_idx, (
-            (reference_name, reference_bytes),
-            (model_name, model_bytes),
-        ) in enumerate(
-            zip(references, models, strict=True),
-            start=1,
-        ):
-            pairs.append({
-                "id": f"dockq_pair_{pair_idx}",
-                "model_name": model_name,
-                "model_bytes": model_bytes,
-                "reference_name": reference_name,
-                "reference_bytes": reference_bytes,
-                "mapping": self.config.get("mapping"),
-            })
+        )
+        pairs = ppiflow_staging.prepare_dockq_pairs_by_candidate(
+            references=references,
+            models=models,
+            mapping=self.config.get("mapping"),
+        )
         if not pairs:
             raise ValueError(f"{self.step_name} did not find any DockQ pairs")
         dockq_args = self.config.get("dockq_args", "--short")

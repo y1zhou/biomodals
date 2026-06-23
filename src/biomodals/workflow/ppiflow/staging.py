@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
+import polars as pl
+
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import AppRunStatus, ArtifactKind, WorkflowArtifact
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
-from biomodals.workflow.ppiflow import manifests
+from biomodals.workflow.ppiflow import manifests, tables
 
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
 
@@ -28,6 +30,16 @@ class SelectedStructureFile:
     volume_name: str
     size_bytes: int | None = None
     media_type: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidateStructureFile:
+    """One selected structure keyed to a PPIFlow candidate id."""
+
+    candidate_id: str
+    file_name: str
+    data: bytes
+    source_path: str | None = None
 
 
 def artifact_mount_path(
@@ -354,3 +366,162 @@ def select_structure_files_from_artifacts(
     if not selected:
         raise FileNotFoundError("No PPIFlow structure files were found in inputs")
     return selected
+
+
+def candidate_structure_files_from_selected(
+    selected: Sequence[tuple[str, bytes]],
+    *,
+    manifest_frame: pl.DataFrame | None = None,
+) -> list[CandidateStructureFile]:
+    """Attach candidate ids to selected structure bytes."""
+    lookup = _candidate_key_lookup(manifest_frame)
+    keyed = []
+    for file_name, data in selected:
+        key = tables.candidate_key(file_name)
+        keyed.append(
+            CandidateStructureFile(
+                candidate_id=lookup.get(key, key),
+                file_name=file_name,
+                data=data,
+                source_path=file_name,
+            )
+        )
+    keyed.sort(key=lambda item: (item.candidate_id, item.file_name))
+    return keyed
+
+
+def candidate_structure_files_from_artifacts(
+    artifacts: Sequence[WorkflowArtifact],
+    volume_roots: Mapping[str, str],
+    *,
+    manifest_frame: pl.DataFrame | None = None,
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> list[CandidateStructureFile]:
+    """Read selected structures and return candidate-keyed records."""
+    return candidate_structure_files_from_selected(
+        select_structure_files_from_artifacts(
+            artifacts,
+            volume_roots,
+            patterns=patterns,
+            max_files=max_files,
+        ),
+        manifest_frame=manifest_frame,
+    )
+
+
+def prepare_dockq_pairs_by_candidate(
+    *,
+    references: Sequence[CandidateStructureFile],
+    models: Sequence[CandidateStructureFile],
+    mapping: object = None,
+) -> list[dict[str, object]]:
+    """Pair DockQ reference/model structures by candidate id."""
+    references_by_id = _unique_candidate_structures(references, "reference")
+    models_by_id = _unique_candidate_structures(models, "model")
+    missing_models = sorted(set(references_by_id).difference(models_by_id))
+    missing_references = sorted(set(models_by_id).difference(references_by_id))
+    if missing_models or missing_references:
+        raise ValueError(
+            "DockQ candidate pairing mismatch: "
+            f"missing models={missing_models}, missing references={missing_references}"
+        )
+    pairs = []
+    for candidate_id in sorted(references_by_id):
+        reference = references_by_id[candidate_id]
+        model = models_by_id[candidate_id]
+        pairs.append({
+            "id": candidate_id,
+            "candidate_id": candidate_id,
+            "model_name": model.file_name,
+            "model_bytes": model.data,
+            "reference_name": reference.file_name,
+            "reference_bytes": reference.data,
+            "mapping": mapping,
+        })
+    return pairs
+
+
+def discover_partial_sample_dirs(root: str | Path) -> list[Path]:
+    """Return PPIFlow partial sample directories below a run root."""
+    root = Path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"PPIFlow partial root was not found: {root}")
+    return sorted({
+        path.parent
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in STRUCTURE_SUFFIXES
+        and ("sample" in path.parent.name.lower() or "partial" in path.parts)
+    })
+
+
+def rosetta_job_manifest_rows(
+    structures: Sequence[CandidateStructureFile],
+    *,
+    rosetta_binary: str,
+    rosetta_script: str | None = None,
+    flags_file: str | None = None,
+) -> list[dict[str, object]]:
+    """Build PPIFlow-owned Rosetta queue/job manifest rows."""
+    rows = []
+    for index, structure in enumerate(structures, start=1):
+        input_pdb = f"inputs/{index}/{sanitize_filename(structure.file_name)}"
+        output_dir = f"outputs/{index}"
+        rows.append({
+            "candidate_id": structure.candidate_id,
+            "index": index,
+            "status": "pending",
+            "binary": rosetta_binary,
+            "pdb": input_pdb,
+            "rosetta_script": rosetta_script,
+            "flags_file": flags_file,
+            "expected_output_dir": output_dir,
+            "expected_score_file": f"{output_dir}/score.sc",
+            "worker_log": f"logs/{index}.log",
+        })
+    return rows
+
+
+def write_rosetta_job_manifest(
+    rows: Sequence[Mapping[str, object]],
+    path: str | Path,
+) -> Path:
+    """Write Rosetta job manifest rows as a small CSV table."""
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([dict(row) for row in rows]).write_csv(manifest_path)
+    return manifest_path
+
+
+def _candidate_key_lookup(manifest_frame: pl.DataFrame | None) -> dict[str, str]:
+    if manifest_frame is None or manifest_frame.is_empty():
+        return {}
+    lookup = {}
+    for row in manifest_frame.iter_rows(named=True):
+        candidate_id = str(row["candidate_id"])
+        for value in (row.get("source_path"), row.get("derived_path")):
+            if value:
+                lookup[tables.candidate_key(str(value))] = candidate_id
+        for file_record in row.get("files") or []:
+            if isinstance(file_record, Mapping):
+                for field_name in ("path", "app_volume_path", "workflow_path"):
+                    if file_record.get(field_name):
+                        lookup[tables.candidate_key(str(file_record[field_name]))] = (
+                            candidate_id
+                        )
+    return lookup
+
+
+def _unique_candidate_structures(
+    structures: Sequence[CandidateStructureFile],
+    role: str,
+) -> dict[str, CandidateStructureFile]:
+    by_id = {}
+    for structure in structures:
+        if structure.candidate_id in by_id:
+            raise ValueError(
+                f"Duplicate {role} structure for candidate {structure.candidate_id!r}"
+            )
+        by_id[structure.candidate_id] = structure
+    return by_id

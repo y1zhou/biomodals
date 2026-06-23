@@ -2,12 +2,16 @@
 
 # ruff: noqa: D103
 
+import tarfile
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import modal
+import polars as pl
 import pytest
+import zstandard as zstd
 
 from biomodals.app.design import ppiflow_app
 from biomodals.helper.styling import strip_ansi
@@ -245,6 +249,16 @@ def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Pat
     return source_root, workflow_root
 
 
+def _tar_zst_bytes(files: dict[str, bytes]) -> bytes:
+    tar_buffer = BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, BytesIO(data))
+    return zstd.ZstdCompressor().compress(tar_buffer.getvalue())
+
+
 def test_ppiflow_workflow_declares_app_dependency() -> None:
     assert CONF.depends_on_apps == (
         "ppiflow",
@@ -349,7 +363,9 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
                     name="LigandMPNN_outputs",
                     kind=ArtifactKind.ARCHIVE,
                     storage=InlineBytes(
-                        data=b"archive",
+                        data=_tar_zst_bytes({
+                            "outputs/seqs/selected.fa": b">selected_design\nACD\n"
+                        }),
                         filename="ligandmpnn.tar.zst",
                         media_type="application/zstd",
                     ),
@@ -396,6 +412,8 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
     assert ligandmpnn.kwargs["cli_args"]["--number_of_batches"] == "3"
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert result.outputs[0].metadata["selected_structure"] == "selected.pdb"
+    assert result.outputs[1].name == "mpnn_seqs"
+    assert b"selected_design" in result.outputs[1].storage.data
 
 
 def test_ligandmpnn_rejects_implicit_multi_structure_selection(
@@ -537,6 +555,47 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert stage_inputs.kwargs["patterns"] == ("*.pdb",)
 
 
+def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
+    stage_inputs = _FakeModalFunction("fc-stage-af3", ["a.pdb", "b.pdb"])
+    prepare = _FakeModalFunction(
+        "fc-af3-prepare",
+        SimpleNamespace(chunk_specs=[]),
+    )
+    postprocess = _FakeModalFunction(
+        "fc-af3-post",
+        {
+            "metrics_csv": (
+                f"{ppiflow_workflow.AF3SCORE_OUTPUT_MOUNTPOINT}/af3-run/"
+                "af3score_metrics.csv"
+            ),
+            "metrics_rows": 1,
+            "processed": 1,
+            "failed": 1,
+        },
+    )
+    node = ppiflow_workflow.AF3ScoreNode(
+        "AF3scoreStep_stage1",
+        _fake_namespace(
+            stage_af3score_inputs=stage_inputs,
+            af3score_prepare=prepare,
+            af3score_postprocess=postprocess,
+        ),
+        {"run_name": "af3-run"},
+    )
+
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage1-af3score",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={"structures": [_upstream_structure_artifact()]},
+        )
+    )
+
+    assert result.status == AppRunStatus.PARTIAL
+
+
 def test_rosetta_step_stages_inputs_and_returns_output_directory(
     tmp_path: Path,
 ) -> None:
@@ -585,7 +644,13 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
         b"ATOM      2  CA  CYS A   2      0.000   0.000   0.000  1.00  0.00           C\n"
     )
     selector = _FakeModalFunction("fc-select", [("model.pdb", pdb_bytes)])
-    predict = _FakeModalFunction("fc-af3-predict", b"af3-tar-zst")
+    predict = _FakeModalFunction(
+        "fc-af3-predict",
+        _tar_zst_bytes({
+            "outputs/model_summary_confidences.json": b'{"ranking_score":0.7,"iptm":0.8}',
+            "outputs/model.cif": b"data_model\n",
+        }),
+    )
     namespace = _fake_namespace(
         select_structures=selector,
         alphafold3_predict_structures=predict,
@@ -610,7 +675,8 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
     assert predict.kwargs["model_seeds"] == [3]
     assert b'"sequence":"AC"' in predict.kwargs["json_bytes"]
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
-    assert result.outputs[0].storage.data == b"af3-tar-zst"
+    assert result.outputs[1].name == "refold_quality_metrics"
+    assert b"ranking_score" in result.outputs[1].storage.data
 
 
 def test_refold_rejects_implicit_multi_structure_selection(tmp_path: Path) -> None:
@@ -842,6 +908,21 @@ def test_filter_transform_selects_only_passing_structures(
         "upstream-structures__design-1.pdb"
     ]
     assert result.outputs[0].metadata["retained_count"] == 1
+    assert [output.name for output in result.outputs] == [
+        "filtered_structures",
+        "filtered_scores",
+        "retained_candidate_manifest",
+        "filter_audit",
+    ]
+    retained_manifest = ppiflow_manifests.read_manifest(
+        workflow_root / result.outputs[2].storage.path
+    )
+    assert retained_manifest.get_column("candidate_id").to_list() == ["design-1"]
+    audit = pl.read_csv(workflow_root / result.outputs[3].storage.path)
+    assert audit.select("candidate_id", "passed", "reason").to_dicts() == [
+        {"candidate_id": "design-1", "passed": True, "reason": "passed"},
+        {"candidate_id": "design-2", "passed": False, "reason": "filtered"},
+    ]
 
 
 def test_fixed_position_transform_parses_rosetta_residue_energies(
@@ -912,6 +993,94 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
         "upstream-structures__design-1.pdb"
     ]
     assert result.outputs[1].metadata["rows"] == 1
+
+
+def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) -> None:
+    _, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    report_dir = workflow_root / "report-inputs"
+    report_dir.mkdir()
+    ranked_csv = report_dir / "ranked_designs.csv"
+    ranked_csv.write_text("design,rank_score\ndesign-1,1.0\n", encoding="utf-8")
+    audit_csv = report_dir / "filter_audit.csv"
+    audit_csv.write_text(
+        "candidate_id,stage_name,passed,reason\n"
+        "design-1,FilterStep_stage2,true,passed\n"
+        "design-2,FilterStep_stage2,false,filtered\n",
+        encoding="utf-8",
+    )
+    manifest_path = report_dir / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="design-1",
+                stage_name="FilterStep_stage2",
+                stage_role="filter",
+                operation_mode="retained",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[],
+            ),
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="design-2",
+                stage_name="FilterStep_stage2",
+                stage_role="filter",
+                operation_mode="rejected",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[],
+            ),
+        ],
+        manifest_path,
+    )
+    node = ppiflow_workflow.ReportNode("ReportStep")
+
+    result = node.run(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage2-report",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={
+                "rank": [
+                    WorkflowArtifact(
+                        artifact_id="rank",
+                        producing_node_id="rank",
+                        kind=ArtifactKind.TABLE,
+                        storage=VolumePath(
+                            volume_name="workflow-volume",
+                            path="report-inputs/ranked_designs.csv",
+                        ),
+                    )
+                ],
+                "filter_audit": [
+                    WorkflowArtifact(
+                        artifact_id="audit",
+                        producing_node_id="filter",
+                        kind=ArtifactKind.TABLE,
+                        storage=VolumePath(
+                            volume_name="workflow-volume",
+                            path="report-inputs/filter_audit.csv",
+                        ),
+                    )
+                ],
+                "candidate_manifest": [
+                    WorkflowArtifact(
+                        artifact_id="manifest",
+                        producing_node_id="filter",
+                        kind=ArtifactKind.TABLE,
+                        storage=VolumePath(
+                            volume_name="workflow-volume",
+                            path="report-inputs/candidate_manifest.parquet",
+                            media_type=ppiflow_manifests.MANIFEST_MEDIA_TYPE,
+                        ),
+                    )
+                ],
+            },
+        )
+    )
+
+    markdown = result.outputs[0].storage.data.decode("utf-8")
+    assert "## Candidate Attrition" in markdown
+    assert "FilterStep_stage2" in markdown
+    assert "## Ranked Designs" in markdown
 
 
 def test_submit_ppiflow_workflow_dry_run_prints_dag_without_orchestrator(
@@ -1050,7 +1219,22 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-rosetta-relax",
         "stage2-dockq",
     }
-    assert definition.dependencies["stage2-report"] == {"stage2-rank"}
+    assert (
+        definition.nodes["stage2-rank"].inputs["refold_metrics"].kind
+        == ArtifactKind.TABLE
+    )
+    assert (
+        definition.nodes["stage2-report"].inputs["filter_tables"].kind
+        == ArtifactKind.TABLE
+    )
+    assert definition.dependencies["stage2-report"] == {
+        "stage2-rank",
+        "stage1-ligandmpnn",
+        "stage1-filter",
+        "stage2-ligandmpnn",
+        "stage2-filter",
+        "stage2-alphafold3-refold",
+    }
 
 
 def test_ppiflow_stage2_only_requires_existing_input() -> None:

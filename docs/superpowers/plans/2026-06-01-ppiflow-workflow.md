@@ -126,26 +126,26 @@ phase.
 
 **Tasks:**
 
-- [ ] Keep upstream-facing score, sequence, and report tables in their existing formats unless separately changed.
-- [ ] Add `mpnn_seqs.csv` extraction from LigandMPNN-designed outputs with `candidate_id` and parent provenance for stage 1 and stage 2.
-- [ ] Add upstream-equivalent FASTA collection into `mpnn_seqs.csv`.
-- [ ] Add ReFold metrics extraction from AlphaFold3 confidence/ranking JSONs into a candidate-keyed CSV.
-- [ ] Add score-table status helpers that classify requested candidate or pair counts as `SUCCEEDED`, `PARTIAL`, or `FAILED` based on usable score rows while retaining diagnostic rows and logs.
-- [ ] Change filter helpers to join structures, scores, and incoming candidate manifests by `candidate_id`.
-- [ ] Make filters emit a retained-candidate manifest for downstream nodes.
-- [ ] Add a filter audit table that records every input candidate, pass/fail status, evaluated filter metrics, and rejection reason.
-- [ ] Aggregate retained, rejected, failed, and skipped counts from manifests and audit tables into a candidate-attrition table.
-- [ ] Make ranking include only retained candidates with complete required structures and score rows.
-- [ ] Keep rejected, partial, failed, and skipped candidates out of `ranked_designs.csv` and visible through attrition/report tables.
-- [ ] Render Markdown and HTML reports from materialized tables/manifests without adding a report app.
-- [ ] Wire stage 1 and stage 2 `mpnn_seqs.csv` outputs into Rank/Report through candidate-id joins.
-- [ ] Wire filter audit tables and candidate manifests into Report for candidate attrition sections.
-- [ ] Add tests for sequence-table extraction.
-- [ ] Add tests for ReFold metrics extraction from AlphaFold3 archive JSONs.
-- [ ] Add tests for score-table `SUCCEEDED`/`PARTIAL`/`FAILED` classification.
-- [ ] Add tests for filter retained manifests and audit tables.
-- [ ] Add tests that `ranked_designs.csv` excludes rejected/partial/failed candidates while reports include attrition counts.
-- [ ] Add tests that `ReportNode` consumes manifests and audit tables without feeding rejected candidates back into downstream scientific nodes.
+- [x] Keep upstream-facing score, sequence, and report tables in their existing formats unless separately changed.
+- [x] Add `mpnn_seqs.csv` extraction from LigandMPNN-designed outputs with `candidate_id` and parent provenance for stage 1 and stage 2.
+- [x] Add upstream-equivalent FASTA collection into `mpnn_seqs.csv`.
+- [x] Add ReFold metrics extraction from AlphaFold3 confidence/ranking JSONs into a candidate-keyed CSV.
+- [x] Add score-table status helpers that classify requested candidate or pair counts as `SUCCEEDED`, `PARTIAL`, or `FAILED` based on usable score rows while retaining diagnostic rows and logs.
+- [x] Change filter helpers to join structures, scores, and incoming candidate manifests by `candidate_id`.
+- [x] Make filters emit a retained-candidate manifest for downstream nodes.
+- [x] Add a filter audit table that records every input candidate, pass/fail status, evaluated filter metrics, and rejection reason.
+- [x] Aggregate retained, rejected, failed, and skipped counts from manifests and audit tables into a candidate-attrition table.
+- [x] Make ranking include only retained candidates with complete required structures and score rows.
+- [x] Keep rejected, partial, failed, and skipped candidates out of `ranked_designs.csv` and visible through attrition/report tables.
+- [x] Render Markdown and HTML reports from materialized tables/manifests without adding a report app.
+- [x] Wire stage 1 and stage 2 `mpnn_seqs.csv` outputs into Rank/Report through candidate-id joins.
+- [x] Wire filter audit tables and candidate manifests into Report for candidate attrition sections.
+- [x] Add tests for sequence-table extraction.
+- [x] Add tests for ReFold metrics extraction from AlphaFold3 archive JSONs.
+- [x] Add tests for score-table `SUCCEEDED`/`PARTIAL`/`FAILED` classification.
+- [x] Add tests for filter retained manifests and audit tables.
+- [x] Add tests that `ranked_designs.csv` excludes rejected/partial/failed candidates while reports include attrition counts.
+- [x] Add tests that `ReportNode` consumes manifests and audit tables without feeding rejected candidates back into downstream scientific nodes.
 
 ## Phase 4: Staging And App-Volume Helpers
 

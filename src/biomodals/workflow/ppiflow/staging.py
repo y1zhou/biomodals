@@ -6,6 +6,7 @@ import fnmatch
 import tarfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 from biomodals.helper.shell import sanitize_filename
@@ -112,6 +113,30 @@ def structure_files_from_tar_zst(
                     safe_selected_file_name(artifact.artifact_id, member.name),
                     extracted.read(),
                 ))
+    return selected
+
+
+def files_from_tar_zst_bytes(
+    data: bytes,
+    *,
+    suffixes: Sequence[str] | None = None,
+) -> list[tuple[str, bytes]]:
+    """Read selected files from tar.zst bytes."""
+    import zstandard as zstd
+
+    suffix_set = {suffix.lower() for suffix in suffixes or ()}
+    selected = []
+    with BytesIO(data) as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                if suffix_set and Path(member.name).suffix.lower() not in suffix_set:
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is not None:
+                    selected.append((member.name, extracted.read()))
     return selected
 
 

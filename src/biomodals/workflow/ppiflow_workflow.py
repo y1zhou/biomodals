@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import html
 import os
 import shlex
 import shutil
@@ -363,6 +362,7 @@ def filter_ppiflow_artifacts(
     *,
     structures: list[WorkflowArtifact],
     scores: list[WorkflowArtifact],
+    candidate_manifests: list[WorkflowArtifact] | None = None,
     config: dict[str, object],
     run_id: str,
     node_id: str,
@@ -418,11 +418,18 @@ def filter_ppiflow_artifacts(
     if not isinstance(raw_filters, Mapping) or not raw_filters:
         raise ValueError(f"{step_name} filters must be a non-empty mapping")
 
-    passing_rows = [
-        row
-        for row in score_frame.iter_rows(named=True)
-        if ppiflow_tables.row_passes_filters(row, raw_filters)
-    ]
+    manifest_frame = _candidate_manifest_frame_from_inputs(
+        candidate_manifests or [],
+        selected,
+        step_name=step_name,
+    )
+    retained_manifest, retained_scores, audit_frame = ppiflow_tables.filter_candidates(
+        manifest_frame=manifest_frame,
+        score_frame=score_frame,
+        filters=raw_filters,
+        filename_col=filename_col,
+        stage_name=step_name,
+    )
     structures_by_key = {}
     for name, data in selected:
         key = ppiflow_tables.candidate_key(name)
@@ -430,13 +437,11 @@ def filter_ppiflow_artifacts(
             raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
         structures_by_key[key] = (name, data)
     retained = []
-    retained_rows = []
-    for row in passing_rows:
+    for row in retained_scores.iter_rows(named=True):
         key = ppiflow_tables.candidate_key(str(row.get(filename_col) or ""))
         structure = structures_by_key.get(key)
         if structure is not None:
             retained.append(structure)
-            retained_rows.append(row)
     if not retained:
         raise ValueError(f"{step_name} filters rejected every available structure")
 
@@ -455,7 +460,11 @@ def filter_ppiflow_artifacts(
     for file_name, file_bytes in retained:
         (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
     filtered_csv = output_dir / "filtered_scores.csv"
-    pl.DataFrame(retained_rows, schema=score_frame.schema).write_csv(filtered_csv)
+    retained_scores.write_csv(filtered_csv)
+    audit_csv = output_dir / "filter_audit.csv"
+    audit_frame.write_csv(audit_csv)
+    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(retained_manifest.to_dicts(), manifest_path)
     WORKFLOW_OUTPUT_VOLUME.commit()
     metadata = {
         "step_name": step_name,
@@ -482,7 +491,24 @@ def filter_ppiflow_artifacts(
                 mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
                 volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
                 media_type="text/csv",
-                metadata={"step_name": step_name, "rows": len(retained_rows)},
+                metadata={"step_name": step_name, "rows": retained_scores.height},
+            ),
+            ppiflow_manifests.manifest_artifact_output(
+                manifest_path=manifest_path,
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                stage_name=step_name,
+                row_count=retained_manifest.height,
+                name="retained_candidate_manifest",
+            ),
+            volume_app_output(
+                name="filter_audit",
+                kind=ArtifactKind.TABLE,
+                remote_path=str(audit_csv),
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                media_type="text/csv",
+                metadata={"step_name": step_name, "rows": audit_frame.height},
             ),
         ],
     )
@@ -675,97 +701,22 @@ def rank_ppiflow_artifacts(
             PPI_FLOW_SOURCE_VOLUME_ROOTS,
         )
     ]
-    dockq_rows = [
-        row
-        for _, frame in csv_frames
-        if "dockq" in frame.columns
-        for row in frame.iter_rows(named=True)
-    ]
-    af3_rows = [
-        row
-        for _, frame in csv_frames
-        if any("iptm" in column.lower() for column in frame.columns)
-        for row in frame.iter_rows(named=True)
-    ]
-    rosetta_rows = [
-        row
-        for _, frame in csv_frames
-        if "interface_score" in frame.columns
-        for row in frame.iter_rows(named=True)
-    ]
-    if not dockq_rows and not af3_rows and not rosetta_rows:
+    score_frames = [frame for _, frame in csv_frames]
+    if not score_frames:
         raise ValueError(f"{step_name} did not find any supported score tables")
 
-    def row_key(row: Mapping[str, object]) -> str:
-        for column in (
-            "target_name",
-            "reference",
-            "reference_pdb",
-            "pdb_name",
-            "description",
-            "filename",
-            "name",
-            "id",
-        ):
-            if row.get(column):
-                return ppiflow_tables.candidate_key(str(row[column]))
-        return ""
-
-    dockq_by_key = {row_key(row): row for row in dockq_rows}
-    af3_by_key = {row_key(row): row for row in af3_rows}
-    rosetta_by_key = {row_key(row): row for row in rosetta_rows}
-    gentype = str(config.get("gentype") or "binder")
-    rank_columns = (
-        ("iptm", "ranking_score")
-        if gentype == "binder"
-        else ("iptm_A_C", "chain_A_iptm", "iptm", "ranking_score")
-    )
-    dockq_threshold = float(config.get("dockq_threshold", 0.49))
-    ranked = []
     structure_by_key = {}
     for name, data in selected_structures:
         key = ppiflow_tables.candidate_key(name)
         if key in structure_by_key:
             raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
         structure_by_key[key] = (name, data)
-    for key, (file_name, _) in structure_by_key.items():
-        dockq_row = dockq_by_key.get(key, {})
-        af3_row = af3_by_key.get(key, {})
-        rosetta_row = rosetta_by_key.get(key, {})
-        dockq = float(dockq_row["dockq"]) if dockq_row.get("dockq") else None
-        if dockq is not None and dockq <= dockq_threshold:
-            continue
-        rank_metric = next(
-            (
-                float(af3_row[column])
-                for column in rank_columns
-                if af3_row.get(column) not in (None, "")
-            ),
-            None,
-        )
-        interface_score = (
-            float(rosetta_row["interface_score"])
-            if rosetta_row.get("interface_score") not in (None, "")
-            else None
-        )
-        score = (
-            100 * rank_metric - interface_score
-            if rank_metric is not None and interface_score is not None
-            else dockq
-            if dockq is not None
-            else rank_metric
-        )
-        if score is None:
-            continue
-        ranked.append({
-            "design": key,
-            "filename": file_name,
-            "rank_score": score,
-            "dockq": dockq,
-            "iptm": rank_metric,
-            "interface_score": interface_score,
-        })
-    ranked.sort(key=lambda row: float(row["rank_score"]), reverse=True)
+    ranked = ppiflow_tables.ranked_design_rows(
+        structures=selected_structures,
+        score_frames=score_frames,
+        gentype=str(config.get("gentype") or "binder"),
+        dockq_threshold=float(config.get("dockq_threshold", 0.49)),
+    )
     if not ranked:
         raise ValueError(f"{step_name} found no structures with usable ranking metrics")
 
@@ -1187,11 +1138,38 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
     ) -> AppRunResult:
         """Expose LigandMPNN archives as structure artifacts."""
         result = AppRunResult.model_validate(result)
-        return _result_with_output_kind(
+        adapted = _result_with_output_kind(
             result,
             ArtifactKind.STRUCTURES,
             {"step_name": self.step_name} | dict(metadata),
         )
+        sequence_rows = []
+        for output in adapted.outputs:
+            if not isinstance(output.storage, InlineBytes):
+                continue
+            if output.storage.media_type != ZSTD_MEDIA_TYPE:
+                continue
+            sequence_rows.extend(
+                ppiflow_tables.mpnn_sequence_rows_from_fasta_files(
+                    ppiflow_staging.files_from_tar_zst_bytes(
+                        output.storage.data,
+                        suffixes=(".fa", ".faa", ".fasta"),
+                    ),
+                    stage_name=self.step_name,
+                    parent_candidate_id=str(metadata.get("selected_structure") or ""),
+                )
+            )
+        sequence_output = _inline_csv_table_output(
+            name="mpnn_seqs",
+            filename="mpnn_seqs.csv",
+            rows=sequence_rows,
+            metadata={"step_name": self.step_name},
+        )
+        if sequence_output is not None:
+            return adapted.model_copy(
+                update={"outputs": [*adapted.outputs, sequence_output]}
+            )
+        return adapted
 
 
 @dataclass
@@ -1315,8 +1293,13 @@ class AF3ScoreNode(_ConfiguredAppStepNode):
             )
 
         metrics_csv = str(metrics["metrics_csv"])
+        status = ppiflow_tables.score_table_status(
+            requested_count=len(input_names),
+            usable_rows=int(metrics.get("metrics_rows", 0)),
+            failed_count=int(metrics.get("failed", 0)),
+        )
         return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
+            status=status,
             outputs=[
                 AppOutput(
                     name="af3score_metrics",
@@ -1444,25 +1427,41 @@ class ReFoldNode(_ConfiguredAppStepNode):
             model_seeds=list(conf.modelSeeds),
         )
         tarball_bytes = function_call.get()
+        metric_rows = ppiflow_tables.refold_metric_rows_from_json_files(
+            ppiflow_staging.files_from_tar_zst_bytes(
+                tarball_bytes,
+                suffixes=(".json",),
+            ),
+            stage_name=self.step_name,
+        )
+        metrics_output = _inline_csv_table_output(
+            name="refold_quality_metrics",
+            filename="refold_quality_metrics.csv",
+            rows=metric_rows,
+            metadata={"step_name": self.step_name, "source_structure": structure_name},
+        )
+        outputs = [
+            AppOutput(
+                name="alphafold3_refolded_structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=InlineBytes(
+                    data=tarball_bytes,
+                    filename=f"{run_name}_alphafold3.tar.zst",
+                    media_type=ZSTD_MEDIA_TYPE,
+                ),
+                metadata={
+                    "step_name": self.step_name,
+                    "run_name": run_name,
+                    "source_structure": structure_name,
+                    "archive_format": "tar.zst",
+                },
+            )
+        ]
+        if metrics_output is not None:
+            outputs.append(metrics_output)
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="alphafold3_refolded_structures",
-                    kind=ArtifactKind.STRUCTURES,
-                    storage=InlineBytes(
-                        data=tarball_bytes,
-                        filename=f"{run_name}_alphafold3.tar.zst",
-                        media_type=ZSTD_MEDIA_TYPE,
-                    ),
-                    metadata={
-                        "step_name": self.step_name,
-                        "run_name": run_name,
-                        "source_structure": structure_name,
-                        "archive_format": "tar.zst",
-                    },
-                )
-            ],
+            outputs=outputs,
         )
 
 
@@ -1583,6 +1582,7 @@ class FilterStructuresNode(WorkflowNativeNode):
             self.modal_namespace.filter_artifacts.remote(
                 structures=structures,
                 scores=scores,
+                candidate_manifests=context.inputs.get("candidate_manifest") or [],
                 config=self.config,
                 run_id=context.run_id,
                 node_id=context.node_id,
@@ -1672,6 +1672,7 @@ class ReportNode(WorkflowNativeNode):
             for artifact in artifact_list
         ]
         ranked_rows: list[dict[str, object]] = []
+        attrition_rows: list[dict[str, object]] = []
         for artifact in context.inputs.get("rank", []):
             path = ppiflow_staging.artifact_mount_path(
                 artifact,
@@ -1681,40 +1682,42 @@ class ReportNode(WorkflowNativeNode):
                 ranked_rows.extend(
                     pl.read_csv(path, infer_schema_length=0).iter_rows(named=True)
                 )
-        lines = [
-            "# PPIFlow Workflow Report",
-            "",
-            f"- Step: {self.step_name}",
-            f"- Input artifacts: {len(artifacts)}",
-            f"- Ranked designs: {len(ranked_rows)}",
-            "",
-        ]
-        if ranked_rows:
-            columns = list(ranked_rows[0])
-            lines.extend([
-                "| " + " | ".join(columns) + " |",
-                "| " + " | ".join("---" for _ in columns) + " |",
-            ])
-            for row in ranked_rows[: int(self.config.get("max_rows", 25))]:
-                lines.append(
-                    "| "
-                    + " | ".join(
-                        str(row.get(column, "")).replace("|", "\\|")
-                        for column in columns
-                    )
-                    + " |"
+        manifest_frames = []
+        audit_frames = []
+        for artifact in artifacts:
+            path = ppiflow_staging.artifact_mount_path(
+                artifact,
+                PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            )
+            if artifact.kind != ArtifactKind.TABLE or not path.is_file():
+                continue
+            if path.suffix == ".parquet":
+                try:
+                    manifest_frames.append(ppiflow_manifests.read_manifest(path))
+                except ValueError:
+                    continue
+            elif path.name == "filter_audit.csv":
+                audit_frames.append(pl.read_csv(path, infer_schema_length=0))
+        for index, manifest_frame in enumerate(manifest_frames):
+            audit_frame = audit_frames[index] if index < len(audit_frames) else None
+            attrition_rows.extend(
+                ppiflow_tables.candidate_attrition_rows(
+                    stage_name=str(
+                        manifest_frame.get_column("stage_name").item(0)
+                        if manifest_frame.height
+                        else "unknown"
+                    ),
+                    manifest_frame=manifest_frame,
+                    audit_frame=audit_frame,
                 )
-        else:
-            lines.extend([
-                "| Artifact | Kind | Volume | Path |",
-                "| --- | --- | --- | --- |",
-            ])
-            for artifact in sorted(artifacts, key=lambda item: item.artifact_id):
-                lines.append(
-                    f"| {artifact.artifact_id} | {artifact.kind} | "
-                    f"{artifact.storage.volume_name} | {artifact.storage.path} |"
-                )
-        markdown = "\n".join(lines) + "\n"
+            )
+        markdown = ppiflow_tables.render_report_markdown(
+            step_name=self.step_name,
+            artifact_count=len(artifacts),
+            ranked_rows=ranked_rows,
+            attrition_rows=attrition_rows,
+            max_rows=int(self.config.get("max_rows", 25)),
+        )
         report_filename = str(
             self.config.get("report_filename") or "design_report.html"
         )
@@ -1735,11 +1738,9 @@ class ReportNode(WorkflowNativeNode):
                     name="design_report_html",
                     kind=ArtifactKind.REPORT,
                     storage=InlineBytes(
-                        data=(
-                            "<!doctype html><html><body><pre>"
-                            + html.escape(markdown)
-                            + "</pre></body></html>\n"
-                        ).encode("utf-8"),
+                        data=ppiflow_tables.render_report_html(markdown).encode(
+                            "utf-8"
+                        ),
                         filename=report_filename,
                         media_type="text/html",
                     ),
@@ -1764,6 +1765,66 @@ def _result_with_output_kind(
         for output in result.outputs
     ]
     return result.model_copy(update={"outputs": outputs})
+
+
+def _inline_csv_table_output(
+    *,
+    name: str,
+    filename: str,
+    rows: Sequence[Mapping[str, object]],
+    metadata: Mapping[str, object],
+) -> AppOutput | None:
+    if not rows:
+        return None
+    csv_text = pl.DataFrame([dict(row) for row in rows]).write_csv()
+    return AppOutput(
+        name=name,
+        kind=ArtifactKind.TABLE,
+        storage=InlineBytes(
+            data=csv_text.encode("utf-8"),
+            filename=filename,
+            media_type="text/csv",
+        ),
+        metadata={"rows": len(rows)} | dict(metadata),
+    )
+
+
+def _candidate_manifest_frame_from_inputs(
+    candidate_manifests: Sequence[WorkflowArtifact],
+    selected_structures: Sequence[tuple[str, bytes]],
+    *,
+    step_name: str,
+) -> pl.DataFrame:
+    if candidate_manifests:
+        frames = [
+            ppiflow_manifests.read_manifest_volume_path(
+                storage=artifact.storage,
+                volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            )
+            for artifact in candidate_manifests
+        ]
+        return pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
+
+    rows = [
+        ppiflow_manifests.candidate_manifest_row(
+            candidate_id=ppiflow_tables.candidate_key(name),
+            stage_name=step_name,
+            stage_role="structure_selection",
+            operation_mode="legacy_structure_keys",
+            candidate_status=AppRunStatus.SUCCEEDED.value,
+            source_path=name,
+            derived_path=name,
+            files=[
+                ppiflow_manifests.candidate_file_record(
+                    role="structure",
+                    path=name,
+                    size_bytes=len(data),
+                )
+            ],
+        )
+        for name, data in selected_structures
+    ]
+    return pl.DataFrame(rows)
 
 
 def _parse_seed_values(value: object) -> list[int]:
@@ -1962,6 +2023,7 @@ def build_ppiflow_workflow(
     enabled = _enabled_section(task_doc)
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
     workflow = Workflow("ppiflow-v2")
+    report_table_inputs: dict[str, Any] = {}
 
     stage1_tail = None
     if stage in {None, 1}:
@@ -1971,6 +2033,7 @@ def build_ppiflow_workflow(
             steps=steps_doc,
             gentype=gentype,
             modal_namespace=modal_namespace,
+            report_table_inputs=report_table_inputs,
         )
 
     if stage in {None, 2}:
@@ -1987,6 +2050,7 @@ def build_ppiflow_workflow(
             gentype=gentype,
             upstream=stage2_upstream,
             modal_namespace=modal_namespace,
+            report_table_inputs=report_table_inputs,
         )
 
     return workflow
@@ -1999,6 +2063,7 @@ def _add_stage1_nodes(
     steps: dict[str, Any],
     gentype: str,
     modal_namespace: PPIFlowModalNamespace,
+    report_table_inputs: dict[str, Any],
 ):
     tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
@@ -2025,6 +2090,7 @@ def _add_stage1_nodes(
             id=node_id,
             inputs=_structure_inputs(tail),
         )
+        report_table_inputs["stage1_mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
 
     if _step_enabled(enabled, "FlowpackerStep_stage1"):
         tail = workflow.add_node(
@@ -2062,6 +2128,9 @@ def _add_stage1_nodes(
             id="stage1-filter",
             inputs=inputs,
         )
+        report_table_inputs["stage1_filter_tables"] = tail.outputs(
+            kind=ArtifactKind.TABLE
+        )
     return tail
 
 
@@ -2073,6 +2142,7 @@ def _add_stage2_nodes(
     gentype: str,
     upstream,
     modal_namespace: PPIFlowModalNamespace,
+    report_table_inputs: dict[str, Any],
 ) -> None:
     tail = upstream
     if _step_enabled(enabled, "RosettaFixStep"):
@@ -2124,6 +2194,7 @@ def _add_stage2_nodes(
             id=node_id,
             inputs=_structure_inputs(tail),
         )
+        report_table_inputs["mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
 
     if _step_enabled(enabled, "FlowpackerStep_stage2"):
         tail = workflow.add_node(
@@ -2162,6 +2233,7 @@ def _add_stage2_nodes(
             id="stage2-filter",
             inputs=inputs,
         )
+        report_table_inputs["filter_tables"] = filtered.outputs(kind=ArtifactKind.TABLE)
 
     refold = None
     if _step_enabled(enabled, "ReFoldStep"):
@@ -2174,6 +2246,7 @@ def _add_stage2_nodes(
             id="stage2-alphafold3-refold",
             inputs=_structure_inputs(filtered),
         )
+        report_table_inputs["refold_metrics"] = refold.outputs(kind=ArtifactKind.TABLE)
 
     dockq = None
     if _step_enabled(enabled, "DockQStep"):
@@ -2212,6 +2285,7 @@ def _add_stage2_nodes(
             inputs["dockq"] = dockq.outputs(kind=ArtifactKind.SCORES)
         if refold is not None:
             inputs["refold"] = refold.outputs(kind=ArtifactKind.STRUCTURES)
+            inputs["refold_metrics"] = refold.outputs(kind=ArtifactKind.TABLE)
         if score is not None:
             inputs["af3scores"] = score.outputs(kind=ArtifactKind.SCORES)
         rank = workflow.add_node(
@@ -2230,6 +2304,7 @@ def _add_stage2_nodes(
             if rank is not None
             else _structure_inputs(filtered)
         )
+        inputs.update(report_table_inputs)
         workflow.add_node(
             ReportNode("ReportStep", _step_cfg(steps, "ReportStep")),
             id="stage2-report",

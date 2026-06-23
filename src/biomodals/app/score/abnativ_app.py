@@ -27,8 +27,8 @@ CONF = AppConfig(
     name="AbNatiV",
     repo_url="https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ",
     package_name="abnativ",
-    version="2.0.3",
-    python_version="3.12",
+    version="2.0.8",
+    python_version="3.13",
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "A10G"),
     model_volume_mountpoint="/root/.abnativ/models/pretrained_models",
@@ -41,11 +41,12 @@ CONF = AppConfig(
 runtime_image = (
     modal.Image
     .micromamba(python_version=CONF.python_version)
-    .apt_install("git", "build-essential", "wget", "zstd")
+    .apt_install("git", "build-essential", "wget")
     .env(CONF.default_env)
-    .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
-    .micromamba_install(["anarci"], channels=["bioconda"])
-    .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
+    .micromamba_install(
+        ["anarci", "hmmer", "pdbfixer"], channels=["bioconda", "conda-forge"]
+    )
+    .uv_pip_install("numba>=0.61.2", f"{CONF.package_name}=={CONF.version}")
     .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

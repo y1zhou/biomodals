@@ -118,7 +118,7 @@ def test_pending_tasks_skip_only_reusable_completed_candidates(tmp_path: Path) -
         ),
     ])
 
-    reusable = coordinators.reusable_completed_candidate_ids(
+    reusable = manifests.reusable_completed_candidate_ids(
         frame,
         volume_roots={"app-volume": app_root},
         workflow_volume_name="workflow-volume",

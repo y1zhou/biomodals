@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import tarfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -107,25 +107,14 @@ def structure_files_from_tar_zst(
     patterns: Sequence[str] | None,
 ) -> list[tuple[str, bytes]]:
     """Read selected structure files from a tar.zst artifact."""
-    import zstandard as zstd
-
-    selected: list[tuple[str, bytes]] = []
-    with archive_path.open("rb") as compressed:
-        reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
-            for member in tar:
-                if not member.isfile():
-                    continue
-                if not matches_structure_pattern(member.name, patterns):
-                    continue
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    continue
-                selected.append((
-                    safe_selected_file_name(artifact.artifact_id, member.name),
-                    extracted.read(),
-                ))
-    return selected
+    return _collect_tar_zst_members(
+        archive_path,
+        include=lambda member: matches_structure_pattern(member.name, patterns),
+        build=lambda member, data: (
+            safe_selected_file_name(artifact.artifact_id, member.name),
+            _required_member_bytes(member, data),
+        ),
+    )
 
 
 def files_from_tar_zst_bytes(
@@ -134,22 +123,17 @@ def files_from_tar_zst_bytes(
     suffixes: Sequence[str] | None = None,
 ) -> list[tuple[str, bytes]]:
     """Read selected files from tar.zst bytes."""
-    import zstandard as zstd
-
     suffix_set = {suffix.lower() for suffix in suffixes or ()}
-    selected = []
-    with BytesIO(data) as compressed:
-        reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
-            for member in tar:
-                if not member.isfile():
-                    continue
-                if suffix_set and Path(member.name).suffix.lower() not in suffix_set:
-                    continue
-                extracted = tar.extractfile(member)
-                if extracted is not None:
-                    selected.append((member.name, extracted.read()))
-    return selected
+    return _collect_tar_zst_members(
+        data,
+        include=lambda member: (
+            not suffix_set or Path(member.name).suffix.lower() in suffix_set
+        ),
+        build=lambda member, member_data: (
+            member.name,
+            _required_member_bytes(member, member_data),
+        ),
+    )
 
 
 def selected_structure_file_records_from_artifact(
@@ -206,32 +190,21 @@ def _selected_structure_file_records_from_tar_zst(
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[SelectedStructureFile]:
-    import zstandard as zstd
-
-    selected = []
     archive_size = archive_path.stat().st_size
-    with archive_path.open("rb") as compressed:
-        reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
-            for member in tar:
-                if not member.isfile() or not matches_structure_pattern(
-                    member.name, patterns
-                ):
-                    continue
-                selected.append(
-                    SelectedStructureFile(
-                        artifact_id=artifact.artifact_id,
-                        file_name=safe_selected_file_name(
-                            artifact.artifact_id, member.name
-                        ),
-                        artifact_file_path=member.name,
-                        app_volume_path=artifact.storage.path,
-                        volume_name=artifact.storage.volume_name,
-                        size_bytes=archive_size,
-                        media_type=artifact.storage.media_type or ZSTD_MEDIA_TYPE,
-                    )
-                )
-    return selected
+    return _collect_tar_zst_members(
+        archive_path,
+        include=lambda member: matches_structure_pattern(member.name, patterns),
+        build=lambda member, _data: SelectedStructureFile(
+            artifact_id=artifact.artifact_id,
+            file_name=safe_selected_file_name(artifact.artifact_id, member.name),
+            artifact_file_path=member.name,
+            app_volume_path=artifact.storage.path,
+            volume_name=artifact.storage.volume_name,
+            size_bytes=archive_size,
+            media_type=artifact.storage.media_type or ZSTD_MEDIA_TYPE,
+        ),
+        read_data=False,
+    )
 
 
 def stage2_input_manifest_rows(
@@ -324,19 +297,14 @@ def csv_files_from_artifact(
     if not root.exists():
         raise FileNotFoundError(f"PPIFlow tabular artifact path not found: {root}")
     if root.is_file() and artifact_is_zstd_archive(artifact, root):
-        selected = []
-        import zstandard as zstd
-
-        with root.open("rb") as compressed:
-            reader = zstd.ZstdDecompressor().stream_reader(compressed)
-            with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
-                for member in tar:
-                    if not member.isfile() or Path(member.name).suffix != ".csv":
-                        continue
-                    extracted = tar.extractfile(member)
-                    if extracted is not None:
-                        selected.append((member.name, extracted.read()))
-        return selected
+        return _collect_tar_zst_members(
+            root,
+            include=lambda member: Path(member.name).suffix == ".csv",
+            build=lambda member, data: (
+                member.name,
+                _required_member_bytes(member, data),
+            ),
+        )
     if root.is_file():
         return [(root.name, root.read_bytes())] if root.suffix == ".csv" else []
     return [
@@ -525,3 +493,38 @@ def _unique_candidate_structures(
             )
         by_id[structure.candidate_id] = structure
     return by_id
+
+
+def _collect_tar_zst_members[ArchiveItem](
+    source: Path | bytes,
+    *,
+    include: Callable[[tarfile.TarInfo], bool],
+    build: Callable[[tarfile.TarInfo, bytes | None], ArchiveItem],
+    read_data: bool = True,
+) -> list[ArchiveItem]:
+    import zstandard as zstd
+
+    selected: list[ArchiveItem] = []
+    compressed_context = (
+        BytesIO(source) if isinstance(source, bytes) else source.open("rb")
+    )
+    with compressed_context as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile() or not include(member):
+                    continue
+                member_data = None
+                if read_data:
+                    extracted = tar.extractfile(member)
+                    if extracted is None:
+                        continue
+                    member_data = extracted.read()
+                selected.append(build(member, member_data))
+    return selected
+
+
+def _required_member_bytes(member: tarfile.TarInfo, data: bytes | None) -> bytes:
+    if data is None:
+        raise RuntimeError(f"Archive member was not read: {member.name}")
+    return data

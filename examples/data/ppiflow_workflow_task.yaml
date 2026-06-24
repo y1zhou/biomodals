@@ -1,0 +1,7 @@
+task:
+  name: ppiflow_5b8c_vhh
+  gentype: nanobody
+  candidate_concurrency: 1
+
+steps:
+  PPIFlowStep: true

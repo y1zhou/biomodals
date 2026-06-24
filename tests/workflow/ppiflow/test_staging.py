@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103
 
+import tarfile
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +28,18 @@ def _source_artifact(path: str) -> WorkflowArtifact:
         kind=ArtifactKind.STRUCTURES,
         storage=VolumePath(volume_name="source-volume", path=path),
     )
+
+
+def _tar_zst_bytes(files: dict[str, bytes]) -> bytes:
+    import zstandard as zstd
+
+    tar_bytes = BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, BytesIO(data))
+    return zstd.ZstdCompressor().compress(tar_bytes.getvalue())
 
 
 def test_select_structure_files_from_artifacts_reads_matching_files(
@@ -62,6 +76,49 @@ def test_csv_files_from_artifact_reads_directory_csvs(tmp_path: Path) -> None:
         artifact,
         {"source-volume": str(source_root)},
     ) == [("metrics.csv", b"score\n1\n")]
+
+
+def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    archive_path = source_root / "outputs.tar.zst"
+    archive_path.write_bytes(
+        _tar_zst_bytes({
+            "nested/design.pdb": b"ATOM\n",
+            "scores/metrics.csv": b"score\n1\n",
+            "notes.txt": b"skip\n",
+        })
+    )
+    artifact = WorkflowArtifact(
+        artifact_id="upstream-structures",
+        producing_node_id="upstream",
+        kind=ArtifactKind.ARCHIVE,
+        storage=VolumePath(
+            volume_name="source-volume",
+            path="outputs.tar.zst",
+            media_type="application/zstd",
+        ),
+    )
+    roots = {"source-volume": str(source_root)}
+
+    assert staging.structure_files_from_artifact(artifact, None, roots) == [
+        ("upstream-structures__nested__design.pdb", b"ATOM\n")
+    ]
+    assert staging.csv_files_from_artifact(artifact, roots) == [
+        ("scores/metrics.csv", b"score\n1\n")
+    ]
+    assert staging.files_from_tar_zst_bytes(
+        archive_path.read_bytes(),
+        suffixes=(".csv",),
+    ) == [("scores/metrics.csv", b"score\n1\n")]
+
+    records = staging.selected_structure_file_records_from_artifact(
+        artifact,
+        None,
+        roots,
+    )
+    assert [record.artifact_file_path for record in records] == ["nested/design.pdb"]
+    assert records[0].size_bytes == archive_path.stat().st_size
 
 
 def test_stage2_input_manifest_rows_scan_structure_directory(

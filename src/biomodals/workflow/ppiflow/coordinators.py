@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import polars as pl
@@ -91,20 +90,6 @@ def status_from_candidate_outcomes(
     if succeeded:
         return AppRunStatus.PARTIAL
     return AppRunStatus.FAILED
-
-
-def reusable_completed_candidate_ids(
-    manifest_frame: pl.DataFrame,
-    *,
-    volume_roots: Mapping[str, str | Path],
-    workflow_volume_name: str,
-) -> set[str]:
-    """Return completed candidates with available expected output files."""
-    return manifests.reusable_completed_candidate_ids(
-        manifest_frame,
-        volume_roots=volume_roots,
-        workflow_volume_name=workflow_volume_name,
-    )
 
 
 def pending_candidate_tasks(

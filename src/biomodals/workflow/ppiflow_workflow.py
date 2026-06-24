@@ -797,7 +797,9 @@ def stage_af3score_inputs(
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
     input_names = []
     for file_name, file_bytes in selected:
-        pdb_name = sanitize_filename(Path(file_name).with_suffix(".pdb").name)
+        pdb_name = f"{sanitize_filename(ppiflow_tables.candidate_key(file_name))}.pdb"
+        if pdb_name in input_names:
+            raise ValueError(f"Duplicate AF3Score staged input name: {pdb_name}")
         (layout.inputs_dir / pdb_name).write_bytes(file_bytes)
         input_names.append(pdb_name)
     AF3SCORE_OUTPUT_VOLUME.commit()
@@ -3097,6 +3099,7 @@ def _stage_ppiflow_app_inputs(
     steps_doc: dict[str, Any],
     run_id: str,
     app_steps: tuple[str, ...],
+    force: bool = False,
 ) -> dict[str, Any]:
     """Upload local PPIFlow app inputs and rewrite step args to mounted paths."""
     staged_steps = deepcopy(steps_doc)
@@ -3135,7 +3138,7 @@ def _stage_ppiflow_app_inputs(
             uploads.append((local_path, remote_rel.as_posix()))
 
     if uploads:
-        with ppiflow_app.CONF.output_volume.batch_upload() as batch:
+        with ppiflow_app.CONF.output_volume.batch_upload(force=force) as batch:
             for local_path, remote_rel in uploads:
                 remote_storage = volume_path_from_mount_path(
                     str(volume_root / remote_rel),
@@ -3172,7 +3175,8 @@ def submit_ppiflow_workflow(
             the task YAML filename stem.
         stage: Optional stage selector. Use 1 for stage 1 only, 2 for stage 2
             only, or omit to build both stages.
-        force: Replace an existing workflow run ledger before running.
+        force: Replace an existing workflow run ledger before running and
+            overwrite staged PPIFlow input files in the app output volume.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
         max_parallel: Maximum number of ready workflow nodes to execute
@@ -3200,6 +3204,7 @@ def submit_ppiflow_workflow(
         steps_doc=_load_yaml_bytes(steps_yaml_bytes),
         run_id=resolved_run_id,
         app_steps=_active_ppiflow_app_steps(task_doc, stage),
+        force=force,
     )
     steps_doc = _inline_rosetta_config_files(steps_doc)
     workflow = build_ppiflow_workflow(

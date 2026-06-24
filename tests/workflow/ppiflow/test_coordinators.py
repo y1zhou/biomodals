@@ -6,10 +6,11 @@ from pathlib import Path
 from threading import Lock
 from time import sleep
 
+import orjson
 import polars as pl
 import pytest
 
-from biomodals.schema import AppRunStatus
+from biomodals.schema import AppOutput, AppRunStatus, ArtifactKind, VolumePath
 from biomodals.workflow.ppiflow import coordinators, manifests
 
 
@@ -162,3 +163,33 @@ def test_outcome_rows_and_manifest_merge() -> None:
     assert [row["candidate_id"] for row in merged] == ["a", "b"]
     assert merged[1]["candidate_status"] == "failed"
     assert merged[1]["error"] == "boom"
+
+
+def test_outcome_rows_accept_app_outputs_in_summary() -> None:
+    rows = coordinators.outcome_manifest_rows(
+        stage_name="Stage",
+        stage_role="sequence_design",
+        operation_mode="abmpnn",
+        outcomes=[
+            coordinators.CandidateOutcome(
+                "candidate-1",
+                AppRunStatus.SUCCEEDED,
+                outputs={
+                    "app_outputs": [
+                        AppOutput(
+                            name="structures",
+                            kind=ArtifactKind.STRUCTURES,
+                            storage=VolumePath(
+                                volume_name="PPIFlow-outputs",
+                                path="candidate-1",
+                            ),
+                        )
+                    ]
+                },
+            )
+        ],
+    )
+
+    summary = orjson.loads(rows[0]["summary_json"])
+
+    assert summary["app_outputs"][0]["name"] == "structures"

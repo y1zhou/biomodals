@@ -8,6 +8,59 @@ from types import SimpleNamespace
 from biomodals.app.design import ppiflow_app
 
 
+def test_ppiflow_args_keep_path_fields_as_strings() -> None:
+    cases = [
+        (
+            ppiflow_app.SampleAntibodyNanobodyConfig(
+                name="target",
+                specified_hotspots="A1",
+                antigen_pdb=Path("/inputs/antigen.pdb"),
+                antigen_chain="A",
+                framework_pdb=Path("/inputs/framework.pdb"),
+                heavy_chain="H",
+            ),
+            ("antigen_pdb", "framework_pdb"),
+        ),
+        (
+            ppiflow_app.SampleBinderConfig(
+                name="target",
+                specified_hotspots="A1",
+                input_pdb=Path("/inputs/target.pdb"),
+                binder_chain="B",
+            ),
+            ("input_pdb",),
+        ),
+        (
+            ppiflow_app.SampleAntibodyNanobodyPartialConfig(
+                name="target",
+                specified_hotspots="A1",
+                complex_pdb=Path("/inputs/complex.pdb"),
+                fixed_positions="H1",
+                cdr_position="H1-3",
+                antigen_chain="A",
+                heavy_chain="H",
+                start_t=0.1,
+            ),
+            ("complex_pdb",),
+        ),
+        (
+            ppiflow_app.SampleBinderPartialConfig(
+                name="target",
+                specified_hotspots="A1",
+                input_pdb=Path("/inputs/target.pdb"),
+                fixed_positions="B1",
+            ),
+            ("input_pdb",),
+        ),
+    ]
+
+    for config, path_fields in cases:
+        args = ppiflow_app.PPIFlowArgs(args=config)
+        assert isinstance(args.args.config, str)
+        for path_field in path_fields:
+            assert isinstance(getattr(args.args, path_field), str)
+
+
 def test_ppiflow_run_uses_app_run_layout_for_outputs_and_logs(
     tmp_path: Path,
     monkeypatch,

@@ -54,6 +54,10 @@ because it is expected to be refactored.
   modules. Avoid duplicating volume strings in workflow scripts.
 - Use `volume_path_from_mount_path(...)` from `biomodals.helper.app_run` to
   convert mounted app paths into `VolumePath` workflow storage references.
+- When staging workflow-derived files for downstream apps, do not use full
+  artifact/provenance strings as local filenames. Derive short deterministic
+  names from candidate ids or content hashes because pipeline-derived names can
+  exceed filesystem component limits.
 - Materialize inline workflow outputs once under
   `nodes/<node-id>/attempts/<attempt-id>/<artifact-id>/` and store materialized
   `VolumePath` app-result JSON in the ledger; do not persist base64

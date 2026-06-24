@@ -254,6 +254,7 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
     input_pdb = tmp_path / "input.pdb"
     input_pdb.write_text("ATOM\n", encoding="utf-8")
     uploaded = []
+    upload_forces = []
 
     class FakeBatch:
         def __enter__(self):
@@ -266,7 +267,8 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
             uploaded.append((Path(local_path), remote_path))
 
     class FakeVolume:
-        def batch_upload(self):
+        def batch_upload(self, force: bool = False):
+            upload_forces.append(force)
             return FakeBatch()
 
     monkeypatch.setattr(
@@ -300,6 +302,18 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
     )
     assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert upload_forces == [False]
+
+    uploaded.clear()
+    upload_forces.clear()
+    _stage_ppiflow_app_inputs(
+        steps_doc=steps_doc,
+        run_id="run-1",
+        app_steps=("PPIFlowStep",),
+        force=True,
+    )
+    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert upload_forces == [True]
 
 
 def test_ppiflow_staging_uses_active_stage_steps(
@@ -321,7 +335,8 @@ def test_ppiflow_staging_uses_active_stage_steps(
             uploaded.append((Path(local_path), remote_path))
 
     class FakeVolume:
-        def batch_upload(self):
+        def batch_upload(self, force: bool = False):
+            _ = force
             return FakeBatch()
 
     monkeypatch.setattr(
@@ -404,7 +419,8 @@ def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
             uploaded.append((Path(local_path), remote_path))
 
     class FakeVolume:
-        def batch_upload(self):
+        def batch_upload(self, force: bool = False):
+            _ = force
             return FakeBatch()
 
     monkeypatch.setattr(

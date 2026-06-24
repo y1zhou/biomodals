@@ -374,6 +374,8 @@ PPIFlowStep:
     assert submission.function_call.object_id == "fc-ppiflow"
     assert fake_function.kwargs["run_name"] == "demo-run"
     assert isinstance(fake_function.kwargs["args"], ppiflow_app.PPIFlowArgs)
+    assert isinstance(fake_function.kwargs["args"].args.input_pdb, str)
+    assert isinstance(fake_function.kwargs["args"].args.config, str)
 
 
 def test_ligandmpnn_step_selects_structure_and_submits_app_function(
@@ -636,6 +638,60 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert af3score_stage.kwargs["run_name"] == "af3-run"
     assert af3score_stage.kwargs["config"]["num_jobs"] == 4
     assert af3score_stage.kwargs["config"]["prepare_workers"] == 2
+
+
+def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    long_dir = (
+        source_root
+        / "upstream"
+        / "results"
+        / ("flowpacker_outputs_" + "x" * 180)
+        / "backbones"
+    )
+    long_dir.mkdir(parents=True)
+    (long_dir / "candidate_a.pdb").write_text("ATOM\n", encoding="utf-8")
+    af3_root = tmp_path / "af3"
+    commits = []
+
+    monkeypatch.setattr(
+        ppiflow_workflow, "_reload_ppiflow_source_volumes", lambda: None
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUME_ROOTS",
+        {"source-volume": str(source_root)},
+    )
+    monkeypatch.setattr(ppiflow_workflow, "AF3SCORE_OUTPUT_MOUNTPOINT", str(af3_root))
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "AF3SCORE_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: commits.append(True)),
+    )
+
+    input_names = ppiflow_workflow.stage_af3score_inputs.get_raw_f()(
+        artifacts=[
+            WorkflowArtifact(
+                artifact_id="stage1-flowpacker-flowpacker_outputs",
+                producing_node_id="stage1-flowpacker",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="source-volume",
+                    path="upstream/results",
+                ),
+            )
+        ],
+        run_name="af3-run",
+    )
+
+    assert input_names == ["candidate_a.pdb"]
+    assert (af3_root / "af3-run" / "inputs" / "candidate_a.pdb").read_text(
+        encoding="utf-8"
+    ) == "ATOM\n"
+    assert commits == [True]
 
 
 def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
@@ -1299,6 +1355,65 @@ PPIFlowStep:
     )
     assert "ppiflow_workflow.PPIFlowDesignNode" not in stdout
     assert "Submitting PPIFlow workflow" not in stdout
+
+
+def test_submit_ppiflow_workflow_propagates_force_to_input_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_yaml = tmp_path / "task.yaml"
+    steps_yaml = tmp_path / "steps.yaml"
+    task_yaml.write_bytes(_task_yaml(enabled_steps="  PPIFlowStep: true\n"))
+    steps_yaml.write_text(
+        f"""
+PPIFlowStep:
+  run_name: demo-run
+  args:
+    name: demo
+    specified_hotspots: A1
+    input_pdb: {ppiflow_app.CONF.output_volume_mountpoint}/inputs/demo.pdb
+    binder_chain: B
+""",
+        encoding="utf-8",
+    )
+    calls = {}
+
+    def fake_stage_ppiflow_app_inputs(**kwargs):
+        calls["staging"] = kwargs
+        return kwargs["steps_doc"]
+
+    class FakeOrchestratorMethod:
+        def remote(self, **kwargs):
+            calls["remote"] = kwargs
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    class FakeWorkflowOrchestrator:
+        def __init__(self) -> None:
+            self.run = FakeOrchestratorMethod()
+
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_stage_ppiflow_app_inputs",
+        fake_stage_ppiflow_app_inputs,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.orchestrator,
+        "WorkflowOrchestrator",
+        FakeWorkflowOrchestrator,
+    )
+
+    raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        task_yaml=str(task_yaml),
+        steps_yaml=str(steps_yaml),
+        run_id="demo",
+        wait=True,
+        force=True,
+    )
+
+    assert calls["staging"]["force"] is True
+    assert calls["remote"]["force"] is True
 
 
 def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:

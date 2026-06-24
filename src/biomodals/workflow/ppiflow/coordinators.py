@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import polars as pl
+from pydantic import BaseModel
 
 from biomodals.schema import AppRunStatus
 from biomodals.workflow.ppiflow import manifests
@@ -124,13 +125,23 @@ def outcome_manifest_rows(
             operation_mode=operation_mode,
             candidate_status=outcome.status.value,
             error=outcome.error,
-            summary=outcome.outputs,
+            summary=_jsonable(outcome.outputs),
             files=outcome.outputs.get("files", [])
             if isinstance(outcome.outputs.get("files"), Sequence)
             else [],
         )
         for outcome in outcomes
     ]
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def merge_candidate_manifest_rows(

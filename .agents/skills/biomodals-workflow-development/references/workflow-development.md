@@ -112,6 +112,13 @@ workflow run volume when the source volume is mounted locally. Reference mode is
 the default because many app outputs are already durable in their owning app
 volume. Copy mode is for workflows that need a self-contained run directory.
 
+When staging selected files from upstream workflow artifacts into app input
+directories, never reuse the full pipeline/provenance-derived selected name as
+the filesystem basename. Those names can accumulate node ids, artifact ids,
+archive paths, and run names and exceed per-component filename limits. Use a
+short deterministic basename from a candidate id, sanitized stem, or content
+hash, and keep provenance in manifests or metadata instead.
+
 The first workflow runtime is Python-first. Pass a `Workflow` object across the
 orchestrator boundary; serialized workflow dictionaries are intentionally
 deferred until the node and app-function contracts stabilize.

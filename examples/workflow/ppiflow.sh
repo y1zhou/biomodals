@@ -26,7 +26,8 @@ if [ "${DRY_RUN:-1}" != "0" ]; then
 fi
 
 "${ENTRY_BIN}" workflow r ppiflow "${workflow_flags[@]}" -- \
-    "${task_yaml}" \
-    "${steps_yaml}" \
+    --task-yaml "${task_yaml}" \
+    --steps-yaml "${steps_yaml}" \
     --run-id ppiflow-vhh-example \
-    --stage 1
+    --max-parallel 2 \
+    --force

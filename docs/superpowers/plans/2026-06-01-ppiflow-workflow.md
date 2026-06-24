@@ -187,23 +187,23 @@ phase.
 - [x] Do not add a workflow runtime or orchestrator flag for PPIFlow candidate concurrency.
 - [x] Normalize candidate-wide node status: all requested candidates succeeded -> `SUCCEEDED`; some succeeded and some failed -> `PARTIAL`; none succeeded -> `FAILED`.
 - [x] Preserve successful outputs, failed candidate records, diagnostic logs, and candidate manifests for `PARTIAL` and `FAILED` results.
-- [ ] Ensure `PARTIAL` does not unblock downstream nodes.
-- [ ] Make each remote stage coordinator consult its manifest before submitting child app calls.
+- [x] Ensure `PARTIAL` does not unblock downstream nodes.
+- [x] Make each remote stage coordinator consult its manifest before submitting child app calls.
 - [x] Make completed manifest rows reusable only after expected-output availability checks pass.
-- [ ] Ensure every candidate-wide node returns the current candidate manifest as an output artifact alongside structures, scores, logs, or reports.
-- [ ] Move candidate-wide `AF3ScoreNode`, `RosettaFixNode`, `RosettaRelaxNode`, `ReFoldNode`, `LigandMPNNNode`, and `PPIFlowPartialNode` coordination into remote workflow-node execution.
-- [ ] Keep one recoverable Modal call id per candidate-wide stage.
-- [ ] Implement stage-specific thin Modal remote wrappers in
+- [x] Ensure every candidate-wide node returns the current candidate manifest as an output artifact alongside structures, scores, logs, or reports.
+- [x] Move candidate-wide `AF3ScoreNode`, `RosettaFixNode`, `RosettaRelaxNode`, `ReFoldNode`, `LigandMPNNNode`, and `PPIFlowPartialNode` coordination into remote workflow-node execution.
+- [x] Keep one recoverable Modal call id per candidate-wide stage.
+- [x] Implement stage-specific thin Modal remote wrappers in
   `ppiflow_workflow.py` over shared candidate-wide coordinator helpers instead
   of one generic stage-parameterized Modal function.
-- [ ] Mount only the workflow/app volumes required by each stage-specific remote
+- [x] Mount only the workflow/app volumes required by each stage-specific remote
   wrapper, and pass an explicit volume map into shared helper functions.
-- [ ] Give each stage-specific wrapper a clear function name for Modal logs and
+- [x] Give each stage-specific wrapper a clear function name for Modal logs and
   future stage-specific resource tuning.
-- [ ] Start stage-specific wrappers with the current workflow resource defaults.
-- [ ] Add `# TODO:` comments at likely wrapper tuning points for future CPU,
+- [x] Start stage-specific wrappers with the current workflow resource defaults.
+- [x] Add `# TODO:` comments at likely wrapper tuning points for future CPU,
   memory, timeout, GPU, or mount-scope adjustments once real telemetry exists.
-- [ ] Add tests or static assertions that stage wrappers declare only the volume
+- [x] Add tests or static assertions that stage wrappers declare only the volume
   mounts their stage needs.
 - [x] Add tests that candidate-wide stage coordinators respect configured child app-call concurrency limits.
 - [x] Add tests that retries reuse manifests and skip only candidates with available expected outputs.
@@ -224,19 +224,19 @@ phase.
 - [x] Represent upstream binder MPNN and AbMPNN as configuration modes on the same `LigandMPNNNode`.
 - [x] Add a separate AbMPNN node only if AbMPNN later needs a distinct app function or output contract.
 - [x] Change `LigandMPNNNode` to return designed structure artifacts and a PPIFlow-owned `mpnn_seqs.csv` table for every successful candidate.
-- [ ] Change `PPIFlowPartialNode` to process all selected structures by default.
-- [ ] Keep before-partial structure selection inside `PPIFlowPartialNode`.
+- [x] Change `PPIFlowPartialNode` to process all selected structures by default.
+- [x] Keep before-partial structure selection inside `PPIFlowPartialNode`.
 - [x] Change `ReFoldNode` to process all selected structures by default.
 - [x] Change `ReFoldNode` to return refolded structure artifacts and a `ReFold Quality Metrics` score artifact for every successful candidate.
 - [x] Change `AF3ScoreNode` to compare requested input count against `metrics_rows`, `processed`, and `failed` from AF3Score postprocess.
 - [x] Return `PARTIAL` from `AF3ScoreNode` for mixed success and `FAILED` when no usable metrics are produced.
 - [x] Update `dockq_app.run_dockq_workflow` so DockQ archives with failed pairs return `PARTIAL` or `FAILED` instead of unconditional `SUCCEEDED`.
 - [x] Update `DockQNode` to preserve DockQ diagnostic CSVs/logs for `PARTIAL` and `FAILED` results.
-- [ ] Make `RosettaFixNode` and `RosettaRelaxNode` remote coordinators own Modal queue creation, worker submission, queue cleanup, expected-output verification, and Rosetta job manifest updates through the hydrated namespace.
-- [ ] Ensure RosettaFix/RosettaRelax diagnostic logs and failed candidate records are materialized for `PARTIAL` and `FAILED` results.
-- [ ] Change `FilterStructuresNode` to expose retained structures, filtered scores, retained candidate manifest, and filter audit table.
-- [ ] Keep `ReportNode` workflow-native and consume candidate manifests/filter audit tables for attrition reporting.
-- [ ] Add node-level tests for each status and output contract above.
+- [x] Make `RosettaFixNode` and `RosettaRelaxNode` remote coordinators own Modal queue creation, worker submission, queue cleanup, expected-output verification, and Rosetta job manifest updates through the hydrated namespace.
+- [x] Ensure RosettaFix/RosettaRelax diagnostic logs and failed candidate records are materialized for `PARTIAL` and `FAILED` results.
+- [x] Change `FilterStructuresNode` to expose retained structures, filtered scores, retained candidate manifest, and filter audit table.
+- [x] Keep `ReportNode` workflow-native and consume candidate manifests/filter audit tables for attrition reporting.
+- [x] Add node-level tests for each status and output contract above.
 
 ## Phase 7: DAG Wiring And Upstream Equivalence
 
@@ -247,19 +247,19 @@ phase.
 
 **Tasks:**
 
-- [ ] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
-- [ ] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, Partial with internal before-partial structure selection, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report.
-- [ ] Preserve the full candidate set through stage 1 and stage 2 fan-out while keeping each upstream step represented as a static workflow DAG node.
-- [ ] Feed ReFold structure outputs into DockQ/RosettaRelax.
-- [ ] Feed ReFold quality metrics into Rank/Report through candidate-id joins.
-- [ ] Feed AF3Score, DockQ, RosettaRelax, ReFold quality metrics, sequence tables, and retained manifests into Rank/Report through strict candidate-id joins.
-- [ ] Ensure downstream scientific nodes consume only retained manifests.
-- [ ] Ensure rejected candidates remain available only to audit/report paths.
-- [ ] Keep stage-2-only runs compatible with explicit manifest input and convenience path-to-manifest normalization.
-- [ ] Keep old in-progress PPIFlow workflow ledger migration out of scope; document rerun with `force` or explicit `Stage2Input`.
-- [ ] Add DAG tests for candidate manifest edges.
-- [ ] Add tests that stage-2-only input manifests feed RosettaFix and downstream stage 2 nodes.
-- [ ] Add tests that rejected candidates do not flow into Partial, MPNN stage 2, ReFold, DockQ, RosettaRelax, or Rank.
+- [x] Build stage 1 exactly as upstream: PPIFlow, binder MPNN or AbMPNN, collect `mpnn_pdbs/mpnn_seqs.csv`, FlowPacker, AF3Score, Filter.
+- [x] Build stage 2 exactly as upstream: RosettaFix, fixed positions CSV, Partial with internal before-partial structure selection, binder MPNN or AbMPNN, FlowPacker, AF3Score, Filter, ReFold, DockQ, RosettaRelax, Rank, Report.
+- [x] Preserve the full candidate set through stage 1 and stage 2 fan-out while keeping each upstream step represented as a static workflow DAG node.
+- [x] Feed ReFold structure outputs into DockQ/RosettaRelax.
+- [x] Feed ReFold quality metrics into Rank/Report through candidate-id joins.
+- [x] Feed AF3Score, DockQ, RosettaRelax, ReFold quality metrics, sequence tables, and retained manifests into Rank/Report through strict candidate-id joins.
+- [x] Ensure downstream scientific nodes consume only retained manifests.
+- [x] Ensure rejected candidates remain available only to audit/report paths.
+- [x] Keep stage-2-only runs compatible with explicit manifest input and convenience path-to-manifest normalization.
+- [x] Keep old in-progress PPIFlow workflow ledger migration out of scope; document rerun with `force` or explicit `Stage2Input`.
+- [x] Add DAG tests for candidate manifest edges.
+- [x] Add tests that stage-2-only input manifests feed RosettaFix and downstream stage 2 nodes.
+- [x] Add tests that rejected candidates do not flow into Partial, MPNN stage 2, ReFold, DockQ, RosettaRelax, or Rank.
 
 ## Phase 8: Verification And Documentation
 
@@ -274,18 +274,26 @@ phase.
 - Modify: `src/biomodals/workflow/ppiflow_workflow.py`
 - Modify: `src/biomodals/workflow/ppiflow/*.py`
 
+**Migration note:**
+
+Existing in-progress PPIFlow workflow ledgers and artifacts are intentionally
+not migrated by this refactor. Users should rerun with `force=True` when they
+want a fresh ledger, or provide completed app-owned outputs through explicit
+`Stage2Input` plus an optional candidate manifest when resuming from previous
+stage outputs.
+
 **Tasks:**
 
-- [ ] Document that old in-progress PPIFlow workflow ledgers/artifacts are not migrated.
-- [ ] Document that users should rerun with `force` or re-enter completed app-owned outputs through explicit `Stage2Input`.
-- [ ] Update PPIFlow workflow help/docs if user-visible stage config changes.
-- [ ] Run `uv run pytest tests/workflow/ppiflow tests/workflow/test_ppiflow_workflow.py -q`.
-- [ ] Run `uv run pytest tests/workflow -q`.
-- [ ] Run `uv run pytest tests/app/test_dockq_workflow_contract.py tests/app/test_catalog_workflow_apps.py tests/app/test_cli_workflow_catalog.py -q`.
-- [ ] Run `uv run biomodals workflow list`.
-- [ ] Run `uv run biomodals workflow help ppiflow`.
-- [ ] Run `prek run --files <changed files>`.
-- [ ] Confirm the final branch consists of phase-sized commits rather than one
+- [x] Document that old in-progress PPIFlow workflow ledgers/artifacts are not migrated.
+- [x] Document that users should rerun with `force` or re-enter completed app-owned outputs through explicit `Stage2Input`.
+- [x] Update PPIFlow workflow help/docs if user-visible stage config changes.
+- [x] Run `uv run pytest tests/workflow/ppiflow tests/workflow/test_ppiflow_workflow.py -q`.
+- [x] Run `uv run pytest tests/workflow -q`.
+- [x] Run `uv run pytest tests/app/test_dockq_workflow_contract.py tests/app/test_catalog_workflow_apps.py tests/app/test_cli_workflow_catalog.py -q`.
+- [x] Run `uv run biomodals workflow list`.
+- [x] Run `uv run biomodals workflow help ppiflow`.
+- [x] Run `prek run --files <changed files>`.
+- [x] Confirm the final branch consists of phase-sized commits rather than one
   large PPIFlow refactor commit.
 
 ### Current Verification Baseline

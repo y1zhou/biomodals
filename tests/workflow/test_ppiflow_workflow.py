@@ -97,26 +97,19 @@ class _FakeModalFunction:
 
 def _fake_namespace(
     ppiflow_run: _FakePPIFlowFunction | None = None,
-    ligandmpnn_run: _FakeModalFunction | None = None,
+    ppiflow_partial_stage: _FakeModalFunction | None = None,
     ligandmpnn_stage: _FakeModalFunction | None = None,
     flowpacker_run: _FakeModalFunction | None = None,
-    af3score_manage_lock: _FakeModalFunction | None = None,
-    af3score_prepare: _FakeModalFunction | None = None,
-    af3score_run: _FakeModalFunction | None = None,
-    af3score_postprocess: _FakeModalFunction | None = None,
+    af3score_stage: _FakeModalFunction | None = None,
     dockq_run: _FakeModalFunction | None = None,
-    rosetta_run: _FakeModalFunction | None = None,
-    alphafold3_search_msa: _FakeModalFunction | None = None,
-    alphafold3_predict_structures: _FakeModalFunction | None = None,
+    rosetta_stage: _FakeModalFunction | None = None,
+    refold_stage: _FakeModalFunction | None = None,
     select_structures: _FakeModalFunction | None = None,
     copy_structures: _FakeModalFunction | None = None,
     filter_artifacts: _FakeModalFunction | None = None,
     derive_fixed_positions: _FakeModalFunction | None = None,
     rank_artifacts: _FakeModalFunction | None = None,
     stage2_input_manifest: _FakeModalFunction | None = None,
-    stage_ppiflow_input: _FakeModalFunction | None = None,
-    stage_af3score_inputs: _FakeModalFunction | None = None,
-    stage_rosetta_inputs: _FakeModalFunction | None = None,
 ) -> PPIFlowModalNamespace:
     fake = cast(modal.Function, ppiflow_run or _FakePPIFlowFunction())
     fake_select = cast(
@@ -126,21 +119,24 @@ def _fake_namespace(
     )
     return PPIFlowModalNamespace(
         ppiflow_run=fake,
-        ligandmpnn_run=cast(modal.Function, ligandmpnn_run or fake),
-        ligandmpnn_stage=cast(
-            modal.Function, ligandmpnn_stage or ligandmpnn_run or fake
-        ),
-        flowpacker_run=cast(modal.Function, flowpacker_run or fake),
-        af3score_manage_lock=cast(modal.Function, af3score_manage_lock or fake),
-        af3score_prepare=cast(modal.Function, af3score_prepare or fake),
-        af3score_run=cast(modal.Function, af3score_run or fake),
-        af3score_postprocess=cast(modal.Function, af3score_postprocess or fake),
-        dockq_run=cast(modal.Function, dockq_run or fake),
-        rosetta_run=cast(modal.Function, rosetta_run or fake),
-        alphafold3_search_msa=cast(modal.Function, alphafold3_search_msa or fake),
-        alphafold3_predict_structures=cast(
+        ppiflow_partial_stage=cast(
             modal.Function,
-            alphafold3_predict_structures or fake,
+            ppiflow_partial_stage or _FakeModalFunction("fc-partial-stage"),
+        ),
+        ligandmpnn_stage=cast(modal.Function, ligandmpnn_stage or fake),
+        flowpacker_run=cast(modal.Function, flowpacker_run or fake),
+        af3score_stage=cast(
+            modal.Function,
+            af3score_stage or _FakeModalFunction("fc-af3score-stage"),
+        ),
+        dockq_run=cast(modal.Function, dockq_run or fake),
+        rosetta_stage=cast(
+            modal.Function,
+            rosetta_stage or _FakeModalFunction("fc-rosetta-stage"),
+        ),
+        refold_stage=cast(
+            modal.Function,
+            refold_stage or _FakeModalFunction("fc-refold-stage"),
         ),
         select_structures=fake_select,
         copy_structures=cast(
@@ -178,28 +174,6 @@ def _fake_namespace(
                 "fc-stage2-input", AppRunResult(status=AppRunStatus.SUCCEEDED)
             ),
         ),
-        stage_ppiflow_input=cast(
-            modal.Function,
-            stage_ppiflow_input
-            or _FakeModalFunction("fc-stage-ppiflow", "/ppiflow/input.pdb"),
-        ),
-        stage_af3score_inputs=cast(
-            modal.Function,
-            stage_af3score_inputs or _FakeModalFunction("fc-stage-af3", ["model.pdb"]),
-        ),
-        stage_rosetta_inputs=cast(
-            modal.Function,
-            stage_rosetta_inputs
-            or _FakeModalFunction(
-                "fc-stage-rosetta",
-                {
-                    "run_name": "rosetta-run",
-                    "run_id": "rosetta-id",
-                    "run_root": "/rosetta/rosetta-run-rosetta-id",
-                    "num_jobs": 1,
-                },
-            ),
-        ),
     )
 
 
@@ -224,6 +198,21 @@ def _upstream_structure_artifact(
         storage=VolumePath(volume_name="source-volume", path="upstream/results"),
         metadata=metadata or {},
     )
+
+
+def _manifest_ancestor_chain(definition, node_id: str) -> list[str]:
+    chain = []
+    current = node_id
+    while "candidate_manifest" in definition.nodes[current].inputs:
+        current = (
+            definition.nodes[current].inputs["candidate_manifest"].producing_node_id
+        )
+        chain.append(current)
+    return chain
+
+
+def _decorator_block(source: str, function_name: str) -> str:
+    return source.split(f"def {function_name}", 1)[0].rsplit("@app.function", 1)[-1]
 
 
 def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
@@ -274,6 +263,39 @@ def test_ppiflow_workflow_declares_app_dependency() -> None:
         "alphafold3",
     )
     assert CONF.tags == {"depends_on": "-".join(CONF.depends_on_apps)}
+
+
+def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
+    source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
+
+    assert (
+        _decorator_block(source, "run_ppiflow_ligandmpnn_stage").count(
+            "WORKFLOW_OUTPUT_VOLUME"
+        )
+        == 1
+    )
+    assert (
+        _decorator_block(source, "run_ppiflow_refold_stage").count(
+            "WORKFLOW_OUTPUT_VOLUME"
+        )
+        == 1
+    )
+    assert "PPI_FLOW_OUTPUT_VOLUME" in _decorator_block(
+        source,
+        "run_ppiflow_partial_stage",
+    )
+    assert "WORKFLOW_OUTPUT_VOLUME" in _decorator_block(
+        source,
+        "run_ppiflow_partial_stage",
+    )
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_af3score_stage",
+    )
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_rosetta_stage",
+    )
 
 
 def test_ppiflow_app_step_uses_included_modal_namespace(tmp_path: Path) -> None:
@@ -531,85 +553,99 @@ def test_flowpacker_step_selects_structures_and_submits_app_function(
     assert result.outputs[0].metadata["structure_count"] == 2
 
 
-def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
-    tmp_path: Path,
-) -> None:
-    stage_inputs = _FakeModalFunction("fc-stage-af3", ["model.pdb"])
-    prepare = _FakeModalFunction(
-        "fc-af3-prepare",
-        SimpleNamespace(chunk_specs=[]),
+def test_partial_step_processes_multi_structure_selection(tmp_path: Path) -> None:
+    selector = _FakeModalFunction(
+        "fc-select",
+        [
+            ("design-a.pdb", b"ATOM A\n"),
+            ("design-b.pdb", b"ATOM B\n"),
+        ],
     )
-    postprocess = _FakeModalFunction(
-        "fc-af3-post",
+    partial_stage = _FakeModalFunction(
+        "fc-partial-stage",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
+    )
+    node = ppiflow_workflow.PPIFlowPartialNode(
+        "PartialStep",
+        _fake_namespace(
+            select_structures=selector,
+            ppiflow_partial_stage=partial_stage,
+        ),
         {
-            "metrics_csv": (
-                f"{ppiflow_workflow.AF3SCORE_OUTPUT_MOUNTPOINT}/af3-run/"
-                "af3score_metrics.csv"
-            ),
-            "metrics_rows": 1,
-            "processed": 1,
-            "failed": 0,
+            "run_name": "partial-run",
+            "args": {
+                "name": "partial",
+                "specified_hotspots": "A1",
+                "input_pdb": "/placeholder.pdb",
+                "binder_chain": "B",
+                "start_t": 0.5,
+            },
         },
     )
-    namespace = _fake_namespace(
-        stage_af3score_inputs=stage_inputs,
-        af3score_prepare=prepare,
-        af3score_postprocess=postprocess,
-    )
-    node = ppiflow_workflow.AF3ScoreNode(
-        "AF3scoreStep_stage1",
-        namespace,
-        {"run_name": "af3-run", "num_jobs": 4, "prepare_workers": 2},
-    )
-    result = node.run(
+
+    submission = node.submit_remote(
         NodeRunContext(
             run_id="run-1",
-            node_id="stage1-af3score",
+            node_id="stage2-partial-ppiflow",
             attempt_id="attempt-1",
             cache_dir=tmp_path,
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
 
-    assert stage_inputs.kwargs["artifacts"] == [_upstream_structure_artifact()]
-    assert prepare.kwargs["run_name"] == "af3-run"
-    assert prepare.kwargs["input_files"] == ["model.pdb"]
-    assert prepare.kwargs["num_jobs"] == 4
-    assert prepare.kwargs["prepare_workers"] == 2
-    assert postprocess.kwargs["input_files"] == ["model.pdb"]
-    assert result.outputs[0].kind == ArtifactKind.SCORES
-    assert result.outputs[0].storage == VolumePath(
-        volume_name=ppiflow_workflow.AF3SCORE_OUTPUT_VOLUME_NAME,
-        path="af3-run/af3score_metrics.csv",
-    )
-    assert stage_inputs.kwargs["patterns"] == ("*.pdb",)
+    assert submission.function_name == "run_ppiflow_partial_stage"
+    assert [
+        structure["candidate_id"]
+        for structure in partial_stage.kwargs["selected_structures"]
+    ] == ["design-a", "design-b"]
 
 
-def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
-    stage_inputs = _FakeModalFunction("fc-stage-af3", ["a.pdb", "b.pdb"])
-    prepare = _FakeModalFunction(
-        "fc-af3-prepare",
-        SimpleNamespace(chunk_specs=[]),
-    )
-    postprocess = _FakeModalFunction(
-        "fc-af3-post",
-        {
-            "metrics_csv": (
-                f"{ppiflow_workflow.AF3SCORE_OUTPUT_MOUNTPOINT}/af3-run/"
-                "af3score_metrics.csv"
-            ),
-            "metrics_rows": 1,
-            "processed": 1,
-            "failed": 1,
-        },
+def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
+    tmp_path: Path,
+) -> None:
+    af3score_stage = _FakeModalFunction(
+        "fc-af3score-stage",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
     )
     node = ppiflow_workflow.AF3ScoreNode(
         "AF3scoreStep_stage1",
-        _fake_namespace(
-            stage_af3score_inputs=stage_inputs,
-            af3score_prepare=prepare,
-            af3score_postprocess=postprocess,
-        ),
+        _fake_namespace(af3score_stage=af3score_stage),
+        {"run_name": "af3-run", "num_jobs": 4, "prepare_workers": 2},
+    )
+
+    submission = node.submit_remote(
+        NodeRunContext(
+            run_id="run-1",
+            node_id="stage1-af3score",
+            attempt_id="attempt-1",
+            cache_dir=tmp_path,
+            inputs={
+                "structures": [_upstream_structure_artifact()],
+                "candidate_manifest": [
+                    _upstream_structure_artifact(kind=ArtifactKind.TABLE)
+                ],
+            },
+        )
+    )
+
+    assert submission.function_name == "run_ppiflow_af3score_stage"
+    assert af3score_stage.kwargs["artifacts"] == [_upstream_structure_artifact()]
+    assert af3score_stage.kwargs["candidate_manifests"] == [
+        _upstream_structure_artifact(kind=ArtifactKind.TABLE)
+    ]
+    assert af3score_stage.kwargs["run_name"] == "af3-run"
+    assert af3score_stage.kwargs["config"]["num_jobs"] == 4
+    assert af3score_stage.kwargs["config"]["prepare_workers"] == 2
+
+
+def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
+    af3score_stage = _FakeModalFunction(
+        "fc-af3score-stage",
+        AppRunResult(status=AppRunStatus.PARTIAL),
+    )
+    node = ppiflow_workflow.AF3ScoreNode(
+        "AF3scoreStep_stage1",
+        _fake_namespace(af3score_stage=af3score_stage),
         {"run_name": "af3-run"},
     )
 
@@ -626,46 +662,133 @@ def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
     assert result.status == AppRunStatus.PARTIAL
 
 
-def test_rosetta_step_stages_inputs_and_returns_output_directory(
+def test_rosetta_step_submits_stage_wrapper(
     tmp_path: Path,
 ) -> None:
-    stage_rosetta = _FakeModalFunction(
-        "fc-stage-rosetta",
-        {
-            "run_name": "rosetta-run",
-            "run_id": "rosetta-id",
-            "run_root": f"{ppiflow_workflow.ROSETTA_OUTPUT_MOUNTPOINT}/rosetta-run-rosetta-id",
-            "num_jobs": 1,
-        },
-    )
-    rosetta_run = _FakeModalFunction("fc-rosetta", None)
-    namespace = _fake_namespace(
-        stage_rosetta_inputs=stage_rosetta,
-        rosetta_run=rosetta_run,
+    rosetta_stage = _FakeModalFunction(
+        "fc-rosetta-stage",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
     )
     node = ppiflow_workflow.RosettaRelaxNode(
         "RosettaRelaxStep",
-        namespace,
+        _fake_namespace(rosetta_stage=rosetta_stage),
         {"run_name": "rosetta-run", "rosetta_binary": "relax", "max_num_pods": 1},
     )
-    result = node.run(
+
+    submission = node.submit_remote(
         NodeRunContext(
             run_id="run-1",
             node_id="stage2-rosetta-relax",
             attempt_id="attempt-1",
             cache_dir=tmp_path,
-            inputs={"structures": [_upstream_structure_artifact()]},
+            inputs={
+                "structures": [_upstream_structure_artifact()],
+                "candidate_manifest": [
+                    _upstream_structure_artifact(kind=ArtifactKind.TABLE)
+                ],
+            },
         )
     )
 
-    assert stage_rosetta.kwargs["rosetta_binary"] == "relax"
-    assert rosetta_run.args == ("rosetta-run", "rosetta-id", 1)
-    assert rosetta_run.kwargs == {}
-    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
-    assert result.outputs[0].storage == VolumePath(
-        volume_name=ppiflow_workflow.ROSETTA_OUTPUT_VOLUME_NAME,
-        path="rosetta-run-rosetta-id",
+    assert submission.function_name == "run_ppiflow_rosetta_stage"
+    assert rosetta_stage.kwargs["run_name"] == "rosetta-run"
+    assert rosetta_stage.kwargs["config"]["rosetta_binary"] == "relax"
+    assert rosetta_stage.kwargs["candidate_manifests"] == [
+        _upstream_structure_artifact(kind=ArtifactKind.TABLE)
+    ]
+
+
+def test_rosetta_stage_records_partial_candidate_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    rosetta_root = tmp_path / "rosetta"
+    run_root = rosetta_root / "rosetta-run-rosetta-id"
+    (run_root / "outputs" / "1").mkdir(parents=True)
+    (run_root / "outputs" / "1" / "score.sc").write_text("SCORE\n", encoding="utf-8")
+    (run_root / "logs").mkdir()
+    (run_root / "logs" / "1.log").write_text("ok\n", encoding="utf-8")
+    job_manifest = run_root / "rosetta_job_manifest.csv"
+    pl.DataFrame([
+        {
+            "candidate_id": "candidate-a",
+            "index": 1,
+            "pdb": "inputs/1/a.pdb",
+            "expected_output_dir": "outputs/1",
+            "expected_score_file": "outputs/1/score.sc",
+            "worker_log": "logs/1.log",
+        },
+        {
+            "candidate_id": "candidate-b",
+            "index": 2,
+            "pdb": "inputs/2/b.pdb",
+            "expected_output_dir": "outputs/2",
+            "expected_score_file": "outputs/2/score.sc",
+            "worker_log": "logs/2.log",
+        },
+    ]).write_csv(job_manifest)
+
+    def fake_stage_rosetta(**kwargs):
+        _ = kwargs
+        return {
+            "run_name": "rosetta-run",
+            "run_id": "rosetta-id",
+            "run_root": str(run_root),
+            "num_jobs": 2,
+            "job_manifest": str(job_manifest),
+        }
+
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "stage_rosetta_inputs",
+        SimpleNamespace(get_raw_f=lambda: fake_stage_rosetta),
     )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ROSETTA_OUTPUT_MOUNTPOINT",
+        str(rosetta_root),
+    )
+    monkeypatch.setattr(ppiflow_workflow, "ROSETTA_OUTPUT_VOLUME_NAME", "rosetta-vol")
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ROSETTA_OUTPUT_VOLUME",
+        SimpleNamespace(reload=lambda: None),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.rosetta_app,
+        "run_rosetta",
+        _FakeModalFunction("fc-rosetta-worker", None),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.modal.Queue.objects,
+        "delete",
+        lambda name: None,
+    )
+
+    result = ppiflow_workflow.run_ppiflow_rosetta_stage.get_raw_f()(
+        artifacts=[_upstream_structure_artifact()],
+        config={"rosetta_binary": "relax", "max_num_pods": 1},
+        step_name="RosettaRelaxStep",
+        run_name="rosetta-run",
+        run_id="run-1",
+        node_id="stage2-rosetta-relax",
+        attempt_id="attempt-1",
+    )
+
+    assert result.status == AppRunStatus.PARTIAL
+    assert [output.name for output in result.outputs] == [
+        "rosetta_outputs",
+        "rosetta_job_manifest",
+        "candidate_manifest",
+    ]
+    frame = ppiflow_manifests.read_manifest(
+        workflow_root / result.outputs[-1].storage.path
+    )
+    assert frame.select("candidate_id", "candidate_status").to_dicts() == [
+        {"candidate_id": "candidate-a", "candidate_status": "succeeded"},
+        {"candidate_id": "candidate-b", "candidate_status": "failed"},
+    ]
 
 
 def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> None:
@@ -674,23 +797,21 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
         b"ATOM      2  CA  CYS A   2      0.000   0.000   0.000  1.00  0.00           C\n"
     )
     selector = _FakeModalFunction("fc-select", [("model.pdb", pdb_bytes)])
-    predict = _FakeModalFunction(
-        "fc-af3-predict",
-        _tar_zst_bytes({
-            "outputs/model_summary_confidences.json": b'{"ranking_score":0.7,"iptm":0.8}',
-            "outputs/model.cif": b"data_model\n",
-        }),
+    refold_stage = _FakeModalFunction(
+        "fc-refold-stage",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
     )
     namespace = _fake_namespace(
         select_structures=selector,
-        alphafold3_predict_structures=predict,
+        refold_stage=refold_stage,
     )
     node = ppiflow_workflow.ReFoldNode(
         "ReFoldStep",
         namespace,
         {"run_name": "refold-run", "model_seeds": [3], "recycle": 2, "sample": 1},
     )
-    result = node.run(
+
+    submission = node.submit_remote(
         NodeRunContext(
             run_id="run-1",
             node_id="stage2-alphafold3-refold",
@@ -700,13 +821,11 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
         )
     )
 
-    assert predict.kwargs["recycle"] == 2
-    assert predict.kwargs["sample"] == 1
-    assert predict.kwargs["model_seeds"] == [3]
-    assert b'"sequence":"AC"' in predict.kwargs["json_bytes"]
-    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
-    assert result.outputs[1].name == "refold_quality_metrics_model"
-    assert b"ranking_score" in result.outputs[1].storage.data
+    assert submission.function_name == "run_ppiflow_refold_stage"
+    assert refold_stage.kwargs["config"]["recycle"] == 2
+    assert refold_stage.kwargs["config"]["sample"] == 1
+    assert refold_stage.kwargs["config"]["model_seeds"] == [3]
+    assert refold_stage.kwargs["selected_structures"][0]["candidate_id"] == "model"
 
 
 def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
@@ -723,22 +842,20 @@ def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
             ),
         ],
     )
-    predict = _FakeModalFunction(
-        "fc-af3-predict",
-        _tar_zst_bytes({
-            "outputs/model_summary_confidences.json": b'{"ranking_score":0.7}'
-        }),
+    refold_stage = _FakeModalFunction(
+        "fc-refold-stage",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
     )
     node = ppiflow_workflow.ReFoldNode(
         "ReFoldStep",
         _fake_namespace(
             select_structures=selector,
-            alphafold3_predict_structures=predict,
+            refold_stage=refold_stage,
         ),
         {"run_name": "refold-run"},
     )
 
-    result = node.run(
+    submission = node.submit_remote(
         NodeRunContext(
             run_id="run-1",
             node_id="stage2-alphafold3-refold",
@@ -748,13 +865,11 @@ def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert [output.name for output in result.outputs] == [
-        "alphafold3_refolded_structures_design-a",
-        "refold_quality_metrics_design-a",
-        "alphafold3_refolded_structures_design-b",
-        "refold_quality_metrics_design-b",
-    ]
+    assert submission.function_name == "run_ppiflow_refold_stage"
+    assert [
+        structure["candidate_id"]
+        for structure in refold_stage.kwargs["selected_structures"]
+    ] == ["design-a", "design-b"]
 
 
 def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> None:
@@ -1276,6 +1391,10 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         == ArtifactKind.TABLE
     )
     assert (
+        definition.nodes["stage2-rank"].inputs["candidate_manifest"].role
+        == ppiflow_manifests.MANIFEST_FILE_ROLE
+    )
+    assert (
         definition.nodes["stage2-report"].inputs["filter_tables"].kind
         == ArtifactKind.TABLE
     )
@@ -1287,6 +1406,96 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-filter",
         "stage2-alphafold3-refold",
     }
+
+
+def test_ppiflow_candidate_manifest_edges_select_manifest_role() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(
+            enabled_steps="""  PPIFlowStep: true
+  MPNNStep_stage1: true
+  AF3scoreStep_stage1: true
+  FilterStep_stage1: true
+  RosettaFixStep: true
+  PartialStep: true
+  MPNNStep_stage2: true
+  AF3scoreStep_stage2: true
+  FilterStep_stage2: true
+  ReFoldStep: true
+  DockQStep: true
+  RosettaRelaxStep: true
+  RankStep: true
+"""
+        ),
+        steps_yaml_bytes=b"{}\n",
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    expected_manifest_sources = {
+        "stage1-ligandmpnn": "stage1-ppiflow-design",
+        "stage1-af3score": "stage1-ligandmpnn",
+        "stage1-filter": "stage1-ligandmpnn",
+        "stage2-rosetta-fix": "stage1-filter",
+        "stage2-fixed-positions": "stage2-rosetta-fix",
+        "stage2-partial-ppiflow": "stage2-fixed-positions",
+        "stage2-ligandmpnn": "stage2-partial-ppiflow",
+        "stage2-af3score": "stage2-ligandmpnn",
+        "stage2-filter": "stage2-ligandmpnn",
+        "stage2-alphafold3-refold": "stage2-filter",
+        "stage2-dockq": "stage2-filter",
+        "stage2-rosetta-relax": "stage2-filter",
+        "stage2-rank": "stage2-rosetta-relax",
+    }
+    for node_id, source_node_id in expected_manifest_sources.items():
+        selector = definition.nodes[node_id].inputs["candidate_manifest"]
+        assert selector.producing_node_id == source_node_id
+        assert selector.kind == ArtifactKind.TABLE
+        assert selector.role == ppiflow_manifests.MANIFEST_FILE_ROLE
+
+
+def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(
+            enabled_steps="""  PPIFlowStep: true
+  AF3scoreStep_stage1: true
+  FilterStep_stage1: true
+  RosettaFixStep: true
+  PartialStep: true
+  MPNNStep_stage2: true
+  AF3scoreStep_stage2: true
+  FilterStep_stage2: true
+  ReFoldStep: true
+  DockQStep: true
+  RosettaRelaxStep: true
+  RankStep: true
+"""
+        ),
+        steps_yaml_bytes=b"{}\n",
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    stage1_retained_path = [
+        "stage2-rosetta-fix",
+        "stage2-fixed-positions",
+        "stage2-partial-ppiflow",
+        "stage2-ligandmpnn",
+        "stage2-af3score",
+        "stage2-filter",
+    ]
+    for node_id in stage1_retained_path:
+        assert "stage1-filter" in _manifest_ancestor_chain(definition, node_id)
+
+    stage2_retained_path = [
+        "stage2-alphafold3-refold",
+        "stage2-dockq",
+        "stage2-rosetta-relax",
+        "stage2-rank",
+    ]
+    for node_id in stage2_retained_path:
+        assert "stage2-filter" in _manifest_ancestor_chain(definition, node_id)
 
 
 def test_ppiflow_candidate_concurrency_is_copied_to_node_configs() -> None:
@@ -1358,8 +1567,69 @@ RosettaFixStep: {}
         == ArtifactKind.TABLE
     )
     assert (
+        definition.nodes["stage2-rosetta-fix"].inputs["candidate_manifest"].role
+        == ppiflow_manifests.MANIFEST_FILE_ROLE
+    )
+    assert (
         definition.nodes["stage2-existing-input"].node.placement
         == ppiflow_workflow.NodePlacement.REMOTE
+    )
+
+
+def test_ppiflow_stage2_only_manifest_feeds_downstream_nodes() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(
+            enabled_steps="""  RosettaFixStep: true
+  PartialStep: true
+  MPNNStep_stage2: true
+  AF3scoreStep_stage2: true
+  FilterStep_stage2: true
+  ReFoldStep: true
+  DockQStep: true
+  RosettaRelaxStep: true
+  RankStep: true
+"""
+        ),
+        steps_yaml_bytes=b"""
+Stage2Input:
+  volume_name: source-volume
+  path: existing/stage1-filtered
+  manifest_path: manifests/candidate_manifest.parquet
+RosettaFixStep: {}
+PartialStep: {}
+MPNNStep_stage2: {}
+AF3scoreStep_stage2: {}
+FilterStep_stage2: {}
+ReFoldStep: {}
+DockQStep: {}
+RosettaRelaxStep: {}
+RankStep: {}
+""",
+        stage=2,
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    assert definition.nodes["stage2-existing-input"].node.config["manifest_path"] == (
+        "manifests/candidate_manifest.parquet"
+    )
+    for node_id in [
+        "stage2-rosetta-fix",
+        "stage2-fixed-positions",
+        "stage2-partial-ppiflow",
+        "stage2-ligandmpnn",
+    ]:
+        assert "stage2-existing-input" in _manifest_ancestor_chain(
+            definition,
+            node_id,
+        )
+    assert (
+        definition
+        .nodes["stage2-alphafold3-refold"]
+        .inputs["candidate_manifest"]
+        .producing_node_id
+        == "stage2-filter"
     )
 
 

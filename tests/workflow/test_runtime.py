@@ -447,6 +447,222 @@ def test_unknown_external_artifact_availability_does_not_rerun_completed_node(
     assert runtime.diagnostics.scheduled_waves == []
 
 
+def test_completed_terminal_skips_missing_ancestors_and_repairs_run_status(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="prepare")
+    workflow.add_node(ExplodingNode(), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    summary_path = tmp_path / "summary.txt"
+    summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+    ledger.mark_run_status(RunStatus.FAILED)
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+    assert runtime.ledger.load_run("demo", "run-1").status == RunStatus.SUCCEEDED
+
+
+def test_completed_terminal_does_not_recheck_intermediate_artifacts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="prepare")
+    workflow.add_node(ExplodingNode(), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    summary_path = tmp_path / "summary.txt"
+    summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="prepare-artifact",
+                producing_node_id="prepare",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="missing-prepare.txt",
+                ),
+            ),
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="summary.txt",
+                ),
+            ),
+        ],
+    )
+    ledger.mark_node_succeeded("prepare", ["prepare-artifact"])
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+    assert "Node output artifacts unavailable" not in capsys.readouterr().out
+
+
+def test_runtime_runs_only_incomplete_terminal_ancestor_closure(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    stale_upstream = workflow.add_node(ExplodingNode(), id="stale-prepare")
+    workflow.add_node(ExplodingNode(), id="stale-summary", depends_on=[stale_upstream])
+    calls: list[str] = []
+    active_upstream = workflow.add_node(FakeNode(calls=calls), id="active-prepare")
+    workflow.add_node(
+        FakeNode(calls=calls),
+        id="active-summary",
+        depends_on=[active_upstream],
+    )
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    stale_summary_path = tmp_path / "stale-summary.txt"
+    stale_summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="stale-summary-artifact",
+                producing_node_id="stale-summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="stale-summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_failed("stale-prepare", "old failure")
+    ledger.mark_node_succeeded("stale-summary", ["stale-summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["active-prepare", "active-summary"]
+    assert runtime.diagnostics.scheduled_waves == [
+        ["active-prepare"],
+        ["active-summary"],
+    ]
+
+
+def test_unknown_external_terminal_artifact_skips_missing_ancestors(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="prepare")
+    workflow.add_node(ExplodingNode(), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_volume_roots={},
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+
+
+def test_force_ignores_terminal_pruning_after_reset(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    upstream = workflow.add_node(FakeNode(calls=calls), id="prepare")
+    workflow.add_node(FakeNode(calls=calls), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    summary_path = tmp_path / "summary.txt"
+    summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1", force=True)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["prepare", "summary"]
+    assert runtime.diagnostics.scheduled_waves == [["prepare"], ["summary"]]
+
+
 def test_strict_external_artifact_checks_require_checker(tmp_path: Path) -> None:
     workflow = Workflow("demo")
 

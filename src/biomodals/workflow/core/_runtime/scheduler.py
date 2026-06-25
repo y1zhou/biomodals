@@ -38,17 +38,31 @@ def evaluate_progress(
     node_is_complete: Callable[[str], bool],
 ) -> SchedulerDecision:
     """Evaluate workflow progress without mutating durable state."""
-    completed = {node_id for node_id in definition.nodes if node_is_complete(node_id)}
-    if len(completed) == len(definition.nodes):
+    terminals = _terminal_nodes(definition)
+    completion_cache: dict[str, bool] = {}
+
+    def is_complete(node_id: str) -> bool:
+        if node_id not in completion_cache:
+            completion_cache[node_id] = node_is_complete(node_id)
+        return completion_cache[node_id]
+
+    completed_terminals = {node_id for node_id in terminals if is_complete(node_id)}
+    incomplete_terminals = terminals - completed_terminals
+    if not incomplete_terminals:
         return SchedulerDecision(
             status=SchedulerDecisionStatus.SUCCEEDED,
-            completed=completed,
+            completed=completed_terminals,
         )
 
+    active_nodes = _ancestor_closure(definition.dependencies, incomplete_terminals)
+    completed = completed_terminals | {
+        node_id for node_id in active_nodes if is_complete(node_id)
+    }
     ready = [
         node_id
         for node_id, dependencies in definition.dependencies.items()
-        if node_id not in completed
+        if node_id in active_nodes
+        and node_id not in completed
         and dependencies.issubset(completed)
         and _node_can_make_progress(node_id, ledger=ledger)
     ]
@@ -62,7 +76,8 @@ def evaluate_progress(
     running = [
         node_id
         for node_id, dependencies in definition.dependencies.items()
-        if node_id not in completed
+        if node_id in active_nodes
+        and node_id not in completed
         and dependencies.issubset(completed)
         and ledger.node_is_running(node_id)
     ]
@@ -80,7 +95,9 @@ def evaluate_progress(
     blocked = [
         node_id
         for node_id, dependencies in definition.dependencies.items()
-        if node_id not in completed and not dependencies.issubset(completed)
+        if node_id in active_nodes
+        and node_id not in completed
+        and not dependencies.issubset(completed)
     ]
     return SchedulerDecision(
         status=SchedulerDecisionStatus.FAILED_NO_PROGRESS,
@@ -88,6 +105,30 @@ def evaluate_progress(
         blocked=blocked,
         warnings=["No runnable workflow nodes remain"],
     )
+
+
+def _terminal_nodes(definition: WorkflowDefinition) -> set[str]:
+    upstream_nodes = {
+        dependency
+        for dependencies in definition.dependencies.values()
+        for dependency in dependencies
+    }
+    return set(definition.nodes) - upstream_nodes
+
+
+def _ancestor_closure(
+    dependencies_by_node: dict[str, set[str]],
+    node_ids: set[str],
+) -> set[str]:
+    active: set[str] = set()
+    pending = list(node_ids)
+    while pending:
+        node_id = pending.pop()
+        if node_id in active:
+            continue
+        active.add(node_id)
+        pending.extend(dependencies_by_node.get(node_id, set()))
+    return active
 
 
 def _node_can_make_progress(node_id: str, *, ledger: WorkflowLedger) -> bool:

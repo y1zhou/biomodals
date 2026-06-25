@@ -215,7 +215,7 @@ def test_rosetta_job_manifest_rows_and_writer(tmp_path: Path) -> None:
         [
             staging.CandidateStructureFile(
                 "candidate-a",
-                "design-a.pdb",
+                "stage1-filter-filtered_structures__" + ("x" * 180) + ".pdb",
                 b"ATOM\n",
             )
         ],
@@ -230,7 +230,7 @@ def test_rosetta_job_manifest_rows_and_writer(tmp_path: Path) -> None:
             "index": 1,
             "status": "pending",
             "binary": "relax",
-            "pdb": "inputs/1/design-a.pdb",
+            "pdb": "inputs/1/candidate-a.pdb",
             "rosetta_script": "workflow.xml",
             "flags_file": "workflow.flags",
             "expected_output_dir": "outputs/1",

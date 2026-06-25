@@ -146,6 +146,10 @@ def _reload_ppiflow_source_volumes() -> None:
     WORKFLOW_OUTPUT_VOLUME.reload()
 
 
+def _reload_workflow_output_volume() -> None:
+    WORKFLOW_OUTPUT_VOLUME.reload()
+
+
 @app.function(
     image=runtime_image,
     cpu=0.125,
@@ -1957,18 +1961,18 @@ class FilterStructuresNode(WorkflowNativeNode):
             raise ValueError(f"{self.step_name} requires structure inputs")
         if not scores:
             raise ValueError(f"{self.step_name} requires score inputs")
-        return AppRunResult.model_validate(
-            self.modal_namespace.filter_artifacts.remote(
-                structures=structures,
-                scores=scores,
-                candidate_manifests=context.inputs.get("candidate_manifest") or [],
-                config=self.config,
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-                step_name=self.step_name,
-            )
+        result = self.modal_namespace.filter_artifacts.remote(
+            structures=structures,
+            scores=scores,
+            candidate_manifests=context.inputs.get("candidate_manifest") or [],
+            config=self.config,
+            run_id=context.run_id,
+            node_id=context.node_id,
+            attempt_id=context.attempt_id,
+            step_name=self.step_name,
         )
+        _reload_workflow_output_volume()
+        return AppRunResult.model_validate(result)
 
 
 @dataclass

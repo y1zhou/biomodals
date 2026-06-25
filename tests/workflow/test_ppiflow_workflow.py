@@ -1015,9 +1015,18 @@ def test_dockq_rejects_unpaired_structure_counts(tmp_path: Path) -> None:
         )
 
 
-def test_filter_step_delegates_score_filtering(tmp_path: Path) -> None:
+def test_filter_step_delegates_score_filtering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     filter_artifacts = _FakeModalFunction(
         "fc-filter", AppRunResult(status=AppRunStatus.SUCCEEDED)
+    )
+    reloads = []
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_reload_workflow_output_volume",
+        lambda: reloads.append(True),
     )
     node = ppiflow_workflow.FilterStructuresNode(
         "FilterStep_stage1",
@@ -1041,6 +1050,7 @@ def test_filter_step_delegates_score_filtering(tmp_path: Path) -> None:
     assert result.status == AppRunStatus.SUCCEEDED
     assert filter_artifacts.kwargs["step_name"] == "FilterStep_stage1"
     assert filter_artifacts.kwargs["config"] == {"filters": {"iptm": "> 0.7"}}
+    assert reloads == [True]
 
 
 def test_fixed_positions_delegates_residue_energy_parsing(tmp_path: Path) -> None:

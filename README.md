@@ -26,13 +26,21 @@ uv run biomodals --help
 To see a list of all available commands, run:
 
 ```bash
-biomodals list
+biomodals --help
 ```
 
-To get help on a specific app, run:
+To list and inspect apps:
 
 ```bash
-biomodals help <app-name>
+biomodals app list
+biomodals app help <app-name>
+```
+
+To list and inspect workflows:
+
+```bash
+biomodals workflow list
+biomodals workflow help <workflow-name>
 ```
 
 Note that this repository is heavily refactored from [the upstream repository](https://github.com/hgbrian/biomodals).

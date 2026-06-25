@@ -12,6 +12,27 @@ files out into another app's workflow-compatible function. Ignore
 `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now; it
 is expected to be refactored.
 
+## Contents
+
+- [Vocabulary](#vocabulary)
+- [ShortMD Reference Pattern](#shortmd-reference-pattern)
+- [RFD LigandMPNN Reference Pattern](#rfd-ligandmpnn-reference-pattern)
+- [Schema Boundaries](#schema-boundaries)
+- [Node Execution Policy](#node-execution-policy)
+- [Artifact Availability And Recovery](#artifact-availability-and-recovery)
+- [Node Placement](#node-placement)
+- [Ledger Layout](#ledger-layout)
+- [Modal Preemption](#modal-preemption)
+- [Fan-Out](#fan-out)
+- [Orchestrator Submission](#orchestrator-submission)
+- [Runtime Diagnostics](#runtime-diagnostics)
+- [CLI Namespace](#cli-namespace)
+- [Workflow App Composition](#workflow-app-composition)
+- [App Interfaces](#app-interfaces)
+- [Volumes And Artifacts](#volumes-and-artifacts)
+- [DAG Construction](#dag-construction)
+- [Testing](#testing)
+
 ## Vocabulary
 
 - **App**: a deployed Modal app that owns tool runtime and app functions.
@@ -125,8 +146,13 @@ deferred until the node and app-function contracts stabilize.
 
 ## Node Execution Policy
 
-Every workflow node checks durable SQLite run state before execution and skips work
-when completed artifact manifests already exist.
+Workflow run completion is terminal-node driven. If all terminal DAG nodes have
+durable completion and no missing recorded outputs, the run succeeds without
+rechecking or scheduling intermediate nodes. If only some terminal nodes are
+incomplete, schedule only those terminals and their ancestor closure.
+
+Within the scheduled closure, nodes check durable SQLite run state before
+execution and skip work when completed artifact manifests already exist.
 
 Incomplete nodes use one of two policies:
 
@@ -488,6 +514,10 @@ Workflow-native remote functions that mutate mounted volumes must call
 `reload()` before reading data written by other containers and `commit()` after
 writing, copying, or deleting files. Validate artifact storage paths with
 `VolumePath` before joining them to mounted paths.
+
+When a caller waits for a remote function that created, copied, or deleted files
+in a mounted volume, reload that same volume before reading, selecting,
+materializing, or validating those paths in the caller.
 
 ## DAG Construction
 

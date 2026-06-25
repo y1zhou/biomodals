@@ -2,6 +2,22 @@
 
 This reference is the maintained app-development standard for files under `src/biomodals/app/**/*_app.py`.
 
+## Contents
+
+- [Discovery And File Shape](#discovery-and-file-shape)
+- [Module Docstring](#module-docstring)
+- [Imports And Ruff](#imports-and-ruff)
+- [AppConfig](#appconfig)
+- [Image Construction](#image-construction)
+- [Volumes](#volumes)
+- [Remote Functions](#remote-functions)
+- [Helper APIs](#helper-apis)
+- [Local Entrypoint](#local-entrypoint)
+- [Data Flow](#data-flow)
+- [Caching](#caching)
+- [Legacy Apps](#legacy-apps)
+- [Examples And Verification](#examples-and-verification)
+
 ## Discovery And File Shape
 
 Biomodals apps are self-contained Modal applications wrapping bioinformatics tools. They live under `src/biomodals/app/<category>/`.

@@ -7,9 +7,8 @@ description: Biomodals Modal app development standards. Use when Codex is creati
 
 ## Core Workflow
 
-Use this skill for Biomodals app files named `*_app.py`.
-
-Before changing behavior, read the current repo guidance:
+Use this skill for Biomodals app files named `*_app.py`. Before non-trivial
+changes, read the current repo guidance:
 
 - `references/app-development.md` for the app-development standards and checklist.
 - `docs/agents/app-development.md` for repo-level coordination notes and deviation links.
@@ -22,64 +21,20 @@ Before changing behavior, read the current repo guidance:
   - `src/biomodals/app/design/ligandmpnn_app.py` for fast,
     workflow-compatible rerunnable app outputs returned as inline zstd bytes.
 
-For new apps, ask the user which data-flow class applies before choosing architecture: short-lived inference, long-running/cached, or parallel/resumable. If the user already gave enough context, state the classification and proceed.
-Also ask whether the app must be workflow-compatible. If yes, follow the
-workflow-compatible app guidance in the reference and use RFdiffusion or
-LigandMPNN as the closest implementation pattern.
+For new apps or major output changes, use the reference before choosing the
+data flow. If workflow compatibility is needed, coordinate with
+`biomodals-workflow-development`.
 
-## Implementation Rules
+## Core Guardrails
 
-Keep app code compatible with `biomodals app help` and app discovery:
-
-- Name files `<toolname>_app.py` under `src/biomodals/app/<category>/`.
-- Use a user-facing module docstring with upstream links, prerequisites, and output behavior.
-- Add `# ruff: noqa: PLC0415` near the top.
-- Use module-level `CONF = AppConfig(...)` for new apps; pin `repo_commit_hash` or `version`.
-- Let `gpu` and `timeout` be overridden from `os.environ`.
-- Build runtime images through `patch_image_for_helper(...)`.
-- Before adding app or workflow helpers, check `biomodals.helper` first.
-  Reuse existing helper APIs for local output paths, shell, archive, copy,
-  download, hashing, warmup, and serialization behavior; only define local
-  helpers when the behavior is app-specific and no shared helper fits.
-- Prefer `CONF.mounts(...)` for model and output volumes. Import shared volumes
-  from `biomodals.helper.constant` only when a function needs a nonstandard
-  mountpoint, a shared database/cache volume, or an explicit `commit()`.
-  When using `Volume.with_mount_options(...)` directly, combine read-only and
-  subpath options in one call.
-- Avoid extracting trivial two- or three-line helpers that are used only once or
-  twice. Inline them and add a short comment when the intent is not obvious.
-- Name local entrypoints `submit_<toolname>_task(...)` and use Google-style `Args:` docstrings so `biomodals app help <app>` renders flags.
-- Use `🧬` for local entrypoint status messages and `💊` for remote Modal-container status messages.
-- Keep Modal function return values primitive when practical: `int`, `str`,
-  `float`, `bool`, `bytes`, `list`, `dict`, or `None`. Return complex objects
-  only when they provide much more benefit than a primitive payload, and ensure
-  the type is serializable by `cloudpickle`. For example, return paths as
-  `str(path)` rather than `Path` objects.
-- For workflow-compatible remote functions, return `AppRunResult` with
-  `AppOutput` storage from `biomodals.schema`; keep local entrypoints CLI-only
-  and adapt them to consume the same app result object.
-- Add or update an example command under `examples/app/` when app behavior or invocation changes.
-
-## Review Checklist
-
-When reviewing or finishing an app change, check:
-
-- Discovery: path, filename, app name, and local entrypoint name match CLI expectations.
-- Reproducibility: upstream version or commit is pinned.
-- Runtime boundaries: dependencies used only inside Modal images stay lazily imported.
-- Volumes: model/cache mounts use app-specific subdirectories when practical; inference mounts are read-only unless the tool writes caches there; writable volumes are committed after writes; mounted volume paths are logged or returned as `VolumePath` when they cross app/workflow boundaries.
-- Data flow: quick jobs return `.tar.zst` bytes via `package_outputs(...)`; persistent, resumable, or batch jobs use `CONF.output_volume`, `CONF.mounts(output_volume=True)`, or shared volumes.
-- Workflow compatibility: if requested, add a remote function that returns
-  `AppRunResult`; use `VolumePath` for durable/cached outputs and `InlineBytes`
-  with `media_type="application/zstd"` only for small zstd archives that are
-  cheap to pass through the workflow runtime.
-- Modal return payloads: prefer primitive, `cloudpickle`-serializable values;
-  avoid returning `Path` objects directly or nested inside tuples, lists, dicts,
-  or dataclasses.
-- Output safety: local output directories are created, existing tarballs are not overwritten accidentally, and final paths or Modal volume locations are printed.
-- CLI docs: local entrypoint docstrings use exact Google-style `Args:` formatting with continuation indentation.
-- Verification: run `prek run --files <changed files>` when practical, plus `uv run biomodals app list` and `uv run biomodals app help <app-name>` for CLI or discovery changes.
-
-## Reference
-
-Load `references/app-development.md` when implementing a non-trivial app, reviewing details, or checking exact patterns for AppConfig, image construction, volumes, remote functions, helper APIs, entrypoints, data flow, caching, legacy migration, and examples.
+- Keep code compatible with `biomodals app list` and `biomodals app help`.
+- Use `AppConfig`, `patch_image_for_helper(...)`, existing `biomodals.helper`
+  APIs, and `CONF.mounts(...)` before adding local variants.
+- Keep Modal returns primitive when practical. Return paths as strings, not
+  `Path` objects.
+- Workflow-compatible app functions return `AppRunResult`; standalone local
+  entrypoints stay CLI-only.
+- Add or update examples and focused tests when behavior or invocation changes.
+- Run `prek run --files <changed files>` when practical; for CLI/discovery
+  changes also smoke test `uv run biomodals app list` and
+  `uv run biomodals app help <app-name>`.

@@ -308,5 +308,7 @@ stage outputs.
 ### Self-Review
 
 - Coverage: the DAG covers every named upstream PPIFlow step and every required app, including the approved `alphafold3` dependency for `ReFoldStep`.
-- Remaining implementation work: candidate manifests, candidate-wide MPNN/Partial/ReFold/AF3Score/Rosetta coordination, DockQ preparation, strict candidate joins, ReFold quality metrics, attrition reporting, and helper submodule extraction.
+- Remaining implementation work: none in this plan; later work should use the
+  current workflow skill and focused issue/ADR context rather than this
+  completed checklist.
 - Type consistency: node names, app function handles, artifact kinds, candidate manifests, and app result statuses match Biomodals workflow vocabulary.

@@ -22,6 +22,10 @@ _Avoid_: large archive, arbitrary binary bytes
 A semantic step in a workflow DAG that consumes workflow artifacts and produces workflow artifacts.
 _Avoid_: Modal function, app function
 
+**Terminal Workflow Node**:
+A workflow node with no downstream dependencies in a validated workflow DAG.
+_Avoid_: final node, last node
+
 **App**:
 A deployed Modal app that owns tool runtime, images, volumes, and exported app functions.
 _Avoid_: workflow node, app node
@@ -202,6 +206,13 @@ _Avoid_: temporary scratch, local cache
 
 - A **Workflow Builder** defines a workflow DAG in Python code.
 - A **Workflow Builder** connects nodes through named **Artifact Selectors** and optional **Control Edges**.
+- A **Terminal Workflow Node** represents an externally relevant workflow output boundary for run completion checks.
+- A **Workflow Runtime** may restrict scheduling to incomplete **Terminal Workflow Nodes** and their upstream ancestor closure.
+- A **Terminal Workflow Node** is complete for DAG pruning only through **Durable Node Completion**, not by discovering files outside the workflow ledger.
+- Completed **Terminal Workflow Nodes** can repair stale failed or partial run status on resume.
+- Unknown **Artifact Availability** does not invalidate **Durable Node Completion** for terminal-node pruning; only missing artifacts do.
+- Failed, running, or incomplete nodes outside the incomplete-terminal ancestor closure do not block workflow success.
+- **Durable Node Completion** is output-driven: available recorded outputs are enough to skip a node even when upstream inputs are stale, missing, or no longer relevant.
 - A **Workflow Builder** and **Workflow Orchestrator** form the stable workflow authoring surface; users should not need to understand scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization internals to run a workflow.
 - A **Workflow Node** declares a **Node Execution Policy**.
 - A **Workflow Node** declares **Node Placement**.
@@ -294,7 +305,11 @@ _Avoid_: temporary scratch, local cache
 - **Node Placement** is not part of semantic workflow DAG identity and should not force a new workflow run when the graph and node configuration are otherwise unchanged.
 - An orchestrator-placed **Stale Node Attempt** is recoverable through its **Node Execution Policy** because no independent app call owns its execution.
 - A remote **Stale Node Attempt** without a recorded function-call identity remains blocked because untracked remote work may still be active.
-- Every **Workflow Node** checks durable run state before execution and skips work when completed artifacts already exist.
+- A **Workflow Runtime** checks terminal nodes first; if all terminal nodes have
+  **Durable Node Completion**, intermediate nodes are not rechecked or scheduled.
+- Within the incomplete-terminal ancestor closure, each scheduled **Workflow Node**
+  checks durable run state before execution and skips work when completed artifacts
+  already exist.
 - A **Workflow Runtime** verifies workflow-volume artifact availability by default before treating completed nodes as reusable; app-owned volume artifact checks are opt-in because the checking function must have those volumes mounted.
 - External app-owned artifact verification is a run-level strictness option on the **Workflow Orchestrator**, not a routine per-node user setting.
 - When external app-owned artifact verification is enabled, the **Workflow Runtime** derives expected volume checks from recorded **Workflow Artifact** locations rather than from workflow node classes.

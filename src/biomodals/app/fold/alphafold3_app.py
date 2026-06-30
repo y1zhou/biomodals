@@ -234,6 +234,22 @@ def _af3_sanitised_name(name: str) -> str:
     return "".join(x for x in spaceless_name if x in allowed_chars)
 
 
+def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
+    """Mark bare sequences as single-sequence inference inputs."""
+    for seq in conf.sequences:
+        if (protein := seq.protein) is not None:
+            if protein.unpairedMsa is None and protein.unpairedMsaPath is None:
+                protein.unpairedMsa = ""
+            if protein.pairedMsa is None and protein.pairedMsaPath is None:
+                protein.pairedMsa = ""
+            if protein.templates is None:
+                protein.templates = []
+        elif (rna := seq.rna) is not None:
+            if rna.unpairedMsa is None and rna.unpairedMsaPath is None:
+                rna.unpairedMsa = ""
+    return conf
+
+
 ##########################################
 # Inference functions
 ##########################################
@@ -416,6 +432,7 @@ def run_inference_pipeline(
         conf = AF3Config.from_file(input_json_path)
         run_name = conf.name
         conf.modelSeeds = model_seeds
+        conf = _fill_missing_msa_for_inference(conf)
         conf.to_files(temp_path, "input")
         print(f"💊 Running inference for {run_name} with seeds {model_seeds}")
 

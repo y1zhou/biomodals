@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from biomodals.helper.styling import print_rich, styled_text
+import sys
+
 from biomodals.workflow.core.builder import WorkflowDefinition
 
 __all__ = ["print_workflow_dag", "print_workflow_message"]
 
 
 def print_workflow_message(renderable: object, *, style: str | None = None) -> None:
-    """Print a workflow runtime message with workflow-specific color controls."""
-    print_rich(renderable, style=style, color_env_var="BIOMODALS_WORKFLOW_COLOR")
+    """Print a workflow runtime message."""
+    del style
+    sys.stdout.write(f"{renderable}\n")
+    sys.stdout.flush()
 
 
 def print_workflow_dag(definition: WorkflowDefinition) -> None:
@@ -24,14 +27,7 @@ def print_workflow_dag(definition: WorkflowDefinition) -> None:
         dependency_text = ", ".join(dependencies) if dependencies else "-"
         node_class = spec.node.__class__.__qualname__
         print_workflow_message(
-            styled_text(
-                ("[workflow]   ", "grey50"),
-                (node_id, "yellow" if dependencies else "bold yellow"),
-                (" [", "grey50"),
-                (spec.node.placement.value, "bold"),
-                ("; ", "grey50"),
-                (node_class, "bold"),
-                ("] <- ", "grey50"),
-                (dependency_text, "grey50"),
-            )
+            "[workflow]   "
+            f"{node_id} [{spec.node.placement.value}; {node_class}] <- "
+            f"{dependency_text}"
         )

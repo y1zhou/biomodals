@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import modal
@@ -129,7 +129,9 @@ PPI_FLOW_SOURCE_VOLUME_ROOTS = {
     ROSETTA_OUTPUT_VOLUME_NAME: ROSETTA_OUTPUT_MOUNTPOINT,
     WORKFLOW_OUTPUT_VOLUME_NAME: WORKFLOW_OUTPUT_MOUNTPOINT,
 }
-PPI_FLOW_SOURCE_VOLUME_MOUNTS = {
+PPI_FLOW_SOURCE_VOLUME_MOUNTS: dict[
+    str | PurePosixPath, modal.Volume | modal.CloudBucketMount
+] = {
     PPI_FLOW_OUTPUT_MOUNTPOINT: PPI_FLOW_OUTPUT_VOLUME,
     FLOWPACKER_OUTPUT_MOUNTPOINT: FLOWPACKER_OUTPUT_VOLUME,
     AF3SCORE_OUTPUT_MOUNTPOINT: AF3SCORE_OUTPUT_VOLUME,
@@ -716,15 +718,15 @@ def rank_ppiflow_artifacts(
         if key in structure_by_key:
             raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
         structure_by_key[key] = (name, data)
+    raw_dockq_threshold = config.get("dockq_threshold", 0.49)
+    if not isinstance(raw_dockq_threshold, str | int | float):
+        raise TypeError("dockq_threshold must be a string or number")
     ranked = ppiflow_tables.ranked_design_rows(
         structures=selected_structures,
         score_frames=score_frames,
         gentype=str(config.get("gentype") or "binder"),
-        dockq_threshold=float(config.get("dockq_threshold", 0.49)),
+        dockq_threshold=float(raw_dockq_threshold),
     )
-    if not ranked:
-        raise ValueError(f"{step_name} found no structures with usable ranking metrics")
-
     output_dir = (
         Path(WORKFLOW_OUTPUT_MOUNTPOINT)
         / "ppiflow"
@@ -741,7 +743,21 @@ def rank_ppiflow_artifacts(
         file_name, file_bytes = structure_by_key[str(row["design"])]
         (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
     ranked_csv = output_dir / str(config.get("output_csv_name") or "ranked_designs.csv")
-    pl.DataFrame(ranked).write_csv(ranked_csv)
+    if ranked:
+        pl.DataFrame(ranked).write_csv(ranked_csv)
+        warnings = []
+    else:
+        pl.DataFrame(
+            schema={
+                "design": pl.String,
+                "filename": pl.String,
+                "rank_score": pl.Float64,
+                "dockq": pl.Float64,
+                "iptm": pl.Float64,
+                "interface_score": pl.Float64,
+            }
+        ).write_csv(ranked_csv)
+        warnings = [f"{step_name} found no structures with usable ranking metrics"]
     WORKFLOW_OUTPUT_VOLUME.commit()
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
@@ -768,6 +784,7 @@ def rank_ppiflow_artifacts(
                 metadata={"step_name": step_name, "rows": len(ranked)},
             ),
         ],
+        warnings=warnings,
     )
 
 
@@ -1287,6 +1304,7 @@ def run_ppiflow_refold_stage(
 ) -> AppRunResult:
     """Run AlphaFold3 refolding for every selected candidate."""
     # TODO: tune CPU/memory/timeout/GPU once ReFold candidate-stage telemetry exists.
+    # TODO: sometimes PDB and score files mismatch in length; investigate
     outcomes = []
     outputs = []
     for structure in selected_structures:
@@ -3103,7 +3121,6 @@ def _stage_ppiflow_app_inputs(
     steps_doc: dict[str, Any],
     run_id: str,
     app_steps: tuple[str, ...],
-    force: bool = False,
 ) -> dict[str, Any]:
     """Upload local PPIFlow app inputs and rewrite step args to mounted paths."""
     staged_steps = deepcopy(steps_doc)
@@ -3142,7 +3159,7 @@ def _stage_ppiflow_app_inputs(
             uploads.append((local_path, remote_rel.as_posix()))
 
     if uploads:
-        with ppiflow_app.CONF.output_volume.batch_upload(force=force) as batch:
+        with ppiflow_app.CONF.output_volume.batch_upload(force=True) as batch:
             for local_path, remote_rel in uploads:
                 remote_storage = volume_path_from_mount_path(
                     str(volume_root / remote_rel),
@@ -3179,8 +3196,7 @@ def submit_ppiflow_workflow(
             the task YAML filename stem.
         stage: Optional stage selector. Use 1 for stage 1 only, 2 for stage 2
             only, or omit to build both stages.
-        force: Replace an existing workflow run ledger before running and
-            overwrite staged PPIFlow input files in the app output volume.
+        force: Replace an existing workflow run ledger before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
         max_parallel: Maximum number of ready workflow nodes to execute
@@ -3208,7 +3224,6 @@ def submit_ppiflow_workflow(
         steps_doc=_load_yaml_bytes(steps_yaml_bytes),
         run_id=resolved_run_id,
         app_steps=_active_ppiflow_app_steps(task_doc, stage),
-        force=force,
     )
     steps_doc = _inline_rosetta_config_files(steps_doc)
     workflow = build_ppiflow_workflow(

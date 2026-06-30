@@ -386,7 +386,7 @@ def prepare_dockq_pairs_by_candidate(
 ) -> list[dict[str, object]]:
     """Pair DockQ reference/model structures by candidate id."""
     references_by_id = _unique_candidate_structures(references, "reference")
-    models_by_id = _unique_candidate_structures(models, "model")
+    models_by_id = _first_candidate_structures(models)
     missing_models = sorted(set(references_by_id).difference(models_by_id))
     missing_references = sorted(set(models_by_id).difference(references_by_id))
     if missing_models or missing_references:
@@ -465,20 +465,10 @@ def write_rosetta_job_manifest(
 def _candidate_key_lookup(manifest_frame: pl.DataFrame | None) -> dict[str, str]:
     if manifest_frame is None or manifest_frame.is_empty():
         return {}
-    lookup = {}
-    for row in manifest_frame.iter_rows(named=True):
-        candidate_id = str(row["candidate_id"])
-        for value in (row.get("source_path"), row.get("derived_path")):
-            if value:
-                lookup[tables.candidate_key(str(value))] = candidate_id
-        for file_record in row.get("files") or []:
-            if isinstance(file_record, Mapping):
-                for field_name in ("path", "app_volume_path", "workflow_path"):
-                    if file_record.get(field_name):
-                        lookup[tables.candidate_key(str(file_record[field_name]))] = (
-                            candidate_id
-                        )
-    return lookup
+    return {
+        row["_candidate_key"]: row["candidate_id"]
+        for row in tables.manifest_candidate_key_pairs(manifest_frame)
+    }
 
 
 def _unique_candidate_structures(
@@ -492,6 +482,15 @@ def _unique_candidate_structures(
                 f"Duplicate {role} structure for candidate {structure.candidate_id!r}"
             )
         by_id[structure.candidate_id] = structure
+    return by_id
+
+
+def _first_candidate_structures(
+    structures: Sequence[CandidateStructureFile],
+) -> dict[str, CandidateStructureFile]:
+    by_id = {}
+    for structure in sorted(structures, key=lambda item: item.file_name):
+        by_id.setdefault(structure.candidate_id, structure)
     return by_id
 
 

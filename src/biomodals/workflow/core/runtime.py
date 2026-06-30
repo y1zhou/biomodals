@@ -17,7 +17,6 @@ from biomodals.workflow.core._runtime import availability, bootstrap, scheduler
 from biomodals.workflow.core._runtime.diagnostics import RuntimeDiagnostics
 from biomodals.workflow.core._runtime.node_runner import NodeRunner
 from biomodals.workflow.core._runtime.remote_calls import RemoteCallManager
-from biomodals.workflow.core._runtime.services import RuntimeServices
 from biomodals.workflow.core._runtime.volume_sync import (
     WorkflowVolume,
     WorkflowVolumeSync,
@@ -66,26 +65,27 @@ class WorkflowRuntime:
             external_artifact_checker = None
         self.workflow = workflow
         volume_root_path = Path(volume_root)
+        self.volume_root = volume_root_path
+        self.workflow_volume_name = workflow_volume_name
+        self.external_artifact_checker = external_artifact_checker
         self.ledger = WorkflowLedger(volume_root_path)
         self.diagnostics = RuntimeDiagnostics()
         self._volume_sync = WorkflowVolumeSync(
             workflow_volume=workflow_volume,
             ledger=self.ledger,
         )
-        self._services = RuntimeServices(
-            ledger=self.ledger,
-            volume_root=volume_root_path,
-            workflow_volume_name=workflow_volume_name,
-            volume_sync=self._volume_sync,
-            external_artifact_checker=external_artifact_checker,
-        )
         self._remote_calls = RemoteCallManager(
-            services=self._services,
+            ledger=self.ledger,
+            volume_sync=self._volume_sync,
             function_call_resolver=function_call_resolver,
             remote_call_poll_timeout=remote_call_poll_timeout,
         )
         self._node_runner = NodeRunner(
-            services=self._services,
+            ledger=self.ledger,
+            volume_root=self.volume_root,
+            workflow_volume_name=self.workflow_volume_name,
+            volume_sync=self._volume_sync,
+            external_artifact_checker=self.external_artifact_checker,
             remote_calls=self._remote_calls,
             node_is_complete=self._node_is_complete,
             max_ready_workers=max_ready_workers,
@@ -105,7 +105,8 @@ class WorkflowRuntime:
             definition,
             run_id=run_id,
             force=force,
-            services=self._services,
+            ledger=self.ledger,
+            volume_sync=self._volume_sync,
         )
 
         while True:
@@ -183,10 +184,10 @@ class WorkflowRuntime:
         return availability.format_artifact_availability_errors(
             availability.artifact_availability_errors(
                 artifact,
-                workflow_volume_name=self._services.workflow_volume_name,
-                volume_root=self._services.volume_root,
+                workflow_volume_name=self.workflow_volume_name,
+                volume_root=self.volume_root,
                 run_root=self.ledger.run_root,
-                external_artifact_checker=(self._services.external_artifact_checker),
+                external_artifact_checker=self.external_artifact_checker,
             )
         )
 
@@ -195,9 +196,9 @@ class WorkflowRuntime:
     ) -> list[str]:
         return availability.artifact_availability_unknown_reasons(
             artifact,
-            workflow_volume_name=self._services.workflow_volume_name,
-            volume_root=self._services.volume_root,
-            external_artifact_checker=self._services.external_artifact_checker,
+            workflow_volume_name=self.workflow_volume_name,
+            volume_root=self.volume_root,
+            external_artifact_checker=self.external_artifact_checker,
         )
 
     def cancel_active_remote_calls(self, *, terminate_containers: bool = True) -> None:

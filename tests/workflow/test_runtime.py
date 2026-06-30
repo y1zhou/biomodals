@@ -587,6 +587,52 @@ def test_runtime_runs_only_incomplete_terminal_ancestor_closure(
     ]
 
 
+def test_incomplete_terminal_starts_from_nearest_incomplete_node(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    stale_prepare = workflow.add_node(ExplodingNode(), id="prepare")
+    completed_filter = workflow.add_node(
+        ExplodingNode(),
+        id="filter",
+        depends_on=[stale_prepare],
+    )
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="report", depends_on=[completed_filter])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="filter-artifact",
+                producing_node_id="filter",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="filter.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_failed("prepare", "old failure")
+    ledger.mark_node_succeeded("filter", ["filter-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["report"]
+    assert runtime.diagnostics.scheduled_waves == [["report"]]
+
+
 def test_unknown_external_terminal_artifact_skips_missing_ancestors(
     tmp_path: Path,
 ) -> None:
@@ -1025,13 +1071,10 @@ def test_runtime_logs_failed_node_transition(
     assert "[workflow] Node failed: fail attempt=attempt-1" in plain_stdout
 
 
-def test_runtime_colorizes_node_state_transitions_when_forced(
+def test_runtime_logs_node_state_transitions_with_plain_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NO_COLOR", "1")
-    monkeypatch.setenv("BIOMODALS_WORKFLOW_COLOR", "1")
     workflow = Workflow("demo")
     first = workflow.add_node(FakeNode(), id="prepare")
     workflow.add_node(FakeNode(), id="produce", depends_on=[first])
@@ -1047,7 +1090,7 @@ def test_runtime_colorizes_node_state_transitions_when_forced(
     assert result.status == AppRunStatus.SUCCEEDED
     stdout = capsys.readouterr().out
     plain_stdout = strip_ansi(stdout)
-    assert "\x1b[" in stdout
+    assert "\x1b[" not in stdout
     assert "[workflow] Node started: prepare" in plain_stdout
     assert "[workflow] Node succeeded: prepare" in plain_stdout
     assert "[workflow] Starting workflow 'demo'" in plain_stdout

@@ -14,16 +14,21 @@ from biomodals.schema import AppRunStatus
 
 def candidate_key(file_name: str) -> str:
     """Return the original structure stem from a collision-safe artifact name."""
-    stem = Path(str(file_name)).stem
+    stem = Path(str(file_name)).stem.lower()
+    stem = re.sub(r"_seed-\d+_sample-\d+_model$", "", stem)
     for suffix in (
         "_summary_confidences",
         "_confidences",
         "_ranking_scores",
         "_scores",
+        "_model",
     ):
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]
-    return stem.rsplit("__", 1)[-1].lower()
+    stem = stem.rsplit("__", 1)[-1]
+    if "_refold-" in stem:
+        stem = stem.rsplit("_refold-", 1)[-1]
+    return stem
 
 
 def row_passes_filters(
@@ -182,7 +187,11 @@ def score_frame_with_candidate_ids(
     if manifest_frame is None or manifest_frame.is_empty():
         return frame.rename({"_candidate_key": "candidate_id"})
 
-    lookup = _manifest_candidate_key_lookup(manifest_frame)
+    key_pairs = manifest_candidate_key_pairs(manifest_frame)
+    if not key_pairs:
+        return frame.rename({"_candidate_key": "candidate_id"})
+
+    lookup = pl.DataFrame(key_pairs).unique("_candidate_key", keep="first")
     return (
         frame
         .join(lookup, on="_candidate_key", how="left")
@@ -383,7 +392,10 @@ def render_report_html(markdown: str) -> str:
     )
 
 
-def _manifest_candidate_key_lookup(manifest_frame: pl.DataFrame) -> pl.DataFrame:
+def manifest_candidate_key_pairs(
+    manifest_frame: pl.DataFrame,
+) -> list[dict[str, str]]:
+    """Return lookup rows mapping known candidate filenames to candidate ids."""
     rows = []
     for row in manifest_frame.iter_rows(named=True):
         candidate_id = str(row["candidate_id"])
@@ -399,7 +411,7 @@ def _manifest_candidate_key_lookup(manifest_frame: pl.DataFrame) -> pl.DataFrame
         rows.extend(
             {"_candidate_key": key, "candidate_id": candidate_id} for key in keys if key
         )
-    return pl.DataFrame(rows).unique("_candidate_key", keep="first")
+    return rows
 
 
 def _filter_metric_values(

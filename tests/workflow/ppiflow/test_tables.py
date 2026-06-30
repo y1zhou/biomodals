@@ -12,6 +12,18 @@ from biomodals.workflow.ppiflow import tables
 def test_candidate_key_recovers_original_structure_stem() -> None:
     assert tables.candidate_key("artifact__nested__design-1.pdb") == "design-1"
     assert tables.candidate_key("design-2.cif") == "design-2"
+    assert (
+        tables.candidate_key(
+            "ppiflow_5b8c_vhh_refold-ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1_model.cif"
+        )
+        == "ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1"
+    )
+    assert (
+        tables.candidate_key(
+            "ppiflow_5b8c_vhh_refold-ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1_seed-1_sample-0_model.cif"
+        )
+        == "ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1"
+    )
 
 
 def test_row_passes_filters_supports_numeric_clauses() -> None:

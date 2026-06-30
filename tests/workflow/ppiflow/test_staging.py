@@ -191,6 +191,33 @@ def test_prepare_dockq_pairs_by_candidate_matches_ids() -> None:
     assert pairs[0]["mapping"] == "A:B"
 
 
+def test_prepare_dockq_pairs_accepts_duplicate_af3_models() -> None:
+    pairs = staging.prepare_dockq_pairs_by_candidate(
+        references=[
+            staging.CandidateStructureFile(
+                "ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1",
+                "reference.pdb",
+                b"REF",
+            ),
+        ],
+        models=staging.candidate_structure_files_from_selected([
+            (
+                "ppiflow_5b8c_vhh_refold-ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1_model.cif",
+                b"MODEL TOP",
+            ),
+            (
+                "ppiflow_5b8c_vhh_refold-ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1_seed-1_sample-0_model.cif",
+                b"MODEL SAMPLE",
+            ),
+        ]),
+    )
+
+    assert [pair["candidate_id"] for pair in pairs] == [
+        "ppiflow_5b8c_vhh_stage2_abmpnn-sample0_1"
+    ]
+    assert pairs[0]["model_bytes"] == b"MODEL TOP"
+
+
 def test_prepare_dockq_pairs_by_candidate_rejects_missing_pairs() -> None:
     with pytest.raises(ValueError, match="pairing mismatch"):
         staging.prepare_dockq_pairs_by_candidate(
@@ -302,7 +329,7 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
     )
     assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
-    assert upload_forces == [False]
+    assert upload_forces == [True]
 
     uploaded.clear()
     upload_forces.clear()
@@ -310,7 +337,6 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         steps_doc=steps_doc,
         run_id="run-1",
         app_steps=("PPIFlowStep",),
-        force=True,
     )
     assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
     assert upload_forces == [True]

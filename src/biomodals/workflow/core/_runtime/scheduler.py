@@ -54,7 +54,11 @@ def evaluate_progress(
             completed=completed_terminals,
         )
 
-    active_nodes = _ancestor_closure(definition.dependencies, incomplete_terminals)
+    active_nodes = _pruned_ancestor_closure(
+        definition.dependencies,
+        incomplete_terminals,
+        is_complete,
+    )
     completed = completed_terminals | {
         node_id for node_id in active_nodes if is_complete(node_id)
     }
@@ -116,9 +120,10 @@ def _terminal_nodes(definition: WorkflowDefinition) -> set[str]:
     return set(definition.nodes) - upstream_nodes
 
 
-def _ancestor_closure(
+def _pruned_ancestor_closure(
     dependencies_by_node: dict[str, set[str]],
     node_ids: set[str],
+    is_complete: Callable[[str], bool],
 ) -> set[str]:
     active: set[str] = set()
     pending = list(node_ids)
@@ -127,6 +132,8 @@ def _ancestor_closure(
         if node_id in active:
             continue
         active.add(node_id)
+        if is_complete(node_id):
+            continue
         pending.extend(dependencies_by_node.get(node_id, set()))
     return active
 

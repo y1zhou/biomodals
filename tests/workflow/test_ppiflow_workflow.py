@@ -1228,6 +1228,49 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
     assert result.outputs[1].metadata["rows"] == 1
 
 
+def test_rank_transform_allows_empty_ranked_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    structures_dir = source_root / "structures"
+    structures_dir.mkdir()
+    (structures_dir / "design-1.pdb").write_text("ATOM 1\n", encoding="utf-8")
+    (source_root / "dockq.csv").write_text(
+        "reference,dockq\ndesign-1.pdb,0.1\n",
+        encoding="utf-8",
+    )
+    score_artifact = WorkflowArtifact(
+        artifact_id="dockq",
+        producing_node_id="dockq",
+        kind=ArtifactKind.SCORES,
+        storage=VolumePath(volume_name="source-volume", path="dockq.csv"),
+    )
+    structure_artifact = _upstream_structure_artifact()
+    structure_artifact.storage.path = "structures"
+
+    result = ppiflow_workflow.rank_ppiflow_artifacts.get_raw_f()(
+        structures=[structure_artifact],
+        score_artifacts=[score_artifact],
+        config={"gentype": "binder", "dockq_threshold": 0.49},
+        run_id="run-1",
+        node_id="rank",
+        attempt_id="attempt-1",
+        step_name="RankStep",
+    )
+
+    structures_output = workflow_root / result.outputs[0].storage.path
+    ranked_csv = workflow_root / result.outputs[1].storage.path
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert result.outputs[1].metadata["rows"] == 0
+    assert result.warnings == [
+        "RankStep found no structures with usable ranking metrics"
+    ]
+    assert list(structures_output.iterdir()) == []
+    assert ranked_csv.read_text(encoding="utf-8") == (
+        "design,filename,rank_score,dockq,iptm,interface_score\n"
+    )
+
+
 def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) -> None:
     _, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
     report_dir = workflow_root / "report-inputs"
@@ -1367,7 +1410,7 @@ PPIFlowStep:
     assert "Submitting PPIFlow workflow" not in stdout
 
 
-def test_submit_ppiflow_workflow_propagates_force_to_input_staging(
+def test_submit_ppiflow_workflow_force_resets_workflow_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1422,7 +1465,7 @@ PPIFlowStep:
         force=True,
     )
 
-    assert calls["staging"]["force"] is True
+    assert "force" not in calls["staging"]
     assert calls["remote"]["force"] is True
 
 

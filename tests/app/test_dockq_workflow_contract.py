@@ -131,6 +131,38 @@ def test_dockq_workflow_reports_partial_or_failed_pairs(
     assert result.outputs[0].metadata["failed"] == expected_failed
 
 
+def test_dockq_batch_shortens_long_structure_filenames(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return type("Result", (), {"returncode": 0, "stdout": "DockQ 0.8\n"})()
+
+    monkeypatch.setattr(dockq_app.subprocess, "run", fake_run)
+    long_name = f"stage2-filter-{'x' * 240}.pdb"
+
+    row = dockq_app._row_from_pair(
+        {
+            "id": "candidate-a",
+            "model_name": "model.pdb",
+            "reference_name": long_name,
+            "model_bytes": b"MODEL",
+            "reference_bytes": b"REF",
+        },
+        pair_idx=1,
+        workdir=tmp_path,
+        dockq_args=["--short"],
+    )
+
+    reference_path = Path(calls[0][2])
+    assert len(reference_path.name) <= dockq_app.MAX_STRUCTURE_FILENAME_LENGTH
+    assert reference_path.exists()
+    assert row["reference"] == reference_path.name
+
+
 def test_dockq_local_entrypoint_writes_tarball_from_workflow_result(
     tmp_path: Path,
     monkeypatch,

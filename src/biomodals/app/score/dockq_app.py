@@ -24,6 +24,7 @@ import shlex
 import subprocess
 import tarfile
 from collections.abc import Iterable
+from hashlib import blake2s
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -87,6 +88,7 @@ METRIC_KEYS = {
     "f1": "f1",
     "clashes": "clashes",
 }
+MAX_STRUCTURE_FILENAME_LENGTH = 120
 
 
 def _parse_short_metrics(output: str) -> dict[str, str]:
@@ -113,7 +115,13 @@ def _safe_structure_name(name: str, fallback: str) -> str:
     suffix = Path(safe).suffix.lower()
     if suffix not in {".pdb", ".cif", ".gz"}:
         safe = f"{safe}.pdb"
-    return safe
+        suffix = ".pdb"
+    if len(safe) <= MAX_STRUCTURE_FILENAME_LENGTH:
+        return safe
+    digest = blake2s(safe.encode("utf-8"), digest_size=6).hexdigest()
+    stem = safe[: -len(suffix)] if suffix else safe
+    keep = MAX_STRUCTURE_FILENAME_LENGTH - len(suffix) - len(digest) - 1
+    return f"{stem[:keep]}-{digest}{suffix}"
 
 
 def _row_from_pair(

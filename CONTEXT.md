@@ -54,6 +54,14 @@ _Avoid_: local entrypoint, submit function
 A terminal app-run outcome in which some requested candidate work succeeded and some failed, with successful outputs and failure diagnostics both preserved.
 _Avoid_: best-effort success, warning-only success
 
+**siRNA Candidate Set**:
+A ranked collection of small interfering RNA candidates designed or scored together for one target mRNA.
+_Avoid_: loose siRNA list, unranked outputs
+
+**Off-Target Reference Set**:
+A collection of non-target transcript regions used to estimate unintended siRNA binding during off-target prediction.
+_Avoid_: background FASTA, all-human mode
+
 **Generated Scaffold Segment**:
 A de novo structure segment introduced by RFdiffusion from a numeric contig segment rather than copied from the input PDB.
 _Avoid_: generated position, inpainted position

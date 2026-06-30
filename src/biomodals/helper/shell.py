@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Literal
 
 from biomodals.helper.internal import timed_function
-from biomodals.helper.styling import print_rich, styled_text
 
 
 def _build_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -33,9 +32,8 @@ def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
 
-    print_rich(
-        styled_text(("Running background command: ", None), (shlex.join(cmd), "yellow"))
-    )
+    sys.stdout.write(f"Running background command: {shlex.join(cmd)}\n")
+    sys.stdout.flush()
     kwargs.setdefault("stdout", sp.DEVNULL)
     kwargs.setdefault("stderr", sp.DEVNULL)
     kwargs["env"] = _build_env(kwargs.get("env", None))
@@ -81,7 +79,8 @@ def run_command(
         cmd = shlex.split(cmd)
 
     cmd_str = shlex.join(cmd)
-    print_rich(styled_text(("Running command: ", None), (cmd_str, "yellow")))
+    sys.stdout.write(f"Running command: {cmd_str}\n")
+    sys.stdout.flush()
     if output_mode not in {"tee", "capture", "inherit", "discard"}:
         raise ValueError(f"Unsupported command output mode: {output_mode}")
     if log_file is not None and output_mode in {"inherit", "discard"}:

@@ -104,17 +104,23 @@ PPIFlow `ranked_designs.csv` contains only retained candidates with at least one
 
 PPIFlow report generation stays a workflow-native transform that renders Markdown and HTML from materialized tables, manifests, and score artifacts. It has no expensive external runtime today, is easy to unit test, and should move to a separate app only if report rendering later needs heavyweight dependencies.
 
-## Bound PPIFlow child-call concurrency
+## Adopt a shared run-level task budget
 
-PPIFlow candidate-wide stage coordinators submit child app calls concurrently with a conservative per-stage limit instead of processing serially or fanning out without bounds. This keeps expensive Modal stages efficient while preventing accidental over-submission; stages may override the default limit through configuration.
+Workflow `max_parallel` remains workflow-node parallelism, not a global Modal
+container limit. Apps and workflows that submit child app calls should share a
+lightweight task-budget helper instead of each owning a queue, pod counter, or
+candidate fan-out loop. PPIFlow `candidate_concurrency`, AF3Score `num_jobs`,
+Rosetta `max_num_pods`, and BoltzGen `num_parallel_runs` become app-specific
+adapters over that shared budget.
 
-## Use a shared PPIFlow candidate concurrency default
+## Use shared leases for hard global limits
 
-PPIFlow uses one shared `candidate_concurrency` default for candidate-wide stage coordinators, initially `4`, with optional per-stage overrides. This keeps the workflow config small while preserving a tuning escape hatch for AF3Score, ReFold, Rosetta, LigandMPNN, and Partial stages.
-
-## Keep PPIFlow concurrency in workflow config
-
-Shared PPIFlow candidate concurrency lives in the existing task/steps YAML parsing layer and is copied into node configuration during DAG construction. It does not become a workflow runtime or orchestrator flag because candidate fan-out is a PPIFlow workflow concern, not a general scheduling API.
+An in-process task budget only bounds one coordinator container. A user-facing
+run-level limit on total child app calls must use a shared lease or token pool
+visible to every workflow node and app coordinator participating in the run.
+The first implementation may keep conservative per-container limits, but hard
+global enforcement should use shared leases rather than another app-local
+scheduler.
 
 ## Split PPIFlow workflow helpers into a submodule
 

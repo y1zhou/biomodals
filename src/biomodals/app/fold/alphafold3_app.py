@@ -54,6 +54,7 @@ from biomodals.helper.shell import (
     package_outputs,
     run_command,
 )
+from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -357,7 +358,9 @@ def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
 
 
 def search_msa_and_templates(
-    config_path: str | Path, search_chains_in_parallel: bool
+    config_path: str | Path,
+    search_chains_in_parallel: bool,
+    max_parallel_data_pipelines: int | None = None,
 ) -> bytes:
     """Manage AlphaFold3 data pipeline(s)."""
     conf = AF3Config.from_file(config_path)
@@ -377,21 +380,23 @@ def search_msa_and_templates(
     # Parallelize MSA search by chains
     with TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
-        data_pipeline_futures = []
+        data_pipeline_inputs: list[tuple[int, bytes]] = []
         for i, msa_chain in msa_chains:
             input_conf = conf.model_copy(update={"sequences": [msa_chain]})
             input_conf.to_files(tmp_path, str(i))
-            data_pipeline_futures.append(
-                run_data_pipeline.spawn(
-                    json_bytes=(tmp_path / f"{i}.json").read_bytes(),
-                    copy_msa_to_ssd=False,
-                )
-            )
-    msa_bytes = modal.FunctionCall.gather(*data_pipeline_futures)
+            data_pipeline_inputs.append((i, (tmp_path / f"{i}.json").read_bytes()))
+    msa_bytes = bounded_map(
+        data_pipeline_inputs,
+        lambda item: run_data_pipeline.remote(
+            json_bytes=item[1],
+            copy_msa_to_ssd=False,
+        ),
+        max_parallel=max_parallel_data_pipelines,
+    )
 
     # Merge into one AF3Config
-    for i, _ in msa_chains:
-        msa_conf = _load_conf_from_bytes(msa_bytes[i])
+    for (i, _), data in zip(data_pipeline_inputs, msa_bytes, strict=True):
+        msa_conf = _load_conf_from_bytes(data)
         conf.sequences[i] = msa_conf.sequences[0]
 
     with TemporaryDirectory() as tmp_dir:
@@ -590,6 +595,7 @@ def submit_alphafold3_task(
     run_name: str | None = None,
     search_msa: bool = True,
     search_chains_in_parallel: bool = True,
+    max_parallel_data_pipelines: int | None = None,
     max_num_gpus: int = 1,
     recycle: int = 10,
     sample: int = 5,
@@ -605,6 +611,8 @@ def submit_alphafold3_task(
             jobs when there is more than one protein/RNA chain to query MSA.
             If True, a 32-core job will be spawned for *each* chain. If False,
             a single container will be used for all chains sequentially.
+        max_parallel_data_pipelines: Maximum number of data-pipeline containers
+            to run at once when `search_chains_in_parallel` is true.
         max_num_gpus: Maximum number of GPUs to use during inference. If >1,
             multiple `model_inference` jobs will be spawned in parallel based
             on the number of model seeds in the JSON config.
@@ -625,7 +633,11 @@ def submit_alphafold3_task(
     # Run inference
     if search_msa:
         print(f"🧬 Running {CONF.name} data pipeline...")
-        json_bytes = search_msa_and_templates(input_path, search_chains_in_parallel)
+        json_bytes = search_msa_and_templates(
+            input_path,
+            search_chains_in_parallel,
+            max_parallel_data_pipelines,
+        )
     else:
         json_bytes = input_path.read_bytes()
 

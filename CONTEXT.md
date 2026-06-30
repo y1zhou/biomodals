@@ -34,6 +34,10 @@ _Avoid_: workflow node, app node
 A callable Modal remote function exposed by a Biomodals app or another Modal app and invoked by a workflow node.
 _Avoid_: workflow node
 
+**Child App Call**:
+A Modal app function call submitted inside an app-backed workflow node or an app-local entrypoint as part of a larger semantic operation.
+_Avoid_: workflow node, scheduler node
+
 **Local Entrypoint**:
 A CLI-facing Modal entrypoint that parses local user inputs, submits app functions, downloads or reports outputs, and returns no workflow contract.
 _Avoid_: workflow entrypoint
@@ -166,6 +170,18 @@ _Avoid_: dynamic DAG
 A bounded process or thread pool from `concurrent.futures` that limits concurrent task execution within one workflow node.
 _Avoid_: server pool, runner server
 
+**Workflow Node Parallelism**:
+The number of ready workflow nodes the workflow runtime may start concurrently in one scheduler wave.
+_Avoid_: global Modal container limit, child app concurrency
+
+**App-Local Scheduler**:
+A tool-specific queue, worker pool, pod pool, or fan-out loop inside an app function or local entrypoint.
+_Avoid_: workflow runtime, DAG scheduler
+
+**Run-Level Task Budget**:
+A shared concurrency budget for child app calls and local workers participating in one user-submitted run.
+_Avoid_: max_parallel, workflow node parallelism
+
 **Workflow Runtime**:
 The reusable library that validates a workflow DAG, schedules workflow nodes, tracks durable run state, and materializes workflow artifacts.
 _Avoid_: engine
@@ -202,148 +218,12 @@ _Avoid_: runner tag, retry hint
 Volume-backed intermediate checkpoint state that lets a long-running workflow node with `RESUME` execution policy restore progress after interruption or restart.
 _Avoid_: temporary scratch, local cache
 
-## Relationships
-
-- A **Terminal Workflow Node** represents an externally relevant workflow output boundary for run completion checks.
-- A **Workflow Runtime** may restrict scheduling to incomplete **Terminal Workflow Nodes** and their upstream ancestor closure.
-- A **Terminal Workflow Node** is complete for DAG pruning only through **Durable Node Completion**, not by discovering files outside the workflow ledger.
-- Completed **Terminal Workflow Nodes** can repair stale failed or partial run status on resume.
-- Unknown **Artifact Availability** does not invalidate **Durable Node Completion** for terminal-node pruning; only missing artifacts do.
-- Failed, running, or incomplete nodes outside the incomplete-terminal ancestor closure do not block workflow success.
-- **Durable Node Completion** is output-driven: when a node's recorded output artifacts are available on disk, the node is treated as complete regardless of whether its upstream inputs have since been regenerated or are no longer present. A completed node whose outputs exist is skipped even if its upstream dependencies were rerun.
-- A **Workflow Builder** and **Workflow Orchestrator** form the stable workflow authoring surface; users should not need to understand scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization internals to run a workflow. The `orchestrator` module at `biomodals.workflow.core.orchestrator` is internal to the workflow core package; workflow scripts import it for app composition but it is not part of the public `biomodals.workflow` API.
-- A **Workflow Node** may use **Dynamic Task Fan-Out** [planned] without changing the workflow DAG shape.
-- A PPIFlow stage preserves its complete **PPIFlow Candidate Set** through **Dynamic Task Fan-Out** while keeping the stage-level DAG static.
-- PPIFlow stage nodes do not select a representative structure by default; they process every selected candidate and preserve the **PPIFlow Candidate Set** unless the user explicitly configures a narrowing selector.
-- A PPIFlow-derived artifact retains **PPIFlow Candidate Identity** so scores and refolded models are paired with the correct source structure.
-- A **PPIFlow Candidate Join** fails when required candidate identities are missing on either side unless a workflow step explicitly opts into missing-candidate tolerance for inspection or debugging.
-- A **PPIFlow Candidate Identity** is deterministic from provenance and stable filenames; sequential identities are only allowed for synthetic stage-2 convenience inputs and must preserve source-path provenance.
-- **PPIFlow Candidate Identity** and candidate manifests are runtime artifact provenance, not semantic workflow DAG identity.
-- A candidate-wide PPIFlow stage writes a **PPIFlow Candidate Manifest** so retries can skip completed candidates and downstream steps can join artifacts by candidate identity.
-- A **PPIFlow Candidate Manifest** is a **Workflow Artifact** stored in the workflow run volume; node metadata may summarize it but must not be the only copy.
-- A completed row in a **PPIFlow Candidate Manifest** is reusable only when its expected output files are available; manifest state alone is not sufficient for retry skipping.
-- A **PPIFlow Candidate Manifest** records expected files with workflow-relative artifact paths and app-volume paths when both are available, including volume identity for app-owned files.
-- A **PPIFlow Candidate Manifest** has one row per candidate with a nested file list; file-level checks expand that list when needed.
-- The **PPIFlow Candidate Manifest** schema is local to PPIFlow until another workflow needs the same candidate-manifest abstraction.
-- Stage-2-only PPIFlow runs start from a **PPIFlow Candidate Manifest**; a convenience structures path is normalized into a minimal manifest with synthetic candidate identities.
-- A **PPIFlow Candidate Filter** emits a new retained-candidate manifest for downstream steps and an audit table that records rejected candidates and filter reasons.
-- PPIFlow reports include **PPIFlow Candidate Attrition** across stages, but downstream scientific stages consume only retained-candidate manifests.
-- PPIFlow ranking includes retained candidates with at least one usable ranking signal; rejected, partial, failed, and skipped candidates are represented in attrition and report tables instead of null-ranked rows. If no retained candidates are rankable, the rank step emits empty rank artifacts with a warning so reporting can still complete.
-- PPIFlow report generation is workflow-native unless future report rendering requires heavyweight app dependencies.
-- PPIFlow derives a **PPIFlow Sequence Table** from LigandMPNN outputs so upstream-equivalent `mpnn_seqs.csv` exists without making the LigandMPNN app own PPIFlow-specific provenance columns.
-- Binder MPNN and AbMPNN are represented as **PPIFlow MPNN Modes** on one LigandMPNN-backed workflow node unless AbMPNN requires a distinct app function or output contract.
-- PPIFlow's before-partial structure selection is internal to `PartialStep`; it is not a separate workflow artifact boundary.
-- **PPIFlow Interface Energy Analysis** stays in the workflow for now so upstream-specific Rosetta script generation and residue-energy interpretation do not become part of the generic Rosetta app API.
-- PPIFlow owns the **PPIFlow Rosetta Job Manifest**, Rosetta script/flags selection, queue setup, queue cleanup, expected output discovery, and per-candidate Rosetta status; the generic Rosetta app remains a worker for executing queued commands.
-- PPIFlow's ReFold stage produces both refolded structures and **ReFold Quality Metrics**; ranking does not infer refold quality from structure files alone.
-- PPIFlow candidate-wide stage coordinators may submit child app calls concurrently, but concurrency is bounded by stage configuration.
-- PPIFlow uses a shared candidate-concurrency default with optional per-stage overrides.
-- PPIFlow candidate-concurrency settings belong to PPIFlow task/steps configuration, not the workflow runtime or orchestrator API.
-- PPIFlow-local helper modules (manifests, tables, staging, coordinators) live in the `biomodals.workflow.ppiflow` submodule, which is workflow-internal even though its package name doesn't start with an underscore. PPIFlow Modal decorators, app registration, and app-bound remote helpers stay in `ppiflow_workflow.py` to avoid hidden Modal registration side effects; `ppiflow_workflow.py` remains the public workflow module.
-- PPIFlow candidate-wide remote wrappers are stage-specific thin Modal functions over shared coordinator helpers.
-- PPIFlow remote wrappers mount only the workflow and app volumes required by that stage.
-- PPIFlow stage-specific remote wrappers start with current workflow resource defaults; resource tuning waits for stage telemetry.
-- PPIFlow node classes stay in `ppiflow_workflow.py` because they are the visible workflow DAG contract.
-- PPIFlow helper behavior is tested in focused helper test modules, while `test_ppiflow_workflow.py` covers DAG and node integration.
-- A **Workflow Node** may use a **Worker Pool** to process dynamically fanned-out tasks.
-- A **Workflow Runtime** schedules **Workflow Nodes** and does not contain tool-specific biological logic. It is an internal orchestration component; users should not instantiate it directly. Internal runtime modules live under the private `_runtime` package, and the `WorkflowRuntime` class remains a thin facade around private runtime collaborators rather than a broad service object.
-- **Runtime Diagnostics** may expose scheduler decision snapshots for tests and debugging, but they are not part of routine workflow authoring.
-- A **Workflow Runtime** may run independent ready nodes in parallel when all of each node's dependencies are satisfied.
-- A **Workflow Orchestrator** runs the **Workflow Runtime** remotely on Modal and is responsible for run-level lifecycle recovery.
-- A **Workflow Orchestrator** is the only writer to the **Workflow Ledger**.
-- Remote workflow nodes and workers write deterministic files and logs; the **Workflow Orchestrator** reconciles those files into the **Workflow Ledger**.
-- A **Workflow Orchestrator** records Modal function call ids before waiting on remote work and reattaches to those calls during recovery before starting replacement work.
-- A remote call is not durably successful until **Durable Node Completion** is committed with its recoverable result and artifact state.
-- A **Workflow Artifact** references durable files stored in a remote Modal volume.
-- An **Inline Byte Output** may contain UTF-8 text, or a small zstd archive when `media_type` is `application/zstd`.
-- An **Inline Byte Output** is normalized into a volume-backed **Workflow Artifact** when the workflow runtime materializes node outputs.
-- Other binary or non-text app outputs are written to volume paths and represented as volume-backed artifacts, not serialized as inline bytes.
-- A **Workflow Node** may invoke one or more **App Functions** to fulfill one semantic step.
-- The **CLI Namespace** separates `biomodals app ...` commands from `biomodals workflow ...` commands.
-- A **Workflow-Compatible App Function** may reuse behavior from a **Local Entrypoint**, but exposes a remote app function contract for workflows.
-- A **Partial App Run** does not satisfy a workflow dependency even when it preserves successful candidate outputs for inspection or recovery.
-- A PPIFlow candidate-wide stage reports a **Partial App Run** when at least one candidate succeeds and at least one candidate fails; downstream PPIFlow stages do not consume that incomplete **PPIFlow Candidate Set** by default.
-- Candidate-level score adapters report success only when every requested candidate or pair produced a usable score; rows that only contain errors are diagnostics, not successful scientific scores.
-- An RFdiffusion contig may contain **Generated Scaffold Segments** and **Fixed Motif Segments**.
-- A **LigandMPNN Redesign Set** includes residues from **Generated Scaffold Segments** and excludes residues from **Fixed Motif Segments**.
-- The **RFdiffusion Output Mapping** is the authoritative source for excluding **Fixed Motif Segments** from a **LigandMPNN Redesign Set**.
-- One input PDB may fan out into many **RFdiffusion Trajectories**.
-- One **RFdiffusion Trajectory** may emit many **RFdiffusion Designs**.
-- Each **RFdiffusion Design** is passed to one LigandMPNN run that emits one **LigandMPNN Sequence Batch**.
-- A **Shared Schema** may be imported by app and workflow modules, but it must not import app or workflow modules.
-- An **App Configuration Schema** lives in `biomodals.schema` when it is shared across apps.
-- Modal-specific helpers that construct volumes, images, or app objects wrap the **App Configuration Schema** outside `biomodals.schema`.
-- App-specific configuration models remain with their app until they become stable cross-module contracts.
-- Every **App** should use an **App Run Layout** for new run-output code so local entrypoints, remote app functions, workflow-compatible app functions, and tests agree on durable path conventions.
-- A local entrypoint may normalize user input into a **Canonical Run Name**, while reusable app functions reject non-canonical names before resolving an **App Run Layout**.
-- A **Workflow-Compatible App Function** should return outputs from an **App Run Layout** as `AppRunResult` records with explicit `VolumePath` or `InlineBytes` storage.
-- A durable **Workflow-Compatible App Function** should report app outputs from the `outputs/` directory and logs from the `logs/` directory in its **App Run Layout**.
-- **Workflow Node**, **App-Backed Node**, and **Workflow-Native Node** contracts are package-development APIs for maintainers implementing reusable workflows; routine workflow users should work through the **Workflow Builder** and **Workflow Orchestrator** instead of runtime node internals.
-- A long-running **Workflow Node** with `RESUME` execution policy will use a **Durable Node Cache** [planned] so interruption and restart do not corrupt outputs or repeat unsafe work.
-- A short-running **Workflow Node** may choose a rerun-on-restart policy when recomputation is cheaper than durable checkpointing.
-- A lightweight **Workflow-Native Node** may run inline in the **Workflow Orchestrator** when remote execution overhead is not justified.
-- A long-running or failure-isolated **Workflow Node** should run as a separate remote Modal function.
-- Long-running PPIFlow stage coordinators run as remote **Workflow Nodes** even when they mainly submit app calls, because the stage needs recoverable call identity, durable candidate manifests, and failure isolation.
-- **Node Placement** is an internal runtime and package-development decision for performance and failure isolation; workflow users should normally think in terms of graph nodes rather than Modal execution sites because both inline and remote nodes run under the Modal-hosted workflow.
-- **Node Placement** is not part of semantic workflow DAG identity and should not force a new workflow run when the graph and node configuration are otherwise unchanged.
-- An orchestrator-placed **Stale Node Attempt** is recoverable through its **Node Execution Policy** because no independent app call owns its execution.
-- A remote **Stale Node Attempt** without a recorded function-call identity remains blocked because untracked remote work may still be active.
-- A **Workflow Runtime** checks terminal nodes first; if all terminal nodes have
-  **Durable Node Completion**, intermediate nodes are not rechecked or scheduled.
-- Within the incomplete-terminal ancestor closure, each scheduled **Workflow Node**
-  checks durable run state before execution and skips work when completed artifacts
-  already exist.
-- A **Workflow Runtime** verifies workflow-volume artifact availability by default before treating completed nodes as reusable; app-owned volume artifact checks are opt-in because the checking function must have those volumes mounted.
-- External app-owned artifact verification is a run-level strictness option on the **Workflow Orchestrator**, not a routine per-node user setting.
-- When external app-owned artifact verification is enabled, the **Workflow Runtime** derives expected volume checks from recorded **Workflow Artifact** locations rather than from workflow node classes.
-- When strict external app-owned artifact verification finds missing expected files, the producing **Workflow Node** is treated as incomplete so normal workflow recovery can rerun it.
-- Only missing **Artifact Availability** invalidates completed node state; unknown availability preserves completed state and emits a diagnostic.
-- A recovered producer reaches **Durable Node Completion** only after its newly reported artifacts are available; persistent absence fails the attempt instead of causing unbounded resubmission.
-- A **Workflow** may compose **App Functions** from any Modal app when those functions can be described by node input and output contracts.
-
-## Example dialogue
-
-> **Dev:** "Should the LigandMPNN app pass its tarball directly to FlowPacker?"
-> **Domain expert:** "No — the workflow should record a **Workflow Artifact** for the LigandMPNN result, materialize it into the run volume, and let FlowPacker consume the artifact's selected structure files."
->
-> **Dev:** "Is AF3Score four workflow steps because it has lock, prepare, run, and postprocess functions?"
-> **Domain expert:** "No — those are **App Functions** inside one **Workflow Node** when the workflow cares about one scoring step."
->
-> **Dev:** "Should users write workflow YAML first?"
-> **Domain expert:** "No — complex workflows should start with the **Workflow Builder** so node contracts and artifact selectors stay explicit in Python."
->
-> **Dev:** "Can every interrupted node just run again?"
-> **Domain expert:** "Only short-running nodes should default to rerun. Long-running nodes need a **Durable Node Cache** and a **Node Execution Policy** that makes restart behavior explicit."
->
-> **Dev:** "Does the workflow orchestrator spawn app-backed nodes as runners?"
-> **Domain expert:** "No — the **Workflow Orchestrator** runs the **Workflow Runtime**, the runtime schedules **Workflow Nodes**, and an **App-Backed Node** calls app functions as its implementation."
->
-> **Dev:** "Should every node be its own Modal function?"
-> **Domain expert:** "No — **Node Placement** determines whether the node runs inline for lightweight workflow logic or remotely for long-running and failure-isolated work."
->
-> **Dev:** "Can the workflow call an app's local entrypoint?"
-> **Domain expert:** "No — **Local Entrypoints** stay CLI-only. Workflows call **Workflow-Compatible App Functions** that may be derived from the same behavior."
->
-> **Dev:** "How does one node consume only PDB files from an upstream design step?"
-> **Domain expert:** "Use an **Artifact Selector** that names the upstream node, selects structure artifacts, and filters files by role or pattern."
->
-> **Dev:** "For RFdiffusion followed by LigandMPNN, should LigandMPNN redesign every residue in the output PDB?"
-> **Domain expert:** "No — the **LigandMPNN Redesign Set** includes **Generated Scaffold Segments** and uses the **RFdiffusion Output Mapping** to exclude **Fixed Motif Segments**."
->
-> **Dev:** "If the user asks for three RFdiffusion trajectories and two RFdiffusion designs, how many LigandMPNN runs do we create?"
-> **Domain expert:** "Six — each **RFdiffusion Trajectory** emits two **RFdiffusion Designs**, and each design receives one **LigandMPNN Sequence Batch**."
->
-> **Dev:** "Does one PPIFlow output structure create a new node in the DAG?"
-> **Domain expert:** "No — the downstream **Workflow Node** uses **Dynamic Task Fan-Out** to create per-structure tasks while the DAG shape stays fixed."
->
-> **Dev:** "If two scoring nodes depend on the same design node, should they wait for each other?"
-> **Domain expert:** "No — once their shared upstream dependency is complete, the **Workflow Runtime** can schedule both nodes in parallel."
-
 ## Flagged ambiguities
 
 - "artifact" can mean either inline app bytes or remote files. Resolved: an **Inline Byte Output** is a small app output before materialization; a **Workflow Artifact** is durable volume-backed state after materialization.
 - "step" can mean either a semantic workflow operation or one callable remote function. Resolved: use **Workflow Node** for the semantic DAG unit and **App Function** for a Modal remote callable.
 - "app node" can mean either a Modal deployment unit or a DAG vertex backed by that app. Resolved: use **App** for the deployment unit and **App-Backed Node** for the DAG vertex.
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.
+- "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for shared child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
 - "positions marked for RFdiffusion to generate scaffolds for" can mean every RFdiffusion output residue or only de novo contig residues. Resolved: use **LigandMPNN Redesign Set** for de novo output residues and exclude copied motif residues.

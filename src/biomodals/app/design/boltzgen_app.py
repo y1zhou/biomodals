@@ -26,6 +26,7 @@ from biomodals.helper.shell import (
     sanitize_filename,
     warmup_directory,
 )
+from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -294,6 +295,7 @@ def collect_boltzgen_data(
     extra_args: str | None = None,
     filter_results: bool = True,
     filter_rmsd_threshold: float = 4.0,
+    max_parallel_runs: int | None = None,
 ) -> bytes | list[str]:
     """Collect BoltzGen output data from multiple runs."""
     out_vol = CONF.output_volume
@@ -324,7 +326,15 @@ def collect_boltzgen_data(
             f"💊 Launching or resuming {len(run_dirs)} incomplete BoltzGen runs "
             f"out of {len(run_ids)} planned runs."
         )
-        for boltzgen_dir in BoltzGenRunner().boltzgen_run.map(run_dirs, kwargs=kwargs):
+
+        def run_one(boltzgen_dir: Path) -> str:
+            return BoltzGenRunner().boltzgen_run.remote(str(boltzgen_dir), **kwargs)
+
+        for boltzgen_dir in bounded_map(
+            run_dirs,
+            run_one,
+            max_parallel=max_parallel_runs,
+        ):
             print(f"💊 BoltzGen run completed: {boltzgen_dir}")
     else:
         print("💊 All planned BoltzGen runs are already complete; skipping relaunch.")
@@ -675,7 +685,8 @@ def submit_boltzgen_task(
             be used together with `salvage_mode` to continue previous runs.
         num_parallel_runs: Number of parallel runs to submit. Due to the stochastic
             nature of BoltzGen, running multiple parallel runs with the same
-            YAML input would generate different results.
+            YAML input would generate different results. Also caps concurrent
+            BoltzGen child runs in salvage mode.
         download_models: Whether to download model weights and skip running.
         force_redownload: Whether to force re-download of model weights even if they exist.
         protocol: Design protocol, one of: protein-anything, peptide-anything,
@@ -764,6 +775,7 @@ def submit_boltzgen_task(
         extra_args=extra_args,
         filter_results=filter_results and (out_dir is not None),
         filter_rmsd_threshold=filter_rmsd_threshold,
+        max_parallel_runs=num_parallel_runs,
     )
     if out_dir is None:
         return

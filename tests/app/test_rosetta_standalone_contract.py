@@ -62,14 +62,9 @@ def test_rosetta_no_local_output_reports_volume_path(
         ),
     )
     monkeypatch.setattr(
-        rosetta_app.modal,
-        "FunctionCall",
-        SimpleNamespace(gather=lambda *tasks: None),
-    )
-    monkeypatch.setattr(
         rosetta_app,
         "run_rosetta",
-        SimpleNamespace(spawn=lambda *args: SimpleNamespace(object_id="call-1")),
+        SimpleNamespace(remote=lambda *args: None),
     )
 
     rosetta_app.submit_rosetta_task(

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
 import polars as pl
 from pydantic import BaseModel
 
+from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import AppRunStatus
 from biomodals.workflow.ppiflow import manifests
 
@@ -60,22 +60,17 @@ def run_candidate_tasks(
     if not tasks:
         return []
 
-    max_workers = min(candidate_concurrency, len(tasks))
-    outcomes: list[CandidateOutcome] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(submit, task): task for task in tasks}
-        for future in as_completed(futures):
-            task = futures[future]
-            try:
-                outcomes.append(future.result())
-            except Exception as exc:  # noqa: BLE001
-                outcomes.append(
-                    CandidateOutcome(
-                        candidate_id=task.candidate_id,
-                        status=AppRunStatus.FAILED,
-                        error=str(exc),
-                    )
-                )
+    def safe_submit(task: CandidateTask) -> CandidateOutcome:
+        try:
+            return submit(task)
+        except Exception as exc:  # noqa: BLE001
+            return CandidateOutcome(
+                candidate_id=task.candidate_id,
+                status=AppRunStatus.FAILED,
+                error=str(exc),
+            )
+
+    outcomes = bounded_map(tasks, safe_submit, max_parallel=candidate_concurrency)
     return sorted(outcomes, key=lambda outcome: outcome.candidate_id)
 
 

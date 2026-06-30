@@ -53,6 +53,7 @@ from biomodals.helper.shell import (
     run_command,
 )
 from biomodals.helper.structure import struct2seq
+from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -272,6 +273,7 @@ def prepare_protenix_inputs(
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
+    max_parallel_msa: int | None = None,
 ) -> bytes:
     """Run CPU preprocessing and cache prepared JSON + search outputs in a volume."""
     from tempfile import mkdtemp
@@ -302,7 +304,7 @@ def prepare_protenix_inputs(
 
     # Load protein and RNA sequences from input JSON
     conf = ProtenixConfig.from_file(tmp_json_path)
-    msa_tasks = []
+    msa_inputs: list[tuple[str, str, str, str]] = []
     output_dirs: list[str] = []
     for task in conf.root:
         protein_seqs: list[str] = []
@@ -331,15 +333,18 @@ def prepare_protenix_inputs(
 
         ProtenixConfig([task]).to_files(cache_dir, task_name)
         MSA_CACHE_VOLUME.commit()
-        msa_task = query_protenix_msa_server.spawn(
+        msa_inputs.append((
             protenix_command,
             f"{cache_dir}/{task_name}.json",
             str(cache_dir),
             msa_server_mode,
-        )
-        msa_tasks.append(msa_task)
+        ))
 
-    _ = modal.FunctionCall.gather(*msa_tasks)
+    bounded_map(
+        msa_inputs,
+        lambda args: query_protenix_msa_server.remote(*args),
+        max_parallel=max_parallel_msa,
+    )
     MSA_CACHE_VOLUME.reload()
 
     # Add the MSA paths back to the input JSON
@@ -554,6 +559,7 @@ def submit_protenix_task(
     force_redownload: bool = False,
     extra_args: str | None = None,
     score_only: bool = False,
+    max_parallel_msa: int | None = None,
 ) -> None:
     """Run Protenix structure prediction on Modal and fetch results to `out_dir`.
 
@@ -581,6 +587,7 @@ def submit_protenix_task(
         extra_args: Additional CLI arguments passed to `protenix pred`.
         score_only: When True, score an existing PDB/CIF structure using
             ``protenixscore score`` instead of running prediction.
+        max_parallel_msa: Maximum number of MSA search containers to run at once.
     """
     # Validate model name
     if model_name not in APP_INFO.supported_models:
@@ -633,6 +640,7 @@ def submit_protenix_task(
                 msa_server_mode=msa_server_mode,
                 use_template=use_template,
                 use_rna_msa=use_rna_msa,
+                max_parallel_msa=max_parallel_msa,
             )
 
         # Run inference

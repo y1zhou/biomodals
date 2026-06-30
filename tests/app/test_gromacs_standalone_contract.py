@@ -36,7 +36,7 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     pdb_path.write_text("ATOM\n", encoding="utf-8")
     prepare_kwargs = {}
     production_kwargs = {}
-    spawned_stats = []
+    analysis_stats = []
 
     class FakePrepare:
         def remote(self, **kwargs):
@@ -49,19 +49,13 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
             return f"{gromacs_app.CONF.output_volume_mountpoint}/single"
 
     class FakeStats:
-        def spawn(self, traj_prefix, **kwargs):
-            spawned_stats.append((traj_prefix, kwargs))
+        def remote(self, traj_prefix, **kwargs):
+            analysis_stats.append((traj_prefix, kwargs))
             return f"stats-{traj_prefix}"
-
-    class FakeFunctionCall:
-        @staticmethod
-        def gather(*tasks):
-            return list(tasks)
 
     monkeypatch.setattr(gromacs_app, "prepare_tpr_cpu", FakePrepare())
     monkeypatch.setattr(gromacs_app, "production_run_cpu", FakeProduction())
     monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
-    monkeypatch.setattr(gromacs_app.modal, "FunctionCall", FakeFunctionCall)
 
     submit_task_info = gromacs_app.submit_gromacs_task.info
     assert submit_task_info is not None
@@ -83,7 +77,7 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
         "num_threads": 2,
         "use_openmp_threads": False,
     }
-    assert spawned_stats == [
+    assert analysis_stats == [
         ("nvt_", {"run_name": "single"}),
         ("npt_", {"run_name": "single"}),
         (

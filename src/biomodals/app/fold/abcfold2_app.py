@@ -27,6 +27,7 @@ from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import package_outputs
+from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -126,6 +127,14 @@ runtime_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int | str):
+        return int(value)
+    raise TypeError(f"Expected integer-like value, got {type(value).__name__}")
 
 
 ##########################################
@@ -328,21 +337,29 @@ def collect_abcfold2_boltz_data(
     if not boltz_conf_path.exists():
         raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
 
-    random_seeds = run_conf.get("seeds", [])
-    if not isinstance(random_seeds, list):
-        if random_seeds is None:
-            random_seeds = []
-        else:
-            random_seeds = [int(random_seeds)]
-    seeds_to_run = []
+    raw_random_seeds = run_conf.get("seeds", [])
+    random_seeds = (
+        [int(seed) for seed in raw_random_seeds]
+        if isinstance(raw_random_seeds, list)
+        else ([] if raw_random_seeds is None else [int(raw_random_seeds)])
+    )
+    seeds_to_run: list[int] = []
     for seed in random_seeds:
         boltz_run_dir = work_path / f"boltz_results_seed-{seed}"
         if not boltz_run_dir.exists():
             seeds_to_run.append(seed)
 
+    max_parallel = _optional_int(run_conf.get("max_parallel_children"))
     if seeds_to_run:
-        # modal function map results need to be consumed to actually run
-        for boltz_run_dir in run_abcfold2_boltz.map(seeds_to_run, kwargs=run_conf):
+
+        def run_seed(seed: int) -> str:
+            return run_abcfold2_boltz.remote(seed, **run_conf)
+
+        for boltz_run_dir in bounded_map(
+            seeds_to_run,
+            run_seed,
+            max_parallel=max_parallel,
+        ):
             print(f"Boltz run complete: {boltz_run_dir}")
 
     CONF.output_volume.reload()
@@ -427,21 +444,29 @@ def collect_abcfold2_chai_data(
     if not chai_conf_path.exists():
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
 
-    random_seeds = run_conf.get("seeds", [])
-    if not isinstance(random_seeds, list):
-        if random_seeds is None:
-            random_seeds = []
-        else:
-            random_seeds = [int(random_seeds)]
-    seeds_to_run = []
+    raw_random_seeds = run_conf.get("seeds", [])
+    random_seeds = (
+        [int(seed) for seed in raw_random_seeds]
+        if isinstance(raw_random_seeds, list)
+        else ([] if raw_random_seeds is None else [int(raw_random_seeds)])
+    )
+    seeds_to_run: list[int] = []
     for seed in random_seeds:
         chai_run_dir = work_path / f"chai_seed-{seed}"
         if not chai_run_dir.exists():
             seeds_to_run.append(seed)
 
+    max_parallel = _optional_int(run_conf.get("max_parallel_children"))
     if seeds_to_run:
-        # modal function map results need to be consumed to actually run
-        for chai_run_dir in run_abcfold2_chai.map(seeds_to_run, kwargs=run_conf):
+
+        def run_seed(seed: int) -> str:
+            return run_abcfold2_chai.remote(seed, **run_conf)
+
+        for chai_run_dir in bounded_map(
+            seeds_to_run,
+            run_seed,
+            max_parallel=max_parallel,
+        ):
             print(f"Chai run complete: {chai_run_dir}")
 
     CONF.output_volume.reload()
@@ -511,6 +536,7 @@ def submit_abcfold2_task(
     force_redownload: bool = False,
     run_boltz: bool = True,
     run_chai: bool = True,
+    max_parallel_children: int | None = None,
 ) -> None:
     """Run ABCFold2 on modal and fetch results to `out_dir`.
 
@@ -532,6 +558,8 @@ def submit_abcfold2_task(
         force_redownload: Whether to force re-download of model weights.
         run_boltz: Whether to run Boltz inference.
         run_chai: Whether to run Chai inference.
+        max_parallel_children: Maximum number of child inference containers to
+            run at once in each ABCFold2 coordinator.
     """
     import json
     from pathlib import Path
@@ -555,6 +583,7 @@ def submit_abcfold2_task(
     run_conf = prepare_abcfold2.remote(
         yaml_str=yaml_str, search_templates=search_templates, msa_chains=msa_chains
     )
+    run_conf["max_parallel_children"] = max_parallel_children
     local_out_dir.mkdir(parents=True, exist_ok=True)
     with open(local_out_dir / "run-config.json", "w") as f:
         json.dump(run_conf, f, indent=2)
@@ -567,29 +596,35 @@ def submit_abcfold2_task(
         download_chai_models.remote(force=force_redownload)
 
     # Run Boltz for each seed
-    inference_tasks: list[modal.FunctionCall] = []
-    output_paths: list[Path] = []
+    inference_jobs: list[tuple[str, Path]] = []
     if run_boltz:
         out_path = local_out_dir / "boltz_models.tar.zst"
         print(f"🧬 Running Boltz and collecting results to {out_path}")
-        boltz_task = collect_abcfold2_boltz_data.spawn(run_conf=run_conf)
-        inference_tasks.append(boltz_task)
-        output_paths.append(out_path)
+        inference_jobs.append(("boltz", out_path))
 
     # Run Chai for each seed
     if run_chai:
         out_path = local_out_dir / "chai_models.tar.zst"
         print(f"🧬 Running Chai and collecting results to {out_path}")
-        chai_task = collect_abcfold2_chai_data.spawn(run_conf=run_conf)
-        inference_tasks.append(chai_task)
-        output_paths.append(out_path)
+        inference_jobs.append(("chai", out_path))
 
-    if not inference_tasks:
+    if not inference_jobs:
         print("🧬 No inference tasks specified, exiting...")
         return
 
-    inference_data = modal.FunctionCall.gather(*inference_tasks)
-    for out_path, data in zip(output_paths, inference_data, strict=True):
+    def run_inference_job(job: tuple[str, Path]) -> tuple[Path, bytes]:
+        model_name, out_path = job
+        if model_name == "boltz":
+            data = collect_abcfold2_boltz_data.remote(run_conf=run_conf)
+        else:
+            data = collect_abcfold2_chai_data.remote(run_conf=run_conf)
+        return out_path, data
+
+    for out_path, data in bounded_map(
+        inference_jobs,
+        run_inference_job,
+        max_parallel=max_parallel_children,
+    ):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(data)
 

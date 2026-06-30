@@ -30,6 +30,7 @@ from biomodals.helper.app_run import (
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
+from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import (
     AppConfig,
     AppOutput,
@@ -969,16 +970,31 @@ def run_ppiflow_af3score_stage(
         task_spec = af3score_app.af3score_prepare.remote(
             run_name=run_name,
             input_files=input_names,
-            num_jobs=int(config.get("num_jobs", config.get("max_batches", 10))),
-            prepare_workers=int(config.get("prepare_workers", 8)),
+            num_jobs=_config_int(
+                config,
+                "num_jobs",
+                _config_int(
+                    config,
+                    "max_batches",
+                    _config_int(config, "max_child_calls", 10),
+                ),
+            ),
+            prepare_workers=_config_int(config, "prepare_workers", 8),
         )
-        chunk_specs = (
+        raw_chunk_specs = (
             task_spec.get("chunk_specs", [])
             if isinstance(task_spec, Mapping)
             else getattr(task_spec, "chunk_specs", [])
         )
-        calls = []
-        for chunk in chunk_specs:
+        chunk_specs = (
+            list(raw_chunk_specs)
+            if isinstance(raw_chunk_specs, Sequence)
+            and not isinstance(raw_chunk_specs, str | bytes)
+            else []
+        )
+        max_parallel = _config_int(config, "max_child_calls", len(chunk_specs))
+
+        def run_chunk(chunk):
             batch_name = (
                 chunk["batch_name"] if isinstance(chunk, Mapping) else chunk.batch_name
             )
@@ -992,16 +1008,14 @@ def run_ppiflow_af3score_stage(
                 if isinstance(chunk, Mapping)
                 else chunk.batch_pdb_dir
             )
-            calls.append(
-                af3score_app.af3score_run.spawn(
-                    run_name=run_name,
-                    batch_name=batch_name,
-                    batch_json_dir=batch_json_dir,
-                    batch_pdb_dir=batch_pdb_dir,
-                )
+            return af3score_app.af3score_run.remote(
+                run_name=run_name,
+                batch_name=batch_name,
+                batch_json_dir=batch_json_dir,
+                batch_pdb_dir=batch_pdb_dir,
             )
-        for call in calls:
-            call.get()
+
+        bounded_map(chunk_specs, run_chunk, max_parallel=max_parallel)
         metrics = af3score_app.af3score_postprocess.remote(
             run_name=run_name,
             input_files=input_names,
@@ -1393,22 +1407,27 @@ def run_ppiflow_rosetta_stage(
         raise ValueError(f"{step_name} requires at least one Rosetta input")
 
     num_cpu_per_pod = min(30, max(1, num_jobs))
-    max_num_pods = max(1, int(config.get("max_num_pods", 1)))
+    max_num_pods = max(1, _config_int(config, "max_num_pods", 1))
+    if config.get("max_child_calls") is not None:
+        max_num_pods = min(max_num_pods, _config_int(config, "max_child_calls", 1))
     num_pods = min(max_num_pods, (num_jobs + num_cpu_per_pod - 1) // num_cpu_per_pod)
-    calls = [
-        rosetta_app.run_rosetta.spawn(
-            str(staged["run_name"]),
-            str(staged["run_id"]),
-            num_cpu_per_pod,
-        )
-        for _ in range(num_pods)
-    ]
-    worker_errors = []
-    for call in calls:
+
+    def run_pod(_) -> str | None:
         try:
-            call.get()
+            rosetta_app.run_rosetta.remote(
+                str(staged["run_name"]),
+                str(staged["run_id"]),
+                num_cpu_per_pod,
+            )
+            return None
         except Exception as exc:  # noqa: BLE001
-            worker_errors.append(str(exc))
+            return str(exc)
+
+    worker_errors = [
+        error
+        for error in bounded_map(range(num_pods), run_pod, max_parallel=num_pods)
+        if error is not None
+    ]
     ROSETTA_OUTPUT_VOLUME.reload()
     cleanup_warnings = []
     try:
@@ -2444,6 +2463,15 @@ def _parse_seed_values(value: object) -> list[int]:
     return seeds
 
 
+def _config_int(config: Mapping[str, object], key: str, default: int) -> int:
+    value = config.get(key)
+    if value is None:
+        return default
+    if isinstance(value, int | float | str):
+        return int(value)
+    raise TypeError(f"{key} must be an integer")
+
+
 def _patterns_from_config(
     config: Mapping[str, object],
     *,
@@ -2591,6 +2619,7 @@ def build_ppiflow_workflow(
     task_yaml_bytes: bytes,
     steps_yaml_bytes: bytes,
     stage: int | None = None,
+    max_child_calls: int | None = None,
     modal_namespace: PPIFlowModalNamespace | None = None,
 ) -> Workflow:
     """Build a PPIFlow workflow DAG from upstream-style YAML files."""
@@ -2616,7 +2645,17 @@ def build_ppiflow_workflow(
 
     task_doc = _load_yaml_bytes(task_yaml_bytes)
     steps_doc = _load_yaml_bytes(steps_yaml_bytes)
+    if max_child_calls is not None:
+        if max_child_calls < 1:
+            raise ValueError("max_child_calls must be at least 1")
+        steps_doc = _steps_doc_with_child_budget(steps_doc, max_child_calls)
     task = _task_section(task_doc)
+    if max_child_calls is not None:
+        task = dict(task)
+        task["candidate_concurrency"] = min(
+            int(task.get("candidate_concurrency", max_child_calls)),
+            max_child_calls,
+        )
     enabled = _enabled_section(task_doc)
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
     candidate_concurrency = ppiflow_coordinators.candidate_concurrency_from_config(
@@ -3090,6 +3129,23 @@ def _step_cfg_with_candidate_concurrency(
     return cfg
 
 
+def _steps_doc_with_child_budget(
+    steps_doc: dict[str, Any], max_child_calls: int
+) -> dict[str, Any]:
+    capped: dict[str, Any] = {}
+    for step_name, raw_cfg in steps_doc.items():
+        if not isinstance(raw_cfg, dict):
+            capped[step_name] = raw_cfg
+            continue
+        cfg = dict(raw_cfg)
+        cfg["max_child_calls"] = max_child_calls
+        for key in ("candidate_concurrency", "num_jobs", "max_batches", "max_num_pods"):
+            if key in cfg and cfg[key] is not None:
+                cfg[key] = min(int(cfg[key]), max_child_calls)
+        capped[step_name] = cfg
+    return capped
+
+
 def _ppiflow_input_fields(args: object) -> tuple[str, ...]:
     if isinstance(args, ppiflow_app.SampleAntibodyNanobodyConfig):
         return ("antigen_pdb", "framework_pdb")
@@ -3183,6 +3239,7 @@ def submit_ppiflow_workflow(
     force: bool = False,
     wait: bool = True,
     max_parallel: int = 16,
+    max_child_calls: int | None = None,
     dry_run: bool = False,
     strict_artifact_checks: bool = False,
 ) -> None:
@@ -3201,6 +3258,8 @@ def submit_ppiflow_workflow(
             Modal function call id for asynchronous collection.
         max_parallel: Maximum number of ready workflow nodes to execute
             concurrently in one scheduler wave.
+        max_child_calls: Best-effort cap on child app calls submitted inside
+            one PPIFlow stage coordinator container.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced app-owned volume artifacts
             before reusing completed workflow nodes.
@@ -3216,6 +3275,7 @@ def submit_ppiflow_workflow(
             task_yaml_bytes=task_yaml_bytes,
             steps_yaml_bytes=steps_yaml_bytes,
             stage=stage,
+            max_child_calls=max_child_calls,
         )
         print_workflow_dag(workflow.validate())
         return
@@ -3230,6 +3290,7 @@ def submit_ppiflow_workflow(
         task_yaml_bytes=task_yaml_bytes,
         steps_yaml_bytes=yaml.safe_dump(steps_doc).encode("utf-8"),
         stage=stage,
+        max_child_calls=max_child_calls,
     )
 
     orchestrator_handle = orchestrator.WorkflowOrchestrator()

@@ -23,6 +23,7 @@ from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.shell import package_outputs, warmup_directory
+from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -397,11 +398,11 @@ def submit_rosetta_task(
     print(
         f"🧬 Running task {run_name}-{run_id} in {max_num_pods} {num_cpu_per_pod}-CPU pods..."
     )
-    rosetta_tasks = [
-        run_rosetta.spawn(run_name, run_id, num_cpu_per_pod)
-        for _ in range(max_num_pods)
-    ]
-    _ = modal.FunctionCall.gather(*rosetta_tasks)
+    bounded_map(
+        range(max_num_pods),
+        lambda _: run_rosetta.remote(run_name, run_id, num_cpu_per_pod),
+        max_parallel=max_num_pods,
+    )
 
     modal.Queue.objects.delete(f"{CONF.name}-queue-{run_id}")
 

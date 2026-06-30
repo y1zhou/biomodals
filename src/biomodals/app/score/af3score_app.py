@@ -35,6 +35,7 @@ from biomodals.helper.shell import (
     run_command,
     sanitize_filename,
 )
+from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -505,21 +506,15 @@ def submit_af3score_task(
             max_batches = min(max_batches, total_chunks)
             print(f"🧬 Running {total_chunks} batches with a max of {max_batches} GPUs")
 
-            from concurrent.futures import ThreadPoolExecutor
+            def run_chunk(spec):
+                return af3score_run.remote(
+                    run_name=run_name,
+                    batch_name=spec.batch_name,
+                    batch_json_dir=spec.batch_json_dir,
+                    batch_pdb_dir=spec.batch_pdb_dir,
+                )
 
-            with ThreadPoolExecutor(max_workers=max_batches) as executor:
-                futures = [
-                    executor.submit(
-                        af3score_run.remote,
-                        run_name=run_name,
-                        batch_name=spec.batch_name,
-                        batch_json_dir=spec.batch_json_dir,
-                        batch_pdb_dir=spec.batch_pdb_dir,
-                    )
-                    for spec in chunk_specs
-                ]
-                for future in futures:
-                    future.result()  # wait for all workers to finish
+            bounded_map(chunk_specs, run_chunk, max_parallel=max_batches)
 
         postprocess_result = af3score_postprocess.remote(
             run_name=run_name,

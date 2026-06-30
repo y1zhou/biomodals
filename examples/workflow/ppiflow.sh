@@ -29,4 +29,5 @@ fi
     --task-yaml "${task_yaml}" \
     --steps-yaml "${steps_yaml}" \
     --run-id ppiflow-vhh-example \
-    --max-parallel 2
+    --max-parallel "${MAX_PARALLEL:-2}" \
+    --max-child-calls "${MAX_CHILD_CALLS:-1}"

@@ -21,6 +21,7 @@ from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
+from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import ArtifactFile
 
 ##########################################
@@ -818,6 +819,7 @@ def submit_gromacs_task(
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
+    max_parallel_analysis: int | None = None,
 ) -> None:
     """Run GROMACS MD simulations on Modal and save results to a volume.
 
@@ -839,6 +841,8 @@ def submit_gromacs_task(
         gen_seed: Random seed for initial velocity generation during
             equilibration. If -1, a random seed will be chosen.
         genion_seed: Random seed for ion placement during system neutralization.
+        max_parallel_analysis: Maximum number of trajectory-analysis containers
+            to run at once.
     """
     # Load input PDB
     pdb_path = Path(input_pdb).expanduser().resolve()
@@ -863,10 +867,11 @@ def submit_gromacs_task(
     else:
         remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
 
-    process_traj_tasks = [
-        collect_traj_stats.spawn(prefix, run_name=run_name)
-        for prefix in ["nvt_", "npt_"]
-    ]
+    bounded_map(
+        ["nvt_", "npt_"],
+        lambda prefix: collect_traj_stats.remote(prefix, run_name=run_name),
+        max_parallel=max_parallel_analysis,
+    )
 
     print("🧬 Starting Gromacs production MD simulation...")
     if cpu_only:
@@ -885,11 +890,15 @@ def submit_gromacs_task(
         )
 
     print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
-    prod_traj_task = collect_traj_stats.spawn(
-        run_name=run_name, traj_prefix="production_", save_processed_traj=True
+    bounded_map(
+        ["production_"],
+        lambda prefix: collect_traj_stats.remote(
+            run_name=run_name,
+            traj_prefix=prefix,
+            save_processed_traj=True,
+        ),
+        max_parallel=max_parallel_analysis,
     )
-
-    _ = modal.FunctionCall.gather(*process_traj_tasks, prod_traj_task)
 
     remote_vol = volume_path_from_mount_path(
         remote_workdir, CONF.output_volume_mountpoint, CONF.output_volume_name

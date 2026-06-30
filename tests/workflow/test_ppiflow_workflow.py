@@ -1692,6 +1692,39 @@ AF3scoreStep_stage1: {}
     assert definition.nodes["stage1-af3score"].node.config["candidate_concurrency"] == 3
 
 
+def test_ppiflow_max_child_calls_caps_stage_fanout_configs() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=b"""
+task:
+  gentype: binder
+  candidate_concurrency: 5
+steps:
+  MPNNStep_stage1: true
+  AF3scoreStep_stage1: true
+  RosettaFixStep: true
+""",
+        steps_yaml_bytes=b"""
+MPNNStep_stage1:
+  candidate_concurrency: 4
+AF3scoreStep_stage1:
+  num_jobs: 6
+RosettaFixStep:
+  max_num_pods: 7
+""",
+        max_child_calls=2,
+        modal_namespace=_fake_namespace(),
+    )
+
+    definition = workflow.validate()
+
+    assert (
+        definition.nodes["stage1-ligandmpnn"].node.config["candidate_concurrency"] == 2
+    )
+    assert definition.nodes["stage1-af3score"].node.config["num_jobs"] == 2
+    assert definition.nodes["stage1-af3score"].node.config["max_child_calls"] == 2
+    assert definition.nodes["stage2-rosetta-fix"].node.config["max_num_pods"] == 2
+
+
 def test_ppiflow_stage2_only_requires_existing_input() -> None:
     try:
         build_ppiflow_workflow(

@@ -15,6 +15,7 @@ from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import package_outputs, run_command, warmup_directory
+from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -96,15 +97,23 @@ def compress_one_run(dir_name: str) -> str:
 
 
 @app.local_entrypoint()
-def compress_all_runs(*args) -> None:
-    """Compress all BoltzGen runs in the output volume."""
-    tasks: list[modal.FunctionCall] = []
+def compress_all_runs(max_parallel: int | None = None) -> None:
+    """Compress all BoltzGen runs in the output volume.
+
+    Args:
+        max_parallel: Maximum number of compression containers to run at once.
+    """
+    run_names: list[str] = []
     for f in BG_CONF.output_volume.iterdir("/", recursive=False):
         if f.type == modal.volume.FileEntryType.DIRECTORY:
             print(f"Compressing BoltzGen run {f.path}")
-            tasks.append(compress_one_run.spawn(f.path))
+            run_names.append(f.path)
 
-    _ = modal.FunctionCall.gather(*tasks)
+    bounded_map(
+        run_names,
+        lambda run_name: compress_one_run.remote(run_name),
+        max_parallel=max_parallel,
+    )
 
 
 if __name__ == "__main__":

@@ -158,12 +158,12 @@ _Avoid_: raw input path, wildcard-only dependency
 A dependency between workflow nodes that enforces execution order without passing workflow artifacts.
 _Avoid_: dummy artifact
 
-**Dynamic Task Fan-Out**:
+**Dynamic Task Fan-Out** [planned]:
 A workflow node execution pattern where the DAG node is fixed but the number of per-input tasks is determined from upstream artifacts at runtime.
 _Avoid_: dynamic DAG
 
 **Worker Pool**:
-A fixed-size set of remote workers spawned by one workflow node to process that node's runtime task queue.
+A bounded process or thread pool from `concurrent.futures` that limits concurrent task execution within one workflow node.
 _Avoid_: server pool, runner server
 
 **Workflow Runtime**:
@@ -174,8 +174,8 @@ _Avoid_: engine
 In-memory inspection data produced by the workflow runtime for the most recent run, including scheduler decisions and scheduled node waves.
 _Avoid_: public scheduler API, debug-only list
 
-**Stale Node Attempt**:
-A durable node attempt still marked as running after the workflow orchestrator that owned it is no longer executing.
+**Stale Node Attempt** [planned]:
+A durable node attempt from a previous failed orchestrator session. On next session the runtime should either rerun the node as a fresh attempt or recover from the previous run's recorded state and remote-call identity.
 _Avoid_: active node, pending node
 
 **Durable Node Completion**:
@@ -198,25 +198,21 @@ _Avoid_: runner location, execution site
 The restart and recovery contract for an incomplete workflow node when Modal interrupts or retries the node.
 _Avoid_: runner tag, retry hint
 
-**Durable Node Cache**:
-Volume-backed intermediate state that lets a long-running workflow node resume or safely skip completed work after restart.
+**Durable Node Cache** [planned]:
+Volume-backed intermediate checkpoint state that lets a long-running workflow node with `RESUME` execution policy restore progress after interruption or restart.
 _Avoid_: temporary scratch, local cache
 
 ## Relationships
 
-- A **Workflow Builder** defines a workflow DAG in Python code.
-- A **Workflow Builder** connects nodes through named **Artifact Selectors** and optional **Control Edges**.
 - A **Terminal Workflow Node** represents an externally relevant workflow output boundary for run completion checks.
 - A **Workflow Runtime** may restrict scheduling to incomplete **Terminal Workflow Nodes** and their upstream ancestor closure.
 - A **Terminal Workflow Node** is complete for DAG pruning only through **Durable Node Completion**, not by discovering files outside the workflow ledger.
 - Completed **Terminal Workflow Nodes** can repair stale failed or partial run status on resume.
 - Unknown **Artifact Availability** does not invalidate **Durable Node Completion** for terminal-node pruning; only missing artifacts do.
 - Failed, running, or incomplete nodes outside the incomplete-terminal ancestor closure do not block workflow success.
-- **Durable Node Completion** is output-driven: available recorded outputs are enough to skip a node even when upstream inputs are stale, missing, or no longer relevant.
-- A **Workflow Builder** and **Workflow Orchestrator** form the stable workflow authoring surface; users should not need to understand scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization internals to run a workflow.
-- A **Workflow Node** declares a **Node Execution Policy**.
-- A **Workflow Node** declares **Node Placement**.
-- A **Workflow Node** may use **Dynamic Task Fan-Out** without changing the workflow DAG shape.
+- **Durable Node Completion** is output-driven: when a node's recorded output artifacts are available on disk, the node is treated as complete regardless of whether its upstream inputs have since been regenerated or are no longer present. A completed node whose outputs exist is skipped even if its upstream dependencies were rerun.
+- A **Workflow Builder** and **Workflow Orchestrator** form the stable workflow authoring surface; users should not need to understand scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization internals to run a workflow. The `orchestrator` module at `biomodals.workflow.core.orchestrator` is internal to the workflow core package; workflow scripts import it for app composition but it is not part of the public `biomodals.workflow` API.
+- A **Workflow Node** may use **Dynamic Task Fan-Out** [planned] without changing the workflow DAG shape.
 - A PPIFlow stage preserves its complete **PPIFlow Candidate Set** through **Dynamic Task Fan-Out** while keeping the stage-level DAG static.
 - PPIFlow stage nodes do not select a representative structure by default; they process every selected candidate and preserve the **PPIFlow Candidate Set** unless the user explicitly configures a narrowing selector.
 - A PPIFlow-derived artifact retains **PPIFlow Candidate Identity** so scores and refolded models are paired with the correct source structure.
@@ -232,7 +228,7 @@ _Avoid_: temporary scratch, local cache
 - Stage-2-only PPIFlow runs start from a **PPIFlow Candidate Manifest**; a convenience structures path is normalized into a minimal manifest with synthetic candidate identities.
 - A **PPIFlow Candidate Filter** emits a new retained-candidate manifest for downstream steps and an audit table that records rejected candidates and filter reasons.
 - PPIFlow reports include **PPIFlow Candidate Attrition** across stages, but downstream scientific stages consume only retained-candidate manifests.
-- PPIFlow ranking includes retained, fully completed candidates only; rejected, partial, failed, and skipped candidates are represented in attrition and report tables instead of null-ranked rows.
+- PPIFlow ranking includes retained candidates with at least one usable ranking signal; rejected, partial, failed, and skipped candidates are represented in attrition and report tables instead of null-ranked rows. If no retained candidates are rankable, the rank step emits empty rank artifacts with a warning so reporting can still complete.
 - PPIFlow report generation is workflow-native unless future report rendering requires heavyweight app dependencies.
 - PPIFlow derives a **PPIFlow Sequence Table** from LigandMPNN outputs so upstream-equivalent `mpnn_seqs.csv` exists without making the LigandMPNN app own PPIFlow-specific provenance columns.
 - Binder MPNN and AbMPNN are represented as **PPIFlow MPNN Modes** on one LigandMPNN-backed workflow node unless AbMPNN requires a distinct app function or output contract.
@@ -243,21 +239,14 @@ _Avoid_: temporary scratch, local cache
 - PPIFlow candidate-wide stage coordinators may submit child app calls concurrently, but concurrency is bounded by stage configuration.
 - PPIFlow uses a shared candidate-concurrency default with optional per-stage overrides.
 - PPIFlow candidate-concurrency settings belong to PPIFlow task/steps configuration, not the workflow runtime or orchestrator API.
-- PPIFlow-local manifest, table, staging, and coordinator helpers belong in the `biomodals.workflow.ppiflow` submodule; `ppiflow_workflow.py` remains the public workflow entrypoint.
-- `biomodals.workflow.ppiflow` is workflow-internal even though its package name does not start with an underscore.
-- PPIFlow Modal decorators, app registration, and app-bound remote helper functions stay in `ppiflow_workflow.py`; the `biomodals.workflow.ppiflow` submodule avoids hidden Modal registration side effects.
+- PPIFlow-local helper modules (manifests, tables, staging, coordinators) live in the `biomodals.workflow.ppiflow` submodule, which is workflow-internal even though its package name doesn't start with an underscore. PPIFlow Modal decorators, app registration, and app-bound remote helpers stay in `ppiflow_workflow.py` to avoid hidden Modal registration side effects; `ppiflow_workflow.py` remains the public workflow module.
 - PPIFlow candidate-wide remote wrappers are stage-specific thin Modal functions over shared coordinator helpers.
 - PPIFlow remote wrappers mount only the workflow and app volumes required by that stage.
 - PPIFlow stage-specific remote wrappers start with current workflow resource defaults; resource tuning waits for stage telemetry.
 - PPIFlow node classes stay in `ppiflow_workflow.py` because they are the visible workflow DAG contract.
 - PPIFlow helper behavior is tested in focused helper test modules, while `test_ppiflow_workflow.py` covers DAG and node integration.
-- Old in-progress PPIFlow workflow ledgers are not migrated across the candidate-manifest refactor; runs should restart with force or re-enter through explicit `Stage2Input`.
-- The PPIFlow refactor is delivered in phase-sized commits; pushing remains a separate explicit action.
 - A **Workflow Node** may use a **Worker Pool** to process dynamically fanned-out tasks.
-- A **Workflow Runtime** schedules **Workflow Nodes** and does not contain tool-specific biological logic.
-- A **Workflow Runtime** is an internal orchestration component; workflow users should not instantiate it directly or depend on its scheduler, ledger, remote-call recovery, volume-sync, or artifact-materialization interfaces.
-- Internal workflow runtime modules may live under a private `_runtime` package so the stable workflow authoring surface stays limited to the **Workflow Builder**, package-development node contracts, and **Workflow Orchestrator**.
-- The `WorkflowRuntime` class should remain a thin internal facade around private runtime collaborators rather than a broad service object with many callable behaviors.
+- A **Workflow Runtime** schedules **Workflow Nodes** and does not contain tool-specific biological logic. It is an internal orchestration component; users should not instantiate it directly. Internal runtime modules live under the private `_runtime` package, and the `WorkflowRuntime` class remains a thin facade around private runtime collaborators rather than a broad service object.
 - **Runtime Diagnostics** may expose scheduler decision snapshots for tests and debugging, but they are not part of routine workflow authoring.
 - A **Workflow Runtime** may run independent ready nodes in parallel when all of each node's dependencies are satisfied.
 - A **Workflow Orchestrator** runs the **Workflow Runtime** remotely on Modal and is responsible for run-level lifecycle recovery.
@@ -265,15 +254,11 @@ _Avoid_: temporary scratch, local cache
 - Remote workflow nodes and workers write deterministic files and logs; the **Workflow Orchestrator** reconciles those files into the **Workflow Ledger**.
 - A **Workflow Orchestrator** records Modal function call ids before waiting on remote work and reattaches to those calls during recovery before starting replacement work.
 - A remote call is not durably successful until **Durable Node Completion** is committed with its recoverable result and artifact state.
-- A workflow step produces zero or more **Workflow Artifacts**.
-- A workflow step consumes zero or more **Workflow Artifacts** from upstream steps.
 - A **Workflow Artifact** references durable files stored in a remote Modal volume.
 - An **Inline Byte Output** may contain UTF-8 text, or a small zstd archive when `media_type` is `application/zstd`.
 - An **Inline Byte Output** is normalized into a volume-backed **Workflow Artifact** when the workflow runtime materializes node outputs.
 - Other binary or non-text app outputs are written to volume paths and represented as volume-backed artifacts, not serialized as inline bytes.
 - A **Workflow Node** may invoke one or more **App Functions** to fulfill one semantic step.
-- An **App** may expose many **App Functions**.
-- A **Local Entrypoint** remains CLI-only and should not be called by the workflow orchestrator.
 - The **CLI Namespace** separates `biomodals app ...` commands from `biomodals workflow ...` commands.
 - A **Workflow-Compatible App Function** may reuse behavior from a **Local Entrypoint**, but exposes a remote app function contract for workflows.
 - A **Partial App Run** does not satisfy a workflow dependency even when it preserves successful candidate outputs for inspection or recovery.
@@ -293,10 +278,8 @@ _Avoid_: temporary scratch, local cache
 - A local entrypoint may normalize user input into a **Canonical Run Name**, while reusable app functions reject non-canonical names before resolving an **App Run Layout**.
 - A **Workflow-Compatible App Function** should return outputs from an **App Run Layout** as `AppRunResult` records with explicit `VolumePath` or `InlineBytes` storage.
 - A durable **Workflow-Compatible App Function** should report app outputs from the `outputs/` directory and logs from the `logs/` directory in its **App Run Layout**.
-- An **App-Backed Node** calls one or more **App Functions** and processes their outputs into workflow artifacts.
-- A **Workflow-Native Node** performs lightweight workflow logic without calling a bioinformatics app.
 - **Workflow Node**, **App-Backed Node**, and **Workflow-Native Node** contracts are package-development APIs for maintainers implementing reusable workflows; routine workflow users should work through the **Workflow Builder** and **Workflow Orchestrator** instead of runtime node internals.
-- A long-running **Workflow Node** must use a **Durable Node Cache** so interruption and restart do not corrupt outputs or repeat unsafe work.
+- A long-running **Workflow Node** with `RESUME` execution policy will use a **Durable Node Cache** [planned] so interruption and restart do not corrupt outputs or repeat unsafe work.
 - A short-running **Workflow Node** may choose a rerun-on-restart policy when recomputation is cheaper than durable checkpointing.
 - A lightweight **Workflow-Native Node** may run inline in the **Workflow Orchestrator** when remote execution overhead is not justified.
 - A long-running or failure-isolated **Workflow Node** should run as a separate remote Modal function.

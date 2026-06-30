@@ -18,9 +18,10 @@ Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
 example for app-composed workflows. Use
 `src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for
 workflows that fan out one app's volume-backed outputs into another app's
-workflow-compatible remote function. Ignore
-`src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now
-because it is expected to be refactored.
+workflow-compatible remote function. Use
+`src/biomodals/workflow/ppiflow_workflow.py` as the reference for
+candidate-manifest joins, retained-candidate filtering, candidate-wide remote
+stage coordinators, and PPIFlow-specific stage wiring.
 
 ## Working Rules
 

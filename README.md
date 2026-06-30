@@ -43,5 +43,13 @@ biomodals workflow list
 biomodals workflow help <workflow-name>
 ```
 
+To run a workflow, pass workflow-specific flags after `--`:
+
+```bash
+uv run biomodals workflow run ppiflow --dry-run -- \
+  --task-yaml examples/data/ppiflow_workflow_task.yaml \
+  --steps-yaml examples/data/ppiflow_workflow_steps.yaml
+```
+
 Note that this repository is heavily refactored from [the upstream repository](https://github.com/hgbrian/biomodals).
 All new apps have the `_app.py` suffix to distinguish from the original ones.

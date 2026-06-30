@@ -96,9 +96,9 @@ PPIFlow candidate manifests store one Parquet row per candidate with a nested li
 
 The PPIFlow candidate manifest schema starts as workflow-local helpers rather than shared `biomodals.schema` models. It is currently a PPIFlow-specific provenance contract, and moving it into shared schemas should wait until another workflow needs the same candidate-manifest abstraction.
 
-## Rank only complete retained PPIFlow candidates
+## Rank retained PPIFlow candidates with usable scores
 
-PPIFlow `ranked_designs.csv` contains only retained candidates with complete required scores and structures. Rejected, partial, failed, and skipped candidates remain visible through attrition and report tables, but they are not included as null-ranked rows because that makes the ranking artifact ambiguous.
+PPIFlow `ranked_designs.csv` contains only retained candidates with at least one usable ranking signal from DockQ, AF3/ReFold, or Rosetta. Rejected, partial, failed, skipped, and unrankable candidates remain visible through attrition and report tables instead of null-ranked rows because that makes the ranking artifact ambiguous. If no retained candidates are rankable, the rank step writes empty rank artifacts with a warning so report generation can still complete.
 
 ## Keep PPIFlow report generation workflow-native
 
@@ -118,11 +118,11 @@ Shared PPIFlow candidate concurrency lives in the existing task/steps YAML parsi
 
 ## Split PPIFlow workflow helpers into a submodule
 
-PPIFlow-local manifest, table, staging, and coordinator helpers live under a `biomodals.workflow.ppiflow` submodule, while `ppiflow_workflow.py` remains the public workflow entrypoint discovered by the CLI and catalog. This keeps the top-level workflow module focused on DAG assembly and node contracts instead of absorbing all candidate-manifest and stage-coordinator mechanics.
+PPIFlow-local manifest, table, staging, and coordinator helpers live under a `biomodals.workflow.ppiflow` submodule, while `ppiflow_workflow.py` remains the public workflow module discovered by the CLI and catalog. This keeps the top-level workflow module focused on DAG assembly and node contracts instead of absorbing all candidate-manifest and stage-coordinator mechanics.
 
-## Keep PPIFlow node classes in the workflow entrypoint
+## Keep PPIFlow node classes in the workflow module
 
-PPIFlow node classes stay in `ppiflow_workflow.py` because they define the visible workflow DAG contract. Helper internals for manifests, tables, staging, and candidate-wide coordination move into `biomodals.workflow.ppiflow`, but the public entrypoint remains the place to read node contracts and DAG assembly.
+PPIFlow node classes stay in `ppiflow_workflow.py` because they define the visible workflow DAG contract. Helper internals for manifests, tables, staging, and candidate-wide coordination move into `biomodals.workflow.ppiflow`, but the public workflow module remains the place to read node contracts and DAG assembly.
 
 ## Split PPIFlow helper tests from workflow integration tests
 
@@ -134,9 +134,9 @@ PPIFlow helpers live under `biomodals.workflow.ppiflow` rather than `_ppiflow`. 
 
 ## No migration for old PPIFlow workflow runs
 
-The PPIFlow workflow refactor does not migrate old in-progress workflow ledgers or artifact manifests. PPIFlow was already marked incomplete as a reference pattern, and the refactor changes candidate identity and artifact contracts; old in-progress runs should be restarted with `force`, while useful completed app-owned outputs can be reintroduced through explicit `Stage2Input`.
+The PPIFlow workflow refactor does not migrate old in-progress workflow ledgers or artifact manifests. The refactor changes candidate identity and artifact contracts; old in-progress runs should be restarted with `force`, while useful completed app-owned outputs can be reintroduced through explicit `Stage2Input`.
 
-## Keep PPIFlow Modal bindings in the workflow entrypoint
+## Keep PPIFlow Modal bindings in the workflow module
 
 PPIFlow Modal decorators, app registration, and app-bound remote helper functions stay in `ppiflow_workflow.py`. The `biomodals.workflow.ppiflow` submodule provides pure or near-pure helper logic for manifests, tables, staging, and coordinator mechanics so importing helper modules does not create hidden Modal app registration side effects and helper tests can run without Modal bindings.
 

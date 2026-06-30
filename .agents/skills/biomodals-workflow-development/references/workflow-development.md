@@ -8,9 +8,11 @@ Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
 workflow example. Use
 `src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for
 workflows that select files from one app's volume-backed output and fan those
-files out into another app's workflow-compatible function. Ignore
-`src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now; it
-is expected to be refactored.
+files out into another app's workflow-compatible function. Do not use
+`src/biomodals/workflow/ppiflow_workflow.py` as a generic starter template, but
+use it as the reference for candidate-manifest joins, retained-candidate
+filtering, candidate-wide remote stage coordinators, and PPIFlow-specific stage
+wiring.
 
 ## Contents
 
@@ -304,15 +306,16 @@ Remote workflow code should:
 
 ## Fan-Out
 
-The first workflow runtime supports static DAG fan-out. Build one node per known
-unit of work during DAG construction, as ShortMD does for per-PDB preparation
-and per-replicate production runs.
+Use static DAG fan-out when the input cardinality is known during DAG
+construction, as ShortMD does for per-PDB preparation and per-replicate
+production runs. Use fixed DAG nodes with runtime task fan-out when a semantic
+stage owns a candidate set, as PPIFlow does for candidate-wide stage
+coordinators.
 
 Use barriered fan-out first: a node starts only after all declared upstream
-dependencies are complete. Streaming between nodes is deferred.
-
-Independent ready nodes may run in parallel when all dependencies for each node
-are satisfied.
+dependencies are complete. Streaming between nodes is deferred. Independent
+ready nodes may run in parallel when all dependencies for each node are
+satisfied.
 
 ## Orchestrator Submission
 
@@ -380,7 +383,7 @@ the included `WorkflowOrchestrator`. Its user-facing flags should mirror
 `biomodals app run`, including Modal mode, detach, timeout, and pass-through
 workflow flags after `--`.
 The run command also exposes `--dry-run`, which forwards `--dry-run` to the
-selected workflow local entrypoint. User-facing workflow entrypoints should
+selected workflow local entrypoint. User-facing workflow local entrypoints should
 accept `dry_run: bool = False`; when set, they should build and validate the DAG,
 call `print_workflow_dag(workflow.validate())`, and return before constructing
 or submitting the orchestrator. DAG graph output should stay compact and print

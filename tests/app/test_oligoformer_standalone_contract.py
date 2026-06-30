@@ -21,9 +21,12 @@ def test_run_oligoformer_builds_off_target_and_toxicity_command(monkeypatch) -> 
     captured = {}
     volume = FakeVolume()
 
-    def fake_run_command(cmd):
+    def fake_run_command(cmd, *, cwd):
         captured["cmd"] = cmd
-        output_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        captured["cwd"] = cwd
+        output_arg = cmd[cmd.index("--output_dir") + 1]
+        captured["output_arg"] = output_arg
+        output_dir = Path(output_arg)
         captured["utr_bytes"] = Path(cmd[cmd.index("--utr") + 1]).read_bytes()
         captured["orf_bytes"] = Path(cmd[cmd.index("--orf") + 1]).read_bytes()
         output_dir.joinpath("result.csv").write_text("ok\n", encoding="utf-8")
@@ -49,7 +52,7 @@ def test_run_oligoformer_builds_off_target_and_toxicity_command(monkeypatch) -> 
 
     cmd = captured["cmd"]
     assert result == b"archive"
-    assert cmd[:4] == ["oligoformer", "-i", "1", "-i1"]
+    assert cmd[:5] == ["python", "scripts/main.py", "-i", "1", "-i1"]
     assert "-off" in cmd
     assert "-tox" in cmd
     assert "--no_func" in cmd
@@ -57,6 +60,8 @@ def test_run_oligoformer_builds_off_target_and_toxicity_command(monkeypatch) -> 
     assert captured["utr_bytes"] == b">utr\nAUGC\n"
     assert captured["orf_bytes"] == b">orf\nAUGC\n"
     assert captured["root"].name == "outputs"
+    assert captured["output_arg"].endswith("/")
+    assert captured["cwd"] == oligoformer_app.CONF.git_clone_dir
     assert volume.commit_count == 1
 
 

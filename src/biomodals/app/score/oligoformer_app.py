@@ -1,8 +1,8 @@
 """OligoFormer source repo: <https://github.com/lulab/OligoFormer>.
 
-OligoFormer predicts siRNA efficacy from an mRNA FASTA file. This wrapper uses
-the upstream Docker image and supports OligoFormer's off-target and toxicity
-options for standalone runs.
+OligoFormer predicts siRNA efficacy from an mRNA FASTA file. This wrapper builds
+the runtime from the upstream README and supports OligoFormer's off-target and
+toxicity options for standalone runs.
 
 ## Off-target prediction
 
@@ -51,16 +51,59 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", "7200")),
 )
 
+OLIGOFORMER_REQUIREMENTS = (
+    "bio==1.6.2",
+    "matplotlib==3.7.5",
+    "numpy==1.24.4",
+    "pandas==2.0.3",
+    "prefetch-generator==1.0.3",
+    "ptflops==0.7.3",
+    "pytorch-ignite==0.5.0.post2",
+    "scikit-learn==1.3.1",
+    "scipy==1.10.1",
+    "torch==2.2.1",
+    "torchvision==0.17.1",
+    "tqdm==4.66.1",
+    "yacs==0.1.8",
+)
+
 
 ##########################################
 # Image and app definitions
 ##########################################
 runtime_image = (
     modal.Image
-    .from_registry("yilanbai/oligoformer:v1.0")
-    .entrypoint([])
+    .debian_slim(python_version=CONF.python_version)
+    .apt_install(
+        "git",
+        "build-essential",
+        "ca-certificates",
+        "wget",
+        "unzip",
+        "perl",
+        "libstatistics-lite-perl",
+        "libbio-perl-perl",
+        "zstd",
+    )
     .env(CONF.default_env)
-    .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3", "modal"])
+    .run_commands(
+        " && ".join((
+            f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
+            f"cd {CONF.git_clone_dir}",
+            f"git checkout {CONF.repo_commit_hash}",
+            "wget -q https://cloud.tsinghua.edu.cn/f/46d71884ee8848b3a958/?dl=1 -O RNA-FM.tar.gz",
+            "tar -xzf RNA-FM.tar.gz",
+            "rm RNA-FM.tar.gz",
+            "test -d RNA-FM/redevelop",
+            "cd off-target/pita",
+            "make install",
+        ))
+    )
+    .workdir(str(CONF.git_clone_dir))
+    .uv_pip_install(*OLIGOFORMER_REQUIREMENTS)
+    .pipe(
+        patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3", "modal"]
+    )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -109,14 +152,16 @@ def run_oligoformer(
 
         mrna_fasta = input_dir / "mrna.fa"
         mrna_fasta.write_bytes(mrna_fasta_bytes)
+        output_prefix = f"{output_dir}/"
         cmd = [
-            "oligoformer",
+            "python",
+            "scripts/main.py",
             "-i",
             "1",
             "-i1",
             str(mrna_fasta),
             "--output_dir",
-            str(output_dir),
+            output_prefix,
         ]
 
         if sirna_fasta_bytes is not None:
@@ -146,7 +191,7 @@ def run_oligoformer(
         if toxicity:
             cmd.extend(["-tox", "--toxicity_threshold", str(toxicity_threshold)])
 
-        run_command(cmd)
+        run_command(cmd, cwd=CONF.git_clone_dir)
         MODEL_VOLUME.commit()
         return package_outputs(output_dir)
 

@@ -40,6 +40,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout, volume_app_output
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
@@ -49,13 +50,11 @@ from biomodals.helper.io import (
 from biomodals.helper.shell import (
     copy_files,
     package_outputs,
-    run_command_with_log,
+    run_command,
     sanitize_filename,
     softlink_dir,
 )
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.schema import (
-    AppOutput,
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
@@ -306,7 +305,12 @@ def run_flowpacker(
         f"💊 Running FlowPacker with model '{model_name}' on {len(input_files)} input(s)"
     )
     log_path = sample_dir / "flowpacker.log"
-    run_command_with_log(cmd, log_file=log_path, cwd=CONF.git_clone_dir, verbose=True)
+    run_command(
+        cmd,
+        output_mode="tee",
+        log_file=log_path,
+        cwd=CONF.git_clone_dir,
+    )
 
     if not sample_dir.exists():
         raise RuntimeError(
@@ -352,23 +356,23 @@ def run_flowpacker_workflow(
         seed=seed,
     )
     archive_filename = f"{safe_run_name}.tar.zst"
-    volume_root = Path(CONF.output_volume_mountpoint)
-    archive_path = volume_root / "workflow" / safe_run_name / archive_filename
+    layout = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / "workflow" / safe_run_name
+    )
+    archive_path = layout.outputs_dir / archive_filename
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     archive_path.write_bytes(tarball_bytes)
     CONF.output_volume.commit()
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            volume_app_output(
                 name="flowpacker_outputs",
                 kind=ArtifactKind.ARCHIVE,
-                storage=volume_path_from_mount_path(
-                    remote_path=str(archive_path),
-                    mount_root=str(volume_root),
-                    volume_name=CONF.output_volume_name,
-                    media_type=ZSTD_MEDIA_TYPE,
-                ),
+                remote_path=str(archive_path),
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
+                media_type=ZSTD_MEDIA_TYPE,
                 metadata={"archive_format": "tar.zst", "filename": archive_filename},
             )
         ],

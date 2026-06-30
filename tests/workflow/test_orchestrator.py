@@ -45,6 +45,8 @@ def test_orchestrator_run_constructs_runtime(monkeypatch) -> None:
             workflow_volume=None,
             function_call_resolver=None,
             max_ready_workers: int = 32,
+            strict_external_artifact_checks: bool = False,
+            external_artifact_checker=None,
         ):
             calls["workflow"] = workflow
             calls["volume_root"] = volume_root
@@ -52,6 +54,8 @@ def test_orchestrator_run_constructs_runtime(monkeypatch) -> None:
             calls["workflow_volume"] = workflow_volume
             calls["function_call_resolver"] = function_call_resolver
             calls["max_ready_workers"] = max_ready_workers
+            calls["strict_external_artifact_checks"] = strict_external_artifact_checks
+            calls["external_artifact_checker"] = external_artifact_checker
 
         def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
             calls["run_id"] = run_id
@@ -81,6 +85,8 @@ def test_orchestrator_run_constructs_runtime(monkeypatch) -> None:
         "workflow_volume": volume,
         "function_call_resolver": calls["function_call_resolver"],
         "max_ready_workers": 7,
+        "strict_external_artifact_checks": False,
+        "external_artifact_checker": None,
         "run_id": "run-1",
         "force": True,
         "closed": True,
@@ -105,9 +111,13 @@ def test_orchestrator_run_passes_function_call_resolver(monkeypatch) -> None:
             workflow_volume=None,
             function_call_resolver=None,
             max_ready_workers: int = 32,
+            strict_external_artifact_checks: bool = False,
+            external_artifact_checker=None,
         ) -> None:
             calls["function_call_resolver"] = function_call_resolver
             calls["max_ready_workers"] = max_ready_workers
+            calls["strict_external_artifact_checks"] = strict_external_artifact_checks
+            calls["external_artifact_checker"] = external_artifact_checker
 
         def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
             calls["run_id"] = run_id
@@ -129,7 +139,58 @@ def test_orchestrator_run_passes_function_call_resolver(monkeypatch) -> None:
     assert result.status == AppRunStatus.SUCCEEDED
     assert callable(calls["function_call_resolver"])
     assert calls["max_ready_workers"] == 9
+    assert calls["strict_external_artifact_checks"] is False
+    assert calls["external_artifact_checker"] is None
     assert calls["run_id"] == "run-1"
+    assert calls["closed"] is True
+    assert volume.reload_count == 1
+    assert volume.commit_count == 1
+
+
+def test_orchestrator_run_passes_external_artifact_checker(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    volume = FakeVolume()
+    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
+
+    class FakeRuntime:
+        def __init__(
+            self,
+            *,
+            workflow: Workflow,
+            volume_root: Path,
+            workflow_volume_name: str | None = None,
+            workflow_volume=None,
+            function_call_resolver=None,
+            max_ready_workers: int = 32,
+            strict_external_artifact_checks: bool = False,
+            external_artifact_checker=None,
+        ) -> None:
+            calls["strict_external_artifact_checks"] = strict_external_artifact_checks
+            calls["external_artifact_checker"] = external_artifact_checker
+
+        def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+
+    def external_checker(_artifact) -> list[str]:
+        return []
+
+    raw_cls, instance = _raw_orchestrator()
+    result = raw_cls.run._get_raw_f()(
+        instance,
+        workflow=Workflow("demo"),
+        run_id="run-1",
+        strict_external_artifact_checks=True,
+        external_artifact_checker=external_checker,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls["strict_external_artifact_checks"] is True
+    assert calls["external_artifact_checker"] is external_checker
     assert calls["closed"] is True
     assert volume.reload_count == 1
     assert volume.commit_count == 1

@@ -1,0 +1,104 @@
+PPIFlowStep:
+  run_name: ppiflow_5b8c_vhh_stage1
+  args:
+    name: ppiflow_5b8c_vhh
+    samples_per_target: 3
+    antigen_pdb: 5B8C.pdb
+    antigen_chain: C
+    specified_hotspots: "C64,C66,C68,C75,C76,C77,C78,C83,C85,C87,C88,C89,C90,C126,C128,C132"
+    framework_pdb: 7eow_nanobody_framework.pdb
+    heavy_chain: A
+    cdr_length: "CDRH1,10-12,CDRH2,7-9,CDRH3,16-20"
+
+AbMPNNStep_stage1:
+  run_name: ppiflow_5b8c_vhh_stage1_abmpnn
+  max_structures: 3
+  seeds: [1]
+  batch_size: 1
+  number_of_batches: 1
+
+FlowpackerStep_stage1:
+  run_name: ppiflow_5b8c_vhh_stage1_flowpacker
+  max_structures: 3
+  n_samples: 1
+  num_steps: 2
+
+AF3scoreStep_stage1:
+  run_name: ppiflow_5b8c_vhh_stage1_af3score
+  max_structures: 3
+  num_jobs: 1
+  prepare_workers: 1
+
+FilterStep_stage1:
+  filters:
+    iptm: ">= 0.0"
+
+RosettaFixStep:
+  run_name: ppiflow_5b8c_vhh_rosetta_fix
+  max_structures: 3
+  rosetta_binary: relax
+  max_num_pods: 1
+
+FixedPositions:
+  fixed_positions: A26,A27,A28
+
+PartialStep:
+  run_name: ppiflow_5b8c_vhh_stage2_partial
+  max_structures: 3
+  args:
+    name: ppiflow_5b8c_vhh_partial
+    samples_per_target: 1
+    specified_hotspots: "C64,C66,C68,C75,C76,C77,C78,C83,C85,C87,C88,C89,C90,C126,C128,C132"
+    complex_pdb: candidate.pdb
+    cdr_position: A26-32,A45-56,A97-113
+    antigen_chain: C
+    heavy_chain: A
+    start_t: 0.2
+
+AbMPNNStep_stage2:
+  run_name: ppiflow_5b8c_vhh_stage2_abmpnn
+  max_structures: 3
+  seeds: [1]
+  batch_size: 1
+  number_of_batches: 1
+
+FlowpackerStep_stage2:
+  run_name: ppiflow_5b8c_vhh_stage2_flowpacker
+  max_structures: 3
+  n_samples: 1
+  num_steps: 2
+
+AF3scoreStep_stage2:
+  run_name: ppiflow_5b8c_vhh_stage2_af3score
+  max_structures: 3
+  num_jobs: 1
+  prepare_workers: 1
+
+FilterStep_stage2:
+  filters:
+    iptm: ">= 0.0"
+
+ReFoldStep:
+  run_name: ppiflow_5b8c_vhh_refold
+  max_structures: 3
+  search_msa: false
+  recycle: 1
+  sample: 1
+  model_seeds: [1]
+
+DockQStep:
+  run_name: ppiflow_5b8c_vhh_dockq
+  max_models: 3
+  dockq_args: "--short"
+
+RosettaRelaxStep:
+  run_name: ppiflow_5b8c_vhh_rosetta_relax
+  max_structures: 3
+  rosetta_binary: relax
+  max_num_pods: 1
+
+RankStep:
+  dockq_threshold: 0.0
+
+ReportStep:
+  max_rows: 10

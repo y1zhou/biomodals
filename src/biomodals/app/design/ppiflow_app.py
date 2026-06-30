@@ -8,14 +8,24 @@ from functools import cached_property
 from pathlib import Path
 
 import modal
-from pydantic import BaseModel, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import (
+    AppRunLayout,
+    volume_app_output,
+    volume_path_from_mount_path,
+)
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME, MODEL_VOLUME_NAME
-from biomodals.helper.shell import run_command_with_log, sanitize_filename
-from biomodals.helper.volume_run import volume_path_from_mount_path
-from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
+from biomodals.helper.shell import run_command, sanitize_filename
+from biomodals.schema import AppRunResult, AppRunStatus, ArtifactKind
 
 ##########################################
 # Modal configs
@@ -129,9 +139,19 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 class CommonConfig(BaseModel):
     """Common input args for PPIFlow scripts."""
 
+    model_config = ConfigDict(validate_default=True)
+
     name: str  # Test target name
     specified_hotspots: str  # Comma-separated, <chain><1-based resi>, e.g. "A123,B45"
     samples_per_target: int = 100  # Number of samples to generate
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def stringify_path_values(cls, value: object) -> object:
+        """Keep Modal-bound config payloads free of pathlib objects."""
+        if isinstance(value, Path):
+            return str(value)
+        return value
 
 
 class SampleAntibodyNanobodyConfig(CommonConfig):
@@ -141,13 +161,13 @@ class SampleAntibodyNanobodyConfig(CommonConfig):
     framework region and **not** the CDRs, otherwise the model would raise errors.
     """
 
-    antigen_pdb: str | Path  # Input antigen protein PDB file path
+    antigen_pdb: str  # Input antigen protein PDB file path
     antigen_chain: str  # Chain ID of the antigen
-    framework_pdb: str | Path
+    framework_pdb: str
     heavy_chain: str
     light_chain: str | None = None  # Leave empty for nanobody design
     cdr_length: str = "CDRH1,5-12,CDRH2,4-17,CDRH3,5-26,CDRL1,5-12,CDRL2,3-10,CDRL3,4-13"  # CDR lengths to sample
-    config: str | Path = (
+    config: str = str(
         SCRIPTS_DIR / "configs" / "inference_nanobody.yaml"
     )  # Path to config in the PPIFlow repo
 
@@ -159,14 +179,14 @@ class SampleBinderConfig(CommonConfig):
     `target_chain`, but for simplicity we only support the PDB input mode here.
     """
 
-    input_pdb: str | Path
+    input_pdb: str
     target_chain: str = "R"
     binder_chain: str
     samples_min_length: int = 50  # min(number of residues) per sample
     samples_max_length: int = 100  # max(number of residues) per sample
     sample_hotspot_rate_min: float = 0.2  # minimum hotspot sampling rate
     sample_hotspot_rate_max: float = 0.5  # maximum hotspot sampling rate
-    config: str | Path = (
+    config: str = str(
         SCRIPTS_DIR / "configs" / "inference_binder.yaml"
     )  # Path to config in the PPIFlow repo
 
@@ -174,7 +194,7 @@ class SampleBinderConfig(CommonConfig):
 class SampleAntibodyNanobodyPartialConfig(CommonConfig):
     """Input args for sample_antibody_nanobody_partial.py."""
 
-    complex_pdb: str | Path
+    complex_pdb: str
     fixed_positions: str  # Key residues to fix in complex_pdb. Format: 'H26,H27,H28,L50-63' (chain ID + residue number, '-' for ranges)."
     cdr_position: str  # Specify CDR residues, e.g. 'H26-32,H45-56,H97-113'
     antigen_chain: str  # Chain ID of the antigen
@@ -182,7 +202,7 @@ class SampleAntibodyNanobodyPartialConfig(CommonConfig):
     light_chain: str | None = None  # Leave empty for nanobody design
     start_t: float  # starting t value for sampling
     retry_Limit: int = 10  # Maximum retry attempts if sampling fails
-    config: str | Path = (
+    config: str = str(
         SCRIPTS_DIR / "configs" / "inference_nanobody.yaml"
     )  # Path to config in the PPIFlow repo
 
@@ -197,7 +217,7 @@ class SampleAntibodyNanobodyPartialConfig(CommonConfig):
 class SampleBinderPartialConfig(CommonConfig):
     """Input args for sample_binder_partial.py."""
 
-    input_pdb: str | Path
+    input_pdb: str
     target_chain: str = "R"
     binder_chain: str = "L"
     fixed_positions: str  # Key residues to fix in input_pdb. e.g. 'L19-27,L31'
@@ -205,7 +225,7 @@ class SampleBinderPartialConfig(CommonConfig):
     start_t: float = 0.15  # starting t value for sampling
     sample_hotspot_rate_min: float = 0.2  # minimum hotspot sampling rate
     sample_hotspot_rate_max: float = 0.5  # maximum hotspot sampling rate
-    config: str | Path = (
+    config: str = str(
         SCRIPTS_DIR / "configs" / "inference_binder_partial.yaml"
     )  # Path to config in the PPIFlow repo
 
@@ -303,11 +323,11 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     """Actual remote runner of PPIFlow."""
     import sys
 
-    workdir = Path(CONF.output_volume_mountpoint) / run_name
-    out_dir = workdir / "outputs"
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    out_dir = layout.outputs_dir
     if out_dir.exists():
         print(f"💊 Output path {out_dir} already exists.")
-        return str(workdir)
+        return str(layout.run_root)
 
     # Build command
     model_weights_path = Path(CONF.model_volume_mountpoint) / args.model_weights_name
@@ -321,12 +341,13 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
     ]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = workdir / f"{CONF.name}-run.log"
+    layout.logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = layout.logs_dir / f"{CONF.name}-run.log"
     print(f"💊 Running {CONF.name}, saving logs to {log_path}")
-    run_command_with_log(cmd, log_file=log_path)
+    run_command(cmd, output_mode="capture", log_file=log_path)
 
     CONF.output_volume.commit()
-    return str(workdir)
+    return str(layout.run_root)
 
 
 @app.function(
@@ -343,14 +364,12 @@ def ppiflow_run_workflow(args: PPIFlowArgs, run_name: str) -> AppRunResult:
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            volume_app_output(
                 name="ppiflow_outputs",
                 kind=ArtifactKind.DIRECTORY,
-                storage=volume_path_from_mount_path(
-                    str(remote_workdir),
-                    CONF.output_volume_mountpoint,
-                    CONF.output_volume_name,
-                ),
+                remote_path=str(remote_workdir),
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
                 metadata={
                     "run_name": safe_run_name,
                     "script_name": args.script_name,
@@ -401,37 +420,39 @@ def submit_ppiflow_task(
             "Input YAML must contain a 'name' field for the design target."
         )
     run_name = sanitize_filename(yaml_dict["name"])
-    remote_workdir = Path(CONF.output_volume_mountpoint) / run_name
+    mount_root = Path(CONF.output_volume_mountpoint)
+    layout = AppRunLayout.from_run_root(mount_root / run_name)
 
     match design_mode:
         case "antibody_nanobody":
             conf = SampleAntibodyNanobodyConfig.model_validate(yaml_dict)
             files_to_upload = [conf.antigen_pdb, conf.framework_pdb]
-            conf.antigen_pdb = remote_workdir / Path(conf.antigen_pdb).name
-            conf.framework_pdb = remote_workdir / Path(conf.framework_pdb).name
+            conf.antigen_pdb = str(layout.inputs_dir / Path(conf.antigen_pdb).name)
+            conf.framework_pdb = str(layout.inputs_dir / Path(conf.framework_pdb).name)
         case "binder":
             conf = SampleBinderConfig.model_validate(yaml_dict)
             files_to_upload = [conf.input_pdb]
-            conf.input_pdb = remote_workdir / Path(conf.input_pdb).name
+            conf.input_pdb = str(layout.inputs_dir / Path(conf.input_pdb).name)
         case "antibody_nanobody_partial":
             conf = SampleAntibodyNanobodyPartialConfig.model_validate(yaml_dict)
             files_to_upload = [conf.complex_pdb]
-            conf.complex_pdb = remote_workdir / Path(conf.complex_pdb).name
+            conf.complex_pdb = str(layout.inputs_dir / Path(conf.complex_pdb).name)
         case "binder_partial":
             conf = SampleBinderPartialConfig.model_validate(yaml_dict)
             files_to_upload = [conf.input_pdb]
-            conf.input_pdb = remote_workdir / Path(conf.input_pdb).name
+            conf.input_pdb = str(layout.inputs_dir / Path(conf.input_pdb).name)
         case _:
             raise ValueError(f"Unsupported design_mode: {design_mode}")
 
     # NOTE: make sure names are unique for different inputs
     remote_dir = volume_path_from_mount_path(
-        str(remote_workdir), CONF.output_volume_mountpoint, CONF.output_volume_name
+        str(layout.run_root), CONF.output_volume_mountpoint, CONF.output_volume_name
     )
+    remote_input_root = layout.inputs_dir.relative_to(mount_root)
     with CONF.output_volume.batch_upload() as batch:
         for file in files_to_upload:
             print(f"🧬 Uploading '{file}' to {remote_dir}...")
-            batch.put_file(file, f"{run_name}/{Path(file).name}")
+            batch.put_file(file, f"/{remote_input_root}/{Path(file).name}")
 
     print(f"🧬 Submitting PPIFlow task with run name: {run_name}")
     res = ppiflow_run.remote(PPIFlowArgs(args=conf), run_name)

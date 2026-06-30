@@ -30,13 +30,10 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import resolve_local_output_dir
-from biomodals.helper.shell import run_command, run_command_with_log, sanitize_filename
-from biomodals.helper.volume_run import (
-    build_volume_run_paths,
-    volume_path_from_mount_path,
-)
+from biomodals.helper.shell import run_command, sanitize_filename
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -133,7 +130,7 @@ def _md5_matches(path: str | Path, expected_md5: str) -> bool:
         checksum_path = Path(tmpdir) / "checksums.md5"
         checksum_path.write_text(f"{expected_md5}  {path}\n")
         try:
-            run_command(["md5sum", "-c", str(checksum_path)], verbose=False)
+            run_command(["md5sum", "-c", str(checksum_path)], output_mode="capture")
         except sp.CalledProcessError:
             return False
     return True
@@ -206,12 +203,12 @@ def merge_pdb_chains(
             `A`, for example `A_B_C`.
 
     """
-    run_paths = build_volume_run_paths(CONF.output_volume_mountpoint, run_name)
-    workdir = run_paths["run_root"]
-    input_dir = run_paths["inputs_dir"]
-    output_dir = run_paths["output_dir"]
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    workdir = layout.run_root
+    input_dir = layout.inputs_dir
+    output_dir = layout.outputs_dir
+    for path in (input_dir, output_dir, layout.logs_dir):
+        path.mkdir(parents=True, exist_ok=True)
 
     antigen_path = input_dir / "antigen.pdb"
     antigen_path.write_bytes(antigen_pdb_bytes)
@@ -229,13 +226,11 @@ def merge_pdb_chains(
         merge_ids,
     ]
 
-    log_path = workdir / "iggm_merge_chains.log"
+    log_path = layout.logs_dir / "iggm_merge_chains.log"
     CONF.output_volume.commit()
     print("💊 Merging IgGM antigen chains...")
     try:
-        run_command_with_log(
-            cmd, log_file=log_path, verbose=True, cwd=CONF.git_clone_dir
-        )
+        run_command(cmd, output_mode="tee", log_file=log_path, cwd=CONF.git_clone_dir)
     finally:
         CONF.output_volume.commit()
 
@@ -268,12 +263,12 @@ def iggm_inference(
     if task not in APP_INFO.valid_tasks:
         raise ValueError(f"Task must be one of {sorted(APP_INFO.valid_tasks)}.")
 
-    run_paths = build_volume_run_paths(CONF.output_volume_mountpoint, run_name)
-    workdir = run_paths["run_root"]
-    input_dir = run_paths["inputs_dir"]
-    output_dir = run_paths["output_dir"]
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    workdir = layout.run_root
+    input_dir = layout.inputs_dir
+    output_dir = layout.outputs_dir
+    for path in (input_dir, output_dir, layout.logs_dir):
+        path.mkdir(parents=True, exist_ok=True)
 
     fasta_path = input_dir / "input.fasta"
     fasta_path.write_bytes(input_fasta_bytes)
@@ -304,13 +299,11 @@ def iggm_inference(
 
     cmd.extend(["--output", str(output_dir)])
 
-    log_path = workdir / "iggm.log"
+    log_path = layout.logs_dir / "iggm.log"
     CONF.output_volume.commit()
     print("💊 Running IgGM...")
     try:
-        run_command_with_log(
-            cmd, log_file=log_path, verbose=True, cwd=CONF.git_clone_dir
-        )
+        run_command(cmd, output_mode="tee", log_file=log_path, cwd=CONF.git_clone_dir)
     finally:
         CONF.output_volume.commit()
 

@@ -11,53 +11,37 @@ workflow schemas, and workflow-compatible app integration points.
 ## Core Workflow
 
 Before making non-trivial workflow changes, read
-`references/workflow-development.md` for the maintained standards.
+`references/workflow-development.md` for the maintained standards and
+`docs/agents/workflow-development.md` for repo-level coordination notes.
 
 Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
 example for app-composed workflows. Use
 `src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for
 workflows that fan out one app's volume-backed outputs into another app's
-workflow-compatible remote function. Ignore
-`src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now
-because it is expected to be refactored.
+workflow-compatible remote function. Use
+`src/biomodals/workflow/ppiflow_workflow.py` as the reference for
+candidate-manifest joins, retained-candidate filtering, candidate-wide remote
+stage coordinators, and PPIFlow-specific stage wiring.
 
 ## Working Rules
 
 - Keep `biomodals.schema` pure Pydantic and free of Modal imports.
-- Compose workflow apps with `from biomodals.workflow.core import orchestrator`
-  and `modal.App(...).include(orchestrator.app)`.
-- Declare app dependencies on `AppConfig.depends_on_apps`, mirror them into
-  `CONF.tags["depends_on"]` for Modal UI metadata using a Modal-valid tag value
-  such as `"-".join(DEPENDENCY_APPS)`, and compose them with
-  `include_dependency_apps(app, CONF.depends_on_apps)`.
-- Prefer included-app Modal handles over deployed-app lookup strings. Do not add
-  `modal.Function.from_name(...)` to new workflow code when the dependency app
-  can be included.
+- Compose workflow apps with the shared orchestrator and included dependency
+  apps; prefer included-app Modal handles over deployed-app lookup strings.
 - Prefer `AppBackedNode` for nodes that primarily call app functions.
   Add `WorkflowNativeNode` only for adapters, summaries, selectors, and
   workflow-specific file-management glue.
-- Every `REMOTE` node must define a node-level `submit_remote(context)` hook
-  that returns `RemoteNodeSubmission` for the actual Modal `FunctionCall`.
-  `process_remote_result(result, metadata)` is part of the node contract and
-  defaults to `AppRunResult.model_validate(result)`. Override it when the raw
-  remote result must be adapted before artifact materialization. `AppBackedNode`
-  and `REMOTE` `WorkflowNativeNode` implementations inherit a default `run()`
-  that submits the remote call, waits for `.get()`, and processes the result.
-- Store hydrated Modal functions/classes in a small `*ModalNamespace` dataclass
-  typed as `modal.Function` or `modal.Cls`, and exclude that namespace from DAG
-  hashing with `repr=False`, `compare=False`, and `metadata={"dag_hash": False}`.
-- Define workflow-specific remote file-management functions as top-level
-  `@app.function`s in the workflow module and put their hydrated handles in the
-  workflow's `*ModalNamespace`. Do not make ordinary node methods Modal
-  functions.
+- `REMOTE` nodes submit real Modal calls through `submit_remote(context)` and
+  adapt raw results with `process_remote_result(...)` only when needed.
+- Store hydrated Modal functions/classes in a `*ModalNamespace` dataclass and
+  exclude that namespace from DAG hashing.
 - Import app-owned volume handles, volume names, and mountpoints from source app
-  modules. Avoid duplicating volume strings in workflow scripts.
-- Use `volume_path_from_mount_path(...)` to convert mounted app paths into
-  `VolumePath` workflow storage references.
-- Materialize inline workflow outputs once under
-  `nodes/<node-id>/attempts/<attempt-id>/<artifact-id>/` and store materialized
-  `VolumePath` app-result JSON in the ledger; do not persist base64
-  `InlineBytes` payloads in SQLite.
+  modules, and reload relevant volumes after remote file mutations before
+  reading those paths.
+- When staging workflow-derived files for downstream apps, do not use full
+  artifact/provenance strings as local filenames. Derive short deterministic
+  names from candidate ids or content hashes because pipeline-derived names can
+  exceed filesystem component limits.
 - User-facing workflow local entrypoints should accept `dry_run: bool = False`.
   When set, build the workflow, call `print_workflow_dag(workflow.validate())`,
   and return before constructing or submitting the orchestrator. The workflow

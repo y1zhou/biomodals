@@ -32,6 +32,7 @@ from biomodals.schema import (
     NodeExecutionPolicy,
     NodePlacement,
     VolumePath,
+    WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
@@ -41,6 +42,10 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+)
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
 )
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
@@ -68,6 +73,25 @@ app = include_dependency_apps(app, CONF.depends_on_apps)
 RFDIFFUSION_OUTPUT_VOLUME = rfdiffusion_app.CONF.output_volume
 RFDIFFUSION_OUTPUT_VOLUME_NAME = rfdiffusion_app.CONF.output_volume_name
 RFDIFFUSION_OUTPUT_MOUNTPOINT = rfdiffusion_app.CONF.output_volume_mountpoint
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    volumes={RFDIFFUSION_OUTPUT_MOUNTPOINT: RFDIFFUSION_OUTPUT_VOLUME},
+)
+def check_rfd_ligandmpnn_external_artifact(
+    artifact: WorkflowArtifact,
+) -> ArtifactAvailability:
+    """Validate RFdiffusion artifacts referenced by the workflow runtime."""
+    RFDIFFUSION_OUTPUT_VOLUME.reload()
+    return check_external_artifact_status(
+        artifact,
+        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        volume_roots={RFDIFFUSION_OUTPUT_VOLUME_NAME: RFDIFFUSION_OUTPUT_MOUNTPOINT},
+    )
 
 
 @dataclass(frozen=True)
@@ -138,7 +162,16 @@ def select_rfdiffusion_design(
     trb_metadata = pickle.loads(trb_path.read_bytes())  # noqa: S301
     if not isinstance(trb_metadata, dict):
         raise TypeError(f"RFdiffusion TRB metadata must be a dict: {trb_path}")
-    is_fixed: list[int] = trb_metadata.get("mask_1d", [])
+    try:
+        is_fixed = list(trb_metadata["mask_1d"])
+    except KeyError as exc:
+        raise ValueError(
+            f"RFdiffusion TRB metadata missing mask_1d: {trb_path}"
+        ) from exc
+    except TypeError as exc:
+        raise TypeError(
+            f"RFdiffusion TRB metadata mask_1d must be iterable: {trb_path}"
+        ) from exc
 
     # We use gemmi to parse the PDB and extract residue labels for comparison
     # Also sanity check the B-factors of the perturbed positions
@@ -149,27 +182,34 @@ def select_rfdiffusion_design(
     if len(structure) == 0:
         raise ValueError(f"No model found in RFdiffusion PDB output: {pdb_path}")
 
-    fixed_labels: list[str] = []
-    redesigned_labels: list[str] = []
-    bfactor_mismatches: list[str] = []
-    idx: int = -1
+    residue_records: list[tuple[str, float]] = []
     for chain in structure[0]:
         chain_id = chain.name.strip()
         for residue in chain:
-            idx += 1
             res_idx = residue.seqid.num  # assume icode is empty
             if res_idx is None:
                 raise ValueError(f"Invalid residue ID in chain {chain_id}: {residue}")
             label = f"{chain_id}{res_idx}"
             residue_b_factor = float(max((atom.b_iso for atom in residue), default=0.0))
-            if is_fixed[idx]:
-                fixed_labels.append(label)
-                if residue_b_factor == 0.0:
-                    bfactor_mismatches.append(label)
-                continue
-            if residue_b_factor != 0.0:
+            residue_records.append((label, residue_b_factor))
+    if len(is_fixed) != len(residue_records):
+        raise ValueError(
+            f"RFdiffusion TRB mask_1d length {len(is_fixed)} does not match "
+            f"{len(residue_records)} residue(s) parsed from {pdb_path}: {trb_path}"
+        )
+
+    fixed_labels: list[str] = []
+    redesigned_labels: list[str] = []
+    bfactor_mismatches: list[str] = []
+    for idx, (label, residue_b_factor) in enumerate(residue_records):
+        if is_fixed[idx]:
+            fixed_labels.append(label)
+            if residue_b_factor == 0.0:
                 bfactor_mismatches.append(label)
-            redesigned_labels.append(label)
+            continue
+        if residue_b_factor != 0.0:
+            bfactor_mismatches.append(label)
+        redesigned_labels.append(label)
     if bfactor_mismatches:
         print(
             "💊 RFdiffusion redesign-set B-factor sanity check mismatches: "
@@ -516,6 +556,7 @@ def submit_rfd_ligandmpnn_workflow(
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
+    strict_artifact_checks: bool = False,
 ) -> None:
     """Run RFdiffusion trajectories followed by LigandMPNN sequence design.
 
@@ -539,6 +580,8 @@ def submit_rfd_ligandmpnn_workflow(
         wait: Wait locally for the remote workflow result.
         max_parallel: Maximum ready workflow nodes per scheduler wave.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
+        strict_artifact_checks: Validate referenced RFdiffusion volume artifacts
+            before reusing completed workflow nodes.
     """
     input_path = Path(input_pdb).expanduser().resolve()
     if not input_path.exists():
@@ -565,6 +608,17 @@ def submit_rfd_ligandmpnn_workflow(
     if dry_run:
         print_workflow_dag(workflow.validate())
         return
+    orchestrator_kwargs = {
+        "workflow": workflow,
+        "run_id": resolved_run_id,
+        "force": force,
+        "max_ready_workers": max_parallel,
+    }
+    if strict_artifact_checks:
+        orchestrator_kwargs["strict_external_artifact_checks"] = True
+        orchestrator_kwargs["external_artifact_checker"] = (
+            check_rfd_ligandmpnn_external_artifact.remote
+        )
     total_structures = num_rfdiffusion_trajectories * num_rfdiffusion_designs
     print(
         f"Submitting {CONF.name} '{resolved_run_id}' with "
@@ -575,12 +629,7 @@ def submit_rfd_ligandmpnn_workflow(
         flush=True,
     )
     orchestrator_handle = orchestrator.WorkflowOrchestrator()
-    fc = orchestrator_handle.run.spawn(
-        workflow=workflow,
-        run_id=resolved_run_id,
-        force=force,
-        max_ready_workers=max_parallel,
-    )
+    fc = orchestrator_handle.run.spawn(**orchestrator_kwargs)
     if wait:
         result: AppRunResult | str = AppRunResult.model_validate(fc.get())
         print(f"{CONF.name} run finished with status: {result.status}", flush=True)

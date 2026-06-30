@@ -30,21 +30,6 @@ This repo is built on Modal, a serverless cloud platform for running Python code
 When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, use the repo-local `biomodals-app-development` skill. See `docs/agents/app-development.md`.
 The detailed app-development standards are consolidated in `.agents/skills/biomodals-app-development/`.
 
-Use these apps as current implementation references:
-
-- `src/biomodals/app/fold/alphafold3_app.py`
-- `src/biomodals/app/bioinfo/rosetta_app.py`
-- `src/biomodals/app/design/boltzgen_app.py`
-- `src/biomodals/app/design/rfdiffusion_app.py` for workflow-compatible
-  durable/cached outputs backed by app output volumes.
-- `src/biomodals/app/design/ligandmpnn_app.py` for workflow-compatible fast
-  rerunnable outputs returned as inline zstd bytes.
-
-When creating future apps, ask whether the app needs to be
-workflow-compatible unless the user has already answered. If it does, follow the
-workflow-development guidance and use RFdiffusion or LigandMPNN as the closest
-reference implementation.
-
 When developing new apps that must violate the skill's conventions for good reason, document the reason for the deviation in `docs/agents/` and link that note from `docs/agents/app-development.md`.
 
 ## Biomodals workflow development
@@ -55,5 +40,3 @@ When creating or editing reusable workflow runtime code under
 skill. See `docs/agents/workflow-development.md`.
 
 The detailed workflow-development standards are consolidated in `.agents/skills/biomodals-workflow-development/`.
-
-Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end workflow reference. Use `src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for workflows that fan out app-owned volume outputs into another workflow-compatible app function. Ignore `src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now because it is expected to be refactored.

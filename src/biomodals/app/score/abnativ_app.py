@@ -10,6 +10,7 @@ r"""AbNatiV source repo: <https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ>.
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import modal
@@ -27,7 +28,7 @@ CONF = AppConfig(
     name="AbNatiV",
     repo_url="https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ",
     package_name="abnativ",
-    version="2.0.3",
+    version="2.0.8",
     python_version="3.12",
     cuda_version="cu128",
     gpu=os.environ.get("GPU", "A10G"),
@@ -35,20 +36,113 @@ CONF = AppConfig(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class AppInfo:
+    """Metadata for model files and patch locations."""
+
+    model_files = {
+        "VH": "vh_model.ckpt",
+        "VHH": "vhh_model.ckpt",
+        "VKappa": "vkappa_model.ckpt",
+        "VLambda": "vlambda_model.ckpt",
+        "VH2": "vh2_model.ckpt",
+        "VL2": "vl2_model.ckpt",
+        "VHH2": "vhh2_model.ckpt",
+        "paired": "vpaired2_model.ckpt",
+    }
+    pkg_path = f"/opt/conda/lib/python{CONF.python_version}/site-packages/abnativ"
+    plotter_path = "model/alignment/plotter.py"
+    scoring_functions_path = "model/scoring_functions.py"
+
+
 ##########################################
 # Image and app definitions
 ##########################################
+APP_INFO = AppInfo()
 runtime_image = (
     modal.Image
     .micromamba(python_version=CONF.python_version)
-    .apt_install("git", "build-essential", "wget", "zstd")
-    .env(CONF.default_env)
-    .micromamba_install(["openmm", "pdbfixer", "biopython"], channels=["conda-forge"])
-    .micromamba_install(["anarci"], channels=["bioconda"])
-    .uv_pip_install(f"{CONF.package_name}=={CONF.version}")
+    .apt_install("git", "build-essential", "wget")
+    .env(CONF.default_env | {"ABNATIV_MODELS_DIR": f"{CONF.model_volume_mountpoint}"})
+    .micromamba_install(
+        ["anarci", "hmmer", "pdbfixer"], channels=["bioconda", "conda-forge"]
+    )
+    .uv_pip_install("numba>=0.61.2", f"{CONF.package_name}=={CONF.version}")
+    # AbNatiV 2.0.8 defines two adjacent strucorr colormap points at 0.25,
+    # which strict Matplotlib builds reject while importing abnativ.
+    .workdir(APP_INFO.pkg_path)
+    .run_commands(
+        " && ".join((
+            f"grep -q '(0.25, \"DimGray\")' {APP_INFO.plotter_path}",
+            f'sed -i \'s/(0\\.25, "DimGray")/(0.250001, "DimGray")/\' {APP_INFO.plotter_path}',
+            f"grep -q '(0.250001, \"DimGray\")' {APP_INFO.plotter_path}",
+        ))
+    )
+    # AbNatiV 2.0.8 saves one figure per sequence profile without closing it.
+    .run_commands(
+        " && ".join((
+            "grep -q 'plt.savefig(fig_fp_save, dpi=200, "
+            f'bbox_inches="tight")\' {APP_INFO.scoring_functions_path}',
+            "sed -i '/plt.savefig(fig_fp_save, dpi=200, "
+            f'bbox_inches="tight")/a\\    plt.close(fig)\' {APP_INFO.scoring_functions_path}',
+            f"grep -q 'plt.close(fig)' {APP_INFO.scoring_functions_path}",
+        ))
+    )
     .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+
+##########################################
+# Model validation helpers
+##########################################
+def _checkpoint_error(checkpoint_path: Path) -> str | None:
+    """Return a reason when a checkpoint is missing or unreadable."""
+    import zipfile
+
+    if not checkpoint_path.exists():
+        return "missing"
+    if not checkpoint_path.is_file():
+        return "not a regular file"
+
+    size = checkpoint_path.stat().st_size
+    if size < 1024:
+        return f"too small ({size} bytes)"
+
+    with checkpoint_path.open("rb") as checkpoint_file:
+        header = checkpoint_file.read(4)
+
+    if header.startswith(b"PK"):
+        try:
+            with zipfile.ZipFile(checkpoint_path) as checkpoint_zip:
+                corrupt_member = checkpoint_zip.testzip()
+        except zipfile.BadZipFile as exc:
+            return f"invalid PyTorch zip checkpoint: {exc}"
+        if corrupt_member is not None:
+            return f"corrupt zip member: {corrupt_member}"
+        return None
+
+    try:
+        import torch  # type: ignore[ty:unresolved-import]
+
+        torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return f"cannot be loaded by torch: {exc}"
+    return None
+
+
+def _invalid_model_files(model_dir: Path, filenames: list[str]) -> dict[str, str]:
+    invalid_files = {}
+    for filename in filenames:
+        if error := _checkpoint_error(model_dir / filename):
+            invalid_files[filename] = error
+    return invalid_files
+
+
+def _redownload_abnativ_model_files(filenames: list[str]) -> None:
+    from abnativ.init import ensure_zenodo_models  # type: ignore[ty:unresolved-import]
+
+    ensure_zenodo_models(filenames, do_force_update=True)
 
 
 ##########################################
@@ -57,17 +151,28 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 @app.function(
     volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=MAX_TIMEOUT
 )
-def download_abnativ_models(force: bool = False) -> None:
-    """Download AbNatiV models into the mounted volume."""
-    # Download all artifacts
-    print(f"💊 Downloading {CONF.name} models...")
-    cmd = ["abnativ", "init"]
-    if force:
-        cmd.append("--force_update")
+def ensure_abnativ_model(model_type: str, force: bool = False) -> None:
+    """Ensure the checkpoint needed for one AbNatiV scoring mode is readable."""
+    filename = APP_INFO.model_files[model_type]
+    model_dir = Path(CONF.model_volume_mountpoint)
+    checkpoint_path = model_dir / filename
 
-    run_command(cmd, bufsize=8)
+    if force:
+        print(f"💊 Force redownloading AbNatiV checkpoint {filename}")
+        _redownload_abnativ_model_files([filename])
+
+    if error := _checkpoint_error(checkpoint_path):
+        print(f"💊 AbNatiV checkpoint {filename} is unreadable: {error}")
+        _redownload_abnativ_model_files([filename])
+
+    if error := _checkpoint_error(checkpoint_path):
+        raise RuntimeError(
+            f"AbNatiV checkpoint {checkpoint_path} is still unreadable after "
+            f"redownload: {error}"
+        )
+
     MODEL_VOLUME.commit()
-    print("💊 Model download complete")
+    print(f"💊 AbNatiV checkpoint {filename} is available")
 
 
 ##########################################
@@ -193,7 +298,6 @@ def submit_abnativ_task(
     input_vh_seq: str | None = None,
     input_vl_seq: str | None = None,
     # Model download options
-    download_models: bool = False,
     force_redownload: bool = False,
     # AbNatiV configs
     model_type: str = "VH",
@@ -221,7 +325,6 @@ def submit_abnativ_task(
             Used if `input_paired_csv` is not provided.
         input_vl_seq: (For paired model only) A single-sequence string for VL sequences.
             Used if `input_paired_csv` is not provided.
-        download_models: Whether to download model weights and skip inference.
         force_redownload: Force re-download of the models even if they already exist.
         model_type: Selects the AbNatiV trained model (VH, VKappa, VLambda, VHH),
             or AbNatiV2 models (VH2, VL2, VHH2). If set to "paired", the paired V2
@@ -237,12 +340,6 @@ def submit_abnativ_task(
             Only applicable for single-chain models.
         plot_profiles: Generate and save per-sequence profile plots under `{output_directory}/{output_id}_profiles`.
     """
-    # Ignore everything else if downloading models
-    if download_models:
-        print("🧬 Checking AbNatiV inference dependencies...")
-        download_abnativ_models.remote(force=force_redownload)
-        return
-
     # Set up output paths
     print("🧬 Starting AbNatiV run...")
     local_out_dir = (
@@ -285,6 +382,7 @@ def submit_abnativ_task(
                 csv_bytes = csv_str.encode("utf-8")
 
             print("🧬 Running AbNatiV paired mode...")
+            ensure_abnativ_model.remote(model_type="paired", force=force_redownload)
             abnativ_scores = abnativ_score_paired.remote(
                 csv_bytes=csv_bytes,
                 output_id=run_name,
@@ -313,6 +411,7 @@ def submit_abnativ_task(
                 fasta_bytes = fasta_str.encode("utf-8")
 
             print(f"🧬 Running AbNatiV unpaired {model_type} mode...")
+            ensure_abnativ_model.remote(model_type=model_type, force=force_redownload)
             abnativ_scores = abnativ_score_unpaired.remote(
                 fasta_bytes=fasta_bytes,
                 output_id=run_name,

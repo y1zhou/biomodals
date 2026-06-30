@@ -53,7 +53,6 @@ from biomodals.helper.shell import (
     copy_files,
     package_outputs,
     run_command,
-    run_command_with_log,
 )
 
 ##########################################
@@ -235,6 +234,22 @@ def _af3_sanitised_name(name: str) -> str:
     return "".join(x for x in spaceless_name if x in allowed_chars)
 
 
+def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
+    """Mark bare sequences as single-sequence inference inputs."""
+    for seq in conf.sequences:
+        if (protein := seq.protein) is not None:
+            if protein.unpairedMsa is None and protein.unpairedMsaPath is None:
+                protein.unpairedMsa = ""
+            if protein.pairedMsa is None and protein.pairedMsaPath is None:
+                protein.pairedMsa = ""
+            if protein.templates is None:
+                protein.templates = []
+        elif (rna := seq.rna) is not None:
+            if rna.unpairedMsa is None and rna.unpairedMsaPath is None:
+                rna.unpairedMsa = ""
+    return conf
+
+
 ##########################################
 # Inference functions
 ##########################################
@@ -329,7 +344,7 @@ def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
         "--jackhmmer_n_cpu=8",
         "--nhmmer_n_cpu=8",
     ]
-    run_command(cmd, verbose=True)
+    run_command(cmd)
 
     # Cache unpaired MSA files in separate directories for future use
     msa_json_path = temp_dir / run_name / f"{run_name}_data.json"
@@ -417,6 +432,7 @@ def run_inference_pipeline(
         conf = AF3Config.from_file(input_json_path)
         run_name = conf.name
         conf.modelSeeds = model_seeds
+        conf = _fill_missing_msa_for_inference(conf)
         conf.to_files(temp_path, "input")
         print(f"💊 Running inference for {run_name} with seeds {model_seeds}")
 
@@ -434,8 +450,8 @@ def run_inference_pipeline(
             f"--num_recycles={recycle}",
             f"--num_diffusion_samples={sample}",
         ]
-        run_command_with_log(
-            cmd, log_file=out_dir / f"{run_name}_inference.log", verbose=True
+        run_command(
+            cmd, output_mode="tee", log_file=out_dir / f"{run_name}_inference.log"
         )
         return package_outputs(out_dir / run_name)
 
@@ -460,9 +476,10 @@ def predict_structures(
     json_bytes = conf.to_json().encode()
     model_seeds = conf.modelSeeds
     if num_containers == 1:
-        tarball_content = run_inference_pipeline.remote(
+        fc = run_inference_pipeline.spawn(
             json_bytes, recycle=recycle, sample=sample, model_seeds=model_seeds
         )
+        tarball_content = fc.get()
         write_local_tarball(out_file, tarball_content)
         return out_file
 
@@ -479,7 +496,7 @@ def predict_structures(
         if not tarball_file.exists() or tarball_file.stat().st_size == 0:
             return False
         try:
-            run_command([*tar_cmd, "-tf", str(tarball_file)], verbose=False)
+            run_command([*tar_cmd, "-tf", str(tarball_file)], output_mode="capture")
         except Exception as exc:
             print(
                 f"🧬 Existing part tarball is not readable; rerunning {tarball_file}: {exc}"
@@ -549,7 +566,9 @@ def predict_structures(
     with TemporaryDirectory() as tmp_dir:
         for tar_filename in tarball_part_files:
             run_command(
-                [*tar_cmd, "-xf", str(tar_filename)], verbose=False, cwd=tmp_dir
+                [*tar_cmd, "-xf", str(tar_filename)],
+                output_mode="capture",
+                cwd=tmp_dir,
             )
 
         # Combine the parts into a single .tar.zst file

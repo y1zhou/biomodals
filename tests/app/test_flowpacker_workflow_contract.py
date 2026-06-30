@@ -58,7 +58,7 @@ def test_flowpacker_workflow_result_stores_archive_in_volume(
     assert output.kind == ArtifactKind.ARCHIVE
     assert output.storage == VolumePath(
         volume_name=output_volume_name,
-        path="workflow/packed/packed.tar.zst",
+        path="workflow/packed/outputs/packed.tar.zst",
         media_type="application/zstd",
     )
     assert output.metadata == {
@@ -66,7 +66,7 @@ def test_flowpacker_workflow_result_stores_archive_in_volume(
         "filename": "packed.tar.zst",
     }
     assert (
-        Path(tmp_path) / "workflow" / "packed" / "packed.tar.zst"
+        Path(tmp_path) / "workflow" / "packed" / "outputs" / "packed.tar.zst"
     ).read_bytes() == b"tarball"
     assert output_volume.commit_count == 1
 

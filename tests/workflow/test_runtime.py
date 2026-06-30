@@ -13,10 +13,12 @@ import orjson
 import pytest
 from pydantic import BaseModel, Field
 
+from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     NodeExecutionPolicy,
@@ -28,6 +30,8 @@ from biomodals.schema import (
     WorkflowRun,
 )
 from biomodals.workflow import Workflow
+from biomodals.workflow.core._runtime import hashing
+from biomodals.workflow.core._runtime.scheduler import SchedulerDecisionStatus
 from biomodals.workflow.core.ledger import WorkflowLedger
 from biomodals.workflow.core.nodes import RemoteNodeSubmission, WorkflowNativeNode
 from biomodals.workflow.core.runtime import WorkflowRuntime
@@ -166,6 +170,21 @@ class FakeVolume:
         self.reload_count += 1
 
 
+class SnapshotVolume(FakeVolume):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.committed_paths: set[str] = set()
+
+    def commit(self) -> None:
+        super().commit()
+        self.committed_paths = {
+            path.relative_to(self.root).as_posix()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        }
+
+
 class HashSettings(BaseModel):
     visible: str
     hidden: str = Field(repr=False)
@@ -196,6 +215,20 @@ class RuntimeHandleNode(WorkflowNativeNode):
         return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
 
+def record_artifacts_with_manifests(
+    ledger: WorkflowLedger,
+    artifacts: list[WorkflowArtifact],
+) -> None:
+    ledger.record_artifacts(artifacts)
+    artifact_dir = ledger.run_root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    for artifact in artifacts:
+        artifact_dir.joinpath(f"{artifact.artifact_id}.json").write_text(
+            artifact.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+
+
 def test_volume_sync_closes_open_ledger_connection(tmp_path: Path) -> None:
     workflow = Workflow("demo")
     volume = FakeVolume()
@@ -214,11 +247,11 @@ def test_volume_sync_closes_open_ledger_connection(tmp_path: Path) -> None:
     volume.on_reload = assert_ledger_closed
     volume.on_commit = assert_ledger_closed
 
-    runtime._reload_volume()
+    runtime._volume_sync.reload()
     runtime.ledger.load_run("demo", "run-1")
     assert runtime.ledger._connection is not None
 
-    runtime._commit_volume()
+    runtime._volume_sync.commit()
 
     assert volume.reload_count == 1
     assert volume.commit_count == 1
@@ -230,12 +263,50 @@ def test_completed_nodes_are_skipped(tmp_path: Path) -> None:
     workflow.add_node(ExplodingNode(), id="done")
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    output_path = tmp_path / "done"
+    output_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(volume_name="Workflow-outputs", path="done"),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+
+
+def test_completed_node_with_missing_workflow_artifact_is_rerun(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
     ledger.record_artifacts([
         WorkflowArtifact(
             artifact_id="artifact-1",
             producing_node_id="done",
             kind=ArtifactKind.REPORT,
-            storage=VolumePath(volume_name="Workflow-outputs", path="done"),
+            storage=VolumePath(
+                volume_name="Workflow-outputs",
+                path="demo/run-1/nodes/done/attempts/attempt-1/output.txt",
+            ),
         )
     ])
     ledger.mark_node_succeeded("done", ["artifact-1"])
@@ -249,7 +320,479 @@ def test_completed_nodes_are_skipped(tmp_path: Path) -> None:
     result = runtime.run(run_id="run-1")
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert runtime.executed_waves == []
+    assert calls == ["done"]
+    assert runtime.diagnostics.scheduled_waves == [["done"]]
+
+
+def test_completed_node_with_missing_external_artifact_is_rerun_when_strict(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/done/outputs",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    def external_checker(artifact: WorkflowArtifact) -> list[str]:
+        return [f"{artifact.artifact_id}: missing external path {artifact.storage}"]
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_artifact_checker=external_checker,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["done"]
+    assert runtime.diagnostics.scheduled_waves == [["done"]]
+
+
+def test_strict_external_artifact_checks_can_use_mounted_volume_roots(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    external_volume = tmp_path / "external-volume"
+    external_volume.joinpath("runs/done/outputs").mkdir(parents=True)
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/done/outputs",
+                ),
+                files=[ArtifactFile(path="model.pdb")],
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_volume_roots={"ExternalApp-outputs": external_volume},
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["done"]
+    assert runtime.diagnostics.scheduled_waves == [["done"]]
+
+
+def test_unknown_external_artifact_availability_does_not_rerun_completed_node(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="done")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="artifact-1",
+                producing_node_id="done",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/done/outputs",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("done", ["artifact-1"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_volume_roots={},
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == []
+    assert runtime.diagnostics.scheduled_waves == []
+
+
+def test_completed_terminal_skips_missing_ancestors_and_repairs_run_status(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="prepare")
+    workflow.add_node(ExplodingNode(), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    summary_path = tmp_path / "summary.txt"
+    summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+    ledger.mark_run_status(RunStatus.FAILED)
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+    assert runtime.ledger.load_run("demo", "run-1").status == RunStatus.SUCCEEDED
+
+
+def test_completed_terminal_does_not_recheck_intermediate_artifacts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="prepare")
+    workflow.add_node(ExplodingNode(), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    summary_path = tmp_path / "summary.txt"
+    summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="prepare-artifact",
+                producing_node_id="prepare",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="missing-prepare.txt",
+                ),
+            ),
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="summary.txt",
+                ),
+            ),
+        ],
+    )
+    ledger.mark_node_succeeded("prepare", ["prepare-artifact"])
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+    assert "Node output artifacts unavailable" not in capsys.readouterr().out
+
+
+def test_runtime_runs_only_incomplete_terminal_ancestor_closure(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    stale_upstream = workflow.add_node(ExplodingNode(), id="stale-prepare")
+    workflow.add_node(ExplodingNode(), id="stale-summary", depends_on=[stale_upstream])
+    calls: list[str] = []
+    active_upstream = workflow.add_node(FakeNode(calls=calls), id="active-prepare")
+    workflow.add_node(
+        FakeNode(calls=calls),
+        id="active-summary",
+        depends_on=[active_upstream],
+    )
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    stale_summary_path = tmp_path / "stale-summary.txt"
+    stale_summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="stale-summary-artifact",
+                producing_node_id="stale-summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="stale-summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_failed("stale-prepare", "old failure")
+    ledger.mark_node_succeeded("stale-summary", ["stale-summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["active-prepare", "active-summary"]
+    assert runtime.diagnostics.scheduled_waves == [
+        ["active-prepare"],
+        ["active-summary"],
+    ]
+
+
+def test_incomplete_terminal_starts_from_nearest_incomplete_node(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    stale_prepare = workflow.add_node(ExplodingNode(), id="prepare")
+    completed_filter = workflow.add_node(
+        ExplodingNode(),
+        id="filter",
+        depends_on=[stale_prepare],
+    )
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="report", depends_on=[completed_filter])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    filter_path = tmp_path / "filter.txt"
+    filter_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="filter-artifact",
+                producing_node_id="filter",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="filter.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_failed("prepare", "old failure")
+    ledger.mark_node_succeeded("filter", ["filter-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["report"]
+    assert runtime.diagnostics.scheduled_waves == [["report"]]
+
+
+def test_unknown_external_terminal_artifact_skips_missing_ancestors(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="prepare")
+    workflow.add_node(ExplodingNode(), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_volume_roots={},
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.scheduled_waves == []
+
+
+def test_force_ignores_terminal_pruning_after_reset(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    upstream = workflow.add_node(FakeNode(calls=calls), id="prepare")
+    workflow.add_node(FakeNode(calls=calls), id="summary", depends_on=[upstream])
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    summary_path = tmp_path / "summary.txt"
+    summary_path.write_text("done\n", encoding="utf-8")
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="summary-artifact",
+                producing_node_id="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="summary.txt",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("summary", ["summary-artifact"])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1", force=True)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["prepare", "summary"]
+    assert runtime.diagnostics.scheduled_waves == [["prepare"], ["summary"]]
+
+
+def test_strict_external_artifact_checks_require_checker(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+
+    with pytest.raises(ValueError, match="external_artifact_checker"):
+        WorkflowRuntime(
+            workflow=workflow,
+            volume_root=tmp_path,
+            workflow_volume_name="Workflow-outputs",
+            strict_external_artifact_checks=True,
+        )
+
+
+def test_completed_node_with_missing_artifact_manifest_is_rerun(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    calls: list[str] = []
+    workflow.add_node(FakeNode(calls=calls), id="one")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    first = runtime.run(run_id="run-1")
+    manifest_path = tmp_path / "demo" / "run-1" / "artifacts" / "one-output.json"
+    manifest_path.unlink()
+    second = runtime.run(run_id="run-1")
+
+    assert first.status == AppRunStatus.SUCCEEDED
+    assert second.status == AppRunStatus.SUCCEEDED
+    assert calls == ["one", "one"]
+    assert manifest_path.exists()
+
+
+def test_remote_completed_node_with_missing_materialized_archive_is_rerun(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    node = DirectSubmitNode(
+        call=FakeRemoteCall(
+            object_id="fc-remote",
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="archive",
+                        kind=ArtifactKind.ARCHIVE,
+                        storage=InlineBytes(
+                            data=b"archive",
+                            filename="designs.tar.zst",
+                            media_type="application/zstd",
+                        ),
+                    )
+                ],
+            ),
+        )
+    )
+    workflow.add_node(node, id="remote")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    first = runtime.run(run_id="run-1")
+    materialized_path = (
+        tmp_path
+        / "demo"
+        / "run-1"
+        / "nodes"
+        / "remote"
+        / "attempts"
+        / "attempt-1"
+        / "remote-archive"
+        / "designs.tar.zst"
+    )
+    materialized_path.unlink()
+    second = runtime.run(run_id="run-1")
+
+    assert first.status == AppRunStatus.SUCCEEDED
+    assert second.status == AppRunStatus.SUCCEEDED
+    assert node.submitted_contexts == ["remote", "remote"]
+    assert materialized_path.exists()
 
 
 def test_force_replaces_existing_run_ledger_and_reruns_completed_nodes(
@@ -275,6 +818,28 @@ def test_force_replaces_existing_run_ledger_and_reruns_completed_nodes(
     assert not stale_file.exists()
 
 
+def test_force_reset_commits_deleted_run_before_recreate(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = SnapshotVolume(tmp_path)
+    workflow.add_node(FakeNode(), id="one")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+
+    assert runtime.run(run_id="run-1").status == AppRunStatus.SUCCEEDED
+    stale_path = tmp_path / "demo" / "run-1" / "nodes" / "stale.txt"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text("stale\n", encoding="utf-8")
+    runtime._volume_sync.commit()
+    assert "demo/run-1/nodes/stale.txt" in volume.committed_paths
+
+    assert runtime.run(run_id="run-1", force=True).status == AppRunStatus.SUCCEEDED
+    assert "demo/run-1/nodes/stale.txt" not in volume.committed_paths
+
+
 def test_independent_ready_nodes_run_in_same_scheduler_wave(
     tmp_path: Path,
 ) -> None:
@@ -293,14 +858,19 @@ def test_independent_ready_nodes_run_in_same_scheduler_wave(
     )
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts([
-        WorkflowArtifact(
-            artifact_id="design-artifact",
-            producing_node_id="design",
-            kind=ArtifactKind.STRUCTURES,
-            storage=VolumePath(volume_name="Workflow-outputs", path="design"),
-        )
-    ])
+    output_dir = tmp_path / "design"
+    output_dir.mkdir()
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="design-artifact",
+                producing_node_id="design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(volume_name="Workflow-outputs", path="design"),
+            )
+        ],
+    )
     ledger.mark_node_succeeded("design", ["design-artifact"])
 
     runtime = WorkflowRuntime(
@@ -311,23 +881,62 @@ def test_independent_ready_nodes_run_in_same_scheduler_wave(
     runtime.run(run_id="run-1")
 
     assert set(calls) == {"score-a", "score-b"}
-    assert runtime.executed_waves == [["score-a", "score-b"]]
+    assert runtime.diagnostics.scheduled_waves == [["score-a", "score-b"]]
 
 
-def test_independent_ready_nodes_execute_concurrently(tmp_path: Path) -> None:
+def test_runtime_records_scheduler_diagnostics(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    workflow.add_node(FakeNode(), id="prepare")
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.diagnostics.run_id == "run-1"
+    assert [
+        decision.status for decision in runtime.diagnostics.scheduler_decisions
+    ] == [
+        SchedulerDecisionStatus.READY,
+        SchedulerDecisionStatus.SUCCEEDED,
+    ]
+    assert runtime.diagnostics.scheduler_decisions[0].ready == ("prepare",)
+    assert runtime.diagnostics.scheduler_decisions[-1].completed == ("prepare",)
+
+
+def test_independent_remote_nodes_execute_concurrently(tmp_path: Path) -> None:
     barrier = Barrier(2, timeout=0.5)
     workflow = Workflow("demo")
 
-    class BarrierNode(WorkflowNativeNode):
-        def run(self, context):
+    class BarrierRemoteCall(FakeRemoteCall):
+        def get(self, timeout=None):
             try:
                 barrier.wait()
             except BrokenBarrierError:
                 return AppRunResult(status=AppRunStatus.FAILED)
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+            return super().get(timeout=timeout)
 
-    workflow.add_node(BarrierNode(), id="one")
-    workflow.add_node(BarrierNode(), id="two")
+    workflow.add_node(
+        DirectSubmitNode(
+            call=BarrierRemoteCall(
+                object_id="fc-one",
+                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
+        ),
+        id="one",
+    )
+    workflow.add_node(
+        DirectSubmitNode(
+            call=BarrierRemoteCall(
+                object_id="fc-two",
+                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
+        ),
+        id="two",
+    )
 
     runtime = WorkflowRuntime(
         workflow=workflow,
@@ -337,7 +946,7 @@ def test_independent_ready_nodes_execute_concurrently(tmp_path: Path) -> None:
     result = runtime.run(run_id="run-1")
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert runtime.executed_waves == [["one", "two"]]
+    assert runtime.diagnostics.scheduled_waves == [["one", "two"]]
 
 
 def test_failed_node_prevents_downstream_nodes_from_running(tmp_path: Path) -> None:
@@ -356,7 +965,7 @@ def test_failed_node_prevents_downstream_nodes_from_running(tmp_path: Path) -> N
     result = runtime.run(run_id="run-1")
 
     assert result.status == AppRunStatus.FAILED
-    assert runtime.executed_waves == [["fail"]]
+    assert runtime.diagnostics.scheduled_waves == [["fail"]]
 
 
 def test_partial_node_marks_run_failed_and_blocks_downstream(tmp_path: Path) -> None:
@@ -379,7 +988,7 @@ def test_partial_node_marks_run_failed_and_blocks_downstream(tmp_path: Path) -> 
     status = runtime.ledger._load_node_status_or_default("partial")
     assert status.status == NodeStatus.FAILED
     assert status.error == "Node returned partial status"
-    assert runtime.executed_waves == [["partial"]]
+    assert runtime.diagnostics.scheduled_waves == [["partial"]]
 
 
 def test_single_node_exception_marks_node_and_run_failed(tmp_path: Path) -> None:
@@ -421,16 +1030,20 @@ def test_runtime_logs_dag_and_node_state_transitions(
 
     assert result.status == AppRunStatus.SUCCEEDED
     stdout = capsys.readouterr().out
-    assert "[workflow] Starting workflow 'demo' run 'run-1'" in stdout
-    assert "[workflow] DAG graph: node_id [placement; class] <- dependency" in stdout
-    assert "[workflow]   prepare [orchestrator; FakeNode] <- -" in stdout
-    assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in stdout
-    assert "tests.workflow.test_runtime.FakeNode" not in stdout
-    assert "<- prepare" in stdout
-    assert "[workflow] Node started: prepare attempt=attempt-1" in stdout
-    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in stdout
-    assert "[workflow] Node started: produce attempt=attempt-1" in stdout
-    assert "[workflow] Node succeeded: produce attempt=attempt-1" in stdout
+    assert "\x1b[" not in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "[workflow] Starting workflow 'demo' run 'run-1'" in plain_stdout
+    assert (
+        "[workflow] DAG graph: node_id [placement; class] <- dependency" in plain_stdout
+    )
+    assert "[workflow]   prepare [orchestrator; FakeNode] <- -" in plain_stdout
+    assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in plain_stdout
+    assert "tests.workflow.test_runtime.FakeNode" not in plain_stdout
+    assert "<- prepare" in plain_stdout
+    assert "[workflow] Node started: prepare attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node started: produce attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node succeeded: produce attempt=attempt-1" in plain_stdout
 
 
 def test_runtime_logs_failed_node_transition(
@@ -453,8 +1066,61 @@ def test_runtime_logs_failed_node_transition(
 
     assert result.status == AppRunStatus.FAILED
     stdout = capsys.readouterr().out
-    assert "[workflow] Node started: fail attempt=attempt-1" in stdout
-    assert "[workflow] Node failed: fail attempt=attempt-1" in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "[workflow] Node started: fail attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node failed: fail attempt=attempt-1" in plain_stdout
+
+
+def test_runtime_logs_node_state_transitions_with_plain_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workflow = Workflow("demo")
+    first = workflow.add_node(FakeNode(), id="prepare")
+    workflow.add_node(FakeNode(), id="produce", depends_on=[first])
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    stdout = capsys.readouterr().out
+    plain_stdout = strip_ansi(stdout)
+    assert "\x1b[" not in stdout
+    assert "[workflow] Node started: prepare" in plain_stdout
+    assert "[workflow] Node succeeded: prepare" in plain_stdout
+    assert "[workflow] Starting workflow 'demo'" in plain_stdout
+    assert "[workflow]   prepare [orchestrator; FakeNode] <- -" in plain_stdout
+    assert "[workflow]   produce [orchestrator; FakeNode] <- prepare" in plain_stdout
+
+
+def test_runtime_color_can_be_disabled_with_biomodals_no_color(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BIOMODALS_NO_COLOR", "1")
+    workflow = Workflow("demo")
+    workflow.add_node(FakeNode(), id="prepare")
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    stdout = capsys.readouterr().out
+    assert "\x1b[" not in stdout
+    plain_stdout = strip_ansi(stdout)
+    assert "[workflow] Node started: prepare attempt=attempt-1" in plain_stdout
+    assert "[workflow] Node succeeded: prepare attempt=attempt-1" in plain_stdout
 
 
 def test_runtime_dag_hash_uses_stable_json_for_dataclass_node_config() -> None:
@@ -483,9 +1149,9 @@ def test_runtime_dag_hash_uses_stable_json_for_dataclass_node_config() -> None:
         id="configured",
     )
 
-    first_hash = WorkflowRuntime._dag_hash(first_workflow.validate())
-    second_hash = WorkflowRuntime._dag_hash(second_workflow.validate())
-    repeated_hash = WorkflowRuntime._dag_hash(repeated_workflow.validate())
+    first_hash = hashing.dag_hash(first_workflow.validate())
+    second_hash = hashing.dag_hash(second_workflow.validate())
+    repeated_hash = hashing.dag_hash(repeated_workflow.validate())
 
     assert first_hash != second_hash
     assert first_hash == repeated_hash
@@ -501,9 +1167,9 @@ def test_runtime_dag_hash_supports_bytes_in_dataclass_node_config() -> None:
         BytesConfiguredNode(payload=b"ATOM 1\n"), id="configured"
     )
 
-    first_hash = WorkflowRuntime._dag_hash(first_workflow.validate())
-    second_hash = WorkflowRuntime._dag_hash(second_workflow.validate())
-    repeated_hash = WorkflowRuntime._dag_hash(repeated_workflow.validate())
+    first_hash = hashing.dag_hash(first_workflow.validate())
+    second_hash = hashing.dag_hash(second_workflow.validate())
+    repeated_hash = hashing.dag_hash(repeated_workflow.validate())
 
     assert first_hash != second_hash
     assert first_hash == repeated_hash
@@ -515,8 +1181,29 @@ def test_runtime_dag_hash_skips_dataclass_fields_marked_excluded() -> None:
     second_workflow = Workflow("demo")
     second_workflow.add_node(RuntimeHandleNode(handle=object()), id="node")
 
-    assert WorkflowRuntime._dag_hash(first_workflow.validate()) == (
-        WorkflowRuntime._dag_hash(second_workflow.validate())
+    assert hashing.dag_hash(first_workflow.validate()) == (
+        hashing.dag_hash(second_workflow.validate())
+    )
+
+
+def test_runtime_dag_hash_ignores_internal_node_placement() -> None:
+    orchestrator_node = ConfiguredNode(
+        settings=HashSettings(visible="same", hidden="same"),
+        output_path=Path("outputs/report.txt"),
+    )
+    remote_node = ConfiguredNode(
+        settings=HashSettings(visible="same", hidden="same"),
+        output_path=Path("outputs/report.txt"),
+    )
+    remote_node.placement = NodePlacement.REMOTE
+
+    first_workflow = Workflow("demo")
+    first_workflow.add_node(orchestrator_node, id="configured")
+    second_workflow = Workflow("demo")
+    second_workflow.add_node(remote_node, id="configured")
+
+    assert hashing.dag_hash(first_workflow.validate()) == (
+        hashing.dag_hash(second_workflow.validate())
     )
 
 
@@ -602,6 +1289,89 @@ def test_runtime_commits_node_start_before_node_execution(tmp_path: Path) -> Non
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert node.commit_count_at_run >= 3
+
+
+def test_downstream_node_sees_committed_inline_artifact(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = SnapshotVolume(tmp_path)
+    upstream = workflow.add_node(
+        FakeNode(
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="report",
+                        kind=ArtifactKind.REPORT,
+                        storage=InlineBytes(data=b"ok\n", filename="report.txt"),
+                    )
+                ],
+            )
+        ),
+        id="upstream",
+    )
+
+    class CommittedReaderNode(WorkflowNativeNode):
+        def run(self, context):
+            artifacts = context.inputs["report"]
+            storage_path = artifacts[0].storage.path
+            assert storage_path in volume.committed_paths
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    workflow.add_node(
+        CommittedReaderNode(),
+        id="downstream",
+        inputs={"report": upstream.outputs(kind=ArtifactKind.REPORT)},
+    )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+
+
+def test_failed_node_logs_are_committed_before_run_returns(tmp_path: Path) -> None:
+    workflow = Workflow("demo")
+    volume = SnapshotVolume(tmp_path)
+    workflow.add_node(
+        FakeNode(
+            result=AppRunResult(
+                status=AppRunStatus.FAILED,
+                logs=[
+                    AppOutput(
+                        name="stderr",
+                        kind=ArtifactKind.LOGS,
+                        storage=InlineBytes(
+                            data=b"missing input\n",
+                            filename="stderr.log",
+                        ),
+                    )
+                ],
+                warnings=["remote file not found"],
+            )
+        ),
+        id="failed",
+    )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.FAILED
+    assert (
+        "demo/run-1/nodes/failed/attempts/attempt-1/logs/failed-logs-stderr/stderr.log"
+    ) in volume.committed_paths
+    assert "demo/run-1/artifacts/failed-logs-stderr.json" in volume.committed_paths
 
 
 def test_remote_placement_requires_direct_submission(tmp_path: Path) -> None:
@@ -905,6 +1675,61 @@ def test_remote_success_reloads_volume_before_materializing_outputs(
     assert volume.reload_count >= 2
 
 
+def test_remote_reload_waits_for_orchestrator_node_volume_access(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("demo")
+    local_running = Event()
+    local_can_finish = Event()
+    local_finished = Event()
+    reload_happened_while_local_running = False
+
+    class GuardedVolume(FakeVolume):
+        def reload(self) -> None:
+            nonlocal reload_happened_while_local_running
+            if local_running.is_set() and not local_finished.is_set():
+                reload_happened_while_local_running = True
+                local_can_finish.set()
+            super().reload()
+
+    class SlowLocalNode(WorkflowNativeNode):
+        def run(self, context):
+            local_running.set()
+            local_can_finish.wait(timeout=1)
+            local_finished.set()
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    class FinishingRemoteCall(FakeRemoteCall):
+        def get(self, timeout=None):
+            local_running.wait(timeout=1)
+            return super().get(timeout=timeout)
+
+    volume = GuardedVolume()
+    workflow.add_node(SlowLocalNode(), id="local")
+    workflow.add_node(
+        DirectSubmitNode(
+            call=FinishingRemoteCall(
+                object_id="fc-remote",
+                result=AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
+        ),
+        id="remote",
+    )
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        workflow_volume=volume,
+        max_ready_workers=2,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert reload_happened_while_local_running is False
+
+
 def test_remote_recovery_reattaches_existing_call_before_rerun(
     tmp_path: Path,
 ) -> None:
@@ -976,6 +1801,10 @@ def test_remote_recovery_processes_direct_submission_metadata(
         placement=NodePlacement.REMOTE,
     )
     ledger.record_attempt_started("remote", "attempt-old")
+    recovered_output = (
+        tmp_path / "demo" / "run-1" / "nodes" / "remote" / "attempts" / "attempt-old"
+    )
+    recovered_output.joinpath("remote-output").mkdir(parents=True)
     ledger.record_app_result(
         "remote",
         "attempt-old",
@@ -1025,6 +1854,104 @@ def test_remote_recovery_processes_direct_submission_metadata(
     assert orjson.loads(artifact_metadata) == {"selected": "B5"}
 
 
+def test_completed_remote_node_with_missing_artifact_does_not_replay_stale_result(
+    tmp_path: Path,
+) -> None:
+    node = DirectSubmitNode(
+        call=FakeRemoteCall(
+            object_id="fc-new",
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="archive",
+                        kind=ArtifactKind.ARCHIVE,
+                        storage=InlineBytes(
+                            data=b"new-archive",
+                            filename="designs.tar.zst",
+                            media_type="application/zstd",
+                        ),
+                    )
+                ],
+            ),
+        )
+    )
+    node.execution_policy = NodeExecutionPolicy.RESUME
+    workflow = Workflow("demo")
+    workflow.add_node(node, id="remote")
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    ledger.record_attempt_started("remote", "attempt-old")
+    ledger.record_attempt_completed(
+        "remote",
+        "attempt-old",
+        NodeStatus.SUCCEEDED,
+        result=AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="archive",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name="ExternalApp-outputs",
+                        path="runs/remote/archive.tar.zst",
+                    ),
+                )
+            ],
+        ),
+    )
+    ledger.record_remote_call(
+        call_id="fc-old",
+        node_id="remote",
+        attempt_id="attempt-old",
+        function_name="direct_app_function",
+        call_kind="node",
+        status="succeeded",
+    )
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="remote-archive",
+                producing_node_id="remote",
+                kind=ArtifactKind.ARCHIVE,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/remote/archive.tar.zst",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("remote", ["remote-archive"])
+
+    def external_checker(artifact: WorkflowArtifact) -> list[str]:
+        return [f"{artifact.artifact_id}: missing external path {artifact.storage}"]
+
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        strict_external_artifact_checks=True,
+        external_artifact_checker=external_checker,
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert node.submitted_contexts == ["remote"]
+    assert (
+        tmp_path
+        / "demo"
+        / "run-1"
+        / "nodes"
+        / "remote"
+        / "attempts"
+        / "attempt-1"
+        / "remote-archive"
+        / "designs.tar.zst"
+    ).read_bytes() == b"new-archive"
+
+
 def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     tmp_path: Path,
 ) -> None:
@@ -1038,17 +1965,22 @@ def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     )
     ledger = WorkflowLedger(tmp_path)
     ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
-    ledger.record_artifacts([
-        WorkflowArtifact(
-            artifact_id="design-structures",
-            producing_node_id="design",
-            kind=ArtifactKind.STRUCTURES,
-            storage=VolumePath(
-                volume_name="Workflow-outputs",
-                path="demo/run-1/nodes/design/outputs",
-            ),
-        )
-    ])
+    output_dir = tmp_path / "demo" / "run-1" / "nodes" / "design" / "outputs"
+    output_dir.mkdir(parents=True)
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="design-structures",
+                producing_node_id="design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="demo/run-1/nodes/design/outputs",
+                ),
+            )
+        ],
+    )
     ledger.mark_node_succeeded("design", ["design-structures"])
 
     runtime = WorkflowRuntime(
@@ -1074,6 +2006,50 @@ def test_runtime_passes_selected_upstream_artifacts_to_node_context(
     }
     status = runtime.ledger._load_node_status_or_default("score")
     assert status.input_artifact_ids == ["design-structures"]
+
+
+def test_runtime_logs_unknown_external_input_artifact_availability(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workflow = Workflow("demo")
+    upstream = workflow.add_node(ExplodingNode(), id="design")
+    calls: list[str] = []
+    workflow.add_node(
+        FakeNode(calls=calls),
+        id="score",
+        inputs={"structures": upstream.outputs(kind=ArtifactKind.STRUCTURES)},
+    )
+    ledger = WorkflowLedger(tmp_path)
+    ledger.create_run(WorkflowRun(workflow_name="demo", run_id="run-1"))
+    record_artifacts_with_manifests(
+        ledger,
+        [
+            WorkflowArtifact(
+                artifact_id="design-structures",
+                producing_node_id="design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="ExternalApp-outputs",
+                    path="runs/design/outputs",
+                ),
+            )
+        ],
+    )
+    ledger.mark_node_succeeded("design", ["design-structures"])
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+    )
+
+    result = runtime.run(run_id="run-1")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls == ["score"]
+    plain_stdout = strip_ansi(capsys.readouterr().out)
+    assert "Input artifact availability unknown" in plain_stdout
+    assert "external volume 'ExternalApp-outputs' was not checked" in plain_stdout
 
 
 def test_runtime_records_succeeded_run_status(tmp_path: Path) -> None:

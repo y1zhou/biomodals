@@ -51,7 +51,6 @@ from biomodals.helper.io import (
 from biomodals.helper.shell import (
     package_outputs,
     run_command,
-    run_command_with_log,
 )
 from biomodals.helper.structure import struct2seq
 from biomodals.helper.web import download_files
@@ -481,10 +480,10 @@ def run_protenix(
             f"--msa_cache_dir={score_msa_cache_dir}",
             "--msa_cache_mode=readwrite",
         ]
-        run_command_with_log(
+        run_command(
             cmd,
+            output_mode="tee",
             log_file=out_dir / f"{run_name}.log",
-            verbose=True,
             env=run_env,
             cwd=tmpdir_path,
         )
@@ -518,10 +517,10 @@ def run_protenix(
     if extra_args:
         cmd.extend(shlex.split(extra_args))
 
-    run_command_with_log(
+    run_command(
         cmd,
+        output_mode="tee",
         log_file=out_dir / f"{run_name}.log",
-        verbose=True,
         env=run_env,
         cwd=tmpdir_path,
     )

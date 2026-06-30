@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess as sp
+import sys
 import warnings
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Literal
 
 from biomodals.helper.internal import timed_function
 
@@ -30,7 +32,8 @@ def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
 
-    print(f"Running background command: {shlex.join(cmd)}")
+    sys.stdout.write(f"Running background command: {shlex.join(cmd)}\n")
+    sys.stdout.flush()
     kwargs.setdefault("stdout", sp.DEVNULL)
     kwargs.setdefault("stderr", sp.DEVNULL)
     kwargs["env"] = _build_env(kwargs.get("env", None))
@@ -40,72 +43,28 @@ def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
 def run_command(
     cmd: list[str] | str,
     *,
-    verbose: bool = True,
-    try_rich_print: bool = False,
+    output_mode: Literal["tee", "capture", "inherit", "discard"] = "tee",
+    log_file: str | Path | None = None,
     **kwargs,
 ) -> list[str]:
-    """Run a shell command and stream output to stdout.
+    """Run a shell command with explicit subprocess output handling.
 
     Args:
         cmd: Command to run, either as a string or a list of arguments.
-        verbose: If True, print the command output to stdout in real time.
-        try_rich_print: If True, attempt to use `rich.print` for output formatting.
+        output_mode: ``tee`` captures and streams raw output, ``capture`` captures
+            without streaming, ``inherit`` attaches the child to parent streams,
+            and ``discard`` drops child output while waiting for completion.
+        log_file: Optional file that receives command timing metadata and raw
+            child output. Only valid with ``tee`` or ``capture`` modes.
         **kwargs: Additional keyword arguments to pass to `subprocess.Popen`.
             For example, you can use `cwd` to specify the working directory, or
             `env` to specify environment variables.
 
     Returns:
-        A list of output lines from the command. Note that both STDOUT and STDERR
-        are captured.
+        Captured output lines. ``inherit`` mode returns an empty list.
     """
     import shlex
     import subprocess as sp
-
-    if try_rich_print:
-        try:
-            import builtins
-
-            import rich
-
-            builtins.print = rich.print  # ty:ignore[invalid-assignment]
-        except ImportError:
-            pass
-
-    if isinstance(cmd, str):
-        cmd = shlex.split(cmd)
-
-    if verbose:
-        print(f"Running command: {shlex.join(cmd)}")
-    # Set default kwargs for sp.Popen
-    kwargs.setdefault("stdout", sp.PIPE)
-    kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-    kwargs["env"] = _build_env(kwargs.get("env", None))
-
-    all_outputs: list[str] = []
-    with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
-
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            if verbose:
-                print(buffered_output, end="", flush=True)
-            all_outputs.append(buffered_output.rstrip("\n"))
-
-        if p.returncode != 0:
-            raise sp.CalledProcessError(p.returncode, cmd)
-
-        return all_outputs
-
-
-def run_command_with_log(
-    cmd: list[str] | str, log_file: str | Path, verbose: bool = False, **kwargs
-) -> None:
-    """Run a shell command and log output to a file."""
-    import shlex
-    import subprocess as sp
-    import sys
     from datetime import datetime, timedelta
     from time import time
 
@@ -120,47 +79,98 @@ def run_command_with_log(
         cmd = shlex.split(cmd)
 
     cmd_str = shlex.join(cmd)
-    print(f"Running command: {cmd_str}")
+    sys.stdout.write(f"Running command: {cmd_str}\n")
+    sys.stdout.flush()
+    if output_mode not in {"tee", "capture", "inherit", "discard"}:
+        raise ValueError(f"Unsupported command output mode: {output_mode}")
+    if log_file is not None and output_mode in {"inherit", "discard"}:
+        raise ValueError("log_file requires output_mode='tee' or 'capture'")
+    kwargs["env"] = _build_env(kwargs.get("env", None))
+    if output_mode == "inherit":
+        kwargs.setdefault("stdout", None)
+        kwargs.setdefault("stderr", None)
+        with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
+            p.wait()
+            if p.returncode != 0:
+                raise sp.CalledProcessError(p.returncode, cmd)
+        return []
+    if output_mode == "discard":
+        kwargs.setdefault("stdout", sp.DEVNULL)
+        kwargs.setdefault("stderr", sp.DEVNULL)
+        with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
+            p.wait()
+            if p.returncode != 0:
+                raise sp.CalledProcessError(p.returncode, cmd)
+        return []
 
+    all_outputs: list[str] = []
+    output_buffer = ""
     kwargs.setdefault("stdout", sp.PIPE)
     kwargs.setdefault("stderr", sp.STDOUT)
-    kwargs.setdefault("bufsize", 1)
-    kwargs.setdefault("encoding", "utf-8")
-    kwargs["env"] = _build_env(kwargs.get("env", None))
-
-    log_path = Path(log_file).expanduser()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    banner = "=" * 100
+    kwargs.setdefault("bufsize", 0)
+    log_path = Path(log_file).expanduser() if log_file is not None else None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
     now = time()
-    with (
-        log_path.open("a", buffering=1) as f,
-        sp.Popen(cmd, **kwargs) as p,  # noqa: S603
-    ):
-        if p.stdout is None:
-            raise RuntimeError("Failed to capture stdout from the command.")
+    banner = "=" * 100
+    log_handle = log_path.open("ab", buffering=0) if log_path is not None else None
+    return_code: int | None = None
+    try:
+        if log_handle is not None:
+            log_handle.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n".encode())
+            log_handle.write(f"Running command: {cmd_str}\n{banner}\n".encode())
 
-        f.write(f"\n{banner}\nTime: {str(datetime.now(UTC))}\n")
-        f.write(f"Running command: {cmd_str}\n{banner}\n")
+        with sp.Popen(cmd, **kwargs) as p:  # noqa: S603
+            if p.stdout is None:
+                raise RuntimeError("Failed to capture stdout from the command.")
 
-        while (buffered_output := p.stdout.readline()) != "" or p.poll() is None:
-            f.write(buffered_output)
-            if verbose:
-                print(buffered_output, end="", flush=True)
+            read_chunk = getattr(p.stdout, "read1", p.stdout.read)
+            while chunk := read_chunk(8192):
+                if isinstance(chunk, str):
+                    text = chunk
+                    raw = chunk.encode()
+                else:
+                    raw = chunk
+                    text = chunk.decode("utf-8", errors="replace")
+                if log_handle is not None:
+                    log_handle.write(raw)
+                if output_mode == "tee":
+                    try:
+                        sys.stdout.buffer.write(raw)
+                    except AttributeError:
+                        sys.stdout.write(text)
+                    sys.stdout.flush()
+                output_buffer += text
+                while "\n" in output_buffer:
+                    line, output_buffer = output_buffer.split("\n", 1)
+                    all_outputs.append(line.removesuffix("\r"))
 
-        f.write(f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n")
+            if output_buffer:
+                all_outputs.append(output_buffer.removesuffix("\r"))
 
-        elapsed_seconds = float(time() - now)
-        elapsed_time = timedelta(seconds=elapsed_seconds)
-        f.write(f"Elapsed time: {elapsed_time}\n")
+            p.wait()
+            return_code = p.returncode
+    finally:
+        if log_handle is not None:
+            log_handle.write(
+                f"\n{banner}\nFinished at: {str(datetime.now(UTC))}\n".encode()
+            )
+            elapsed_seconds = float(time() - now)
+            elapsed_time = timedelta(seconds=elapsed_seconds)
+            log_handle.write(f"Elapsed time: {elapsed_time}\n".encode())
+            log_handle.close()
 
-        if p.returncode != 0:
+    if return_code != 0:
+        if log_path is not None:
             warnings.warn(
-                f"Command '{cmd_str}' failed with return code {p.returncode}. "
+                f"Command '{cmd_str}' failed with return code {return_code}. "
                 f"Check log file {log_path} for details.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            raise sp.CalledProcessError(p.returncode, cmd)
+        raise sp.CalledProcessError(return_code, cmd)
+
+    return all_outputs
 
 
 def find_with_fd(dir_path: str | Path, file_pattern: str = ".", *args) -> list[str]:
@@ -184,7 +194,7 @@ def find_with_fd(dir_path: str | Path, file_pattern: str = ".", *args) -> list[s
         raise FileNotFoundError(dir_path)
 
     cmd = [fd_binary, file_pattern, *args]
-    return run_command(cmd, verbose=False, cwd=str(dir_path))
+    return run_command(cmd, output_mode="capture", cwd=str(dir_path))
 
 
 def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
@@ -291,13 +301,16 @@ def package_outputs(
 
 
 @timed_function
-def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
+def copy_files(
+    src_dst_mapping: dict[str | Path, str | Path], cp_args: str = "-an"
+) -> None:
     """Copy files from source to destination paths.
 
     Args:
         src_dst_mapping: A dictionary mapping source file paths to destination file paths.
             Both keys and values can be either strings or Path objects. The function
             will create any necessary parent directories for the destination paths.
+        cp_args: Additional arguments to pass to the cp command. Defaults to "-an".
     """
     import shlex
     import shutil
@@ -315,7 +328,7 @@ def copy_files(src_dst_mapping: dict[str | Path, str | Path]) -> None:
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         subprocesses.append(
             sp.Popen(  # noqa: S603
-                [cp_binary, "-an", str(src_path), str(dst_path)],
+                [cp_binary, cp_args, str(src_path), str(dst_path)],
                 stdout=sp.PIPE,
                 stderr=sp.PIPE,
             )

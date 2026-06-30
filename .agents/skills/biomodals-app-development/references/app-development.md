@@ -2,6 +2,22 @@
 
 This reference is the maintained app-development standard for files under `src/biomodals/app/**/*_app.py`.
 
+## Contents
+
+- [Discovery And File Shape](#discovery-and-file-shape)
+- [Module Docstring](#module-docstring)
+- [Imports And Ruff](#imports-and-ruff)
+- [AppConfig](#appconfig)
+- [Image Construction](#image-construction)
+- [Volumes](#volumes)
+- [Remote Functions](#remote-functions)
+- [Helper APIs](#helper-apis)
+- [Local Entrypoint](#local-entrypoint)
+- [Data Flow](#data-flow)
+- [Caching](#caching)
+- [Legacy Apps](#legacy-apps)
+- [Examples And Verification](#examples-and-verification)
+
 ## Discovery And File Shape
 
 Biomodals apps are self-contained Modal applications wrapping bioinformatics tools. They live under `src/biomodals/app/<category>/`.
@@ -138,9 +154,12 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
   `VOLUME.commit()`.
 - Use `CONF.output_volume` and `CONF.mounts(output_volume=True)` for
   app-specific persistent outputs; output volumes are normally mounted whole.
-- Use `volume_path_from_mount_path(...)` when printing or returning remote
-  volume paths so logs show a validated `VolumePath` instead of an ambiguous
-  absolute container path.
+- Use `AppRunLayout` from `biomodals.helper.app_run` for new per-run
+  app output paths so local entrypoints, remote functions, and workflow-compatible
+  functions share the same directory contract.
+- Use `volume_path_from_mount_path(...)` from `biomodals.helper.app_run` when
+  printing or returning remote volume paths so logs show a validated `VolumePath`
+  instead of an ambiguous absolute container path.
 
 ## Remote Functions
 
@@ -191,7 +210,8 @@ Resource pattern:
 Prefer existing helpers instead of reimplementing common behavior:
 
 - `run_command(cmd)` from `biomodals.helper.shell` for streaming shell commands.
-- `run_command_with_log(cmd, log_file)` for command logging.
+- `run_command(cmd, output_mode="capture" | "tee", log_file=path)` for command
+  logging.
 - `run_background_command(cmd)` for non-blocking subprocesses.
 - `package_outputs(root)` for `.tar.zst` bytes.
 - `copy_files(mapping)` for parallel file copying.

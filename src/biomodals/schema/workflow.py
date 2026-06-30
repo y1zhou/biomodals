@@ -98,13 +98,6 @@ class ArtifactSelector(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ControlEdge(BaseModel):
-    """Ordering dependency between workflow nodes without artifact passage."""
-
-    upstream_node_id: str
-    downstream_node_id: str
-
-
 class WorkflowRun(BaseModel):
     """Durable status record for one workflow run."""
 

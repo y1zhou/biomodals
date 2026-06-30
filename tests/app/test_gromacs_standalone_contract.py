@@ -9,6 +9,25 @@ from types import SimpleNamespace
 from biomodals.app.bioinfo import gromacs_app
 
 
+def test_gromacs_declares_workflow_expected_files() -> None:
+    prepared = gromacs_app.prepared_workflow_files("demo")
+    production = gromacs_app.production_workflow_files("demo-rep1")
+
+    assert [(item.path, item.role) for item in prepared] == [
+        ("demo.pdb", "input_structure"),
+        ("production_demo.tpr", "production_topology"),
+        ("production.mdp", "production_parameters"),
+    ]
+    assert [(item.path, item.role) for item in production] == [
+        ("production_demo-rep1.xtc", "trajectory"),
+        ("production_demo-rep1.tpr", "production_topology"),
+        ("production_demo-rep1_nopbc_centered.pdb", "centered_structure"),
+        ("rmsd_production_demo-rep1.csv", "rmsd"),
+        ("rg_production_demo-rep1.csv", "radius_of_gyration"),
+        ("rmsf_production_demo-rep1.csv", "rmsf"),
+    ]
+
+
 def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     tmp_path: Path,
     monkeypatch,
@@ -72,6 +91,61 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
             {"run_name": "single", "save_processed_traj": True},
         ),
     ]
+
+
+def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    scripts_dir.joinpath("prepare-tpr.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    captured = {}
+
+    class FakeVolume:
+        def __init__(self) -> None:
+            self.commit_count = 0
+
+        def commit(self) -> None:
+            self.commit_count += 1
+
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        gromacs_app,
+        "APP_INFO",
+        SimpleNamespace(gmx_scripts=str(scripts_dir)),
+    )
+    monkeypatch.setattr(
+        gromacs_app,
+        "CONF",
+        SimpleNamespace(output_volume_mountpoint=str(tmp_path), output_volume=volume),
+    )
+
+    def fake_run_command(cmd, *, cwd, env):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        captured["env"] = env
+        return []
+
+    monkeypatch.setattr(gromacs_app, "run_command", fake_run_command)
+
+    result = gromacs_app.prepare_tpr_cpu.get_raw_f()(
+        pdb_content=b"ATOM\n",
+        run_name="prep",
+        simulation_time_ns=1,
+        num_threads=2,
+    )
+
+    run_root = tmp_path / "prep"
+    input_path = run_root / "prep.pdb"
+    staged_input_path = run_root / "inputs" / "prep.pdb"
+    assert result == str(run_root)
+    assert input_path.read_bytes() == b"ATOM\n"
+    assert staged_input_path.read_bytes() == b"ATOM\n"
+    assert captured["cmd"][captured["cmd"].index("-i") + 1] == str(input_path)
+    assert captured["cwd"] == str(run_root)
+    assert captured["env"] == {"OMP_NUM_THREADS": None}
+    assert volume.commit_count == 2
 
 
 def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> None:

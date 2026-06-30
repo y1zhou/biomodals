@@ -21,10 +21,10 @@ import modal
 
 from biomodals.app.bioinfo import gromacs_app
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import volume_app_output
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.schema import (
     AppConfig,
     AppOutput,
@@ -35,6 +35,7 @@ from biomodals.schema import (
     NodeExecutionPolicy,
     NodePlacement,
     VolumePath,
+    WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
@@ -44,6 +45,10 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+)
+from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
 )
 
 DEPENDENCY_APPS = ("gromacs",)
@@ -70,6 +75,23 @@ app = include_dependency_apps(app, CONF.depends_on_apps)
 GROMACS_OUTPUT_VOLUME = gromacs_app.CONF.output_volume
 GROMACS_OUTPUT_VOLUME_NAME = gromacs_app.CONF.output_volume_name
 GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
+
+
+@app.function(
+    image=runtime_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
+)
+def check_shortmd_external_artifact(artifact: WorkflowArtifact) -> ArtifactAvailability:
+    """Validate ShortMD artifacts stored in the GROMACS output volume."""
+    GROMACS_OUTPUT_VOLUME.reload()
+    return check_external_artifact_status(
+        artifact,
+        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        volume_roots={GROMACS_OUTPUT_VOLUME_NAME: GROMACS_OUTPUT_MOUNTPOINT},
+    )
 
 
 @dataclass(frozen=True)
@@ -259,15 +281,14 @@ class ShortMDPrepNode(AppBackedNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                AppOutput(
+                volume_app_output(
                     name="prepared_gromacs_run",
                     kind=ArtifactKind.DIRECTORY,
-                    storage=volume_path_from_mount_path(
-                        remote_path=remote_workdir,
-                        mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                        volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    ),
+                    remote_path=remote_workdir,
+                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={"stage": "prep", "run_name": safe_run_name},
+                    files=gromacs_app.prepared_workflow_files(safe_run_name),
                 )
             ],
         )
@@ -342,19 +363,20 @@ class ShortMDCloneNode(WorkflowNativeNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                AppOutput(
+                volume_app_output(
                     name="cloned_gromacs_run",
                     kind=ArtifactKind.DIRECTORY,
-                    storage=volume_path_from_mount_path(
-                        remote_path=remote_workdir,
-                        mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                        volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    ),
+                    remote_path=remote_workdir,
+                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={
                         "stage": str(metadata["stage"]),
                         "run_name": str(metadata["run_name"]),
                         "source_run_name": str(metadata["source_run_name"]),
                     },
+                    files=gromacs_app.prepared_workflow_files(
+                        str(metadata["run_name"])
+                    ),
                 )
             ],
         )
@@ -448,19 +470,20 @@ class ShortMDReplicateNode(AppBackedNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                AppOutput(
+                volume_app_output(
                     name="gromacs_production",
                     kind=ArtifactKind.DIRECTORY,
-                    storage=volume_path_from_mount_path(
-                        remote_path=str(remote_workdir),
-                        mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                        volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    ),
+                    remote_path=str(remote_workdir),
+                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={
                         "stage": "production",
                         "run_name": safe_replicate_run_name,
                         "source_run_name": safe_source_run_name,
                     },
+                    files=gromacs_app.production_workflow_files(
+                        safe_replicate_run_name
+                    ),
                 )
             ],
         )
@@ -650,6 +673,7 @@ def submit_shortmd_workflow(
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
+    strict_artifact_checks: bool = False,
 ) -> None:
     """Run ShortMD production replicate workflow for a directory of PDB files.
 
@@ -674,6 +698,8 @@ def submit_shortmd_workflow(
         max_parallel: Maximum number of ready workflow nodes to execute
             concurrently in one scheduler wave.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
+        strict_artifact_checks: Validate referenced GROMACS volume artifacts
+            before reusing completed workflow nodes.
     """
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
@@ -704,6 +730,11 @@ def submit_shortmd_workflow(
         "force": force,
         "max_ready_workers": max_parallel,
     }
+    if strict_artifact_checks:
+        orchestrator_kwargs["strict_external_artifact_checks"] = True
+        orchestrator_kwargs["external_artifact_checker"] = (
+            check_shortmd_external_artifact.remote
+        )
     print(
         f"Submitting ShortMD workflow '{resolved_run_id}' with "
         f"{len(input_pdbs)} input PDB(s), {replicates} replicate(s) each",

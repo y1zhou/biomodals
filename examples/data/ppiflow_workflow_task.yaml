@@ -1,0 +1,22 @@
+task:
+  name: ppiflow_5b8c_vhh
+  gentype: nanobody
+  candidate_concurrency: 1
+
+steps:
+  PPIFlowStep: true
+  AbMPNNStep_stage1: true
+  FlowpackerStep_stage1: true
+  AF3scoreStep_stage1: true
+  FilterStep_stage1: true
+  RosettaFixStep: true
+  PartialStep: true
+  AbMPNNStep_stage2: true
+  FlowpackerStep_stage2: true
+  AF3scoreStep_stage2: true
+  FilterStep_stage2: true
+  ReFoldStep: true
+  DockQStep: true
+  RosettaRelaxStep: true
+  RankStep: true
+  ReportStep: true

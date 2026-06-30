@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+import tempfile
 from pathlib import Path
 
 from biomodals.app.design import ligandmpnn_app
@@ -52,6 +53,38 @@ def test_build_ligandmpnn_cli_args_constructs_run_mode_args() -> None:
         "--sc_num_samples": "7",
         "--redesigned_residues": "A1 A2",
     }
+
+
+def test_build_base_command_uses_app_run_layout_for_scratch_paths(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    cli_args: dict[str, str | int | float | bool] = {"--model_type": "protein_mpnn"}
+
+    cmd, workdir = ligandmpnn_app.build_base_command(
+        run_name="mpnn-run",
+        script_mode="run",
+        struct_bytes=b"ATOM\n",
+        cli_args=cli_args,
+        bias_aa_per_residue_bytes=b"{}",
+        omit_aa_per_residue_bytes=b"{}",
+    )
+
+    assert workdir == tmp_path / "mpnn-run"
+    assert (workdir / "inputs" / "mpnn-run.pdb").read_bytes() == b"ATOM\n"
+    assert (workdir / "inputs" / "bias_AA_per_residue.json").read_bytes() == b"{}"
+    assert (workdir / "inputs" / "omit_AA_per_residue.json").read_bytes() == b"{}"
+    assert (workdir / "outputs").is_dir()
+    assert (workdir / "logs").is_dir()
+    assert cmd[1] == str(ligandmpnn_app.CONF.git_clone_dir / "run.py")
+    assert cli_args["--pdb_path"] == str(workdir / "inputs" / "mpnn-run.pdb")
+    assert cli_args["--bias_AA_per_residue"] == str(
+        workdir / "inputs" / "bias_AA_per_residue.json"
+    )
+    assert cli_args["--omit_AA_per_residue"] == str(
+        workdir / "inputs" / "omit_AA_per_residue.json"
+    )
 
 
 def test_ligandmpnn_workflow_result_returns_inline_zstd_archive(

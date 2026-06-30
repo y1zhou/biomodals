@@ -12,6 +12,7 @@ import modal
 import pytest
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
+from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -189,7 +190,7 @@ def test_rfdiffusion_node_calls_app_function_with_hydra_overrides(
                             kind=ArtifactKind.DIRECTORY,
                             storage=VolumePath(
                                 volume_name=rfdiffusion_app.CONF.output_volume_name,
-                                path="demo-rfd001/rfd-scaffolds",
+                                path="demo-rfd001/outputs/rfd-scaffolds",
                             ),
                             metadata={"run_name": "demo-rfd001"},
                         )
@@ -269,7 +270,7 @@ def test_select_rfdiffusion_design_reads_pdb_trb_and_infers_redesigned_residues(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scaffolds_dir = tmp_path / "demo-rfd001" / "rfd-scaffolds"
+    scaffolds_dir = tmp_path / "demo-rfd001" / "outputs" / "rfd-scaffolds"
     scaffolds_dir.mkdir(parents=True)
     pdb_bytes = (
         b"ATOM      1  N   GLY A   1      0.000   0.000   0.000  1.00  0.00           N\n"
@@ -304,7 +305,7 @@ def test_select_rfdiffusion_design_reads_pdb_trb_and_infers_redesigned_residues(
     )
 
     selected = select_rfdiffusion_design.get_raw_f()(
-        rfd_output_storage_path="demo-rfd001/rfd-scaffolds",
+        rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
         rfd_run_name="demo-rfd001",
         design_index=0,
     )
@@ -322,7 +323,7 @@ def test_select_rfdiffusion_design_uses_mask_1d_without_complex_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scaffolds_dir = tmp_path / "demo-rfd001" / "rfd-scaffolds"
+    scaffolds_dir = tmp_path / "demo-rfd001" / "outputs" / "rfd-scaffolds"
     scaffolds_dir.mkdir(parents=True)
     pdb_bytes = (
         b"ATOM      1  N   GLY A   1      0.000   0.000   0.000  1.00  0.00           N\n"
@@ -350,12 +351,50 @@ def test_select_rfdiffusion_design_uses_mask_1d_without_complex_metadata(
     )
 
     selected = select_rfdiffusion_design.get_raw_f()(
-        rfd_output_storage_path="demo-rfd001/rfd-scaffolds",
+        rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
         rfd_run_name="demo-rfd001",
         design_index=0,
     )
 
     assert selected["redesigned_residues"] == "A1 A3"
+
+
+def test_select_rfdiffusion_design_rejects_mask_length_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scaffolds_dir = tmp_path / "demo-rfd001" / "outputs" / "rfd-scaffolds"
+    scaffolds_dir.mkdir(parents=True)
+    scaffolds_dir.joinpath("demo-rfd001_0.pdb").write_bytes(
+        b"ATOM      1  N   GLY A   1      0.000   0.000   0.000  1.00  0.00           N\n"
+        b"ATOM      2  CA  GLY A   2      0.000   0.000   0.000  1.00 42.00           C\n"
+        b"ATOM      3  N   GLY A   3      0.000   0.000   0.000  1.00  0.00           N\n"
+    )
+    scaffolds_dir.joinpath("demo-rfd001_0.trb").write_bytes(
+        pickle.dumps({"mask_1d": [0, 1]})
+    )
+
+    class FakeVolume:
+        def reload(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        rfd_ligandmpnn_workflow,
+        "RFDIFFUSION_OUTPUT_MOUNTPOINT",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        rfd_ligandmpnn_workflow,
+        "RFDIFFUSION_OUTPUT_VOLUME",
+        FakeVolume(),
+    )
+
+    with pytest.raises(ValueError, match="mask_1d length 2 does not match 3"):
+        select_rfdiffusion_design.get_raw_f()(
+            rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
+            rfd_run_name="demo-rfd001",
+            design_index=0,
+        )
 
 
 def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
@@ -422,7 +461,7 @@ def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
         kind=ArtifactKind.DIRECTORY,
         storage=VolumePath(
             volume_name=rfdiffusion_app.CONF.output_volume_name,
-            path="demo-rfd001/rfd-scaffolds",
+            path="demo-rfd001/outputs/rfd-scaffolds",
         ),
         metadata={"run_name": "demo-rfd001"},
     )
@@ -437,7 +476,7 @@ def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert select_calls == {
-        "rfd_output_storage_path": "demo-rfd001/rfd-scaffolds",
+        "rfd_output_storage_path": "demo-rfd001/outputs/rfd-scaffolds",
         "rfd_run_name": "demo-rfd001",
         "design_index": 0,
     }
@@ -505,7 +544,7 @@ def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
         kind=ArtifactKind.DIRECTORY,
         storage=VolumePath(
             volume_name=rfdiffusion_app.CONF.output_volume_name,
-            path="demo-rfd001/rfd-scaffolds",
+            path="demo-rfd001/outputs/rfd-scaffolds",
         ),
         metadata={"run_name": "demo-rfd001"},
     )
@@ -526,7 +565,7 @@ def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
         "redesigned_residues": "A1 A2",
     }
     assert select_calls == {
-        "rfd_output_storage_path": "demo-rfd001/rfd-scaffolds",
+        "rfd_output_storage_path": "demo-rfd001/outputs/rfd-scaffolds",
         "rfd_run_name": "demo-rfd001",
         "design_index": 0,
     }
@@ -664,9 +703,56 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert calls["spawn"]["run_id"] == "demo"
     assert calls["spawn"]["force"] is False
     assert calls["spawn"]["max_ready_workers"] == 3
-    stdout = capsys.readouterr().out
+    stdout = strip_ansi(capsys.readouterr().out)
     assert "Submitting RFDLigandMPNNWorkflow 'demo'" in stdout
     assert "1 RFdiffusion trajector" in stdout
+
+
+def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    calls: dict[str, object] = {}
+
+    class FakeOrchestratorMethod:
+        def remote(self, **kwargs: object) -> AppRunResult:
+            calls["remote"] = kwargs
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def spawn(self, **kwargs: object) -> str:
+            calls["spawn"] = kwargs
+            return "call-1"
+
+    class FakeWorkflowOrchestrator:
+        def __init__(self) -> None:
+            self.run = FakeOrchestratorMethod()
+
+    monkeypatch.setattr(
+        rfd_ligandmpnn_workflow.orchestrator,
+        "WorkflowOrchestrator",
+        FakeWorkflowOrchestrator,
+    )
+
+    raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdb=str(input_pdb),
+        contigs="100-150/0 E333-526",
+        hotspot_res="E405,E408",
+        run_id="demo",
+        num_rfdiffusion_trajectories=1,
+        num_rfdiffusion_designs=1,
+        wait=False,
+        strict_artifact_checks=True,
+    )
+
+    spawn_kwargs = calls["spawn"]
+    assert spawn_kwargs["strict_external_artifact_checks"] is True
+    checker = spawn_kwargs["external_artifact_checker"]
+    assert callable(checker)
+    assert "check_rfd_ligandmpnn_external_artifact" in repr(checker)
 
 
 def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(

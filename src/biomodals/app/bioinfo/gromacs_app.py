@@ -18,9 +18,10 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
-from biomodals.helper.volume_run import volume_path_from_mount_path
+from biomodals.schema import ArtifactFile
 
 ##########################################
 # Modal configs
@@ -54,6 +55,29 @@ class AppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
+
+
+def prepared_workflow_files(run_name: str) -> list[ArtifactFile]:
+    """Return expected workflow files from a GROMACS preparation run."""
+    return [
+        ArtifactFile(path=f"{run_name}.pdb", role="input_structure"),
+        ArtifactFile(path=f"production_{run_name}.tpr", role="production_topology"),
+        ArtifactFile(path="production.mdp", role="production_parameters"),
+    ]
+
+
+def production_workflow_files(run_name: str) -> list[ArtifactFile]:
+    """Return expected workflow files from a GROMACS production run."""
+    prefix = f"production_{run_name}"
+    return [
+        ArtifactFile(path=f"{prefix}.xtc", role="trajectory"),
+        ArtifactFile(path=f"{prefix}.tpr", role="production_topology"),
+        ArtifactFile(path=f"{prefix}_nopbc_centered.pdb", role="centered_structure"),
+        ArtifactFile(path=f"rmsd_{prefix}.csv", role="rmsd"),
+        ArtifactFile(path=f"rg_{prefix}.csv", role="radius_of_gyration"),
+        ArtifactFile(path=f"rmsf_{prefix}.csv", role="rmsf"),
+    ]
+
 
 runtime_image = (
     modal.Image
@@ -225,7 +249,8 @@ def prepare_tpr_gpu(
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
-    work_path = Path(CONF.output_volume_mountpoint) / run_name
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
 
     # Skip prep if production tpr already exists
@@ -239,7 +264,10 @@ def prepare_tpr_gpu(
         print("✅ Preparation already completed, skipping.")
         return str(work_path)
 
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
     input_pdb_path = work_path / f"{run_name}.pdb"
+    staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
     CONF.output_volume.commit()
 
@@ -296,7 +324,8 @@ def prepare_tpr_cpu(
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
-    work_path = Path(CONF.output_volume_mountpoint) / run_name
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
 
     # Skip prep if production tpr already exists
@@ -310,7 +339,10 @@ def prepare_tpr_cpu(
         print("✅ Preparation already completed, skipping.")
         return str(work_path)
 
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
     input_pdb_path = work_path / f"{run_name}.pdb"
+    staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
     CONF.output_volume.commit()
 
@@ -375,7 +407,7 @@ def find_traj_last_time_ns(traj_file: str) -> float:
         raise RuntimeError("Gromacs executable not found")
 
     cmd = [gmx, "check", "-f", str(traj_path)]
-    result = run_command(cmd, cwd=traj_path.parent, verbose=False)
+    result = run_command(cmd, cwd=traj_path.parent, output_mode="capture")
 
     for line in result:
         # Last frame      20000 time 200000.000
@@ -416,7 +448,9 @@ def production_run_gpu(
     """Production Gromacs run."""
     import shutil
 
-    work_path = Path(CONF.output_volume_mountpoint) / run_name
+    work_path = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_name
+    ).run_root
     deffnm = f"production_{run_name}"
     tpr_file_path = work_path / f"{deffnm}.tpr"
     if not tpr_file_path.exists():
@@ -485,7 +519,9 @@ def production_run_cpu(
     """Production Gromacs run."""
     import shutil
 
-    work_path = Path(CONF.output_volume_mountpoint) / run_name
+    work_path = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_name
+    ).run_root
     deffnm = f"production_{run_name}"
     tpr_file_path = work_path / f"{deffnm}.tpr"
     if not tpr_file_path.exists():
@@ -574,7 +610,7 @@ def postprocess_traj(
         cmd,
         cwd=str(Path(processed_traj_file).parent),
         env={"OMP_NUM_THREADS": None},
-        verbose=False,
+        output_mode="capture",
     )
     CONF.output_volume.commit()
 
@@ -603,7 +639,9 @@ def collect_traj_stats(
     import matplotlib.pyplot as plt  # type: ignore[ty:unresolved-import]
     import numpy as np
 
-    work_path = Path(CONF.output_volume_mountpoint) / run_name
+    work_path = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_name
+    ).run_root
     traj_path = work_path / f"{traj_prefix}{run_name}.xtc"
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")

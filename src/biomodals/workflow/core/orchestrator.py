@@ -15,6 +15,7 @@ from biomodals.helper.constant import (
     WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
 )
 from biomodals.schema import AppRunResult
+from biomodals.workflow.core.artifact_availability import ExternalArtifactChecker
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.runtime import WorkflowRuntime
 
@@ -61,6 +62,8 @@ class WorkflowOrchestrator:
         run_id: str,
         force: bool = False,
         max_ready_workers: int = 32,
+        strict_external_artifact_checks: bool = False,
+        external_artifact_checker: ExternalArtifactChecker | None = None,
     ) -> AppRunResult:
         """Run one workflow definition through the workflow runtime."""
         if not isinstance(workflow, Workflow):
@@ -74,6 +77,8 @@ class WorkflowOrchestrator:
             workflow_volume=OUT_VOLUME,
             function_call_resolver=modal.FunctionCall.from_id,
             max_ready_workers=max_ready_workers,
+            strict_external_artifact_checks=strict_external_artifact_checks,
+            external_artifact_checker=external_artifact_checker,
         )
         try:
             return self._runtime.run(run_id=run_id, force=force)

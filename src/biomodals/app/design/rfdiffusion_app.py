@@ -25,21 +25,25 @@ from modal import App, Image
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.app_run import (
+    AppRunLayout,
+    volume_app_output,
+    volume_path_from_mount_path,
+)
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import (
     find_with_fd,
     package_outputs,
-    run_command_with_log,
+    run_command,
     sanitize_filename,
     softlink_dir,
     warmup_directory,
 )
-from biomodals.helper.volume_run import volume_path_from_mount_path
 from biomodals.helper.web import download_files
 from biomodals.schema import (
-    AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     VolumePath,
 )
@@ -143,74 +147,91 @@ def download_rfdiffusion_models(force: bool = False) -> None:
 
 def _rfdiffusion_infer(
     input_pdb_bytes: bytes, input_pdb_name: str, run_name: str, hydra_overrides: str
-) -> str:
-    """Run RFdiffusion inference and return the cached output directory."""
+) -> dict[str, str]:
+    """Run RFdiffusion inference and return layout paths for workflow outputs."""
     import shutil
-    from tempfile import TemporaryDirectory
 
-    # ---- cached output dir (persistent volume) ----
-    cached_run_dir = Path(CONF.output_volume_mountpoint) / run_name
-    cached_run_dir.mkdir(parents=True, exist_ok=True)
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    rfd_out_dir = layout.outputs_dir / "rfd-scaffolds"
+    log_path = layout.logs_dir / f"{run_name}-{CONF.name}.log"
+    success_marker = layout.markers_dir / "SUCCESS"
+    run_paths = {
+        "run_dir": str(layout.run_root),
+        "outputs_dir": str(rfd_out_dir),
+        "log_path": str(log_path),
+    }
 
     # ---- compute hash based on all inputs ----
     input_hash = hash_string(
         ":".join((input_pdb_bytes.decode("utf-8"), hydra_overrides))
     )
-    success_marker = cached_run_dir / "SUCCESS"
     if success_marker.exists():
         marker_hash = success_marker.read_text().strip()
-        if marker_hash == input_hash:
+        if marker_hash == input_hash and rfd_out_dir.exists():
             print(f"💊 Found RFdiffusion cached output: hash={marker_hash}")
-            return str(cached_run_dir)
+            return run_paths
 
-    # optional: keep actual RFdiffusion outputs in a subdir
-    rfd_out_dir = cached_run_dir / "rfd-scaffolds"
-    rfd_out_dir.mkdir(exist_ok=True)
+    for path in (layout.inputs_dir, rfd_out_dir, layout.logs_dir, layout.markers_dir):
+        path.mkdir(parents=True, exist_ok=True)
     out_prefix = rfd_out_dir / run_name
 
-    with TemporaryDirectory() as tmpdir:
-        # ---- input pdb (tmp is fine) ----
-        input_pdb = Path(tmpdir) / input_pdb_name
-        input_pdb.write_bytes(input_pdb_bytes)
+    input_pdb = layout.inputs_dir / Path(input_pdb_name).name
+    input_pdb.write_bytes(input_pdb_bytes)
 
-        # hydra overrides are passed as a single string, split safely.
-        cmd = [
-            sys.executable,
-            f"{CONF.git_clone_dir}/scripts/run_inference.py",
-            f"inference.input_pdb={input_pdb}",
-            f"inference.output_prefix={out_prefix}",
-            *shlex.split(hydra_overrides),
-        ]
+    # hydra overrides are passed as a single string, split safely.
+    cmd = [
+        sys.executable,
+        f"{CONF.git_clone_dir}/scripts/run_inference.py",
+        f"inference.input_pdb={input_pdb}",
+        f"inference.output_prefix={out_prefix}",
+        *shlex.split(hydra_overrides),
+    ]
 
-        # Symlink to model and IGSO3 cache directories
-        for subdir in ("models", "schedules"):
-            softlink_dir(
-                Path(CONF.model_volume_mountpoint) / subdir, CONF.git_clone_dir / subdir
-            )
+    # Symlink to model and IGSO3 cache directories.
+    for subdir in ("models", "schedules"):
+        softlink_dir(
+            Path(CONF.model_volume_mountpoint) / subdir, CONF.git_clone_dir / subdir
+        )
 
-        # ---- run inference (writes directly into cache volume) ----
-        try:
-            run_command_with_log(
-                cmd,
-                log_file=cached_run_dir / f"{run_name}-{CONF.name}.log",
-                verbose=True,
-                cwd=CONF.git_clone_dir,
-            )
-            CONF.output_volume.commit()
+    try:
+        run_command(
+            cmd,
+            output_mode="tee",
+            log_file=log_path,
+            cwd=CONF.git_clone_dir,
+        )
+        CONF.output_volume.commit()
 
-            # If trajectories are generated, compress them to save space
-            traj_dir = rfd_out_dir / "traj"
-            traj_tarball = rfd_out_dir / f"{run_name}_traj.tar.zst"
-            if not traj_tarball.exists() and traj_dir.exists():
-                traj_tarball.write_bytes(package_outputs(traj_dir))
-            if traj_tarball.exists() and traj_dir.exists():
-                shutil.rmtree(traj_dir)
+        # If trajectories are generated, compress them to save space.
+        traj_dir = rfd_out_dir / "traj"
+        traj_tarball = rfd_out_dir / f"{run_name}_traj.tar.zst"
+        if not traj_tarball.exists() and traj_dir.exists():
+            traj_tarball.write_bytes(package_outputs(traj_dir))
+        if traj_tarball.exists() and traj_dir.exists():
+            shutil.rmtree(traj_dir)
 
-            success_marker.write_text(input_hash)
-        finally:
-            CONF.output_volume.commit()
+        success_marker.write_text(input_hash)
+    finally:
+        CONF.output_volume.commit()
 
-    return str(cached_run_dir)
+    return run_paths
+
+
+def _expected_rfdiffusion_output_files(
+    *, run_name: str, hydra_overrides: str
+) -> list[ArtifactFile]:
+    num_designs = 1
+    for token in shlex.split(hydra_overrides):
+        key, separator, value = token.partition("=")
+        if key == "inference.num_designs" and separator:
+            num_designs = int(value)
+    files: list[ArtifactFile] = []
+    for design_index in range(num_designs):
+        files.extend([
+            ArtifactFile(path=f"{run_name}_{design_index}.pdb", role="structure"),
+            ArtifactFile(path=f"{run_name}_{design_index}.trb", role="metadata"),
+        ])
+    return files
 
 
 @app.function(
@@ -225,7 +246,7 @@ def rfdiffusion_infer(
 ) -> AppRunResult:
     """Run RFdiffusion and return a workflow-compatible output directory."""
     safe_run_name = sanitize_filename(run_name)
-    run_dir = _rfdiffusion_infer(
+    run_paths = _rfdiffusion_infer(
         input_pdb_bytes=input_pdb_bytes,
         input_pdb_name=input_pdb_name,
         run_name=safe_run_name,
@@ -234,26 +255,26 @@ def rfdiffusion_infer(
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
-            AppOutput(
+            volume_app_output(
                 name=f"{CONF.name}_outputs",
                 kind=ArtifactKind.DIRECTORY,
-                storage=volume_path_from_mount_path(
-                    remote_path=f"{run_dir}/rfd-scaffolds",
-                    mount_root=CONF.output_volume_mountpoint,
-                    volume_name=CONF.output_volume_name,
-                ),
+                remote_path=run_paths["outputs_dir"],
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
                 metadata={"run_name": safe_run_name},
+                files=_expected_rfdiffusion_output_files(
+                    run_name=safe_run_name,
+                    hydra_overrides=hydra_overrides,
+                ),
             )
         ],
         logs=[
-            AppOutput(
+            volume_app_output(
                 name=f"{CONF.name}_log",
                 kind=ArtifactKind.LOGS,
-                storage=volume_path_from_mount_path(
-                    remote_path=f"{run_dir}/{safe_run_name}-{CONF.name}.log",
-                    mount_root=CONF.output_volume_mountpoint,
-                    volume_name=CONF.output_volume_name,
-                ),
+                remote_path=run_paths["log_path"],
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
             )
         ],
     )
@@ -262,7 +283,9 @@ def rfdiffusion_infer(
 @app.function(timeout=CONF.timeout, volumes=CONF.mounts(output_volume=True))
 def bundle_rfdiffusion_outputs(run_name: str) -> bytes:
     """Bundle an RFdiffusion output directory from the app output volume."""
-    run_dir = Path(CONF.output_volume_mountpoint) / run_name
+    run_dir = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_name
+    ).run_root
     remote_run_dir = volume_path_from_mount_path(
         str(run_dir), CONF.output_volume_mountpoint, CONF.output_volume_name
     )

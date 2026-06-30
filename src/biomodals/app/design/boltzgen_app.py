@@ -9,7 +9,6 @@
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 import os
-import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -18,15 +17,15 @@ import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.shell import (
+    copy_files,
     package_outputs,
     run_command,
-    run_command_with_log,
     sanitize_filename,
     warmup_directory,
 )
-from biomodals.helper.volume_run import volume_path_from_mount_path
 
 ##########################################
 # Modal configs
@@ -35,7 +34,7 @@ CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
     name="BoltzGen",
     repo_url="https://github.com/y1zhou/boltzgen",
-    repo_commit_hash="b54ed4330a4dd3fbd6abe4bbcfe426284600f992",
+    repo_commit_hash="7327d07d14a8a70ec20f967afbb6e3d842b9c11f",
     package_name="boltzgen",
     version="0.3.2",
     python_version="3.12",
@@ -215,12 +214,12 @@ def prepare_boltzgen_run(
     yaml_content: bytes, run_name: str, additional_files: dict[str, bytes]
 ) -> None:
     """Prepare BoltzGen input and output directories."""
-    workdir = Path(CONF.output_volume_mountpoint) / run_name
-    for d in ("inputs", "outputs"):
-        (workdir / d).mkdir(parents=True, exist_ok=True)
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    for path in (layout.inputs_dir, layout.outputs_dir):
+        path.mkdir(parents=True, exist_ok=True)
 
     # Write yaml to file
-    conf_path = workdir / "inputs" / "config"
+    conf_path = layout.inputs_dir / "config"
     conf_path.mkdir(parents=True, exist_ok=True)
     (conf_path / f"{run_name}.yaml").write_bytes(yaml_content)
 
@@ -247,7 +246,9 @@ def get_run_ids(
     from uuid import uuid4
 
     CONF.output_volume.reload()
-    outdir = Path(CONF.output_volume_mountpoint) / run_name / "outputs"
+    outdir = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_name
+    ).outputs_dir
 
     if not salvage_mode:
         today: str = datetime.now(UTC).strftime("%Y%m%d")
@@ -257,7 +258,9 @@ def get_run_ids(
         raise RuntimeError(
             f"💊 No existing run directories found for run name '{run_name}'."
         )
-    all_run_dirs = [d for d in outdir.iterdir() if d.is_dir()]
+    all_run_dirs = sorted(
+        (d for d in outdir.iterdir() if d.is_dir()), key=lambda d: d.name
+    )
     if not all_run_dirs:
         raise RuntimeError(
             f"💊 No existing run directories found for run name '{run_name}'."
@@ -295,8 +298,9 @@ def collect_boltzgen_data(
     """Collect BoltzGen output data from multiple runs."""
     out_vol = CONF.output_volume
     out_vol.reload()
-    outdir = Path(CONF.output_volume_mountpoint) / run_name / "outputs"
-    config_dir = outdir.parent / "inputs" / "config"
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    outdir = layout.outputs_dir
+    config_dir = layout.inputs_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
 
     all_run_dirs = [outdir / x for x in run_ids]
@@ -340,7 +344,7 @@ def collect_boltzgen_data(
 
         print("💊 Packaging filtered BoltzGen outputs...")
         tarball_bytes = package_outputs_helper.remote(
-            outdir.parent / "pass-filter-designs",
+            layout.run_root / "pass-filter-designs",
             [
                 "all-designs.parquet",
                 "top-designs.parquet",
@@ -448,7 +452,7 @@ class BoltzGenRunner:
         )
         print(f"💊 Running BoltzGen, saving logs to {log_vol_path}")
         try:
-            run_command_with_log(cmd, log_file=log_path, cwd=out_path)
+            run_command(cmd, output_mode="capture", log_file=log_path, cwd=out_path)
         finally:
             CONF.output_volume.commit()
         return str(out_dir)
@@ -475,8 +479,9 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
     import polars as pl
     from tqdm import tqdm
 
-    workdir = Path(CONF.output_volume_mountpoint) / run_name / "outputs"
-    out_dir = Path(CONF.output_volume_mountpoint) / run_name / "combined-outputs"
+    layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    workdir = layout.outputs_dir
+    out_dir = layout.run_root / "combined-outputs"
     (out_dir / "refold_cif").mkdir(parents=True, exist_ok=True)
     CONF.output_volume.reload()
 
@@ -512,15 +517,16 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
 
         for f in tqdm(cif_files, desc=f"Copying CIFs from {run_id}"):
             dest = out_dir / f"{run_id}_{f.name}"
-            if not dest.exists():
+            if not dest.exists(follow_symlinks=False):
                 # Make soft link instead of copy to save space
-                dest.symlink_to(f)
+                dest.symlink_to(f.relative_to(out_dir, walk_up=True))
                 # shutil.copyfile(f, dest)
 
+        refold_cif_out_dir = out_dir / "refold_cif"
         for f in tqdm(refold_cif_files, desc=f"Copying refolded CIFs from {run_id}"):
-            dest = out_dir / "refold_cif" / f"{run_id}_{f.name}"
-            if not dest.exists():
-                dest.symlink_to(f)
+            dest = refold_cif_out_dir / f"{run_id}_{f.name}"
+            if not dest.exists(follow_symlinks=False):
+                dest.symlink_to(f.relative_to(refold_cif_out_dir, walk_up=True))
                 # shutil.copyfile(f, dest)
 
     metrics_df = pl.concat(metrics_dfs, how="diagonal")
@@ -546,20 +552,21 @@ def combine_multiple_runs(run_name: str, run_ids: list[str]):
 def refilter_designs(
     run_name: str,
     budget: int = 100,
-    rmsd_threshold: float = 4.0,
+    rmsd_threshold: float = 2.5,
     modality: str = "antibody",  # or "peptide"
 ):
     """Refilter combined BoltzGen designs using boltzgen.task.filter.Filter."""
     import polars as pl
     from boltzgen.task.filter.filter import Filter  # type: ignore[ty:unresolved-import]
 
-    workdir = Path(CONF.output_volume_mountpoint) / run_name
-    warmup_directory(workdir / "combined-outputs")
+    workdir = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / run_name
+    ).run_root
+    # warmup_directory(workdir / "outputs", file_pattern=r"\.cif$")
 
-    filter_task = Filter(
+    filter_kwargs = dict(
         design_dir=workdir / "combined-outputs",
         outdir=workdir / "refiltered",
-        budget=budget,  # How many designs to subselect from all designs
         filter_cysteine=True,  # remove designs with cysteines
         use_affinity=False,  # When designing binders to small molecules this should be true
         filter_bindingsite=True,  # This filters out everything that does not have a residue within 4A of a binding site residue
@@ -576,29 +583,30 @@ def refilter_designs(
             "delta_sasa_refolded": 4,
             "neg_design_hydrophobicity": 7,
         },
-        # size_buckets=[
-        #     {"num_designs": 10, "min": 50, "max": 100}, # maximum number of designs that are allowed in the final selected diverse set
-        #     {"num_designs": 10, "min": 100, "max": 150},
-        #     {"num_designs": 10, "min": 150, "max": 200},
-        # ],
         # additional_filters=[
         #     {"feature": "design_ptm", "lower_is_better": False, "threshold": 0.7},
         #     {"feature": "sheet", "lower_is_better": True, "threshold": 0.8},
         # ],
     )
+
+    # If budget <= 0, collect all designs that pass filters and skip sub-selection
+    all_design_metrics_file = (
+        workdir / "refiltered" / "final_ranked_designs" / "all_designs_metrics.csv"
+    )
+    if keep_all_pass_filter := (budget <= 0):
+        print("💊 Budget<=0; will collect all designs that pass filters.")
+        budget = 1
+
+    filter_task = Filter(**filter_kwargs, budget=budget)
     filter_task.run(jupyter_nb=False)
 
     # All designs
     # filter_task.outdir
-    refiltered_df = pl.read_csv(
-        workdir / "refiltered" / "final_ranked_designs" / "all_designs_metrics.csv"
-    )
+    refiltered_df = pl.read_csv(all_design_metrics_file)
 
     # Final designs
     final_df = pl.read_csv(
-        workdir
-        / "refiltered"
-        / "final_ranked_designs"
+        all_design_metrics_file.parent
         / f"final_designs_metrics_{filter_task.budget}.csv"
     )
 
@@ -608,19 +616,31 @@ def refilter_designs(
 
     refiltered_df.write_parquet(out_dir / "all-designs.parquet")
     final_df.write_parquet(out_dir / "top-designs.parquet")
-    for r in final_df.filter("pass_filters").iter_rows(named=True):
-        r_id = r["id"]
-        r_cif_path = workdir / "combined-outputs" / f"{r_id}.cif"
-        refold_cif_path = workdir / "combined-outputs" / "refold_cif" / f"{r_id}.cif"
+
+    copy_cif_ids = (
+        refiltered_df.filter("pass_filters").get_column("id")
+        if keep_all_pass_filter
+        else final_df.filter("pass_filters").get_column("id")
+    )
+    boltzgen_cif_dir = workdir / "combined-outputs"
+    boltzgen_refold_cif_dir = boltzgen_cif_dir / "refold_cif"
+    src_dest_mapping: dict[str | Path, str | Path] = {}
+    for r_id in copy_cif_ids:
+        r_cif_path = boltzgen_cif_dir / f"{r_id}.cif"
+        refold_cif_path = boltzgen_refold_cif_dir / f"{r_id}.cif"
 
         r_save_cif_path = out_dir / "boltzgen-cif" / f"{r_id}.cif"
         r_save_refold_cif_path = out_dir / "refold-cif" / f"{r_id}.cif"
-        if not r_save_cif_path.exists():
-            shutil.copyfile(r_cif_path, r_save_cif_path, follow_symlinks=True)
-        if not r_save_refold_cif_path.exists():
-            shutil.copyfile(
-                refold_cif_path, r_save_refold_cif_path, follow_symlinks=True
-            )
+        src_dest_mapping[r_cif_path] = r_save_cif_path
+        src_dest_mapping[refold_cif_path] = r_save_refold_cif_path
+
+        # if not r_save_cif_path.exists():
+        #     shutil.copyfile(r_cif_path, r_save_cif_path, follow_symlinks=True)
+        # if not r_save_refold_cif_path.exists():
+        #     shutil.copyfile(
+        #         refold_cif_path, r_save_refold_cif_path, follow_symlinks=True
+        #     )
+    copy_files(src_dest_mapping, cp_args="-anL")
 
 
 ##########################################
@@ -643,7 +663,7 @@ def submit_boltzgen_task(
     focus_run_ids: str | None = None,
     ignore_run_ids: str | None = None,
     filter_results: bool = False,
-    filter_rmsd_threshold: float = 4.0,
+    filter_rmsd_threshold: float = 2.5,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
 
@@ -666,6 +686,7 @@ def submit_boltzgen_task(
         budget: Number of designs to keep after filtering. It is recommended
             to set this to a reasonably large number (e.g. 100) to get the best
             results, and do further filtering locally after combining multiple runs.
+            If set to <=0, all designs that pass BoltzGen filters will be collected.
         steps: Specific pipeline steps to run (e.g. "design inverse_folding").
         extra_args: Additional CLI arguments as a string. See
             <https://github.com/HannesStark/boltzgen#all-command-line-arguments>.

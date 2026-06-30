@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from biomodals.app.design import rfdiffusion_app
+from biomodals.helper.app_run import AppRunLayout
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -42,8 +43,14 @@ def test_rfdiffusion_workflow_result_references_cached_output_directory(
 
     def fake_run_rfdiffusion_infer(**kwargs):
         seen_kwargs.update(kwargs)
-        run_dir.mkdir()
-        return str(run_dir)
+        layout = AppRunLayout.from_run_root(run_dir)
+        layout.outputs_dir.mkdir(parents=True)
+        layout.logs_dir.mkdir(parents=True)
+        return {
+            "run_dir": str(layout.run_root),
+            "outputs_dir": str(layout.outputs_dir / "rfd-scaffolds"),
+            "log_path": str(layout.logs_dir / "rfd-run-RFdiffusion.log"),
+        }
 
     monkeypatch.setattr(
         rfdiffusion_app,
@@ -79,15 +86,23 @@ def test_rfdiffusion_workflow_result_references_cached_output_directory(
     assert output.kind == ArtifactKind.DIRECTORY
     assert output.storage == VolumePath(
         volume_name=rfdiffusion_app.CONF.output_volume_name,
-        path="rfd-run/rfd-scaffolds",
+        path="rfd-run/outputs/rfd-scaffolds",
     )
-    assert output.metadata == {"run_name": "rfd-run"}
+    assert output.metadata == {
+        "run_name": "rfd-run",
+        "files": [
+            {"path": "rfd-run_0.pdb", "role": "structure"},
+            {"path": "rfd-run_0.trb", "role": "metadata"},
+            {"path": "rfd-run_1.pdb", "role": "structure"},
+            {"path": "rfd-run_1.trb", "role": "metadata"},
+        ],
+    }
     log = result.logs[0]
     assert log.name == "RFdiffusion_log"
     assert log.kind == ArtifactKind.LOGS
     assert log.storage == VolumePath(
         volume_name=rfdiffusion_app.CONF.output_volume_name,
-        path="rfd-run/rfd-run-RFdiffusion.log",
+        path="rfd-run/logs/rfd-run-RFdiffusion.log",
     )
 
 
@@ -110,7 +125,7 @@ def test_rfdiffusion_local_entrypoint_writes_tarball_from_workflow_result(
                         kind=ArtifactKind.DIRECTORY,
                         storage=VolumePath(
                             volume_name=rfdiffusion_app.CONF.output_volume_name,
-                            path="rfd-run/rfd-scaffolds",
+                            path="rfd-run/outputs/rfd-scaffolds",
                         ),
                         metadata={"run_name": "rfd-run"},
                     )

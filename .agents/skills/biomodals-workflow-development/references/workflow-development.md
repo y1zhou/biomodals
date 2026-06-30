@@ -8,9 +8,32 @@ Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
 workflow example. Use
 `src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for
 workflows that select files from one app's volume-backed output and fan those
-files out into another app's workflow-compatible function. Ignore
-`src/biomodals/workflow/ppiflow_workflow.py` as a reference pattern for now; it
-is expected to be refactored.
+files out into another app's workflow-compatible function. Do not use
+`src/biomodals/workflow/ppiflow_workflow.py` as a generic starter template, but
+use it as the reference for candidate-manifest joins, retained-candidate
+filtering, candidate-wide remote stage coordinators, and PPIFlow-specific stage
+wiring.
+
+## Contents
+
+- [Vocabulary](#vocabulary)
+- [ShortMD Reference Pattern](#shortmd-reference-pattern)
+- [RFD LigandMPNN Reference Pattern](#rfd-ligandmpnn-reference-pattern)
+- [Schema Boundaries](#schema-boundaries)
+- [Node Execution Policy](#node-execution-policy)
+- [Artifact Availability And Recovery](#artifact-availability-and-recovery)
+- [Node Placement](#node-placement)
+- [Ledger Layout](#ledger-layout)
+- [Modal Preemption](#modal-preemption)
+- [Fan-Out](#fan-out)
+- [Orchestrator Submission](#orchestrator-submission)
+- [Runtime Diagnostics](#runtime-diagnostics)
+- [CLI Namespace](#cli-namespace)
+- [Workflow App Composition](#workflow-app-composition)
+- [App Interfaces](#app-interfaces)
+- [Volumes And Artifacts](#volumes-and-artifacts)
+- [DAG Construction](#dag-construction)
+- [Testing](#testing)
 
 ## Vocabulary
 
@@ -112,14 +135,26 @@ workflow run volume when the source volume is mounted locally. Reference mode is
 the default because many app outputs are already durable in their owning app
 volume. Copy mode is for workflows that need a self-contained run directory.
 
+When staging selected files from upstream workflow artifacts into app input
+directories, never reuse the full pipeline/provenance-derived selected name as
+the filesystem basename. Those names can accumulate node ids, artifact ids,
+archive paths, and run names and exceed per-component filename limits. Use a
+short deterministic basename from a candidate id, sanitized stem, or content
+hash, and keep provenance in manifests or metadata instead.
+
 The first workflow runtime is Python-first. Pass a `Workflow` object across the
 orchestrator boundary; serialized workflow dictionaries are intentionally
 deferred until the node and app-function contracts stabilize.
 
 ## Node Execution Policy
 
-Every workflow node checks durable SQLite run state before execution and skips work
-when completed artifact manifests already exist.
+Workflow run completion is terminal-node driven. If all terminal DAG nodes have
+durable completion and no missing recorded outputs, the run succeeds without
+rechecking or scheduling intermediate nodes. If only some terminal nodes are
+incomplete, schedule only those terminals and their ancestor closure.
+
+Within the scheduled closure, nodes check durable SQLite run state before
+execution and skip work when completed artifact manifests already exist.
 
 Incomplete nodes use one of two policies:
 
@@ -137,6 +172,27 @@ and does not unblock downstream nodes.
 Forced workflow runs replace the existing run directory before creating a fresh
 ledger. Use force only when discarding previous artifacts, node caches, and
 attempt records is intentional.
+
+## Artifact Availability And Recovery
+
+The runtime verifies workflow-volume artifact availability before reusing a
+previously completed node. If a recorded workflow-volume artifact manifest or
+expected file is missing, the producing node is treated as incomplete and normal
+node recovery decides whether to rerun or resume it.
+
+App-owned volume artifacts are skipped by default because the reusable runtime
+does not own those `modal.Volume` handles. Workflows that need strict recovery
+for app-owned outputs may enable the orchestrator/runtime
+`strict_external_artifact_checks` option and pass one checker that can inspect
+the required mounted app volumes. Keep those checks run-level and derived from
+recorded `WorkflowArtifact` locations; do not add per-node user settings or
+tool-specific logic to workflow core.
+
+The helpers in `workflow.core.artifact_availability` are pure Python so workflow
+modules can call them from a lightweight Modal function that mounts the
+app-owned volumes needed for the run. Use the typed availability contract to
+distinguish `available`, `missing`, and `unknown` app-owned volume state; only
+missing artifacts should drive rerun or resume decisions.
 
 ## Node Placement
 
@@ -250,15 +306,16 @@ Remote workflow code should:
 
 ## Fan-Out
 
-The first workflow runtime supports static DAG fan-out. Build one node per known
-unit of work during DAG construction, as ShortMD does for per-PDB preparation
-and per-replicate production runs.
+Use static DAG fan-out when the input cardinality is known during DAG
+construction, as ShortMD does for per-PDB preparation and per-replicate
+production runs. Use fixed DAG nodes with runtime task fan-out when a semantic
+stage owns a candidate set, as PPIFlow does for candidate-wide stage
+coordinators.
 
 Use barriered fan-out first: a node starts only after all declared upstream
-dependencies are complete. Streaming between nodes is deferred.
-
-Independent ready nodes may run in parallel when all dependencies for each node
-are satisfied.
+dependencies are complete. Streaming between nodes is deferred. Independent
+ready nodes may run in parallel when all dependencies for each node are
+satisfied.
 
 ## Orchestrator Submission
 
@@ -278,6 +335,14 @@ All remote orchestration functions should live as methods on
 must not perform deployed app lookups, import workflow app functions by name, or
 handle hydration details for workflow-specific apps. Domain-specific input
 staging and DAG construction belong in top-level workflow scripts.
+
+## Runtime Diagnostics
+
+`WorkflowRuntime.diagnostics` stores in-memory diagnostics for the most recent
+run, including stable scheduler decision snapshots and scheduled node waves.
+Use it in tests or debugging when you need to inspect why the runtime scheduled,
+blocked, or completed nodes. Do not expose private scheduler, ledger, or
+volume-sync collaborators as routine workflow authoring APIs.
 
 Keep the public orchestrator method surface minimal. The intended remote method
 for user-facing submission is `WorkflowOrchestrator.run(...)`. The orchestrator
@@ -318,7 +383,7 @@ the included `WorkflowOrchestrator`. Its user-facing flags should mirror
 `biomodals app run`, including Modal mode, detach, timeout, and pass-through
 workflow flags after `--`.
 The run command also exposes `--dry-run`, which forwards `--dry-run` to the
-selected workflow local entrypoint. User-facing workflow entrypoints should
+selected workflow local entrypoint. User-facing workflow local entrypoints should
 accept `dry_run: bool = False`; when set, they should build and validate the DAG,
 call `print_workflow_dag(workflow.validate())`, and return before constructing
 or submitting the orchestrator. DAG graph output should stay compact and print
@@ -444,7 +509,7 @@ source app module rather than hardcoding them in the workflow.
 
 When an app function returns an absolute path under its mounted volume, convert
 that path to workflow storage with
-`biomodals.helper.volume_run.volume_path_from_mount_path(...)`. The helper takes
+`biomodals.helper.app_run.volume_path_from_mount_path(...)`. The helper takes
 `str` inputs and returns a single validated `VolumePath`; do not construct a
 `VolumePath` only to extract `.path` and wrap it again.
 
@@ -452,6 +517,10 @@ Workflow-native remote functions that mutate mounted volumes must call
 `reload()` before reading data written by other containers and `commit()` after
 writing, copying, or deleting files. Validate artifact storage paths with
 `VolumePath` before joining them to mounted paths.
+
+When a caller waits for a remote function that created, copied, or deleted files
+in a mounted volume, reload that same volume before reading, selecting,
+materializing, or validating those paths in the caller.
 
 ## DAG Construction
 

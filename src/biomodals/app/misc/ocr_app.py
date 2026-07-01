@@ -5,13 +5,34 @@ MinerU-Popo source repo: <https://github.com/opendatalab/MinerU-Popo>.
 
 ## Outputs
 
-MinerU runs on an input PDF and returns a `.tar.zst` archive containing the
-`<pdf-stem>/` directory produced by MinerU, including `mineru.log`.
+The local entrypoint writes all outputs under `<pdf-stem>/`. MinerU outputs live
+at the top level, logs live under `logs/`, and optional MinerU-Popo outputs live
+under `popo-results/`.
 
-When `--run-popo` is set, MinerU-Popo post-processes the MinerU result and
-returns a second `.tar.zst` archive whose top-level directory is
-`popo-results/`. This prevents Popo outputs from overwriting the MinerU
-directory after local extraction.
+Example layout for input `demo.pdf` with `--run-popo`:
+
+```text
+demo/
+  hybrid_auto/
+  logs/
+    mineru.log
+    label_normalization.log
+    inference.log
+    build_tree.log
+  popo-results/
+    label_normalization/
+      mineru/
+        demo.json
+    inference/
+      mineru/
+        demo.json
+    build_tree/
+      mineru/
+        demo.json
+    build_tree_txt/
+      mineru/
+        demo.txt
+```
 """
 
 # Ignore ruff warnings about import location
@@ -35,31 +56,36 @@ from biomodals.helper.shell import package_outputs, run_command, sanitize_filena
 ##########################################
 # Modal configs
 ##########################################
-MINERU_REPO_URL = "https://github.com/opendatalab/MinerU"
-MINERU_REPO_COMMIT_HASH = "3e60291846cb7c3bf8fe7f4f16238f4fc6cce491"
-MINERU_VERSION = "3.4"
-
-POPO_REPO_URL = "https://github.com/opendatalab/MinerU-Popo"
-POPO_REPO_COMMIT_HASH = "75c36a8c0f38adee03c78850366645a58cd5d4af"
-POPO_REPO_DIR = Path("/opt/MinerU-Popo")
-POPO_REQUIREMENTS_PATH = POPO_REPO_DIR / "requirements-biomodals.txt"
-POPO_MODEL_REPO_ID = "DreamEternal/MinerU-Popo"
-
 CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
-    name="OCR",
-    repo_url=MINERU_REPO_URL,
-    repo_commit_hash=MINERU_REPO_COMMIT_HASH,
+    name="MinerU",
+    repo_url="https://github.com/opendatalab/MinerU",
+    repo_commit_hash="3e60291846cb7c3bf8fe7f4f16238f4fc6cce491",
     package_name="mineru",
-    version=MINERU_VERSION,
+    version="3.4",
     python_version="3.12",
     cuda_version="cu130",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", str(MAX_TIMEOUT))),
 )
 
+POPO_CONF = AppConfig(
+    tags=CONF.tags,
+    name="MinerU-Popo",
+    repo_url="https://github.com/opendatalab/MinerU-Popo",
+    repo_commit_hash="75c36a8c0f38adee03c78850366645a58cd5d4af",
+    python_version="3.10",
+    cuda_version="cu129",
+    gpu=os.environ.get("POPO_GPU", os.environ.get("GPU", "L40S")),
+    timeout=int(
+        os.environ.get("POPO_TIMEOUT", os.environ.get("TIMEOUT", str(MAX_TIMEOUT)))
+    ),
+)
+
+POPO_REPO_DIR = POPO_CONF.git_clone_dir
 MINERU_CONFIG_PATH = Path(CONF.model_volume_mountpoint) / CONF.name / "mineru.json"
-POPO_MODEL_DIR = Path(CONF.model_volume_mountpoint) / CONF.name / "MinerU-Popo"
+VLLM_CACHE_ROOT = Path(CONF.model_volume_mountpoint) / CONF.name / "vllm-cache"
+POPO_HF_CACHE_DIR = Path(POPO_CONF.default_env["HF_HOME"]) / "hub"
 
 ##########################################
 # Image and app definitions
@@ -80,28 +106,39 @@ mineru_image = (
         CONF.default_env
         | {
             "MINERU_TOOLS_CONFIG_JSON": str(MINERU_CONFIG_PATH),
+            "VLLM_CACHE_ROOT": str(VLLM_CACHE_ROOT),
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
         }
     )
-    .uv_pip_install(f"mineru[core,vllm]=={MINERU_VERSION}")
+    .uv_pip_install(f"mineru[core,vllm]=={CONF.version}")
     .pipe(patch_image_for_helper)
 )
 
 popo_image = (
     modal.Image
-    .debian_slim(python_version="3.10")
+    .debian_slim(python_version=POPO_CONF.python_version)
     .apt_install(*common_apt_packages)
-    .env(CONF.default_env | {"POPO_INFERENCE_BACKEND": "transformers"})
+    .env(
+        POPO_CONF.default_env
+        | {
+            "POPO_INFERENCE_BACKEND": "transformers",
+        }
+    )
+    .uv_pip_install("huggingface_hub")
     .run_commands(
-        f"git clone {POPO_REPO_URL} {POPO_REPO_DIR}",
-        f"cd {POPO_REPO_DIR} && git checkout {POPO_REPO_COMMIT_HASH}",
+        f"git clone {POPO_CONF.repo_url} {POPO_REPO_DIR}",
+        f"cd {POPO_REPO_DIR} && git checkout {POPO_CONF.repo_commit_hash}",
         (
-            "sed -E 's/^(click|gradio_pdf)==[^[:space:]]+$/\\1/' "
-            f"{POPO_REPO_DIR}/requirements.txt > {POPO_REQUIREMENTS_PATH}"
+            f"grep -Ev '^(cuda-bindings|nvidia-)' {POPO_REPO_DIR}/requirements.txt "
+            "| sed -E 's/^(click|gradio_pdf)==[^[:space:]]+$/\\1/' "
+            f"> {POPO_REPO_DIR / 'requirements-biomodals.txt'}"
+        ),
+        (
+            "/.uv/uv pip install --python $(command -v python) "
+            f"--compile-bytecode -r {POPO_REPO_DIR / 'requirements-biomodals.txt'}"
         ),
     )
-    .uv_pip_install(requirements=[str(POPO_REQUIREMENTS_PATH)])
-    .pipe(patch_image_for_helper)
+    .pipe(patch_image_for_helper, skip_deps=("uniaf3",))
 )
 
 app = modal.App(CONF.name, image=mineru_image, tags=CONF.tags)
@@ -122,22 +159,41 @@ def _extract_tar_zst_bytes(archive_bytes: bytes, destination: Path) -> None:
         )
 
 
-def _resolve_mineru_hybrid_dir(extract_root: Path, doc_id: str) -> Path:
-    """Find the MinerU hybrid output directory inside an extracted archive."""
-    expected = extract_root / doc_id / "hybrid_auto"
-    if expected.is_dir():
-        return expected
+def _collect_local_run_logs(run_dir: Path) -> None:
+    """Move MinerU and Popo logs into the run-level logs directory."""
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
-    matches = [
-        path
-        for path in extract_root.rglob("hybrid_auto")
-        if path.is_dir() and path.parent.name == doc_id
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise FileNotFoundError(f"MinerU archive does not contain {doc_id}/hybrid_auto")
-    raise RuntimeError(f"MinerU archive contains multiple {doc_id}/hybrid_auto dirs")
+    mineru_log = run_dir / "mineru.log"
+    if mineru_log.is_file():
+        mineru_log.replace(logs_dir / "mineru.log")
+
+    popo_logs_dir = run_dir / "popo-results" / "logs"
+    if not popo_logs_dir.is_dir():
+        return
+
+    for path in popo_logs_dir.iterdir():
+        if path.is_file():
+            path.replace(logs_dir / path.name)
+    popo_logs_dir.rmdir()
+
+
+def _snapshot_download_popo_model(
+    *,
+    force: bool = False,
+    local_files_only: bool = False,
+) -> Path:
+    """Download or resolve the MinerU-Popo model in Hugging Face's cache layout."""
+    from huggingface_hub import snapshot_download  # type: ignore[ty:unresolved-import]
+
+    snapshot_path = snapshot_download(
+        repo_id="DreamEternal/MinerU-Popo",
+        cache_dir=POPO_HF_CACHE_DIR,
+        token=os.environ.get("HF_TOKEN"),
+        force_download=force,
+        local_files_only=local_files_only,
+    )
+    return Path(snapshot_path)
 
 
 ##########################################
@@ -147,14 +203,14 @@ def _resolve_mineru_hybrid_dir(extract_root: Path, doc_id: str) -> Path:
     image=mineru_image,
     volumes=CONF.mounts(model_volume=True, model_ro=False, is_huggingface=True),
     secrets=[modal.Secret.from_name("huggingface")],
-    timeout=MAX_TIMEOUT,
+    timeout=CONF.timeout,
 )
 def download_mineru_model_weights() -> None:
     """Download MinerU models into the Biomodals model store."""
     MINERU_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     print("💊 Downloading MinerU model weights...")
     run_command(
-        ["mineru-models-download"],
+        ["mineru-models-download", "--source", "huggingface", "--model_type", "all"],
         env={"MINERU_TOOLS_CONFIG_JSON": str(MINERU_CONFIG_PATH)},
     )
     MODEL_VOLUME.commit()
@@ -163,23 +219,19 @@ def download_mineru_model_weights() -> None:
 
 @app.function(
     image=popo_image,
-    volumes=CONF.mounts(model_volume=True, model_ro=False, is_huggingface=True),
+    volumes=POPO_CONF.mounts(model_volume=True, model_ro=False, is_huggingface=True),
     secrets=[modal.Secret.from_name("huggingface")],
-    timeout=MAX_TIMEOUT,
+    timeout=POPO_CONF.timeout,
 )
 def download_popo_model_weights(force: bool = False) -> None:
     """Download MinerU-Popo checkpoints into the Biomodals model store."""
-    from huggingface_hub import snapshot_download  # type: ignore[ty:unresolved-import]
-
-    POPO_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"💊 Downloading MinerU-Popo model weights to {POPO_MODEL_DIR}...")
-    snapshot_download(
-        repo_id=POPO_MODEL_REPO_ID,
-        local_dir=POPO_MODEL_DIR,
-        force_download=force,
+    print(
+        "💊 Downloading MinerU-Popo model weights to "
+        f"{POPO_HF_CACHE_DIR / 'models--DreamEternal--MinerU-Popo'}..."
     )
+    snapshot_path = _snapshot_download_popo_model(force=force)
     MODEL_VOLUME.commit()
-    print("💊 MinerU-Popo model download complete")
+    print(f"💊 MinerU-Popo model download complete: {snapshot_path}")
 
 
 ##########################################
@@ -190,8 +242,8 @@ def download_popo_model_weights(force: bool = False) -> None:
     gpu=CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 131072),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(model_volume=True, is_huggingface=True),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(model_volume=True, model_ro=False, is_huggingface=True),
 )
 def run_mineru_ocr(
     pdf_content: bytes,
@@ -213,6 +265,7 @@ def run_mineru_ocr(
         log_path = workdir / "mineru.log"
         input_pdf.write_bytes(pdf_content)
         out_dir.mkdir(parents=True, exist_ok=True)
+        VLLM_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             "mineru",
@@ -231,7 +284,10 @@ def run_mineru_ocr(
                 cmd,
                 output_mode="tee",
                 log_file=log_path,
-                env={"VLLM_USE_FLASHINFER_SAMPLER": "0"},
+                env={
+                    "VLLM_CACHE_ROOT": str(VLLM_CACHE_ROOT),
+                    "VLLM_USE_FLASHINFER_SAMPLER": "0",
+                },
             )
         finally:
             if log_path.exists():
@@ -243,16 +299,21 @@ def run_mineru_ocr(
             raise FileNotFoundError(
                 f"MinerU did not create expected output: {hybrid_dir}"
             )
-        return package_outputs(result_dir)
+        archive = package_outputs(result_dir)
+        try:
+            MODEL_VOLUME.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"💊 Warning: failed to persist vLLM cache: {exc}")
+        return archive
 
 
 @app.function(
     image=popo_image,
-    gpu=CONF.gpu,
+    gpu=POPO_CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(4096, 131072),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(model_volume=True, is_huggingface=True),
+    timeout=POPO_CONF.timeout,
+    volumes=POPO_CONF.mounts(model_volume=True, is_huggingface=True),
 )
 def run_mineru_popo(
     mineru_results_archive: bytes,
@@ -265,11 +326,27 @@ def run_mineru_popo(
     if Path(safe_input_name).suffix.lower() != ".pdf":
         raise ValueError(f"Input must be a PDF file, got: {input_name}")
     doc_id = Path(safe_input_name).stem
-    with TemporaryDirectory(prefix=f"{CONF.name}_popo_") as tmpdir:
+    with TemporaryDirectory(prefix=f"{POPO_CONF.name}_") as tmpdir:
         workdir = Path(tmpdir)
         mineru_extract_root = workdir / "mineru-results"
         _extract_tar_zst_bytes(mineru_results_archive, mineru_extract_root)
-        hybrid_dir = _resolve_mineru_hybrid_dir(mineru_extract_root, doc_id)
+        hybrid_dir = mineru_extract_root / doc_id / "hybrid_auto"
+        if not hybrid_dir.is_dir():
+            matches = [
+                path
+                for path in mineru_extract_root.rglob("hybrid_auto")
+                if path.is_dir() and path.parent.name == doc_id
+            ]
+            if len(matches) == 1:
+                hybrid_dir = matches[0]
+            elif not matches:
+                raise FileNotFoundError(
+                    f"MinerU archive does not contain {doc_id}/hybrid_auto"
+                )
+            else:
+                raise RuntimeError(
+                    f"MinerU archive contains multiple {doc_id}/hybrid_auto dirs"
+                )
 
         post_process_doc_dir = workdir / "post-process" / "mineru" / doc_id
         post_process_doc_dir.mkdir(parents=True, exist_ok=True)
@@ -283,14 +360,14 @@ def run_mineru_popo(
         (pdf_dir / safe_input_name).write_bytes(pdf_content)
 
         popo_results = workdir / "popo-results"
-        outputs_dir = popo_results / "outputs"
         logs_dir = popo_results / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
 
-        label_dir = outputs_dir / "label_normalization"
-        inference_dir = outputs_dir / "inference" / "mineru"
-        tree_dir = outputs_dir / "build_tree" / "mineru"
-        tree_txt_dir = outputs_dir / "build_tree_txt" / "mineru"
+        label_dir = popo_results / "label_normalization"
+        inference_dir = popo_results / "inference" / "mineru"
+        tree_dir = popo_results / "build_tree" / "mineru"
+        tree_txt_dir = popo_results / "build_tree_txt" / "mineru"
+        model_snapshot_dir = _snapshot_download_popo_model(local_files_only=True)
 
         run_command(
             [
@@ -324,7 +401,7 @@ def run_mineru_popo(
                 "--input-dir",
                 str(label_dir / "mineru"),
                 "--model-path",
-                str(POPO_MODEL_DIR),
+                str(model_snapshot_dir),
                 "--output-dir",
                 str(inference_dir),
                 "--raw-output-root",
@@ -418,6 +495,7 @@ def submit_ocr_task(
     safe_input_name = sanitize_filename(input_path.name)
     safe_input_stem = sanitize_filename(input_path.stem)
     output_dir = resolve_local_output_dir(out_dir)
+    run_dir = output_dir / safe_input_stem
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_content = input_path.read_bytes()
 
@@ -427,24 +505,24 @@ def submit_ocr_task(
         safe_input_name,
         effort,
     )
-    mineru_archive_path = output_dir / f"{safe_input_stem}_mineru.tar.zst"
-    mineru_archive_path.write_bytes(mineru_archive)
     _extract_tar_zst_bytes(mineru_archive, output_dir)
-    print(f"🧬 Saved MinerU archive to {mineru_archive_path}")
-    print(f"🧬 Extracted MinerU results under {output_dir / input_path.stem}")
+    _collect_local_run_logs(run_dir)
+    print(f"🧬 Extracted MinerU results under {run_dir}")
 
-    if not run_popo:
-        return
+    if run_popo:
+        print("🧬 Running MinerU-Popo post-processing...")
+        popo_archive = run_mineru_popo.remote(
+            mineru_archive,
+            pdf_content,
+            safe_input_name,
+            popo_max_new_tokens,
+        )
+        _extract_tar_zst_bytes(popo_archive, run_dir)
+        _collect_local_run_logs(run_dir)
+        print(f"🧬 Extracted MinerU-Popo results under {run_dir / 'popo-results'}")
 
-    print("🧬 Running MinerU-Popo post-processing...")
-    popo_archive = run_mineru_popo.remote(
-        mineru_archive,
-        pdf_content,
-        safe_input_name,
-        popo_max_new_tokens,
-    )
-    popo_archive_path = output_dir / f"{safe_input_stem}_popo.tar.zst"
-    popo_archive_path.write_bytes(popo_archive)
-    _extract_tar_zst_bytes(popo_archive, output_dir)
-    print(f"🧬 Saved MinerU-Popo archive to {popo_archive_path}")
-    print(f"🧬 Extracted MinerU-Popo results under {output_dir / 'popo-results'}")
+    for archive_name in (
+        f"{safe_input_stem}_mineru.tar.zst",
+        f"{safe_input_stem}_popo.tar.zst",
+    ):
+        (output_dir / archive_name).unlink(missing_ok=True)

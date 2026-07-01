@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -56,45 +57,87 @@ CONF = AppConfig(
     gpu=os.environ.get("GPU", "A10G"),
     timeout=int(os.environ.get("TIMEOUT", "7200")),
 )
-ENSIRNA_ENV_NAME = "my_environment_name"
-ENSIRNA_DIR = CONF.git_clone_dir / "ENsiRNA"
-ROSETTA_COMPAT_ROOT = Path("/app/ENsiRNA-main/rosetta/rosetta.binary.linux.release-371")
-ROSETTA_RNA_DENOVO = (
-    ROSETTA_COMPAT_ROOT / "main/source/bin/rna_denovo.static.linuxgccrelease"
-)
-ROSETTA_EXTRACT = (
-    ROSETTA_COMPAT_ROOT / "main/tools/rna_tools/silent_util/extract_lowscore_decoys.py"
-)
-RNAFM_PRETRAINED_URL = (
-    "https://huggingface.co/cuhkaih/rnafm/resolve/main/RNA-FM_pretrained.pth"
-)
-RNAFM_CACHE_PATH = (
-    Path(CONF.default_env["TORCH_HOME"]) / "hub/checkpoints/RNA-FM_pretrained.pth"
-)
-ENSIRNA_CHECKPOINT_FILENAMES = tuple(f"checkpoint_{idx}.ckpt" for idx in range(1, 6))
-ENSIRNA_CHECKPOINT_DIR = Path(CONF.model_volume_mountpoint) / "pkl"
-ENSIRNA_MODEL_DOWNLOADS = {
-    RNAFM_PRETRAINED_URL: RNAFM_CACHE_PATH,
-    **{
-        (
-            f"{CONF.repo_url}/raw/{CONF.repo_commit_hash}/ENsiRNA/pkl/{filename}"
-        ): ENSIRNA_CHECKPOINT_DIR / filename
-        for filename in ENSIRNA_CHECKPOINT_FILENAMES
-    },
-}
-ENSIRNA_PIP_PACKAGES = (
-    "biopython",
-    "numpy",
-    "pandas",
-    "scipy",
-    "tensorboard",
-    "tqdm",
-    "openpyxl",
-    "rdkit",
-    "scikit-learn",
-    "xgboost",
-)
-ROSETTA_EXTRACT_SHIM = """#!/usr/bin/env python3
+
+
+@dataclass(frozen=True, slots=True)
+class AppInfo:
+    """Container for ENsiRNA-specific paths, dependencies, and patches."""
+
+    conda_env_name: str = "base"
+    mamba_root: str = "/root/micromamba"
+    ensirna_dir: Path = CONF.git_clone_dir / "ENsiRNA"
+    rosetta_compat_root: Path = Path(
+        "/app/ENsiRNA-main/rosetta/rosetta.binary.linux.release-371"
+    )
+    rnafm_pretrained_url: str = (
+        "https://huggingface.co/cuhkaih/rnafm/resolve/main/RNA-FM_pretrained.pth"
+    )
+    rnafm_cache_path: Path = (
+        Path(CONF.default_env["TORCH_HOME"]) / "hub/checkpoints/RNA-FM_pretrained.pth"
+    )
+    checkpoint_filenames: tuple[str, ...] = tuple(
+        f"checkpoint_{idx}.ckpt" for idx in range(1, 6)
+    )
+    checkpoint_dir: Path = Path(CONF.model_volume_mountpoint) / "pkl"
+    conda_packages: tuple[str, ...] = (
+        f"python={CONF.python_version}",
+        "pip",
+        "viennarna=2.6.4-0",
+    )
+    conda_channels: tuple[str, ...] = ("conda-forge", "bioconda")
+    pip_packages: tuple[str, ...] = (
+        "biopython",
+        "numpy",
+        "pandas",
+        "scipy",
+        "tensorboard",
+        "tqdm",
+        "openpyxl",
+        "rdkit",
+        "scikit-learn",
+        "xgboost",
+    )
+    torch_packages: tuple[str, ...] = ("torch", "torchvision", "torchaudio")
+    torch_index_url: str = "https://download.pytorch.org/whl/cu118"
+    extra_pip_packages: tuple[str, ...] = ("torch-geometric", "rna-fm")
+
+    @property
+    def mamba_bin_path(self) -> str:
+        """Return PATH with micromamba's base environment first."""
+        return f"{self.mamba_root}/bin:/root/.local/bin:$PATH"
+
+    @property
+    def rosetta_rna_denovo(self) -> Path:
+        """Return the ENsiRNA-expected Rosetta rna_denovo path."""
+        return self.rosetta_compat_root / (
+            "main/source/bin/rna_denovo.static.linuxgccrelease"
+        )
+
+    @property
+    def rosetta_extract(self) -> Path:
+        """Return the ENsiRNA-expected Rosetta extract script path."""
+        return self.rosetta_compat_root / (
+            "main/tools/rna_tools/silent_util/extract_lowscore_decoys.py"
+        )
+
+    @property
+    def model_downloads(self) -> dict[str, Path]:
+        """Return ENsiRNA model URLs mapped to model-volume paths."""
+        return {
+            self.rnafm_pretrained_url: self.rnafm_cache_path,
+            **{
+                (
+                    f"{CONF.repo_url}/raw/{CONF.repo_commit_hash}/ENsiRNA/pkl/"
+                    f"{filename}"
+                ): self.checkpoint_dir / filename
+                for filename in self.checkpoint_filenames
+            },
+        }
+
+    @property
+    def rosetta_extract_shim(self) -> str:
+        """Return the Rosetta extract shim written into the image."""
+        return """#!/usr/bin/env python3
 import subprocess
 import sys
 from pathlib import Path
@@ -113,13 +156,22 @@ target = Path(f"{silent_file}.1.pdb")
 if created[0] != target:
     created[0].replace(target)
 """
-ROSETTA_EXTRACT_WRITER = (
-    "from pathlib import Path; "
-    f"Path({str(ROSETTA_EXTRACT)!r}).write_text({ROSETTA_EXTRACT_SHIM!r})"
-)
-GET_PDB_RUNTIME_PATCH = f"""from pathlib import Path
 
-path = Path({str(ENSIRNA_DIR / "data/get_pdb.py")!r})
+    @property
+    def rosetta_extract_writer(self) -> str:
+        """Return a Python one-liner that writes the Rosetta extract shim."""
+        return (
+            "from pathlib import Path; "
+            f"Path({str(self.rosetta_extract)!r}).write_text("
+            f"{self.rosetta_extract_shim!r})"
+        )
+
+    @property
+    def get_pdb_runtime_patch(self) -> str:
+        """Return the source patch for ENsiRNA's PDB generation helper."""
+        return f"""from pathlib import Path
+
+path = Path({str(self.ensirna_dir / "data/get_pdb.py")!r})
 text = path.read_text()
 old = '''        if len(sec_pos) != 61+len(seq2)+len(seq1)+1+1:
             print('!=',data['siRNA'],len(sec_pos),len(seq2))
@@ -167,28 +219,28 @@ text = text.replace(secstruct_old, secstruct_new)
 text = text.replace(rosetta_cmd_old, rosetta_cmd_new)
 path.write_text(text)
 """
-GET_PDB_RUNTIME_PATCH_RUNNER = f"exec({GET_PDB_RUNTIME_PATCH!r})"
+
+    @property
+    def get_pdb_runtime_patch_runner(self) -> str:
+        """Return a Python one-liner that applies the PDB helper patch."""
+        return f"exec({self.get_pdb_runtime_patch!r})"
 
 
 ##########################################
 # Image and app definitions
 ##########################################
+APP_INFO = AppInfo()
 runtime_image = (
     modal.Image
     .from_registry("rosettacommons/rosetta:serial-420", add_python=CONF.python_version)
     .apt_install("git", "curl", "ca-certificates", "build-essential", "zstd")
-    .env(CONF.default_env | {"PATH": "/root/.local/bin:$PATH"})
+    .env(
+        CONF.default_env
+        | {"MAMBA_ROOT_PREFIX": APP_INFO.mamba_root, "PATH": APP_INFO.mamba_bin_path}
+    )
     .run_commands("curl -L micro.mamba.pm/install.sh | bash")
-    .run_commands(
-        " ".join((
-            "micromamba create -y",
-            f"-n {ENSIRNA_ENV_NAME}",
-            "-c conda-forge",
-            "-c bioconda",
-            f"python={CONF.python_version}",
-            "pip",
-            "viennarna=2.6.4-0",
-        ))
+    .micromamba_install(
+        *APP_INFO.conda_packages, channels=list(APP_INFO.conda_channels)
     )
     .run_commands(
         " && ".join((
@@ -200,24 +252,17 @@ runtime_image = (
     )
     .run_commands(
         " && ".join((
-            f"mkdir -p {ROSETTA_RNA_DENOVO.parent} {ROSETTA_EXTRACT.parent}",
-            f"ln -sf /usr/local/bin/rna_denovo {ROSETTA_RNA_DENOVO}",
-            f"python -c {shlex.quote(ROSETTA_EXTRACT_WRITER)}",
-            f"chmod +x {ROSETTA_EXTRACT}",
+            f"mkdir -p {APP_INFO.rosetta_rna_denovo.parent} "
+            f"{APP_INFO.rosetta_extract.parent}",
+            f"ln -sf /usr/local/bin/rna_denovo {APP_INFO.rosetta_rna_denovo}",
+            f"python -c {shlex.quote(APP_INFO.rosetta_extract_writer)}",
+            f"chmod +x {APP_INFO.rosetta_extract}",
         ))
     )
-    .run_commands(f"python -c {shlex.quote(GET_PDB_RUNTIME_PATCH_RUNNER)}")
-    .run_commands(
-        f"micromamba run -n {ENSIRNA_ENV_NAME} pip install "
-        + " ".join(ENSIRNA_PIP_PACKAGES)
-    )
-    .run_commands(
-        f"micromamba run -n {ENSIRNA_ENV_NAME} pip install "
-        "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118"
-    )
-    .run_commands(
-        f"micromamba run -n {ENSIRNA_ENV_NAME} pip install torch-geometric rna-fm"
-    )
+    .run_commands(f"python -c {shlex.quote(APP_INFO.get_pdb_runtime_patch_runner)}")
+    .uv_pip_install(*APP_INFO.pip_packages)
+    .uv_pip_install(*APP_INFO.torch_packages, index_url=APP_INFO.torch_index_url)
+    .uv_pip_install(*APP_INFO.extra_pip_packages)
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
@@ -232,7 +277,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 def download_ensirna_models(force: bool = False) -> None:
     """Download ENsiRNA model files into the standard model volume."""
     download_files(
-        ENSIRNA_MODEL_DOWNLOADS,
+        APP_INFO.model_downloads,
         force=force,
         num_retries=3,
         progress_bar_desc="ENsiRNA model downloads",
@@ -260,10 +305,10 @@ def run_ensirna(mrna_fasta_bytes: bytes, run_name: str) -> bytes:
         input_dir.mkdir(parents=True)
         output_dir.mkdir()
 
-        checkpoint_dir = ENSIRNA_DIR / "pkl"
+        checkpoint_dir = APP_INFO.ensirna_dir / "pkl"
         checkpoint_dir.mkdir(exist_ok=True)
-        for filename in ENSIRNA_CHECKPOINT_FILENAMES:
-            checkpoint = ENSIRNA_CHECKPOINT_DIR / filename
+        for filename in APP_INFO.checkpoint_filenames:
+            checkpoint = APP_INFO.checkpoint_dir / filename
             if not checkpoint.exists():
                 raise FileNotFoundError(f"ENsiRNA checkpoint not found: {checkpoint}")
             link = checkpoint_dir / filename
@@ -278,13 +323,13 @@ def run_ensirna(mrna_fasta_bytes: bytes, run_name: str) -> bytes:
                 "micromamba",
                 "run",
                 "-n",
-                ENSIRNA_ENV_NAME,
+                APP_INFO.conda_env_name,
                 "bash",
                 "design.sh",
                 str(mrna_fasta),
                 str(output_dir),
             ],
-            cwd=ENSIRNA_DIR,
+            cwd=APP_INFO.ensirna_dir,
         )
         return package_outputs(output_dir)
 

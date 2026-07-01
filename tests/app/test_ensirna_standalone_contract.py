@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
 from pathlib import Path
 
 from biomodals.app.score import ensirna_app
@@ -21,10 +22,11 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert 'from_registry("rosettacommons/rosetta:serial-420"' in source
     assert ".debian_slim(" not in source
     assert "tanwenchong/ensirna:v2" not in source
-    assert 'PATH": "/root/.local/bin:$PATH"' in source
-    assert "ROSETTA_EXTRACT_SHIM" in source
+    assert '"MAMBA_ROOT_PREFIX": APP_INFO.mamba_root' in source
+    assert '"PATH": APP_INFO.mamba_bin_path' in source
+    assert "def rosetta_extract_shim" in source
     assert "rna_denovo.static.linuxgccrelease" in source
-    assert "GET_PDB_RUNTIME_PATCH" in source
+    assert "def get_pdb_runtime_patch" in source
     assert "expected_len = 61 + len(seq2) + len(seq1) + 1 + 1" in source
     assert "def _fit_secstruct(secstruct, size):" in source
     assert "-out:file:silent" in source
@@ -35,11 +37,12 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert "MODEL_VOLUME.commit()" in source
     assert "download_files(" in source
     assert "curl -fL --retry" not in source
+    assert "micromamba create" not in source
+    assert ".micromamba_install(" in source
     assert "viennarna=2.6.4-0" in source
-    assert (
-        "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118"
-        in source
-    )
+    assert ".uv_pip_install(*APP_INFO.pip_packages)" in source
+    assert ".uv_pip_install(*APP_INFO.torch_packages" in source
+    assert "https://download.pytorch.org/whl/cu118" in source
     assert "rna-fm" in source
     assert "ignore_dep_versions=True" in source
     assert 'skip_deps=["uniaf3"]' in source
@@ -59,12 +62,12 @@ def test_download_ensirna_models_writes_to_model_volume(monkeypatch) -> None:
     ensirna_app.download_ensirna_models.get_raw_f()(force=True)
 
     assert len(captured["urls"]) == 6
-    assert ensirna_app.RNAFM_PRETRAINED_URL in captured["urls"]
+    assert ensirna_app.APP_INFO.rnafm_pretrained_url in captured["urls"]
     assert captured["kwargs"]["force"] is True
     assert captured["kwargs"]["num_retries"] == 3
     assert volume.commit_count == 1
-    for filename in ensirna_app.ENSIRNA_CHECKPOINT_FILENAMES:
-        assert (ensirna_app.ENSIRNA_CHECKPOINT_DIR / filename) in captured[
+    for filename in ensirna_app.APP_INFO.checkpoint_filenames:
+        assert (ensirna_app.APP_INFO.checkpoint_dir / filename) in captured[
             "urls"
         ].values()
 
@@ -78,7 +81,7 @@ def test_run_ensirna_uses_documented_design_pipeline(
     checkpoint_dir = tmp_path / "models" / "pkl"
     (ensirna_dir / "pkl").mkdir(parents=True)
     checkpoint_dir.mkdir(parents=True)
-    for filename in ensirna_app.ENSIRNA_CHECKPOINT_FILENAMES:
+    for filename in ensirna_app.APP_INFO.checkpoint_filenames:
         (checkpoint_dir / filename).write_bytes(b"checkpoint")
 
     def fake_run_command(cmd, *, cwd):
@@ -91,8 +94,15 @@ def test_run_ensirna_uses_documented_design_pipeline(
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
     monkeypatch.setattr(ensirna_app, "package_outputs", fake_package_outputs)
-    monkeypatch.setattr(ensirna_app, "ENSIRNA_DIR", ensirna_dir)
-    monkeypatch.setattr(ensirna_app, "ENSIRNA_CHECKPOINT_DIR", checkpoint_dir)
+    monkeypatch.setattr(
+        ensirna_app,
+        "APP_INFO",
+        replace(
+            ensirna_app.APP_INFO,
+            ensirna_dir=ensirna_dir,
+            checkpoint_dir=checkpoint_dir,
+        ),
+    )
 
     result = ensirna_app.run_ensirna.get_raw_f()(
         mrna_fasta_bytes=b">m\nAUGCUAGCUAGCUAGCUAGC\n",
@@ -104,7 +114,7 @@ def test_run_ensirna_uses_documented_design_pipeline(
         "micromamba",
         "run",
         "-n",
-        ensirna_app.ENSIRNA_ENV_NAME,
+        ensirna_app.APP_INFO.conda_env_name,
         "bash",
         "design.sh",
     ]
@@ -112,7 +122,7 @@ def test_run_ensirna_uses_documented_design_pipeline(
     assert Path(captured["cmd"][7]).name == "outputs"
     assert captured["cwd"] == ensirna_dir
     assert captured["root"].name == "outputs"
-    for filename in ensirna_app.ENSIRNA_CHECKPOINT_FILENAMES:
+    for filename in ensirna_app.APP_INFO.checkpoint_filenames:
         assert (ensirna_dir / "pkl" / filename).resolve() == checkpoint_dir / filename
 
 

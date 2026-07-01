@@ -20,6 +20,7 @@ Results are saved locally as `<run-name>_oligoformer.tar.zst`.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -34,6 +35,7 @@ from biomodals.helper.io import (
     write_local_tarball,
 )
 from biomodals.helper.shell import package_outputs, run_command, sanitize_filename
+from biomodals.helper.web import download_files
 
 ##########################################
 # Modal configs
@@ -51,21 +53,44 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", "7200")),
 )
 
-OLIGOFORMER_REQUIREMENTS = (
-    "bio==1.6.2",
-    "matplotlib==3.7.5",
-    "numpy==1.24.4",
-    "pandas==2.0.3",
-    "prefetch-generator==1.0.3",
-    "ptflops==0.7.3",
-    "pytorch-ignite==0.5.0.post2",
-    "scikit-learn==1.3.1",
-    "scipy==1.10.1",
-    "torch==2.2.1",
-    "torchvision==0.17.1",
-    "tqdm==4.66.1",
-    "yacs==0.1.8",
-)
+
+@dataclass(frozen=True, slots=True)
+class AppInfo:
+    """OligoFormer runtime paths and pinned dependencies."""
+
+    requirements: tuple[str, ...] = (
+        "bio==1.6.2",
+        "matplotlib==3.7.5",
+        "numpy==1.24.4",
+        "pandas==2.0.3",
+        "prefetch-generator==1.0.3",
+        "ptflops==0.7.3",
+        "pytorch-ignite==0.5.0.post2",
+        "scikit-learn==1.3.1",
+        "scipy==1.10.1",
+        "torch==2.2.1",
+        "torchvision==0.17.1",
+        "tqdm==4.66.1",
+        "yacs==0.1.8",
+    )
+    rnafm_archive_url: str = (
+        "https://cloud.tsinghua.edu.cn/f/46d71884ee8848b3a958/?dl=1"
+    )
+    repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
+    model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
+
+    @property
+    def model_rnafm_redevelop_dir(self) -> Path:
+        """Return the RNA-FM redevelop directory expected by OligoFormer."""
+        return self.model_rnafm_dir / "redevelop"
+
+    @property
+    def repo_rnafm_redevelop_dir(self) -> Path:
+        """Return the runtime RNA-FM redevelop directory inside OligoFormer."""
+        return self.repo_rnafm_dir / "redevelop"
+
+
+APP_INFO = AppInfo()
 
 
 ##########################################
@@ -78,7 +103,6 @@ runtime_image = (
         "git",
         "build-essential",
         "ca-certificates",
-        "wget",
         "unzip",
         "perl",
         "libstatistics-lite-perl",
@@ -91,21 +115,61 @@ runtime_image = (
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
             f"cd {CONF.git_clone_dir}",
             f"git checkout {CONF.repo_commit_hash}",
-            "wget -q https://cloud.tsinghua.edu.cn/f/46d71884ee8848b3a958/?dl=1 -O RNA-FM.tar.gz",
-            "tar -xzf RNA-FM.tar.gz",
-            "rm RNA-FM.tar.gz",
-            "test -d RNA-FM/redevelop",
             "cd off-target/pita",
             "make install",
         ))
     )
     .workdir(str(CONF.git_clone_dir))
-    .uv_pip_install(*OLIGOFORMER_REQUIREMENTS)
+    .uv_pip_install(*APP_INFO.requirements)
     .pipe(
         patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3", "modal"]
     )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+
+##########################################
+# Fetch model weights
+##########################################
+@app.function(
+    volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=CONF.timeout
+)
+def download_oligoformer_models(force: bool = False) -> None:
+    """Download RNA-FM weights into the standard model volume."""
+    import shutil
+
+    if APP_INFO.model_rnafm_redevelop_dir.is_dir() and not force:
+        print("🧬 OligoFormer RNA-FM weights already available")
+        return
+
+    if APP_INFO.model_rnafm_dir.exists():
+        shutil.rmtree(APP_INFO.model_rnafm_dir)
+
+    with TemporaryDirectory(prefix="oligoformer_models_") as tmpdir:
+        archive_path = Path(tmpdir) / "RNA-FM.tar.gz"
+        download_files(
+            {APP_INFO.rnafm_archive_url: archive_path},
+            force=True,
+            num_retries=3,
+            progress_bar_desc="OligoFormer model downloads",
+        )
+        APP_INFO.model_rnafm_dir.parent.mkdir(parents=True, exist_ok=True)
+        run_command([
+            "tar",
+            "-xzf",
+            str(archive_path),
+            "-C",
+            str(APP_INFO.model_rnafm_dir.parent),
+        ])
+
+    if not APP_INFO.model_rnafm_redevelop_dir.is_dir():
+        raise FileNotFoundError(
+            "OligoFormer RNA-FM weights were not extracted to "
+            f"{APP_INFO.model_rnafm_redevelop_dir}"
+        )
+
+    MODEL_VOLUME.commit()
+    print("🧬 OligoFormer RNA-FM weights downloaded and committed")
 
 
 ##########################################
@@ -116,7 +180,7 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
-    volumes=CONF.mounts(model_volume=True, model_ro=False),
+    volumes=CONF.mounts(model_volume=True),
 )
 def run_oligoformer(
     mrna_fasta_bytes: bytes,
@@ -141,6 +205,23 @@ def run_oligoformer(
             "OligoFormer off-target mode requires both UTR and ORF references "
             "unless all_human is enabled."
         )
+    if not APP_INFO.model_rnafm_redevelop_dir.is_dir():
+        raise FileNotFoundError(
+            "OligoFormer RNA-FM weights are missing. Run "
+            "download_oligoformer_models first."
+        )
+
+    import shutil
+
+    if APP_INFO.repo_rnafm_dir.is_symlink():
+        APP_INFO.repo_rnafm_dir.unlink()
+    elif (
+        APP_INFO.repo_rnafm_dir.exists()
+        and not APP_INFO.repo_rnafm_redevelop_dir.is_dir()
+    ):
+        shutil.rmtree(APP_INFO.repo_rnafm_dir)
+    if not APP_INFO.repo_rnafm_redevelop_dir.is_dir():
+        shutil.copytree(APP_INFO.model_rnafm_dir, APP_INFO.repo_rnafm_dir)
 
     safe_run_name = sanitize_filename(run_name)
     with TemporaryDirectory(prefix=f"oligoformer_{safe_run_name}_") as tmpdir:
@@ -192,7 +273,6 @@ def run_oligoformer(
             cmd.extend(["-tox", "--toxicity_threshold", str(toxicity_threshold)])
 
         run_command(cmd, cwd=CONF.git_clone_dir)
-        MODEL_VOLUME.commit()
         return package_outputs(output_dir)
 
 
@@ -277,6 +357,7 @@ def submit_oligoformer_task(
         orf_bytes = orf_path.read_bytes()
 
     print(f"🧬 Submitting OligoFormer run '{run_name}'")
+    download_oligoformer_models.remote(force=False)
     tarball_bytes = run_oligoformer.remote(
         mrna_fasta_bytes=input_path.read_bytes(),
         run_name=run_name,

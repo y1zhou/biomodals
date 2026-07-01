@@ -42,6 +42,7 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert "ensirna_prepare_inputs" in source
     assert "ensirna_prepare_pdb_chunk" in source
     assert "ensirna_finalize_prepared_inputs" in source
+    assert "ensirna_preprocess_dataset" in source
     assert "run_ensirna_inference" in source
     assert "MODEL_VOLUME.commit()" in source
     assert "download_files(" in source
@@ -60,6 +61,21 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert '"run.py"' in source
     assert "ignore_dep_versions=True" in source
     assert 'skip_deps=["uniaf3"]' in source
+    preprocess_block = source[
+        source.index("def ensirna_preprocess_dataset") - 180 : source.index(
+            "def run_ensirna_inference"
+        )
+    ]
+    assert "gpu=CONF.gpu" in preprocess_block
+    assert (
+        "volumes=CONF.mounts(output_volume=True, model_volume=True)" in preprocess_block
+    )
+    finalize_block = source[
+        source.index("def ensirna_finalize_prepared_inputs") : source.index(
+            "def ensirna_preprocess_dataset"
+        )
+    ]
+    assert '"data.dataset"' not in finalize_block
 
 
 def test_download_ensirna_models_writes_to_model_volume(monkeypatch) -> None:
@@ -258,30 +274,15 @@ def test_prepare_pdb_chunk_runs_rosetta_on_cpu(
     assert output_volume.commit_count == 1
 
 
-def test_finalize_prepared_inputs_merges_json_and_preprocesses_on_cpu(
+def test_finalize_prepared_inputs_merges_json_only_on_cpu(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    captured = {}
     output_volume = FakeVolume()
-    ensirna_dir = tmp_path / "ENsiRNA"
-    ensirna_dir.mkdir()
-    rnafm_cache = tmp_path / "models" / "RNA-FM_pretrained.pth"
-    rnafm_cache.parent.mkdir()
-    rnafm_cache.write_bytes(b"weights")
     monkeypatch.setattr(
         ensirna_app,
         "CONF",
         SimpleNamespace(output_volume=output_volume),
-    )
-    monkeypatch.setattr(
-        ensirna_app,
-        "APP_INFO",
-        replace(
-            ensirna_app.APP_INFO,
-            ensirna_dir=ensirna_dir,
-            rnafm_cache_path=rnafm_cache,
-        ),
     )
     layout = ensirna_app.AppRunLayout.from_run_root(tmp_path / "prepared")
     layout.prep_dir.mkdir(parents=True)
@@ -308,12 +309,8 @@ def test_finalize_prepared_inputs_merges_json_and_preprocesses_on_cpu(
         cached=False,
     )
 
-    def fake_run_command(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["cwd"] = kwargs["cwd"]
-        captured["env"] = kwargs["env"]
-        Path(plan.processed_dir).mkdir(parents=True)
-        Path(plan.processed_dir, "_metainfo").write_text("{}", encoding="utf-8")
+    def fake_run_command(*_args, **_kwargs):
+        raise AssertionError("CPU finalize should not run dataset preprocessing")
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
     result = ensirna_app.ensirna_finalize_prepared_inputs.get_raw_f()(plan)
@@ -323,7 +320,72 @@ def test_finalize_prepared_inputs_merges_json_and_preprocesses_on_cpu(
     )
     assert result.chunks == []
     assert result.cached is False
+    assert not ensirna_app._prepared_marker_path(layout).exists()
+    assert not Path(plan.processed_dir).exists()
+    assert output_volume.reload_count == 1
+    assert output_volume.commit_count == 1
+
+
+def test_preprocess_dataset_runs_rnafm_on_gpu_and_marks_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured = {}
+    output_volume = FakeVolume()
+    ensirna_dir = tmp_path / "ENsiRNA"
+    ensirna_dir.mkdir()
+    rnafm_cache = tmp_path / "models" / "RNA-FM_pretrained.pth"
+    rnafm_cache.parent.mkdir()
+    rnafm_cache.write_bytes(b"weights")
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(output_volume=output_volume),
+    )
+    monkeypatch.setattr(
+        ensirna_app,
+        "APP_INFO",
+        replace(
+            ensirna_app.APP_INFO,
+            ensirna_dir=ensirna_dir,
+            rnafm_cache_path=rnafm_cache,
+        ),
+    )
+    layout = ensirna_app.AppRunLayout.from_run_root(tmp_path / "prepared")
+    layout.outputs_dir.mkdir(parents=True)
+    layout.outputs_dir.joinpath("mrna.json").write_text(
+        '{"siRNA":"m_0"}\n{"siRNA":"m_1"}\n',
+        encoding="utf-8",
+    )
+    plan = ensirna_app.EnsirnaPreparationPlan(
+        cache_key="abc123",
+        prepared_dir=str(layout.run_root),
+        json_path=str(layout.outputs_dir / "mrna.json"),
+        processed_dir=str(layout.outputs_dir / "mrna_processed"),
+        result_xlsx=str(layout.outputs_dir / "mrna_result.xlsx"),
+        candidate_count=2,
+        chunk_count=2,
+        chunks=[],
+        cached=False,
+    )
+
+    def fake_run_command(cmd, **kwargs):
+        assert not ensirna_app._prepared_marker_path(layout).exists()
+        captured["cmd"] = cmd
+        captured["cwd"] = kwargs["cwd"]
+        captured["env"] = kwargs["env"]
+        Path(plan.processed_dir).mkdir(parents=True)
+        Path(plan.processed_dir, "_metainfo").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
+    result = ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan)
+
+    assert result.chunks == []
+    assert result.cached is False
     assert ensirna_app._prepared_marker_path(layout).exists()
+    assert '"json_records":2' in ensirna_app._prepared_marker_path(layout).read_text(
+        encoding="utf-8"
+    )
     assert captured["cmd"][:7] == [
         "micromamba",
         "run",
@@ -334,7 +396,7 @@ def test_finalize_prepared_inputs_merges_json_and_preprocesses_on_cpu(
         "data.dataset",
     ]
     assert captured["cwd"] == ensirna_dir
-    assert captured["env"] == {ensirna_app.APP_INFO.rnafm_device_env: "cpu"}
+    assert captured["env"] == {ensirna_app.APP_INFO.rnafm_device_env: "cuda"}
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
 
@@ -461,6 +523,17 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
         chunks=[],
         cached=False,
     )
+    preprocessed_plan = ensirna_app.EnsirnaPreparationPlan(
+        cache_key="abc123",
+        prepared_dir="/remote/prepared",
+        json_path="/remote/outputs/mrna.json",
+        processed_dir="/remote/outputs/mrna_processed",
+        result_xlsx="/remote/outputs/mrna_result.xlsx",
+        candidate_count=1,
+        chunk_count=1,
+        chunks=[],
+        cached=False,
+    )
 
     class FakePrepare:
         def remote(self, **kwargs):
@@ -477,9 +550,15 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
             captured["finalize"] = plan
             return finalized_plan
 
+    class FakePreprocess:
+        def remote(self, plan):
+            captured["preprocess"] = plan
+            return preprocessed_plan
+
     monkeypatch.setattr(ensirna_app, "ensirna_prepare_inputs", FakePrepare())
     monkeypatch.setattr(ensirna_app, "ensirna_prepare_pdb_chunk", FakePdbChunk())
     monkeypatch.setattr(ensirna_app, "ensirna_finalize_prepared_inputs", FakeFinalize())
+    monkeypatch.setattr(ensirna_app, "ensirna_preprocess_dataset", FakePreprocess())
     monkeypatch.setattr(ensirna_app, "run_ensirna_inference", FakeRun())
     raw_f = ensirna_app.submit_ensirna_task.info.raw_f
     assert raw_f is not None
@@ -499,5 +578,6 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
     }
     assert captured["chunk"] == {"chunk": chunk, "pdb_cores": 1}
     assert captured["finalize"] == prepare_plan
+    assert captured["preprocess"] == finalized_plan
     assert captured["run"] == {"prepared_dir": "/remote/prepared", "force": False}
     assert (tmp_path / "demo_ensirna.tar.zst").read_bytes() == b"archive"

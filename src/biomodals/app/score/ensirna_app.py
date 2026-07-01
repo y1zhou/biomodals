@@ -595,8 +595,7 @@ def ensirna_prepare_inputs(
     volumes=CONF.mounts(output_volume=True),
 )
 def ensirna_prepare_pdb_chunk(
-    chunk: EnsirnaPdbChunkSpec,
-    pdb_cores: int = 1,
+    chunk: EnsirnaPdbChunkSpec, pdb_cores: int = 1
 ) -> dict[str, int | str]:
     """Run Rosetta PDB generation for one CSV chunk on CPU."""
     CONF.output_volume.reload()
@@ -631,12 +630,12 @@ def ensirna_prepare_pdb_chunk(
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True, model_volume=True),
+    volumes=CONF.mounts(output_volume=True),
 )
 def ensirna_finalize_prepared_inputs(
     plan: EnsirnaPreparationPlan,
 ) -> EnsirnaPreparationPlan:
-    """Merge PDB chunks and build the CPU preprocessed dataset cache."""
+    """Merge PDB chunk JSON files into the prepared dataset JSON."""
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(plan.prepared_dir)
     if cached_plan := _cached_preparation_plan(cache_key=plan.cache_key, layout=layout):
@@ -644,7 +643,6 @@ def ensirna_finalize_prepared_inputs(
 
     json_path = Path(plan.json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_records = 0
     with json_path.open("wb") as out:
         for chunk in plan.chunks:
             chunk_json = Path(chunk.json_path)
@@ -657,7 +655,40 @@ def ensirna_finalize_prepared_inputs(
                 out.write(data)
                 if not data.endswith(b"\n"):
                     out.write(b"\n")
-                json_records += data.count(b"\n") + int(not data.endswith(b"\n"))
+
+    CONF.output_volume.commit()
+    return EnsirnaPreparationPlan(
+        cache_key=plan.cache_key,
+        prepared_dir=plan.prepared_dir,
+        json_path=plan.json_path,
+        processed_dir=plan.processed_dir,
+        result_xlsx=plan.result_xlsx,
+        candidate_count=plan.candidate_count,
+        chunk_count=plan.chunk_count,
+        chunks=[],
+        cached=False,
+    )
+
+
+@app.function(
+    gpu=CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def ensirna_preprocess_dataset(
+    plan: EnsirnaPreparationPlan,
+) -> EnsirnaPreparationPlan:
+    """Build the RNA-FM preprocessed dataset cache on GPU."""
+    CONF.output_volume.reload()
+    layout = AppRunLayout.from_run_root(plan.prepared_dir)
+    if cached_plan := _cached_preparation_plan(cache_key=plan.cache_key, layout=layout):
+        return cached_plan
+
+    json_path = Path(plan.json_path)
+    if not json_path.exists():
+        raise FileNotFoundError(f"ENsiRNA merged JSON not found: {json_path}")
 
     processed_dir = Path(plan.processed_dir)
     if processed_dir.exists():
@@ -681,12 +712,19 @@ def ensirna_finalize_prepared_inputs(
             str(processed_dir),
         ],
         cwd=APP_INFO.ensirna_dir,
-        env={APP_INFO.rnafm_device_env: "cpu"},
+        env={APP_INFO.rnafm_device_env: "cuda"},
     )
+    processed_marker = processed_dir / "_metainfo"
+    if not processed_marker.exists():
+        raise FileNotFoundError(
+            f"ENsiRNA processed dataset marker not found: {processed_marker}"
+        )
 
-    _write_prepared_marker(layout=layout, plan=plan, json_records=json_records)
-    CONF.output_volume.commit()
-    return EnsirnaPreparationPlan(
+    json_data = json_path.read_bytes()
+    json_records = (
+        json_data.count(b"\n") + int(not json_data.endswith(b"\n")) if json_data else 0
+    )
+    prepared_plan = EnsirnaPreparationPlan(
         cache_key=plan.cache_key,
         prepared_dir=plan.prepared_dir,
         json_path=plan.json_path,
@@ -697,6 +735,13 @@ def ensirna_finalize_prepared_inputs(
         chunks=[],
         cached=False,
     )
+    _write_prepared_marker(
+        layout=layout,
+        plan=prepared_plan,
+        json_records=json_records,
+    )
+    CONF.output_volume.commit()
+    return prepared_plan
 
 
 @app.function(
@@ -813,7 +858,8 @@ def submit_ensirna_task(
             run_chunk,
             max_parallel=max(1, min(prepare_workers, len(prepare_plan.chunks))),
         )
-        prepared_plan = ensirna_finalize_prepared_inputs.remote(prepare_plan)
+        finalized_plan = ensirna_finalize_prepared_inputs.remote(prepare_plan)
+        prepared_plan = ensirna_preprocess_dataset.remote(finalized_plan)
 
     tarball_bytes = run_ensirna_inference.remote(
         prepared_dir=prepared_plan.prepared_dir,

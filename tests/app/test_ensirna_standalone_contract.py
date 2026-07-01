@@ -3,22 +3,87 @@
 # ruff: noqa: D101,D102,D103,D107
 
 from pathlib import Path
-from types import SimpleNamespace
 
 from biomodals.app.score import ensirna_app
 
 
-def test_run_ensirna_uses_documented_design_pipeline(monkeypatch) -> None:
+class FakeVolume:
+    def __init__(self) -> None:
+        self.commit_count = 0
+
+    def commit(self) -> None:
+        self.commit_count += 1
+
+
+def test_runtime_image_uses_rosetta_base_build() -> None:
+    source = Path(ensirna_app.__file__).read_text(encoding="utf-8")
+
+    assert 'from_registry("rosettacommons/rosetta:serial-420"' in source
+    assert ".debian_slim(" not in source
+    assert "tanwenchong/ensirna:v2" not in source
+    assert 'PATH": "/root/.local/bin:$PATH"' in source
+    assert "ROSETTA_EXTRACT_SHIM" in source
+    assert "rna_denovo.static.linuxgccrelease" in source
+    assert "GET_PDB_RUNTIME_PATCH" in source
+    assert "expected_len = 61 + len(seq2) + len(seq1) + 1 + 1" in source
+    assert "def _fit_secstruct(secstruct, size):" in source
+    assert "-out:file:silent" in source
+    assert "https://huggingface.co/cuhkaih/rnafm/resolve/main" in source
+    assert "RNA-FM_pretrained.pth" in source
+    assert "find . -path '*/pkl/*.ckpt' -delete" in source
+    assert "download_ensirna_models" in source
+    assert "MODEL_VOLUME.commit()" in source
+    assert "download_files(" in source
+    assert "curl -fL --retry" not in source
+    assert "viennarna=2.6.4-0" in source
+    assert (
+        "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118"
+        in source
+    )
+    assert "rna-fm" in source
+    assert "ignore_dep_versions=True" in source
+    assert 'skip_deps=["uniaf3"]' in source
+
+
+def test_download_ensirna_models_writes_to_model_volume(monkeypatch) -> None:
     captured = {}
-    volume = SimpleNamespace(commit_count=0)
+    volume = FakeVolume()
 
-    def commit():
-        volume.commit_count += 1
+    def fake_download_files(urls, **kwargs):
+        captured["urls"] = urls
+        captured["kwargs"] = kwargs
 
-    volume.commit = commit
+    monkeypatch.setattr(ensirna_app, "download_files", fake_download_files)
+    monkeypatch.setattr(ensirna_app, "MODEL_VOLUME", volume)
 
-    def fake_run_command(cmd):
+    ensirna_app.download_ensirna_models.get_raw_f()(force=True)
+
+    assert len(captured["urls"]) == 6
+    assert ensirna_app.RNAFM_PRETRAINED_URL in captured["urls"]
+    assert captured["kwargs"]["force"] is True
+    assert captured["kwargs"]["num_retries"] == 3
+    assert volume.commit_count == 1
+    for filename in ensirna_app.ENSIRNA_CHECKPOINT_FILENAMES:
+        assert (ensirna_app.ENSIRNA_CHECKPOINT_DIR / filename) in captured[
+            "urls"
+        ].values()
+
+
+def test_run_ensirna_uses_documented_design_pipeline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured = {}
+    ensirna_dir = tmp_path / "ENsiRNA"
+    checkpoint_dir = tmp_path / "models" / "pkl"
+    (ensirna_dir / "pkl").mkdir(parents=True)
+    checkpoint_dir.mkdir(parents=True)
+    for filename in ensirna_app.ENSIRNA_CHECKPOINT_FILENAMES:
+        (checkpoint_dir / filename).write_bytes(b"checkpoint")
+
+    def fake_run_command(cmd, *, cwd):
         captured["cmd"] = cmd
+        captured["cwd"] = cwd
 
     def fake_package_outputs(root):
         captured["root"] = Path(root)
@@ -26,7 +91,8 @@ def test_run_ensirna_uses_documented_design_pipeline(monkeypatch) -> None:
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
     monkeypatch.setattr(ensirna_app, "package_outputs", fake_package_outputs)
-    monkeypatch.setattr(ensirna_app, "MODEL_VOLUME", volume)
+    monkeypatch.setattr(ensirna_app, "ENSIRNA_DIR", ensirna_dir)
+    monkeypatch.setattr(ensirna_app, "ENSIRNA_CHECKPOINT_DIR", checkpoint_dir)
 
     result = ensirna_app.run_ensirna.get_raw_f()(
         mrna_fasta_bytes=b">m\nAUGCUAGCUAGCUAGCUAGC\n",
@@ -34,11 +100,20 @@ def test_run_ensirna_uses_documented_design_pipeline(monkeypatch) -> None:
     )
 
     assert result == b"archive"
-    assert captured["cmd"][:2] == ["bash", "-lc"]
-    assert f"cd {ensirna_app.ENSIRNA_DIR};" in captured["cmd"][2]
-    assert "bash design.sh" in captured["cmd"][2]
+    assert captured["cmd"][:6] == [
+        "micromamba",
+        "run",
+        "-n",
+        ensirna_app.ENSIRNA_ENV_NAME,
+        "bash",
+        "design.sh",
+    ]
+    assert Path(captured["cmd"][6]).name == "mrna.fasta"
+    assert Path(captured["cmd"][7]).name == "outputs"
+    assert captured["cwd"] == ensirna_dir
     assert captured["root"].name == "outputs"
-    assert volume.commit_count == 1
+    for filename in ensirna_app.ENSIRNA_CHECKPOINT_FILENAMES:
+        assert (ensirna_dir / "pkl" / filename).resolve() == checkpoint_dir / filename
 
 
 def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> None:
@@ -46,11 +121,16 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
     input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
     captured = {}
 
+    class FakeDownload:
+        def remote(self, *, force: bool):
+            captured["download_force"] = force
+
     class FakeRun:
         def remote(self, **kwargs):
-            captured.update(kwargs)
+            captured["run"] = kwargs
             return b"archive"
 
+    monkeypatch.setattr(ensirna_app, "download_ensirna_models", FakeDownload())
     monkeypatch.setattr(ensirna_app, "run_ensirna", FakeRun())
     raw_f = ensirna_app.submit_ensirna_task.info.raw_f
     assert raw_f is not None
@@ -61,7 +141,8 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
         run_name="demo",
     )
 
-    assert captured == {
+    assert captured["download_force"] is False
+    assert captured["run"] == {
         "mrna_fasta_bytes": b">m\nAUGCUAGCUAGCUAGCUAGC\n",
         "run_name": "demo",
     }

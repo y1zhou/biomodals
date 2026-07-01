@@ -11,6 +11,6 @@ ENTRY_BIN=$(realpath "${BIOMODALS_ROOT}/biomodals")
 temp_dir=$(mktemp -d)
 
 "${ENTRY_BIN}" app r ensirna -- \
-    --mrna-fasta "${SCRIPT_DIR}/../data/sirna_target.fa" \
+    --mrna-fasta "${SCRIPT_DIR}/../data/ensirna_target.fa" \
     --out-dir "${temp_dir}" \
     --run-name biomodals_ensirna_example

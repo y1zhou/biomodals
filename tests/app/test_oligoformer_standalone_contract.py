@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import tarfile
+import threading
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -120,6 +121,7 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
 
 def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkeypatch):
     captured: dict[str, object] = {"commands": []}
+    script_barrier = threading.Barrier(2, timeout=2)
     volume = FakeVolume()
     repo_dir = tmp_path / "repo"
     repo_dir.joinpath("toxicity").mkdir(parents=True)
@@ -160,6 +162,12 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         commands = captured["commands"]
         assert isinstance(commands, list)
         commands.append(cmd)
+        try:
+            script_barrier.wait()
+        except threading.BrokenBarrierError as exc:
+            raise AssertionError(
+                "off-target scripts did not start concurrently"
+            ) from exc
         infer_dir = repo_dir / "data/infer/target"
         infer_dir.mkdir(parents=True, exist_ok=True)
         if cmd[1] == "scripts/pita.sh":
@@ -190,8 +198,10 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     assert result == b"archive"
     commands = captured["commands"]
     assert isinstance(commands, list)
-    assert commands[0][1] == "scripts/pita.sh"
-    assert commands[1][1] == "scripts/targetscan.sh"
+    assert {command[1] for command in commands} == {
+        "scripts/pita.sh",
+        "scripts/targetscan.sh",
+    }
     assert captured["package_root"] == layout.outputs_dir
     assert "off_target_filter" in final_table
     assert "toxicity_filter" in final_table

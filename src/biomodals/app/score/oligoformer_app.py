@@ -504,8 +504,7 @@ def _apply_off_target_filters(
 ):
     """Apply upstream-equivalent PITA and TargetScan post-processing."""
     import shutil
-
-    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor
 
     infer_dir = CONF.git_clone_dir / "data/infer" / stem
     if infer_dir.exists():
@@ -518,14 +517,117 @@ def _apply_off_target_filters(
         sirna_file = infer_dir / "top_n_siRNA.fa"
     _write_sirna_fasta(result, sirna_file, top_n)
 
-    run_command(
+    # TODO(oligoformer-scale): Modal-node sharding can preserve Biomodals output
+    # by splitting siRNAs into isolated workdirs, then reducing PITA min(Score)
+    # and TargetScan max(score). The stock scripts are not safe to shard inside
+    # one checkout: PITA uses tmp_seqfile1/2 and TargetScan uses off-target/tmp.
+    commands = (
         ["bash", "scripts/pita.sh", utr_path, str(sirna_file), orf_path, stem],
-        cwd=CONF.git_clone_dir,
-    )
-    run_command(
         ["bash", "scripts/targetscan.sh", str(sirna_file), utr_path, orf_path, stem],
-        cwd=CONF.git_clone_dir,
     )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(run_command, command, cwd=CONF.git_clone_dir)
+            for command in commands
+        ]
+        for future in futures:
+            future.result()
+
+    try:
+        import polars as pl
+    except ImportError:
+        return _apply_off_target_filters_pandas(
+            result=result,
+            infer_dir=infer_dir,
+            top_n=top_n,
+            pita_threshold=pita_threshold,
+            targetscan_threshold=targetscan_threshold,
+        )
+
+    original_columns = list(result.columns)
+    pl_when = pl.when
+    result_pl = pl.DataFrame(result.to_dict(orient="list")).with_columns(
+        (pl.lit("RNA") + (pl.col("pos").cast(pl.Int64) - 1).cast(pl.String)).alias(
+            "tmp"
+        )
+    )
+    pita_raw = pl.read_csv(infer_dir / "pita.tab", separator="\t")
+    pita = pita_raw.group_by("microRNA").agg(pl.col("Score").min().alias("pita_score"))
+    result_pl = result_pl.join(pita, left_on="tmp", right_on="microRNA", how="left")
+    result_pl = result_pl.with_columns(
+        pl_when(pl.col("pita_score") < pita_threshold)
+        .then(1)
+        .otherwise(0)
+        .alias("pita_filter")
+    )
+    if top_n != -1:
+        result_pl = result_pl.with_columns(
+            pl_when(pl.col("pita_score").is_null())
+            .then(-1)
+            .otherwise(pl.col("pita_filter"))
+            .alias("pita_filter")
+        )
+
+    targetscan_raw = pl.read_csv(
+        infer_dir / "targetscan.tab",
+        separator="\t",
+        has_header=False,
+        new_columns=["refseq", "siRNA", "targetscan_score"],
+    )
+    targetscan = targetscan_raw.group_by("siRNA").agg(
+        pl.col("targetscan_score").max().alias("targetscan_score")
+    )
+    pita_sirnas = pita.select(pl.col("microRNA").alias("siRNA"))
+    missing_targetscan = pita_sirnas.join(
+        targetscan.select("siRNA"), on="siRNA", how="anti"
+    ).with_columns(pl.lit(0.0).alias("targetscan_score"))
+    targetscan = pl.concat([targetscan, missing_targetscan], how="vertical_relaxed")
+    result_pl = result_pl.join(targetscan, left_on="tmp", right_on="siRNA", how="left")
+    result_pl = result_pl.with_columns(
+        pl_when(pl.col("targetscan_score") > targetscan_threshold)
+        .then(1)
+        .otherwise(0)
+        .alias("targetscan_filter")
+    )
+    if top_n != -1:
+        result_pl = result_pl.with_columns(
+            pl_when(pl.col("targetscan_score").is_null())
+            .then(-1)
+            .otherwise(pl.col("targetscan_filter"))
+            .alias("targetscan_filter")
+        )
+
+    pita_hit = pl.col("pita_filter") == 1
+    targetscan_hit = pl.col("targetscan_filter") == 1
+    if top_n == -1:
+        off_target_filter = pl_when(pita_hit | targetscan_hit).then(1).otherwise(0)
+    else:
+        pita_missing = pl.col("pita_filter") == -1
+        targetscan_missing = pl.col("targetscan_filter") == -1
+        off_target_filter = (
+            pl_when(pita_missing | targetscan_missing)
+            .then(-5)
+            .when(pita_hit | targetscan_hit)
+            .then(1)
+            .otherwise(0)
+        )
+    result_pl = result_pl.with_columns(off_target_filter.alias("off_target_filter"))
+    result_pl = result_pl.select(
+        original_columns + ["pita_score", "targetscan_score", "off_target_filter"]
+    )
+    return result.__class__(result_pl.to_dict(as_series=False))
+
+
+def _apply_off_target_filters_pandas(
+    *,
+    result,
+    infer_dir: Path,
+    top_n: int,
+    pita_threshold: float,
+    targetscan_threshold: float,
+):
+    """Apply off-target table merges with the legacy pandas implementation."""
+    import pandas as pd
 
     pita = pd.read_csv(infer_dir / "pita.tab", sep="\t")
     pita = (

@@ -78,6 +78,9 @@ class AppInfo:
     )
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
     model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
+    repo_ref_dir: Path = CONF.git_clone_dir / "off-target/ref"
+    model_ref_dir: Path = Path(CONF.model_volume_mountpoint) / "off-target/ref"
+    human_ref_filenames: tuple[str, ...] = ("human_UTR.txt", "human_ORF.txt")
 
     @property
     def model_rnafm_redevelop_dir(self) -> Path:
@@ -88,6 +91,22 @@ class AppInfo:
     def repo_rnafm_redevelop_dir(self) -> Path:
         """Return the runtime RNA-FM redevelop directory inside OligoFormer."""
         return self.repo_rnafm_dir / "redevelop"
+
+    @property
+    def human_ref_downloads(self) -> dict[str, Path]:
+        """Return full-human off-target reference zip downloads."""
+        return {
+            (
+                f"{CONF.repo_url}/raw/{CONF.repo_commit_hash}/off-target/ref/"
+                f"{filename}.zip"
+            ): self.model_ref_dir / f"{filename}.zip"
+            for filename in self.human_ref_filenames
+        }
+
+    @property
+    def model_human_ref_paths(self) -> tuple[Path, ...]:
+        """Return extracted full-human off-target reference paths."""
+        return tuple(self.model_ref_dir / name for name in self.human_ref_filenames)
 
 
 APP_INFO = AppInfo()
@@ -115,6 +134,9 @@ runtime_image = (
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
             f"cd {CONF.git_clone_dir}",
             f"git checkout {CONF.repo_commit_hash}",
+            "grep -q \"Args.orf = './off-target/ref/human_UTR.txt'\" scripts/infer.py",
+            "sed -i \"s|Args.orf = './off-target/ref/human_UTR.txt'|Args.orf = './off-target/ref/human_ORF.txt'|\" scripts/infer.py",
+            "rm -f off-target/ref/human_UTR.txt.zip off-target/ref/human_ORF.txt.zip",
             "cd off-target/pita",
             "make install",
         ))
@@ -135,41 +157,66 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=CONF.timeout
 )
 def download_oligoformer_models(force: bool = False) -> None:
-    """Download RNA-FM weights into the standard model volume."""
+    """Download RNA-FM weights and full-human refs into the model volume."""
     import shutil
+    import zipfile
 
-    if APP_INFO.model_rnafm_redevelop_dir.is_dir() and not force:
-        print("🧬 OligoFormer RNA-FM weights already available")
+    refs_ready = all(path.is_file() for path in APP_INFO.model_human_ref_paths)
+    if APP_INFO.model_rnafm_redevelop_dir.is_dir() and refs_ready and not force:
+        print("🧬 OligoFormer models and human refs already available")
         return
 
-    if APP_INFO.model_rnafm_dir.exists():
+    if APP_INFO.model_rnafm_dir.exists() and force:
         shutil.rmtree(APP_INFO.model_rnafm_dir)
 
-    with TemporaryDirectory(prefix="oligoformer_models_") as tmpdir:
-        archive_path = Path(tmpdir) / "RNA-FM.tar.gz"
+    if force or not APP_INFO.model_rnafm_redevelop_dir.is_dir():
+        with TemporaryDirectory(prefix="oligoformer_models_") as tmpdir:
+            archive_path = Path(tmpdir) / "RNA-FM.tar.gz"
+            download_files(
+                {APP_INFO.rnafm_archive_url: archive_path},
+                force=True,
+                num_retries=3,
+                progress_bar_desc="OligoFormer model downloads",
+            )
+            APP_INFO.model_rnafm_dir.parent.mkdir(parents=True, exist_ok=True)
+            run_command([
+                "tar",
+                "-xzf",
+                str(archive_path),
+                "-C",
+                str(APP_INFO.model_rnafm_dir.parent),
+            ])
+
+    if force or not refs_ready:
+        APP_INFO.model_ref_dir.mkdir(parents=True, exist_ok=True)
         download_files(
-            {APP_INFO.rnafm_archive_url: archive_path},
-            force=True,
+            APP_INFO.human_ref_downloads,
+            force=force,
             num_retries=3,
-            progress_bar_desc="OligoFormer model downloads",
+            progress_bar_desc="OligoFormer human ref downloads",
         )
-        APP_INFO.model_rnafm_dir.parent.mkdir(parents=True, exist_ok=True)
-        run_command([
-            "tar",
-            "-xzf",
-            str(archive_path),
-            "-C",
-            str(APP_INFO.model_rnafm_dir.parent),
-        ])
+        for ref_path in APP_INFO.model_human_ref_paths:
+            if force or not ref_path.is_file():
+                with zipfile.ZipFile(
+                    ref_path.with_suffix(ref_path.suffix + ".zip")
+                ) as ref_zip:
+                    ref_path.write_bytes(ref_zip.read(ref_path.name))
 
     if not APP_INFO.model_rnafm_redevelop_dir.is_dir():
         raise FileNotFoundError(
             "OligoFormer RNA-FM weights were not extracted to "
             f"{APP_INFO.model_rnafm_redevelop_dir}"
         )
+    missing_refs = [
+        str(path) for path in APP_INFO.model_human_ref_paths if not path.is_file()
+    ]
+    if missing_refs:
+        raise FileNotFoundError(
+            "OligoFormer full-human refs were not extracted: " + ", ".join(missing_refs)
+        )
 
     MODEL_VOLUME.commit()
-    print("🧬 OligoFormer RNA-FM weights downloaded and committed")
+    print("🧬 OligoFormer models and human refs downloaded and committed")
 
 
 ##########################################
@@ -222,6 +269,18 @@ def run_oligoformer(
         shutil.rmtree(APP_INFO.repo_rnafm_dir)
     if not APP_INFO.repo_rnafm_redevelop_dir.is_dir():
         shutil.copytree(APP_INFO.model_rnafm_dir, APP_INFO.repo_rnafm_dir)
+    if all_human:
+        APP_INFO.repo_ref_dir.mkdir(parents=True, exist_ok=True)
+        for model_ref_path in APP_INFO.model_human_ref_paths:
+            if not model_ref_path.is_file():
+                raise FileNotFoundError(
+                    "OligoFormer full-human ref is missing. Run "
+                    f"download_oligoformer_models first: {model_ref_path}"
+                )
+            repo_ref_path = APP_INFO.repo_ref_dir / model_ref_path.name
+            if repo_ref_path.exists() or repo_ref_path.is_symlink():
+                repo_ref_path.unlink()
+            repo_ref_path.symlink_to(model_ref_path)
 
     safe_run_name = sanitize_filename(run_name)
     with TemporaryDirectory(prefix=f"oligoformer_{safe_run_name}_") as tmpdir:

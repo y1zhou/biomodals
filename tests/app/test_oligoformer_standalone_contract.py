@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,8 @@ def test_run_oligoformer_builds_off_target_and_toxicity_command(
     info = oligoformer_app.AppInfo(
         repo_rnafm_dir=tmp_path / "repo" / "RNA-FM",
         model_rnafm_dir=tmp_path / "models" / "RNA-FM",
+        repo_ref_dir=tmp_path / "repo" / "off-target" / "ref",
+        model_ref_dir=tmp_path / "models" / "off-target" / "ref",
     )
     info.repo_rnafm_dir.parent.mkdir(parents=True)
     info.model_rnafm_redevelop_dir.mkdir(parents=True)
@@ -86,20 +89,29 @@ def test_download_oligoformer_models_writes_to_model_volume(
     info = oligoformer_app.AppInfo(
         repo_rnafm_dir=tmp_path / "repo" / "RNA-FM",
         model_rnafm_dir=tmp_path / "models" / "RNA-FM",
+        repo_ref_dir=tmp_path / "repo" / "off-target" / "ref",
+        model_ref_dir=tmp_path / "models" / "off-target" / "ref",
     )
-    captured = {}
+    calls = []
 
     def fake_download_files(urls, *, force, num_retries, progress_bar_desc):
-        captured["urls"] = urls
-        captured["force"] = force
-        captured["num_retries"] = num_retries
-        captured["progress_bar_desc"] = progress_bar_desc
-        archive_path = next(iter(urls.values()))
-        Path(archive_path).parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(archive_path, "w:gz") as archive:
-            payload = tmp_path / "model.pt"
-            payload.write_text("weights", encoding="utf-8")
-            archive.add(payload, arcname="RNA-FM/redevelop/model.pt")
+        calls.append({
+            "urls": urls,
+            "force": force,
+            "num_retries": num_retries,
+            "progress_bar_desc": progress_bar_desc,
+        })
+        for archive_path in urls.values():
+            Path(archive_path).parent.mkdir(parents=True, exist_ok=True)
+            if str(archive_path).endswith(".tar.gz"):
+                with tarfile.open(archive_path, "w:gz") as archive:
+                    payload = tmp_path / "model.pt"
+                    payload.write_text("weights", encoding="utf-8")
+                    archive.add(payload, arcname="RNA-FM/redevelop/model.pt")
+            else:
+                ref_name = Path(archive_path).name.removesuffix(".zip")
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr(ref_name, f">{ref_name}\nAUGC\n")
 
     monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
     monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", volume)
@@ -107,15 +119,67 @@ def test_download_oligoformer_models_writes_to_model_volume(
 
     oligoformer_app.download_oligoformer_models.get_raw_f()(force=True)
 
-    assert list(captured["urls"]) == [info.rnafm_archive_url]
-    assert captured["force"] is True
-    assert captured["num_retries"] == 3
-    assert captured["progress_bar_desc"] == "OligoFormer model downloads"
+    assert list(calls[0]["urls"]) == [info.rnafm_archive_url]
+    assert calls[0]["force"] is True
+    assert calls[0]["num_retries"] == 3
+    assert calls[0]["progress_bar_desc"] == "OligoFormer model downloads"
+    assert calls[1]["urls"] == info.human_ref_downloads
+    assert calls[1]["progress_bar_desc"] == "OligoFormer human ref downloads"
     assert (
         info.model_rnafm_redevelop_dir.joinpath("model.pt").read_text(encoding="utf-8")
         == "weights"
     )
+    for ref_path in info.model_human_ref_paths:
+        assert ref_path.read_text(encoding="utf-8") == f">{ref_path.name}\nAUGC\n"
     assert volume.commit_count == 1
+
+
+def test_run_oligoformer_all_human_uses_cached_refs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured = {}
+    info = oligoformer_app.AppInfo(
+        repo_rnafm_dir=tmp_path / "repo" / "RNA-FM",
+        model_rnafm_dir=tmp_path / "models" / "RNA-FM",
+        repo_ref_dir=tmp_path / "repo" / "off-target" / "ref",
+        model_ref_dir=tmp_path / "models" / "off-target" / "ref",
+    )
+    info.repo_rnafm_dir.parent.mkdir(parents=True)
+    info.model_rnafm_redevelop_dir.mkdir(parents=True)
+    info.model_ref_dir.mkdir(parents=True)
+    info.model_rnafm_redevelop_dir.joinpath("model.pt").write_text(
+        "weights", encoding="utf-8"
+    )
+    for ref_path in info.model_human_ref_paths:
+        ref_path.write_text(f">{ref_path.name}\nAUGC\n", encoding="utf-8")
+
+    def fake_run_command(cmd, *, cwd):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        output_dir = Path(cmd[cmd.index("--output_dir") + 1])
+        output_dir.joinpath("result.csv").write_text("ok\n", encoding="utf-8")
+
+    monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
+    monkeypatch.setattr(oligoformer_app, "package_outputs", lambda root: b"archive")
+    monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
+
+    result = oligoformer_app.run_oligoformer.get_raw_f()(
+        mrna_fasta_bytes=b">m\nAUGCUAGCUAGCUAGCUAGCUAGC\n",
+        run_name="demo",
+        off_target=True,
+        all_human=True,
+        top_n=1,
+    )
+
+    assert result == b"archive"
+    assert "-off" in captured["cmd"]
+    assert "-a" in captured["cmd"]
+    assert "--utr" not in captured["cmd"]
+    assert "--orf" not in captured["cmd"]
+    for ref_path in info.model_human_ref_paths:
+        repo_ref = info.repo_ref_dir / ref_path.name
+        assert repo_ref.resolve() == ref_path
+        assert repo_ref.read_text(encoding="utf-8") == f">{ref_path.name}\nAUGC\n"
 
 
 def test_submit_oligoformer_downloads_models_before_run(

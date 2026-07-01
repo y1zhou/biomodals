@@ -135,7 +135,6 @@ def test_prepare_inputs_reuses_completed_volume_cache(
 
     result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
         mrna_fasta_bytes=fasta,
-        run_name="demo",
         max_prepare_jobs=8,
     )
 
@@ -189,7 +188,6 @@ def test_prepare_inputs_creates_cpu_chunk_plan(
 
     result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
         mrna_fasta_bytes=b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-        run_name="demo",
         max_prepare_jobs=2,
     )
 
@@ -212,6 +210,138 @@ def test_prepare_inputs_creates_cpu_chunk_plan(
         .startswith("siRNA,anti seq")
     )
     assert Path(result.chunks[0].pdb_dir).name == "mrna_pdb"
+    assert output_volume.reload_count == 1
+    assert output_volume.commit_count == 1
+
+
+def test_prepare_inputs_preserves_pdb_cache_and_chunks_missing_work(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ensirna_dir = tmp_path / "ENsiRNA"
+    ensirna_dir.mkdir()
+    output_volume = FakeVolume()
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=output_volume, output_volume_mountpoint=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr(
+        ensirna_app,
+        "APP_INFO",
+        replace(
+            ensirna_app.APP_INFO,
+            ensirna_dir=ensirna_dir,
+        ),
+    )
+    fasta = b">m\nAUGCUAGCUAGCUAGCUAGC\n"
+    cache_key = ensirna_app._cache_key_for_fasta(fasta)
+    layout = ensirna_app._layout_for_cache_key(cache_key)
+    layout.outputs_dir.mkdir(parents=True)
+    layout.outputs_dir.joinpath("mrna.csv").write_text(
+        "siRNA,anti seq,sense seq,mRNA_seq,position,efficacy\n"
+        "m_0,GC,CG,AUGC,0,0\n"
+        "m_1,GC,CG,AUGC,1,0\n"
+        "m_2,GC,CG,AUGC,2,0\n",
+        encoding="utf-8",
+    )
+    pdb_dir = layout.outputs_dir / "mrna_pdb"
+    pdb_dir.mkdir()
+    pdb_dir.joinpath("m_0.pdb").write_text("PDB", encoding="utf-8")
+    pdb_dir.joinpath("m_1").mkdir()
+    layout.prep_dir.mkdir(parents=True)
+    layout.prep_dir.joinpath("chunk_0000.json").write_text(
+        '{"siRNA":"m_0"}\n', encoding="utf-8"
+    )
+
+    def fake_run_command(*args, **kwargs):
+        raise AssertionError("existing candidate CSV should be reused")
+
+    monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
+
+    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+        mrna_fasta_bytes=fasta,
+        max_prepare_jobs=4,
+    )
+
+    assert result.cached is False
+    assert result.candidate_count == 3
+    assert result.chunk_count == 2
+    assert [chunk.chunk_name for chunk in result.chunks] == [
+        "chunk_0001",
+        "chunk_0002",
+    ]
+    assert pdb_dir.joinpath("m_0.pdb").exists()
+    assert not pdb_dir.joinpath("m_1").exists()
+    assert layout.prep_dir.joinpath("chunk_0000.json").exists()
+    chunk_csv_text = "\n".join(
+        Path(chunk.csv_path).read_text(encoding="utf-8") for chunk in result.chunks
+    )
+    assert "m_0,GC,CG,AUGC,0,0" not in chunk_csv_text
+    assert "m_1,GC,CG,AUGC,1,0" in chunk_csv_text
+    assert "m_2,GC,CG,AUGC,2,0" in chunk_csv_text
+    assert output_volume.reload_count == 1
+    assert output_volume.commit_count == 1
+
+
+def test_prepare_inputs_force_deletes_existing_pdb_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured = {}
+    ensirna_dir = tmp_path / "ENsiRNA"
+    ensirna_dir.mkdir()
+    output_volume = FakeVolume()
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=output_volume, output_volume_mountpoint=str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr(
+        ensirna_app,
+        "APP_INFO",
+        replace(
+            ensirna_app.APP_INFO,
+            ensirna_dir=ensirna_dir,
+        ),
+    )
+    fasta = b">m\nAUGCUAGCUAGCUAGCUAGC\n"
+    cache_key = ensirna_app._cache_key_for_fasta(fasta)
+    layout = ensirna_app._layout_for_cache_key(cache_key)
+    old_pdb = layout.outputs_dir / "mrna_pdb" / "m_0.pdb"
+    old_pdb.parent.mkdir(parents=True)
+    old_pdb.write_text("PDB", encoding="utf-8")
+    layout.prep_dir.mkdir(parents=True)
+    layout.prep_dir.joinpath("chunk_0007.json").write_text(
+        '{"siRNA":"m_0"}\n', encoding="utf-8"
+    )
+
+    def fake_run_command(cmd, **kwargs):
+        captured["old_pdb_exists_during_get_sirna"] = old_pdb.exists()
+        out_dir = Path(cmd[cmd.index("-o") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.joinpath("mrna.csv").write_text(
+            "siRNA,anti seq,sense seq,mRNA_seq,position,efficacy\nm_0,GC,CG,AUGC,0,0\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
+
+    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+        mrna_fasta_bytes=fasta,
+        max_prepare_jobs=4,
+        force=True,
+    )
+
+    assert captured["old_pdb_exists_during_get_sirna"] is False
+    assert not old_pdb.exists()
+    assert not layout.prep_dir.joinpath("chunk_0007.json").exists()
+    assert result.chunk_count == 1
+    assert [chunk.chunk_name for chunk in result.chunks] == ["chunk_0000"]
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
 
@@ -295,7 +425,6 @@ def test_finalize_prepared_inputs_merges_json_only_on_cpu(
         prepared_dir=str(layout.run_root),
         json_path=str(layout.outputs_dir / "mrna.json"),
         processed_dir=str(layout.outputs_dir / "mrna_processed"),
-        result_xlsx=str(layout.outputs_dir / "mrna_result.xlsx"),
         candidate_count=2,
         chunk_count=2,
         chunks=[
@@ -322,6 +451,64 @@ def test_finalize_prepared_inputs_merges_json_only_on_cpu(
     assert result.cached is False
     assert not ensirna_app._prepared_marker_path(layout).exists()
     assert not Path(plan.processed_dir).exists()
+    assert output_volume.reload_count == 1
+    assert output_volume.commit_count == 1
+
+
+def test_finalize_prepared_inputs_merges_cached_and_new_json_in_csv_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_volume = FakeVolume()
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(output_volume=output_volume),
+    )
+    layout = ensirna_app.AppRunLayout.from_run_root(tmp_path / "prepared")
+    layout.outputs_dir.mkdir(parents=True)
+    layout.prep_dir.mkdir(parents=True)
+    layout.outputs_dir.joinpath("mrna.csv").write_text(
+        "siRNA,anti seq,sense seq,mRNA_seq,position,efficacy\n"
+        "m_0,GC,CG,AUGC,0,0\n"
+        "m_1,GC,CG,AUGC,1,0\n"
+        "m_2,GC,CG,AUGC,2,0\n",
+        encoding="utf-8",
+    )
+    layout.prep_dir.joinpath("chunk_0000.json").write_text(
+        '{"siRNA":"m_0"}\n', encoding="utf-8"
+    )
+    chunk_a = layout.prep_dir / "chunk_0001.json"
+    chunk_b = layout.prep_dir / "chunk_0002.json"
+    chunk_a.write_text('{"siRNA":"m_2"}\n', encoding="utf-8")
+    chunk_b.write_text('{"siRNA":"m_1"}\n', encoding="utf-8")
+    plan = ensirna_app.EnsirnaPreparationPlan(
+        cache_key="abc123",
+        prepared_dir=str(layout.run_root),
+        json_path=str(layout.outputs_dir / "mrna.json"),
+        processed_dir=str(layout.outputs_dir / "mrna_processed"),
+        candidate_count=3,
+        chunk_count=2,
+        chunks=[
+            ensirna_app.EnsirnaPdbChunkSpec(
+                "chunk_0001", "unused.csv", str(chunk_a), "unused_pdb"
+            ),
+            ensirna_app.EnsirnaPdbChunkSpec(
+                "chunk_0002", "unused.csv", str(chunk_b), "unused_pdb"
+            ),
+        ],
+        cached=False,
+    )
+
+    def fake_run_command(*_args, **_kwargs):
+        raise AssertionError("CPU finalize should not run dataset preprocessing")
+
+    monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
+    ensirna_app.ensirna_finalize_prepared_inputs.get_raw_f()(plan)
+
+    assert Path(plan.json_path).read_text(encoding="utf-8") == (
+        '{"siRNA":"m_0"}\n{"siRNA":"m_1"}\n{"siRNA":"m_2"}\n'
+    )
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
 
@@ -362,7 +549,6 @@ def test_preprocess_dataset_runs_rnafm_on_gpu_and_marks_cache(
         prepared_dir=str(layout.run_root),
         json_path=str(layout.outputs_dir / "mrna.json"),
         processed_dir=str(layout.outputs_dir / "mrna_processed"),
-        result_xlsx=str(layout.outputs_dir / "mrna_result.xlsx"),
         candidate_count=2,
         chunk_count=2,
         chunks=[],
@@ -401,7 +587,7 @@ def test_preprocess_dataset_runs_rnafm_on_gpu_and_marks_cache(
     assert output_volume.commit_count == 1
 
 
-def test_run_ensirna_inference_uses_prepared_artifacts(
+def test_run_ensirna_inference_returns_result_xlsx_bytes(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -443,18 +629,12 @@ def test_run_ensirna_inference_uses_prepared_artifacts(
         captured["cwd"] = kwargs["cwd"]
         layout.outputs_dir.joinpath("mrna_result.xlsx").write_bytes(b"xlsx")
 
-    def fake_package_outputs(root, **kwargs):
-        captured["package_root"] = Path(root)
-        captured["package_paths"] = kwargs["paths_to_bundle"]
-        return b"archive"
-
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    monkeypatch.setattr(ensirna_app, "package_outputs", fake_package_outputs)
     result = ensirna_app.run_ensirna_inference.get_raw_f()(
         prepared_dir=str(layout.run_root)
     )
 
-    assert result == b"archive"
+    assert result == b"xlsx"
     assert captured["cmd"][:6] == [
         "micromamba",
         "run",
@@ -472,15 +652,13 @@ def test_run_ensirna_inference_uses_prepared_artifacts(
     assert captured["cmd"][captured["cmd"].index("--gpu") + 1] == "0"
     assert captured["cmd"][captured["cmd"].index("--id") + 1] == "mrna"
     assert captured["cwd"] == ensirna_dir
-    assert captured["package_root"] == layout.outputs_dir
-    assert captured["package_paths"] == ensirna_app.APP_INFO.output_paths
     for filename in ensirna_app.APP_INFO.checkpoint_filenames:
         assert (ensirna_dir / "pkl" / filename).resolve() == checkpoint_dir / filename
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
 
 
-def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> None:
+def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     input_fasta = tmp_path / "target.fa"
     input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
     captured = {}
@@ -492,7 +670,7 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
     class FakeRun:
         def remote(self, **kwargs):
             captured["run"] = kwargs
-            return b"archive"
+            return b"xlsx"
 
     monkeypatch.setattr(ensirna_app, "download_ensirna_models", FakeDownload())
     chunk = ensirna_app.EnsirnaPdbChunkSpec(
@@ -506,7 +684,6 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
         prepared_dir="/remote/prepared",
         json_path="/remote/outputs/mrna.json",
         processed_dir="/remote/outputs/mrna_processed",
-        result_xlsx="/remote/outputs/mrna_result.xlsx",
         candidate_count=1,
         chunk_count=1,
         chunks=[chunk],
@@ -517,7 +694,6 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
         prepared_dir="/remote/prepared",
         json_path="/remote/outputs/mrna.json",
         processed_dir="/remote/outputs/mrna_processed",
-        result_xlsx="/remote/outputs/mrna_result.xlsx",
         candidate_count=1,
         chunk_count=1,
         chunks=[],
@@ -528,7 +704,6 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
         prepared_dir="/remote/prepared",
         json_path="/remote/outputs/mrna.json",
         processed_dir="/remote/outputs/mrna_processed",
-        result_xlsx="/remote/outputs/mrna_result.xlsx",
         candidate_count=1,
         chunk_count=1,
         chunks=[],
@@ -572,7 +747,6 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
     assert captured["download_force"] is False
     assert captured["prepare"] == {
         "mrna_fasta_bytes": b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-        "run_name": "demo",
         "max_prepare_jobs": 4,
         "force": False,
     }
@@ -580,4 +754,4 @@ def test_submit_ensirna_writes_local_tarball(tmp_path: Path, monkeypatch) -> Non
     assert captured["finalize"] == prepare_plan
     assert captured["preprocess"] == finalized_plan
     assert captured["run"] == {"prepared_dir": "/remote/prepared", "force": False}
-    assert (tmp_path / "demo_ensirna.tar.zst").read_bytes() == b"archive"
+    assert (tmp_path / "demo.xlsx").read_bytes() == b"xlsx"

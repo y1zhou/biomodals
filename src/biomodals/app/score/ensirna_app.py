@@ -14,9 +14,8 @@ the standard Biomodals model volume.
 
 ## Outputs
 
-Results are saved locally as `<run-name>_ensirna.tar.zst`. The archive contains
-the upstream ENsiRNA output directory, including `mrna_result.xlsx` when the run
-completes successfully.
+Results are saved locally as `<run-name>.xlsx`, containing the upstream
+`mrna_result.xlsx` workbook.
 """
 
 # Ignore ruff warnings about import location
@@ -36,12 +35,8 @@ from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MODEL_VOLUME
-from biomodals.helper.io import (
-    build_local_output_path,
-    resolve_local_output_dir,
-    write_local_tarball,
-)
-from biomodals.helper.shell import package_outputs, run_command
+from biomodals.helper.io import resolve_local_output_dir
+from biomodals.helper.shell import run_command
 from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
@@ -294,18 +289,6 @@ path.write_text(text)
         """Return a Python one-liner that applies the dataset patch."""
         return f"exec({self.dataset_runtime_patch!r})"
 
-    @property
-    def output_paths(self) -> tuple[str, ...]:
-        """Return upstream-visible output paths relative to an output directory."""
-        stem = self.input_stem
-        return (
-            f"{stem}.csv",
-            f"{stem}.json",
-            f"{stem}_pdb",
-            f"{stem}_processed",
-            f"{stem}_result.xlsx",
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class EnsirnaPdbChunkSpec:
@@ -325,7 +308,6 @@ class EnsirnaPreparationPlan:
     prepared_dir: str
     json_path: str
     processed_dir: str
-    result_xlsx: str
     candidate_count: int
     chunk_count: int
     chunks: list[EnsirnaPdbChunkSpec]
@@ -376,7 +358,6 @@ def _plan_from_layout(
         prepared_dir=str(layout.run_root),
         json_path=str(layout.outputs_dir / f"{stem}.json"),
         processed_dir=str(layout.outputs_dir / f"{stem}_processed"),
-        result_xlsx=str(layout.outputs_dir / f"{stem}_result.xlsx"),
         candidate_count=candidate_count,
         chunk_count=chunk_count,
         chunks=[],
@@ -420,6 +401,38 @@ def _write_prepared_marker(
             "processed_dir": plan.processed_dir,
         })
     )
+
+
+def _load_prepared_json_records(layout: AppRunLayout) -> dict[str, dict]:
+    """Return existing prepared JSON records keyed by siRNA ID."""
+    import orjson
+
+    stem = APP_INFO.input_stem
+    records = {}
+    json_paths = [
+        layout.outputs_dir / f"{stem}.json",
+        *sorted(layout.prep_dir.glob("*.json")),
+    ]
+    for json_path in json_paths:
+        if not json_path.exists():
+            continue
+        for line in json_path.read_bytes().splitlines():
+            if not line.strip():
+                continue
+            record = orjson.loads(line)
+            if "siRNA" in record:
+                records[str(record["siRNA"])] = record
+    return records
+
+
+def _next_pdb_chunk_index(prep_dir: Path) -> int:
+    """Return the next collision-free numeric PDB chunk index."""
+    next_index = 0
+    for path in prep_dir.glob("chunk_*.*"):
+        chunk_id = path.stem.removeprefix("chunk_")
+        if chunk_id.isdecimal():
+            next_index = max(next_index, int(chunk_id) + 1)
+    return next_index
 
 
 def _link_checkpoints() -> None:
@@ -507,14 +520,12 @@ def download_ensirna_models(force: bool = False) -> None:
 )
 def ensirna_prepare_inputs(
     mrna_fasta_bytes: bytes,
-    run_name: str,
     max_prepare_jobs: int = 4,
     force: bool = False,
 ) -> EnsirnaPreparationPlan:
     """Create siRNA CSV and CPU PDB chunk work in the output volume."""
     import polars as pl
 
-    del run_name
     cache_key = _cache_key_for_fasta(mrna_fasta_bytes)
     CONF.output_volume.reload()
     layout = _layout_for_cache_key(cache_key)
@@ -523,48 +534,70 @@ def ensirna_prepare_inputs(
     ):
         return cached_plan
 
-    if layout.run_root.exists():
+    if force and layout.run_root.exists():
         shutil.rmtree(layout.run_root)
-    layout.inputs_dir.mkdir(parents=True)
-    layout.outputs_dir.mkdir(parents=True)
-    layout.prep_dir.mkdir(parents=True)
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    layout.outputs_dir.mkdir(parents=True, exist_ok=True)
+    layout.prep_dir.mkdir(parents=True, exist_ok=True)
 
     mrna_fasta = layout.inputs_dir / APP_INFO.input_fasta_name
     mrna_fasta.write_bytes(mrna_fasta_bytes)
-    run_command(
-        [
-            "micromamba",
-            "run",
-            "-n",
-            APP_INFO.conda_env_name,
-            "python",
-            "get_siRNA.py",
-            "-i",
-            str(mrna_fasta),
-            "-o",
-            str(layout.outputs_dir),
-        ],
-        cwd=APP_INFO.ensirna_dir,
-        output_mode="capture",
-    )
-
     stem = APP_INFO.input_stem
     csv_path = layout.outputs_dir / f"{stem}.csv"
+    if not csv_path.exists():
+        run_command(
+            [
+                "micromamba",
+                "run",
+                "-n",
+                APP_INFO.conda_env_name,
+                "python",
+                "get_siRNA.py",
+                "-i",
+                str(mrna_fasta),
+                "-o",
+                str(layout.outputs_dir),
+            ],
+            cwd=APP_INFO.ensirna_dir,
+            output_mode="capture",
+        )
+
     frame = pl.read_csv(csv_path)
     candidate_count = frame.height
     if candidate_count == 0:
         raise RuntimeError("ENsiRNA did not generate any siRNA candidates.")
 
-    chunk_count = min(max(1, max_prepare_jobs), candidate_count)
-    chunk_size = (candidate_count + chunk_count - 1) // chunk_count
     pdb_dir = layout.outputs_dir / f"{stem}_pdb"
-    pdb_dir.mkdir()
+    pdb_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate_sirnas = [str(value) for value in frame.get_column("siRNA").to_list()]
+    for sirna in candidate_sirnas:
+        lock_dir = pdb_dir / sirna
+        if lock_dir.is_dir():
+            shutil.rmtree(lock_dir)
+    existing_json_sirnas = set(_load_prepared_json_records(layout))
+    remaining_sirnas = [
+        sirna
+        for sirna in candidate_sirnas
+        if not (pdb_dir / f"{sirna}.pdb").exists() or sirna not in existing_json_sirnas
+    ]
+    remaining_frame = frame.filter(
+        pl.col("siRNA").cast(pl.String).is_in(remaining_sirnas)
+    )
 
     chunks = []
-    for idx, offset in enumerate(range(0, candidate_count, chunk_size)):
+    remaining_count = remaining_frame.height
+    chunk_count = min(max(1, max_prepare_jobs), remaining_count)
+    chunk_size = (
+        (remaining_count + chunk_count - 1) // chunk_count if remaining_count else 1
+    )
+    next_chunk_index = _next_pdb_chunk_index(layout.prep_dir)
+    for idx, offset in enumerate(range(0, remaining_count, chunk_size)):
         chunk_name = f"chunk_{idx:04d}"
+        if next_chunk_index:
+            chunk_name = f"chunk_{next_chunk_index + idx:04d}"
         chunk_csv = layout.prep_dir / f"{chunk_name}.csv"
-        frame.slice(offset, chunk_size).write_csv(chunk_csv)
+        remaining_frame.slice(offset, chunk_size).write_csv(chunk_csv)
         chunks.append(
             EnsirnaPdbChunkSpec(
                 chunk_name=chunk_name,
@@ -580,7 +613,6 @@ def ensirna_prepare_inputs(
         prepared_dir=str(layout.run_root),
         json_path=str(layout.outputs_dir / f"{stem}.json"),
         processed_dir=str(layout.outputs_dir / f"{stem}_processed"),
-        result_xlsx=str(layout.outputs_dir / f"{stem}_result.xlsx"),
         candidate_count=candidate_count,
         chunk_count=len(chunks),
         chunks=chunks,
@@ -636,25 +668,42 @@ def ensirna_finalize_prepared_inputs(
     plan: EnsirnaPreparationPlan,
 ) -> EnsirnaPreparationPlan:
     """Merge PDB chunk JSON files into the prepared dataset JSON."""
+    import orjson
+    import polars as pl
+
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(plan.prepared_dir)
     if cached_plan := _cached_preparation_plan(cache_key=plan.cache_key, layout=layout):
         return cached_plan
 
+    for chunk in plan.chunks:
+        chunk_json = Path(chunk.json_path)
+        if not chunk_json.exists():
+            raise FileNotFoundError(f"ENsiRNA PDB chunk JSON not found: {chunk_json}")
+
+    records = _load_prepared_json_records(layout)
+    stem = APP_INFO.input_stem
+    csv_path = layout.outputs_dir / f"{stem}.csv"
+    if csv_path.exists():
+        candidate_sirnas = [
+            str(value) for value in pl.read_csv(csv_path).get_column("siRNA").to_list()
+        ]
+        missing_sirnas = [sirna for sirna in candidate_sirnas if sirna not in records]
+        if missing_sirnas:
+            raise FileNotFoundError(
+                "ENsiRNA PDB JSON records missing for "
+                f"{len(missing_sirnas)} candidates: {missing_sirnas[:5]}"
+            )
+        ordered_records = [records[sirna] for sirna in candidate_sirnas]
+    else:
+        ordered_records = list(records.values())
+
     json_path = Path(plan.json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     with json_path.open("wb") as out:
-        for chunk in plan.chunks:
-            chunk_json = Path(chunk.json_path)
-            if not chunk_json.exists():
-                raise FileNotFoundError(
-                    f"ENsiRNA PDB chunk JSON not found: {chunk_json}"
-                )
-            data = chunk_json.read_bytes()
-            if data:
-                out.write(data)
-                if not data.endswith(b"\n"):
-                    out.write(b"\n")
+        for record in ordered_records:
+            out.write(orjson.dumps(record))
+            out.write(b"\n")
 
     CONF.output_volume.commit()
     return EnsirnaPreparationPlan(
@@ -662,7 +711,6 @@ def ensirna_finalize_prepared_inputs(
         prepared_dir=plan.prepared_dir,
         json_path=plan.json_path,
         processed_dir=plan.processed_dir,
-        result_xlsx=plan.result_xlsx,
         candidate_count=plan.candidate_count,
         chunk_count=plan.chunk_count,
         chunks=[],
@@ -729,7 +777,6 @@ def ensirna_preprocess_dataset(
         prepared_dir=plan.prepared_dir,
         json_path=plan.json_path,
         processed_dir=plan.processed_dir,
-        result_xlsx=plan.result_xlsx,
         candidate_count=plan.candidate_count,
         chunk_count=plan.chunk_count,
         chunks=[],
@@ -761,7 +808,7 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
         ]
         raise FileNotFoundError(f"ENsiRNA prepared inputs are incomplete: {missing}")
 
-    result_xlsx = layout.outputs_dir / f"{APP_INFO.input_stem}_result.xlsx"
+    result_xlsx = layout.outputs_dir / "mrna_result.xlsx"
     if force or not result_xlsx.exists():
         _link_checkpoints()
         checkpoint_args = [
@@ -791,10 +838,9 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
         )
         CONF.output_volume.commit()
 
-    return package_outputs(
-        layout.outputs_dir,
-        paths_to_bundle=APP_INFO.output_paths,
-    )
+    if not result_xlsx.exists():
+        raise FileNotFoundError(f"ENsiRNA result XLSX not found: {result_xlsx}")
+    return result_xlsx.read_bytes()
 
 
 ##########################################
@@ -827,17 +873,12 @@ def submit_ensirna_task(
     if not input_path.exists():
         raise FileNotFoundError(f"mRNA FASTA not found: {input_path}")
     run_name = run_name or input_path.stem
-    out_file = build_local_output_path(
-        resolve_local_output_dir(out_dir),
-        run_name=run_name,
-        suffix="ensirna",
-    )
+    out_file = resolve_local_output_dir(out_dir) / f"{run_name}.xlsx"
 
     print(f"🧬 Submitting ENsiRNA run '{run_name}'")
     download_ensirna_models.remote(force=False)
     prepare_plan = ensirna_prepare_inputs.remote(
         mrna_fasta_bytes=input_path.read_bytes(),
-        run_name=run_name,
         max_prepare_jobs=prepare_workers,
         force=force,
     )
@@ -856,14 +897,15 @@ def submit_ensirna_task(
         bounded_map(
             prepare_plan.chunks,
             run_chunk,
-            max_parallel=max(1, min(prepare_workers, len(prepare_plan.chunks))),
+            max_parallel=prepare_workers,
         )
         finalized_plan = ensirna_finalize_prepared_inputs.remote(prepare_plan)
         prepared_plan = ensirna_preprocess_dataset.remote(finalized_plan)
 
-    tarball_bytes = run_ensirna_inference.remote(
+    xlsx_bytes = run_ensirna_inference.remote(
         prepared_dir=prepared_plan.prepared_dir,
         force=force,
     )
-    write_local_tarball(out_file, tarball_bytes)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_bytes(xlsx_bytes)
     print(f"🧬 ENsiRNA run complete! Results saved to {out_file}")

@@ -178,6 +178,9 @@ Always specify a timeout with `CONF.timeout` or `MAX_TIMEOUT`. Add resource hint
 - Workflow-compatible app functions are the main exception to the primitive
   preference: return `AppRunResult` from `biomodals.schema` so workflows can
   materialize `AppOutput` artifacts consistently.
+- Prefix Modal function `print(...)` messages with the `💊` emoji followed by
+  one space so remote logs are visually distinct from local orchestration
+  output.
 - Before creating a new app or adding major app outputs, ask whether the app
   needs to be workflow-compatible. If yes, design a remote function that returns
   `AppRunResult`, keep the local entrypoint CLI-only, and update the local
@@ -239,6 +242,8 @@ The `@app.local_entrypoint()` function is the user-facing orchestration layer on
 - Read local inputs as bytes and pass bytes to remote functions for quick jobs.
 - Write returned tarball bytes locally.
 - Print final local path or Modal volume location.
+- Prefix local entrypoint `print(...)` messages with the `🧬` emoji followed by
+  one space so CLI progress is visually distinct from Modal function logs.
 
 Docstring rules for `biomodals app help`:
 

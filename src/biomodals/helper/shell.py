@@ -46,6 +46,7 @@ def run_command(
     output_mode: Literal["tee", "capture", "log", "inherit", "discard"] = "tee",
     log_file: str | Path | None = None,
     show_command: bool = True,
+    warn_on_error: bool = True,
     **kwargs,
 ) -> list[str]:
     """Run a shell command with explicit subprocess output handling.
@@ -60,6 +61,8 @@ def run_command(
             child output. Only valid with ``tee``, ``capture``, or ``log`` modes.
         show_command: Whether to print the command banner to stdout before
             running. Command metadata is still written to ``log_file``.
+        warn_on_error: Whether to emit a warning with the log path before
+            raising on non-zero exit.
         **kwargs: Additional keyword arguments to pass to `subprocess.Popen`.
             For example, you can use `cwd` to specify the working directory, or
             `env` to specify environment variables.
@@ -118,8 +121,9 @@ def run_command(
     log_path = Path(log_file).expanduser() if log_file is not None else None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        sys.stdout.write(f"Saving logs to: {log_path}\n")
-        sys.stdout.flush()
+        if show_command:
+            sys.stdout.write(f"Saving logs to: {log_path}\n")
+            sys.stdout.flush()
     now = time()
     banner = "=" * 100
     log_handle = log_path.open("ab", buffering=0) if log_path is not None else None
@@ -172,12 +176,17 @@ def run_command(
 
     if return_code != 0:
         if log_path is not None:
-            warnings.warn(
-                f"Command '{cmd_str}' failed with return code {return_code}. "
-                f"Check log file {log_path} for details.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            if warn_on_error:
+                message = f"Command failed with return code {return_code}."
+                if show_command:
+                    message = (
+                        f"Command '{cmd_str}' failed with return code {return_code}."
+                    )
+                warnings.warn(
+                    f"{message} Check log file {log_path} for details.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         raise sp.CalledProcessError(return_code, cmd)
 
     return all_outputs

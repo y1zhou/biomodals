@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import subprocess as sp
 import sys
+import warnings
 
 import pytest
 
@@ -86,12 +88,49 @@ def test_run_command_log_mode_writes_without_streaming_or_collecting(
     )
 
     captured = capfd.readouterr()
-    assert captured.out == f"Saving logs to: {log_path}\n"
+    assert captured.out == ""
     assert captured.err == ""
     assert lines == []
     log_text = log_path.read_text()
     assert "logged\n" in log_text
     assert "err\n" in log_text
+
+
+def test_run_command_hidden_failure_warning_omits_command(tmp_path) -> None:
+    log_path = tmp_path / "command.log"
+    with (
+        pytest.raises(sp.CalledProcessError),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        run_command(
+            [sys.executable, "-c", "raise SystemExit(3)"],
+            output_mode="log",
+            log_file=log_path,
+            show_command=False,
+        )
+
+    assert len(caught) == 1
+    assert "Command failed with return code 3." in str(caught[0].message)
+    assert sys.executable not in str(caught[0].message)
+
+
+def test_run_command_can_suppress_failure_warning(tmp_path) -> None:
+    log_path = tmp_path / "command.log"
+    with (
+        pytest.raises(sp.CalledProcessError),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        run_command(
+            [sys.executable, "-c", "raise SystemExit(3)"],
+            output_mode="log",
+            log_file=log_path,
+            show_command=False,
+            warn_on_error=False,
+        )
+
+    assert caught == []
 
 
 def test_run_command_log_mode_requires_log_file() -> None:
@@ -149,6 +188,7 @@ def test_run_command_capture_logs_raw_child_output_without_returning_log_metadat
 
     captured = capfd.readouterr()
     assert captured.out.startswith("Running command: ")
+    assert f"Saving logs to: {log_path}\n" in captured.out
     assert "[ranked_designs]" not in captured.out
     assert captured.err == ""
     assert lines == ["[ranked_designs]"]

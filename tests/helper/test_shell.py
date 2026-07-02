@@ -53,6 +53,55 @@ def test_run_command_capture_returns_output_without_streaming(capfd) -> None:
     assert lines == ["[literal]"]
 
 
+def test_run_command_can_hide_command_banner(capfd) -> None:
+    lines = run_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('hidden\\n')",
+        ],
+        output_mode="capture",
+        show_command=False,
+    )
+
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert lines == ["hidden"]
+
+
+def test_run_command_log_mode_writes_without_streaming_or_collecting(
+    tmp_path, capfd
+) -> None:
+    log_path = tmp_path / "command.log"
+    lines = run_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('logged\\n'); sys.stderr.write('err\\n')",
+        ],
+        output_mode="log",
+        log_file=log_path,
+        show_command=False,
+    )
+
+    captured = capfd.readouterr()
+    assert captured.out == f"Saving logs to: {log_path}\n"
+    assert captured.err == ""
+    assert lines == []
+    log_text = log_path.read_text()
+    assert "logged\n" in log_text
+    assert "err\n" in log_text
+
+
+def test_run_command_log_mode_requires_log_file() -> None:
+    with pytest.raises(ValueError, match="requires log_file"):
+        run_command(
+            [sys.executable, "-c", "print('ignored')"],
+            output_mode="log",
+        )
+
+
 def test_run_command_inherit_uses_parent_streams(capfd) -> None:
     lines = run_command(
         [

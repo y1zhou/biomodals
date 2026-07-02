@@ -496,6 +496,9 @@ def submit_ocr_task(
     safe_input_stem = sanitize_filename(input_path.stem)
     output_dir = resolve_local_output_dir(out_dir)
     run_dir = output_dir / safe_input_stem
+    if run_dir.exists():
+        print(f"🧬 Run directory already exists: {run_dir}")
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_content = input_path.read_bytes()
 

@@ -8,6 +8,8 @@ MinerU-Popo source repo: <https://github.com/opendatalab/MinerU-Popo>.
 The local entrypoint writes all outputs under `<pdf-stem>/`. MinerU outputs live
 at the top level, logs live under `logs/`, and optional MinerU-Popo outputs live
 under `popo-results/`.
+Existing `hybrid_auto/` and `popo-results/` directories are reused unless
+`--force` is passed.
 
 Example layout for input `demo.pdf` with `--run-popo`:
 
@@ -455,6 +457,7 @@ def submit_ocr_task(
     download_mineru_models: bool = False,
     download_popo_models: bool = False,
     skip_model_download: bool = False,
+    force: bool = False,
     force_popo_redownload: bool = False,
     popo_max_new_tokens: int = 8192,
 ) -> None:
@@ -470,6 +473,7 @@ def submit_ocr_task(
         download_popo_models: Download MinerU-Popo model weights and continue if
             `input_pdf` is also provided.
         skip_model_download: Skip automatic model download checks before inference.
+        force: Re-run MinerU and MinerU-Popo even when their output directories exist.
         force_popo_redownload: Force Hugging Face re-download for MinerU-Popo weights.
         popo_max_new_tokens: Maximum new tokens for MinerU-Popo transformer generation.
     """
@@ -478,13 +482,11 @@ def submit_ocr_task(
     if input_pdf is None and not (download_mineru_models or download_popo_models):
         raise ValueError("input_pdf is required unless a model download flag is set")
 
-    if download_mineru_models or (input_pdf is not None and not skip_model_download):
-        download_mineru_model_weights.remote()
-    if download_popo_models or (
-        input_pdf is not None and run_popo and not skip_model_download
-    ):
-        download_popo_model_weights.remote(force=force_popo_redownload)
     if input_pdf is None:
+        if download_mineru_models:
+            download_mineru_model_weights.remote()
+        if download_popo_models:
+            download_popo_model_weights.remote(force=force_popo_redownload)
         return
 
     input_path = Path(input_pdf).expanduser().resolve()
@@ -496,23 +498,36 @@ def submit_ocr_task(
     safe_input_stem = sanitize_filename(input_path.stem)
     output_dir = resolve_local_output_dir(out_dir)
     run_dir = output_dir / safe_input_stem
-    if run_dir.exists():
-        print(f"🧬 Run directory already exists: {run_dir}")
-        return
+    mineru_results_dir = run_dir / "hybrid_auto"
+    popo_results_dir = run_dir / "popo-results"
+    should_run_mineru = force or not mineru_results_dir.exists()
+    should_run_popo = run_popo and (force or not popo_results_dir.exists())
+
+    if download_mineru_models or (should_run_mineru and not skip_model_download):
+        download_mineru_model_weights.remote()
+    if download_popo_models or (should_run_popo and not skip_model_download):
+        download_popo_model_weights.remote(force=force_popo_redownload)
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    pdf_content = input_path.read_bytes()
-
-    print(f"🧬 Running MinerU on {input_path}...")
-    mineru_archive = run_mineru_ocr.remote(
-        pdf_content,
-        safe_input_name,
-        effort,
+    pdf_content = (
+        input_path.read_bytes() if should_run_mineru or should_run_popo else b""
     )
-    _extract_tar_zst_bytes(mineru_archive, output_dir)
-    _collect_local_run_logs(run_dir)
-    print(f"🧬 Extracted MinerU results under {run_dir}")
 
-    if run_popo:
+    if should_run_mineru:
+        print(f"🧬 Running MinerU on {input_path}...")
+        mineru_archive = run_mineru_ocr.remote(
+            pdf_content,
+            safe_input_name,
+            effort,
+        )
+        _extract_tar_zst_bytes(mineru_archive, output_dir)
+        _collect_local_run_logs(run_dir)
+        print(f"🧬 Extracted MinerU results under {run_dir}")
+    else:
+        print(f"🧬 Skipping MinerU; found existing results at {mineru_results_dir}")
+        mineru_archive = package_outputs(run_dir) if should_run_popo else b""
+
+    if should_run_popo:
         print("🧬 Running MinerU-Popo post-processing...")
         popo_archive = run_mineru_popo.remote(
             mineru_archive,
@@ -523,6 +538,8 @@ def submit_ocr_task(
         _extract_tar_zst_bytes(popo_archive, run_dir)
         _collect_local_run_logs(run_dir)
         print(f"🧬 Extracted MinerU-Popo results under {run_dir / 'popo-results'}")
+    elif run_popo:
+        print(f"🧬 Skipping MinerU-Popo; found existing results at {popo_results_dir}")
 
     for archive_name in (
         f"{safe_input_stem}_mineru.tar.zst",

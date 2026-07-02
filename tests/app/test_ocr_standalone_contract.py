@@ -298,3 +298,171 @@ def test_ocr_local_entrypoint_nests_popo_results_without_popo_archive(
     assert not (run_dir / "popo-results" / "logs").exists()
     assert (run_dir / "logs" / "mineru.log").read_text() == "mineru log\n"
     assert (run_dir / "logs" / "inference.log").read_text() == "popo log\n"
+
+
+def test_ocr_local_entrypoint_skips_mineru_when_hybrid_exists(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_pdf = tmp_path / "demo.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    out_dir = tmp_path / "out"
+    hybrid_dir = out_dir / "demo" / "hybrid_auto"
+    hybrid_dir.mkdir(parents=True)
+    (hybrid_dir / "demo_model.json").write_text("[]\n")
+    calls = {}
+
+    class FakeMinerUOCR:
+        def remote(self, *args, **kwargs) -> bytes:
+            raise AssertionError("MinerU should be skipped")
+
+    class FakePopo:
+        def remote(
+            self,
+            mineru_results_archive: bytes,
+            pdf_content: bytes,
+            input_name: str,
+            max_new_tokens: int,
+        ) -> bytes:
+            calls["popo"] = {
+                "mineru_results_archive": mineru_results_archive,
+                "pdf_content": pdf_content,
+                "input_name": input_name,
+                "max_new_tokens": max_new_tokens,
+            }
+            popo_root = tmp_path / "remote-popo" / "popo-results"
+            inference_dir = popo_root / "inference" / "mineru"
+            inference_dir.mkdir(parents=True)
+            (inference_dir / "demo.json").write_text("[]\n")
+            return ocr_app.package_outputs(popo_root)
+
+    monkeypatch.setattr(ocr_app, "run_mineru_ocr", FakeMinerUOCR())
+    monkeypatch.setattr(ocr_app, "run_mineru_popo", FakePopo())
+
+    raw_f = ocr_app.submit_ocr_task.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdf=str(input_pdf),
+        out_dir=str(out_dir),
+        run_popo=True,
+        skip_model_download=True,
+        popo_max_new_tokens=32,
+    )
+
+    names = _tar_zst_names(calls["popo"]["mineru_results_archive"], tmp_path)
+    assert "demo/hybrid_auto/demo_model.json" in names
+    assert calls["popo"]["pdf_content"] == b"%PDF-1.7\n"
+    assert calls["popo"]["input_name"] == "demo.pdf"
+    assert calls["popo"]["max_new_tokens"] == 32
+    assert (
+        out_dir / "demo" / "popo-results" / "inference" / "mineru" / "demo.json"
+    ).is_file()
+
+
+def test_ocr_local_entrypoint_skips_popo_when_results_exist(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_pdf = tmp_path / "demo.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    run_dir = tmp_path / "out" / "demo"
+    hybrid_dir = run_dir / "hybrid_auto"
+    popo_results = run_dir / "popo-results" / "inference" / "mineru"
+    hybrid_dir.mkdir(parents=True)
+    popo_results.mkdir(parents=True)
+    (hybrid_dir / "demo_model.json").write_text("[]\n")
+    (popo_results / "demo.json").write_text("[]\n")
+
+    class FakeMinerUOCR:
+        def remote(self, *args, **kwargs) -> bytes:
+            raise AssertionError("MinerU should be skipped")
+
+    class FakePopo:
+        def remote(self, *args, **kwargs) -> bytes:
+            raise AssertionError("MinerU-Popo should be skipped")
+
+    monkeypatch.setattr(ocr_app, "run_mineru_ocr", FakeMinerUOCR())
+    monkeypatch.setattr(ocr_app, "run_mineru_popo", FakePopo())
+
+    raw_f = ocr_app.submit_ocr_task.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdf=str(input_pdf),
+        out_dir=str(tmp_path / "out"),
+        run_popo=True,
+        skip_model_download=True,
+    )
+
+    assert (hybrid_dir / "demo_model.json").is_file()
+    assert (popo_results / "demo.json").is_file()
+
+
+def test_ocr_local_entrypoint_force_reruns_existing_outputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_pdf = tmp_path / "demo.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    out_dir = tmp_path / "out"
+    run_dir = out_dir / "demo"
+    (run_dir / "hybrid_auto").mkdir(parents=True)
+    (run_dir / "popo-results").mkdir()
+    calls = {}
+
+    class FakeMinerUOCR:
+        def remote(self, pdf_content: bytes, input_name: str, effort: str) -> bytes:
+            calls["mineru"] = {
+                "pdf_content": pdf_content,
+                "input_name": input_name,
+                "effort": effort,
+            }
+            mineru_root = tmp_path / "remote-mineru" / "demo"
+            hybrid_dir = mineru_root / "hybrid_auto"
+            hybrid_dir.mkdir(parents=True)
+            (hybrid_dir / "demo_model.json").write_text("[]\n")
+            return ocr_app.package_outputs(mineru_root)
+
+    class FakePopo:
+        def remote(
+            self,
+            mineru_results_archive: bytes,
+            pdf_content: bytes,
+            input_name: str,
+            max_new_tokens: int,
+        ) -> bytes:
+            calls["popo"] = {
+                "mineru_results_archive": mineru_results_archive,
+                "pdf_content": pdf_content,
+                "input_name": input_name,
+                "max_new_tokens": max_new_tokens,
+            }
+            popo_root = tmp_path / "remote-popo" / "popo-results"
+            inference_dir = popo_root / "inference" / "mineru"
+            inference_dir.mkdir(parents=True)
+            (inference_dir / "demo.json").write_text("[]\n")
+            return ocr_app.package_outputs(popo_root)
+
+    monkeypatch.setattr(ocr_app, "run_mineru_ocr", FakeMinerUOCR())
+    monkeypatch.setattr(ocr_app, "run_mineru_popo", FakePopo())
+
+    raw_f = ocr_app.submit_ocr_task.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdf=str(input_pdf),
+        out_dir=str(out_dir),
+        run_popo=True,
+        skip_model_download=True,
+        force=True,
+        popo_max_new_tokens=32,
+    )
+
+    assert calls["mineru"] == {
+        "pdf_content": b"%PDF-1.7\n",
+        "input_name": "demo.pdf",
+        "effort": "high",
+    }
+    assert calls["popo"]["pdf_content"] == b"%PDF-1.7\n"
+    assert calls["popo"]["input_name"] == "demo.pdf"
+    assert calls["popo"]["max_new_tokens"] == 32
+    assert (run_dir / "hybrid_auto" / "demo_model.json").is_file()
+    assert (run_dir / "popo-results" / "inference" / "mineru" / "demo.json").is_file()

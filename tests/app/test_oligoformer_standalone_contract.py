@@ -122,8 +122,12 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
 def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkeypatch):
     captured: dict[str, object] = {}
     prepare_calls: list[oligoformer_app.OffTargetShardSpec] = []
+    prepare_batch_calls: list[tuple[list[oligoformer_app.OffTargetShardSpec], int]] = []
     row_batch_calls: list[tuple[list[oligoformer_app.PitaRowShardSpec], int]] = []
     finalize_calls: list[oligoformer_app.PreparedOffTargetShard] = []
+    finalize_batch_calls: list[
+        tuple[list[oligoformer_app.PreparedOffTargetShard], int]
+    ] = []
     volume = FakeVolume()
     repo_dir = tmp_path / "repo"
     repo_dir.joinpath("toxicity").mkdir(parents=True)
@@ -162,62 +166,74 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         final_ready=False,
     )
 
-    class FakePrepareOffTargetShard:
-        def remote(self, spec: oligoformer_app.OffTargetShardSpec):
-            prepare_calls.append(spec)
-            cache_dir = oligoformer_app._off_target_shard_cache_dir(spec)
-            row_dir = cache_dir / "pita_rows"
-            row_dir.mkdir(parents=True, exist_ok=True)
-            cache_dir.joinpath("potential_targets.tsv").write_text(
-                "potential\n", encoding="utf-8"
-            )
-            cache_dir.joinpath("ext_utr.stab").write_text("utr\n", encoding="utf-8")
-            targetscan_path = cache_dir / "targetscan.tab"
-            targetscan_score = "2" if spec.record_name == "RNA0" else "0.5"
-            targetscan_path.write_text(
-                f"ref\t{spec.record_name}\t{targetscan_score}\n",
-                encoding="utf-8",
-            )
-            row = oligoformer_app.PitaRowShardSpec(
-                run_root=spec.run_root,
-                stem=spec.stem,
-                sirna_index=spec.index,
-                record_name=spec.record_name,
-                shard_index=0,
-                start_row=0,
-                end_row=1,
-                potential_targets_path=str(cache_dir / "potential_targets.tsv"),
-                input_path=str(
-                    row_dir / "00000_000000000000_000000000001.potential.tsv"
-                ),
-                ext_utr_path=str(cache_dir / "ext_utr.stab"),
-                output_path=str(row_dir / "00000_000000000000_000000000001.scored.tsv"),
-                log_path=str(
-                    layout.outputs_dir
-                    / "logs"
-                    / "off_target"
-                    / spec.stem
-                    / f"{spec.index:05d}_{spec.record_name}"
-                    / "pita_rows"
-                    / "00000_000000000000_000000000001.log"
-                ),
-            )
-            Path(row.input_path).write_text("potential\n", encoding="utf-8")
-            return oligoformer_app.PreparedOffTargetShard(
-                index=spec.index,
-                record_name=spec.record_name,
-                cache_dir=str(cache_dir),
-                logs_dir=str(
-                    layout.outputs_dir
-                    / "logs"
-                    / "off_target"
-                    / spec.stem
-                    / f"{spec.index:05d}_{spec.record_name}"
-                ),
-                pita_path=str(cache_dir / "pita.tab"),
-                targetscan_path=str(targetscan_path),
-                row_shards=(row,),
-            )
+    class FakePrepareOffTargetShardBatch:
+        def remote(
+            self,
+            specs: list[oligoformer_app.OffTargetShardSpec],
+            local_workers: int,
+        ):
+            prepare_batch_calls.append((list(specs), local_workers))
+            prepared_shards = []
+            for spec in specs:
+                prepare_calls.append(spec)
+                cache_dir = oligoformer_app._off_target_shard_cache_dir(spec)
+                row_dir = cache_dir / "pita_rows"
+                row_dir.mkdir(parents=True, exist_ok=True)
+                cache_dir.joinpath("potential_targets.tsv").write_text(
+                    "potential\n", encoding="utf-8"
+                )
+                cache_dir.joinpath("ext_utr.stab").write_text("utr\n", encoding="utf-8")
+                targetscan_path = cache_dir / "targetscan.tab"
+                targetscan_score = "2" if spec.record_name == "RNA0" else "0.5"
+                targetscan_path.write_text(
+                    f"ref\t{spec.record_name}\t{targetscan_score}\n",
+                    encoding="utf-8",
+                )
+                row = oligoformer_app.PitaRowShardSpec(
+                    run_root=spec.run_root,
+                    stem=spec.stem,
+                    sirna_index=spec.index,
+                    record_name=spec.record_name,
+                    shard_index=0,
+                    start_row=0,
+                    end_row=1,
+                    potential_targets_path=str(cache_dir / "potential_targets.tsv"),
+                    input_path=str(
+                        row_dir / "00000_000000000000_000000000001.potential.tsv"
+                    ),
+                    ext_utr_path=str(cache_dir / "ext_utr.stab"),
+                    output_path=str(
+                        row_dir / "00000_000000000000_000000000001.scored.tsv"
+                    ),
+                    log_path=str(
+                        layout.outputs_dir
+                        / "logs"
+                        / "off_target"
+                        / spec.stem
+                        / f"{spec.index:05d}_{spec.record_name}"
+                        / "pita_rows"
+                        / "00000_000000000000_000000000001.log"
+                    ),
+                )
+                Path(row.input_path).write_text("potential\n", encoding="utf-8")
+                prepared_shards.append(
+                    oligoformer_app.PreparedOffTargetShard(
+                        index=spec.index,
+                        record_name=spec.record_name,
+                        cache_dir=str(cache_dir),
+                        logs_dir=str(
+                            layout.outputs_dir
+                            / "logs"
+                            / "off_target"
+                            / spec.stem
+                            / f"{spec.index:05d}_{spec.record_name}"
+                        ),
+                        pita_path=str(cache_dir / "pita.tab"),
+                        targetscan_path=str(targetscan_path),
+                        row_shards=(row,),
+                    )
+                )
+            return prepared_shards
 
     class FakeRowBatch:
         def remote(
@@ -240,19 +256,29 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                 outputs.append(row.output_path)
             return outputs
 
-    class FakeFinalizePitaShard:
-        def remote(self, prepared: oligoformer_app.PreparedOffTargetShard):
-            finalize_calls.append(prepared)
-            pita_score = "-11" if prepared.record_name == "RNA0" else "-2"
-            Path(prepared.pita_path).write_text(
-                f"microRNA\tScore\n{prepared.record_name}\t{pita_score}\n",
-                encoding="utf-8",
-            )
-            return oligoformer_app.OffTargetShardResult(
-                index=prepared.index,
-                pita_path=prepared.pita_path,
-                targetscan_path=prepared.targetscan_path,
-            )
+    class FakeFinalizePitaShardBatch:
+        def remote(
+            self,
+            prepared_shards: list[oligoformer_app.PreparedOffTargetShard],
+            local_workers: int,
+        ):
+            finalize_batch_calls.append((list(prepared_shards), local_workers))
+            results = []
+            for prepared in prepared_shards:
+                finalize_calls.append(prepared)
+                pita_score = "-11" if prepared.record_name == "RNA0" else "-2"
+                Path(prepared.pita_path).write_text(
+                    f"microRNA\tScore\n{prepared.record_name}\t{pita_score}\n",
+                    encoding="utf-8",
+                )
+                results.append(
+                    oligoformer_app.OffTargetShardResult(
+                        index=prepared.index,
+                        pita_path=prepared.pita_path,
+                        targetscan_path=prepared.targetscan_path,
+                    )
+                )
+            return results
 
     def fake_package_outputs(root, *, paths_to_bundle=None):
         captured["package_root"] = Path(root)
@@ -262,8 +288,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
     monkeypatch.setattr(
         oligoformer_app,
-        "prepare_oligoformer_off_target_shard",
-        FakePrepareOffTargetShard(),
+        "prepare_oligoformer_off_target_shard_batch",
+        FakePrepareOffTargetShardBatch(),
     )
     monkeypatch.setattr(
         oligoformer_app,
@@ -272,8 +298,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     )
     monkeypatch.setattr(
         oligoformer_app,
-        "finalize_oligoformer_pita_shard",
-        FakeFinalizePitaShard(),
+        "finalize_oligoformer_pita_shard_batch",
+        FakeFinalizePitaShardBatch(),
     )
     monkeypatch.setattr(oligoformer_app, "package_outputs", fake_package_outputs)
     monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_nodes_env, "4")
@@ -288,9 +314,11 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
 
     final_table = layout.outputs_dir.joinpath("target.txt").read_text(encoding="utf-8")
     assert result == b"archive"
+    assert [len(batch) for batch, _ in prepare_batch_calls] == [1, 1]
+    assert [workers for _, workers in prepare_batch_calls] == [1, 1]
     assert [call.record_name for call in prepare_calls] == ["RNA0", "RNA1"]
     assert all(call.output_dir == str(layout.outputs_dir) for call in prepare_calls)
-    assert len(row_batch_calls) == 2
+    assert len(row_batch_calls) == 1
     assert all(local_workers == 32 for _, local_workers in row_batch_calls)
     batched_rows = [row for rows, _ in row_batch_calls for row in rows]
     assert [row.record_name for row in batched_rows] == ["RNA0", "RNA1"]
@@ -298,6 +326,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         Path(row.log_path).is_relative_to(layout.outputs_dir / "logs" / "off_target")
         for row in batched_rows
     )
+    assert [len(batch) for batch, _ in finalize_batch_calls] == [2]
+    assert [workers for _, workers in finalize_batch_calls] == [2]
     assert [call.record_name for call in finalize_calls] == ["RNA0", "RNA1"]
     assert captured["package_root"] == layout.outputs_dir
     assert captured["package_paths"] == [
@@ -324,14 +354,154 @@ def test_oligoformer_off_target_defaults_use_distributed_cpu_nodes(monkeypatch):
     monkeypatch.delenv(oligoformer_app.APP_INFO.off_target_nodes_env, raising=False)
     monkeypatch.delenv(oligoformer_app.APP_INFO.off_target_workers_env, raising=False)
     monkeypatch.delenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_nodes_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_workers_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
         oligoformer_app.APP_INFO.off_target_row_shard_size_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_rnaplfold_nodes_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_rnaplfold_workers_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_rnaplfold_shard_size_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_context_nodes_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_context_workers_env,
+        raising=False,
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_context_shard_size_env,
         raising=False,
     )
 
     assert oligoformer_app._off_target_nodes(100) == 32
     assert oligoformer_app._off_target_workers_per_node() == 32
+    assert oligoformer_app._pita_prepare_nodes(100) == 32
+    assert oligoformer_app._pita_prepare_workers() == 32
+    assert oligoformer_app._pita_prepare_utr_shard_size() == 1000
     assert oligoformer_app._pita_row_shard_size() == 1000
     assert oligoformer_app._pita_row_attempts() == 3
+    assert oligoformer_app._targetscan_rnaplfold_nodes(100) == 32
+    assert oligoformer_app._targetscan_rnaplfold_workers() == 8
+    assert oligoformer_app._targetscan_rnaplfold_shard_size() == 500
+    assert oligoformer_app._targetscan_context_nodes(100) == 32
+    assert oligoformer_app._targetscan_context_workers() == 32
+    assert oligoformer_app._targetscan_context_shard_size() == 500
+
+
+def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
+    tmp_path: Path, monkeypatch
+):
+    remote_batches = []
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    repo_dir.joinpath("off-target", "pita", "lib").mkdir(parents=True)
+    utr_stab_path = tmp_path / "utr.stab"
+    mir_stab_path = tmp_path / "mir.stab"
+    potential_targets_path = tmp_path / "cache" / "potential_targets.tsv"
+    utr_stab_path.write_text(
+        "utr1\tAAAA\nutr2\tCCCC\nutr3\tGGGG\n",
+        encoding="utf-8",
+    )
+    mir_stab_path.write_text("RNA0\tUUUU\n", encoding="utf-8")
+
+    class FakePitaPrepareUtrShardBatch:
+        def remote(self, specs, local_workers):
+            remote_batches.append((specs, local_workers))
+            outputs = []
+            for spec in specs:
+                rows = Path(spec.input_path).read_text(encoding="utf-8").splitlines()
+                row_names = [row.split("\t", 1)[0] for row in rows]
+                output_path = Path(spec.output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    "".join(f"RNA0\t{name}\n" for name in row_names),
+                    encoding="utf-8",
+                )
+                output_path.with_suffix(output_path.suffix + ".done").write_text(
+                    "done", encoding="utf-8"
+                )
+                outputs.append(str(output_path))
+            return outputs
+
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_pita_prepare_utr_shard_batch",
+        FakePitaPrepareUtrShardBatch(),
+    )
+    monkeypatch.setenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
+        "2",
+    )
+    monkeypatch.setenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_workers_env,
+        "2",
+    )
+    monkeypatch.setenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_nodes_env,
+        "2",
+    )
+
+    row_count = oligoformer_app._write_pita_potential_targets_from_utr_shards(
+        utr_stab_path=utr_stab_path,
+        mir_stab_path=mir_stab_path,
+        potential_targets_path=potential_targets_path,
+        shard_dir=tmp_path / "cache" / "pita_prepare_utr_shards",
+        logs_dir=tmp_path / "logs",
+    )
+
+    assert row_count == 3
+    assert potential_targets_path.read_text(encoding="utf-8") == (
+        "RNA0\tutr1\nRNA0\tutr2\nRNA0\tutr3\n"
+    )
+    remote_specs = [spec for batch, _workers in remote_batches for spec in batch]
+    assert [spec.shard_index for spec in remote_specs] == [0, 1]
+    assert [workers for _batch, workers in remote_batches] == [2]
+    assert {Path(spec.log_path).parent.name for spec in remote_specs} == {
+        "pita_prepare_utr_shards"
+    }
+    assert volume.commit_count == 1
+    assert volume.reload_count == 1
+
+
+def test_worker_aware_batches_fill_containers_before_spawning_more():
+    assert [
+        len(batch)
+        for batch in oligoformer_app._batch_items_for_local_workers(
+            list(range(45)),
+            max_nodes=32,
+            local_workers=32,
+        )
+    ] == [32, 13]
+
+    large_batches = oligoformer_app._batch_items_for_local_workers(
+        list(range(1317)),
+        max_nodes=32,
+        local_workers=32,
+    )
+    assert len(large_batches) == 32
+    assert max(len(batch) for batch in large_batches) == 42
 
 
 def test_pita_row_shard_retries_interrupted_commands_atomically(
@@ -468,9 +638,21 @@ def test_download_oligoformer_models_writes_to_model_volume(
                     payload.write_text("weights", encoding="utf-8")
                     archive.add(payload, arcname="RNA-FM/redevelop/model.pt")
             else:
-                ref_name = Path(archive_path).name.removesuffix(".zip")
+                archive_name = Path(archive_path).name
                 with zipfile.ZipFile(archive_path, "w") as archive:
-                    archive.writestr(ref_name, f">{ref_name}\nAUGC\n")
+                    if "UTR" in archive_name:
+                        archive.writestr(
+                            "UTR_Sequences.txt",
+                            "Gene ID\tTranscript ID\tGene Symbol\tSpecies ID\t"
+                            "UTR Sequence\n"
+                            "ENST000001\tGENE1\tGENE1\t9606\tAUGC\n",
+                        )
+                    else:
+                        archive.writestr(
+                            "ORF_Sequences.txt",
+                            "Transcript ID\tSpecies ID\tORF Sequence\n"
+                            "ENST000001\t9606\tAUGC\n",
+                        )
 
     monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
     monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", volume)
@@ -489,7 +671,8 @@ def test_download_oligoformer_models_writes_to_model_volume(
         == "weights"
     )
     for ref_path in info.model_human_ref_paths:
-        assert ref_path.read_text(encoding="utf-8") == f">{ref_path.name}\nAUGC\n"
+        assert ref_path.read_text(encoding="utf-8") == ">ENST000001\nAUGC\n"
+    assert not info.targetscan_rnaplfold_marker_path.exists()
     assert volume.commit_count == 1
     assert "min(Args.top_n, RESULT_ranked.shape[0])" in source
     assert "--biomodals_stage" in source

@@ -7,13 +7,61 @@ toxicity options for standalone runs.
 ## Off-target prediction
 
 When `--off-target` is set, provide both `--utr-file` and `--orf-file`, or set
-`--all-human` to use the upstream bundled human references.
+`--all-human` to use human references converted from TargetScan 8.0 UTR and ORF
+data.
 
 ## Outputs
 
 Results are saved locally as `<run-name>_oligoformer.tar.zst`. The tarball
 contains the final top-level `.txt`, `_ranked.txt`, and `_ranked_filtered.txt`
 tables only; detailed off-target logs stay in the Modal output-volume cache.
+
+For each input mRNA record, the tarball contains three TSV tables:
+
+- `<stem>.txt`: candidates in original mRNA-window order.
+- `<stem>_ranked.txt`: all candidates sorted by predicted `efficacy`
+  descending.
+- `<stem>_ranked_filtered.txt`: candidates with `filter == 0`, sorted by
+  predicted `efficacy` descending.
+
+Output columns:
+
+- `pos`: 1-based candidate index/window position in the mRNA scan. If a custom
+  siRNA FASTA was provided, treat this mostly as input row order.
+- `sense`: sense/passenger strand, computed as the complement of `siRNA`.
+- `siRNA`: antisense/guide siRNA candidate sequence.
+- `efficacy`: OligoFormer predicted efficacy score. Higher is better; treat it
+  as a ranking score, not a guaranteed percent knockdown.
+- `func_filter`: upstream functionality-rule filter. `0` passes. Nonzero means
+  the sequence failed one of the rule checks: bad GC content, homopolymer run,
+  GC/C-rich run, or palindromic sequence.
+- `pita_score`: PITA off-target score, present with `--off-target`. More
+  negative is worse; the default failure threshold is `< -10`.
+- `targetscan_score`: TargetScan off-target score, present with `--off-target`.
+  Higher is worse; the default failure threshold is `> 1`.
+- `off_target_filter`: combined off-target flag, present with `--off-target`.
+  `0` passes, `1` means predicted off-target risk, and `-5` means the candidate
+  was not off-target evaluated because only the top `--top-n` candidates were
+  scored.
+- `Seed`: 6-mer seed used for toxicity lookup, present with `--toxicity`.
+- `cell_viability`: toxicity table cell-viability value for `Seed`, present
+  with `--toxicity`. Lower is worse; the default failure threshold is `< 50`.
+- `toxicity_filter`: toxicity flag, present with `--toxicity`. `0` passes and
+  `1` fails.
+- `filter`: sum of the enabled filter flags. `0` means the candidate passed all
+  enabled filters. Nonzero means reject or manually review.
+
+Candidate selection:
+
+Start from `<stem>_ranked_filtered.txt`, take the highest-`efficacy` rows, and
+choose several candidates that are not all clustered at the same `pos`. For a
+conservative therapeutic-style screen, require `filter == 0`, `func_filter == 0`,
+`off_target_filter == 0` when off-target prediction is enabled, and
+`toxicity_filter == 0` when toxicity prediction is enabled. If off-target
+prediction was run with the default `--top-n 20`, only the top 20 efficacy
+candidates were off-target scored; do not treat `off_target_filter == -5` as
+safe. Rerun with a larger `--top-n` or `--top-n -1` before selecting lower-ranked
+candidates from `<stem>_ranked.txt`.
 """
 
 # Ignore ruff warnings about import location
@@ -27,6 +75,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TypeVar
 
 import modal
 import polars as pl
@@ -41,8 +90,10 @@ from biomodals.helper.io import (
     write_local_tarball,
 )
 from biomodals.helper.shell import package_outputs, run_command
-from biomodals.helper.task_budget import bounded_map
+from biomodals.helper.task_budget import batches_for_total_concurrency, bounded_map
 from biomodals.helper.web import download_files
+
+T = TypeVar("T")
 
 ##########################################
 # Modal configs
@@ -83,6 +134,22 @@ class AppInfo:
     rnafm_archive_url: str = (
         "https://cloud.tsinghua.edu.cn/f/46d71884ee8848b3a958/?dl=1"
     )
+    viennarna_archive_url: str = (
+        "https://www.tbi.univie.ac.at/RNA/download/sourcecode/2_7_x/"
+        "ViennaRNA-2.7.2.tar.gz"
+    )
+    targetscan_data_page_url: str = (
+        "https://www.targetscan.org/cgi-bin/targetscan/data_download.vert80.cgi"
+    )
+    targetscan_utr_url: str = (
+        "https://www.targetscan.org/vert_80/vert_80_data_download/UTR_Sequences.txt.zip"
+    )
+    targetscan_orf_url: str = (
+        "https://www.targetscan.org/vert_80/vert_80_data_download/ORF_Sequences.txt.zip"
+    )
+    targetscan_species_id: str = "9606"
+    targetscan_version: str = "8.0"
+    off_target_cache_salt: str = "targetscan-8.0-viennarna-2.7.2"
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
     model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
     repo_ref_dir: Path = CONF.git_clone_dir / "off-target/ref"
@@ -92,12 +159,32 @@ class AppInfo:
     prepared_marker_name: str = "oligoformer.json"
     off_target_workers_env: str = "OLIGOFORMER_OFF_TARGET_WORKERS"
     off_target_nodes_env: str = "OLIGOFORMER_OFF_TARGET_NODES"
+    off_target_pita_prepare_nodes_env: str = "OLIGOFORMER_PITA_PREPARE_NODES"
+    off_target_pita_prepare_workers_env: str = "OLIGOFORMER_PITA_PREPARE_WORKERS"
+    off_target_pita_prepare_utr_shard_size_env: str = (
+        "OLIGOFORMER_PITA_PREPARE_UTR_SHARD_SIZE"
+    )
     off_target_row_shard_size_env: str = "OLIGOFORMER_PITA_ROW_SHARD_SIZE"
     off_target_row_attempts_env: str = "OLIGOFORMER_PITA_ROW_ATTEMPTS"
+    targetscan_rnaplfold_nodes_env: str = "OLIGOFORMER_RNAPLFOLD_NODES"
+    targetscan_rnaplfold_workers_env: str = "OLIGOFORMER_RNAPLFOLD_WORKERS"
+    targetscan_rnaplfold_shard_size_env: str = "OLIGOFORMER_RNAPLFOLD_SHARD_SIZE"
+    targetscan_context_nodes_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_NODES"
+    targetscan_context_workers_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_WORKERS"
+    targetscan_context_shard_size_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_SHARD_SIZE"
     default_off_target_nodes: int = 32
     default_off_target_workers_per_node: int = 32
+    default_pita_prepare_nodes: int = 32
+    default_pita_prepare_workers: int = 32
+    default_pita_prepare_utr_shard_size: int = 1000
     default_pita_row_shard_size: int = 1000
     default_pita_row_attempts: int = 3
+    default_targetscan_rnaplfold_nodes: int = 32
+    default_targetscan_rnaplfold_workers: int = 8
+    default_targetscan_rnaplfold_shard_size: int = 500
+    default_targetscan_context_nodes: int = 32
+    default_targetscan_context_workers: int = 32
+    default_targetscan_context_shard_size: int = 500
 
     @property
     def model_rnafm_redevelop_dir(self) -> Path:
@@ -111,19 +198,61 @@ class AppInfo:
 
     @property
     def human_ref_downloads(self) -> dict[str, Path]:
-        """Return full-human off-target reference zip downloads."""
+        """Return TargetScan 8.0 full-human off-target reference zip downloads."""
         return {
-            (
-                f"{CONF.repo_url}/raw/{CONF.repo_commit_hash}/off-target/ref/"
-                f"{filename}.zip"
-            ): self.model_ref_dir / f"{filename}.zip"
-            for filename in self.human_ref_filenames
+            self.targetscan_utr_url: self.model_ref_dir
+            / "TargetScan_8_0_UTR_Sequences.txt.zip",
+            self.targetscan_orf_url: self.model_ref_dir
+            / "TargetScan_8_0_ORF_Sequences.txt.zip",
         }
 
     @property
     def model_human_ref_paths(self) -> tuple[Path, ...]:
-        """Return extracted full-human off-target reference paths."""
+        """Return converted full-human off-target reference paths."""
         return tuple(self.model_ref_dir / name for name in self.human_ref_filenames)
+
+    @property
+    def targetscan_ref_marker_path(self) -> Path:
+        """Return the marker for converted TargetScan 8.0 human references."""
+        return self.model_ref_dir / "targetscan_8_0_human_refs.json"
+
+    @property
+    def targetscan_rnaplfold_cache_dir(self) -> Path:
+        """Return cached TargetScan 8.0 RNAplfold outputs for human UTRs."""
+        return self.model_ref_dir / "targetscan_8_0_RNAplfold_in_out"
+
+    @property
+    def targetscan_rnaplfold_shard_dir(self) -> Path:
+        """Return shard inputs for building the RNAplfold cache."""
+        return self.model_ref_dir / "targetscan_8_0_RNAplfold_shards"
+
+    @property
+    def targetscan_rnaplfold_marker_path(self) -> Path:
+        """Return the marker for cached TargetScan 8.0 RNAplfold outputs."""
+        return self.model_ref_dir / "targetscan_8_0_rnaplfold_cache.json"
+
+    @property
+    def targetscan_ref_metadata(self) -> dict[str, object]:
+        """Return metadata identifying the converted TargetScan human refs."""
+        return {
+            "targetscan_version": self.targetscan_version,
+            "species_id": self.targetscan_species_id,
+            "source_page_url": self.targetscan_data_page_url,
+            "source_urls": sorted(self.human_ref_downloads),
+            "sequence_transform": "strip alignment gaps and write FASTA pairs",
+            "output_files": list(self.human_ref_filenames),
+        }
+
+    @property
+    def targetscan_rnaplfold_metadata(self) -> dict[str, object]:
+        """Return metadata identifying cached RNAplfold reference outputs."""
+        return {
+            "targetscan_version": self.targetscan_version,
+            "species_id": self.targetscan_species_id,
+            "viennarna_url": self.viennarna_archive_url,
+            "command": "RNAplfold -L 40 -W 80 -u 20",
+            "input_file": "human_UTR.txt",
+        }
 
     @property
     def stage_patch(self) -> str:
@@ -226,6 +355,39 @@ class PitaRowShardSpec:
     ext_utr_path: str
     output_path: str
     log_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class PitaPrepareUtrShardSpec:
+    """One cached PITA UTR shard for potential-target discovery."""
+
+    shard_index: int
+    input_path: str
+    mir_stab_path: str
+    output_path: str
+    log_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class TargetscanRnaPlfoldShardSpec:
+    """One shard of TargetScan UTRs for RNAplfold cache preparation."""
+
+    shard_index: int
+    shard_path: str
+    output_dir: str
+    log_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class TargetscanContextShardSpec:
+    """One TargetScan context-score target-table shard."""
+
+    shard_index: int
+    common_dir: str
+    targets_path: str
+    output_path: str
+    log_path: str
+    rnaplfold_cache_dir: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,13 +517,206 @@ def _build_plan(
 APP_INFO = AppInfo()
 
 
+def _targetscan_human_refs_ready() -> bool:
+    """Return whether converted TargetScan 8.0 human refs are available."""
+    import orjson
+
+    if not all(path.is_file() for path in APP_INFO.model_human_ref_paths):
+        return False
+    if not APP_INFO.targetscan_ref_marker_path.is_file():
+        return False
+    try:
+        marker = orjson.loads(APP_INFO.targetscan_ref_marker_path.read_bytes())
+    except orjson.JSONDecodeError:
+        return False
+    expected = APP_INFO.targetscan_ref_metadata
+    return all(marker.get(key) == value for key, value in expected.items())
+
+
+def _convert_targetscan_zip_to_fasta(
+    zip_path: Path,
+    output_path: Path,
+    *,
+    transcript_col: int,
+    species_col: int,
+    sequence_col: int,
+) -> int:
+    """Convert one TargetScan 8.0 table zip to an OligoFormer FASTA-like ref."""
+    import zipfile
+
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    row_count = 0
+    with zipfile.ZipFile(zip_path) as ref_zip:
+        member = next(
+            name
+            for name in ref_zip.namelist()
+            if not name.endswith("/") and name.endswith(".txt")
+        )
+        with (
+            ref_zip.open(member) as source,
+            tmp_path.open("w", encoding="utf-8") as out,
+        ):
+            next(source)
+            for raw_line in source:
+                fields = raw_line.decode("utf-8").rstrip("\r\n").split("\t")
+                if len(fields) <= max(transcript_col, species_col, sequence_col):
+                    continue
+                if fields[species_col].strip() != APP_INFO.targetscan_species_id:
+                    continue
+                transcript_id = fields[transcript_col].strip()
+                sequence = (
+                    fields[sequence_col]
+                    .strip()
+                    .upper()
+                    .replace("-", "")
+                    .replace("T", "U")
+                )
+                if not transcript_id or not sequence:
+                    continue
+                out.write(f">{transcript_id}\n{sequence}\n")
+                row_count += 1
+    if row_count == 0:
+        raise RuntimeError(
+            f"TargetScan 8.0 conversion produced no human rows from {zip_path}"
+        )
+    tmp_path.replace(output_path)
+    return row_count
+
+
+def _convert_targetscan_human_refs() -> dict[str, int]:
+    """Convert downloaded TargetScan 8.0 UTR and ORF zips to human refs."""
+    downloads = APP_INFO.human_ref_downloads
+    utr_count = _convert_targetscan_zip_to_fasta(
+        downloads[APP_INFO.targetscan_utr_url],
+        APP_INFO.model_ref_dir / "human_UTR.txt",
+        transcript_col=0,
+        species_col=3,
+        sequence_col=4,
+    )
+    orf_count = _convert_targetscan_zip_to_fasta(
+        downloads[APP_INFO.targetscan_orf_url],
+        APP_INFO.model_ref_dir / "human_ORF.txt",
+        transcript_col=0,
+        species_col=1,
+        sequence_col=2,
+    )
+    return {"human_UTR.txt": utr_count, "human_ORF.txt": orf_count}
+
+
+def _read_fasta_pairs(path: Path) -> list[tuple[str, str]]:
+    """Read simple two-line FASTA-like records."""
+    records = []
+    name = ""
+    chunks: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if name:
+                records.append((name, "".join(chunks)))
+            name = line[1:]
+            chunks = []
+        else:
+            chunks.append(line)
+    if name:
+        records.append((name, "".join(chunks)))
+    return records
+
+
+def _targetscan_rnaplfold_cache_ready() -> bool:
+    """Return whether the TargetScan RNAplfold cache is ready for human refs."""
+    import orjson
+
+    marker_path = APP_INFO.targetscan_rnaplfold_marker_path
+    cache_dir = APP_INFO.targetscan_rnaplfold_cache_dir
+    if not marker_path.is_file() or not cache_dir.is_dir():
+        return False
+    try:
+        marker = orjson.loads(marker_path.read_bytes())
+    except orjson.JSONDecodeError:
+        return False
+    expected = APP_INFO.targetscan_rnaplfold_metadata
+    if not all(marker.get(key) == value for key, value in expected.items()):
+        return False
+    expected_count = marker.get("record_count")
+    if not isinstance(expected_count, int) or expected_count <= 0:
+        return False
+    sample_records = marker.get("sample_records")
+    if not isinstance(sample_records, list) or not sample_records:
+        return False
+    return all(
+        (cache_dir / f"{name}.{APP_INFO.targetscan_species_id}_lunp").is_file()
+        for name in sample_records
+        if isinstance(name, str)
+    )
+
+
+def _is_model_human_ref_pair(utr_path: str, orf_path: str) -> bool:
+    """Return whether the paths point at the converted all-human refs."""
+    return (
+        Path(utr_path) == APP_INFO.model_ref_dir / "human_UTR.txt"
+        and Path(orf_path) == APP_INFO.model_ref_dir / "human_ORF.txt"
+    )
+
+
+def _targetscan_rnaplfold_nodes(shard_count: int) -> int:
+    """Return the number of Modal nodes for RNAplfold cache preparation."""
+    return min(
+        shard_count,
+        _positive_int_from_env(
+            APP_INFO.targetscan_rnaplfold_nodes_env,
+            APP_INFO.default_targetscan_rnaplfold_nodes,
+        ),
+    )
+
+
+def _targetscan_rnaplfold_workers() -> int:
+    """Return local RNAplfold subprocess workers per Modal node."""
+    return _positive_int_from_env(
+        APP_INFO.targetscan_rnaplfold_workers_env,
+        APP_INFO.default_targetscan_rnaplfold_workers,
+    )
+
+
+def _targetscan_rnaplfold_shard_size() -> int:
+    """Return the number of TargetScan UTR records per RNAplfold shard."""
+    return _positive_int_from_env(
+        APP_INFO.targetscan_rnaplfold_shard_size_env,
+        APP_INFO.default_targetscan_rnaplfold_shard_size,
+    )
+
+
+def _targetscan_context_workers() -> int:
+    """Return local TargetScan context-score workers per Modal node."""
+    return _positive_int_from_env(
+        APP_INFO.targetscan_context_workers_env,
+        APP_INFO.default_targetscan_context_workers,
+    )
+
+
+def _targetscan_context_nodes(task_count: int) -> int:
+    """Return max parallel TargetScan context-score Modal nodes."""
+    if task_count < 1:
+        return 1
+    nodes = _positive_int_from_env(
+        APP_INFO.targetscan_context_nodes_env,
+        APP_INFO.default_targetscan_context_nodes,
+    )
+    return max(1, min(nodes, task_count))
+
+
+def _targetscan_context_shard_size() -> int:
+    """Return TargetScan BL/PCT target rows per context-score shard."""
+    return _positive_int_from_env(
+        APP_INFO.targetscan_context_shard_size_env,
+        APP_INFO.default_targetscan_context_shard_size,
+    )
+
+
 ##########################################
 # Image and app definitions
 ##########################################
-# TODO(oligoformer-perf): Preserve current Biomodals TargetScan outputs for the
-# first GPU/CPU split. Before adding upstream RNAplfold binaries to PATH and
-# restoring site-accessibility scoring, add golden tests because that can change
-# off-target scores and increase CPU runtime.
 runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
@@ -369,6 +724,8 @@ runtime_image = (
         "git",
         "build-essential",
         "ca-certificates",
+        "curl",
+        "pkg-config",
         "unzip",
         "perl",
         "libstatistics-lite-perl",
@@ -378,6 +735,20 @@ runtime_image = (
     .env(CONF.default_env)
     .run_commands(
         " && ".join((
+            "tmpdir=$(mktemp -d)",
+            f"curl -fsSL {shlex.quote(APP_INFO.viennarna_archive_url)} "
+            '-o "$tmpdir/ViennaRNA-2.7.2.tar.gz"',
+            'tar -xzf "$tmpdir/ViennaRNA-2.7.2.tar.gz" -C "$tmpdir"',
+            'cd "$tmpdir/ViennaRNA-2.7.2"',
+            "./configure --without-gsl --without-swig --without-perl "
+            "--without-python --without-doc --without-svm --disable-openmp "
+            "--disable-unittests --disable-check-executables",
+            "make -j$(nproc)",
+            "make install",
+            "ldconfig",
+            "RNAplfold --version",
+            "cd /",
+            'rm -rf "$tmpdir"',
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
             f"cd {CONF.git_clone_dir}",
             f"git checkout {CONF.repo_commit_hash}",
@@ -386,7 +757,10 @@ runtime_image = (
             'grep -q "for i in range(Args.top_n):" scripts/infer.py',
             'sed -i "s|for i in range(Args.top_n):|for i in range(min(Args.top_n, RESULT_ranked.shape[0])):|g" scripts/infer.py',
             f"python -c {shlex.quote(APP_INFO.stage_patch_runner)}",
-            "rm -f off-target/ref/human_UTR.txt.zip off-target/ref/human_ORF.txt.zip",
+            "rm -f off-target/ref/human_UTR.txt.zip "
+            "off-target/ref/human_ORF.txt.zip "
+            "off-target/ref/human_UTR.txt "
+            "off-target/ref/human_ORF.txt",
             "cd off-target/pita",
             "make install",
         ))
@@ -407,13 +781,14 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=CONF.timeout
 )
 def download_oligoformer_models(force: bool = False) -> None:
-    """Download RNA-FM weights and full-human refs into the model volume."""
+    """Download RNA-FM weights and TargetScan 8.0 human refs into the model volume."""
     import shutil
-    import zipfile
 
-    refs_ready = all(path.is_file() for path in APP_INFO.model_human_ref_paths)
+    import orjson
+
+    refs_ready = _targetscan_human_refs_ready()
     if APP_INFO.model_rnafm_redevelop_dir.is_dir() and refs_ready and not force:
-        print("🧬 OligoFormer models and human refs already available")
+        print("🧬 OligoFormer models and TargetScan 8.0 human refs already available")
         return
 
     if APP_INFO.model_rnafm_dir.exists() and force:
@@ -445,17 +820,27 @@ def download_oligoformer_models(force: bool = False) -> None:
             num_retries=3,
             progress_bar_desc="OligoFormer human ref downloads",
         )
-        for ref_path in APP_INFO.model_human_ref_paths:
-            if force or not ref_path.is_file():
-                with zipfile.ZipFile(
-                    ref_path.with_suffix(ref_path.suffix + ".zip")
-                ) as ref_zip:
-                    ref_path.write_bytes(ref_zip.read(ref_path.name))
+        row_counts = _convert_targetscan_human_refs()
+        shutil.rmtree(APP_INFO.targetscan_rnaplfold_cache_dir, ignore_errors=True)
+        shutil.rmtree(APP_INFO.targetscan_rnaplfold_shard_dir, ignore_errors=True)
+        APP_INFO.targetscan_rnaplfold_marker_path.unlink(missing_ok=True)
+        APP_INFO.targetscan_ref_marker_path.write_bytes(
+            orjson.dumps(APP_INFO.targetscan_ref_metadata | {"row_counts": row_counts})
+        )
+        print(
+            "🧬 Converted TargetScan 8.0 human refs: "
+            + ", ".join(f"{name}={count}" for name, count in row_counts.items())
+        )
 
     if not APP_INFO.model_rnafm_redevelop_dir.is_dir():
         raise FileNotFoundError(
             "OligoFormer RNA-FM weights were not extracted to "
             f"{APP_INFO.model_rnafm_redevelop_dir}"
+        )
+    if not _targetscan_human_refs_ready():
+        raise FileNotFoundError(
+            "OligoFormer TargetScan 8.0 human refs were not converted under "
+            f"{APP_INFO.model_ref_dir}"
         )
     missing_refs = [
         str(path) for path in APP_INFO.model_human_ref_paths if not path.is_file()
@@ -466,7 +851,189 @@ def download_oligoformer_models(force: bool = False) -> None:
         )
 
     MODEL_VOLUME.commit()
-    print("🧬 OligoFormer models and human refs downloaded and committed")
+    print("🧬 OligoFormer models and TargetScan 8.0 human refs committed")
+
+
+def _run_rnaplfold_for_record(
+    *,
+    name: str,
+    sequence: str,
+    output_dir: Path,
+    workdir: Path,
+    log_path: Path,
+) -> bool:
+    """Run RNAplfold for one TargetScan UTR record if the output is missing."""
+    import shutil
+    import subprocess as sp
+
+    if "/" in name or "\0" in name:
+        raise ValueError(f"Unsafe TargetScan transcript identifier: {name!r}")
+    species = APP_INFO.targetscan_species_id
+    output_path = output_dir / f"{name}.{species}_lunp"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return False
+
+    fasta_bytes = f">{name}.{species}\n{sequence}\n".encode()
+    tmp_output_path = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
+    tmp_output_path.unlink(missing_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    rnaplfold_bin = shutil.which("RNAplfold")
+    if rnaplfold_bin is None:
+        raise FileNotFoundError("RNAplfold is not available on PATH")
+    with log_path.open("ab") as log:
+        log.write(f"Running RNAplfold for {name}.{species}\n".encode())
+        sp.run(  # noqa: S603 - RNAplfold is resolved from PATH and input is FASTA bytes.
+            [rnaplfold_bin, "-L", "40", "-W", "80", "-u", "20"],
+            input=fasta_bytes,
+            cwd=workdir,
+            stdout=log,
+            stderr=log,
+            check=True,
+        )
+
+    generated_lunp = workdir / f"{name}.{species}_lunp"
+    generated_ps = workdir / f"{name}.{species}_dp.ps"
+    if not generated_lunp.is_file():
+        raise FileNotFoundError(f"RNAplfold did not produce {generated_lunp}")
+    shutil.copy2(generated_lunp, tmp_output_path)
+    tmp_output_path.replace(output_path)
+    generated_lunp.unlink(missing_ok=True)
+    generated_ps.unlink(missing_ok=True)
+    return True
+
+
+@app.function(
+    cpu=APP_INFO.default_targetscan_rnaplfold_workers,
+    memory=(1024, 16384),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(model_volume=True, model_ro=False),
+)
+def run_oligoformer_targetscan_rnaplfold_shard(
+    spec: TargetscanRnaPlfoldShardSpec,
+) -> int:
+    """Populate one shard of cached TargetScan RNAplfold outputs."""
+    MODEL_VOLUME.reload()
+    records = _read_fasta_pairs(Path(spec.shard_path))
+    output_dir = Path(spec.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(spec.log_path)
+    local_workers = _targetscan_rnaplfold_workers()
+    print(
+        "💊 Running OligoFormer TargetScan RNAplfold shard "
+        f"{spec.shard_index} with {len(records)} UTRs using "
+        f"{local_workers} workers; log: {log_path}"
+    )
+    with TemporaryDirectory(
+        prefix=f"oligoformer_rnaplfold_{spec.shard_index}_"
+    ) as tmpdir:
+        workdir = Path(tmpdir)
+        created_flags = bounded_map(
+            records,
+            lambda record: _run_rnaplfold_for_record(
+                name=record[0],
+                sequence=record[1],
+                output_dir=output_dir,
+                workdir=workdir,
+                log_path=log_path,
+            ),
+            max_parallel=local_workers,
+        )
+    created = sum(created_flags)
+    MODEL_VOLUME.commit()
+    print(
+        "💊 OligoFormer TargetScan RNAplfold shard "
+        f"{spec.shard_index} created {created}/{len(records)} outputs"
+    )
+    return created
+
+
+@app.function(
+    cpu=(0.125, 8.125),
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(model_volume=True, model_ro=False),
+)
+def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
+    """Build or reuse cached TargetScan RNAplfold outputs for all-human refs."""
+    import shutil
+
+    import orjson
+
+    MODEL_VOLUME.reload()
+    _ensure_human_refs()
+    if _targetscan_rnaplfold_cache_ready() and not force:
+        print("🧬 OligoFormer TargetScan RNAplfold cache already available")
+        return
+
+    cache_dir = APP_INFO.targetscan_rnaplfold_cache_dir
+    shard_dir = APP_INFO.targetscan_rnaplfold_shard_dir
+    marker_path = APP_INFO.targetscan_rnaplfold_marker_path
+    if force:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.rmtree(shard_dir, ignore_errors=True)
+        marker_path.unlink(missing_ok=True)
+
+    records = _read_fasta_pairs(APP_INFO.model_ref_dir / "human_UTR.txt")
+    if not records:
+        raise RuntimeError("TargetScan human UTR refs contain no records")
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_size = _targetscan_rnaplfold_shard_size()
+    shard_specs = []
+    for shard_index, start in enumerate(range(0, len(records), shard_size)):
+        shard_records = records[start : start + shard_size]
+        shard_path = shard_dir / f"{shard_index:05d}.fa"
+        with shard_path.open("w", encoding="utf-8") as handle:
+            for name, sequence in shard_records:
+                handle.write(f">{name}\n{sequence}\n")
+        shard_specs.append(
+            TargetscanRnaPlfoldShardSpec(
+                shard_index=shard_index,
+                shard_path=str(shard_path),
+                output_dir=str(cache_dir),
+                log_path=str(shard_dir / "logs" / f"{shard_index:05d}.log"),
+            )
+        )
+
+    MODEL_VOLUME.commit()
+    node_count = _targetscan_rnaplfold_nodes(len(shard_specs))
+    local_workers = _targetscan_rnaplfold_workers()
+    print(
+        "🧬 Preparing OligoFormer TargetScan RNAplfold cache for "
+        f"{len(records)} UTRs across {len(shard_specs)} shards on up to "
+        f"{node_count} CPU nodes with {local_workers} workers each"
+    )
+    bounded_map(
+        shard_specs,
+        lambda spec: run_oligoformer_targetscan_rnaplfold_shard.remote(spec),
+        max_parallel=node_count,
+    )
+
+    MODEL_VOLUME.reload()
+    missing = [
+        name
+        for name, _ in records
+        if not (cache_dir / f"{name}.{APP_INFO.targetscan_species_id}_lunp").is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "OligoFormer TargetScan RNAplfold cache is incomplete; missing "
+            + ", ".join(missing[:10])
+        )
+    sample_indexes = sorted({0, len(records) // 2, len(records) - 1})
+    marker_path.write_bytes(
+        orjson.dumps(
+            APP_INFO.targetscan_rnaplfold_metadata
+            | {
+                "record_count": len(records),
+                "shard_count": len(shard_specs),
+                "sample_records": [records[index][0] for index in sample_indexes],
+            }
+        )
+    )
+    MODEL_VOLUME.commit()
+    print(f"🧬 OligoFormer TargetScan RNAplfold cache committed: {len(records)} UTRs")
 
 
 ##########################################
@@ -488,7 +1055,7 @@ def _ensure_rnafm_runtime() -> None:
 
 
 def _ensure_human_refs() -> None:
-    """Validate full-human refs in the model volume."""
+    """Validate TargetScan 8.0 full-human refs in the model volume."""
     missing_refs = [
         str(path) for path in APP_INFO.model_human_ref_paths if not path.is_file()
     ]
@@ -496,6 +1063,11 @@ def _ensure_human_refs() -> None:
         raise FileNotFoundError(
             "OligoFormer full-human refs are missing. Run "
             "download_oligoformer_models first: " + ", ".join(missing_refs)
+        )
+    if not _targetscan_human_refs_ready():
+        raise FileNotFoundError(
+            "OligoFormer full-human refs were not converted from TargetScan 8.0. "
+            "Run download_oligoformer_models first."
         )
 
 
@@ -538,6 +1110,7 @@ def _cache_key_for_run(
             f"mrna:{_hash_bytes(mrna_fasta_bytes)}",
             f"sirna:{_hash_bytes(sirna_fasta_bytes)}",
             f"off_target:{int(off_target)}",
+            f"off_target_cache_salt:{APP_INFO.off_target_cache_salt if off_target else ''}",
             f"toxicity:{int(toxicity)}",
             f"top_n:{top_n if off_target else ''}",
             f"functionality_filter:{int(functionality_filter)}",
@@ -643,6 +1216,33 @@ def _off_target_workers_per_node() -> int:
     )
 
 
+def _pita_prepare_nodes(task_count: int) -> int:
+    """Return max parallel PITA target-discovery Modal nodes."""
+    if task_count < 1:
+        return 1
+    nodes = _positive_int_from_env(
+        APP_INFO.off_target_pita_prepare_nodes_env,
+        APP_INFO.default_pita_prepare_nodes,
+    )
+    return max(1, min(nodes, task_count))
+
+
+def _pita_prepare_workers() -> int:
+    """Return local PITA target-discovery workers per Modal node."""
+    return _positive_int_from_env(
+        APP_INFO.off_target_pita_prepare_workers_env,
+        APP_INFO.default_pita_prepare_workers,
+    )
+
+
+def _pita_prepare_utr_shard_size() -> int:
+    """Return the number of UTR STAB rows per PITA target-discovery shard."""
+    return _positive_int_from_env(
+        APP_INFO.off_target_pita_prepare_utr_shard_size_env,
+        APP_INFO.default_pita_prepare_utr_shard_size,
+    )
+
+
 def _pita_row_shard_size() -> int:
     """Return the PITA row-shard size, preserving upstream's 1000-row batches."""
     return _positive_int_from_env(
@@ -719,15 +1319,39 @@ def _off_target_shard_spec(
     )
 
 
-def _batch_items(
-    items: list[PitaRowShardSpec],
+def _batch_items(  # noqa: UP047 - OligoFormer runtime image uses Python 3.10.
+    items: list[T],
     max_batches: int,
-) -> list[list[PitaRowShardSpec]]:
-    """Split row-shard specs into at most ``max_batches`` ordered batches."""
+) -> list[list[T]]:
+    """Split items into at most ``max_batches`` ordered batches."""
     if not items:
         return []
     batch_count = max(1, min(max_batches, len(items)))
     batch_size = (len(items) + batch_count - 1) // batch_count
+    return [
+        items[index : index + batch_size] for index in range(0, len(items), batch_size)
+    ]
+
+
+def _batch_items_for_local_workers(  # noqa: UP047 - runtime image uses Python 3.10.
+    items: list[T],
+    *,
+    max_nodes: int,
+    local_workers: int,
+) -> list[list[T]]:
+    """Split work so each Modal node can keep local workers busy."""
+    if not items:
+        return []
+    if max_nodes < 1:
+        raise ValueError("max_nodes must be at least 1")
+    if local_workers < 1:
+        raise ValueError("local_workers must be at least 1")
+
+    worker_sized_node_count = (len(items) + local_workers - 1) // local_workers
+    if worker_sized_node_count <= max_nodes:
+        batch_size = local_workers
+    else:
+        batch_size = (len(items) + max_nodes - 1) // max_nodes
     return [
         items[index : index + batch_size] for index in range(0, len(items), batch_size)
     ]
@@ -746,31 +1370,192 @@ def _prepare_off_target_shard_root(shard_root: Path) -> None:
     )
 
 
-def _write_pita_prepare_script(script_path: Path, potential_targets_path: Path) -> None:
-    """Write a patched PITA runner that stops after potential target discovery."""
+def _write_pita_stage0_script(
+    script_path: Path,
+    utr_stab_path: Path,
+    mir_stab_path: Path,
+) -> None:
+    """Write a patched PITA runner that stops after STAB preparation."""
     source = (CONF.git_clone_dir / "off-target/pita/lib/pita_run.pl").read_text(
         encoding="utf-8"
     )
-    before_scoring, separator, _ = source.partition("## Step 2: Compute site scores")
+    before_search, separator, _ = source.partition(
+        "## Step 1: Search potential targets"
+    )
     if not separator:
-        raise RuntimeError("Could not patch PITA runner before site scoring")
+        raise RuntimeError("Could not patch PITA runner before target discovery")
     _, helper_separator, helpers = source.partition("sub dsystem")
     if not helper_separator:
         raise RuntimeError("Could not find PITA dsystem helper")
-    perl_potential_targets_path = (
-        str(potential_targets_path).replace("\\", "\\\\").replace("'", "\\'")
-    )
+    perl_utr_stab_path = str(utr_stab_path).replace("\\", "\\\\").replace("'", "\\'")
+    perl_mir_stab_path = str(mir_stab_path).replace("\\", "\\\\").replace("'", "\\'")
     script_path.write_text(
-        before_scoring
+        before_search
         + f"""
 require File::Copy;
-File::Copy::copy("tmp_pt_$r", '{perl_potential_targets_path}') or die "copy tmp_pt failed: $!";
+File::Copy::copy("tmp_utr_stab_$r", '{perl_utr_stab_path}') or die "copy tmp_utr_stab failed: $!";
+File::Copy::copy("tmp_mir_stab_$r", '{perl_mir_stab_path}') or die "copy tmp_mir_stab failed: $!";
 exit (0);
 sub dsystem{helpers}
 """,
         encoding="utf-8",
     )
     script_path.chmod(0o755)
+
+
+def _pita_prepare_utr_shard_specs(
+    *,
+    utr_stab_path: Path,
+    mir_stab_path: Path,
+    shard_dir: Path,
+    logs_dir: Path,
+    shard_size: int,
+) -> tuple[PitaPrepareUtrShardSpec, ...]:
+    """Write local UTR STAB shard files and return discovery specs."""
+    rows = utr_stab_path.read_text(encoding="utf-8").splitlines()
+    if not rows:
+        return ()
+
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    specs = []
+    for shard_index, start_row in enumerate(range(0, len(rows), shard_size)):
+        end_row = min(start_row + shard_size, len(rows))
+        shard_name = f"{shard_index:05d}_{start_row:012d}_{end_row:012d}"
+        input_path = shard_dir / f"{shard_name}.utr.stab"
+        output_path = shard_dir / f"{shard_name}.potential.tsv"
+        input_path.write_text(
+            "\n".join(rows[start_row:end_row]) + "\n",
+            encoding="utf-8",
+        )
+        specs.append(
+            PitaPrepareUtrShardSpec(
+                shard_index=shard_index,
+                input_path=str(input_path),
+                mir_stab_path=str(mir_stab_path),
+                output_path=str(output_path),
+                log_path=str(
+                    logs_dir / "pita_prepare_utr_shards" / f"{shard_name}.log"
+                ),
+            )
+        )
+    return tuple(specs)
+
+
+def _run_pita_prepare_utr_shard(spec: PitaPrepareUtrShardSpec) -> str:
+    """Run one local UTR STAB shard through PITA potential-target discovery."""
+    output_path = Path(spec.output_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".done")
+    if marker_path.exists() and output_path.exists():
+        return str(output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output_path = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
+    tmp_output_path.unlink(missing_ok=True)
+    pita_lib = CONF.git_clone_dir / "off-target/pita/lib"
+    cmd = (
+        "set -euo pipefail; "
+        f"perl {shlex.quote(str(pita_lib / 'find_potential_mirna_targets.pl'))} "
+        f"{shlex.quote(spec.input_path)} -f {shlex.quote(spec.mir_stab_path)} "
+        f"> {shlex.quote(str(tmp_output_path))}"
+    )
+    run_command(
+        ["bash", "-lc", cmd],
+        cwd=pita_lib.parent,
+        output_mode="log",
+        log_file=spec.log_path,
+        show_command=False,
+    )
+    tmp_output_path.replace(output_path)
+    marker_path.write_text("done", encoding="utf-8")
+    return str(output_path)
+
+
+@app.function(
+    cpu=32.0,
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def run_oligoformer_pita_prepare_utr_shard_batch(
+    specs: list[PitaPrepareUtrShardSpec],
+    local_workers: int,
+) -> list[str]:
+    """Run cached PITA UTR target-discovery shards on one CPU node."""
+    CONF.output_volume.reload()
+    print(
+        "💊 Running OligoFormer PITA target-discovery batch with "
+        f"{len(specs)} shards using {local_workers} workers; logs under "
+        f"{Path(specs[0].log_path).parent if specs else 'n/a'}"
+    )
+    outputs = bounded_map(
+        specs,
+        _run_pita_prepare_utr_shard,
+        max_parallel=local_workers,
+    )
+    CONF.output_volume.commit()
+    return outputs
+
+
+def _write_pita_potential_targets_from_utr_shards(
+    *,
+    utr_stab_path: Path,
+    mir_stab_path: Path,
+    potential_targets_path: Path,
+    shard_dir: Path,
+    logs_dir: Path,
+) -> int:
+    """Run chunked PITA potential-target discovery and concatenate in UTR order."""
+    specs = _pita_prepare_utr_shard_specs(
+        utr_stab_path=utr_stab_path,
+        mir_stab_path=mir_stab_path,
+        shard_dir=shard_dir,
+        logs_dir=logs_dir,
+        shard_size=_pita_prepare_utr_shard_size(),
+    )
+    potential_targets_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_potential_targets_path = potential_targets_path.with_name(
+        f".{potential_targets_path.name}.tmp.{os.getpid()}"
+    )
+    tmp_potential_targets_path.unlink(missing_ok=True)
+    if not specs:
+        tmp_potential_targets_path.write_text("", encoding="utf-8")
+        tmp_potential_targets_path.replace(potential_targets_path)
+        return 0
+
+    local_workers = _pita_prepare_workers()
+    batches = _batch_items_for_local_workers(
+        list(specs),
+        max_nodes=_pita_prepare_nodes(len(specs)),
+        local_workers=local_workers,
+    )
+    print(
+        "💊 Running OligoFormer PITA target discovery for "
+        f"{len(specs)} UTR shards on {len(batches)} CPU nodes with "
+        f"{local_workers} workers each"
+    )
+    CONF.output_volume.commit()
+    output_batches = bounded_map(
+        batches,
+        lambda batch: run_oligoformer_pita_prepare_utr_shard_batch.remote(
+            list(batch),
+            local_workers=local_workers,
+        ),
+        max_parallel=len(batches),
+    )
+    CONF.output_volume.reload()
+    outputs = [output for batch in output_batches for output in batch]
+    row_count = 0
+    with tmp_potential_targets_path.open("w", encoding="utf-8") as out:
+        for output in outputs:
+            data = Path(output).read_text(encoding="utf-8")
+            if not data:
+                continue
+            out.write(data)
+            if not data.endswith("\n"):
+                out.write("\n")
+            row_count += len(data.splitlines())
+    tmp_potential_targets_path.replace(potential_targets_path)
+    return row_count
 
 
 def _pita_row_shard_specs(
@@ -855,8 +1640,10 @@ def _run_pita_prepare(
 
     pita_root = shard_root / "off-target/pita"
     sirna_file = _off_target_shard_sirna_file(spec, shard_root)
-    script_path = pita_root / "prepare_pita_rows.pl"
-    _write_pita_prepare_script(script_path, potential_targets_path)
+    utr_stab_path = shard_root / f"{spec.stem}_shard_{spec.index:05d}_utr.stab"
+    mir_stab_path = shard_root / f"{spec.stem}_shard_{spec.index:05d}_mir.stab"
+    script_path = pita_root / "prepare_pita_stage0.pl"
+    _write_pita_stage0_script(script_path, utr_stab_path, mir_stab_path)
     cmd = [
         "perl",
         str(script_path),
@@ -875,10 +1662,28 @@ def _run_pita_prepare(
         cmd,
         cwd=pita_root,
         output_mode="log",
-        log_file=logs_dir / "pita_prepare.log",
+        log_file=logs_dir / "pita_prepare_stage0.log",
         show_command=False,
     )
-    row_count = len(potential_targets_path.read_text(encoding="utf-8").splitlines())
+    missing_stage0_outputs = [
+        str(path)
+        for path in (utr_stab_path, mir_stab_path, ext_utr_path)
+        if not path.exists()
+    ]
+    if missing_stage0_outputs:
+        raise FileNotFoundError(
+            "OligoFormer PITA stage 0 did not produce expected files: "
+            + ", ".join(missing_stage0_outputs)
+        )
+    cached_mir_stab_path = cache_dir / f"{spec.stem}_shard_{spec.index:05d}_mir.stab"
+    cached_mir_stab_path.write_bytes(mir_stab_path.read_bytes())
+    row_count = _write_pita_potential_targets_from_utr_shards(
+        utr_stab_path=utr_stab_path,
+        mir_stab_path=cached_mir_stab_path,
+        potential_targets_path=potential_targets_path,
+        shard_dir=cache_dir / "pita_prepare_utr_shards",
+        logs_dir=logs_dir,
+    )
     marker_path.write_text(str(row_count), encoding="utf-8")
 
     row_shards = _pita_row_shard_specs(
@@ -932,35 +1737,349 @@ def _pita_row_shard_spec(
     )
 
 
+def _write_targetscan_runner(script_path: Path) -> None:
+    """Write a TargetScan runner that can reuse cached RNAplfold outputs."""
+    script_path.write_text(
+        r"""#!/usr/bin/env bash
+set -eu
+shopt -s nullglob
+mir=$1
+utr=$2
+orf=$3
+stem=$4
+context_dir=$5
+context_shard_size=${6:-500}
+rm -rf ./off-target/tmp
+cp -r ./off-target/targetscan ./off-target/tmp
+cp "$mir" "$utr" "$orf" ./off-target/tmp/
+cd ./off-target/tmp
+mir=$(basename "$mir")
+utr=$(basename "$utr")
+orf=$(basename "$orf")
+awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",x,$1;}' "$mir" | sed 's/>//g' > sirnas_for_context_scores.txt
+awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,substr($1,2,7),"9606";}' "$mir" | sed 's/>//g' > sirnas.txt
+awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",$1;}' "$utr" | sed 's/>//g' > UTR.txt
+awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",$1;}' "$orf" | sed 's/>//g' > ORF.txt
+awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",length($1);}' "$orf" | sed 's/>//g' > ORF.length.txt
+perl targetscan_70.pl sirnas.txt UTR.txt targetscan_70_output.txt
+perl targetscan_70_BL_bins.pl UTR.txt > UTRs_median_BLs_bins.txt
+perl targetscan_70_BL_PCT.pl sirnas.txt targetscan_70_output.txt UTRs_median_BLs_bins.txt > targetscan_70_output.BL_PCT.txt
+perl targetscan_count_8mers.pl sirnas.txt ORF.txt > ORF_8mer_counts.txt
+rm -rf "$context_dir"
+mkdir -p "$context_dir/common" "$context_dir/shards" "$context_dir/outputs"
+cp sirnas_for_context_scores.txt UTR.txt ORF.length.txt ORF_8mer_counts.txt "$context_dir/common/"
+cp TA_SPS_by_seed_region.txt Agarwal_2015_parameters.txt All_cell_lines.AIRs.txt "$context_dir/common/"
+if [[ -s targetscan_70_output.BL_PCT.txt ]]; then
+  split -d -a 5 -l "$context_shard_size" targetscan_70_output.BL_PCT.txt "$context_dir/shards/targets_"
+fi
+""",
+        encoding="utf-8",
+    )
+    script_path.chmod(0o755)
+
+
+def _targetscan_context_shard_specs(
+    *,
+    context_dir: Path,
+    logs_dir: Path,
+    rnaplfold_cache_dir: str,
+) -> tuple[TargetscanContextShardSpec, ...]:
+    """Build context-score shard specs from prepared TargetScan target shards."""
+    shard_paths = sorted((context_dir / "shards").glob("targets_*"))
+    return tuple(
+        TargetscanContextShardSpec(
+            shard_index=shard_index,
+            common_dir=str(context_dir / "common"),
+            targets_path=str(shard_path),
+            output_path=str(
+                context_dir
+                / "outputs"
+                / f"Targets.BL_PCT.context_scores.{shard_index:05d}.txt"
+            ),
+            log_path=str(logs_dir / "targetscan_context" / f"{shard_index:05d}.log"),
+            rnaplfold_cache_dir=rnaplfold_cache_dir,
+        )
+        for shard_index, shard_path in enumerate(shard_paths)
+    )
+
+
+def _run_targetscan_context_shard(spec: TargetscanContextShardSpec) -> str:
+    """Run one TargetScan context-score shard on a CPU node."""
+    import shutil
+
+    output_path = Path(spec.output_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".done")
+    if marker_path.exists() and output_path.exists():
+        return str(output_path)
+
+    common_dir = Path(spec.common_dir)
+    with TemporaryDirectory(
+        prefix=f"oligoformer_targetscan_context_{spec.shard_index}_"
+    ) as tmpdir:
+        workdir = Path(tmpdir)
+        shutil.copy2(
+            CONF.git_clone_dir
+            / "off-target/targetscan/targetscan_70_context_scores.pl",
+            workdir / "targetscan_70_context_scores.pl",
+        )
+        for name in (
+            "sirnas_for_context_scores.txt",
+            "UTR.txt",
+            "ORF.length.txt",
+            "ORF_8mer_counts.txt",
+            "TA_SPS_by_seed_region.txt",
+            "Agarwal_2015_parameters.txt",
+            "All_cell_lines.AIRs.txt",
+        ):
+            (workdir / name).symlink_to(common_dir / name)
+        (workdir / "predicted_targets.txt").symlink_to(Path(spec.targets_path))
+        if spec.rnaplfold_cache_dir:
+            (workdir / "RNAplfold_in_out").symlink_to(Path(spec.rnaplfold_cache_dir))
+
+        tmp_output_path = workdir / "Targets.BL_PCT.context_scores.txt"
+        run_command(
+            [
+                "perl",
+                "targetscan_70_context_scores.pl",
+                "sirnas_for_context_scores.txt",
+                "UTR.txt",
+                "predicted_targets.txt",
+                "ORF.length.txt",
+                "ORF_8mer_counts.txt",
+                str(tmp_output_path),
+            ],
+            cwd=workdir,
+            output_mode="log",
+            log_file=spec.log_path,
+            show_command=False,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(tmp_output_path.read_bytes())
+
+    marker_path.write_text("done", encoding="utf-8")
+    return str(output_path)
+
+
+@app.function(
+    cpu=32.0,
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def run_oligoformer_targetscan_context_shard_batch(
+    specs: list[TargetscanContextShardSpec],
+    local_workers: int,
+) -> list[str]:
+    """Run TargetScan context-score shards on one CPU node."""
+    CONF.output_volume.reload()
+    print(
+        "💊 Running OligoFormer TargetScan context batch with "
+        f"{len(specs)} shards using {local_workers} workers; logs under "
+        f"{Path(specs[0].log_path).parent if specs else 'n/a'}"
+    )
+    outputs = bounded_map(
+        specs,
+        _run_targetscan_context_shard,
+        max_parallel=local_workers,
+    )
+    CONF.output_volume.commit()
+    return outputs
+
+
+def _merge_targetscan_context_outputs(
+    *,
+    context_outputs: list[str],
+    targetscan_path: Path,
+    log_file: Path,
+) -> None:
+    """Merge TargetScan context-score shards into OligoFormer's target table."""
+    targetscan_path.parent.mkdir(parents=True, exist_ok=True)
+    if not context_outputs:
+        targetscan_path.write_text("", encoding="utf-8")
+        return
+
+    with TemporaryDirectory(prefix="oligoformer_targetscan_merge_") as tmpdir:
+        workdir = Path(tmpdir)
+        context_scores_path = workdir / "Targets.BL_PCT.context_scores.txt"
+        first = True
+        with context_scores_path.open("w", encoding="utf-8") as out:
+            for output in context_outputs:
+                lines = Path(output).read_text(encoding="utf-8").splitlines()
+                if not lines:
+                    continue
+                if first:
+                    out.write("\n".join(lines))
+                    out.write("\n")
+                    first = False
+                elif len(lines) > 1:
+                    out.write("\n".join(lines[1:]))
+                    out.write("\n")
+
+        cmd = (
+            "set -eu; "
+            "sed '1d' Targets.BL_PCT.context_scores.txt "
+            '| awk \'BEGIN{FS="\\t";OFS="\\t"} {print $1,$3,$4,$28;}\' '
+            "| sort -k 1,2 > temp.txt; "
+            "grep '6mer' temp.txt | awk 'BEGIN{OFS=\"\\t\"} {print $1,$2,$4}' "
+            "> 6mer.txt; "
+            "grep '7mer-1a' temp.txt | awk 'BEGIN{OFS=\"\\t\"} "
+            "{ if( $28< -0.01 ) {print $1,$2,$4;} }' > 7merA1.txt; "
+            "grep '7mer-m8' temp.txt | awk 'BEGIN{OFS=\"\\t\"} "
+            "{ if( $28< -0.02 ) {print $1,$2,$4;} }' > 7merm8.txt; "
+            "grep '8mer-1a' temp.txt | awk 'BEGIN{OFS=\"\\t\"} "
+            "{ if( $28< -0.03 ) {print $1,$2,$4;} }' > 8mer.txt; "
+            "cat 6mer.txt 7merA1.txt 7merm8.txt 8mer.txt | sort -k 1,2 "
+            "> temp.filtered.txt; "
+            'awk \'BEGIN{OFS="\\t";target="";sirna="";totscore=0.0;} '
+            "{ if( target==$1 && sirna==$2 ) { totscore+=$3; } else { print "
+            "target,sirna,-totscore; target=$1; sirna=$2; totscore=$3; } } "
+            "END{print target,sirna,-totscore;}' temp.filtered.txt | sed '1d' "
+            "> offtarget_predictions.tab"
+        )
+        run_command(
+            ["bash", "-lc", cmd],
+            cwd=workdir,
+            output_mode="log",
+            log_file=log_file,
+            show_command=False,
+        )
+        targetscan_path.write_bytes(
+            (workdir / "offtarget_predictions.tab").read_bytes()
+        )
+
+
 def _run_targetscan_cached(spec: OffTargetShardSpec, shard_root: Path) -> str:
     """Run or reuse cached TargetScan output for one siRNA."""
+    from time import perf_counter
+
     cache_dir = _off_target_shard_cache_dir(spec)
     targetscan_path = cache_dir / "targetscan.tab"
     marker_path = cache_dir / "targetscan.done"
     if marker_path.exists() and targetscan_path.exists():
         return str(targetscan_path)
 
-    infer_dir = _off_target_shard_infer_dir(spec, shard_root)
     sirna_file = _off_target_shard_sirna_file(spec, shard_root)
     logs_dir = _off_target_shard_logs_dir(spec)
-    run_command(
-        [
-            "bash",
-            str(CONF.git_clone_dir / "scripts/targetscan.sh"),
-            str(sirna_file),
-            spec.utr_path,
-            spec.orf_path,
-            f"{spec.stem}_shard_{spec.index:05d}",
-        ],
-        cwd=shard_root,
-        output_mode="log",
-        log_file=logs_dir / "targetscan.log",
+    version_output = run_command(
+        ["RNAplfold", "--version"],
+        output_mode="capture",
         show_command=False,
     )
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    targetscan_path.write_bytes((infer_dir / "targetscan.tab").read_bytes())
+    print(
+        "💊 OligoFormer RNAplfold available: "
+        f"{version_output[0] if version_output else 'version output unavailable'}"
+    )
+    rnaplfold_cache_dir = ""
+    if _is_model_human_ref_pair(spec.utr_path, spec.orf_path):
+        if not _targetscan_rnaplfold_cache_ready():
+            raise FileNotFoundError(
+                "OligoFormer TargetScan RNAplfold cache is missing. Run "
+                "prepare_oligoformer_targetscan_rnaplfold_cache first."
+            )
+        rnaplfold_cache_dir = str(APP_INFO.targetscan_rnaplfold_cache_dir)
+
+    script_path = shard_root / "run_targetscan_cached.sh"
+    _write_targetscan_runner(script_path)
+    context_shard_size = _targetscan_context_shard_size()
+    context_dir = cache_dir / "targetscan_context"
+    prep_marker_path = context_dir / "targetscan_prepare.done"
+    print(
+        "💊 Preparing OligoFormer TargetScan shard "
+        f"{spec.stem}:{spec.index} with {context_shard_size} target rows "
+        f"per context shard; log: {logs_dir / 'targetscan_prep.log'}"
+    )
+    started_at = perf_counter()
+    if not prep_marker_path.exists():
+        run_command(
+            [
+                str(script_path),
+                str(sirna_file),
+                spec.utr_path,
+                spec.orf_path,
+                f"{spec.stem}_shard_{spec.index:05d}",
+                str(context_dir),
+                str(context_shard_size),
+            ],
+            cwd=shard_root,
+            output_mode="log",
+            log_file=logs_dir / "targetscan_prep.log",
+            show_command=False,
+        )
+        prep_marker_path.write_text("done", encoding="utf-8")
+        CONF.output_volume.commit()
+
+    CONF.output_volume.reload()
+    context_shards = _targetscan_context_shard_specs(
+        context_dir=context_dir,
+        logs_dir=logs_dir,
+        rnaplfold_cache_dir=rnaplfold_cache_dir,
+    )
+    context_workers = _targetscan_context_workers()
+    context_batches = _batch_items_for_local_workers(
+        list(context_shards),
+        max_nodes=_targetscan_context_nodes(len(context_shards)),
+        local_workers=context_workers,
+    )
+    print(
+        "💊 Running OligoFormer TargetScan context scoring for "
+        f"{len(context_shards)} shards on {len(context_batches)} CPU nodes with "
+        f"{context_workers} workers each"
+    )
+    context_output_batches = bounded_map(
+        context_batches,
+        lambda batch: run_oligoformer_targetscan_context_shard_batch.remote(
+            list(batch),
+            local_workers=context_workers,
+        ),
+        max_parallel=len(context_batches),
+    )
+    context_outputs = [output for batch in context_output_batches for output in batch]
+    CONF.output_volume.reload()
+    _merge_targetscan_context_outputs(
+        context_outputs=context_outputs,
+        targetscan_path=targetscan_path,
+        log_file=logs_dir / "targetscan_merge.log",
+    )
+    elapsed_seconds = perf_counter() - started_at
+    print(
+        "💊 OligoFormer TargetScan shard "
+        f"{spec.stem}:{spec.index} finished in {elapsed_seconds:.1f}s; "
+        f"log: {logs_dir / 'targetscan_prep.log'}"
+    )
     marker_path.write_text("done", encoding="utf-8")
     return str(targetscan_path)
+
+
+def _prepare_oligoformer_off_target_shard(
+    spec: OffTargetShardSpec,
+) -> PreparedOffTargetShard:
+    """Prepare one siRNA off-target shard in the shared output-volume cache."""
+    from time import perf_counter
+
+    started_at = perf_counter()
+    with TemporaryDirectory(prefix=f"oligoformer_{spec.stem}_prepare_") as tmpdir:
+        shard_root = Path(tmpdir) / f"{spec.stem}_shard_{spec.index:05d}"
+        _prepare_off_target_shard_root(shard_root)
+
+        _off_target_shard_sirna_file(spec, shard_root)
+        targetscan_path = _run_targetscan_cached(spec, shard_root)
+        prepared = _run_pita_prepare(spec, shard_root)
+        prepared = PreparedOffTargetShard(
+            index=prepared.index,
+            record_name=prepared.record_name,
+            cache_dir=prepared.cache_dir,
+            logs_dir=prepared.logs_dir,
+            pita_path=prepared.pita_path,
+            targetscan_path=targetscan_path,
+            row_shards=prepared.row_shards,
+        )
+    elapsed_seconds = perf_counter() - started_at
+    print(
+        "💊 OligoFormer off-target prep shard "
+        f"{spec.stem}:{spec.index} finished in {elapsed_seconds:.1f}s; "
+        f"row shards: {len(prepared.row_shards)}"
+    )
+    return prepared
 
 
 @app.function(
@@ -974,28 +2093,38 @@ def prepare_oligoformer_off_target_shard(
 ) -> PreparedOffTargetShard:
     """Prepare one siRNA off-target shard in the shared output-volume cache."""
     CONF.output_volume.reload()
-    with TemporaryDirectory(prefix=f"oligoformer_{spec.stem}_prepare_") as tmpdir:
-        shard_root = Path(tmpdir) / f"{spec.stem}_shard_{spec.index:05d}"
-        _prepare_off_target_shard_root(shard_root)
+    prepared = _prepare_oligoformer_off_target_shard(spec)
+    CONF.output_volume.commit()
+    return prepared
 
-        _off_target_shard_sirna_file(spec, shard_root)
-        targetscan_path, prepared = bounded_map(
-            (
-                lambda: _run_targetscan_cached(spec, shard_root),
-                lambda: _run_pita_prepare(spec, shard_root),
-            ),
-            lambda task: task(),
-            max_parallel=2,
-        )
-        prepared = PreparedOffTargetShard(
-            index=prepared.index,
-            record_name=prepared.record_name,
-            cache_dir=prepared.cache_dir,
-            logs_dir=prepared.logs_dir,
-            pita_path=prepared.pita_path,
-            targetscan_path=targetscan_path,
-            row_shards=prepared.row_shards,
-        )
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def prepare_oligoformer_off_target_shard_batch(
+    specs: list[OffTargetShardSpec],
+    local_workers: int,
+) -> list[PreparedOffTargetShard]:
+    """Prepare cached siRNA off-target shards on one CPU node."""
+    CONF.output_volume.reload()
+    print(
+        "💊 Running OligoFormer off-target prep batch with "
+        f"{len(specs)} siRNAs using {local_workers} workers"
+    )
+    if local_workers == 1:
+        prepared = []
+        for spec in specs:
+            prepared.append(_prepare_oligoformer_off_target_shard(spec))
+            CONF.output_volume.commit()
+        return prepared
+    prepared = bounded_map(
+        specs,
+        _prepare_oligoformer_off_target_shard,
+        max_parallel=local_workers,
+    )
     CONF.output_volume.commit()
     return prepared
 
@@ -1079,7 +2208,7 @@ def _run_pita_row_shard(spec: PitaRowShardSpec) -> str:
 
 
 @app.function(
-    cpu=(0.125, 32.125),
+    cpu=32.0,
     memory=(1024, 32768),
     timeout=CONF.timeout,
     volumes=CONF.mounts(output_volume=True),
@@ -1170,6 +2299,25 @@ def _write_pita_targets_from_scored_rows(
     Path(prepared.cache_dir, "pita_finalize.done").write_text("done", encoding="utf-8")
 
 
+def _finalize_oligoformer_pita_shard(
+    prepared: PreparedOffTargetShard,
+) -> OffTargetShardResult:
+    """Finalize one per-siRNA PITA table from cached row shards."""
+    pita_path = Path(prepared.pita_path)
+    marker_path = Path(prepared.cache_dir) / "pita_finalize.done"
+    if not marker_path.exists() or not pita_path.exists():
+        row_outputs = [
+            Path(row.output_path)
+            for row in sorted(prepared.row_shards, key=lambda item: item.shard_index)
+        ]
+        _write_pita_targets_from_scored_rows(prepared, row_outputs)
+    return OffTargetShardResult(
+        index=prepared.index,
+        pita_path=prepared.pita_path,
+        targetscan_path=prepared.targetscan_path,
+    )
+
+
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
@@ -1181,20 +2329,34 @@ def finalize_oligoformer_pita_shard(
 ) -> OffTargetShardResult:
     """Finalize one per-siRNA PITA table from cached row shards."""
     CONF.output_volume.reload()
-    pita_path = Path(prepared.pita_path)
-    marker_path = Path(prepared.cache_dir) / "pita_finalize.done"
-    if not marker_path.exists() or not pita_path.exists():
-        row_outputs = [
-            Path(row.output_path)
-            for row in sorted(prepared.row_shards, key=lambda item: item.shard_index)
-        ]
-        _write_pita_targets_from_scored_rows(prepared, row_outputs)
-        CONF.output_volume.commit()
-    return OffTargetShardResult(
-        index=prepared.index,
-        pita_path=prepared.pita_path,
-        targetscan_path=prepared.targetscan_path,
+    result = _finalize_oligoformer_pita_shard(prepared)
+    CONF.output_volume.commit()
+    return result
+
+
+@app.function(
+    cpu=32.0,
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_oligoformer_pita_shard_batch(
+    prepared_shards: list[PreparedOffTargetShard],
+    local_workers: int,
+) -> list[OffTargetShardResult]:
+    """Finalize cached per-siRNA PITA tables on one CPU node."""
+    CONF.output_volume.reload()
+    print(
+        "💊 Running OligoFormer PITA finalize batch with "
+        f"{len(prepared_shards)} siRNAs using {local_workers} workers"
     )
+    results = bounded_map(
+        prepared_shards,
+        _finalize_oligoformer_pita_shard,
+        max_parallel=local_workers,
+    )
+    CONF.output_volume.commit()
+    return results
 
 
 def _merge_pita_shards(shard_results: list[OffTargetShardResult], output_path: Path):
@@ -1260,19 +2422,36 @@ def _run_off_target_shards(
         )
         for item in enumerate(records)
     ]
+    # Each prep item fans out into TargetScan and PITA child shard batches, so
+    # keep in-batch prep serial and bound the parent Modal container count.
+    prepare_batches, prepare_workers = batches_for_total_concurrency(
+        shard_specs,
+        max_batches=node_count,
+        max_workers_per_batch=1,
+        total_concurrency=node_count,
+    )
     print(
         "💊 Running OligoFormer off-target prep for "
-        f"{len(records)} siRNAs on up to {node_count} CPU nodes"
+        f"{len(records)} siRNAs in {len(prepare_batches)} batches with "
+        f"{prepare_workers} worker each"
     )
     print(f"💊 Saving OligoFormer off-target logs under {logs_dir}")
-    prepared_shards = bounded_map(
-        shard_specs,
-        lambda spec: prepare_oligoformer_off_target_shard.remote(spec),
-        max_parallel=node_count,
+    prepared_batches = bounded_map(
+        prepare_batches,
+        lambda batch: prepare_oligoformer_off_target_shard_batch.remote(
+            list(batch),
+            local_workers=prepare_workers,
+        ),
+        max_parallel=len(prepare_batches),
     )
+    prepared_shards = [prepared for batch in prepared_batches for prepared in batch]
 
     row_shards = [row for prepared in prepared_shards for row in prepared.row_shards]
-    row_batches = _batch_items(row_shards, _off_target_nodes(len(row_shards)))
+    row_batches = _batch_items_for_local_workers(
+        row_shards,
+        max_nodes=_off_target_nodes(len(row_shards)),
+        local_workers=local_workers,
+    )
     if row_batches:
         print(
             "💊 Running OligoFormer PITA scoring for "
@@ -1289,11 +2468,26 @@ def _run_off_target_shards(
         )
 
     CONF.output_volume.reload()
-    shard_results = bounded_map(
+    finalize_batches, finalize_workers = batches_for_total_concurrency(
         prepared_shards,
-        lambda prepared: finalize_oligoformer_pita_shard.remote(prepared),
-        max_parallel=node_count,
+        max_batches=node_count,
+        max_workers_per_batch=local_workers,
+        total_concurrency=node_count,
     )
+    print(
+        "💊 Finalizing OligoFormer PITA tables for "
+        f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} batches with "
+        f"{finalize_workers} workers each"
+    )
+    result_batches = bounded_map(
+        finalize_batches,
+        lambda batch: finalize_oligoformer_pita_shard_batch.remote(
+            list(batch),
+            local_workers=finalize_workers,
+        ),
+        max_parallel=len(finalize_batches),
+    )
+    shard_results = [result for batch in result_batches for result in batch]
     CONF.output_volume.reload()
     _merge_pita_shards(shard_results, infer_dir / "pita.tab")
     _merge_targetscan_shards(shard_results, infer_dir / "targetscan.tab")
@@ -1620,6 +2814,7 @@ def run_oligoformer_postprocess(
     else:
         if off_target and all_human:
             _ensure_human_refs()
+            prepare_oligoformer_targetscan_rnaplfold_cache.remote(force=False)
             utr_path = str(APP_INFO.model_ref_dir / "human_UTR.txt")
             orf_path = str(APP_INFO.model_ref_dir / "human_ORF.txt")
         else:
@@ -1710,8 +2905,8 @@ def submit_oligoformer_task(
             traversing the mRNA with OligoFormer's default 19 nt window.
         off_target: Enable OligoFormer off-target prediction.
         toxicity: Enable OligoFormer toxicity prediction.
-        all_human: Use upstream bundled human ORF and UTR references for
-            off-target prediction.
+        all_human: Use converted TargetScan 8.0 human ORF and UTR references
+            for off-target prediction.
         utr_file: Local UTR reference file for off-target prediction.
         orf_file: Local ORF reference file for off-target prediction.
         top_n: Number of top siRNAs to use for off-target prediction. Defaults

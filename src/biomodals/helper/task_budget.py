@@ -37,3 +37,47 @@ def bounded_map(  # noqa: UP047
         for future in as_completed(futures):
             results[futures[future]] = future.result()
     return [results[index] for index in range(len(item_list))]
+
+
+def batches_for_total_concurrency(  # noqa: UP047
+    items: Iterable[T],
+    *,
+    max_batches: int,
+    max_workers_per_batch: int,
+    total_concurrency: int,
+) -> tuple[list[list[T]], int]:
+    """Split work into batches while capping total active workers.
+
+    Returns ordered batches and the local worker count each batch should use.
+    If there are many items, local workers per batch are reduced so
+    ``len(batches) * workers_per_batch`` does not exceed ``total_concurrency``.
+    """
+    item_list = list(items)
+    if not item_list:
+        return [], 1
+    if max_batches < 1:
+        raise ValueError("max_batches must be at least 1")
+    if max_workers_per_batch < 1:
+        raise ValueError("max_workers_per_batch must be at least 1")
+    if total_concurrency < 1:
+        raise ValueError("total_concurrency must be at least 1")
+
+    worker_sized_batch_count = (
+        len(item_list) + max_workers_per_batch - 1
+    ) // max_workers_per_batch
+    batch_count = min(
+        len(item_list),
+        max_batches,
+        total_concurrency,
+        max(1, worker_sized_batch_count),
+    )
+    workers_per_batch = max(
+        1,
+        min(max_workers_per_batch, total_concurrency // batch_count),
+    )
+    batch_size = (len(item_list) + batch_count - 1) // batch_count
+    batches = [
+        item_list[index : index + batch_size]
+        for index in range(0, len(item_list), batch_size)
+    ]
+    return batches, workers_per_batch

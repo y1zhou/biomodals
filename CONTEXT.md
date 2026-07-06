@@ -62,6 +62,26 @@ _Avoid_: loose siRNA list, unranked outputs
 A collection of non-target transcript regions used to estimate unintended siRNA binding during off-target prediction.
 _Avoid_: background FASTA, all-human mode
 
+**siRNA Candidate Batch**:
+A subset of a siRNA candidate set that is scored together against one or more off-target reference shards.
+_Avoid_: single siRNA job, candidate chunk
+
+**Off-Target Reference Shard**:
+A transcript-aligned subset of an off-target reference set that preserves the UTR, ORF, and related transcript-region records needed to score candidates against that subset.
+_Avoid_: loose FASTA split, UTR-only shard
+
+**Off-Target Scoring Tile**:
+The pair of one siRNA candidate batch and one off-target reference shard whose partial off-target evidence can be combined with other tiles for the same candidate set.
+_Avoid_: worker job, Modal task, queue item
+
+**Off-Target Tile Manifest**:
+A run-level manifest of typed off-target scoring tiles that defines the finite TargetScan and PITA work to run for one siRNA candidate set.
+_Avoid_: worker queue, dynamic task list
+
+**Off-Target Evidence Table**:
+A transcript-level table of partial TargetScan or PITA off-target evidence that can be merged across scoring tiles before candidate-level filtering or ranking.
+_Avoid_: final score table, shard output
+
 **Generated Scaffold Segment**:
 A de novo structure segment introduced by RFdiffusion from a numeric contig segment rather than copied from the input PDB.
 _Avoid_: generated position, inpainted position

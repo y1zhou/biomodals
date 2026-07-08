@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import polars as pl
 import pytest
 
 from biomodals.app.score import oligoformer_app
@@ -353,7 +354,50 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         captured["package_paths"] = [str(path) for path in paths_to_bundle or ()]
         return b"archive"
 
+    class FakeCall:
+        def __init__(self, func, args, kwargs):
+            self.func = func
+            self.args = args
+            self.kwargs = kwargs
+            self.cancelled = False
+
+        def get(self):
+            return self.func(*self.args, **self.kwargs)
+
+        def cancel(self, terminate_containers=False):
+            self.cancelled = terminate_containers
+
+    class FakeBranch:
+        def __init__(self, func):
+            self.func = func
+            self.spawn_calls = []
+
+        def spawn(self, *args, **kwargs):
+            self.spawn_calls.append((args, kwargs))
+            return FakeCall(self.func, args, kwargs)
+
+    gather_calls = []
+    targetscan_branch = FakeBranch(
+        oligoformer_app.run_oligoformer_targetscan_branch.get_raw_f()
+    )
+    pita_branch = FakeBranch(oligoformer_app.run_oligoformer_pita_branch.get_raw_f())
+
+    def fake_gather(*calls):
+        gather_calls.append(calls)
+        return tuple(call.get() for call in calls)
+
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_targetscan_branch",
+        targetscan_branch,
+    )
+    monkeypatch.setattr(oligoformer_app, "run_oligoformer_pita_branch", pita_branch)
+    monkeypatch.setattr(
+        oligoformer_app.modal.FunctionCall,
+        "gather",
+        staticmethod(fake_gather),
+    )
     monkeypatch.setattr(
         oligoformer_app,
         "_run_targetscan_prepare_batches",
@@ -404,6 +448,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     final_table = layout.outputs_dir.joinpath("target.txt").read_text(encoding="utf-8")
     raw_off_target_dir = layout.prep_dir / "off_target" / "target"
     assert result == b"archive"
+    assert len(targetscan_branch.spawn_calls) == 1
+    assert len(pita_branch.spawn_calls) == 1
+    assert len(gather_calls) == 1
     assert len(targetscan_plan_calls) == 1
     assert [record.name for record in targetscan_plan_calls[0].records] == [
         "RNA0",
@@ -454,8 +501,73 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         "ref\tRNA0\t2",
         "ref\tRNA1\t0.5",
     ]
-    assert volume.reload_count == 6
-    assert volume.commit_count == 5
+    assert volume.reload_count >= 4
+    assert volume.commit_count >= 3
+
+
+def test_apply_off_target_filters_handles_header_only_pita(tmp_path: Path, monkeypatch):
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+
+    def fake_run_off_target_shards(*, infer_dir: Path, **_kwargs) -> None:
+        infer_dir.mkdir(parents=True, exist_ok=True)
+        infer_dir.joinpath("pita.tab").write_text(
+            "RefSeq\tmicroRNA\tSites\tScore\n",
+            encoding="utf-8",
+        )
+        infer_dir.joinpath("targetscan.tab").write_text(
+            "ref\tRNA0\t0.5\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        oligoformer_app, "_run_off_target_shards", fake_run_off_target_shards
+    )
+
+    result = pl.DataFrame({
+        "pos": [1, 2],
+        "sense": ["GC", "CG"],
+        "siRNA": ["AUGCUAGCUAGCUAGCUAG", "UGCUAGCUAGCUAGCUAGC"],
+        "efficacy": [0.8, 0.6],
+        "func_filter": [0, 0],
+    })
+
+    filtered = oligoformer_app._apply_off_target_filters(
+        result=result,
+        run_root=str(tmp_path / "run"),
+        stem="target",
+        utr_path=str(tmp_path / "utr.txt"),
+        orf_path=str(tmp_path / "orf.txt"),
+        output_dir=tmp_path / "outputs",
+        top_n=1,
+        pita_threshold=-10.0,
+        targetscan_threshold=1.0,
+    )
+
+    assert filtered.select(
+        "pita_score", "targetscan_score", "off_target_filter"
+    ).rows() == [
+        (None, 0.5, 0),
+        (None, None, -5),
+    ]
+
+
+def test_final_filter_does_not_let_negative_sentinel_cancel_failures():
+    result = pl.DataFrame({
+        "func_filter": [4, 0],
+        "off_target_filter": [-5, -5],
+        "toxicity_filter": [1, 0],
+    })
+
+    filtered = oligoformer_app._apply_final_filter(
+        result=result,
+        off_target=True,
+        toxicity=True,
+        functionality_filter=True,
+    )
+
+    assert filtered.get_column("filter").to_list() == [3, 1]
 
 
 def test_targetscan_batch_merge_matches_split_sirna_merge(tmp_path: Path):

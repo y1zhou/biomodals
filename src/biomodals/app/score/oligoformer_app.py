@@ -53,8 +53,8 @@ Output columns:
   with `--toxicity`. Lower is worse; the default failure threshold is `< 50`.
 - `toxicity_filter`: toxicity flag, present with `--toxicity`. `0` passes and
   `1` fails.
-- `filter`: sum of the enabled filter flags. `0` means the candidate passed all
-  enabled filters. Nonzero means reject or manually review.
+- `filter`: count of enabled filter failures. `0` means the candidate passed
+  all enabled filters. Nonzero means reject or manually review.
 
 Candidate selection:
 
@@ -77,10 +77,11 @@ from __future__ import annotations
 import hashlib
 import os
 import shlex
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import modal
 import polars as pl
@@ -1969,19 +1970,19 @@ def _run_targetscan_context_batches(
         APP_INFO.targetscan_context_workers_env,
         APP_INFO.default_targetscan_context_workers,
     )
-    context_batches = _batch_items_for_local_workers(
-        context_shards,
-        max_nodes=_bounded_node_count(
-            len(context_shards),
-            env_name=APP_INFO.targetscan_context_nodes_env,
-            default=APP_INFO.default_targetscan_context_nodes,
-        ),
-        local_workers=context_workers,
+    context_node_count = _bounded_node_count(
+        len(context_shards),
+        env_name=APP_INFO.targetscan_context_nodes_env,
+        default=APP_INFO.default_targetscan_context_nodes,
     )
+    context_batches = [
+        context_shards[index : index + context_workers]
+        for index in range(0, len(context_shards), context_workers)
+    ]
     print(
         "💊 Running OligoFormer TargetScan context scoring for "
-        f"{len(context_shards)} shards on {len(context_batches)} CPU nodes with "
-        f"{context_workers} workers each"
+        f"{len(context_shards)} shards on up to {context_node_count} CPU nodes "
+        f"with {context_workers} workers each"
     )
     context_output_batches = bounded_map(
         context_batches,
@@ -1989,7 +1990,7 @@ def _run_targetscan_context_batches(
             list(batch),
             local_workers=context_workers,
         ),
-        max_parallel=len(context_batches),
+        max_parallel=context_node_count,
     )
     return [output for batch in context_output_batches for output in batch]
 
@@ -2472,6 +2473,145 @@ def _prepare_pita_target_discovery_plan_for_spec(
     return _prepare_pita_target_discovery_plan(spec, shard_root)
 
 
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def run_oligoformer_targetscan_branch(
+    targetscan_specs: list[TargetscanBatchSpec],
+) -> list[str]:
+    """Run TargetScan off-target scoring for all selected siRNAs."""
+    if not targetscan_specs:
+        return []
+
+    CONF.output_volume.reload()
+    targetscan_plans = _run_targetscan_prepare_batches(targetscan_specs)
+    context_shards = [
+        shard
+        for plan in targetscan_plans
+        for shard in sorted(plan.context_shards, key=lambda item: item.shard_index)
+    ]
+    context_outputs = _run_targetscan_context_batches(context_shards)
+    CONF.output_volume.reload()
+    context_outputs_by_path = {
+        shard.output_path: output
+        for shard, output in zip(context_shards, context_outputs, strict=True)
+    }
+    targetscan_paths = [
+        _finalize_targetscan_batch_context_plan(plan, context_outputs_by_path)
+        for plan in targetscan_plans
+    ]
+    CONF.output_volume.commit()
+    return targetscan_paths
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def run_oligoformer_pita_branch(
+    shard_specs: list[OffTargetShardSpec],
+    node_count: int,
+    local_workers: int,
+) -> list[OffTargetShardResult]:
+    """Run PITA off-target scoring for all selected siRNAs."""
+    if not shard_specs:
+        return []
+
+    CONF.output_volume.reload()
+    prep_workers = min(
+        _positive_int_from_env(
+            APP_INFO.off_target_prep_workers_env,
+            APP_INFO.default_off_target_prep_workers,
+        ),
+        len(shard_specs),
+    )
+    print(
+        "💊 Preparing OligoFormer PITA inputs for "
+        f"{len(shard_specs)} siRNAs with {prep_workers} local workers"
+    )
+    with TemporaryDirectory(
+        prefix=f"oligoformer_{shard_specs[0].stem}_off_target_prepare_"
+    ) as tmpdir:
+        prepare_root = Path(tmpdir)
+        pita_plans = bounded_map(
+            shard_specs,
+            lambda spec: _prepare_pita_target_discovery_plan_for_spec(
+                spec=spec,
+                prepare_root=prepare_root,
+            ),
+            max_parallel=prep_workers,
+        )
+
+    CONF.output_volume.commit()
+    pita_utr_shards = [
+        shard
+        for plan in pita_plans
+        for shard in sorted(plan.utr_shards, key=lambda item: item.shard_index)
+    ]
+    pita_utr_outputs = _run_pita_prepare_utr_shard_batches(pita_utr_shards)
+    CONF.output_volume.reload()
+    pita_outputs_by_path = {
+        shard.output_path: output
+        for shard, output in zip(pita_utr_shards, pita_utr_outputs, strict=True)
+    }
+    prepared_shards = [
+        _finalize_pita_target_discovery_plan(plan, pita_outputs_by_path)
+        for plan in pita_plans
+    ]
+    CONF.output_volume.commit()
+
+    row_shards = [row for prepared in prepared_shards for row in prepared.row_shards]
+    row_batches = _batch_items_for_local_workers(
+        row_shards,
+        max_nodes=_bounded_node_count(
+            len(row_shards),
+            env_name=APP_INFO.off_target_nodes_env,
+            default=APP_INFO.default_off_target_nodes,
+        ),
+        local_workers=local_workers,
+    )
+    if row_batches:
+        print(
+            "💊 Running OligoFormer PITA scoring for "
+            f"{len(row_shards)} row shards on up to {len(row_batches)} CPU nodes "
+            f"with {local_workers} workers each"
+        )
+        bounded_map(
+            row_batches,
+            lambda batch: run_oligoformer_pita_row_shard_batch.remote(
+                list(batch),
+                local_workers=local_workers,
+            ),
+            max_parallel=len(row_batches),
+        )
+
+    finalize_batches, finalize_workers = batches_for_total_concurrency(
+        prepared_shards,
+        max_batches=node_count,
+        max_workers_per_batch=local_workers,
+        total_concurrency=node_count,
+    )
+    print(
+        "💊 Finalizing OligoFormer PITA tables for "
+        f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} batches with "
+        f"{finalize_workers} workers each"
+    )
+    result_batches = bounded_map(
+        finalize_batches,
+        lambda batch: finalize_oligoformer_pita_shard_batch.remote(
+            list(batch),
+            local_workers=finalize_workers,
+        ),
+        max_parallel=len(finalize_batches),
+    )
+    return [result for batch in result_batches for result in batch]
+
+
 def _run_off_target_shards(
     *,
     run_root: str,
@@ -2529,113 +2669,27 @@ def _run_off_target_shards(
     print(f"💊 Saving OligoFormer off-target logs under {logs_dir}")
 
     CONF.output_volume.commit()
-    targetscan_plans = _run_targetscan_prepare_batches(targetscan_specs)
-    CONF.output_volume.reload()
-
-    prep_workers = min(
-        _positive_int_from_env(
-            APP_INFO.off_target_prep_workers_env,
-            APP_INFO.default_off_target_prep_workers,
-        ),
-        len(shard_specs),
-    )
-    print(
-        "💊 Preparing OligoFormer PITA inputs for "
-        f"{len(shard_specs)} siRNAs with {prep_workers} local workers"
-    )
-    with TemporaryDirectory(prefix=f"oligoformer_{stem}_off_target_prepare_") as tmpdir:
-        prepare_root = Path(tmpdir)
-        pita_plans = bounded_map(
+    branch_calls = (
+        run_oligoformer_targetscan_branch.spawn(targetscan_specs),
+        run_oligoformer_pita_branch.spawn(
             shard_specs,
-            lambda spec: _prepare_pita_target_discovery_plan_for_spec(
-                spec=spec,
-                prepare_root=prepare_root,
-            ),
-            max_parallel=prep_workers,
-        )
-
-    CONF.output_volume.commit()
-
-    context_shards = [
-        shard
-        for plan in targetscan_plans
-        for shard in sorted(plan.context_shards, key=lambda item: item.shard_index)
-    ]
-    context_outputs = _run_targetscan_context_batches(context_shards)
-    CONF.output_volume.reload()
-    context_outputs_by_path = {
-        shard.output_path: output
-        for shard, output in zip(context_shards, context_outputs, strict=True)
-    }
-    targetscan_paths = [
-        _finalize_targetscan_batch_context_plan(plan, context_outputs_by_path)
-        for plan in targetscan_plans
-    ]
-    CONF.output_volume.commit()
-
-    pita_utr_shards = [
-        shard
-        for plan in pita_plans
-        for shard in sorted(plan.utr_shards, key=lambda item: item.shard_index)
-    ]
-    pita_utr_outputs = _run_pita_prepare_utr_shard_batches(pita_utr_shards)
-    CONF.output_volume.reload()
-    pita_outputs_by_path = {
-        shard.output_path: output
-        for shard, output in zip(pita_utr_shards, pita_utr_outputs, strict=True)
-    }
-    prepared_shards = [
-        _finalize_pita_target_discovery_plan(plan, pita_outputs_by_path)
-        for plan in pita_plans
-    ]
-    CONF.output_volume.commit()
-
-    row_shards = [row for prepared in prepared_shards for row in prepared.row_shards]
-    row_batches = _batch_items_for_local_workers(
-        row_shards,
-        max_nodes=_bounded_node_count(
-            len(row_shards),
-            env_name=APP_INFO.off_target_nodes_env,
-            default=APP_INFO.default_off_target_nodes,
+            node_count=node_count,
+            local_workers=local_workers,
         ),
-        local_workers=local_workers,
     )
-    if row_batches:
-        print(
-            "💊 Running OligoFormer PITA scoring for "
-            f"{len(row_shards)} row shards on up to {len(row_batches)} CPU nodes "
-            f"with {local_workers} workers each"
+    print("💊 Running OligoFormer TargetScan and PITA branches concurrently")
+    try:
+        targetscan_paths_raw, shard_results_raw = modal.FunctionCall.gather(
+            *branch_calls
         )
-        bounded_map(
-            row_batches,
-            lambda batch: run_oligoformer_pita_row_shard_batch.remote(
-                list(batch),
-                local_workers=local_workers,
-            ),
-            max_parallel=len(row_batches),
-        )
+    except BaseException:
+        for call in branch_calls:
+            with suppress(Exception):
+                call.cancel()
+        raise
+    targetscan_paths = cast(list[str], targetscan_paths_raw)
+    shard_results = cast(list[OffTargetShardResult], shard_results_raw)
 
-    CONF.output_volume.reload()
-    finalize_batches, finalize_workers = batches_for_total_concurrency(
-        prepared_shards,
-        max_batches=node_count,
-        max_workers_per_batch=local_workers,
-        total_concurrency=node_count,
-    )
-    print(
-        "💊 Finalizing OligoFormer PITA tables for "
-        f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} batches with "
-        f"{finalize_workers} workers each"
-    )
-    result_batches = bounded_map(
-        finalize_batches,
-        lambda batch: finalize_oligoformer_pita_shard_batch.remote(
-            list(batch),
-            local_workers=finalize_workers,
-        ),
-        max_parallel=len(finalize_batches),
-    )
-    shard_results = [result for batch in result_batches for result in batch]
     CONF.output_volume.reload()
     raw_off_target_dir = (
         AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
@@ -2699,39 +2753,47 @@ def _apply_off_target_filters(
             "tmp"
         )
     )
-    pita_raw = pl.read_csv(infer_dir / "pita.tab", separator="\t")
-    pita = pita_raw.group_by("microRNA").agg(pl.col("Score").min().alias("pita_score"))
+    evaluated_sirnas = pl.DataFrame({
+        "tmp": [record.name for record in records],
+        "_off_target_evaluated": [True] * len(records),
+    })
+    result = result.join(evaluated_sirnas, on="tmp", how="left")
+    pita_raw = pl.read_csv(
+        infer_dir / "pita.tab",
+        separator="\t",
+        schema_overrides={"Score": pl.String},
+    )
+    pita = (
+        pita_raw
+        .with_columns(
+            pl.col("Score").cast(pl.Float64, strict=False).alias("_pita_score")
+        )
+        .sort(["microRNA", "_pita_score"], nulls_last=True)
+        .group_by("microRNA", maintain_order=True)
+        .agg(
+            pl.first("Score").alias("pita_score"),
+            pl.first("_pita_score").alias("_pita_score"),
+        )
+    )
     result = result.join(pita, left_on="tmp", right_on="microRNA", how="left")
     result = result.with_columns(
         pl
-        .when(pl.col("pita_score") < pita_threshold)
+        .when(pl.col("_pita_score") < pita_threshold)
         .then(1)
         .otherwise(0)
         .alias("pita_filter")
     )
-    if top_n != -1:
-        result = result.with_columns(
-            pl
-            .when(pl.col("pita_score").is_null())
-            .then(-1)
-            .otherwise(pl.col("pita_filter"))
-            .alias("pita_filter")
-        )
 
     targetscan_raw = pl.read_csv(
         infer_dir / "targetscan.tab",
         separator="\t",
         has_header=False,
         new_columns=["refseq", "siRNA", "targetscan_score"],
+        schema_overrides={"targetscan_score": pl.Float64},
     )
     targetscan = targetscan_raw.group_by("siRNA").agg(
         pl.col("targetscan_score").max().alias("targetscan_score")
     )
-    pita_sirnas = pita.select(pl.col("microRNA").alias("siRNA"))
-    missing_targetscan = pita_sirnas.join(
-        targetscan.select("siRNA"), on="siRNA", how="anti"
-    ).with_columns(pl.lit(0).alias("targetscan_score"))
-    targetscan = pl.concat([targetscan, missing_targetscan], how="vertical_relaxed")
     result = result.join(targetscan, left_on="tmp", right_on="siRNA", how="left")
     result = result.with_columns(
         pl
@@ -2740,25 +2802,16 @@ def _apply_off_target_filters(
         .otherwise(0)
         .alias("targetscan_filter")
     )
-    if top_n != -1:
-        result = result.with_columns(
-            pl
-            .when(pl.col("targetscan_score").is_null())
-            .then(-1)
-            .otherwise(pl.col("targetscan_filter"))
-            .alias("targetscan_filter")
-        )
 
     pita_hit = pl.col("pita_filter") == 1
     targetscan_hit = pl.col("targetscan_filter") == 1
     if top_n == -1:
         off_target_filter = pl.when(pita_hit | targetscan_hit).then(1).otherwise(0)
     else:
-        pita_missing = pl.col("pita_filter") == -1
-        targetscan_missing = pl.col("targetscan_filter") == -1
+        was_evaluated = pl.col("_off_target_evaluated").fill_null(False)
         off_target_filter = (
             pl
-            .when(pita_missing | targetscan_missing)
+            .when(~was_evaluated)
             .then(-5)
             .when(pita_hit | targetscan_hit)
             .then(1)
@@ -2798,13 +2851,16 @@ def _apply_final_filter(
 
     filter_terms = []
     if functionality_filter:
-        filter_terms.append(pl.col("func_filter"))
+        filter_terms.append(pl.col("func_filter") != 0)
     if off_target:
-        filter_terms.append(pl.col("off_target_filter"))
+        filter_terms.append(pl.col("off_target_filter") != 0)
     if toxicity:
-        filter_terms.append(pl.col("toxicity_filter"))
+        filter_terms.append(pl.col("toxicity_filter") != 0)
 
-    return result.with_columns(sum(filter_terms, start=pl.lit(0)).alias("filter"))
+    filter_expr = pl.lit(0)
+    for term in filter_terms:
+        filter_expr = filter_expr + term.cast(pl.Int64)
+    return result.with_columns(filter_expr.alias("filter"))
 
 
 def _write_final_outputs(result: pl.DataFrame, output_dir: Path, stem: str) -> None:

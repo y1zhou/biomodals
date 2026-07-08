@@ -10,6 +10,13 @@ When `--off-target` is set, provide both `--utr-file` and `--orf-file`, or set
 `--all-human` to use human references converted from TargetScan 8.0 UTR and ORF
 data.
 
+For positive `--top-n` values, Biomodals ranks candidates by predicted efficacy
+first, then sends the actual sequence from each selected ranked row to PITA and
+TargetScan. Candidate names use the original zero-based row identity
+(`RNA<index>`), so off-target evidence can be merged back into the ranked table
+without confusing top-N rank with candidate identity. `--top-n -1` scores every
+candidate.
+
 Advanced tuning: `--targetscan-ref-shard-size` controls how many UTR records are
 put into each TargetScan reference-preparation shard. Larger values reduce Modal
 fanout and are useful for exact sharded-vs-unsharded comparisons; smaller values
@@ -20,6 +27,10 @@ increase reference-prep parallelism.
 Results are saved locally as `<run-name>_oligoformer.tar.zst`. The tarball
 contains the final top-level `.txt`, `_ranked.txt`, and `_ranked_filtered.txt`
 tables only; detailed off-target logs stay in the Modal output-volume cache.
+After merged off-target evidence is produced, bulky generated shard inputs under
+`prepare/off_target/<stem>/` are removed. The app preserves final tables, merged
+raw evidence (`pita.tab` and `targetscan.tab`), completion markers, logs,
+efficacy outputs, model caches, and reusable reference caches.
 
 For each input mRNA record, the tarball contains three TSV tables:
 
@@ -67,6 +78,18 @@ prediction was run with the default `--top-n 20`, only the top 20 efficacy
 candidates were off-target scored; do not treat `off_target_filter == -5` as
 safe. Rerun with a larger `--top-n` or `--top-n -1` before selecting lower-ranked
 candidates from `<stem>_ranked.txt`.
+
+## Upstream equivalence
+
+Use `scripts/verify_oligoformer_upstream_equivalence.py` when changing
+off-target reducers, candidate identity handling, or cache semantics. The
+verifier defaults to `--top-n -1` with `examples/data/sirna_target.fa` plus
+small checked-in UTR/ORF fixtures, generates Biomodals app artifacts, then runs
+direct upstream OligoFormer/PITA/TargetScan commands in a GPU Modal Sandbox and
+compares canonicalized final tables plus raw `pita.tab` and `targetscan.tab`
+evidence. It is intentionally separate from fast pytest coverage and reuses
+persisted Modal output-volume artifacts by default; pass `--force` to recompute
+them.
 """
 
 # Ignore ruff warnings about import location
@@ -155,7 +178,10 @@ class AppInfo:
     )
     targetscan_species_id: str = "9606"
     targetscan_version: str = "8.0"
-    off_target_cache_salt: str = "targetscan-8.0-viennarna-2.7.2"
+    off_target_cache_salt: str = (
+        "targetscan-8.0-viennarna-2.7.2-semantic-topn-targetscan-polars-v1"
+    )
+    postprocess_cache_salt: str = "final-tables-v2"
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
     model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
     repo_ref_dir: Path = CONF.git_clone_dir / "off-target/ref"
@@ -525,9 +551,33 @@ def _package_output_tables(output_dir: Path, output_stems: tuple[str, ...]) -> b
     return package_outputs(output_dir, paths_to_bundle=bundle_paths)
 
 
-def _paths_ready(paths: tuple[Path, ...], marker: Path) -> bool:
+def _marker_matches(marker: Path, expected: dict[str, object]) -> bool:
+    """Return whether a cache marker contains expected metadata."""
+    import orjson
+
+    if not marker.exists():
+        return False
+    try:
+        metadata = orjson.loads(marker.read_bytes())
+    except orjson.JSONDecodeError:
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    return all(metadata.get(key) == value for key, value in expected.items())
+
+
+def _paths_ready(
+    paths: tuple[Path, ...],
+    marker: Path,
+    *,
+    expected_marker: dict[str, object] | None = None,
+) -> bool:
     """Return whether a marker and all paths exist."""
-    return marker.exists() and all(path.exists() for path in paths)
+    if not all(path.exists() for path in paths):
+        return False
+    if expected_marker is None:
+        return marker.exists()
+    return _marker_matches(marker, expected_marker)
 
 
 def _build_plan(
@@ -556,6 +606,11 @@ def _build_plan(
         final_ready=_paths_ready(
             _output_paths(output_dir, output_stems),
             _marker_path(layout, "final.done"),
+            expected_marker={
+                "cache_key": cache_key,
+                "output_stems": list(output_stems),
+                "postprocess_cache_salt": APP_INFO.postprocess_cache_salt,
+            },
         ),
     )
 
@@ -1127,17 +1182,24 @@ def _cache_key_for_run(
     )
 
 
-def _write_cache_marker(layout: AppRunLayout, marker: str, plan: OligoformerRunPlan):
+def _write_cache_marker(
+    layout: AppRunLayout,
+    marker: str,
+    plan: OligoformerRunPlan,
+    *,
+    extra_metadata: dict[str, object] | None = None,
+):
     """Write a small cache marker after a stage completes."""
     import orjson
 
     layout.markers_dir.mkdir(parents=True, exist_ok=True)
-    _marker_path(layout, marker).write_bytes(
-        orjson.dumps({
-            "cache_key": plan.cache_key,
-            "output_stems": plan.output_stems,
-        })
-    )
+    metadata = {
+        "cache_key": plan.cache_key,
+        "output_stems": list(plan.output_stems),
+    }
+    if extra_metadata is not None:
+        metadata.update(extra_metadata)
+    _marker_path(layout, marker).write_bytes(orjson.dumps(metadata))
 
 
 def _copy_outputs(src_dir: Path, dst_dir: Path, output_stems: tuple[str, ...]) -> None:
@@ -1160,27 +1222,26 @@ def _read_efficacy_output(path: Path) -> pl.DataFrame:
 def _off_target_sirna_records(
     result: pl.DataFrame, top_n: int
 ) -> list[OffTargetSirnaRecord]:
-    """Return upstream-shaped siRNA FASTA records for off-target tools."""
+    """Return siRNA FASTA records for off-target tools."""
     if top_n == -1:
         return [
             OffTargetSirnaRecord(name=f"RNA{int(pos) - 1}", sequence=str(sirna))
             for pos, sirna in result.select("pos", "siRNA").iter_rows()
         ]
 
-    original_sirnas = result.get_column("siRNA").to_list()
-    ranked_indices = (
+    ranked_rows = (
         result
         .with_row_index("_biomodals_index")
         .sort("efficacy", descending=True)
-        .get_column("_biomodals_index")
-        .to_list()
+        .head(top_n)
+        .select("_biomodals_index", "siRNA")
     )
     return [
-        # Preserve upstream's current top_n behavior, including its index use.
         OffTargetSirnaRecord(
-            name=f"RNA{ranked_indices[idx]}", sequence=str(original_sirnas[idx])
+            name=f"RNA{int(index)}",
+            sequence=str(sirna),
         )
-        for idx in range(min(top_n, len(ranked_indices)))
+        for index, sirna in ranked_rows.iter_rows()
     ]
 
 
@@ -1905,58 +1966,67 @@ def _merge_targetscan_context_outputs(
 ) -> None:
     """Merge TargetScan context-score shards into OligoFormer's target table."""
     targetscan_path.parent.mkdir(parents=True, exist_ok=True)
-    if not context_outputs:
+    existing_outputs = [
+        output for output in context_outputs if Path(output).stat().st_size > 0
+    ]
+    if not existing_outputs:
         targetscan_path.write_text("", encoding="utf-8")
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text(
+            "No TargetScan context outputs to merge.\n", encoding="utf-8"
+        )
         return
 
-    with TemporaryDirectory(prefix="oligoformer_targetscan_merge_") as tmpdir:
-        workdir = Path(tmpdir)
-        context_scores_path = workdir / "Targets.BL_PCT.context_scores.txt"
-        first = True
-        with context_scores_path.open("w", encoding="utf-8") as out:
-            for output in context_outputs:
-                lines = Path(output).read_text(encoding="utf-8").splitlines()
-                if not lines:
-                    continue
-                if first:
-                    out.write("\n".join(lines))
-                    out.write("\n")
-                    first = False
-                elif len(lines) > 1:
-                    out.write("\n".join(lines[1:]))
-                    out.write("\n")
+    context_scores = pl.scan_csv(
+        existing_outputs,
+        separator="\t",
+        infer_schema_length=0,
+    )
+    column_names = context_scores.collect_schema().names()
+    if len(column_names) < 28:
+        raise ValueError(
+            "TargetScan context output must contain at least 28 columns; "
+            f"found {len(column_names)}"
+        )
 
-        cmd = (
-            "set -eu; "
-            "sed '1d' Targets.BL_PCT.context_scores.txt "
-            '| awk \'BEGIN{FS="\\t";OFS="\\t"} {print $1,$3,$4,$28;}\' '
-            "| sort -k 1,2 > temp.txt; "
-            "grep '6mer' temp.txt | awk 'BEGIN{OFS=\"\\t\"} {print $1,$2,$4}' "
-            "> 6mer.txt; "
-            "grep '7mer-1a' temp.txt | awk 'BEGIN{OFS=\"\\t\"} "
-            "{ if( $28< -0.01 ) {print $1,$2,$4;} }' > 7merA1.txt; "
-            "grep '7mer-m8' temp.txt | awk 'BEGIN{OFS=\"\\t\"} "
-            "{ if( $28< -0.02 ) {print $1,$2,$4;} }' > 7merm8.txt; "
-            "grep '8mer-1a' temp.txt | awk 'BEGIN{OFS=\"\\t\"} "
-            "{ if( $28< -0.03 ) {print $1,$2,$4;} }' > 8mer.txt; "
-            "cat 6mer.txt 7merA1.txt 7merm8.txt 8mer.txt | sort -k 1,2 "
-            "> temp.filtered.txt; "
-            'awk \'BEGIN{OFS="\\t";target="";sirna="";totscore=0.0;} '
-            "{ if( target==$1 && sirna==$2 ) { totscore+=$3; } else { print "
-            "target,sirna,-totscore; target=$1; sirna=$2; totscore=$3; } } "
-            "END{print target,sirna,-totscore;}' temp.filtered.txt | sed '1d' "
-            "> offtarget_predictions.tab"
+    target_col, sirna_col, site_type_col, score_col = (
+        column_names[0],
+        column_names[2],
+        column_names[3],
+        column_names[27],
+    )
+    merged = (
+        context_scores
+        .select(
+            pl.col(target_col).alias("refseq"),
+            pl.col(sirna_col).alias("siRNA"),
+            pl.col(site_type_col).alias("site_type"),
+            pl.col(score_col).cast(pl.Float64, strict=False).alias("score"),
         )
-        run_command(
-            ["bash", "-lc", cmd],
-            cwd=workdir,
-            output_mode="log",
-            log_file=log_file,
-            show_command=False,
+        .filter(pl.col("score").is_not_null())
+        .filter(
+            (pl.col("site_type") == "6mer")
+            | ((pl.col("site_type") == "7mer-1a") & (pl.col("score") < -0.01))
+            | ((pl.col("site_type") == "7mer-m8") & (pl.col("score") < -0.02))
+            | ((pl.col("site_type") == "8mer-1a") & (pl.col("score") < -0.03))
         )
-        targetscan_path.write_bytes(
-            (workdir / "offtarget_predictions.tab").read_bytes()
-        )
+        .group_by("refseq", "siRNA")
+        .agg((-pl.col("score").sum()).alias("targetscan_score"))
+        .sort("refseq", "siRNA")
+        .collect()
+    )
+    merged.write_csv(
+        targetscan_path,
+        separator="\t",
+        include_header=False,
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
+        "Merged TargetScan context outputs with Polars.\n"
+        f"context_outputs\t{len(existing_outputs)}\n"
+        f"output_rows\t{merged.height}\n",
+        encoding="utf-8",
+    )
 
 
 def _run_targetscan_context_batches(
@@ -2201,6 +2271,28 @@ def _merge_targetscan_batch_outputs(
         if rows:
             out.write("\n".join(rows))
             out.write("\n")
+
+
+def _raw_off_target_ready(raw_off_target_dir: Path) -> bool:
+    """Return whether merged off-target evidence is ready for reuse."""
+    return all(
+        (raw_off_target_dir / name).exists()
+        for name in ("off_target.done", "pita.tab", "targetscan.tab")
+    )
+
+
+def _cleanup_off_target_transients(raw_off_target_dir: Path) -> None:
+    """Remove bulky shard inputs after merged off-target evidence exists."""
+    import shutil
+
+    keep_names = {"off_target.done", "pita.tab", "targetscan.tab"}
+    for child in raw_off_target_dir.iterdir():
+        if child.name in keep_names:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def _run_pita_row_shard(spec: PitaRowShardSpec) -> str:
@@ -2628,6 +2720,21 @@ def _run_off_target_shards(
     if not records:
         raise RuntimeError("No siRNA records available for off-target prediction")
 
+    raw_off_target_dir = (
+        AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
+    )
+    merged_pita_path = raw_off_target_dir / "pita.tab"
+    merged_targetscan_path = raw_off_target_dir / "targetscan.tab"
+    if _raw_off_target_ready(raw_off_target_dir):
+        infer_dir.joinpath("pita.tab").write_bytes(merged_pita_path.read_bytes())
+        infer_dir.joinpath("targetscan.tab").write_bytes(
+            merged_targetscan_path.read_bytes()
+        )
+        print(
+            f"💊 Reusing cached OligoFormer off-target evidence: {raw_off_target_dir}"
+        )
+        return
+
     row_shard_size = _positive_int_from_env(
         APP_INFO.off_target_row_shard_size_env,
         APP_INFO.default_pita_row_shard_size,
@@ -2691,16 +2798,13 @@ def _run_off_target_shards(
     shard_results = cast(list[OffTargetShardResult], shard_results_raw)
 
     CONF.output_volume.reload()
-    raw_off_target_dir = (
-        AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
-    )
-    merged_pita_path = raw_off_target_dir / "pita.tab"
-    merged_targetscan_path = raw_off_target_dir / "targetscan.tab"
     _merge_pita_shards(shard_results, merged_pita_path)
     _merge_targetscan_batch_outputs(
         targetscan_paths=targetscan_paths,
         output_path=merged_targetscan_path,
     )
+    raw_off_target_dir.joinpath("off_target.done").write_text("done", encoding="utf-8")
+    _cleanup_off_target_transients(raw_off_target_dir)
     infer_dir.joinpath("pita.tab").write_bytes(merged_pita_path.read_bytes())
     infer_dir.joinpath("targetscan.tab").write_bytes(
         merged_targetscan_path.read_bytes()
@@ -2795,6 +2899,15 @@ def _apply_off_target_filters(
         pl.col("targetscan_score").max().alias("targetscan_score")
     )
     result = result.join(targetscan, left_on="tmp", right_on="siRNA", how="left")
+    result = result.with_columns(
+        pl
+        .when(
+            pl.col("_pita_score").is_not_null() & pl.col("targetscan_score").is_null()
+        )
+        .then(0.0)
+        .otherwise(pl.col("targetscan_score"))
+        .alias("targetscan_score")
+    )
     result = result.with_columns(
         pl
         .when(pl.col("targetscan_score") > targetscan_threshold)
@@ -3073,7 +3186,12 @@ def run_oligoformer_postprocess(
             )
             _write_final_outputs(result, output_dir, stem)
 
-    _write_cache_marker(layout, "final.done", refreshed_plan)
+    _write_cache_marker(
+        layout,
+        "final.done",
+        refreshed_plan,
+        extra_metadata={"postprocess_cache_salt": APP_INFO.postprocess_cache_salt},
+    )
     CONF.output_volume.commit()
     return _package_output_tables(output_dir, refreshed_plan.output_stems)
 

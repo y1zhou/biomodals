@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import orjson
 import polars as pl
 import pytest
 
@@ -39,6 +40,23 @@ def _fake_conf(tmp_path: Path, volume: FakeVolume, repo_dir: Path | None = None)
     )
 
 
+def _write_targetscan_context_output(
+    path: Path,
+    rows: list[tuple[str, str, str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = [f"h{index}" for index in range(1, 29)]
+    lines = ["\t".join(header)]
+    for target, sirna, site_type, score in rows:
+        fields = [f"x{index}" for index in range(1, 29)]
+        fields[0] = target
+        fields[2] = sirna
+        fields[3] = site_type
+        fields[27] = score
+        lines.append("\t".join(fields))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def test_prepare_oligoformer_run_writes_volume_inputs(tmp_path: Path, monkeypatch):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
@@ -61,6 +79,48 @@ def test_prepare_oligoformer_run_writes_volume_inputs(tmp_path: Path, monkeypatc
     assert result.final_ready is False
     assert volume.reload_count == 1
     assert volume.commit_count == 1
+
+
+def test_final_ready_requires_current_postprocess_marker_salt(tmp_path: Path):
+    layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
+    layout.outputs_dir.mkdir(parents=True)
+    layout.markers_dir.mkdir(parents=True)
+    for suffix in ("", "_ranked", "_ranked_filtered"):
+        layout.outputs_dir.joinpath(f"target{suffix}.txt").write_text(
+            "ok\n", encoding="utf-8"
+        )
+
+    oligoformer_app._marker_path(layout, "final.done").write_bytes(
+        orjson.dumps({
+            "cache_key": "abc123",
+            "output_stems": ["target"],
+        })
+    )
+    assert not oligoformer_app._build_plan(
+        "abc123", ("target",), layout.run_root
+    ).final_ready
+
+    stale_plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        run_root=str(layout.run_root),
+        efficacy_dir=str(layout.prep_dir / "efficacy"),
+        output_dir=str(layout.outputs_dir),
+        output_stems=("target",),
+        efficacy_ready=False,
+        final_ready=False,
+    )
+    oligoformer_app._write_cache_marker(
+        layout,
+        "final.done",
+        stale_plan,
+        extra_metadata={
+            "postprocess_cache_salt": oligoformer_app.APP_INFO.postprocess_cache_salt
+        },
+    )
+
+    assert oligoformer_app._build_plan(
+        "abc123", ("target",), layout.run_root
+    ).final_ready
 
 
 def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monkeypatch):
@@ -501,8 +561,59 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         "ref\tRNA0\t2",
         "ref\tRNA1\t0.5",
     ]
+    assert raw_off_target_dir.joinpath("off_target.done").exists()
+    assert not raw_off_target_dir.joinpath("targetscan").exists()
+    assert not raw_off_target_dir.joinpath("targetscan_ref_shards").exists()
+    assert not raw_off_target_dir.joinpath("00000_RNA0").exists()
+    assert not raw_off_target_dir.joinpath("00001_RNA1").exists()
     assert volume.reload_count >= 4
     assert volume.commit_count >= 3
+
+
+def test_run_off_target_shards_reuses_merged_raw_evidence(tmp_path: Path, monkeypatch):
+    layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
+    raw_off_target_dir = layout.prep_dir / "off_target" / "target"
+    raw_off_target_dir.mkdir(parents=True)
+    raw_off_target_dir.joinpath("off_target.done").write_text("done", encoding="utf-8")
+    raw_off_target_dir.joinpath("pita.tab").write_text(
+        "microRNA\tScore\nRNA0\t-1\n",
+        encoding="utf-8",
+    )
+    raw_off_target_dir.joinpath("targetscan.tab").write_text(
+        "ref\tRNA0\t0.5\n",
+        encoding="utf-8",
+    )
+    infer_dir = tmp_path / "infer"
+    infer_dir.mkdir()
+
+    class ExplodingBranch:
+        def spawn(self, *_args, **_kwargs):
+            raise AssertionError("cached raw evidence should skip branch fanout")
+
+    monkeypatch.setattr(
+        oligoformer_app, "run_oligoformer_targetscan_branch", ExplodingBranch()
+    )
+    monkeypatch.setattr(
+        oligoformer_app, "run_oligoformer_pita_branch", ExplodingBranch()
+    )
+
+    oligoformer_app._run_off_target_shards(
+        run_root=str(layout.run_root),
+        records=[oligoformer_app.OffTargetSirnaRecord("RNA0", "AUGCUAGCUAGCUAGCUAG")],
+        stem="target",
+        utr_path=str(tmp_path / "utr.txt"),
+        orf_path=str(tmp_path / "orf.txt"),
+        infer_dir=infer_dir,
+        output_dir=layout.outputs_dir,
+        logs_dir=layout.outputs_dir / "logs" / "off_target" / "target",
+    )
+
+    assert infer_dir.joinpath("pita.tab").read_text(encoding="utf-8") == (
+        "microRNA\tScore\nRNA0\t-1\n"
+    )
+    assert infer_dir.joinpath("targetscan.tab").read_text(encoding="utf-8") == (
+        "ref\tRNA0\t0.5\n"
+    )
 
 
 def test_apply_off_target_filters_handles_header_only_pita(tmp_path: Path, monkeypatch):
@@ -553,6 +664,71 @@ def test_apply_off_target_filters_handles_header_only_pita(tmp_path: Path, monke
     ]
 
 
+def test_apply_off_target_filters_fills_missing_targetscan_for_pita_hits(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+
+    def fake_run_off_target_shards(*, infer_dir: Path, **_kwargs) -> None:
+        infer_dir.mkdir(parents=True, exist_ok=True)
+        infer_dir.joinpath("pita.tab").write_text(
+            "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-2\n",
+            encoding="utf-8",
+        )
+        infer_dir.joinpath("targetscan.tab").write_text(
+            "ref\tRNA1\t0.5\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        oligoformer_app, "_run_off_target_shards", fake_run_off_target_shards
+    )
+
+    result = pl.DataFrame({
+        "pos": [1, 2],
+        "sense": ["GC", "CG"],
+        "siRNA": ["AUGCUAGCUAGCUAGCUAG", "UGCUAGCUAGCUAGCUAGC"],
+        "efficacy": [0.8, 0.6],
+        "func_filter": [0, 0],
+    })
+
+    filtered = oligoformer_app._apply_off_target_filters(
+        result=result,
+        run_root=str(tmp_path / "run"),
+        stem="target",
+        utr_path=str(tmp_path / "utr.txt"),
+        orf_path=str(tmp_path / "orf.txt"),
+        output_dir=tmp_path / "outputs",
+        top_n=-1,
+        pita_threshold=-10.0,
+        targetscan_threshold=1.0,
+    )
+
+    assert filtered.select(
+        "pita_score", "targetscan_score", "off_target_filter"
+    ).rows() == [
+        ("-2", 0.0, 0),
+        (None, 0.5, 0),
+    ]
+
+
+def test_off_target_top_n_records_bind_ranked_names_to_ranked_sequences():
+    result = pl.DataFrame({
+        "pos": [1, 2, 3],
+        "siRNA": ["AAAA", "CCCC", "GGGG"],
+        "efficacy": [0.1, 0.9, 0.2],
+    })
+
+    records = oligoformer_app._off_target_sirna_records(result, top_n=2)
+
+    assert [(record.name, record.sequence) for record in records] == [
+        ("RNA1", "CCCC"),
+        ("RNA2", "GGGG"),
+    ]
+
+
 def test_final_filter_does_not_let_negative_sentinel_cancel_failures():
     result = pl.DataFrame({
         "func_filter": [4, 0],
@@ -571,26 +747,13 @@ def test_final_filter_does_not_let_negative_sentinel_cancel_failures():
 
 
 def test_targetscan_batch_merge_matches_split_sirna_merge(tmp_path: Path):
-    def write_context_output(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        header = [f"h{index}" for index in range(1, 29)]
-        lines = ["\t".join(header)]
-        for target, sirna, site_type, score in rows:
-            fields = [f"x{index}" for index in range(1, 29)]
-            fields[0] = target
-            fields[2] = sirna
-            fields[3] = site_type
-            fields[27] = score
-            lines.append("\t".join(fields))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
     rows = [
         ("refA", "RNA0", "6mer", "-0.5"),
         ("refA", "RNA0", "6mer", "-0.25"),
         ("refB", "RNA1", "6mer", "-0.75"),
     ]
     batch_context = tmp_path / "batch_context.txt"
-    write_context_output(batch_context, rows)
+    _write_targetscan_context_output(batch_context, rows)
     batch_output = tmp_path / "batch_targetscan.tab"
     oligoformer_app._merge_targetscan_context_outputs(
         context_outputs=[str(batch_context)],
@@ -601,7 +764,7 @@ def test_targetscan_batch_merge_matches_split_sirna_merge(tmp_path: Path):
     split_outputs = []
     for sirna in ("RNA0", "RNA1"):
         context_path = tmp_path / f"{sirna}_context.txt"
-        write_context_output(
+        _write_targetscan_context_output(
             context_path,
             [row for row in rows if row[1] == sirna],
         )
@@ -623,6 +786,49 @@ def test_targetscan_batch_merge_matches_split_sirna_merge(tmp_path: Path):
         line for line in batch_output.read_text(encoding="utf-8").splitlines() if line
     ]
     assert sorted(batch_lines) == sorted(split_lines)
+
+
+def test_merge_targetscan_context_outputs_applies_site_type_thresholds(
+    tmp_path: Path,
+):
+    context_path = tmp_path / "context.txt"
+    _write_targetscan_context_output(
+        context_path,
+        [
+            ("refA", "RNA0", "6mer", "-0.5"),
+            ("refA", "RNA0", "7mer-1a", "-0.02"),
+            ("refA", "RNA0", "7mer-1a", "-0.01"),
+            ("refA", "RNA0", "7mer-m8", "-0.03"),
+            ("refA", "RNA0", "7mer-m8", "-0.02"),
+            ("refA", "RNA0", "8mer-1a", "-0.04"),
+            ("refA", "RNA0", "8mer-1a", "-0.03"),
+            ("refA", "RNA1", "8mer-1a", "0.04"),
+            ("refB", "RNA2", "7mer-1a", "-0.02"),
+        ],
+    )
+    output_path = tmp_path / "targetscan.tab"
+
+    oligoformer_app._merge_targetscan_context_outputs(
+        context_outputs=[str(context_path)],
+        targetscan_path=output_path,
+        log_file=tmp_path / "merge.log",
+    )
+
+    merged = pl.read_csv(
+        output_path,
+        separator="\t",
+        has_header=False,
+        new_columns=["refseq", "siRNA", "targetscan_score"],
+        schema_overrides={"targetscan_score": pl.Float64},
+    )
+    assert merged.select("refseq", "siRNA").rows() == [
+        ("refA", "RNA0"),
+        ("refB", "RNA2"),
+    ]
+    assert merged.get_column("targetscan_score").to_list() == pytest.approx([
+        0.59,
+        0.02,
+    ])
 
 
 def test_merge_targetscan_batch_outputs_sorts_upstream_order(tmp_path: Path):

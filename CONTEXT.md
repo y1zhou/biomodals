@@ -58,6 +58,10 @@ _Avoid_: best-effort success, warning-only success
 A ranked collection of small interfering RNA candidates designed or scored together for one target mRNA.
 _Avoid_: loose siRNA list, unranked outputs
 
+**siRNA Candidate Identity**:
+A stable per-candidate identity used to join efficacy, off-target evidence, toxicity, and final selection results for the same siRNA candidate.
+_Avoid_: top-N rank, sorted row number, incidental list position
+
 **Off-Target Reference Set**:
 A collection of non-target transcript regions used to estimate unintended siRNA binding during off-target prediction.
 _Avoid_: background FASTA, all-human mode
@@ -81,6 +85,10 @@ _Avoid_: worker queue, dynamic task list
 **Off-Target Evidence Table**:
 A transcript-level table of partial TargetScan or PITA off-target evidence that can be merged across scoring tiles before candidate-level filtering or ranking.
 _Avoid_: final score table, shard output
+
+**Upstream Equivalence**:
+Agreement between Biomodals-produced tables and tables produced by invoking the wrapped upstream tools directly, after canonicalizing table order and applying defined numeric tolerances.
+_Avoid_: raw byte identity, same app implementation comparison
 
 **Generated Scaffold Segment**:
 A de novo structure segment introduced by RFdiffusion from a numeric contig segment rather than copied from the input PDB.

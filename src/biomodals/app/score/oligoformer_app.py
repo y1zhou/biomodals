@@ -26,11 +26,11 @@ increase reference-prep parallelism.
 
 Results are saved locally as `<run-name>_oligoformer.tar.zst`. The tarball
 contains the final top-level `.txt`, `_ranked.txt`, and `_ranked_filtered.txt`
-tables only; detailed off-target logs stay in the Modal output-volume cache.
-After merged off-target evidence is produced, bulky generated shard inputs under
-`prepare/off_target/<stem>/` are removed. The app preserves final tables, merged
-raw evidence (`pita.tab` and `targetscan.tab`), completion markers, logs,
-efficacy outputs, model caches, and reusable reference caches.
+tables only; detailed off-target logs stay in the Modal output-volume run
+directory under `<stem>/<cache-key>/`. After final tables are generated, bulky
+off-target intermediates under `prepare/off_target/<stem>/` are removed. The app
+preserves final tables, completion markers, logs, efficacy outputs, model
+caches, and reusable reference caches.
 
 For each input mRNA record, the tarball contains three TSV tables:
 
@@ -86,10 +86,9 @@ off-target reducers, candidate identity handling, or cache semantics. The
 verifier defaults to `--top-n -1` with `examples/data/sirna_target.fa` plus
 small checked-in UTR/ORF fixtures, generates Biomodals app artifacts, then runs
 direct upstream OligoFormer/PITA/TargetScan commands in a GPU Modal Sandbox and
-compares canonicalized final tables plus raw `pita.tab` and `targetscan.tab`
-evidence. It is intentionally separate from fast pytest coverage and reuses
-persisted Modal output-volume artifacts by default; pass `--force` to recompute
-them.
+compares canonicalized app and upstream artifacts. It is intentionally separate
+from fast pytest coverage and reuses persisted Modal output-volume artifacts by
+default; pass `--force` to recompute them.
 """
 
 # Ignore ruff warnings about import location
@@ -123,6 +122,8 @@ from biomodals.helper.task_budget import batches_for_total_concurrency, bounded_
 from biomodals.helper.web import download_files
 
 T = TypeVar("T")
+TARGETSCAN_COLUMNS = ("refseq", "siRNA", "targetscan_score")
+TARGETSCAN_HEADER = "\t".join(TARGETSCAN_COLUMNS)
 
 ##########################################
 # Modal configs
@@ -503,10 +504,15 @@ def _fasta_record_names(fasta_bytes: bytes) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _run_layout_for_cache_key(cache_key: str) -> AppRunLayout:
+def _run_layout_for_cache_key(
+    cache_key: str,
+    output_stems: tuple[str, ...],
+) -> AppRunLayout:
     """Return the output-volume run layout for an OligoFormer cache key."""
+    if not output_stems:
+        raise ValueError("OligoFormer run layout requires at least one output stem")
     return AppRunLayout.from_run_root(
-        Path(CONF.output_volume_mountpoint) / "cache" / cache_key[:2] / cache_key
+        Path(CONF.output_volume_mountpoint) / output_stems[0] / cache_key
     )
 
 
@@ -589,7 +595,7 @@ def _build_plan(
     layout = (
         AppRunLayout.from_run_root(run_root)
         if run_root is not None
-        else _run_layout_for_cache_key(cache_key)
+        else _run_layout_for_cache_key(cache_key, output_stems)
     )
     efficacy_dir = layout.prep_dir / "efficacy"
     output_dir = layout.outputs_dir
@@ -1932,29 +1938,52 @@ def _run_targetscan_context_shard(spec: TargetscanContextShardSpec) -> str:
     return str(output_path)
 
 
+def _targetscan_context_shard_ready(spec: TargetscanContextShardSpec) -> bool:
+    """Return whether one context-score shard output is ready."""
+    output_path = Path(spec.output_path)
+    marker_path = output_path.with_suffix(output_path.suffix + ".done")
+    return marker_path.exists() and output_path.exists()
+
+
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
     volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
-def run_oligoformer_targetscan_context_shard_batch(
-    specs: list[TargetscanContextShardSpec],
+def run_oligoformer_targetscan_context_queue_worker(
+    queue_name: str,
     local_workers: int,
 ) -> list[str]:
-    """Run TargetScan context-score shards on one CPU node."""
+    """Drain queued TargetScan context-score shards on one CPU node."""
     CONF.output_volume.reload()
     print(
-        "💊 Running OligoFormer TargetScan context batch with "
-        f"{len(specs)} shards using {local_workers} workers; logs under "
-        f"{Path(specs[0].log_path).parent if specs else 'n/a'}"
+        "💊 Running OligoFormer TargetScan context queue worker "
+        f"{queue_name} with {local_workers} local workers"
     )
-    outputs = bounded_map(
-        specs,
-        _run_targetscan_context_shard,
-        max_parallel=local_workers,
+
+    queue = modal.Queue.from_name(queue_name)
+
+    def _worker(_worker_index: int) -> list[str]:
+        outputs = []
+        while True:
+            spec = queue.get(block=False)
+            if spec is None:
+                return outputs
+            output = _run_targetscan_context_shard(
+                cast(TargetscanContextShardSpec, spec)
+            )
+            CONF.output_volume.commit()
+            outputs.append(output)
+
+    output_batches = bounded_map(
+        range(local_workers), _worker, max_parallel=local_workers
     )
+    outputs = [output for batch in output_batches for output in batch]
     CONF.output_volume.commit()
+    print(
+        f"💊 TargetScan context queue worker {queue_name} finished {len(outputs)} shards"
+    )
     return outputs
 
 
@@ -1970,7 +1999,7 @@ def _merge_targetscan_context_outputs(
         output for output in context_outputs if Path(output).stat().st_size > 0
     ]
     if not existing_outputs:
-        targetscan_path.write_text("", encoding="utf-8")
+        targetscan_path.write_text(TARGETSCAN_HEADER + "\n", encoding="utf-8")
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.write_text(
             "No TargetScan context outputs to merge.\n", encoding="utf-8"
@@ -2018,7 +2047,7 @@ def _merge_targetscan_context_outputs(
     merged.write_csv(
         targetscan_path,
         separator="\t",
-        include_header=False,
+        include_header=merged.height == 0,
     )
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text(
@@ -2032,37 +2061,70 @@ def _merge_targetscan_context_outputs(
 def _run_targetscan_context_batches(
     context_shards: list[TargetscanContextShardSpec],
 ) -> list[str]:
-    """Run TargetScan context-score shard batches with bounded global fanout."""
+    """Run TargetScan context-score shards with queue-based work stealing."""
     if not context_shards:
         return []
+
+    from uuid import uuid4
+
+    expected_outputs = [shard.output_path for shard in context_shards]
+    pending_shards = [
+        shard for shard in context_shards if not _targetscan_context_shard_ready(shard)
+    ]
+    if not pending_shards:
+        return expected_outputs
 
     context_workers = _positive_int_from_env(
         APP_INFO.targetscan_context_workers_env,
         APP_INFO.default_targetscan_context_workers,
     )
     context_node_count = _bounded_node_count(
-        len(context_shards),
+        len(pending_shards),
         env_name=APP_INFO.targetscan_context_nodes_env,
         default=APP_INFO.default_targetscan_context_nodes,
     )
-    context_batches = [
-        context_shards[index : index + context_workers]
-        for index in range(0, len(context_shards), context_workers)
-    ]
+    local_workers = min(context_workers, len(pending_shards))
+    queue_key = hash_string("\n".join(expected_outputs))
+    queue_name = (
+        f"{CONF.package_name}-targetscan-context-{queue_key[:16]}-{uuid4().hex[:12]}"
+    )
+    queue = modal.Queue.from_name(queue_name, create_if_missing=True)
+    for shard in pending_shards:
+        queue.put(shard)
+
     print(
         "💊 Running OligoFormer TargetScan context scoring for "
-        f"{len(context_shards)} shards on up to {context_node_count} CPU nodes "
-        f"with {context_workers} workers each"
+        f"{len(pending_shards)} pending of {len(context_shards)} shards via "
+        f"{context_node_count} queue workers with {local_workers} local workers each"
     )
-    context_output_batches = bounded_map(
-        context_batches,
-        lambda batch: run_oligoformer_targetscan_context_shard_batch.remote(
-            list(batch),
-            local_workers=context_workers,
-        ),
-        max_parallel=context_node_count,
-    )
-    return [output for batch in context_output_batches for output in batch]
+    try:
+        bounded_map(
+            range(context_node_count),
+            lambda _index: run_oligoformer_targetscan_context_queue_worker.remote(
+                queue_name,
+                local_workers=local_workers,
+            ),
+            max_parallel=context_node_count,
+        )
+    finally:
+        with suppress(Exception):
+            modal.Queue.objects.delete(queue_name)
+
+    CONF.output_volume.reload()
+    missing_outputs = [
+        shard.output_path
+        for shard in context_shards
+        if not _targetscan_context_shard_ready(shard)
+    ]
+    if missing_outputs:
+        preview = ", ".join(missing_outputs[:5])
+        if len(missing_outputs) > 5:
+            preview += f", ... ({len(missing_outputs)} total)"
+        raise RuntimeError(
+            "OligoFormer TargetScan context scoring did not produce all outputs: "
+            f"{preview}"
+        )
+    return expected_outputs
 
 
 def _prepare_targetscan_batch_context_plan(
@@ -2264,13 +2326,37 @@ def _merge_targetscan_batch_outputs(
         rows.extend(
             line
             for line in Path(targetscan_path).read_text(encoding="utf-8").splitlines()
-            if line
+            if line and line != TARGETSCAN_HEADER
         )
     rows.sort(key=lambda row: tuple(row.split("\t")[:2]))
     with output_path.open("w", encoding="utf-8") as out:
         if rows:
             out.write("\n".join(rows))
             out.write("\n")
+        else:
+            out.write(TARGETSCAN_HEADER + "\n")
+
+
+def _read_targetscan_table(path: Path) -> pl.DataFrame:
+    """Read headerless or header-only TargetScan raw output."""
+    schema = {
+        "refseq": pl.String,
+        "siRNA": pl.String,
+        "targetscan_score": pl.Float64,
+    }
+    if path.stat().st_size == 0:
+        return pl.DataFrame(schema=schema)
+    with path.open(encoding="utf-8") as handle:
+        first_line = handle.readline().rstrip("\n")
+    if first_line == TARGETSCAN_HEADER:
+        return pl.read_csv(path, separator="\t", schema_overrides=schema)
+    return pl.read_csv(
+        path,
+        separator="\t",
+        has_header=False,
+        new_columns=list(TARGETSCAN_COLUMNS),
+        schema_overrides={"targetscan_score": pl.Float64},
+    )
 
 
 def _raw_off_target_ready(raw_off_target_dir: Path) -> bool:
@@ -2888,13 +2974,7 @@ def _apply_off_target_filters(
         .alias("pita_filter")
     )
 
-    targetscan_raw = pl.read_csv(
-        infer_dir / "targetscan.tab",
-        separator="\t",
-        has_header=False,
-        new_columns=["refseq", "siRNA", "targetscan_score"],
-        schema_overrides={"targetscan_score": pl.Float64},
-    )
+    targetscan_raw = _read_targetscan_table(infer_dir / "targetscan.tab")
     targetscan = targetscan_raw.group_by("siRNA").agg(
         pl.col("targetscan_score").max().alias("targetscan_score")
     )
@@ -3037,7 +3117,7 @@ def prepare_oligoformer_run(
         toxicity_threshold=toxicity_threshold,
     )
 
-    layout = _run_layout_for_cache_key(cache_key)
+    layout = _run_layout_for_cache_key(cache_key, output_stems)
     if force and layout.run_root.exists():
         import shutil
 
@@ -3185,6 +3265,12 @@ def run_oligoformer_postprocess(
                 functionality_filter=functionality_filter,
             )
             _write_final_outputs(result, output_dir, stem)
+
+        if off_target:
+            import shutil
+
+            for stem in refreshed_plan.output_stems:
+                shutil.rmtree(layout.prep_dir / "off_target" / stem, ignore_errors=True)
 
     _write_cache_marker(
         layout,

@@ -66,11 +66,12 @@ spawns both branches and gathers them before merging the raw `pita.tab` and
 `targetscan.tab` evidence tables. On failure, branch cancellation is best-effort
 so cleanup errors do not hide the original failure.
 
-TargetScan context-score shards are submitted in worker-sized batches with a
-bounded number of active Modal nodes. This avoids the earlier shape where one
-100-plus-shard local batch could contain multiple expensive stragglers and pin
-the whole run even though most shards had finished. The current default remains
-32 local workers per context batch and up to 32 active context nodes.
+TargetScan context-score shards are submitted through a per-run Modal Queue with
+a bounded number of active Modal worker nodes. Each worker node runs local
+threads that pull one shard at a time until the queue is empty. This avoids
+static batch tail latency where one container receives multiple expensive shards
+while other containers finish early. The current default remains up to 32 local
+workers per context worker node and up to 32 active context worker nodes.
 
 PITA and TargetScan evidence are interpreted independently. A missing PITA hit
 or missing TargetScan hit for an evaluated siRNA means that tool found no
@@ -97,22 +98,21 @@ The off-target cache salt changes when these reducer semantics change.
 Final-table completion markers carry a post-processing semantics salt separate
 from the run cache key and off-target evidence salt. This lets the app recompute
 final tables after sentinel handling, final filter aggregation, or output-column
-semantics change while still reusing the same run root and expensive prepared
-intermediates.
+semantics change while still reusing the same run root. Off-target intermediates
+are treated as resumable same-run state, not durable cross-run cache.
 
 TargetScan branch-reduction optimization is deferred until upstream-equivalence
-tests exist for the raw PITA evidence, raw TargetScan evidence, and final ranked
-tables. Context scoring is bounded, but final per-batch reduction remains a
-tail-latency risk; correctness takes priority because the recent reducer and
-candidate-identity fixes changed evidence semantics.
+tests exist for final ranked tables. Context scoring is bounded, but final
+per-batch reduction remains a tail-latency risk; correctness takes priority
+because the recent reducer and candidate-identity fixes changed evidence
+semantics.
 
 Upstream-equivalence tests should compare canonicalized table output instead of
 raw bytes. The reference remains the upstream OligoFormer, PITA, and TargetScan
 programs run directly, but comparison should normalize row ordering, headers,
-and numeric formatting before checking raw PITA evidence, raw TargetScan
-evidence, and final ranked tables. This keeps the tests strict about scientific
-results without making harmless formatting differences block reducer or
-packaging cleanup.
+and numeric formatting before checking final ranked tables. This keeps the tests
+strict about scientific results without making harmless formatting differences
+block reducer or packaging cleanup.
 
 The upstream-equivalence suite should run as a separate Modal sandbox
 verification command, not as a normal fast `pytest` integration test. Local
@@ -193,7 +193,10 @@ details change.
 After final outputs are generated, workers should clean up bulky generated
 off-target shard inputs and transient intermediates under the run's
 `prepare/off_target/<stem>/` tree. The cleanup must preserve final output
-tables, raw merged evidence such as `pita.tab` and `targetscan.tab`, completion
-markers, logs, efficacy outputs, model caches, and reusable reference caches.
-This keeps the output volume from accumulating large per-run shard files that
-are not needed once the merged evidence and final tables exist.
+tables, completion markers, logs, efficacy outputs, model caches, and reusable
+reference caches. Raw merged evidence such as `pita.tab` and `targetscan.tab`
+is deleted with the rest of the off-target prepare tree once final tables exist,
+because the current run key includes `top_n` and other post-processing knobs.
+Those files are therefore useful for retrying an incomplete same-key run, not
+for broad cross-run reuse. This keeps the output volume from accumulating large
+per-run shard files that are not needed once final tables exist.

@@ -4,8 +4,10 @@
 This is an engineering verifier, not a fast pytest. The local mode launches the
 Biomodals Modal app to produce candidate artifacts, then launches a Modal
 Sandbox in the same OligoFormer runtime image and invokes upstream
-`scripts/main.py` directly. The app is never used as the oracle for upstream
-OligoFormer, PITA, or TargetScan behavior.
+`scripts/main.py` directly. It compares final tables only because normal app
+runs delete raw off-target intermediates after final outputs are written. The
+app is never used as the oracle for upstream OligoFormer, PITA, or TargetScan
+behavior.
 """
 
 # This verifier intentionally stages files under a private Modal Sandbox /tmp and
@@ -340,30 +342,21 @@ def _copy_app_artifacts(config: dict[str, Any], artifact_root: Path) -> None:
     """Copy Biomodals app outputs into verifier artifact storage."""
     run_root = Path(config["run_root"])
     app_output_dir = artifact_root / "app/outputs"
-    app_raw_dir = artifact_root / "app/raw"
     for stem in config["output_stems"]:
         for suffix in FINAL_TABLE_SUFFIXES:
             name = f"{stem}{suffix}.txt"
             _copy_required(run_root / "outputs" / name, app_output_dir / name)
-        raw_dir = run_root / "prepare/off_target" / stem
-        _copy_required(raw_dir / "pita.tab", app_raw_dir / f"{stem}.pita.tab")
-        _copy_required(
-            raw_dir / "targetscan.tab",
-            app_raw_dir / f"{stem}.targetscan.tab",
-        )
 
 
 def _run_upstream(config: dict[str, Any], artifact_root: Path) -> None:
     """Run direct upstream OligoFormer/PITA/TargetScan commands in the sandbox."""
     repo_dir = Path(config["repo_dir"])
     upstream_output_dir = artifact_root / "upstream/outputs"
-    upstream_raw_dir = artifact_root / "upstream/raw"
     upstream_done = artifact_root / "upstream/upstream.done"
     if upstream_done.exists() and not config["force"]:
         return
 
     upstream_output_dir.mkdir(parents=True, exist_ok=True)
-    upstream_raw_dir.mkdir(parents=True, exist_ok=True)
     _ensure_rnafm_runtime(config)
 
     for stem in config["output_stems"]:
@@ -394,13 +387,6 @@ def _run_upstream(config: dict[str, Any], artifact_root: Path) -> None:
         stderr_log=artifact_root / "logs/upstream_main.stderr.log",
     )
 
-    for stem in config["output_stems"]:
-        raw_dir = repo_dir / "data/infer" / stem
-        _copy_required(raw_dir / "pita.tab", upstream_raw_dir / f"{stem}.pita.tab")
-        _copy_required(
-            raw_dir / "targetscan.tab",
-            upstream_raw_dir / f"{stem}.targetscan.tab",
-        )
     upstream_done.write_text("done\n", encoding="utf-8")
 
 
@@ -423,24 +409,6 @@ def _compare_artifacts(
                     canonical_dir=artifact_root / "canonical",
                 )
             )
-        comparisons.append(
-            compare_tables(
-                name=f"{stem}.pita",
-                app_path=artifact_root / "app/raw" / f"{stem}.pita.tab",
-                upstream_path=artifact_root / "upstream/raw" / f"{stem}.pita.tab",
-                kind="pita",
-                canonical_dir=artifact_root / "canonical",
-            )
-        )
-        comparisons.append(
-            compare_tables(
-                name=f"{stem}.targetscan",
-                app_path=artifact_root / "app/raw" / f"{stem}.targetscan.tab",
-                upstream_path=artifact_root / "upstream/raw" / f"{stem}.targetscan.tab",
-                kind="targetscan",
-                canonical_dir=artifact_root / "canonical",
-            )
-        )
     return [comparison.as_dict() for comparison in comparisons]
 
 

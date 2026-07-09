@@ -2,20 +2,22 @@
 
 Status: accepted, implemented for the current OligoFormer app.
 
-OligoFormer off-target scoring represents parallel work as deterministic tiles
-rather than a dynamic worker queue. TargetScan tiles are candidate-batch by
-reference-shard preparation tasks that expand into bounded context-score row
-tiles. PITA tiles are per-siRNA preparation tasks that expand into bounded UTR
-and row-scoring shards. This preserves the finite shape of a run after efficacy
-prediction, lets the app count and bound fanout before submitting work, and
-makes retries, cache keys, result comparison, and packaging inspectable.
+OligoFormer off-target scoring represents parallel work as deterministic tiles,
+with bounded queues only where measured shard skew requires work stealing.
+TargetScan tiles are candidate-batch by reference-shard preparation tasks that
+expand into bounded context-score row tiles. PITA tiles are per-siRNA
+preparation tasks that expand into bounded UTR and row-scoring shards. This
+preserves the finite shape of a run after efficacy prediction, lets the app
+count and bound fanout before submitting work, and makes retries, cache keys,
+result comparison, and packaging inspectable.
 
 The rejected first implementation is a dynamic queue of single-siRNA jobs over
 reference chunks. That shape is viable but too fine-grained for Modal startup
 overhead, repeats tool setup that upstream TargetScan and PITA can share across
 multi-siRNA inputs, and makes `top_n=-1` harder to reason about before work is
-submitted. A queue can be introduced later if real reference shards show enough
-runtime skew to require work stealing.
+submitted. The accepted compromise is to keep deterministic manifests for
+candidate and reference tiling, then use bounded per-stage queues or fanout only
+inside stages with measured imbalance.
 
 When `top_n=-1` is used with off-target scoring, the app still means "score all
 efficacy candidates". The app first materializes the bounded tile manifests and
@@ -71,7 +73,17 @@ a bounded number of active Modal worker nodes. Each worker node runs local
 threads that pull one shard at a time until the queue is empty. This avoids
 static batch tail latency where one container receives multiple expensive shards
 while other containers finish early. The current default remains up to 32 local
-workers per context worker node and up to 32 active context worker nodes.
+workers per context worker node and up to 100 active context worker nodes. The
+actual worker-node count is bounded by the queue size divided by the local
+worker count, so small queues do not spawn idle containers.
+
+TargetScan per-reference-batch reduction is also a bounded parallel stage.
+After all context-score shards finish, each reference batch is reduced by a
+remote finalizer that warms the context output directory with
+`warmup_directory()` before the Polars scan, writes that batch's `targetscan.tab`,
+and commits the output volume. The current default is up to 16 active merge
+nodes, which removes the serial tail from 29 per-batch reducers while avoiding
+unbounded concurrent reads from the Modal output volume.
 
 PITA and TargetScan evidence are interpreted independently. A missing PITA hit
 or missing TargetScan hit for an evaluated siRNA means that tool found no
@@ -101,11 +113,11 @@ final tables after sentinel handling, final filter aggregation, or output-column
 semantics change while still reusing the same run root. Off-target intermediates
 are treated as resumable same-run state, not durable cross-run cache.
 
-TargetScan branch-reduction optimization is deferred until upstream-equivalence
-tests exist for final ranked tables. Context scoring is bounded, but final
-per-batch reduction remains a tail-latency risk; correctness takes priority
-because the recent reducer and candidate-identity fixes changed evidence
-semantics.
+TargetScan branch-reduction optimization keeps the reducer semantics unchanged:
+only the placement changes from serial in the parent branch node to bounded
+parallel remote finalizers. Upstream-equivalence tests should continue to protect
+final ranked tables and raw evidence semantics before additional approximate
+prefilters or heuristic pruning are considered.
 
 Upstream-equivalence tests should compare canonicalized table output instead of
 raw bytes. The reference remains the upstream OligoFormer, PITA, and TargetScan

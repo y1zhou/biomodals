@@ -220,6 +220,14 @@ def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
     """Warm up the disk cache for all files in a directory matching a pattern."""
     if not Path(dir_path).exists():
         raise FileNotFoundError(dir_path)
+    fd_binary = shutil.which("fd") or shutil.which("fdfind")
+    if fd_binary is None:
+        warnings.warn(
+            "Neither 'fd' nor 'fdfind' is installed. Skipping directory warmup.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
     fd_args = [
         "-tf",
         "-j256",
@@ -230,11 +238,12 @@ def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
         "bs=1M",
         "status=none",
     ]
-    try:
-        find_with_fd(dir_path, file_pattern, *fd_args)
-    except FileNotFoundError as e:
-        warnings.warn(str(e), RuntimeWarning, stacklevel=2)
-        return
+    run_command(
+        [fd_binary, file_pattern, *fd_args],
+        output_mode="capture",
+        cwd=str(dir_path),
+        show_command=False,
+    )
 
 
 @timed_function

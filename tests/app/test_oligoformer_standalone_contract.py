@@ -188,6 +188,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     captured: dict[str, object] = {}
     targetscan_plan_calls: list[oligoformer_app.TargetscanBatchSpec] = []
     targetscan_worker_calls: list[tuple[str, int]] = []
+    targetscan_finalize_calls: list[
+        tuple[oligoformer_app.PreparedTargetscanBatch, list[str]]
+    ] = []
     pita_plan_calls: list[oligoformer_app.OffTargetShardSpec] = []
     pita_prepare_batch_calls: list[
         tuple[list[oligoformer_app.PitaPrepareUtrShardSpec], int]
@@ -285,11 +288,20 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         def put(self, item):
             self.items.append(item)
 
-        def get(self, *, block=False):
-            del block
+        def put_many(self, items):
+            self.items.extend(items)
+
+        def get(self, *, block=False, timeout=None):
+            del block, timeout
             if not self.items:
                 return None
             return self.items.pop(0)
+
+        def get_many(self, n_values: int, *, block=False, timeout=None):
+            del block, timeout
+            values = self.items[:n_values]
+            del self.items[:n_values]
+            return values
 
     class FakeQueue:
         class objects:
@@ -311,7 +323,11 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             outputs = []
             while True:
                 spec = queue.get(block=False)
-                if spec is None:
+                if (
+                    spec is None
+                    or spec
+                    == oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
+                ):
                     break
                 output_path = Path(spec.output_path)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,6 +337,20 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                 )
                 outputs.append(spec.output_path)
             return outputs
+
+        def spawn(self, queue_name: str, local_workers: int):
+            return FakeCall(self.remote, (queue_name, local_workers), {})
+
+    class FakeFinalizeTargetscanBatch:
+        def remote(
+            self,
+            plan: oligoformer_app.PreparedTargetscanBatch,
+            context_outputs: list[str],
+        ):
+            targetscan_finalize_calls.append((plan, list(context_outputs)))
+            return oligoformer_app._finalize_targetscan_batch_context_plan(
+                plan, context_outputs
+            )
 
     def fake_merge_targetscan_context_outputs(
         *,
@@ -502,6 +532,11 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         "run_oligoformer_targetscan_context_queue_worker",
         FakeTargetscanContextQueueWorker(),
     )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "finalize_oligoformer_targetscan_batch_context_plan",
+        FakeFinalizeTargetscanBatch(),
+    )
     monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
     monkeypatch.setattr(
         oligoformer_app,
@@ -558,6 +593,12 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     assert targetscan_queue_name.startswith("oligoformer-targetscan-context-")
     assert targetscan_local_workers == 1
     assert deleted_queues == [targetscan_queue_name]
+    assert len(targetscan_finalize_calls) == 1
+    targetscan_finalize_plan, targetscan_finalize_outputs = targetscan_finalize_calls[0]
+    assert targetscan_finalize_plan.needs_merge is True
+    assert targetscan_finalize_outputs == [
+        targetscan_finalize_plan.context_shards[0].output_path
+    ]
     assert sorted(call.record_name for call in pita_plan_calls) == ["RNA0", "RNA1"]
     assert [len(batch) for batch, _ in pita_prepare_batch_calls] == [2]
     assert [workers for _, workers in pita_prepare_batch_calls] == [32]
@@ -899,6 +940,29 @@ def test_merge_targetscan_context_outputs_applies_site_type_thresholds(
     ])
 
 
+def test_merge_targetscan_context_outputs_warms_multi_file_directory(
+    tmp_path: Path, monkeypatch
+):
+    first_context = tmp_path / "context_1.txt"
+    second_context = tmp_path / "context_2.txt"
+    _write_targetscan_context_output(first_context, [("refA", "RNA0", "6mer", "-0.5")])
+    _write_targetscan_context_output(second_context, [("refB", "RNA1", "6mer", "-0.2")])
+    warmup_calls = []
+    monkeypatch.setattr(
+        oligoformer_app,
+        "warmup_directory",
+        lambda path: warmup_calls.append(Path(path)),
+    )
+
+    oligoformer_app._merge_targetscan_context_outputs(
+        context_outputs=[str(first_context), str(second_context)],
+        targetscan_path=tmp_path / "targetscan.tab",
+        log_file=tmp_path / "merge.log",
+    )
+
+    assert warmup_calls == [tmp_path]
+
+
 def test_merge_targetscan_context_outputs_writes_header_only_empty_table(
     tmp_path: Path,
 ):
@@ -973,12 +1037,23 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
             with queue_lock:
                 self.items.append(item)
 
-        def get(self, *, block=False):
-            del block
+        def put_many(self, items):
+            with queue_lock:
+                self.items.extend(items)
+
+        def get(self, *, block=False, timeout=None):
+            del block, timeout
             with queue_lock:
                 if not self.items:
                     return None
                 return self.items.pop(0)
+
+        def get_many(self, n_values: int, *, block=False, timeout=None):
+            del block, timeout
+            with queue_lock:
+                values = self.items[:n_values]
+                del self.items[:n_values]
+                return values
 
     class FakeQueue:
         class objects:
@@ -998,9 +1073,13 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
             worker_calls.append((queue_name, local_workers))
             queue = FakeQueue.from_name(queue_name)
             outputs = []
-            for _ in range(local_workers):
+            while True:
                 spec = queue.get(block=False)
-                if spec is None:
+                if (
+                    spec is None
+                    or spec
+                    == oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
+                ):
                     break
                 output_path = Path(spec.output_path)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1012,6 +1091,16 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
                 )
                 outputs.append(spec.output_path)
             return outputs
+
+        def spawn(self, queue_name: str, local_workers: int):
+            class FakeCall:
+                def get(self_inner):
+                    return self.remote(queue_name, local_workers)
+
+                def cancel(self_inner, terminate_containers=False):
+                    del terminate_containers
+
+            return FakeCall()
 
     monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
     monkeypatch.setattr(
@@ -1043,6 +1132,131 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
         output_path = Path(shard.output_path)
         assert output_path.exists()
         assert output_path.with_suffix(output_path.suffix + ".done").exists()
+
+
+def test_run_targetscan_context_batches_caps_default_queue_workers(
+    tmp_path: Path, monkeypatch
+):
+    from threading import Lock
+
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_context_nodes_env, raising=False
+    )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_context_workers_env, raising=False
+    )
+
+    fake_queues = {}
+    deleted_queues = []
+    ready_outputs = set()
+    worker_calls = []
+    bounded_map_calls = []
+    queue_lock = Lock()
+
+    class FakeQueueInstance:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            with queue_lock:
+                self.items.append(item)
+
+        def put_many(self, items):
+            with queue_lock:
+                self.items.extend(items)
+
+        def get(self, *, block=False, timeout=None):
+            del block, timeout
+            with queue_lock:
+                if not self.items:
+                    return None
+                return self.items.pop(0)
+
+        def get_many(self, n_values: int, *, block=False, timeout=None):
+            del block, timeout
+            with queue_lock:
+                values = self.items[:n_values]
+                del self.items[:n_values]
+                return values
+
+    class FakeQueue:
+        class objects:
+            @staticmethod
+            def delete(name):
+                deleted_queues.append(name)
+                fake_queues.pop(name, None)
+
+        @staticmethod
+        def from_name(name, create_if_missing=False):
+            if create_if_missing:
+                return fake_queues.setdefault(name, FakeQueueInstance())
+            return fake_queues[name]
+
+    class FakeTargetscanContextQueueWorker:
+        def remote(self, queue_name: str, local_workers: int):
+            worker_calls.append((queue_name, local_workers))
+            queue = FakeQueue.from_name(queue_name)
+            outputs = []
+            while True:
+                spec = queue.get(block=False)
+                if (
+                    spec is None
+                    or spec
+                    == oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
+                ):
+                    return outputs
+                ready_outputs.add(spec.output_path)
+                outputs.append(spec.output_path)
+
+        def spawn(self, queue_name: str, local_workers: int):
+            class FakeCall:
+                def get(self_inner):
+                    return self.remote(queue_name, local_workers)
+
+                def cancel(self_inner, terminate_containers=False):
+                    del terminate_containers
+
+            return FakeCall()
+
+    def fake_bounded_map(items, fn, *, max_parallel: int):
+        items = list(items)
+        bounded_map_calls.append((len(items), max_parallel))
+        return [fn(item) for item in items]
+
+    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
+    monkeypatch.setattr(oligoformer_app, "bounded_map", fake_bounded_map)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_targetscan_context_shard_ready",
+        lambda shard: shard.output_path in ready_outputs,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_targetscan_context_queue_worker",
+        FakeTargetscanContextQueueWorker(),
+    )
+    shards = [
+        oligoformer_app.TargetscanContextShardSpec(
+            shard_index=index,
+            common_dir=str(tmp_path / "common"),
+            targets_path=str(tmp_path / "shards" / f"targets_{index:05d}"),
+            output_path=str(tmp_path / "outputs" / f"context_{index:05d}.txt"),
+            log_path=str(tmp_path / "logs" / f"{index:05d}.log"),
+            rnaplfold_cache_dir="",
+        )
+        for index in range(3425)
+    ]
+
+    outputs = oligoformer_app._run_targetscan_context_batches(shards)
+
+    assert outputs == [shard.output_path for shard in shards]
+    assert bounded_map_calls == [(100, 100)]
+    assert len(worker_calls) == 100
+    assert {local_workers for _, local_workers in worker_calls} == {32}
+    assert deleted_queues == [worker_calls[0][0]]
+    assert fake_queues == {}
 
 
 def test_merge_pita_shards_sorts_like_upstream_score_table(tmp_path: Path):
@@ -1136,6 +1350,10 @@ def test_oligoformer_off_target_defaults_use_distributed_cpu_nodes(monkeypatch):
         oligoformer_app.APP_INFO.targetscan_context_shard_size_env,
         raising=False,
     )
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_merge_nodes_env,
+        raising=False,
+    )
 
     assert (
         oligoformer_app._bounded_node_count(
@@ -1175,7 +1393,15 @@ def test_oligoformer_off_target_defaults_use_distributed_cpu_nodes(monkeypatch):
             env_name=oligoformer_app.APP_INFO.targetscan_context_nodes_env,
             default=oligoformer_app.APP_INFO.default_targetscan_context_nodes,
         )
-        == 32
+        == 100
+    )
+    assert (
+        oligoformer_app._bounded_node_count(
+            100,
+            env_name=oligoformer_app.APP_INFO.targetscan_merge_nodes_env,
+            default=oligoformer_app.APP_INFO.default_targetscan_merge_nodes,
+        )
+        == 16
     )
     assert (
         oligoformer_app._positive_int_from_env(

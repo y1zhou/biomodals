@@ -98,6 +98,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import queue as queue_lib
 import shlex
 from contextlib import suppress
 from dataclasses import dataclass
@@ -117,7 +118,7 @@ from biomodals.helper.io import (
     resolve_local_output_dir,
     write_local_tarball,
 )
-from biomodals.helper.shell import package_outputs, run_command
+from biomodals.helper.shell import package_outputs, run_command, warmup_directory
 from biomodals.helper.task_budget import batches_for_total_concurrency, bounded_map
 from biomodals.helper.web import download_files
 
@@ -210,6 +211,8 @@ class AppInfo:
     targetscan_context_nodes_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_NODES"
     targetscan_context_workers_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_WORKERS"
     targetscan_context_shard_size_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_SHARD_SIZE"
+    targetscan_context_attempts_env: str = "OLIGOFORMER_TARGETSCAN_CONTEXT_ATTEMPTS"
+    targetscan_merge_nodes_env: str = "OLIGOFORMER_TARGETSCAN_MERGE_NODES"
     default_off_target_nodes: int = 32
     default_off_target_workers_per_node: int = 32
     default_off_target_prep_workers: int = 16
@@ -223,9 +226,41 @@ class AppInfo:
     default_targetscan_rnaplfold_shard_size: int = 500
     default_targetscan_prepare_nodes: int = 32
     default_targetscan_prepare_ref_shard_size: int = 1000
-    default_targetscan_context_nodes: int = 32
+    default_targetscan_context_nodes: int = 100
     default_targetscan_context_workers: int = 32
     default_targetscan_context_shard_size: int = 500
+    default_targetscan_context_attempts: int = 3
+    targetscan_context_queue_put_batch_size: int = 256
+    targetscan_context_queue_initial_batches: int = 4
+    targetscan_context_queue_idle_timeout: float = 45.0
+    targetscan_context_queue_sentinel: str = (
+        "__biomodals_oligoformer_targetscan_context_stop__"
+    )
+    default_targetscan_merge_nodes: int = 16
+
+    @property
+    def tuning_env_names(self) -> tuple[str, ...]:
+        """Return local env vars that should be forwarded into Modal containers."""
+        return (
+            self.off_target_workers_env,
+            self.off_target_nodes_env,
+            self.off_target_prep_workers_env,
+            self.off_target_pita_prepare_nodes_env,
+            self.off_target_pita_prepare_workers_env,
+            self.off_target_pita_prepare_utr_shard_size_env,
+            self.off_target_row_shard_size_env,
+            self.off_target_row_attempts_env,
+            self.targetscan_rnaplfold_nodes_env,
+            self.targetscan_rnaplfold_workers_env,
+            self.targetscan_rnaplfold_shard_size_env,
+            self.targetscan_prepare_nodes_env,
+            self.targetscan_prepare_ref_shard_size_env,
+            self.targetscan_context_nodes_env,
+            self.targetscan_context_workers_env,
+            self.targetscan_context_shard_size_env,
+            self.targetscan_context_attempts_env,
+            self.targetscan_merge_nodes_env,
+        )
 
     @property
     def model_rnafm_redevelop_dir(self) -> Path:
@@ -820,6 +855,11 @@ runtime_image = (
     )
     .workdir(str(CONF.git_clone_dir))
     .uv_pip_install(*APP_INFO.requirements)
+    .env({
+        name: value
+        for name in APP_INFO.tuning_env_names
+        if (value := os.environ.get(name))
+    })
     .pipe(
         patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3", "modal"]
     )
@@ -1954,37 +1994,35 @@ def _targetscan_context_shard_ready(spec: TargetscanContextShardSpec) -> bool:
 def run_oligoformer_targetscan_context_queue_worker(
     queue_name: str,
     local_workers: int,
-) -> list[str]:
+) -> int:
     """Drain queued TargetScan context-score shards on one CPU node."""
     CONF.output_volume.reload()
-    print(
-        "💊 Running OligoFormer TargetScan context queue worker "
-        f"{queue_name} with {local_workers} local workers"
-    )
 
     queue = modal.Queue.from_name(queue_name)
+    idle_timeout = APP_INFO.targetscan_context_queue_idle_timeout
 
-    def _worker(_worker_index: int) -> list[str]:
-        outputs = []
+    def _worker(_worker_index: int) -> int:
+        output_count = 0
         while True:
-            spec = queue.get(block=False)
-            if spec is None:
-                return outputs
+            try:
+                spec = queue.get(timeout=idle_timeout)
+            except queue_lib.Empty:
+                return output_count
+            if spec == APP_INFO.targetscan_context_queue_sentinel:
+                return output_count
             output = _run_targetscan_context_shard(
                 cast(TargetscanContextShardSpec, spec)
             )
             CONF.output_volume.commit()
-            outputs.append(output)
+            del output
+            output_count += 1
 
-    output_batches = bounded_map(
+    output_counts = bounded_map(
         range(local_workers), _worker, max_parallel=local_workers
     )
-    outputs = [output for batch in output_batches for output in batch]
+    output_count = sum(output_counts)
     CONF.output_volume.commit()
-    print(
-        f"💊 TargetScan context queue worker {queue_name} finished {len(outputs)} shards"
-    )
-    return outputs
+    return output_count
 
 
 def _merge_targetscan_context_outputs(
@@ -2006,6 +2044,8 @@ def _merge_targetscan_context_outputs(
         )
         return
 
+    if len(existing_outputs) > 1:
+        warmup_directory(Path(existing_outputs[0]).parent)
     context_scores = pl.scan_csv(
         existing_outputs,
         separator="\t",
@@ -2067,48 +2107,101 @@ def _run_targetscan_context_batches(
 
     from uuid import uuid4
 
-    expected_outputs = [shard.output_path for shard in context_shards]
-    pending_shards = [
-        shard for shard in context_shards if not _targetscan_context_shard_ready(shard)
-    ]
-    if not pending_shards:
-        return expected_outputs
-
     context_workers = _positive_int_from_env(
         APP_INFO.targetscan_context_workers_env,
         APP_INFO.default_targetscan_context_workers,
     )
-    context_node_count = _bounded_node_count(
-        len(pending_shards),
-        env_name=APP_INFO.targetscan_context_nodes_env,
-        default=APP_INFO.default_targetscan_context_nodes,
-    )
-    local_workers = min(context_workers, len(pending_shards))
+    expected_outputs = [shard.output_path for shard in context_shards]
     queue_key = hash_string("\n".join(expected_outputs))
-    queue_name = (
-        f"{CONF.package_name}-targetscan-context-{queue_key[:16]}-{uuid4().hex[:12]}"
+    put_batch_size = APP_INFO.targetscan_context_queue_put_batch_size
+    max_attempts = _positive_int_from_env(
+        APP_INFO.targetscan_context_attempts_env,
+        APP_INFO.default_targetscan_context_attempts,
     )
-    queue = modal.Queue.from_name(queue_name, create_if_missing=True)
-    for shard in pending_shards:
-        queue.put(shard)
 
-    print(
-        "💊 Running OligoFormer TargetScan context scoring for "
-        f"{len(pending_shards)} pending of {len(context_shards)} shards via "
-        f"{context_node_count} queue workers with {local_workers} local workers each"
-    )
-    try:
-        bounded_map(
-            range(context_node_count),
-            lambda _index: run_oligoformer_targetscan_context_queue_worker.remote(
-                queue_name,
-                local_workers=local_workers,
-            ),
-            max_parallel=context_node_count,
+    for attempt in range(1, max_attempts + 1):
+        CONF.output_volume.reload()
+        pending_shards = [
+            shard
+            for shard in context_shards
+            if not _targetscan_context_shard_ready(shard)
+        ]
+        if not pending_shards:
+            return expected_outputs
+
+        local_workers = min(context_workers, len(pending_shards))
+        queue_sized_node_count = (
+            len(pending_shards) + local_workers - 1
+        ) // local_workers
+        context_node_count = _bounded_node_count(
+            queue_sized_node_count,
+            env_name=APP_INFO.targetscan_context_nodes_env,
+            default=APP_INFO.default_targetscan_context_nodes,
         )
-    finally:
-        with suppress(Exception):
-            modal.Queue.objects.delete(queue_name)
+        queue_name = (
+            f"{CONF.package_name}-targetscan-context-{queue_key[:16]}-"
+            f"{attempt}-{uuid4().hex[:12]}"
+        )
+        queue = modal.Queue.from_name(queue_name, create_if_missing=True)
+        print(
+            "💊 Running OligoFormer TargetScan context scoring for "
+            f"{len(pending_shards)} pending of {len(context_shards)} shards via "
+            f"{context_node_count} queue workers with {local_workers} local workers "
+            f"each (attempt {attempt}/{max_attempts})"
+        )
+        worker_calls = []
+        print(
+            "💊 Queueing OligoFormer TargetScan context scoring for "
+            f"{len(pending_shards)} pending of {len(context_shards)} shards"
+        )
+        try:
+            initial_count = min(
+                len(pending_shards),
+                put_batch_size * APP_INFO.targetscan_context_queue_initial_batches,
+            )
+            for start in range(0, initial_count, put_batch_size):
+                queue.put_many(pending_shards[start : start + put_batch_size])
+            worker_calls = bounded_map(
+                range(context_node_count),
+                lambda _index, q=queue_name, w=local_workers: (
+                    run_oligoformer_targetscan_context_queue_worker.spawn(
+                        q,
+                        local_workers=w,
+                    )
+                ),
+                max_parallel=context_node_count,
+            )
+            for start in range(initial_count, len(pending_shards), put_batch_size):
+                queue.put_many(pending_shards[start : start + put_batch_size])
+            stop_tokens = [APP_INFO.targetscan_context_queue_sentinel] * (
+                context_node_count * local_workers
+            )
+            for start in range(0, len(stop_tokens), put_batch_size):
+                queue.put_many(stop_tokens[start : start + put_batch_size])
+            for call in worker_calls:
+                call.get()
+        except BaseException:
+            for call in worker_calls:
+                with suppress(Exception):
+                    call.cancel(terminate_containers=True)
+            raise
+        finally:
+            with suppress(Exception):
+                modal.Queue.objects.delete(queue_name)
+
+        CONF.output_volume.reload()
+        missing_outputs = [
+            shard.output_path
+            for shard in context_shards
+            if not _targetscan_context_shard_ready(shard)
+        ]
+        if not missing_outputs:
+            return expected_outputs
+        if attempt < max_attempts:
+            print(
+                "💊 Retrying OligoFormer TargetScan context scoring for "
+                f"{len(missing_outputs)} missing shards"
+            )
 
     CONF.output_volume.reload()
     missing_outputs = [
@@ -2238,14 +2331,10 @@ fi
 
 def _finalize_targetscan_batch_context_plan(
     plan: PreparedTargetscanBatch,
-    outputs_by_path: dict[str, str],
+    context_outputs: list[str],
 ) -> str:
     """Merge TargetScan context-score outputs for one siRNA batch."""
     if plan.needs_merge:
-        context_outputs = [
-            outputs_by_path[shard.output_path]
-            for shard in sorted(plan.context_shards, key=lambda item: item.shard_index)
-        ]
         targetscan_path = Path(plan.targetscan_path)
         _merge_targetscan_context_outputs(
             context_outputs=context_outputs,
@@ -2257,6 +2346,23 @@ def _finalize_targetscan_batch_context_plan(
             encoding="utf-8",
         )
     return plan.targetscan_path
+
+
+@app.function(
+    cpu=(0.125, 8.125),
+    memory=(1024, 32768),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_oligoformer_targetscan_batch_context_plan(
+    plan: PreparedTargetscanBatch,
+    context_outputs: list[str],
+) -> str:
+    """Finalize one TargetScan reference batch from context-score outputs."""
+    CONF.output_volume.reload()
+    targetscan_path = _finalize_targetscan_batch_context_plan(plan, context_outputs)
+    CONF.output_volume.commit()
+    return targetscan_path
 
 
 @app.function(
@@ -2677,10 +2783,35 @@ def run_oligoformer_targetscan_branch(
         shard.output_path: output
         for shard, output in zip(context_shards, context_outputs, strict=True)
     }
-    targetscan_paths = [
-        _finalize_targetscan_batch_context_plan(plan, context_outputs_by_path)
+    merge_inputs = [
+        (
+            plan,
+            [
+                context_outputs_by_path[shard.output_path]
+                for shard in sorted(
+                    plan.context_shards, key=lambda item: item.shard_index
+                )
+            ],
+        )
         for plan in targetscan_plans
     ]
+    merge_node_count = _bounded_node_count(
+        len(merge_inputs),
+        env_name=APP_INFO.targetscan_merge_nodes_env,
+        default=APP_INFO.default_targetscan_merge_nodes,
+    )
+    print(
+        "💊 Merging OligoFormer TargetScan context outputs for "
+        f"{len(merge_inputs)} reference batches on up to {merge_node_count} CPU nodes"
+    )
+    targetscan_paths = bounded_map(
+        merge_inputs,
+        lambda item: finalize_oligoformer_targetscan_batch_context_plan.remote(
+            item[0],
+            item[1],
+        ),
+        max_parallel=merge_node_count,
+    )
     CONF.output_volume.commit()
     return targetscan_paths
 

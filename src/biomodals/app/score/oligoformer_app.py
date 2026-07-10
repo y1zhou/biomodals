@@ -18,9 +18,10 @@ without confusing top-N rank with candidate identity. `--top-n -1` scores every
 candidate.
 
 Advanced tuning: `--targetscan-ref-shard-size` controls how many UTR records are
-put into each TargetScan reference-preparation shard. Larger values reduce Modal
-fanout and are useful for exact sharded-vs-unsharded comparisons; smaller values
-increase reference-prep parallelism.
+put into each TargetScan reference-preparation shard. When omitted, Biomodals
+distributes the reference across `OLIGOFORMER_TARGETSCAN_PREPARE_NODES` shards.
+Larger values reduce Modal fanout and are useful for exact sharded-vs-unsharded
+comparisons; smaller values increase reference-prep parallelism.
 
 ## Outputs
 
@@ -228,7 +229,6 @@ class AppInfo:
     default_targetscan_rnaplfold_workers: int = 8
     default_targetscan_rnaplfold_shard_size: int = 500
     default_targetscan_prepare_nodes: int = 32
-    default_targetscan_prepare_ref_shard_size: int = 1000
     default_targetscan_context_nodes: int = 100
     default_targetscan_context_workers: int = 32
     default_targetscan_context_shard_size: int = 500
@@ -470,7 +470,8 @@ class TargetscanBatchSpec:
     stem: str
     ref_shard_size: int
     shard_index: int
-    records: tuple[OffTargetSirnaRecord, ...]
+    sirna_path: str
+    sirna_count: int
     utr_path: str
     orf_path: str
     rnaplfold_cache_dir: str
@@ -1589,6 +1590,33 @@ def _write_sirna_records(records: list[OffTargetSirnaRecord], sirna_file: Path) 
             handle.write(f"{record.sequence}\n")
 
 
+def _targetscan_ref_shard_size(
+    utr_count: int, configured_size: int | None = None
+) -> int:
+    """Choose a TargetScan reference shard size from explicit tuning or fanout."""
+    if utr_count < 1:
+        raise ValueError("TargetScan requires at least one UTR record")
+    if configured_size is not None:
+        if configured_size < 1:
+            raise ValueError("targetscan_ref_shard_size must be a positive integer")
+        return configured_size
+
+    raw_size = os.environ.get(APP_INFO.targetscan_prepare_ref_shard_size_env)
+    if raw_size is not None:
+        size = int(raw_size)
+        if size < 1:
+            raise ValueError(
+                f"{APP_INFO.targetscan_prepare_ref_shard_size_env} must be positive"
+            )
+        return size
+
+    node_count = _positive_int_from_env(
+        APP_INFO.targetscan_prepare_nodes_env,
+        APP_INFO.default_targetscan_prepare_nodes,
+    )
+    return max(1, (utr_count + node_count - 1) // node_count)
+
+
 def _positive_int_from_env(env_name: str, default: int) -> int:
     """Return a positive integer environment override."""
     raw_value = os.environ.get(env_name)
@@ -1677,17 +1705,16 @@ def _targetscan_batch_specs(
         return []
 
     layout = AppRunLayout.from_run_root(run_root)
-    shard_root = layout.prep_dir / "off_target" / stem / "targetscan_ref_shards"
+    off_target_root = layout.prep_dir / "off_target" / stem
+    shard_root = off_target_root / "targetscan_ref_shards"
     shard_root.mkdir(parents=True, exist_ok=True)
+
+    sirna_path = off_target_root / "targetscan_siRNA.fa"
+    _write_sirna_records(records, sirna_path)
 
     utr_records = _read_fasta_pairs(Path(utr_path))
     orf_records_by_name = dict(_read_fasta_pairs(Path(orf_path)))
-    shard_size = ref_shard_size or _positive_int_from_env(
-        APP_INFO.targetscan_prepare_ref_shard_size_env,
-        APP_INFO.default_targetscan_prepare_ref_shard_size,
-    )
-    if shard_size < 1:
-        raise ValueError("targetscan_ref_shard_size must be a positive integer")
+    shard_size = _targetscan_ref_shard_size(len(utr_records), ref_shard_size)
     rnaplfold_cache_dir = ""
     if _is_model_human_ref_pair(utr_path, orf_path):
         if not _targetscan_rnaplfold_cache_ready():
@@ -1731,7 +1758,8 @@ def _targetscan_batch_specs(
                 stem=stem,
                 ref_shard_size=shard_size,
                 shard_index=shard_index,
-                records=tuple(records),
+                sirna_path=str(sirna_path),
+                sirna_count=len(records),
                 utr_path=str(shard_utr_path),
                 orf_path=str(shard_orf_path),
                 rnaplfold_cache_dir=rnaplfold_cache_dir,
@@ -2520,7 +2548,10 @@ def _prepare_targetscan_batch_context_plan(
     batch_root: Path,
 ) -> PreparedTargetscanBatch:
     """Prepare TargetScan context-score shard specs for a siRNA batch."""
-    if not spec.records:
+    import shutil
+    from time import monotonic
+
+    if spec.sirna_count < 1:
         raise RuntimeError("TargetScan batch requires at least one siRNA record")
 
     cache_dir = _targetscan_batch_cache_dir(spec)
@@ -2535,38 +2566,102 @@ def _prepare_targetscan_batch_context_plan(
             needs_merge=False,
         )
 
-    sirna_file = (
-        batch_root
-        / "data/infer"
-        / f"{spec.stem}_targetscan_{spec.shard_index:05d}"
-        / "siRNA.fa"
-    )
-    if not sirna_file.exists():
-        _write_sirna_records(list(spec.records), sirna_file)
     rnaplfold_cache_dir = spec.rnaplfold_cache_dir
+    context_shard_size = _positive_int_from_env(
+        APP_INFO.targetscan_context_shard_size_env,
+        APP_INFO.default_targetscan_context_shard_size,
+    )
+    context_dir = cache_dir / "targetscan_context"
+    prep_marker_path = context_dir / "targetscan_prepare.done"
+    print(
+        "💊 Preparing OligoFormer TargetScan batch "
+        f"{spec.stem}:{spec.shard_index} for {spec.sirna_count} siRNAs with "
+        f"{context_shard_size} target rows per context shard; "
+        f"log: {logs_dir / 'targetscan_prep.log'}"
+    )
+    if not prep_marker_path.exists():
+        targetscan_workdir = batch_root / "off-target" / "tmp"
+        shutil.copytree(
+            batch_root / "off-target" / "targetscan",
+            targetscan_workdir,
+        )
+        species = APP_INFO.targetscan_species_id
+        sirnas = _read_fasta_pairs(Path(spec.sirna_path))
+        utrs = _read_fasta_pairs(Path(spec.utr_path))
+        orfs = _read_fasta_pairs(Path(spec.orf_path))
+        targetscan_workdir.joinpath("sirnas_for_context_scores.txt").write_text(
+            "".join(
+                f"{name}\t{species}\t{name}\t{sequence}\n" for name, sequence in sirnas
+            ),
+            encoding="utf-8",
+        )
+        targetscan_workdir.joinpath("sirnas.txt").write_text(
+            "".join(
+                f"{name}\t{sequence[1:8]}\t{species}\n" for name, sequence in sirnas
+            ),
+            encoding="utf-8",
+        )
+        targetscan_workdir.joinpath("UTR.txt").write_text(
+            "".join(f"{name}\t{species}\t{sequence}\n" for name, sequence in utrs),
+            encoding="utf-8",
+        )
+        targetscan_workdir.joinpath("ORF.txt").write_text(
+            "".join(f"{name}\t{species}\t{sequence}\n" for name, sequence in orfs),
+            encoding="utf-8",
+        )
+        targetscan_workdir.joinpath("ORF.length.txt").write_text(
+            "".join(f"{name}\t{species}\t{len(sequence)}\n" for name, sequence in orfs),
+            encoding="utf-8",
+        )
 
-    targetscan_cmd = r"""
+        checkpoint_dir = cache_dir / "targetscan_seed"
+        checkpoint_path = checkpoint_dir / "targetscan_70_output.txt"
+        checkpoint_marker = checkpoint_dir / "targetscan_70.done"
+        local_seed_path = targetscan_workdir / "targetscan_70_output.txt"
+        if checkpoint_marker.exists() and checkpoint_path.exists():
+            print(
+                "💊 Reusing OligoFormer TargetScan seed checkpoint for batch "
+                f"{spec.stem}:{spec.shard_index}"
+            )
+            shutil.copy2(checkpoint_path, local_seed_path)
+        else:
+            print(
+                "💊 Running OligoFormer TargetScan seed scan for batch "
+                f"{spec.stem}:{spec.shard_index}"
+            )
+            started_at = monotonic()
+            run_command(
+                [
+                    "perl",
+                    "targetscan_70.pl",
+                    "sirnas.txt",
+                    "UTR.txt",
+                    local_seed_path.name,
+                ],
+                cwd=targetscan_workdir,
+                output_mode="log",
+                log_file=logs_dir / "targetscan_prep.log",
+                show_command=False,
+            )
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            tmp_checkpoint = checkpoint_path.with_name(
+                f".{checkpoint_path.name}.tmp.{os.getpid()}"
+            )
+            tmp_checkpoint.unlink(missing_ok=True)
+            shutil.copy2(local_seed_path, tmp_checkpoint)
+            tmp_checkpoint.replace(checkpoint_path)
+            checkpoint_marker.write_text("done", encoding="utf-8")
+            CONF.output_volume.commit()
+            print(
+                "💊 Checkpointed OligoFormer TargetScan seed scan for batch "
+                f"{spec.stem}:{spec.shard_index} in "
+                f"{monotonic() - started_at:.1f}s"
+            )
+
+        targetscan_cmd = r"""
 set -eu
-shopt -s nullglob
-mir=$1
-utr=$2
-orf=$3
-stem=$4
-context_dir=$5
-context_shard_size=${6:-500}
-rm -rf ./off-target/tmp
-cp -r ./off-target/targetscan ./off-target/tmp
-cp "$mir" "$utr" "$orf" ./off-target/tmp/
-cd ./off-target/tmp
-mir=$(basename "$mir")
-utr=$(basename "$utr")
-orf=$(basename "$orf")
-awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",x,$1;}' "$mir" | sed 's/>//g' > sirnas_for_context_scores.txt
-awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,substr($1,2,7),"9606";}' "$mir" | sed 's/>//g' > sirnas.txt
-awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",$1;}' "$utr" | sed 's/>//g' > UTR.txt
-awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",$1;}' "$orf" | sed 's/>//g' > ORF.txt
-awk 'BEGIN{OFS="\t"} {x=$0; getline; print x,"9606",length($1);}' "$orf" | sed 's/>//g' > ORF.length.txt
-perl targetscan_70.pl sirnas.txt UTR.txt targetscan_70_output.txt
+context_dir=$1
+context_shard_size=$2
 perl targetscan_70_BL_bins.pl UTR.txt > UTRs_median_BLs_bins.txt
 perl targetscan_70_BL_PCT.pl sirnas.txt targetscan_70_output.txt UTRs_median_BLs_bins.txt > targetscan_70_output.BL_PCT.txt
 perl targetscan_count_8mers.pl sirnas.txt ORF.txt > ORF_8mer_counts.txt
@@ -2578,33 +2673,20 @@ if [[ -s targetscan_70_output.BL_PCT.txt ]]; then
   split -d -a 5 -l "$context_shard_size" targetscan_70_output.BL_PCT.txt "$context_dir/shards/targets_"
 fi
 """
-    context_shard_size = _positive_int_from_env(
-        APP_INFO.targetscan_context_shard_size_env,
-        APP_INFO.default_targetscan_context_shard_size,
-    )
-    context_dir = cache_dir / "targetscan_context"
-    prep_marker_path = context_dir / "targetscan_prepare.done"
-    print(
-        "💊 Preparing OligoFormer TargetScan batch "
-        f"{spec.stem}:{spec.shard_index} for {len(spec.records)} siRNAs with "
-        f"{context_shard_size} target rows per context shard; "
-        f"log: {logs_dir / 'targetscan_prep.log'}"
-    )
-    if not prep_marker_path.exists():
+        print(
+            "💊 Building OligoFormer TargetScan context inputs for batch "
+            f"{spec.stem}:{spec.shard_index}"
+        )
         run_command(
             [
                 "bash",
                 "-lc",
                 targetscan_cmd,
-                "run_targetscan_cached",
-                str(sirna_file),
-                spec.utr_path,
-                spec.orf_path,
-                f"{spec.stem}_targetscan_{spec.shard_index:05d}",
+                "prepare_targetscan_context",
                 str(context_dir),
                 str(context_shard_size),
             ],
-            cwd=batch_root,
+            cwd=targetscan_workdir,
             output_mode="log",
             log_file=logs_dir / "targetscan_prep.log",
             show_command=False,
@@ -2615,6 +2697,10 @@ fi
         context_dir=context_dir,
         logs_dir=logs_dir,
         rnaplfold_cache_dir=rnaplfold_cache_dir,
+    )
+    print(
+        "💊 Prepared OligoFormer TargetScan batch "
+        f"{spec.stem}:{spec.shard_index} with {len(context_shards)} context shards"
     )
     return PreparedTargetscanBatch(
         targetscan_path=str(targetscan_path),
@@ -2689,6 +2775,7 @@ def prepare_oligoformer_targetscan_batch_shard(
             batch_root=batch_root,
         )
     CONF.output_volume.commit()
+    print(f"💊 Committed OligoFormer TargetScan batch {spec.stem}:{spec.shard_index}")
     return plan
 
 
@@ -2706,13 +2793,19 @@ def _run_targetscan_prepare_batches(
     )
     print(
         "💊 Preparing OligoFormer TargetScan for "
-        f"{len(specs)} reference shards on up to {node_count} CPU nodes"
+        f"{len(specs)} reference shards of up to {specs[0].ref_shard_size} UTRs "
+        f"on up to {node_count} CPU nodes"
     )
-    return bounded_map(
+    plans = bounded_map(
         specs,
         lambda spec: prepare_oligoformer_targetscan_batch_shard.remote(spec),
         max_parallel=node_count,
     )
+    print(
+        "💊 Prepared all OligoFormer TargetScan reference shards: "
+        f"{len(plans)}/{len(specs)}"
+    )
+    return plans
 
 
 def _merge_targetscan_batch_outputs(
@@ -4049,7 +4142,8 @@ def submit_oligoformer_task(
         targetscan_ref_shard_size: Advanced TargetScan UTR records per
             reference-preparation shard. Defaults to the
             OLIGOFORMER_TARGETSCAN_PREPARE_REF_SHARD_SIZE environment variable
-            when set, otherwise 1000.
+            when set; otherwise the UTR reference is distributed across
+            OLIGOFORMER_TARGETSCAN_PREPARE_NODES shards.
         force: Rebuild cached intermediates and outputs.
     """
     input_path = Path(mrna_fasta).expanduser().resolve()
@@ -4069,14 +4163,6 @@ def submit_oligoformer_task(
         )
     if targetscan_ref_shard_size is not None and targetscan_ref_shard_size < 1:
         raise ValueError("targetscan_ref_shard_size must be a positive integer")
-    resolved_targetscan_ref_shard_size = (
-        targetscan_ref_shard_size
-        if targetscan_ref_shard_size is not None
-        else _positive_int_from_env(
-            APP_INFO.targetscan_prepare_ref_shard_size_env,
-            APP_INFO.default_targetscan_prepare_ref_shard_size,
-        )
-    )
 
     sirna_fasta_bytes = None
     if sirna_fasta is not None:
@@ -4196,7 +4282,7 @@ def submit_oligoformer_task(
             pita_threshold=pita_threshold,
             targetscan_threshold=targetscan_threshold,
             toxicity_threshold=toxicity_threshold,
-            targetscan_ref_shard_size=resolved_targetscan_ref_shard_size,
+            targetscan_ref_shard_size=targetscan_ref_shard_size,
         )
     write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 OligoFormer run complete! Results saved to {out_file}")

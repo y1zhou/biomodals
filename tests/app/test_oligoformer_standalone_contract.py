@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import shlex
+import shutil
 import subprocess as sp
 import tarfile
 import zipfile
@@ -846,6 +847,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     ):
         targetscan_plan_calls.extend(specs)
         spec = specs[0]
+        captured["targetscan_sirnas"] = Path(spec.sirna_path).read_text(
+            encoding="utf-8"
+        )
         cache_dir = oligoformer_app._targetscan_batch_cache_dir(spec)
         context_dir = cache_dir / "targetscan_context"
         context_spec = oligoformer_app.TargetscanContextShardSpec(
@@ -1212,11 +1216,11 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     assert len(pita_branch.spawn_calls) == 1
     assert len(gather_calls) == 1
     assert len(targetscan_plan_calls) == 1
-    assert [record.name for record in targetscan_plan_calls[0].records] == [
-        "RNA0",
-        "RNA1",
-    ]
-    assert targetscan_plan_calls[0].ref_shard_size == 1000
+    assert targetscan_plan_calls[0].sirna_count == 2
+    assert captured["targetscan_sirnas"] == (
+        ">RNA0\nAUGCUAGCUAGCUAGCUAG\n>RNA1\nUGCUAGCUAGCUAGCUAGC\n"
+    )
+    assert targetscan_plan_calls[0].ref_shard_size == 1
     assert targetscan_plan_calls[0].shard_index == 0
     assert len(targetscan_worker_calls) == 1
     targetscan_queue_name, targetscan_local_workers = targetscan_worker_calls[0]
@@ -2221,13 +2225,7 @@ def test_oligoformer_off_target_defaults_use_distributed_cpu_nodes(monkeypatch):
         )
         == 500
     )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.targetscan_prepare_ref_shard_size_env,
-            oligoformer_app.APP_INFO.default_targetscan_prepare_ref_shard_size,
-        )
-        == 1000
-    )
+    assert oligoformer_app._targetscan_ref_shard_size(100) == 4
     assert (
         oligoformer_app._positive_int_from_env(
             oligoformer_app.APP_INFO.targetscan_context_workers_env,
@@ -2289,7 +2287,11 @@ def test_targetscan_batch_specs_split_transcript_aligned_refs(
         ">tx1\nAUG\n>tx2\nCCC\n",
         ">tx3\nGGG\n",
     ]
-    assert all(spec.records == tuple(records) for spec in specs)
+    assert all(spec.sirna_count == 1 for spec in specs)
+    assert len({spec.sirna_path for spec in specs}) == 1
+    assert Path(specs[0].sirna_path).read_text(encoding="utf-8") == (
+        ">RNA0\nAUGCUAGCUAGCUAGCUAG\n"
+    )
     assert [
         Path(spec.run_root)
         / "prepare"
@@ -2319,6 +2321,108 @@ def test_targetscan_batch_specs_split_transcript_aligned_refs(
         "size_3",
         "00000",
     )
+
+
+def test_targetscan_ref_shard_size_uses_prepare_node_fanout(monkeypatch):
+    monkeypatch.delenv(
+        oligoformer_app.APP_INFO.targetscan_prepare_ref_shard_size_env,
+        raising=False,
+    )
+    monkeypatch.setenv(
+        oligoformer_app.APP_INFO.targetscan_prepare_nodes_env,
+        "300",
+    )
+
+    assert oligoformer_app._targetscan_ref_shard_size(28_352) == 95
+    assert oligoformer_app._targetscan_ref_shard_size(28_352, 100) == 100
+
+
+def test_targetscan_batch_reuses_seed_checkpoint_after_interruption(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    run_root = tmp_path / "run"
+    output_dir = run_root / "outputs"
+    sirna_path = tmp_path / "siRNA.fa"
+    utr_path = tmp_path / "UTR.fa"
+    orf_path = tmp_path / "ORF.fa"
+    sirna_path.write_text(
+        ">RNA0\nAUGCUAGCUAGCUAGCUAG\n",
+        encoding="utf-8",
+    )
+    utr_path.write_text(">tx1\nAAAA\n", encoding="utf-8")
+    orf_path.write_text(">tx1\nAUGC\n", encoding="utf-8")
+    spec = oligoformer_app.TargetscanBatchSpec(
+        run_root=str(run_root),
+        output_dir=str(output_dir),
+        stem="target",
+        ref_shard_size=1,
+        shard_index=0,
+        sirna_path=str(sirna_path),
+        sirna_count=1,
+        utr_path=str(utr_path),
+        orf_path=str(orf_path),
+        rnaplfold_cache_dir="",
+    )
+    calls = []
+
+    def fake_run_command(cmd, **kwargs):
+        calls.append(list(cmd))
+        cwd = Path(kwargs["cwd"])
+        if cmd[0] == "perl":
+            cwd.joinpath(cmd[-1]).write_text("seed output\n", encoding="utf-8")
+        else:
+            context_dir = Path(cmd[-2])
+            context_dir.joinpath("common").mkdir(parents=True)
+            context_dir.joinpath("outputs").mkdir()
+            context_dir.joinpath("shards").mkdir()
+            context_dir.joinpath("shards", "targets_00000").write_text(
+                "targets\n",
+                encoding="utf-8",
+            )
+        return []
+
+    monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
+    first_batch_root = tmp_path / "first-batch"
+    first_batch_root.joinpath("off-target", "targetscan").mkdir(parents=True)
+
+    first = oligoformer_app._prepare_targetscan_batch_context_plan(
+        spec,
+        first_batch_root,
+    )
+
+    workdir = first_batch_root / "off-target" / "tmp"
+    assert (
+        workdir.joinpath("sirnas_for_context_scores.txt").read_text(encoding="utf-8")
+        == "RNA0\t9606\tRNA0\tAUGCUAGCUAGCUAGCUAG\n"
+    )
+    assert workdir.joinpath("sirnas.txt").read_text(encoding="utf-8") == (
+        "RNA0\tUGCUAGC\t9606\n"
+    )
+    assert len(first.context_shards) == 1
+    assert [cmd[0] for cmd in calls] == ["perl", "bash"]
+    assert volume.commit_count == 1
+
+    cache_dir = oligoformer_app._targetscan_batch_cache_dir(spec)
+    checkpoint_path = cache_dir / "targetscan_seed" / "targetscan_70_output.txt"
+    assert checkpoint_path.read_text(encoding="utf-8") == "seed output\n"
+    shutil.rmtree(cache_dir / "targetscan_context")
+    calls.clear()
+    second_batch_root = tmp_path / "second-batch"
+    second_batch_root.joinpath("off-target", "targetscan").mkdir(parents=True)
+
+    second = oligoformer_app._prepare_targetscan_batch_context_plan(
+        spec,
+        second_batch_root,
+    )
+
+    assert len(second.context_shards) == 1
+    assert [cmd[0] for cmd in calls] == ["bash"]
+    assert volume.commit_count == 1
+    assert "Reusing OligoFormer TargetScan seed checkpoint" in capsys.readouterr().out
 
 
 def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(

@@ -775,6 +775,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     pita_prepare_batch_calls: list[
         tuple[list[oligoformer_app.PitaPrepareUtrShardSpec], int]
     ] = []
+    pita_consolidate_batch_calls: list[
+        tuple[list[oligoformer_app.PitaPreparePlan], int]
+    ] = []
     row_batch_calls: list[tuple[list[oligoformer_app.PitaRowShardSpec], int]] = []
     finalize_calls: list[oligoformer_app.PreparedOffTargetShard] = []
     finalize_batch_calls: list[
@@ -1040,7 +1043,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         )
 
     class FakePitaPrepareUtrShardBatch:
-        def remote(
+        def _run(
             self,
             specs: list[oligoformer_app.PitaPrepareUtrShardSpec],
             local_workers: int,
@@ -1060,10 +1063,28 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                     encoding="utf-8",
                 )
                 outputs.append(spec.output_path)
-            return outputs
+            return len(outputs)
+
+        def starmap(self, inputs):
+            return [self._run(*args) for args in inputs]
+
+    class FakePitaConsolidateBatch:
+        def _run(
+            self,
+            plans: list[oligoformer_app.PitaPreparePlan],
+            local_workers: int,
+        ):
+            pita_consolidate_batch_calls.append((list(plans), local_workers))
+            return [
+                oligoformer_app._finalize_pita_target_discovery_plan(plan)
+                for plan in plans
+            ]
+
+        def starmap(self, inputs):
+            return [self._run(*args) for args in inputs]
 
     class FakeRowBatch:
-        def remote(
+        def _run(
             self,
             row_shards: list[oligoformer_app.PitaRowShardSpec],
             local_workers: int,
@@ -1081,10 +1102,13 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text("row log\n", encoding="utf-8")
                 outputs.append(row.output_path)
-            return outputs
+            return len(outputs)
+
+        def starmap(self, inputs):
+            return [self._run(*args) for args in inputs]
 
     class FakeFinalizePitaShardBatch:
-        def remote(
+        def _run(
             self,
             prepared_shards: list[oligoformer_app.PreparedOffTargetShard],
             local_workers: int,
@@ -1105,6 +1129,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                     )
                 )
             return results
+
+        def starmap(self, inputs):
+            return [self._run(*args) for args in inputs]
 
     def fake_package_outputs(root, *, paths_to_bundle=None):
         captured["package_root"] = Path(root)
@@ -1189,6 +1216,11 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     )
     monkeypatch.setattr(
         oligoformer_app,
+        "run_oligoformer_pita_consolidate_batch",
+        FakePitaConsolidateBatch(),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
         "run_oligoformer_pita_row_shard_batch",
         FakeRowBatch(),
     )
@@ -1236,6 +1268,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     assert sorted(call.record_name for call in pita_plan_calls) == ["RNA0", "RNA1"]
     assert [len(batch) for batch, _ in pita_prepare_batch_calls] == [2]
     assert [workers for _, workers in pita_prepare_batch_calls] == [32]
+    assert [len(batch) for batch, _ in pita_consolidate_batch_calls] == [2]
+    assert [workers for _, workers in pita_consolidate_batch_calls] == [8]
     assert all(call.output_dir == str(final_output_dir) for call in pita_plan_calls)
     assert len(row_batch_calls) == 1
     assert all(local_workers == 32 for _, local_workers in row_batch_calls)
@@ -2694,7 +2728,6 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
     repo_dir.joinpath("off-target", "pita", "lib").mkdir(parents=True)
     utr_stab_path = tmp_path / "utr.stab"
     mir_stab_path = tmp_path / "mir.stab"
-    potential_targets_path = tmp_path / "cache" / "potential_targets.tsv"
     utr_stab_path.write_text(
         "utr1\tAAAA\nutr2\tCCCC\nutr3\tGGGG\n",
         encoding="utf-8",
@@ -2702,7 +2735,7 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
     mir_stab_path.write_text("RNA0\tUUUU\n", encoding="utf-8")
 
     class FakePitaPrepareUtrShardBatch:
-        def remote(self, specs, local_workers):
+        def _run(self, specs, local_workers):
             remote_batches.append((specs, local_workers))
             outputs = []
             for spec in specs:
@@ -2718,7 +2751,10 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
                     "done", encoding="utf-8"
                 )
                 outputs.append(str(output_path))
-            return outputs
+            return len(outputs)
+
+        def starmap(self, inputs):
+            return [self._run(*args) for args in inputs]
 
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
     monkeypatch.setattr(
@@ -2750,17 +2786,9 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
         ),
     )
     volume.commit()
-    outputs = oligoformer_app._run_pita_prepare_utr_shard_batches(list(specs))
-    volume.reload()
-    row_count = oligoformer_app._write_pita_potential_targets_from_outputs(
-        outputs=outputs,
-        potential_targets_path=potential_targets_path,
-    )
+    oligoformer_app._run_pita_prepare_utr_shard_batches(list(specs))
 
-    assert row_count == 3
-    assert potential_targets_path.read_text(encoding="utf-8") == (
-        "RNA0\tutr1\nRNA0\tutr2\nRNA0\tutr3\n"
-    )
+    assert all(Path(spec.output_path).exists() for spec in specs)
     remote_specs = [spec for batch, _workers in remote_batches for spec in batch]
     assert [spec.shard_index for spec in remote_specs] == [0, 1]
     assert [workers for _batch, workers in remote_batches] == [2]
@@ -2769,6 +2797,76 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
     }
     assert volume.commit_count == 1
     assert volume.reload_count == 1
+
+
+def test_finalize_pita_discovery_warms_and_writes_row_inputs_in_one_pass(
+    tmp_path: Path,
+    monkeypatch,
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    warmup_calls = []
+    monkeypatch.setattr(
+        oligoformer_app,
+        "warmup_directory",
+        lambda path, file_pattern=".": warmup_calls.append((Path(path), file_pattern)),
+    )
+    spec = oligoformer_app.OffTargetShardSpec(
+        run_root=str(tmp_path / "run"),
+        output_dir=str(tmp_path / "outputs"),
+        stem="target",
+        index=0,
+        record_name="RNA0",
+        record_sequence="AUGCUAGCUAGCUAGCUAG",
+        utr_path=str(tmp_path / "utr.fa"),
+        orf_path=str(tmp_path / "orf.fa"),
+        row_shard_size=2,
+    )
+    cache_dir = oligoformer_app._off_target_shard_cache_dir(spec)
+    shard_dir = cache_dir / "pita_prepare_utr_shards"
+    shard_dir.mkdir(parents=True)
+    cache_dir.joinpath("target_shard_00000_ext_utr.stab").write_text(
+        "utr\n",
+        encoding="utf-8",
+    )
+    utr_shards = []
+    for shard_index, rows in enumerate(("RNA0\tutr1\nRNA0\tutr2", "RNA0\tutr3\n")):
+        output_path = shard_dir / f"{shard_index:05d}.potential.tsv"
+        output_path.write_text(rows, encoding="utf-8")
+        output_path.with_suffix(output_path.suffix + ".done").write_text(
+            "done",
+            encoding="utf-8",
+        )
+        utr_shards.append(
+            oligoformer_app.PitaPrepareUtrShardSpec(
+                shard_index=shard_index,
+                input_path=str(shard_dir / f"{shard_index:05d}.utr.stab"),
+                mir_stab_path=str(cache_dir / "mir.stab"),
+                output_path=str(output_path),
+                log_path=str(tmp_path / "logs" / f"{shard_index:05d}.log"),
+            )
+        )
+    plan = oligoformer_app.PitaPreparePlan(
+        spec=spec,
+        utr_shards=tuple(utr_shards),
+        row_count=None,
+    )
+
+    prepared = oligoformer_app._finalize_pita_target_discovery_plan(plan)
+
+    assert warmup_calls == [(shard_dir, r"\.potential\.tsv$")]
+    assert (
+        cache_dir.joinpath("potential_targets.tsv").read_text(encoding="utf-8")
+        == "RNA0\tutr1\nRNA0\tutr2\nRNA0\tutr3\n"
+    )
+    assert cache_dir.joinpath("pita_prepare.done").read_text(encoding="utf-8") == "3"
+    assert [(row.start_row, row.end_row) for row in prepared.row_shards] == [
+        (0, 2),
+        (2, 3),
+    ]
+    assert [
+        Path(row.input_path).read_text(encoding="utf-8") for row in prepared.row_shards
+    ] == ["RNA0\tutr1\nRNA0\tutr2\n", "RNA0\tutr3\n"]
 
 
 def test_worker_aware_batches_fill_containers_before_spawning_more():

@@ -103,12 +103,16 @@ from __future__ import annotations
 import hashlib
 import os
 import queue as queue_lib
+import re
 import shlex
+from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TypeVar, cast
+from uuid import uuid4
 
 import modal
 import polars as pl
@@ -1637,6 +1641,21 @@ def _bounded_node_count(task_count: int, *, env_name: str, default: int) -> int:
     return max(1, min(nodes, task_count))
 
 
+def _unique_tmp_path(path: Path) -> Path:
+    """Return a collision-resistant temporary sibling path."""
+    return path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid4().hex}")
+
+
+def _warmup_file_parents(
+    paths: Iterable[str | Path],
+    *,
+    file_pattern: str,
+) -> None:
+    """Warm unique parent directories before reading matching file contents."""
+    for parent in sorted({Path(path).parent for path in paths}):
+        warmup_directory(parent, file_pattern=file_pattern)
+
+
 def _off_target_shard_cache_dir(spec: OffTargetShardSpec) -> Path:
     """Return the shared-cache directory for one siRNA off-target shard."""
     return (
@@ -1922,31 +1941,65 @@ def _cached_pita_prepare_utr_shard_specs(
 
 def _run_pita_prepare_utr_shard(spec: PitaPrepareUtrShardSpec) -> str:
     """Run one local UTR STAB shard through PITA potential-target discovery."""
+    import subprocess as sp
+    from time import sleep
+
     output_path = Path(spec.output_path)
     marker_path = output_path.with_suffix(output_path.suffix + ".done")
     if marker_path.exists() and output_path.exists():
         return str(output_path)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_output_path = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
-    tmp_output_path.unlink(missing_ok=True)
     pita_lib = CONF.git_clone_dir / "off-target/pita/lib"
-    cmd = (
-        "set -euo pipefail; "
-        f"perl {shlex.quote(str(pita_lib / 'find_potential_mirna_targets.pl'))} "
-        f"{shlex.quote(spec.input_path)} -f {shlex.quote(spec.mir_stab_path)} "
-        f"> {shlex.quote(str(tmp_output_path))}"
+    attempts = _positive_int_from_env(
+        APP_INFO.off_target_row_attempts_env,
+        APP_INFO.default_pita_row_attempts,
     )
-    run_command(
-        ["bash", "-lc", cmd],
-        cwd=pita_lib.parent,
-        output_mode="log",
-        log_file=spec.log_path,
-        show_command=False,
-    )
-    tmp_output_path.replace(output_path)
+    for attempt in range(1, attempts + 1):
+        tmp_output_path = _unique_tmp_path(output_path)
+        cmd = (
+            "set -euo pipefail; "
+            f"perl {shlex.quote(str(pita_lib / 'find_potential_mirna_targets.pl'))} "
+            f"{shlex.quote(spec.input_path)} -f {shlex.quote(spec.mir_stab_path)} "
+            f"> {shlex.quote(str(tmp_output_path))}"
+        )
+        try:
+            run_command(
+                ["bash", "-lc", cmd],
+                cwd=pita_lib.parent,
+                output_mode="log",
+                log_file=spec.log_path,
+                show_command=False,
+                warn_on_error=False,
+            )
+        except sp.CalledProcessError as exc:
+            tmp_output_path.unlink(missing_ok=True)
+            if exc.returncode in {-2, -15} and attempt < attempts:
+                print(
+                    "💊 Retrying OligoFormer PITA target-discovery shard "
+                    f"{spec.shard_index} after signal {-exc.returncode}; "
+                    f"log: {spec.log_path}"
+                )
+                sleep(min(30, 2 ** (attempt - 1)))
+                continue
+            raise RuntimeError(
+                "OligoFormer PITA target-discovery shard "
+                f"{spec.shard_index} failed with return code {exc.returncode}. "
+                f"Check log file {spec.log_path}."
+            ) from exc
+        tmp_output_path.replace(output_path)
+        break
     marker_path.write_text("done", encoding="utf-8")
     return str(output_path)
+
+
+def _pita_prepare_utr_shard_ready(spec: PitaPrepareUtrShardSpec) -> bool:
+    """Return whether one PITA target-discovery shard is complete."""
+    output_path = Path(spec.output_path)
+    return (
+        output_path.exists()
+        and output_path.with_suffix(output_path.suffix + ".done").exists()
+    )
 
 
 @app.function(
@@ -1958,9 +2011,13 @@ def _run_pita_prepare_utr_shard(spec: PitaPrepareUtrShardSpec) -> str:
 def run_oligoformer_pita_prepare_utr_shard_batch(
     specs: list[PitaPrepareUtrShardSpec],
     local_workers: int,
-) -> list[str]:
+) -> int:
     """Run cached PITA UTR target-discovery shards on one CPU node."""
     CONF.output_volume.reload()
+    _warmup_file_parents(
+        (spec.mir_stab_path for spec in specs),
+        file_pattern=r"\.(utr|mir)\.stab$",
+    )
     print(
         "💊 Running OligoFormer PITA target-discovery batch with "
         f"{len(specs)} shards using {local_workers} workers; logs under "
@@ -1972,40 +2029,15 @@ def run_oligoformer_pita_prepare_utr_shard_batch(
         max_parallel=local_workers,
     )
     CONF.output_volume.commit()
-    return outputs
-
-
-def _write_pita_potential_targets_from_outputs(
-    *,
-    outputs: list[str],
-    potential_targets_path: Path,
-) -> int:
-    """Concatenate PITA target-discovery shard outputs in UTR order."""
-    potential_targets_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_potential_targets_path = potential_targets_path.with_name(
-        f".{potential_targets_path.name}.tmp.{os.getpid()}"
-    )
-    tmp_potential_targets_path.unlink(missing_ok=True)
-    row_count = 0
-    with tmp_potential_targets_path.open("w", encoding="utf-8") as out:
-        for output in outputs:
-            data = Path(output).read_text(encoding="utf-8")
-            if not data:
-                continue
-            out.write(data)
-            if not data.endswith("\n"):
-                out.write("\n")
-            row_count += len(data.splitlines())
-    tmp_potential_targets_path.replace(potential_targets_path)
-    return row_count
+    return len(outputs)
 
 
 def _run_pita_prepare_utr_shard_batches(
     specs: list[PitaPrepareUtrShardSpec],
-) -> list[str]:
+) -> None:
     """Run PITA target-discovery shard batches with bounded global fanout."""
     if not specs:
-        return []
+        return
 
     local_workers = _positive_int_from_env(
         APP_INFO.off_target_pita_prepare_workers_env,
@@ -2025,15 +2057,61 @@ def _run_pita_prepare_utr_shard_batches(
         f"{len(specs)} UTR shards on {len(batches)} CPU nodes with "
         f"{local_workers} workers each"
     )
-    output_batches = bounded_map(
-        batches,
-        lambda batch: run_oligoformer_pita_prepare_utr_shard_batch.remote(
-            list(batch),
-            local_workers=local_workers,
+    completed_shards = 0
+    progress_interval = max(1, len(batches) // 10)
+    for completed_batches, output_count in enumerate(
+        run_oligoformer_pita_prepare_utr_shard_batch.starmap(
+            (list(batch), local_workers) for batch in batches
         ),
-        max_parallel=len(batches),
-    )
-    return [output for batch in output_batches for output in batch]
+        start=1,
+    ):
+        completed_shards += output_count
+        if completed_batches % progress_interval == 0 or completed_batches == len(
+            batches
+        ):
+            print(
+                "💊 Completed OligoFormer PITA target discovery for "
+                f"{completed_shards}/{len(specs)} UTR shards "
+                f"({completed_batches}/{len(batches)} batches)"
+            )
+    if completed_shards != len(specs):
+        raise RuntimeError(
+            "OligoFormer PITA target discovery reported "
+            f"{completed_shards} completed shards; expected {len(specs)}"
+        )
+
+    CONF.output_volume.reload()
+    missing_specs = [spec for spec in specs if not _pita_prepare_utr_shard_ready(spec)]
+    if missing_specs:
+        retry_batches = _batch_items_for_local_workers(
+            missing_specs,
+            max_nodes=min(len(batches), len(missing_specs)),
+            local_workers=local_workers,
+        )
+        print(
+            "💊 Retrying OligoFormer PITA target discovery for "
+            f"{len(missing_specs)} missing UTR shards"
+        )
+        retried_shards = sum(
+            run_oligoformer_pita_prepare_utr_shard_batch.starmap(
+                (list(batch), local_workers) for batch in retry_batches
+            )
+        )
+        if retried_shards != len(missing_specs):
+            raise RuntimeError(
+                "OligoFormer PITA target-discovery retry reported "
+                f"{retried_shards} completed shards; expected {len(missing_specs)}"
+            )
+        CONF.output_volume.reload()
+        missing_specs = [
+            spec for spec in missing_specs if not _pita_prepare_utr_shard_ready(spec)
+        ]
+    if missing_specs:
+        raise FileNotFoundError(
+            "OligoFormer PITA target discovery did not produce "
+            f"{len(missing_specs)} expected outputs; first missing output: "
+            f"{missing_specs[0].output_path}"
+        )
 
 
 def _pita_row_shard_specs(
@@ -2061,6 +2139,18 @@ def _pita_row_shard_specs(
     )
 
 
+def _write_pita_row_input(path: Path, lines: list[str]) -> None:
+    """Atomically write one PITA potential-target row input."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _unique_tmp_path(path)
+    try:
+        with tmp_path.open("w", encoding="utf-8") as out:
+            out.writelines(lines)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _ensure_pita_row_inputs(
     potential_targets_path: Path,
     row_shards: tuple[PitaRowShardSpec, ...],
@@ -2070,12 +2160,23 @@ def _ensure_pita_row_inputs(
     if not missing:
         return
 
-    potential_rows = potential_targets_path.read_text(encoding="utf-8").splitlines()
-    for row in missing:
-        input_path = Path(row.input_path)
-        input_path.parent.mkdir(parents=True, exist_ok=True)
-        shard_rows = potential_rows[row.start_row : row.end_row]
-        input_path.write_text("\n".join(shard_rows) + "\n", encoding="utf-8")
+    _warmup_file_parents(
+        [potential_targets_path],
+        file_pattern=f"^{re.escape(potential_targets_path.name)}$",
+    )
+    missing_indices = {row.shard_index for row in missing}
+    with potential_targets_path.open("r", encoding="utf-8") as potential_rows:
+        for row in row_shards:
+            shard_rows = [
+                line if line.endswith("\n") else f"{line}\n"
+                for line in islice(
+                    potential_rows,
+                    row.end_row - row.start_row,
+                )
+            ]
+            if row.shard_index not in missing_indices:
+                continue
+            _write_pita_row_input(Path(row.input_path), shard_rows)
 
 
 def _pita_prepared_shard_from_plan(
@@ -2233,23 +2334,161 @@ def _prepare_pita_target_discovery_plan(
 
 def _finalize_pita_target_discovery_plan(
     plan: PitaPreparePlan,
-    outputs_by_path: dict[str, str],
 ) -> PreparedOffTargetShard:
     """Merge PITA target-discovery shards and return row-score specs."""
     if plan.row_count is not None:
         return _pita_prepared_shard_from_plan(plan, row_count=plan.row_count)
 
     outputs = [
-        outputs_by_path[shard.output_path]
+        shard.output_path
         for shard in sorted(plan.utr_shards, key=lambda item: item.shard_index)
     ]
+    missing_outputs = [
+        shard.output_path
+        for shard in plan.utr_shards
+        if not _pita_prepare_utr_shard_ready(shard)
+    ]
+    if missing_outputs:
+        raise FileNotFoundError(
+            "OligoFormer PITA consolidation is missing "
+            f"{len(missing_outputs)} target-discovery outputs; first missing output: "
+            f"{missing_outputs[0]}"
+        )
+
     cache_dir = _off_target_shard_cache_dir(plan.spec)
-    row_count = _write_pita_potential_targets_from_outputs(
-        outputs=outputs,
-        potential_targets_path=cache_dir / "potential_targets.tsv",
+    potential_targets_path = cache_dir / "potential_targets.tsv"
+    ext_utr_path = (
+        cache_dir / f"{plan.spec.stem}_shard_{plan.spec.index:05d}_ext_utr.stab"
     )
-    cache_dir.joinpath("pita_prepare.done").write_text(str(row_count), encoding="utf-8")
+    row_dir = cache_dir / "pita_rows"
+    potential_targets_path.parent.mkdir(parents=True, exist_ok=True)
+    row_dir.mkdir(parents=True, exist_ok=True)
+    _warmup_file_parents(
+        outputs,
+        file_pattern=r"\.potential\.tsv$",
+    )
+
+    tmp_potential_targets_path = _unique_tmp_path(potential_targets_path)
+    row_count = 0
+    row_lines: list[str] = []
+    row_shard_index = 0
+
+    def _flush_row_lines() -> None:
+        nonlocal row_shard_index
+        if not row_lines:
+            return
+        row_spec = _pita_row_shard_spec(
+            spec=plan.spec,
+            shard_index=row_shard_index,
+            start_row=row_count - len(row_lines),
+            end_row=row_count,
+            potential_targets_path=potential_targets_path,
+            ext_utr_path=ext_utr_path,
+            row_dir=row_dir,
+        )
+        _write_pita_row_input(Path(row_spec.input_path), row_lines)
+        row_lines.clear()
+        row_shard_index += 1
+
+    try:
+        with tmp_potential_targets_path.open("w", encoding="utf-8") as out:
+            for output in outputs:
+                with Path(output).open("r", encoding="utf-8") as shard_rows:
+                    for line in shard_rows:
+                        normalized_line = line if line.endswith("\n") else f"{line}\n"
+                        out.write(normalized_line)
+                        row_lines.append(normalized_line)
+                        row_count += 1
+                        if len(row_lines) < plan.spec.row_shard_size:
+                            continue
+                        _flush_row_lines()
+
+            _flush_row_lines()
+        tmp_potential_targets_path.replace(potential_targets_path)
+    finally:
+        tmp_potential_targets_path.unlink(missing_ok=True)
+
+    marker_path = cache_dir / "pita_prepare.done"
+    tmp_marker_path = _unique_tmp_path(marker_path)
+    try:
+        tmp_marker_path.write_text(str(row_count), encoding="utf-8")
+        tmp_marker_path.replace(marker_path)
+    finally:
+        tmp_marker_path.unlink(missing_ok=True)
     return _pita_prepared_shard_from_plan(plan, row_count=row_count)
+
+
+@app.function(
+    cpu=(0.125, 8.125),
+    memory=(1024, 32768),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True),
+)
+def run_oligoformer_pita_consolidate_batch(
+    plans: list[PitaPreparePlan],
+    local_workers: int,
+) -> list[PreparedOffTargetShard]:
+    """Consolidate PITA discovery outputs and create row inputs."""
+    CONF.output_volume.reload()
+    print(
+        "💊 Consolidating OligoFormer PITA discovery outputs for "
+        f"{len(plans)} siRNAs using {local_workers} workers"
+    )
+    prepared_shards = bounded_map(
+        plans,
+        _finalize_pita_target_discovery_plan,
+        max_parallel=local_workers,
+    )
+    CONF.output_volume.commit()
+    return prepared_shards
+
+
+def _run_pita_consolidate_batches(
+    plans: list[PitaPreparePlan],
+) -> list[PreparedOffTargetShard]:
+    """Consolidate per-siRNA PITA plans with Modal-native fanout."""
+    if not plans:
+        return []
+
+    local_workers = min(
+        8,
+        _positive_int_from_env(
+            APP_INFO.off_target_pita_prepare_workers_env,
+            APP_INFO.default_pita_prepare_workers,
+        ),
+    )
+    batches = _batch_items_for_local_workers(
+        plans,
+        max_nodes=_bounded_node_count(
+            len(plans),
+            env_name=APP_INFO.off_target_pita_prepare_nodes_env,
+            default=APP_INFO.default_pita_prepare_nodes,
+        ),
+        local_workers=local_workers,
+    )
+    print(
+        "💊 Consolidating OligoFormer PITA discovery outputs for "
+        f"{len(plans)} siRNAs on {len(batches)} CPU nodes with "
+        f"{local_workers} workers each"
+    )
+    prepared_shards = []
+    progress_interval = max(1, len(batches) // 10)
+    for completed_batches, batch_results in enumerate(
+        run_oligoformer_pita_consolidate_batch.starmap(
+            (list(batch), local_workers) for batch in batches
+        ),
+        start=1,
+    ):
+        prepared_shards.extend(batch_results)
+        if completed_batches % progress_interval == 0 or completed_batches == len(
+            batches
+        ):
+            print(
+                "💊 Consolidated OligoFormer PITA discovery outputs for "
+                f"{len(prepared_shards)}/{len(plans)} siRNAs "
+                f"({completed_batches}/{len(batches)} batches)"
+            )
+    return prepared_shards
 
 
 def _pita_row_shard_spec(
@@ -3076,10 +3315,7 @@ def _run_pita_row_shard(spec: PitaRowShardSpec) -> str:
         )
         transient_return_codes = {-2, -15}
         for attempt in range(1, attempts + 1):
-            tmp_output_path = output_path.with_name(
-                f".{output_path.name}.tmp.{os.getpid()}.{attempt}"
-            )
-            tmp_output_path.unlink(missing_ok=True)
+            tmp_output_path = _unique_tmp_path(output_path)
             cmd = (
                 "set -euo pipefail; "
                 f"cat {shlex.quote(str(input_path))} "
@@ -3141,16 +3377,24 @@ def _run_pita_row_shard(spec: PitaRowShardSpec) -> str:
 def run_oligoformer_pita_row_shard_batch(
     row_shards: list[PitaRowShardSpec],
     local_workers: int,
-) -> list[str]:
+) -> int:
     """Run cached PITA row-shard scoring on one CPU node."""
     CONF.output_volume.reload()
+    _warmup_file_parents(
+        (row.input_path for row in row_shards),
+        file_pattern=r"\.potential\.tsv$",
+    )
+    _warmup_file_parents(
+        (row.ext_utr_path for row in row_shards),
+        file_pattern=r"_ext_utr\.stab$",
+    )
     outputs = bounded_map(
         row_shards,
         _run_pita_row_shard,
         max_parallel=local_workers,
     )
     CONF.output_volume.commit()
-    return outputs
+    return len(outputs)
 
 
 def _write_pita_targets_from_scored_rows(
@@ -3167,10 +3411,9 @@ def _write_pita_targets_from_scored_rows(
         )
         for row_output in row_outputs:
             if row_output.exists():
-                data = row_output.read_text(encoding="utf-8")
-                out.write(data)
-                if data and not data.endswith("\n"):
-                    out.write("\n")
+                with row_output.open("r", encoding="utf-8") as rows:
+                    for line in rows:
+                        out.write(line if line.endswith("\n") else f"{line}\n")
 
     with TemporaryDirectory(
         prefix=f"oligoformer_pita_finalize_{prepared.index}_"
@@ -3258,6 +3501,14 @@ def finalize_oligoformer_pita_shard_batch(
         "💊 Running OligoFormer PITA finalize batch with "
         f"{len(prepared_shards)} siRNAs using {local_workers} workers"
     )
+    _warmup_file_parents(
+        (
+            row.output_path
+            for prepared in prepared_shards
+            for row in prepared.row_shards
+        ),
+        file_pattern=r"\.scored\.tsv$",
+    )
     results = bounded_map(
         prepared_shards,
         _finalize_oligoformer_pita_shard,
@@ -3270,6 +3521,8 @@ def finalize_oligoformer_pita_shard_batch(
 def _merge_pita_shards(shard_results: list[OffTargetShardResult], output_path: Path):
     """Merge per-siRNA PITA tables in upstream score-sorted order."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if shard_results:
+        warmup_directory(output_path.parent, file_pattern=r"^pita\.tab$")
     header = None
     rows = []
     with output_path.open("w", encoding="utf-8") as out:
@@ -3418,17 +3671,8 @@ def run_oligoformer_pita_branch(
         for plan in pita_plans
         for shard in sorted(plan.utr_shards, key=lambda item: item.shard_index)
     ]
-    pita_utr_outputs = _run_pita_prepare_utr_shard_batches(pita_utr_shards)
-    CONF.output_volume.reload()
-    pita_outputs_by_path = {
-        shard.output_path: output
-        for shard, output in zip(pita_utr_shards, pita_utr_outputs, strict=True)
-    }
-    prepared_shards = [
-        _finalize_pita_target_discovery_plan(plan, pita_outputs_by_path)
-        for plan in pita_plans
-    ]
-    CONF.output_volume.commit()
+    _run_pita_prepare_utr_shard_batches(pita_utr_shards)
+    prepared_shards = _run_pita_consolidate_batches(pita_plans)
 
     row_shards = [row for prepared in prepared_shards for row in prepared.row_shards]
     row_batches = _batch_items_for_local_workers(
@@ -3446,14 +3690,16 @@ def run_oligoformer_pita_branch(
             f"{len(row_shards)} row shards on up to {len(row_batches)} CPU nodes "
             f"with {local_workers} workers each"
         )
-        bounded_map(
-            row_batches,
-            lambda batch: run_oligoformer_pita_row_shard_batch.remote(
-                list(batch),
-                local_workers=local_workers,
-            ),
-            max_parallel=len(row_batches),
+        completed_rows = sum(
+            run_oligoformer_pita_row_shard_batch.starmap(
+                (list(batch), local_workers) for batch in row_batches
+            )
         )
+        if completed_rows != len(row_shards):
+            raise RuntimeError(
+                "OligoFormer PITA scoring reported "
+                f"{completed_rows} completed row shards; expected {len(row_shards)}"
+            )
 
     finalize_batches, finalize_workers = batches_for_total_concurrency(
         prepared_shards,
@@ -3466,13 +3712,8 @@ def run_oligoformer_pita_branch(
         f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} batches with "
         f"{finalize_workers} workers each"
     )
-    result_batches = bounded_map(
-        finalize_batches,
-        lambda batch: finalize_oligoformer_pita_shard_batch.remote(
-            list(batch),
-            local_workers=finalize_workers,
-        ),
-        max_parallel=len(finalize_batches),
+    result_batches = finalize_oligoformer_pita_shard_batch.starmap(
+        (list(batch), finalize_workers) for batch in finalize_batches
     )
     return [result for batch in result_batches for result in batch]
 

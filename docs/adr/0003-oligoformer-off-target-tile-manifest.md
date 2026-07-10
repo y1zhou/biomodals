@@ -31,6 +31,22 @@ consume those artifacts. This keeps reference-only work out of the
 candidate-batch fanout and makes reruns reuse the expensive parts that do not
 depend on the siRNA candidate set.
 
+The converted full-human UTR and ORF sources remain immutable assets in the
+shared model volume. The derived RNAplfold files are written under the
+OligoFormer output volume's `reference-cache/` tree instead of the shared model
+volume. The output volume uses Modal Volume v2, which is the required storage
+backend for the stage's default fanout of up to 32 concurrent distinct-file
+writer nodes. The reference-cache tree also stores the converted UTR and ORF
+content digests used by evidence cache keys; declared source URLs alone are not
+sufficient identity for persisted scientific results.
+
+An all-human run plan pins that content identity. Before constructing evidence,
+post-processing reacquires the stable global reference-state generation,
+reloads both volumes, revalidates the pinned identity, and holds the generation
+through evidence commit. A concurrent forced reference refresh therefore waits
+or makes the prepared run fail closed and require re-planning; it cannot relabel
+evidence built from another reference version.
+
 The manifest expands in two levels for stages whose row counts are only known
 after upstream discovery. The first level contains candidate-batch by
 reference-shard tiles known before submission; those tiles may then emit
@@ -56,6 +72,14 @@ can make candidates appear safer than they are because missing reference shards
 remove evidence, so failed tile diagnostics should be preserved without treating
 the incomplete ranking as a valid result.
 
+Different threshold variants may request the same evidence concurrently. A
+per-evidence, per-stem distributed build generation uses Modal Dict's atomic
+`skip_if_exists` insertion to elect one writer. The writer publishes
+`off_target.done` only after both merged evidence tables exist, commits those
+files, then records its generation complete. Waiters reload the output volume
+and reuse those tables. Failed and stale generations advance through
+append-only status records instead of deleting a possibly replaced lock.
+
 The tiled implementation preserves exact upstream-equivalent scores before
 adding approximate prefilters or heuristic pruning. Validation should compare
 the merged TargetScan evidence, merged PITA evidence, and final ranked table
@@ -76,6 +100,12 @@ while other containers finish early. The current default remains up to 32 local
 workers per context worker node and up to 100 active context worker nodes. The
 actual worker-node count is bounded by the queue size divided by the local
 worker count, so small queues do not spawn idle containers.
+
+Each TargetScan context worker commits the output volume once when the worker
+finishes or fails, rather than after every shard. When a worker call fails, the
+parent reloads the output volume, rebuilds a fresh queue from completion-marker
+gaps, and retries the missing deterministic shards up to the configured attempt
+limit. A dequeued shard is therefore not lost when its worker terminates.
 
 TargetScan per-reference-batch reduction is also a bounded parallel stage.
 After all context-score shards finish, each reference batch is reduced by a
@@ -107,11 +137,12 @@ by TargetScan, applies the site-type thresholds before aggregation, and writes
 the same no-header evidence table shape consumed by the final off-target merge.
 The off-target cache salt changes when these reducer semantics change.
 
-Final-table completion markers carry a post-processing semantics salt separate
-from the run cache key and off-target evidence salt. This lets the app recompute
-final tables after sentinel handling, final filter aggregation, or output-column
-semantics change while still reusing the same run root. Off-target intermediates
-are treated as resumable same-run state, not durable cross-run cache.
+Final-table completion markers carry a post-processing key and semantics salt
+separate from the compute cache key and off-target evidence salt. Toxicity mode
+and filter thresholds select distinct final output directories below the same
+compute run root. This lets the app recompute final tables after threshold,
+sentinel handling, final filter aggregation, or output-column semantics changes
+while reusing efficacy and merged off-target evidence.
 
 TargetScan branch-reduction optimization keeps the reducer semantics unchanged:
 only the placement changes from serial in the parent branch node to bounded
@@ -206,9 +237,10 @@ After final outputs are generated, workers should clean up bulky generated
 off-target shard inputs and transient intermediates under the run's
 `prepare/off_target/<stem>/` tree. The cleanup must preserve final output
 tables, completion markers, logs, efficacy outputs, model caches, and reusable
-reference caches. Raw merged evidence such as `pita.tab` and `targetscan.tab`
-is deleted with the rest of the off-target prepare tree once final tables exist,
-because the current run key includes `top_n` and other post-processing knobs.
-Those files are therefore useful for retrying an incomplete same-key run, not
-for broad cross-run reuse. This keeps the output volume from accumulating large
-per-run shard files that are not needed once final tables exist.
+reference caches. Compact merged evidence (`pita.tab`, `targetscan.tab`, and its
+completion marker) is retained after shard inputs are removed. The efficacy key
+contains only GPU inputs and semantics; the evidence key adds `top_n`, candidate
+binding, and reference content identity; and the final-table key adds filtering
+thresholds. Retaining only the merged evidence therefore supports threshold
+variants without accumulating the large per-shard inputs and outputs, while
+custom reference and `top_n` variants still reuse GPU efficacy.

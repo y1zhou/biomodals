@@ -6,6 +6,7 @@ import shlex
 import subprocess as sp
 import tarfile
 import zipfile
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,10 @@ def _fake_conf(tmp_path: Path, volume: FakeVolume, repo_dir: Path | None = None)
         git_clone_dir=repo_dir or tmp_path / "repo",
         output_volume=volume,
     )
+
+
+def _run_config(**changes):
+    return replace(oligoformer_app.OligoformerRunConfig(), **changes)
 
 
 def _write_targetscan_context_output(
@@ -85,37 +90,352 @@ def test_prepare_oligoformer_run_writes_volume_inputs(tmp_path: Path, monkeypatc
     assert volume.commit_count == 1
 
 
+def test_prepare_oligoformer_run_reuses_compute_cache_across_final_thresholds(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    shared = {
+        "mrna_fasta_bytes": b">target\nAUGCUAGCUAGCUAGCUAGCUAGC\n",
+        "off_target": True,
+        "utr_bytes": b">utr\nAUGC\n",
+        "orf_bytes": b">orf\nAUGC\n",
+    }
+
+    first = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        **shared,
+        pita_threshold=-10.0,
+        toxicity=False,
+    )
+    second = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        **shared,
+        pita_threshold=-5.0,
+        toxicity=True,
+    )
+
+    assert first.cache_key == second.cache_key
+    assert first.postprocess_key != second.postprocess_key
+    assert first.run_root == second.run_root
+    assert first.efficacy_dir == second.efficacy_dir
+    assert first.output_dir != second.output_dir
+
+
+def test_prepare_oligoformer_run_reuses_efficacy_across_evidence_inputs(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    shared = {
+        "mrna_fasta_bytes": b">target\nAUGCUAGCUAGCUAGCUAGCUAGC\n",
+        "off_target": True,
+        "orf_bytes": b">orf\nAUGC\n",
+    }
+
+    first = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        **shared,
+        utr_bytes=b">utr\nAUGC\n",
+        top_n=20,
+    )
+    second = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        **shared,
+        utr_bytes=b">utr\nAUGCAUGC\n",
+        top_n=40,
+    )
+
+    assert first.efficacy_key == second.efficacy_key
+    assert first.efficacy_dir == second.efficacy_dir
+    assert first.cache_key != second.cache_key
+    assert first.run_root != second.run_root
+
+
+def test_force_uses_isolated_cache_generation_without_deleting_shared_cache(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    kwargs = {"mrna_fasta_bytes": b">target\nAUGCUAGCUAGCUAGCUAGCUAGC\n"}
+
+    shared = oligoformer_app.prepare_oligoformer_run.get_raw_f()(**kwargs)
+    forced = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        **kwargs,
+        force=True,
+        force_generation="force-run",
+    )
+    repeated_plan = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        **kwargs,
+        force=True,
+        force_generation="force-run",
+    )
+
+    assert forced.efficacy_key != shared.efficacy_key
+    assert forced.cache_key != shared.cache_key
+    assert forced.run_root != shared.run_root
+    assert repeated_plan == forced
+    assert (
+        oligoformer_app.AppRunLayout
+        .from_run_root(shared.run_root)
+        .inputs_dir.joinpath("mrna.fa")
+        .exists()
+    )
+
+
+def test_all_human_evidence_key_uses_converted_reference_content_identity(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    identity_path = oligoformer_app.APP_INFO.targetscan_ref_identity_path
+    identity_path.parent.mkdir(parents=True)
+    shared_identity = oligoformer_app.APP_INFO.targetscan_ref_metadata | {
+        "row_counts": {"human_UTR.txt": 1, "human_ORF.txt": 1},
+    }
+    shared = {
+        "mrna_fasta_bytes": b">target\nAUGCUAGCUAGCUAGCUAGCUAGC\n",
+        "off_target": True,
+        "all_human": True,
+    }
+
+    identity_path.write_bytes(
+        orjson.dumps(
+            shared_identity
+            | {
+                "content_sha256": {
+                    "human_UTR.txt": "utr-v1",
+                    "human_ORF.txt": "orf-v1",
+                }
+            }
+        )
+    )
+    first = oligoformer_app.prepare_oligoformer_run.get_raw_f()(**shared)
+    identity_path.write_bytes(
+        orjson.dumps(
+            shared_identity
+            | {
+                "content_sha256": {
+                    "human_UTR.txt": "utr-v2",
+                    "human_ORF.txt": "orf-v1",
+                }
+            }
+        )
+    )
+    second = oligoformer_app.prepare_oligoformer_run.get_raw_f()(**shared)
+
+    assert first.efficacy_key == second.efficacy_key
+    assert first.reference_identity != second.reference_identity
+    assert first.cache_key != second.cache_key
+
+
+def test_targetscan_rnaplfold_cache_uses_output_volume_v2(tmp_path: Path, monkeypatch):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    info = oligoformer_app.AppInfo(
+        model_ref_dir=tmp_path / "models" / "off-target" / "ref"
+    )
+
+    cache_root = Path(tmp_path / "outputs-volume" / "reference-cache")
+    assert info.targetscan_rnaplfold_cache_dir.is_relative_to(cache_root)
+    assert info.targetscan_rnaplfold_shard_dir.is_relative_to(cache_root)
+    assert info.targetscan_rnaplfold_marker_path.is_relative_to(cache_root)
+
+
+def test_targetscan_rnaplfold_cache_identity_includes_converted_utr_digest(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    info = oligoformer_app.AppInfo(
+        model_ref_dir=tmp_path / "models" / "off-target" / "ref"
+    )
+    monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
+    identity = info.targetscan_ref_metadata | {
+        "content_sha256": {
+            "human_UTR.txt": "utr-v1",
+            "human_ORF.txt": "orf-v1",
+        }
+    }
+    info.targetscan_ref_identity_path.parent.mkdir(parents=True)
+    info.targetscan_ref_identity_path.write_bytes(orjson.dumps(identity))
+    info.targetscan_rnaplfold_cache_dir.mkdir(parents=True)
+    info.targetscan_rnaplfold_cache_dir.joinpath("ENST1.9606_lunp").write_text(
+        "cache\n", encoding="utf-8"
+    )
+    info.targetscan_rnaplfold_marker_path.write_bytes(
+        orjson.dumps(
+            oligoformer_app._targetscan_rnaplfold_expected_metadata()
+            | {"record_count": 1, "sample_records": ["ENST1"]}
+        )
+    )
+
+    assert oligoformer_app._targetscan_rnaplfold_cache_ready()
+
+    info.targetscan_ref_identity_path.write_bytes(
+        orjson.dumps(
+            identity
+            | {
+                "content_sha256": {
+                    "human_UTR.txt": "utr-v2",
+                    "human_ORF.txt": "orf-v1",
+                }
+            }
+        )
+    )
+    assert not oligoformer_app._targetscan_rnaplfold_cache_ready()
+
+
+def test_cache_build_lock_reclaims_stale_generation_without_deleting_owner(
+    monkeypatch,
+):
+    info = replace(
+        oligoformer_app.APP_INFO,
+        cache_lock_poll_seconds=0,
+        cache_lock_stale_seconds=-1,
+    )
+    monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
+    lock_key = oligoformer_app.hash_string("stage\nidentity")
+    old_owner = {"id": "old", "acquired_at": 0.0}
+    values = {f"{lock_key}:owner:0": old_owner}
+
+    class FakeDictInstance:
+        def put(self, key, value, *, skip_if_exists=False):
+            if skip_if_exists and key in values:
+                return False
+            values[key] = value
+            return True
+
+        def get(self, key, default=None):
+            return values.get(key, default)
+
+    class FakeDict:
+        @staticmethod
+        def from_name(_name, create_if_missing=False):
+            assert create_if_missing
+            return FakeDictInstance()
+
+    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
+
+    with oligoformer_app._cache_build_lock("stage", "identity") as owns_build:
+        assert owns_build
+
+    assert values[f"{lock_key}:owner:0"] == old_owner
+    assert values[f"{lock_key}:status:0"]["state"] == "abandoned"
+    assert values[f"{lock_key}:status:1"]["state"] == "complete"
+
+    with oligoformer_app._cache_build_lock(
+        "stage", "identity", rebuild=True
+    ) as owns_rebuild:
+        assert owns_rebuild
+
+    assert values[f"{lock_key}:status:2"]["state"] == "complete"
+
+
+def test_targetscan_rnaplfold_preparation_is_single_writer(monkeypatch, tmp_path: Path):
+    output_volume = FakeVolume()
+    model_volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, output_volume))
+    monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", model_volume)
+    monkeypatch.setattr(oligoformer_app, "_ensure_human_refs", lambda: None)
+    monkeypatch.setattr(
+        oligoformer_app, "_targetscan_ref_identity_matches_model", lambda: True
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_targetscan_ref_identity",
+        lambda: {
+            "content_sha256": {
+                "human_UTR.txt": "utr",
+                "human_ORF.txt": "orf",
+            }
+        },
+    )
+    ready = False
+    build_calls = []
+    values = {}
+
+    def fake_ready():
+        return ready
+
+    def fake_build(force):
+        nonlocal ready
+        build_calls.append(force)
+        ready = True
+        output_volume.commit()
+
+    class FakeDictInstance:
+        def put(self, key, value, *, skip_if_exists=False):
+            if skip_if_exists and key in values:
+                return False
+            values[key] = value
+            return True
+
+        def get(self, key, default=None):
+            return values.get(key, default)
+
+    class FakeDict:
+        @staticmethod
+        def from_name(_name, create_if_missing=False):
+            assert create_if_missing
+            return FakeDictInstance()
+
+    monkeypatch.setattr(
+        oligoformer_app, "_targetscan_rnaplfold_cache_ready", fake_ready
+    )
+    monkeypatch.setattr(
+        oligoformer_app, "_build_targetscan_rnaplfold_cache", fake_build
+    )
+    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
+
+    raw_f = oligoformer_app.prepare_oligoformer_targetscan_rnaplfold_cache.get_raw_f()
+    raw_f(force=False)
+    raw_f(force=False)
+
+    assert build_calls == [False]
+    assert any(
+        isinstance(value, dict) and value.get("state") == "complete"
+        for value in values.values()
+    )
+
+
 def test_final_ready_requires_current_postprocess_marker_salt(tmp_path: Path):
     layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
-    layout.outputs_dir.mkdir(parents=True)
+    postprocess_key = "final-key"
+    output_dir = layout.outputs_dir / postprocess_key
+    output_dir.mkdir(parents=True)
     layout.markers_dir.mkdir(parents=True)
     for suffix in ("", "_ranked", "_ranked_filtered"):
-        layout.outputs_dir.joinpath(f"target{suffix}.txt").write_text(
-            "ok\n", encoding="utf-8"
-        )
+        output_dir.joinpath(f"target{suffix}.txt").write_text("ok\n", encoding="utf-8")
 
-    oligoformer_app._marker_path(layout, "final.done").write_bytes(
+    marker_name = oligoformer_app._final_marker_name(postprocess_key)
+    oligoformer_app._marker_path(layout, marker_name).write_bytes(
         orjson.dumps({
             "cache_key": "abc123",
             "output_stems": ["target"],
         })
     )
     assert not oligoformer_app._build_plan(
-        "abc123", ("target",), layout.run_root
+        "abc123",
+        "efficacy123",
+        ("target",),
+        layout.run_root,
+        config=_run_config(),
+        postprocess_key=postprocess_key,
     ).final_ready
 
     stale_plan = oligoformer_app.OligoformerRunPlan(
         cache_key="abc123",
+        efficacy_key="efficacy123",
         run_root=str(layout.run_root),
         efficacy_dir=str(layout.prep_dir / "efficacy"),
-        output_dir=str(layout.outputs_dir),
+        output_dir=str(output_dir),
         output_stems=("target",),
+        config=_run_config(),
+        postprocess_key=postprocess_key,
         efficacy_ready=False,
+        evidence_ready=False,
         final_ready=False,
     )
     oligoformer_app._write_cache_marker(
         layout,
-        "final.done",
+        marker_name,
         stale_plan,
         extra_metadata={
             "postprocess_cache_salt": oligoformer_app.APP_INFO.postprocess_cache_salt
@@ -123,7 +443,12 @@ def test_final_ready_requires_current_postprocess_marker_salt(tmp_path: Path):
     )
 
     assert oligoformer_app._build_plan(
-        "abc123", ("target",), layout.run_root
+        "abc123",
+        "efficacy123",
+        ("target",),
+        layout.run_root,
+        config=_run_config(),
+        postprocess_key=postprocess_key,
     ).final_ready
 
 
@@ -142,16 +467,27 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
         "weights", encoding="utf-8"
     )
     input_dir = tmp_path / "run" / "inputs"
-    efficacy_dir = tmp_path / "run" / "prepare" / "efficacy"
+    efficacy_dir = (
+        tmp_path
+        / "outputs-volume"
+        / "efficacy-cache"
+        / "target"
+        / "efficacy123"
+        / "outputs"
+    )
     input_dir.mkdir(parents=True)
     input_dir.joinpath("mrna.fa").write_text(">target\nAUGCUAGCUAGCUAGCUAGC\n")
     plan = oligoformer_app.OligoformerRunPlan(
         cache_key="abc123",
+        efficacy_key="efficacy123",
         run_root=str(tmp_path / "run"),
         efficacy_dir=str(efficacy_dir),
-        output_dir=str(tmp_path / "run" / "outputs"),
+        output_dir=str(tmp_path / "run" / "outputs" / "postprocess"),
         output_stems=("target",),
+        config=_run_config(functionality_filter=False),
+        postprocess_key="postprocess",
         efficacy_ready=False,
+        evidence_ready=True,
         final_ready=False,
     )
 
@@ -163,9 +499,31 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
         for suffix in ("", "_ranked", "_ranked_filtered"):
             out_dir.joinpath(f"target{suffix}.txt").write_text("ok\n")
 
+    lock_values = {}
+
+    class FakeDictInstance:
+        def put(self, key, value, *, skip_if_exists=False):
+            if skip_if_exists and key in lock_values:
+                return False
+            lock_values[key] = value
+            return True
+
+        def get(self, key, default=None):
+            return lock_values.get(key, default)
+
+        def pop(self, key, default=None):
+            return lock_values.pop(key, default)
+
+    class FakeDict:
+        @staticmethod
+        def from_name(_name, create_if_missing=False):
+            assert create_if_missing
+            return FakeDictInstance()
+
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
     monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
     monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
+    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
 
     result = oligoformer_app.run_oligoformer_efficacy.get_raw_f()(
         plan=plan,
@@ -180,8 +538,229 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
     assert "-tox" not in captured["cmd"]
     assert captured["cwd"] == repo_dir
     assert result.efficacy_ready is True
-    assert volume.reload_count == 1
+    assert any(
+        isinstance(value, dict) and value.get("state") == "complete"
+        for value in lock_values.values()
+    )
+    assert volume.reload_count == 2
     assert volume.commit_count == 1
+
+
+def test_run_oligoformer_efficacy_rejects_mismatched_plan_settings():
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root="/remote/run",
+        efficacy_dir="/remote/run/prepare/efficacy",
+        output_dir="/remote/run/outputs/postprocess",
+        output_stems=("target",),
+        config=_run_config(functionality_filter=False),
+        postprocess_key="postprocess",
+        efficacy_ready=False,
+        evidence_ready=True,
+        final_ready=False,
+    )
+
+    with pytest.raises(ValueError, match="efficacy settings"):
+        oligoformer_app.run_oligoformer_efficacy.get_raw_f()(plan)
+
+
+def test_run_oligoformer_efficacy_rechecks_cache_after_lock(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    efficacy_layout = oligoformer_app._efficacy_layout_for_key(
+        "efficacy123", ("target",)
+    )
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root=str(tmp_path / "run"),
+        efficacy_dir=str(efficacy_layout.outputs_dir),
+        output_dir=str(tmp_path / "run" / "outputs" / "postprocess"),
+        output_stems=("target",),
+        config=_run_config(),
+        postprocess_key="postprocess",
+        efficacy_ready=False,
+        evidence_ready=True,
+        final_ready=False,
+    )
+
+    class PublishEfficacyOnEnter:
+        def __enter__(self):
+            efficacy_layout.outputs_dir.mkdir(parents=True)
+            for suffix in ("", "_ranked", "_ranked_filtered"):
+                efficacy_layout.outputs_dir.joinpath(f"target{suffix}.txt").write_text(
+                    "cached\n", encoding="utf-8"
+                )
+            efficacy_layout.markers_dir.mkdir(parents=True)
+            oligoformer_app._marker_path(efficacy_layout, "efficacy.done").write_bytes(
+                orjson.dumps({
+                    "efficacy_key": "efficacy123",
+                    "output_stems": ["target"],
+                })
+            )
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_cache_build_lock(stage, identity, *, rebuild=False):
+        assert (stage, identity) == ("efficacy", "efficacy123")
+        assert not rebuild
+        return PublishEfficacyOnEnter()
+
+    def exploding_run_command(*_args, **_kwargs):
+        raise AssertionError("the cache published by the lock holder must be reused")
+
+    monkeypatch.setattr(oligoformer_app, "_cache_build_lock", fake_cache_build_lock)
+    monkeypatch.setattr(oligoformer_app, "run_command", exploding_run_command)
+
+    result = oligoformer_app.run_oligoformer_efficacy.get_raw_f()(plan)
+
+    assert result.efficacy_ready
+    assert volume.reload_count == 2
+    assert volume.commit_count == 0
+
+
+def test_run_oligoformer_postprocess_rejects_mismatched_plan_settings():
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root="/remote/run",
+        efficacy_dir="/remote/run/prepare/efficacy",
+        output_dir="/remote/run/outputs/postprocess",
+        output_stems=("target",),
+        config=_run_config(),
+        postprocess_key="postprocess",
+        efficacy_ready=True,
+        evidence_ready=True,
+        final_ready=False,
+    )
+
+    with pytest.raises(ValueError, match="post-processing settings"):
+        oligoformer_app.run_oligoformer_postprocess.get_raw_f()(
+            plan,
+            off_target=True,
+        )
+
+
+def test_run_postprocess_rechecks_final_cache_after_lock(tmp_path: Path, monkeypatch):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
+    output_dir = layout.outputs_dir / "postprocess"
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root=str(layout.run_root),
+        efficacy_dir=str(tmp_path / "efficacy"),
+        output_dir=str(output_dir),
+        output_stems=("target",),
+        config=_run_config(),
+        postprocess_key="postprocess",
+        efficacy_ready=False,
+        evidence_ready=True,
+        final_ready=False,
+    )
+
+    class PublishFinalOnEnter:
+        def __enter__(self):
+            output_dir.mkdir(parents=True)
+            for suffix in ("", "_ranked", "_ranked_filtered"):
+                output_dir.joinpath(f"target{suffix}.txt").write_text(
+                    "cached\n", encoding="utf-8"
+                )
+            oligoformer_app._write_cache_marker(
+                layout,
+                oligoformer_app._final_marker_name(plan.postprocess_key),
+                plan,
+                extra_metadata={
+                    "postprocess_cache_salt": (
+                        oligoformer_app.APP_INFO.postprocess_cache_salt
+                    )
+                },
+            )
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_cache_build_lock",
+        lambda *_args, **_kwargs: PublishFinalOnEnter(),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_package_output_tables",
+        lambda *_args, **_kwargs: b"archive",
+    )
+
+    result = oligoformer_app.run_oligoformer_postprocess.get_raw_f()(plan)
+
+    assert result == b"archive"
+    assert volume.reload_count == 1
+
+
+def test_run_postprocess_rejects_changed_all_human_reference_identity(
+    tmp_path: Path, monkeypatch
+):
+    output_volume = FakeVolume()
+    model_volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, output_volume))
+    monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", model_volume)
+    efficacy_layout = oligoformer_app._efficacy_layout_for_key(
+        "efficacy123", ("target",)
+    )
+    efficacy_layout.outputs_dir.mkdir(parents=True)
+    for suffix in ("", "_ranked", "_ranked_filtered"):
+        efficacy_layout.outputs_dir.joinpath(f"target{suffix}.txt").write_text(
+            "cached\n", encoding="utf-8"
+        )
+    efficacy_layout.markers_dir.mkdir(parents=True)
+    oligoformer_app._marker_path(efficacy_layout, "efficacy.done").write_bytes(
+        orjson.dumps({
+            "efficacy_key": "efficacy123",
+            "output_stems": ["target"],
+        })
+    )
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root=str(tmp_path / "run"),
+        efficacy_dir=str(efficacy_layout.outputs_dir),
+        output_dir=str(tmp_path / "run" / "outputs" / "postprocess"),
+        output_stems=("target",),
+        config=_run_config(off_target=True, all_human=True),
+        postprocess_key="postprocess",
+        efficacy_ready=True,
+        evidence_ready=False,
+        final_ready=False,
+        reference_identity="reference-v1",
+    )
+
+    monkeypatch.setattr(oligoformer_app, "_ensure_human_refs", lambda: None)
+    monkeypatch.setattr(
+        oligoformer_app, "_targetscan_rnaplfold_cache_ready", lambda: True
+    )
+    monkeypatch.setattr(
+        oligoformer_app, "_targetscan_ref_identity_digest", lambda: "reference-v2"
+    )
+    monkeypatch.setattr(
+        oligoformer_app, "_targetscan_ref_identity_matches_model", lambda: True
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_cache_build_lock",
+        lambda *_args, **_kwargs: nullcontext(True),
+    )
+
+    with pytest.raises(FileNotFoundError, match="changed after run preparation"):
+        oligoformer_app.run_oligoformer_postprocess.get_raw_f()(
+            plan,
+            off_target=True,
+            all_human=True,
+        )
 
 
 def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkeypatch):
@@ -200,7 +779,6 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     finalize_batch_calls: list[
         tuple[list[oligoformer_app.PreparedOffTargetShard], int]
     ] = []
-    volume = FakeVolume()
     repo_dir = tmp_path / "repo"
     repo_dir.joinpath("toxicity").mkdir(parents=True)
     repo_dir.joinpath("toxicity", "cell_viability.txt").write_text(
@@ -210,31 +788,56 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     repo_dir.joinpath("off-target", "pita").mkdir(parents=True)
     repo_dir.joinpath("off-target", "targetscan").mkdir(parents=True)
     layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
-    layout.prep_dir.joinpath("efficacy").mkdir(parents=True)
+
+    class TrackingVolume(FakeVolume):
+        def __init__(self):
+            super().__init__()
+            self.evidence_ready_committed = False
+
+        def commit(self):
+            super().commit()
+            evidence_dir = layout.prep_dir / "off_target" / "target"
+            if oligoformer_app._raw_off_target_ready(evidence_dir):
+                self.evidence_ready_committed = True
+
+    volume = TrackingVolume()
+    efficacy_layout = oligoformer_app.AppRunLayout.from_run_root(
+        tmp_path / "outputs-volume" / "efficacy-cache" / "target" / "efficacy123"
+    )
+    efficacy_dir = efficacy_layout.outputs_dir
+    final_output_dir = layout.outputs_dir / "postprocess"
+    efficacy_dir.mkdir(parents=True)
     layout.inputs_dir.mkdir(parents=True)
     layout.inputs_dir.joinpath("utr.txt").write_text(">utr\nAUGC\n", encoding="utf-8")
     layout.inputs_dir.joinpath("orf.txt").write_text(">orf\nAUGC\n", encoding="utf-8")
-    layout.prep_dir.joinpath("efficacy", "target.txt").write_text(
+    efficacy_dir.joinpath("target.txt").write_text(
         "pos\tsense\tsiRNA\tefficacy\tfunc_filter\tfilter\n"
         "1\tGC\tAUGCUAGCUAGCUAGCUAG\t0.8\t0\t0\n"
         "2\tCG\tUGCUAGCUAGCUAGCUAGC\t0.6\t0\t0\n",
         encoding="utf-8",
     )
     for suffix in ("_ranked", "_ranked_filtered"):
-        layout.prep_dir.joinpath("efficacy", f"target{suffix}.txt").write_text(
+        efficacy_dir.joinpath(f"target{suffix}.txt").write_text(
             "placeholder\n", encoding="utf-8"
         )
-    layout.markers_dir.mkdir(parents=True)
-    oligoformer_app._marker_path(layout, "efficacy.done").write_text(
-        "{}", encoding="utf-8"
+    efficacy_layout.markers_dir.mkdir(parents=True)
+    oligoformer_app._marker_path(efficacy_layout, "efficacy.done").write_bytes(
+        orjson.dumps({
+            "efficacy_key": "efficacy123",
+            "output_stems": ["target"],
+        })
     )
     plan = oligoformer_app.OligoformerRunPlan(
         cache_key="abc123",
+        efficacy_key="efficacy123",
         run_root=str(layout.run_root),
-        efficacy_dir=str(layout.prep_dir / "efficacy"),
-        output_dir=str(layout.outputs_dir),
+        efficacy_dir=str(efficacy_dir),
+        output_dir=str(final_output_dir),
         output_stems=("target",),
+        config=_run_config(off_target=True, toxicity=True, top_n=-1),
+        postprocess_key="postprocess",
         efficacy_ready=True,
+        evidence_ready=False,
         final_ready=False,
     )
 
@@ -251,7 +854,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             targets_path=str(context_dir / "shards" / "targets_00000"),
             output_path=str(context_dir / "outputs" / "context_00000.txt"),
             log_path=str(
-                layout.outputs_dir
+                final_output_dir
                 / "logs"
                 / "off_target"
                 / spec.stem
@@ -266,7 +869,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             oligoformer_app.PreparedTargetscanBatch(
                 targetscan_path=str(cache_dir / "targetscan.tab"),
                 logs_dir=str(
-                    layout.outputs_dir
+                    final_output_dir
                     / "logs"
                     / "off_target"
                     / spec.stem
@@ -280,6 +883,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
 
     fake_queues = {}
     deleted_queues = []
+    fake_dicts = {}
 
     class FakeQueueInstance:
         def __init__(self):
@@ -315,6 +919,31 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             if create_if_missing:
                 return fake_queues.setdefault(name, FakeQueueInstance())
             return fake_queues[name]
+
+    class FakeDictInstance:
+        def __init__(self):
+            self.values = {}
+
+        def put(self, key, value, *, skip_if_exists=False):
+            if skip_if_exists and key in self.values:
+                return False
+            if isinstance(value, dict) and value.get("state") == "complete":
+                assert volume.evidence_ready_committed
+            self.values[key] = value
+            return True
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+        def pop(self, key, default=None):
+            return self.values.pop(key, default)
+
+    class FakeDict:
+        @staticmethod
+        def from_name(name, create_if_missing=False):
+            if create_if_missing:
+                return fake_dicts.setdefault(name, FakeDictInstance())
+            return fake_dicts[name]
 
     class FakeTargetscanContextQueueWorker:
         def remote(self, queue_name: str, local_workers: int):
@@ -393,7 +1022,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                     mir_stab_path=str(cache_dir / f"{spec.record_name}_mir.stab"),
                     output_path=str(output_path),
                     log_path=str(
-                        layout.outputs_dir
+                        final_output_dir
                         / "logs"
                         / "off_target"
                         / spec.stem
@@ -538,6 +1167,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         FakeFinalizeTargetscanBatch(),
     )
     monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
+    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
     monkeypatch.setattr(
         oligoformer_app,
         "_merge_targetscan_context_outputs",
@@ -575,7 +1205,7 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         top_n=-1,
     )
 
-    final_table = layout.outputs_dir.joinpath("target.txt").read_text(encoding="utf-8")
+    final_table = final_output_dir.joinpath("target.txt").read_text(encoding="utf-8")
     raw_off_target_dir = layout.prep_dir / "off_target" / "target"
     assert result == b"archive"
     assert len(targetscan_branch.spawn_calls) == 1
@@ -602,19 +1232,19 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     assert sorted(call.record_name for call in pita_plan_calls) == ["RNA0", "RNA1"]
     assert [len(batch) for batch, _ in pita_prepare_batch_calls] == [2]
     assert [workers for _, workers in pita_prepare_batch_calls] == [32]
-    assert all(call.output_dir == str(layout.outputs_dir) for call in pita_plan_calls)
+    assert all(call.output_dir == str(final_output_dir) for call in pita_plan_calls)
     assert len(row_batch_calls) == 1
     assert all(local_workers == 32 for _, local_workers in row_batch_calls)
     batched_rows = [row for rows, _ in row_batch_calls for row in rows]
     assert [row.record_name for row in batched_rows] == ["RNA0", "RNA1"]
     assert all(
-        Path(row.log_path).is_relative_to(layout.outputs_dir / "logs" / "off_target")
+        Path(row.log_path).is_relative_to(final_output_dir / "logs" / "off_target")
         for row in batched_rows
     )
     assert [len(batch) for batch, _ in finalize_batch_calls] == [2]
     assert [workers for _, workers in finalize_batch_calls] == [2]
     assert [call.record_name for call in finalize_calls] == ["RNA0", "RNA1"]
-    assert captured["package_root"] == layout.outputs_dir
+    assert captured["package_root"] == final_output_dir
     assert captured["package_paths"] == [
         "target.txt",
         "target_ranked.txt",
@@ -627,7 +1257,18 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         "1\tGC\tAUGCUAGCUAGCUAGCUAG\t0.8\t0\t-11\t2.0\t1\tUGCUAG\t60\t0\t1",
         "2\tCG\tUGCUAGCUAGCUAGCUAGC\t0.6\t0\t-2\t0.5\t0\tGCUAGC\t60\t0\t0",
     ]
-    assert not raw_off_target_dir.exists()
+    assert {path.name for path in raw_off_target_dir.iterdir()} == {
+        "off_target.done",
+        "pita.tab",
+        "targetscan.tab",
+    }
+    assert all(
+        any(
+            isinstance(value, dict) and value.get("state") == "complete"
+            for value in fake_dict.values.values()
+        )
+        for fake_dict in fake_dicts.values()
+    )
     assert volume.reload_count >= 4
     assert volume.commit_count >= 3
 
@@ -1132,6 +1773,127 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
         output_path = Path(shard.output_path)
         assert output_path.exists()
         assert output_path.with_suffix(output_path.suffix + ".done").exists()
+
+
+def test_run_targetscan_context_batches_retries_failed_workers(
+    tmp_path: Path, monkeypatch
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_nodes_env, "1")
+    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_workers_env, "1")
+    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_attempts_env, "2")
+    ready_outputs: set[str] = set()
+    queues = {}
+    attempts = []
+
+    class FakeQueueInstance:
+        def put_many(self, items):
+            self.items = list(getattr(self, "items", [])) + list(items)
+
+    class FakeQueue:
+        class objects:
+            @staticmethod
+            def delete(name):
+                queues.pop(name, None)
+
+        @staticmethod
+        def from_name(name, create_if_missing=False):
+            if create_if_missing:
+                return queues.setdefault(name, FakeQueueInstance())
+            return queues[name]
+
+    class FakeCall:
+        def __init__(self, attempt: int):
+            self.attempt = attempt
+
+        def get(self):
+            if self.attempt == 1:
+                raise RuntimeError("worker crashed")
+            ready_outputs.add(shard.output_path)
+            return 1
+
+        def cancel(self, terminate_containers=False):
+            del terminate_containers
+
+    class FakeWorker:
+        def spawn(self, queue_name: str, local_workers: int):
+            del queue_name, local_workers
+            attempts.append(len(attempts) + 1)
+            return FakeCall(attempts[-1])
+
+    shard = oligoformer_app.TargetscanContextShardSpec(
+        shard_index=0,
+        common_dir=str(tmp_path / "common"),
+        targets_path=str(tmp_path / "targets"),
+        output_path=str(tmp_path / "output.txt"),
+        log_path=str(tmp_path / "output.log"),
+        rnaplfold_cache_dir="",
+    )
+    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_targetscan_context_queue_worker",
+        FakeWorker(),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_targetscan_context_shard_ready",
+        lambda spec: spec.output_path in ready_outputs,
+    )
+
+    assert oligoformer_app._run_targetscan_context_batches([shard]) == [
+        shard.output_path
+    ]
+    assert attempts == [1, 2]
+    assert queues == {}
+
+
+def test_targetscan_context_worker_commits_once_per_worker(tmp_path: Path, monkeypatch):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    shards = [
+        oligoformer_app.TargetscanContextShardSpec(
+            shard_index=index,
+            common_dir=str(tmp_path / "common"),
+            targets_path=str(tmp_path / f"targets-{index}"),
+            output_path=str(tmp_path / f"output-{index}.txt"),
+            log_path=str(tmp_path / f"output-{index}.log"),
+            rnaplfold_cache_dir="",
+        )
+        for index in range(2)
+    ]
+
+    class FakeQueue:
+        def __init__(self):
+            self.items = shards + [
+                oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
+            ]
+
+        def get(self, timeout=None):
+            del timeout
+            return self.items.pop(0)
+
+        @classmethod
+        def from_name(cls, _name):
+            return cls()
+
+    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_run_targetscan_context_shard",
+        lambda spec: spec.output_path,
+    )
+
+    completed = (
+        oligoformer_app.run_oligoformer_targetscan_context_queue_worker.get_raw_f()(
+            "queue", local_workers=1
+        )
+    )
+
+    assert completed == 2
+    assert volume.reload_count == 1
+    assert volume.commit_count == 1
 
 
 def test_run_targetscan_context_batches_caps_default_queue_workers(
@@ -1774,7 +2536,19 @@ def test_download_oligoformer_models_writes_to_model_volume(
     tmp_path: Path, monkeypatch
 ) -> None:
     source = Path(oligoformer_app.__file__).read_text(encoding="utf-8")
-    volume = FakeVolume()
+    commit_events = []
+
+    class TrackingVolume(FakeVolume):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def commit(self):
+            super().commit()
+            commit_events.append(self.name)
+
+    model_volume = TrackingVolume("model")
+    output_volume = TrackingVolume("output")
     info = oligoformer_app.AppInfo(
         repo_rnafm_dir=tmp_path / "repo" / "RNA-FM",
         model_rnafm_dir=tmp_path / "models" / "RNA-FM",
@@ -1782,6 +2556,7 @@ def test_download_oligoformer_models_writes_to_model_volume(
         model_ref_dir=tmp_path / "models" / "off-target" / "ref",
     )
     calls = []
+    lock_calls = []
 
     def fake_download_files(urls, *, force, num_retries, progress_bar_desc):
         calls.append({
@@ -1807,6 +2582,7 @@ def test_download_oligoformer_models_writes_to_model_volume(
                             "UTR Sequence\n"
                             "ENST000001\tGENE1\tGENE1\t9606\tAUGC\n",
                         )
+
                     else:
                         archive.writestr(
                             "ORF_Sequences.txt",
@@ -1814,9 +2590,23 @@ def test_download_oligoformer_models_writes_to_model_volume(
                             "ENST000001\t9606\tAUGC\n",
                         )
 
+    def fake_cache_build_lock(stage, identity, *, rebuild=False):
+        lock_calls.append((stage, identity, rebuild))
+        return nullcontext(True)
+
     monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
-    monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", volume)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "CONF",
+        _fake_conf(tmp_path, output_volume),
+    )
+    monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", model_volume)
     monkeypatch.setattr(oligoformer_app, "download_files", fake_download_files)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_cache_build_lock",
+        fake_cache_build_lock,
+    )
 
     oligoformer_app.download_oligoformer_models.get_raw_f()(force=True)
 
@@ -1832,10 +2622,96 @@ def test_download_oligoformer_models_writes_to_model_volume(
     )
     for ref_path in info.model_human_ref_paths:
         assert ref_path.read_text(encoding="utf-8") == ">ENST000001\nAUGC\n"
+    identity = orjson.loads(info.targetscan_ref_identity_path.read_bytes())
+    assert identity["content_sha256"] == {
+        path.name: oligoformer_app._hash_path(path)
+        for path in info.model_human_ref_paths
+    }
     assert not info.targetscan_rnaplfold_marker_path.exists()
-    assert volume.commit_count == 1
+    assert model_volume.commit_count == 1
+    assert output_volume.reload_count == 1
+    assert output_volume.commit_count == 1
+    assert commit_events == ["model", "output"]
+    assert lock_calls == [("targetscan-reference-state", "global", True)]
     assert "min(Args.top_n, RESULT_ranked.shape[0])" in source
     assert "--biomodals_stage" in source
+
+
+def test_download_models_refreshes_stale_output_reference_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_volume = FakeVolume()
+    output_volume = FakeVolume()
+    info = oligoformer_app.AppInfo(
+        repo_rnafm_dir=tmp_path / "repo" / "RNA-FM",
+        model_rnafm_dir=tmp_path / "models" / "RNA-FM",
+        repo_ref_dir=tmp_path / "repo" / "off-target" / "ref",
+        model_ref_dir=tmp_path / "models" / "off-target" / "ref",
+    )
+    info.model_rnafm_redevelop_dir.mkdir(parents=True)
+    info.model_rnafm_redevelop_dir.joinpath("model.pt").write_text(
+        "weights", encoding="utf-8"
+    )
+    info.model_ref_dir.mkdir(parents=True)
+    for path in info.model_human_ref_paths:
+        path.write_text(f">{path.stem}\nAUGC\n", encoding="utf-8")
+    model_identity = info.targetscan_ref_metadata | {
+        "row_counts": {path.name: 1 for path in info.model_human_ref_paths},
+        "content_sha256": {
+            path.name: oligoformer_app._hash_path(path)
+            for path in info.model_human_ref_paths
+        },
+    }
+    info.targetscan_ref_marker_path.write_bytes(orjson.dumps(model_identity))
+
+    monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "CONF",
+        _fake_conf(tmp_path, output_volume),
+    )
+    monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", model_volume)
+    info.targetscan_ref_identity_path.parent.mkdir(parents=True)
+    info.targetscan_ref_identity_path.write_bytes(
+        orjson.dumps(
+            model_identity
+            | {
+                "content_sha256": {
+                    "human_UTR.txt": "stale",
+                    "human_ORF.txt": "stale",
+                }
+            }
+        )
+    )
+
+    def exploding_download(*_args, **_kwargs):
+        raise AssertionError("valid model-volume assets must not be redownloaded")
+
+    monkeypatch.setattr(oligoformer_app, "download_files", exploding_download)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_cache_build_lock",
+        lambda *_args, **_kwargs: nullcontext(True),
+    )
+
+    oligoformer_app.download_oligoformer_models.get_raw_f()(force=False)
+
+    assert (
+        orjson.loads(info.targetscan_ref_identity_path.read_bytes()) == model_identity
+    )
+    assert output_volume.reload_count == 2
+    assert output_volume.commit_count == 1
+    assert model_volume.commit_count == 1
+
+    def exploding_lock(*_args, **_kwargs):
+        raise AssertionError("ready assets must bypass the coordination ledger")
+
+    monkeypatch.setattr(oligoformer_app, "_cache_build_lock", exploding_lock)
+    oligoformer_app.download_oligoformer_models.get_raw_f()(force=False)
+
+    assert output_volume.reload_count == 3
+    assert output_volume.commit_count == 1
+    assert model_volume.commit_count == 1
 
 
 def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) -> None:
@@ -1844,11 +2720,15 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
     calls = []
     plan = oligoformer_app.OligoformerRunPlan(
         cache_key="abc123",
+        efficacy_key="efficacy123",
         run_root="/remote/run",
         efficacy_dir="/remote/run/prepare/efficacy",
-        output_dir="/remote/run/outputs",
+        output_dir="/remote/run/outputs/postprocess",
         output_stems=("m",),
+        config=_run_config(),
+        postprocess_key="postprocess",
         efficacy_ready=False,
+        evidence_ready=False,
         final_ready=False,
     )
     efficacy_plan = replace(plan, efficacy_ready=True)
@@ -1863,9 +2743,16 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
             return plan
 
     class FakeEfficacy:
-        def remote(self, **kwargs):
+        def spawn(self, **kwargs):
             calls.append(("efficacy", kwargs))
-            return efficacy_plan
+            return FakeCall(efficacy_plan)
+
+    class FakeCall:
+        def __init__(self, result):
+            self.result = result
+
+        def get(self):
+            return self.result
 
     class FakePostprocess:
         def remote(self, **kwargs):
@@ -1885,9 +2772,9 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
 
     raw_f(mrna_fasta=str(input_fasta), out_dir=str(tmp_path), run_name="demo")
 
-    assert calls[0] == ("download", False)
-    assert calls[1][0] == "prepare"
-    assert calls[1][1]["top_n"] == oligoformer_app.APP_INFO.default_top_n
+    assert calls[0][0] == "prepare"
+    assert calls[0][1]["top_n"] == oligoformer_app.APP_INFO.default_top_n
+    assert calls[1] == ("download", False)
     assert calls[2] == (
         "efficacy",
         {"plan": plan, "functionality_filter": True},
@@ -1895,6 +2782,220 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
     assert calls[3][0] == "postprocess"
     assert calls[3][1]["plan"] == efficacy_plan
     assert (tmp_path / "demo_oligoformer.tar.zst").read_bytes() == b"archive"
+
+
+def test_submit_oligoformer_skips_model_setup_for_cached_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_fasta = tmp_path / "target.fa"
+    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root="/remote/run",
+        efficacy_dir="/remote/run/prepare/efficacy",
+        output_dir="/remote/run/outputs/postprocess",
+        output_stems=("m",),
+        config=_run_config(),
+        postprocess_key="postprocess",
+        efficacy_ready=True,
+        evidence_ready=True,
+        final_ready=True,
+    )
+
+    class FakePrepare:
+        def remote(self, **_kwargs):
+            return plan
+
+    class ExplodingDownload:
+        def remote(self, **_kwargs):
+            raise AssertionError("cached runs must not initialize model assets")
+
+    class FakePackage:
+        def remote(self, _plan):
+            return b"archive"
+
+    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
+    monkeypatch.setattr(
+        oligoformer_app, "download_oligoformer_models", ExplodingDownload()
+    )
+    monkeypatch.setattr(oligoformer_app, "package_oligoformer_outputs", FakePackage())
+
+    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
+    assert raw_f is not None
+    raw_f(mrna_fasta=str(input_fasta), out_dir=str(tmp_path), run_name="cached")
+
+    assert (tmp_path / "cached_oligoformer.tar.zst").read_bytes() == b"archive"
+
+
+def test_submit_oligoformer_skips_human_setup_when_evidence_is_cached(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_fasta = tmp_path / "target.fa"
+    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root="/remote/run",
+        efficacy_dir="/remote/efficacy",
+        output_dir="/remote/run/outputs/postprocess",
+        output_stems=("m",),
+        config=_run_config(off_target=True, all_human=True),
+        postprocess_key="postprocess",
+        efficacy_ready=True,
+        evidence_ready=True,
+        final_ready=False,
+    )
+
+    class FakePrepare:
+        def remote(self, **_kwargs):
+            return plan
+
+    class ExplodingDownload:
+        def remote(self, **_kwargs):
+            raise AssertionError("cached evidence must not initialize model assets")
+
+    class ExplodingReferencePrep:
+        def spawn(self, **_kwargs):
+            raise AssertionError("cached evidence must not rebuild RNAplfold refs")
+
+    class FakePostprocess:
+        def remote(self, **kwargs):
+            assert kwargs["plan"] == plan
+            return b"archive"
+
+    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
+    monkeypatch.setattr(
+        oligoformer_app, "download_oligoformer_models", ExplodingDownload()
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "prepare_oligoformer_targetscan_rnaplfold_cache",
+        ExplodingReferencePrep(),
+    )
+    monkeypatch.setattr(
+        oligoformer_app, "run_oligoformer_postprocess", FakePostprocess()
+    )
+
+    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        mrna_fasta=str(input_fasta),
+        out_dir=str(tmp_path),
+        run_name="cached-evidence",
+        off_target=True,
+        all_human=True,
+    )
+
+    assert (tmp_path / "cached-evidence_oligoformer.tar.zst").read_bytes() == b"archive"
+
+
+def test_submit_oligoformer_overlaps_human_reference_prep_with_efficacy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_fasta = tmp_path / "target.fa"
+    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
+    events = []
+    plan = oligoformer_app.OligoformerRunPlan(
+        cache_key="abc123",
+        efficacy_key="efficacy123",
+        run_root="/remote/run",
+        efficacy_dir="/remote/run/prepare/efficacy",
+        output_dir="/remote/run/outputs/postprocess",
+        output_stems=("m",),
+        config=_run_config(off_target=True, all_human=True),
+        postprocess_key="postprocess",
+        efficacy_ready=False,
+        evidence_ready=False,
+        final_ready=False,
+    )
+    refreshed_plan = replace(
+        plan,
+        cache_key="def456",
+        run_root="/remote/refreshed-run",
+        output_dir="/remote/refreshed-run/outputs/postprocess",
+    )
+    efficacy_plan = replace(refreshed_plan, efficacy_ready=True)
+
+    class FakeCall:
+        def __init__(self, name: str, result):
+            self.name = name
+            self.result = result
+
+        def get(self):
+            events.append(("get", self.name))
+            return self.result
+
+        def cancel(self):
+            events.append(("cancel", self.name))
+
+    class FakePrepare:
+        def remote(self, **_kwargs):
+            events.append("prepare")
+            return plan if events.count("prepare") == 1 else refreshed_plan
+
+    class FakeDownload:
+        def remote(self, *, force):
+            events.append(("download", force))
+
+    class FakeEfficacy:
+        def spawn(self, **kwargs):
+            assert kwargs["plan"] == refreshed_plan
+            events.append("spawn-efficacy")
+            return FakeCall("efficacy", efficacy_plan)
+
+    class FakeReferencePrep:
+        def spawn(self, *, force):
+            events.append(("spawn-reference", force))
+            return FakeCall("reference", None)
+
+    class FakePostprocess:
+        def remote(self, **kwargs):
+            assert kwargs["plan"] == efficacy_plan
+            events.append("postprocess")
+            return b"archive"
+
+    def fake_gather(*calls):
+        events.append(("gather", tuple(call.name for call in calls)))
+        return tuple(call.get() for call in calls)
+
+    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
+    monkeypatch.setattr(oligoformer_app, "download_oligoformer_models", FakeDownload())
+    monkeypatch.setattr(oligoformer_app, "run_oligoformer_efficacy", FakeEfficacy())
+    monkeypatch.setattr(
+        oligoformer_app,
+        "prepare_oligoformer_targetscan_rnaplfold_cache",
+        FakeReferencePrep(),
+    )
+    monkeypatch.setattr(
+        oligoformer_app, "run_oligoformer_postprocess", FakePostprocess()
+    )
+    monkeypatch.setattr(
+        oligoformer_app.modal.FunctionCall,
+        "gather",
+        staticmethod(fake_gather),
+    )
+
+    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        mrna_fasta=str(input_fasta),
+        out_dir=str(tmp_path),
+        run_name="human",
+        off_target=True,
+        all_human=True,
+    )
+
+    assert events[:5] == [
+        "prepare",
+        ("download", False),
+        "prepare",
+        ("spawn-reference", False),
+        "spawn-efficacy",
+    ]
+    assert ("gather", ("efficacy", "reference")) in events
+    assert events[-1] == "postprocess"
+    assert (tmp_path / "human_oligoformer.tar.zst").read_bytes() == b"archive"
 
 
 def test_submit_oligoformer_requires_off_target_references(tmp_path: Path) -> None:

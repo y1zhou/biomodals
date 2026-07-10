@@ -340,12 +340,12 @@ def _run_logged(
 
 def _copy_app_artifacts(config: dict[str, Any], artifact_root: Path) -> None:
     """Copy Biomodals app outputs into verifier artifact storage."""
-    run_root = Path(config["run_root"])
+    output_dir = Path(config["output_dir"])
     app_output_dir = artifact_root / "app/outputs"
     for stem in config["output_stems"]:
         for suffix in FINAL_TABLE_SUFFIXES:
             name = f"{stem}{suffix}.txt"
-            _copy_required(run_root / "outputs" / name, app_output_dir / name)
+            _copy_required(output_dir / name, app_output_dir / name)
 
 
 def _run_upstream(config: dict[str, Any], artifact_root: Path) -> None:
@@ -551,6 +551,7 @@ def _run_local(args: argparse.Namespace) -> int:
                 "force": args.force,
                 "artifact_root": str(artifact_root),
                 "run_root": plan.run_root,
+                "output_dir": plan.output_dir,
                 "output_stems": list(plan.output_stems),
                 "top_n": args.top_n,
                 "mrna_fasta": "/tmp/oligoformer_verifier/mrna.fa",

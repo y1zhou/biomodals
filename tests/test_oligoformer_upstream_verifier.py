@@ -44,6 +44,31 @@ def test_default_fixture_paths_exist():
     assert verifier._parse_args([]).top_n == -1
 
 
+def test_copy_app_artifacts_uses_final_variant_output_dir(tmp_path: Path):
+    verifier = _load_verifier()
+    output_dir = tmp_path / "run" / "outputs" / "postprocess-key"
+    output_dir.mkdir(parents=True)
+    for suffix in verifier.FINAL_TABLE_SUFFIXES:
+        output_dir.joinpath(f"target{suffix}.txt").write_text(
+            f"{suffix or 'original'}\n", encoding="utf-8"
+        )
+
+    verifier._copy_app_artifacts(
+        {
+            "output_dir": str(output_dir),
+            "output_stems": ["target"],
+        },
+        tmp_path / "artifacts",
+    )
+
+    copied = tmp_path / "artifacts" / "app" / "outputs"
+    assert {path.name for path in copied.iterdir()} == {
+        "target.txt",
+        "target_ranked.txt",
+        "target_ranked_filtered.txt",
+    }
+
+
 def test_compare_tables_canonicalizes_order_and_float_format(tmp_path: Path):
     verifier = _load_verifier()
     app_path = tmp_path / "app.txt"

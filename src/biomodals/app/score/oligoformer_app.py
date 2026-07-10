@@ -27,10 +27,13 @@ increase reference-prep parallelism.
 Results are saved locally as `<run-name>_oligoformer.tar.zst`. The tarball
 contains the final top-level `.txt`, `_ranked.txt`, and `_ranked_filtered.txt`
 tables only; detailed off-target logs stay in the Modal output-volume run
-directory under `<stem>/<cache-key>/`. After final tables are generated, bulky
-off-target intermediates under `prepare/off_target/<stem>/` are removed. The app
-preserves final tables, completion markers, logs, efficacy outputs, model
-caches, and reusable reference caches.
+directory under `<stem>/<cache-key>/`. Final-table variants for different filter
+thresholds reuse the same efficacy and merged off-target evidence; reference or
+`top_n` variants reuse efficacy while building distinct evidence. After final
+tables are generated, bulky off-target shard inputs under
+`prepare/off_target/<stem>/` are removed. The app preserves compact merged PITA
+and TargetScan evidence, final tables, completion markers, logs, efficacy
+outputs, model caches, and reusable reference caches.
 
 For each input mRNA record, the tarball contains three TSV tables:
 
@@ -100,7 +103,7 @@ import hashlib
 import os
 import queue as queue_lib
 import shlex
-from contextlib import suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -112,7 +115,7 @@ import polars as pl
 from biomodals.app.config import AppConfig
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout
-from biomodals.helper.constant import MODEL_VOLUME
+from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
     resolve_local_output_dir,
@@ -183,7 +186,7 @@ class AppInfo:
     off_target_cache_salt: str = (
         "targetscan-8.0-viennarna-2.7.2-semantic-topn-targetscan-polars-v1"
     )
-    postprocess_cache_salt: str = "final-tables-v2"
+    postprocess_cache_salt: str = "final-tables-v3"
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
     model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
     repo_ref_dir: Path = CONF.git_clone_dir / "off-target/ref"
@@ -237,6 +240,9 @@ class AppInfo:
         "__biomodals_oligoformer_targetscan_context_stop__"
     )
     default_targetscan_merge_nodes: int = 16
+    cache_lock_dict_name: str = f"{CONF.package_name}-cache-locks"
+    cache_lock_poll_seconds: float = 5.0
+    cache_lock_stale_seconds: float = MAX_TIMEOUT + 600
 
     @property
     def tuning_env_names(self) -> tuple[str, ...]:
@@ -293,19 +299,40 @@ class AppInfo:
         return self.model_ref_dir / "targetscan_8_0_human_refs.json"
 
     @property
+    def targetscan_ref_identity_path(self) -> Path:
+        """Return the output-volume identity for converted human references."""
+        return (
+            Path(CONF.output_volume_mountpoint)
+            / "reference-cache"
+            / "targetscan_8_0_human_refs.json"
+        )
+
+    @property
     def targetscan_rnaplfold_cache_dir(self) -> Path:
         """Return cached TargetScan 8.0 RNAplfold outputs for human UTRs."""
-        return self.model_ref_dir / "targetscan_8_0_RNAplfold_in_out"
+        return (
+            Path(CONF.output_volume_mountpoint)
+            / "reference-cache"
+            / "targetscan_8_0_RNAplfold_in_out"
+        )
 
     @property
     def targetscan_rnaplfold_shard_dir(self) -> Path:
         """Return shard inputs for building the RNAplfold cache."""
-        return self.model_ref_dir / "targetscan_8_0_RNAplfold_shards"
+        return (
+            Path(CONF.output_volume_mountpoint)
+            / "reference-cache"
+            / "targetscan_8_0_RNAplfold_shards"
+        )
 
     @property
     def targetscan_rnaplfold_marker_path(self) -> Path:
         """Return the marker for cached TargetScan 8.0 RNAplfold outputs."""
-        return self.model_ref_dir / "targetscan_8_0_rnaplfold_cache.json"
+        return (
+            Path(CONF.output_volume_mountpoint)
+            / "reference-cache"
+            / "targetscan_8_0_rnaplfold_cache.json"
+        )
 
     @property
     def targetscan_ref_metadata(self) -> dict[str, object]:
@@ -325,6 +352,7 @@ class AppInfo:
         return {
             "targetscan_version": self.targetscan_version,
             "species_id": self.targetscan_species_id,
+            "reference_metadata": self.targetscan_ref_metadata,
             "viennarna_url": self.viennarna_archive_url,
             "command": "RNAplfold -L 40 -W 80 -u 20",
             "input_file": "human_UTR.txt",
@@ -371,16 +399,35 @@ infer_path.write_text(infer_text)
 
 
 @dataclass(frozen=True, slots=True)
+class OligoformerRunConfig:
+    """Semantic configuration shared by OligoFormer compute and final stages."""
+
+    off_target: bool = False
+    toxicity: bool = False
+    all_human: bool = False
+    top_n: int = 20
+    functionality_filter: bool = True
+    pita_threshold: float = -10.0
+    targetscan_threshold: float = 1.0
+    toxicity_threshold: float = 50.0
+
+
+@dataclass(frozen=True, slots=True)
 class OligoformerRunPlan:
     """Volume-backed OligoFormer run plan."""
 
     cache_key: str
+    efficacy_key: str
     run_root: str
     efficacy_dir: str
     output_dir: str
     output_stems: tuple[str, ...]
+    config: OligoformerRunConfig
+    postprocess_key: str
     efficacy_ready: bool
+    evidence_ready: bool
     final_ready: bool
+    reference_identity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,7 +566,7 @@ def _hash_bytes(data: bytes | None) -> str:
 
 
 def _hash_path(path: Path) -> str:
-    """Return a stable hash for a file path."""
+    """Return a stable SHA-256 digest for one file."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -551,9 +598,27 @@ def _run_layout_for_cache_key(
     )
 
 
+def _efficacy_layout_for_key(
+    efficacy_key: str,
+    output_stems: tuple[str, ...],
+) -> AppRunLayout:
+    """Return the shared output-volume layout for one efficacy input."""
+    return AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint)
+        / "efficacy-cache"
+        / output_stems[0]
+        / efficacy_key
+    )
+
+
 def _marker_path(layout: AppRunLayout, marker: str) -> Path:
     """Return an OligoFormer cache marker path."""
     return layout.markers_dir / marker
+
+
+def _final_marker_name(postprocess_key: str) -> str:
+    """Return the completion marker name for one final-table variant."""
+    return f"final.{postprocess_key}.done"
 
 
 def _output_paths(output_dir: Path, output_stems: tuple[str, ...]) -> tuple[Path, ...]:
@@ -623,8 +688,13 @@ def _paths_ready(
 
 def _build_plan(
     cache_key: str,
+    efficacy_key: str,
     output_stems: tuple[str, ...],
     run_root: str | Path | None = None,
+    *,
+    config: OligoformerRunConfig,
+    postprocess_key: str,
+    reference_identity: str | None = None,
 ) -> OligoformerRunPlan:
     """Build an OligoFormer run plan from current volume state."""
     layout = (
@@ -632,27 +702,44 @@ def _build_plan(
         if run_root is not None
         else _run_layout_for_cache_key(cache_key, output_stems)
     )
-    efficacy_dir = layout.prep_dir / "efficacy"
-    output_dir = layout.outputs_dir
+    efficacy_layout = _efficacy_layout_for_key(efficacy_key, output_stems)
+    efficacy_dir = efficacy_layout.outputs_dir
+    output_dir = layout.outputs_dir / postprocess_key
     return OligoformerRunPlan(
         cache_key=cache_key,
+        efficacy_key=efficacy_key,
         run_root=str(layout.run_root),
         efficacy_dir=str(efficacy_dir),
         output_dir=str(output_dir),
         output_stems=output_stems,
+        config=config,
+        postprocess_key=postprocess_key,
         efficacy_ready=_paths_ready(
             _output_paths(efficacy_dir, output_stems),
-            _marker_path(layout, "efficacy.done"),
+            _marker_path(efficacy_layout, "efficacy.done"),
+            expected_marker={
+                "efficacy_key": efficacy_key,
+                "output_stems": list(output_stems),
+            },
+        ),
+        evidence_ready=(
+            not config.off_target
+            or all(
+                _raw_off_target_ready(layout.prep_dir / "off_target" / stem)
+                for stem in output_stems
+            )
         ),
         final_ready=_paths_ready(
             _output_paths(output_dir, output_stems),
-            _marker_path(layout, "final.done"),
+            _marker_path(layout, _final_marker_name(postprocess_key)),
             expected_marker={
                 "cache_key": cache_key,
+                "postprocess_key": postprocess_key,
                 "output_stems": list(output_stems),
                 "postprocess_cache_salt": APP_INFO.postprocess_cache_salt,
             },
         ),
+        reference_identity=reference_identity,
     )
 
 
@@ -671,8 +758,88 @@ def _targetscan_human_refs_ready() -> bool:
         marker = orjson.loads(APP_INFO.targetscan_ref_marker_path.read_bytes())
     except orjson.JSONDecodeError:
         return False
+    if not isinstance(marker, dict):
+        return False
     expected = APP_INFO.targetscan_ref_metadata
-    return all(marker.get(key) == value for key, value in expected.items())
+    if not all(marker.get(key) == value for key, value in expected.items()):
+        return False
+    content_sha256 = marker.get("content_sha256")
+    if not isinstance(content_sha256, dict):
+        return False
+    return all(
+        content_sha256.get(path.name) == _hash_path(path)
+        for path in APP_INFO.model_human_ref_paths
+    )
+
+
+def _targetscan_ref_identity() -> dict[str, object]:
+    """Return the persisted content identity for full-human references."""
+    import orjson
+
+    path = APP_INFO.targetscan_ref_identity_path
+    if not path.is_file():
+        raise FileNotFoundError(
+            "OligoFormer full-human reference identity is missing. Run "
+            "download_oligoformer_models first."
+        )
+    try:
+        identity = orjson.loads(path.read_bytes())
+    except orjson.JSONDecodeError as exc:
+        raise FileNotFoundError(
+            "OligoFormer full-human reference identity is invalid. Run "
+            "download_oligoformer_models first."
+        ) from exc
+    if not isinstance(identity, dict):
+        raise FileNotFoundError(
+            "OligoFormer full-human reference identity is invalid. Run "
+            "download_oligoformer_models first."
+        )
+    expected = APP_INFO.targetscan_ref_metadata
+    content_sha256 = identity.get("content_sha256")
+    if not all(identity.get(key) == value for key, value in expected.items()) or not (
+        isinstance(content_sha256, dict)
+        and all(
+            isinstance(content_sha256.get(name), str)
+            for name in APP_INFO.human_ref_filenames
+        )
+    ):
+        raise FileNotFoundError(
+            "OligoFormer full-human reference identity is stale. Run "
+            "download_oligoformer_models first."
+        )
+    return identity
+
+
+def _targetscan_ref_identity_digest() -> str:
+    """Return the canonical digest pinned by full-human evidence plans."""
+    import orjson
+
+    return _hash_bytes(
+        orjson.dumps(_targetscan_ref_identity(), option=orjson.OPT_SORT_KEYS)
+    )
+
+
+def _targetscan_ref_identity_matches_model() -> bool:
+    """Return whether output identity matches committed model reference bytes."""
+    import orjson
+
+    if not _targetscan_human_refs_ready():
+        return False
+    try:
+        model_identity = orjson.loads(APP_INFO.targetscan_ref_marker_path.read_bytes())
+        output_identity = _targetscan_ref_identity()
+    except (FileNotFoundError, orjson.JSONDecodeError):
+        return False
+    return isinstance(model_identity, dict) and output_identity == model_identity
+
+
+def _targetscan_rnaplfold_expected_metadata() -> dict[str, object]:
+    """Return RNAplfold cache metadata tied to the converted UTR bytes."""
+    identity = _targetscan_ref_identity()
+    content_sha256 = cast(dict[str, object], identity["content_sha256"])
+    return APP_INFO.targetscan_rnaplfold_metadata | {
+        "input_sha256": content_sha256["human_UTR.txt"]
+    }
 
 
 def _convert_targetscan_zip_to_fasta(
@@ -778,7 +945,10 @@ def _targetscan_rnaplfold_cache_ready() -> bool:
         marker = orjson.loads(marker_path.read_bytes())
     except orjson.JSONDecodeError:
         return False
-    expected = APP_INFO.targetscan_rnaplfold_metadata
+    try:
+        expected = _targetscan_rnaplfold_expected_metadata()
+    except FileNotFoundError:
+        return False
     if not all(marker.get(key) == value for key, value in expected.items()):
         return False
     expected_count = marker.get("record_count")
@@ -870,18 +1040,29 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ##########################################
 # Fetch model weights
 ##########################################
-@app.function(
-    volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=CONF.timeout
-)
-def download_oligoformer_models(force: bool = False) -> None:
-    """Download RNA-FM weights and TargetScan 8.0 human refs into the model volume."""
+def _download_oligoformer_models_locked(force: bool) -> None:
+    """Download model assets while holding the global reference-state lock."""
     import shutil
 
     import orjson
 
+    CONF.output_volume.reload()
     refs_ready = _targetscan_human_refs_ready()
-    if APP_INFO.model_rnafm_redevelop_dir.is_dir() and refs_ready and not force:
-        print("🧬 OligoFormer models and TargetScan 8.0 human refs already available")
+    try:
+        output_ref_identity = _targetscan_ref_identity()
+        model_ref_identity = orjson.loads(
+            APP_INFO.targetscan_ref_marker_path.read_bytes()
+        )
+        ref_identity_ready = refs_ready and output_ref_identity == model_ref_identity
+    except (FileNotFoundError, orjson.JSONDecodeError):
+        ref_identity_ready = False
+    if (
+        APP_INFO.model_rnafm_redevelop_dir.is_dir()
+        and refs_ready
+        and ref_identity_ready
+        and not force
+    ):
+        print("💊 OligoFormer models and TargetScan 8.0 human refs already available")
         return
 
     if APP_INFO.model_rnafm_dir.exists() and force:
@@ -905,6 +1086,7 @@ def download_oligoformer_models(force: bool = False) -> None:
                 str(APP_INFO.model_rnafm_dir.parent),
             ])
 
+    identity_to_publish: dict[str, object] | None = None
     if force or not refs_ready:
         APP_INFO.model_ref_dir.mkdir(parents=True, exist_ok=True)
         download_files(
@@ -914,14 +1096,16 @@ def download_oligoformer_models(force: bool = False) -> None:
             progress_bar_desc="OligoFormer human ref downloads",
         )
         row_counts = _convert_targetscan_human_refs()
-        shutil.rmtree(APP_INFO.targetscan_rnaplfold_cache_dir, ignore_errors=True)
-        shutil.rmtree(APP_INFO.targetscan_rnaplfold_shard_dir, ignore_errors=True)
-        APP_INFO.targetscan_rnaplfold_marker_path.unlink(missing_ok=True)
-        APP_INFO.targetscan_ref_marker_path.write_bytes(
-            orjson.dumps(APP_INFO.targetscan_ref_metadata | {"row_counts": row_counts})
-        )
+        identity = APP_INFO.targetscan_ref_metadata | {
+            "row_counts": row_counts,
+            "content_sha256": {
+                path.name: _hash_path(path) for path in APP_INFO.model_human_ref_paths
+            },
+        }
+        APP_INFO.targetscan_ref_marker_path.write_bytes(orjson.dumps(identity))
+        identity_to_publish = identity
         print(
-            "🧬 Converted TargetScan 8.0 human refs: "
+            "💊 Converted TargetScan 8.0 human refs: "
             + ", ".join(f"{name}={count}" for name, count in row_counts.items())
         )
 
@@ -944,7 +1128,46 @@ def download_oligoformer_models(force: bool = False) -> None:
         )
 
     MODEL_VOLUME.commit()
-    print("🧬 OligoFormer models and TargetScan 8.0 human refs committed")
+    if identity_to_publish is not None or not ref_identity_ready:
+        if identity_to_publish is not None:
+            shutil.rmtree(APP_INFO.targetscan_rnaplfold_cache_dir, ignore_errors=True)
+            shutil.rmtree(APP_INFO.targetscan_rnaplfold_shard_dir, ignore_errors=True)
+            APP_INFO.targetscan_rnaplfold_marker_path.unlink(missing_ok=True)
+            identity_bytes = orjson.dumps(identity_to_publish)
+        else:
+            identity_bytes = APP_INFO.targetscan_ref_marker_path.read_bytes()
+        APP_INFO.targetscan_ref_identity_path.parent.mkdir(parents=True, exist_ok=True)
+        APP_INFO.targetscan_ref_identity_path.write_bytes(identity_bytes)
+        CONF.output_volume.commit()
+    print("💊 OligoFormer models and TargetScan 8.0 human refs committed")
+
+
+@app.function(
+    volumes=CONF.mounts(output_volume=True, model_volume=True, model_ro=False),
+    timeout=MAX_TIMEOUT,
+)
+def download_oligoformer_models(force: bool = False) -> None:
+    """Download RNA-FM weights and TargetScan 8.0 human refs into the model volume."""
+    if not force:
+        CONF.output_volume.reload()
+        MODEL_VOLUME.reload()
+        if (
+            APP_INFO.model_rnafm_redevelop_dir.is_dir()
+            and _targetscan_ref_identity_matches_model()
+        ):
+            print("💊 OligoFormer models and TargetScan 8.0 human refs available")
+            return
+    with _cache_build_lock(
+        "targetscan-reference-state",
+        "global",
+        rebuild=True,
+    ) as owns_reference_state:
+        if not owns_reference_state:
+            raise RuntimeError(
+                "OligoFormer reference-state publication was not serialized"
+            )
+        MODEL_VOLUME.reload()
+        _download_oligoformer_models_locked(force)
 
 
 def _run_rnaplfold_for_record(
@@ -998,14 +1221,14 @@ def _run_rnaplfold_for_record(
 @app.function(
     cpu=APP_INFO.default_targetscan_rnaplfold_workers,
     memory=(1024, 16384),
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(model_volume=True, model_ro=False),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True),
 )
 def run_oligoformer_targetscan_rnaplfold_shard(
     spec: TargetscanRnaPlfoldShardSpec,
 ) -> int:
     """Populate one shard of cached TargetScan RNAplfold outputs."""
-    MODEL_VOLUME.reload()
+    CONF.output_volume.reload()
     records = _read_fasta_pairs(Path(spec.shard_path))
     output_dir = Path(spec.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1035,7 +1258,7 @@ def run_oligoformer_targetscan_rnaplfold_shard(
             max_parallel=local_workers,
         )
     created = sum(created_flags)
-    MODEL_VOLUME.commit()
+    CONF.output_volume.commit()
     print(
         "💊 OligoFormer TargetScan RNAplfold shard "
         f"{spec.shard_index} created {created}/{len(records)} outputs"
@@ -1043,28 +1266,23 @@ def run_oligoformer_targetscan_rnaplfold_shard(
     return created
 
 
-@app.function(
-    cpu=(0.125, 8.125),
-    memory=(1024, 32768),
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(model_volume=True, model_ro=False),
-)
-def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
-    """Build or reuse cached TargetScan RNAplfold outputs for all-human refs."""
+def _build_targetscan_rnaplfold_cache(force: bool) -> None:
+    """Build the TargetScan RNAplfold cache while holding its build lock."""
     import shutil
 
     import orjson
 
+    CONF.output_volume.reload()
     MODEL_VOLUME.reload()
     _ensure_human_refs()
     if _targetscan_rnaplfold_cache_ready() and not force:
-        print("🧬 OligoFormer TargetScan RNAplfold cache already available")
+        print("💊 OligoFormer TargetScan RNAplfold cache already available")
         return
 
     cache_dir = APP_INFO.targetscan_rnaplfold_cache_dir
     shard_dir = APP_INFO.targetscan_rnaplfold_shard_dir
     marker_path = APP_INFO.targetscan_rnaplfold_marker_path
-    if force:
+    if force or marker_path.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
         shutil.rmtree(shard_dir, ignore_errors=True)
         marker_path.unlink(missing_ok=True)
@@ -1095,7 +1313,7 @@ def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
             )
         )
 
-    MODEL_VOLUME.commit()
+    CONF.output_volume.commit()
     node_count = _bounded_node_count(
         len(shard_specs),
         env_name=APP_INFO.targetscan_rnaplfold_nodes_env,
@@ -1106,7 +1324,7 @@ def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
         APP_INFO.default_targetscan_rnaplfold_workers,
     )
     print(
-        "🧬 Preparing OligoFormer TargetScan RNAplfold cache for "
+        "💊 Preparing OligoFormer TargetScan RNAplfold cache for "
         f"{len(records)} UTRs across {len(shard_specs)} shards on up to "
         f"{node_count} CPU nodes with {local_workers} workers each"
     )
@@ -1116,7 +1334,7 @@ def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
         max_parallel=node_count,
     )
 
-    MODEL_VOLUME.reload()
+    CONF.output_volume.reload()
     missing = [
         name
         for name, _ in records
@@ -1130,7 +1348,7 @@ def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
     sample_indexes = sorted({0, len(records) // 2, len(records) - 1})
     marker_path.write_bytes(
         orjson.dumps(
-            APP_INFO.targetscan_rnaplfold_metadata
+            _targetscan_rnaplfold_expected_metadata()
             | {
                 "record_count": len(records),
                 "shard_count": len(shard_specs),
@@ -1138,8 +1356,50 @@ def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
             }
         )
     )
-    MODEL_VOLUME.commit()
-    print(f"🧬 OligoFormer TargetScan RNAplfold cache committed: {len(records)} UTRs")
+    CONF.output_volume.commit()
+    print(f"💊 OligoFormer TargetScan RNAplfold cache committed: {len(records)} UTRs")
+
+
+@app.function(
+    cpu=(0.125, 8.125),
+    memory=(1024, 32768),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
+    """Build or reuse cached TargetScan RNAplfold outputs for all-human refs."""
+    CONF.output_volume.reload()
+    MODEL_VOLUME.reload()
+    _ensure_human_refs()
+    if not _targetscan_ref_identity_matches_model():
+        raise FileNotFoundError(
+            "OligoFormer human reference identity does not match the model volume. "
+            "Run download_oligoformer_models first."
+        )
+    if _targetscan_rnaplfold_cache_ready() and not force:
+        print("💊 OligoFormer TargetScan RNAplfold cache already available")
+        return
+    with _cache_build_lock(
+        "targetscan-reference-state",
+        "global",
+        rebuild=True,
+    ) as owns_cache_build:
+        CONF.output_volume.reload()
+        MODEL_VOLUME.reload()
+        _ensure_human_refs()
+        if not _targetscan_ref_identity_matches_model():
+            raise FileNotFoundError(
+                "OligoFormer human reference identity changed during RNAplfold "
+                "setup. Run download_oligoformer_models first."
+            )
+        if _targetscan_rnaplfold_cache_ready() and (not force or not owns_cache_build):
+            print("💊 OligoFormer TargetScan RNAplfold cache already available")
+            return
+        if not owns_cache_build:
+            raise RuntimeError(
+                "OligoFormer RNAplfold cache was marked complete without outputs"
+            )
+        _build_targetscan_rnaplfold_cache(force)
 
 
 ##########################################
@@ -1177,31 +1437,45 @@ def _ensure_human_refs() -> None:
         )
 
 
-def _cache_key_for_run(
+def _efficacy_key_for_run(
     *,
     mrna_fasta_bytes: bytes,
     sirna_fasta_bytes: bytes | None,
-    off_target: bool,
-    toxicity: bool,
-    all_human: bool,
+    functionality_filter: bool,
+    force_generation: str | None = None,
+) -> str:
+    """Return a deterministic key for GPU efficacy outputs."""
+    return hash_string(
+        "\n".join((
+            CONF.name,
+            CONF.version or "",
+            CONF.repo_commit_hash or "",
+            f"mrna:{_hash_bytes(mrna_fasta_bytes)}",
+            f"sirna:{_hash_bytes(sirna_fasta_bytes)}",
+            f"functionality_filter:{int(functionality_filter)}",
+            f"force_generation:{force_generation or ''}",
+        ))
+    )
+
+
+def _cache_key_for_run(
+    *,
+    efficacy_key: str,
     utr_bytes: bytes | None,
     orf_bytes: bytes | None,
-    top_n: int,
-    functionality_filter: bool,
-    pita_threshold: float,
-    targetscan_threshold: float,
-    toxicity_threshold: float,
+    config: OligoformerRunConfig,
+    reference_identity: str | None = None,
 ) -> str:
-    """Return a deterministic cache key for one OligoFormer run."""
+    """Return a deterministic key for reusable off-target evidence."""
     ref_parts = ["off-target=0"]
-    if off_target:
-        ref_parts = [f"all-human={int(all_human)}"]
-        if all_human:
-            _ensure_human_refs()
-            ref_parts.extend(
-                f"{path.name}:{_hash_path(path)}"
-                for path in APP_INFO.model_human_ref_paths
-            )
+    if config.off_target:
+        ref_parts = [f"all-human={int(config.all_human)}"]
+        if config.all_human:
+            if reference_identity is None:
+                raise ValueError(
+                    "Full-human off-target caching requires reference identity"
+                )
+            ref_parts.append(f"human-ref-identity:{reference_identity}")
         else:
             ref_parts.extend((
                 f"utr:{_hash_bytes(utr_bytes)}",
@@ -1210,20 +1484,34 @@ def _cache_key_for_run(
 
     return hash_string(
         "\n".join((
-            CONF.name,
-            CONF.version or "",
-            CONF.repo_commit_hash or "",
-            f"mrna:{_hash_bytes(mrna_fasta_bytes)}",
-            f"sirna:{_hash_bytes(sirna_fasta_bytes)}",
-            f"off_target:{int(off_target)}",
-            f"off_target_cache_salt:{APP_INFO.off_target_cache_salt if off_target else ''}",
-            f"toxicity:{int(toxicity)}",
-            f"top_n:{top_n if off_target else ''}",
-            f"functionality_filter:{int(functionality_filter)}",
-            f"pita_threshold:{pita_threshold if off_target else ''}",
-            f"targetscan_threshold:{targetscan_threshold if off_target else ''}",
-            f"toxicity_threshold:{toxicity_threshold if toxicity else ''}",
+            efficacy_key,
+            f"off_target:{int(config.off_target)}",
+            "off_target_cache_salt:"
+            f"{APP_INFO.off_target_cache_salt if config.off_target else ''}",
+            f"top_n:{config.top_n if config.off_target else ''}",
             *ref_parts,
+        ))
+    )
+
+
+def _postprocess_key_for_run(
+    *,
+    cache_key: str,
+    config: OligoformerRunConfig,
+) -> str:
+    """Return a key for one final-table filtering configuration."""
+    return hash_string(
+        "\n".join((
+            cache_key,
+            APP_INFO.postprocess_cache_salt,
+            f"off_target:{int(config.off_target)}",
+            f"toxicity:{int(config.toxicity)}",
+            f"functionality_filter:{int(config.functionality_filter)}",
+            f"pita_threshold:{config.pita_threshold if config.off_target else ''}",
+            "targetscan_threshold:"
+            f"{config.targetscan_threshold if config.off_target else ''}",
+            "toxicity_threshold:"
+            f"{config.toxicity_threshold if config.toxicity else ''}",
         ))
     )
 
@@ -1241,6 +1529,7 @@ def _write_cache_marker(
     layout.markers_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "cache_key": plan.cache_key,
+        "postprocess_key": plan.postprocess_key,
         "output_stems": list(plan.output_stems),
     }
     if extra_metadata is not None:
@@ -1603,7 +1892,7 @@ def _run_pita_prepare_utr_shard(spec: PitaPrepareUtrShardSpec) -> str:
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True),
 )
 def run_oligoformer_pita_prepare_utr_shard_batch(
@@ -1988,8 +2277,8 @@ def _targetscan_context_shard_ready(spec: TargetscanContextShardSpec) -> bool:
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True, model_volume=True),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True),
 )
 def run_oligoformer_targetscan_context_queue_worker(
     queue_name: str,
@@ -2010,19 +2299,15 @@ def run_oligoformer_targetscan_context_queue_worker(
                 return output_count
             if spec == APP_INFO.targetscan_context_queue_sentinel:
                 return output_count
-            output = _run_targetscan_context_shard(
-                cast(TargetscanContextShardSpec, spec)
-            )
-            CONF.output_volume.commit()
-            del output
+            _run_targetscan_context_shard(cast(TargetscanContextShardSpec, spec))
             output_count += 1
 
-    output_counts = bounded_map(
-        range(local_workers), _worker, max_parallel=local_workers
-    )
-    output_count = sum(output_counts)
-    CONF.output_volume.commit()
-    return output_count
+    try:
+        return sum(
+            bounded_map(range(local_workers), _worker, max_parallel=local_workers)
+        )
+    finally:
+        CONF.output_volume.commit()
 
 
 def _merge_targetscan_context_outputs(
@@ -2118,6 +2403,7 @@ def _run_targetscan_context_batches(
         APP_INFO.targetscan_context_attempts_env,
         APP_INFO.default_targetscan_context_attempts,
     )
+    last_error: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
         CONF.output_volume.reload()
@@ -2180,6 +2466,11 @@ def _run_targetscan_context_batches(
                 queue.put_many(stop_tokens[start : start + put_batch_size])
             for call in worker_calls:
                 call.get()
+        except Exception as exc:
+            last_error = exc
+            for call in worker_calls:
+                with suppress(Exception):
+                    call.cancel(terminate_containers=True)
         except BaseException:
             for call in worker_calls:
                 with suppress(Exception):
@@ -2198,9 +2489,10 @@ def _run_targetscan_context_batches(
         if not missing_outputs:
             return expected_outputs
         if attempt < max_attempts:
+            reason = f" after {type(last_error).__name__}" if last_error else ""
             print(
                 "💊 Retrying OligoFormer TargetScan context scoring for "
-                f"{len(missing_outputs)} missing shards"
+                f"{len(missing_outputs)} missing shards{reason}"
             )
 
     CONF.output_volume.reload()
@@ -2213,10 +2505,13 @@ def _run_targetscan_context_batches(
         preview = ", ".join(missing_outputs[:5])
         if len(missing_outputs) > 5:
             preview += f", ... ({len(missing_outputs)} total)"
-        raise RuntimeError(
+        error = RuntimeError(
             "OligoFormer TargetScan context scoring did not produce all outputs: "
             f"{preview}"
         )
+        if last_error is not None:
+            raise error from last_error
+        raise error
     return expected_outputs
 
 
@@ -2351,7 +2646,7 @@ def _finalize_targetscan_batch_context_plan(
 @app.function(
     cpu=(0.125, 8.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True),
 )
 def finalize_oligoformer_targetscan_batch_context_plan(
@@ -2368,7 +2663,7 @@ def finalize_oligoformer_targetscan_batch_context_plan(
 @app.function(
     cpu=(0.125, 8.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
 def prepare_oligoformer_targetscan_batch_shard(
@@ -2473,6 +2768,78 @@ def _raw_off_target_ready(raw_off_target_dir: Path) -> bool:
     )
 
 
+@contextmanager
+def _cache_build_lock(stage: str, identity: str, *, rebuild: bool = False):
+    """Elect one cache builder using append-only lock generations."""
+    from time import sleep, time
+    from uuid import uuid4
+
+    locks = modal.Dict.from_name(
+        APP_INFO.cache_lock_dict_name,
+        create_if_missing=True,
+    )
+    lock_key = hash_string(f"{stage}\n{identity}")
+    head_key = f"{lock_key}:head"
+    owner = {"id": uuid4().hex, "acquired_at": time()}
+    stored_head = locks.get(head_key, 0)
+    generation = stored_head if isinstance(stored_head, int) else 0
+    owns_generation = False
+    rebuild_pending = rebuild
+    while True:
+        owner_key = f"{lock_key}:owner:{generation}"
+        status_key = f"{lock_key}:status:{generation}"
+        if locks.put(owner_key, owner, skip_if_exists=True):
+            owns_generation = True
+            locks.put(head_key, generation)
+            break
+        status = locks.get(status_key)
+        if isinstance(status, dict) and status.get("state") == "complete":
+            if locks.get(f"{lock_key}:owner:{generation + 1}") is not None:
+                generation += 1
+                continue
+            if rebuild_pending:
+                rebuild_pending = False
+                generation += 1
+                continue
+            break
+        if isinstance(status, dict) and status.get("state") in {
+            "abandoned",
+            "failed",
+        }:
+            generation += 1
+            continue
+        current = locks.get(owner_key)
+        if (
+            isinstance(current, dict)
+            and isinstance(current.get("acquired_at"), (int, float))
+            and time() - current["acquired_at"] > APP_INFO.cache_lock_stale_seconds
+        ):
+            locks.put(
+                status_key,
+                {"state": "abandoned", "recorded_at": time()},
+                skip_if_exists=True,
+            )
+            continue
+        sleep(APP_INFO.cache_lock_poll_seconds)
+    try:
+        yield owns_generation
+    except BaseException:
+        if owns_generation:
+            locks.put(
+                status_key,
+                {"state": "failed", "recorded_at": time()},
+                skip_if_exists=True,
+            )
+        raise
+    else:
+        if owns_generation:
+            locks.put(
+                status_key,
+                {"state": "complete", "recorded_at": time()},
+                skip_if_exists=True,
+            )
+
+
 def _cleanup_off_target_transients(raw_off_target_dir: Path) -> None:
     """Remove bulky shard inputs after merged off-target evidence exists."""
     import shutil
@@ -2571,7 +2938,7 @@ def _run_pita_row_shard(spec: PitaRowShardSpec) -> str:
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True),
 )
 def run_oligoformer_pita_row_shard_batch(
@@ -2681,23 +3048,7 @@ def _finalize_oligoformer_pita_shard(
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True),
-)
-def finalize_oligoformer_pita_shard(
-    prepared: PreparedOffTargetShard,
-) -> OffTargetShardResult:
-    """Finalize one per-siRNA PITA table from cached row shards."""
-    CONF.output_volume.reload()
-    result = _finalize_oligoformer_pita_shard(prepared)
-    CONF.output_volume.commit()
-    return result
-
-
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True),
 )
 def finalize_oligoformer_pita_shard_batch(
@@ -2760,7 +3111,7 @@ def _prepare_pita_target_discovery_plan_for_spec(
 @app.function(
     cpu=(0.125, 4.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True),
 )
 def run_oligoformer_targetscan_branch(
@@ -2819,7 +3170,7 @@ def run_oligoformer_targetscan_branch(
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True),
 )
 def run_oligoformer_pita_branch(
@@ -3205,7 +3556,7 @@ def _write_final_outputs(result: pl.DataFrame, output_dir: Path, stem: str) -> N
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True, model_volume=True),
+    volumes=CONF.mounts(output_volume=True),
 )
 def prepare_oligoformer_run(
     mrna_fasta_bytes: bytes,
@@ -3221,6 +3572,7 @@ def prepare_oligoformer_run(
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
     force: bool = False,
+    force_generation: str | None = None,
 ) -> OligoformerRunPlan:
     """Prepare or discover a volume-backed OligoFormer run cache."""
     if top_n != -1 and top_n < 1:
@@ -3232,29 +3584,51 @@ def prepare_oligoformer_run(
         )
 
     output_stems = _fasta_record_names(mrna_fasta_bytes)
+    if force and force_generation is None:
+        from uuid import uuid4
+
+        force_generation = uuid4().hex
     CONF.output_volume.reload()
-    cache_key = _cache_key_for_run(
-        mrna_fasta_bytes=mrna_fasta_bytes,
-        sirna_fasta_bytes=sirna_fasta_bytes,
+    config = OligoformerRunConfig(
         off_target=off_target,
         toxicity=toxicity,
         all_human=all_human,
-        utr_bytes=utr_bytes,
-        orf_bytes=orf_bytes,
         top_n=top_n,
         functionality_filter=functionality_filter,
         pita_threshold=pita_threshold,
         targetscan_threshold=targetscan_threshold,
         toxicity_threshold=toxicity_threshold,
     )
+    efficacy_key = _efficacy_key_for_run(
+        mrna_fasta_bytes=mrna_fasta_bytes,
+        sirna_fasta_bytes=sirna_fasta_bytes,
+        functionality_filter=functionality_filter,
+        force_generation=force_generation if force else None,
+    )
+    reference_identity = (
+        _targetscan_ref_identity_digest() if off_target and all_human else None
+    )
+    cache_key = _cache_key_for_run(
+        efficacy_key=efficacy_key,
+        utr_bytes=utr_bytes,
+        orf_bytes=orf_bytes,
+        config=config,
+        reference_identity=reference_identity,
+    )
+    postprocess_key = _postprocess_key_for_run(
+        cache_key=cache_key,
+        config=config,
+    )
 
     layout = _run_layout_for_cache_key(cache_key, output_stems)
-    if force and layout.run_root.exists():
-        import shutil
-
-        shutil.rmtree(layout.run_root)
-
-    plan = _build_plan(cache_key, output_stems)
+    plan = _build_plan(
+        cache_key,
+        efficacy_key,
+        output_stems,
+        config=config,
+        postprocess_key=postprocess_key,
+        reference_identity=reference_identity,
+    )
     if plan.final_ready:
         return plan
 
@@ -3267,14 +3641,21 @@ def prepare_oligoformer_run(
         (layout.inputs_dir / "orf.txt").write_bytes(orf_bytes or b"")
 
     CONF.output_volume.commit()
-    return _build_plan(cache_key, output_stems)
+    return _build_plan(
+        cache_key,
+        efficacy_key,
+        output_stems,
+        config=config,
+        postprocess_key=postprocess_key,
+        reference_identity=reference_identity,
+    )
 
 
 @app.function(
     gpu=CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
 def run_oligoformer_efficacy(
@@ -3282,49 +3663,250 @@ def run_oligoformer_efficacy(
     functionality_filter: bool = True,
 ) -> OligoformerRunPlan:
     """Run GPU efficacy prediction into the output-volume cache."""
+    if functionality_filter != plan.config.functionality_filter:
+        raise ValueError(
+            "OligoFormer efficacy settings do not match the prepared run plan"
+        )
     CONF.output_volume.reload()
-    if plan.efficacy_ready:
-        return plan
-    if not APP_INFO.model_rnafm_redevelop_dir.is_dir():
-        raise FileNotFoundError(
-            "OligoFormer RNA-FM weights are missing. Run "
-            "download_oligoformer_models first."
+    refreshed_plan = _build_plan(
+        plan.cache_key,
+        plan.efficacy_key,
+        plan.output_stems,
+        plan.run_root,
+        config=plan.config,
+        postprocess_key=plan.postprocess_key,
+        reference_identity=plan.reference_identity,
+    )
+    if refreshed_plan.efficacy_ready:
+        return refreshed_plan
+
+    with _cache_build_lock(
+        "efficacy",
+        plan.efficacy_key,
+    ) as owns_cache_build:
+        CONF.output_volume.reload()
+        refreshed_plan = _build_plan(
+            plan.cache_key,
+            plan.efficacy_key,
+            plan.output_stems,
+            plan.run_root,
+            config=plan.config,
+            postprocess_key=plan.postprocess_key,
+            reference_identity=plan.reference_identity,
+        )
+        if refreshed_plan.efficacy_ready:
+            return refreshed_plan
+        if not owns_cache_build:
+            raise RuntimeError(
+                "OligoFormer efficacy cache was marked complete without outputs"
+            )
+        if not APP_INFO.model_rnafm_redevelop_dir.is_dir():
+            raise FileNotFoundError(
+                "OligoFormer RNA-FM weights are missing. Run "
+                "download_oligoformer_models first."
+            )
+
+        _ensure_rnafm_runtime()
+        import orjson
+
+        input_layout = AppRunLayout.from_run_root(plan.run_root)
+        efficacy_layout = _efficacy_layout_for_key(
+            plan.efficacy_key,
+            plan.output_stems,
+        )
+        efficacy_dir = Path(plan.efficacy_dir)
+        efficacy_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "python",
+            "scripts/main.py",
+            "-i",
+            "1",
+            "-i1",
+            str(input_layout.inputs_dir / "mrna.fa"),
+            "--output_dir",
+            f"{efficacy_dir}/",
+            "--biomodals_stage",
+            "efficacy",
+        ]
+
+        sirna_fasta = input_layout.inputs_dir / "sirna.fa"
+        if sirna_fasta.exists():
+            cmd.extend(["-i2", str(sirna_fasta)])
+        if not functionality_filter:
+            cmd.append("--no_func")
+
+        run_command(cmd, cwd=CONF.git_clone_dir)
+        efficacy_layout.markers_dir.mkdir(parents=True, exist_ok=True)
+        _marker_path(efficacy_layout, "efficacy.done").write_bytes(
+            orjson.dumps({
+                "efficacy_key": plan.efficacy_key,
+                "output_stems": list(plan.output_stems),
+            })
+        )
+        CONF.output_volume.commit()
+        return _build_plan(
+            plan.cache_key,
+            plan.efficacy_key,
+            plan.output_stems,
+            plan.run_root,
+            config=plan.config,
+            postprocess_key=plan.postprocess_key,
+            reference_identity=plan.reference_identity,
         )
 
-    _ensure_rnafm_runtime()
+
+def _run_oligoformer_postprocess_locked(
+    plan: OligoformerRunPlan,
+    off_target: bool = False,
+    toxicity: bool = False,
+    all_human: bool = False,
+    top_n: int = APP_INFO.default_top_n,
+    functionality_filter: bool = True,
+    pita_threshold: float = -10.0,
+    targetscan_threshold: float = 1.0,
+    toxicity_threshold: float = 50.0,
+    targetscan_ref_shard_size: int | None = None,
+) -> bytes:
+    """Build final tables while holding their cache-generation lock."""
+    CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(plan.run_root)
-    efficacy_dir = Path(plan.efficacy_dir)
-    efficacy_dir.mkdir(parents=True, exist_ok=True)
+    refreshed_plan = _build_plan(
+        plan.cache_key,
+        plan.efficacy_key,
+        plan.output_stems,
+        plan.run_root,
+        config=plan.config,
+        postprocess_key=plan.postprocess_key,
+        reference_identity=plan.reference_identity,
+    )
+    if refreshed_plan.final_ready:
+        return _package_output_tables(
+            Path(refreshed_plan.output_dir), refreshed_plan.output_stems
+        )
+    if not refreshed_plan.efficacy_ready:
+        raise FileNotFoundError(
+            "OligoFormer efficacy outputs are incomplete for "
+            f"{refreshed_plan.cache_key}"
+        )
 
-    cmd = [
-        "python",
-        "scripts/main.py",
-        "-i",
-        "1",
-        "-i1",
-        str(layout.inputs_dir / "mrna.fa"),
-        "--output_dir",
-        f"{efficacy_dir}/",
-        "--biomodals_stage",
-        "efficacy",
-    ]
+    efficacy_dir = Path(refreshed_plan.efficacy_dir)
+    output_dir = Path(refreshed_plan.output_dir)
+    if not off_target and not toxicity:
+        _copy_outputs(efficacy_dir, output_dir, refreshed_plan.output_stems)
+    else:
+        needs_reference_guard = (
+            off_target and all_human and not refreshed_plan.evidence_ready
+        )
+        if off_target and all_human:
+            if needs_reference_guard:
+                _ensure_human_refs()
+                if not _targetscan_rnaplfold_cache_ready():
+                    prepare_oligoformer_targetscan_rnaplfold_cache.remote(force=False)
+                    CONF.output_volume.reload()
+            utr_path = str(APP_INFO.model_ref_dir / "human_UTR.txt")
+            orf_path = str(APP_INFO.model_ref_dir / "human_ORF.txt")
+        else:
+            utr_path = str(layout.inputs_dir / "utr.txt")
+            orf_path = str(layout.inputs_dir / "orf.txt")
 
-    sirna_fasta = layout.inputs_dir / "sirna.fa"
-    if sirna_fasta.exists():
-        cmd.extend(["-i2", str(sirna_fasta)])
-    if not functionality_filter:
-        cmd.append("--no_func")
+        reference_guard = (
+            _cache_build_lock(
+                "targetscan-reference-state",
+                "global",
+                rebuild=True,
+            )
+            if needs_reference_guard
+            else nullcontext(False)
+        )
+        with reference_guard as owns_reference_state:
+            if needs_reference_guard:
+                if not owns_reference_state:
+                    raise RuntimeError(
+                        "OligoFormer reference-state access was not serialized"
+                    )
+                CONF.output_volume.reload()
+                MODEL_VOLUME.reload()
+                if (
+                    refreshed_plan.reference_identity is None
+                    or _targetscan_ref_identity_digest()
+                    != refreshed_plan.reference_identity
+                    or not _targetscan_ref_identity_matches_model()
+                ):
+                    raise FileNotFoundError(
+                        "OligoFormer human references changed after run preparation. "
+                        "Prepare and submit the run again."
+                    )
+                if not _targetscan_rnaplfold_cache_ready():
+                    raise FileNotFoundError(
+                        "OligoFormer RNAplfold references changed after preparation. "
+                        "Prepare and submit the run again."
+                    )
 
-    run_command(cmd, cwd=CONF.git_clone_dir)
-    _write_cache_marker(layout, "efficacy.done", plan)
+            for stem in refreshed_plan.output_stems:
+                result = _read_efficacy_output(efficacy_dir / f"{stem}.txt")
+                if off_target:
+                    evidence_dir = layout.prep_dir / "off_target" / stem
+                    needs_lock = not _raw_off_target_ready(evidence_dir)
+                    lock = (
+                        _cache_build_lock(
+                            "off-target-evidence",
+                            f"{refreshed_plan.run_root}\n{stem}",
+                        )
+                        if needs_lock
+                        else nullcontext()
+                    )
+                    with lock as owns_cache_build:
+                        if needs_lock:
+                            CONF.output_volume.reload()
+                            if not owns_cache_build and not _raw_off_target_ready(
+                                evidence_dir
+                            ):
+                                raise RuntimeError(
+                                    "OligoFormer off-target evidence cache was marked "
+                                    "complete without outputs"
+                                )
+                        result = _apply_off_target_filters(
+                            result=result,
+                            run_root=refreshed_plan.run_root,
+                            stem=stem,
+                            utr_path=utr_path,
+                            orf_path=orf_path,
+                            output_dir=output_dir,
+                            top_n=top_n,
+                            pita_threshold=pita_threshold,
+                            targetscan_threshold=targetscan_threshold,
+                            targetscan_ref_shard_size=targetscan_ref_shard_size,
+                        )
+                        if owns_cache_build:
+                            CONF.output_volume.commit()
+                if toxicity:
+                    result = _apply_toxicity_filters(
+                        result=result,
+                        toxicity_threshold=toxicity_threshold,
+                    )
+                result = _apply_final_filter(
+                    result=result,
+                    off_target=off_target,
+                    toxicity=toxicity,
+                    functionality_filter=functionality_filter,
+                )
+                _write_final_outputs(result, output_dir, stem)
+
+    _write_cache_marker(
+        layout,
+        _final_marker_name(refreshed_plan.postprocess_key),
+        refreshed_plan,
+        extra_metadata={"postprocess_cache_salt": APP_INFO.postprocess_cache_salt},
+    )
     CONF.output_volume.commit()
-    return _build_plan(plan.cache_key, plan.output_stems, plan.run_root)
+    return _package_output_tables(output_dir, refreshed_plan.output_stems)
 
 
 @app.function(
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
+    timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
 def run_oligoformer_postprocess(
@@ -3342,75 +3924,55 @@ def run_oligoformer_postprocess(
     """Run CPU post-processing and return packaged OligoFormer outputs."""
     if targetscan_ref_shard_size is not None and targetscan_ref_shard_size < 1:
         raise ValueError("targetscan_ref_shard_size must be a positive integer")
-    CONF.output_volume.reload()
-    layout = AppRunLayout.from_run_root(plan.run_root)
-    refreshed_plan = _build_plan(plan.cache_key, plan.output_stems, plan.run_root)
-    if refreshed_plan.final_ready:
-        return _package_output_tables(
-            Path(refreshed_plan.output_dir), refreshed_plan.output_stems
-        )
-    if not refreshed_plan.efficacy_ready:
-        raise FileNotFoundError(
-            "OligoFormer efficacy outputs are incomplete for "
-            f"{refreshed_plan.cache_key}"
-        )
-
-    efficacy_dir = Path(refreshed_plan.efficacy_dir)
-    output_dir = Path(refreshed_plan.output_dir)
-    if not off_target and not toxicity:
-        _copy_outputs(efficacy_dir, output_dir, refreshed_plan.output_stems)
-    else:
-        if off_target and all_human:
-            _ensure_human_refs()
-            prepare_oligoformer_targetscan_rnaplfold_cache.remote(force=False)
-            utr_path = str(APP_INFO.model_ref_dir / "human_UTR.txt")
-            orf_path = str(APP_INFO.model_ref_dir / "human_ORF.txt")
-        else:
-            utr_path = str(layout.inputs_dir / "utr.txt")
-            orf_path = str(layout.inputs_dir / "orf.txt")
-
-        for stem in refreshed_plan.output_stems:
-            result = _read_efficacy_output(efficacy_dir / f"{stem}.txt")
-            if off_target:
-                result = _apply_off_target_filters(
-                    result=result,
-                    run_root=refreshed_plan.run_root,
-                    stem=stem,
-                    utr_path=utr_path,
-                    orf_path=orf_path,
-                    output_dir=output_dir,
-                    top_n=top_n,
-                    pita_threshold=pita_threshold,
-                    targetscan_threshold=targetscan_threshold,
-                    targetscan_ref_shard_size=targetscan_ref_shard_size,
-                )
-            if toxicity:
-                result = _apply_toxicity_filters(
-                    result=result,
-                    toxicity_threshold=toxicity_threshold,
-                )
-            result = _apply_final_filter(
-                result=result,
-                off_target=off_target,
-                toxicity=toxicity,
-                functionality_filter=functionality_filter,
-            )
-            _write_final_outputs(result, output_dir, stem)
-
-        if off_target:
-            import shutil
-
-            for stem in refreshed_plan.output_stems:
-                shutil.rmtree(layout.prep_dir / "off_target" / stem, ignore_errors=True)
-
-    _write_cache_marker(
-        layout,
-        "final.done",
-        refreshed_plan,
-        extra_metadata={"postprocess_cache_salt": APP_INFO.postprocess_cache_salt},
+    requested_config = OligoformerRunConfig(
+        off_target=off_target,
+        toxicity=toxicity,
+        all_human=all_human,
+        top_n=top_n,
+        functionality_filter=functionality_filter,
+        pita_threshold=pita_threshold,
+        targetscan_threshold=targetscan_threshold,
+        toxicity_threshold=toxicity_threshold,
     )
-    CONF.output_volume.commit()
-    return _package_output_tables(output_dir, refreshed_plan.output_stems)
+    if requested_config != plan.config:
+        raise ValueError(
+            "OligoFormer post-processing settings do not match the prepared run plan"
+        )
+
+    with _cache_build_lock(
+        "final-tables",
+        f"{plan.run_root}\n{plan.postprocess_key}",
+    ) as owns_final_build:
+        CONF.output_volume.reload()
+        refreshed_plan = _build_plan(
+            plan.cache_key,
+            plan.efficacy_key,
+            plan.output_stems,
+            plan.run_root,
+            config=plan.config,
+            postprocess_key=plan.postprocess_key,
+            reference_identity=plan.reference_identity,
+        )
+        if refreshed_plan.final_ready:
+            return _package_output_tables(
+                Path(refreshed_plan.output_dir), refreshed_plan.output_stems
+            )
+        if not owns_final_build:
+            raise RuntimeError(
+                "OligoFormer final-table cache was marked complete without outputs"
+            )
+        return _run_oligoformer_postprocess_locked(
+            plan=plan,
+            off_target=off_target,
+            toxicity=toxicity,
+            all_human=all_human,
+            top_n=top_n,
+            functionality_filter=functionality_filter,
+            pita_threshold=pita_threshold,
+            targetscan_threshold=targetscan_threshold,
+            toxicity_threshold=toxicity_threshold,
+            targetscan_ref_shard_size=targetscan_ref_shard_size,
+        )
 
 
 @app.function(
@@ -3422,7 +3984,15 @@ def run_oligoformer_postprocess(
 def package_oligoformer_outputs(plan: OligoformerRunPlan) -> bytes:
     """Return cached OligoFormer outputs as standalone tarball bytes."""
     CONF.output_volume.reload()
-    refreshed_plan = _build_plan(plan.cache_key, plan.output_stems, plan.run_root)
+    refreshed_plan = _build_plan(
+        plan.cache_key,
+        plan.efficacy_key,
+        plan.output_stems,
+        plan.run_root,
+        config=plan.config,
+        postprocess_key=plan.postprocess_key,
+        reference_identity=plan.reference_identity,
+    )
     if not refreshed_plan.final_ready:
         raise FileNotFoundError(
             f"OligoFormer final outputs are incomplete for {refreshed_plan.cache_key}"
@@ -3530,35 +4100,91 @@ def submit_oligoformer_task(
         orf_bytes = orf_path.read_bytes()
 
     print(f"🧬 Submitting OligoFormer run '{run_name}'")
-    download_oligoformer_models.remote(force=False)
-    plan = prepare_oligoformer_run.remote(
-        mrna_fasta_bytes=input_path.read_bytes(),
-        sirna_fasta_bytes=sirna_fasta_bytes,
-        off_target=off_target,
-        toxicity=toxicity,
-        all_human=all_human,
-        utr_bytes=utr_bytes,
-        orf_bytes=orf_bytes,
-        top_n=top_n,
-        functionality_filter=functionality_filter,
-        pita_threshold=pita_threshold,
-        targetscan_threshold=targetscan_threshold,
-        toxicity_threshold=toxicity_threshold,
-        force=force,
-    )
+    force_generation = None
+    if force:
+        from uuid import uuid4
+
+        force_generation = uuid4().hex
+    prepare_kwargs = {
+        "mrna_fasta_bytes": input_path.read_bytes(),
+        "sirna_fasta_bytes": sirna_fasta_bytes,
+        "off_target": off_target,
+        "toxicity": toxicity,
+        "all_human": all_human,
+        "utr_bytes": utr_bytes,
+        "orf_bytes": orf_bytes,
+        "top_n": top_n,
+        "functionality_filter": functionality_filter,
+        "pita_threshold": pita_threshold,
+        "targetscan_threshold": targetscan_threshold,
+        "toxicity_threshold": toxicity_threshold,
+        "force": force,
+        "force_generation": force_generation,
+    }
+    model_assets_ready = False
+    try:
+        plan = prepare_oligoformer_run.remote(**prepare_kwargs)
+    except FileNotFoundError:
+        if not (off_target and all_human):
+            raise
+        download_oligoformer_models.remote(force=False)
+        model_assets_ready = True
+        plan = prepare_oligoformer_run.remote(**prepare_kwargs)
+
+    needs_human_reference_cache = off_target and all_human and not plan.evidence_ready
+    if (
+        not plan.final_ready
+        and (not plan.efficacy_ready or needs_human_reference_cache)
+        and not model_assets_ready
+    ):
+        download_oligoformer_models.remote(force=False)
+        model_assets_ready = True
+        if off_target and all_human:
+            plan = prepare_oligoformer_run.remote(**prepare_kwargs)
+
     if plan.final_ready:
         print(f"🧬 Reusing cached OligoFormer outputs: {plan.run_root}")
         tarball_bytes = package_oligoformer_outputs.remote(plan)
     else:
+        needs_human_reference_cache = (
+            off_target and all_human and not plan.evidence_ready
+        )
+
+        reference_call = None
+        if needs_human_reference_cache:
+            print("🧬 Preparing reusable TargetScan RNAplfold references")
+            reference_call = prepare_oligoformer_targetscan_rnaplfold_cache.spawn(
+                force=False
+            )
+
+        efficacy_call = None
         if plan.efficacy_ready:
             print(f"🧬 Reusing cached OligoFormer efficacy: {plan.run_root}")
             efficacy_plan = plan
         else:
             print("🧬 Running OligoFormer efficacy on GPU")
-            efficacy_plan = run_oligoformer_efficacy.remote(
+            efficacy_call = run_oligoformer_efficacy.spawn(
                 plan=plan,
                 functionality_filter=functionality_filter,
             )
+
+        if efficacy_call is not None and reference_call is not None:
+            try:
+                efficacy_plan_raw, _ = modal.FunctionCall.gather(
+                    efficacy_call,
+                    reference_call,
+                )
+            except BaseException:
+                for call in (efficacy_call, reference_call):
+                    with suppress(Exception):
+                        call.cancel()
+                raise
+            efficacy_plan = cast(OligoformerRunPlan, efficacy_plan_raw)
+        elif efficacy_call is not None:
+            efficacy_plan = efficacy_call.get()
+        elif reference_call is not None:
+            reference_call.get()
+
         print("🧬 Running OligoFormer CPU post-processing")
         tarball_bytes = run_oligoformer_postprocess.remote(
             plan=efficacy_plan,

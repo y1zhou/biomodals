@@ -1853,6 +1853,44 @@ def test_run_targetscan_context_batches_retries_failed_workers(
     assert queues == {}
 
 
+def test_targetscan_context_shard_retries_interrupted_commands_atomically(
+    tmp_path: Path, monkeypatch, capfd
+):
+    attempts: list[list[str]] = []
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    script_path = repo_dir / "off-target/targetscan/targetscan_70_context_scores.pl"
+    script_path.parent.mkdir(parents=True)
+    script_path.write_text("script\n", encoding="utf-8")
+    spec = oligoformer_app.TargetscanContextShardSpec(
+        shard_index=7,
+        common_dir=str(tmp_path / "common"),
+        targets_path=str(tmp_path / "targets.txt"),
+        output_path=str(tmp_path / "outputs" / "context.txt"),
+        log_path=str(tmp_path / "logs" / "context.log"),
+        rnaplfold_cache_dir="",
+    )
+
+    def fake_run_command(cmd, **_kwargs):
+        attempts.append(cmd)
+        tmp_output_path = Path(cmd[-1])
+        tmp_output_path.write_text("partial\n", encoding="utf-8")
+        if len(attempts) == 1:
+            raise sp.CalledProcessError(-2, cmd)
+        tmp_output_path.write_text("success\n", encoding="utf-8")
+
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+    monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
+    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_attempts_env, "2")
+
+    assert oligoformer_app._run_targetscan_context_shard(spec) == spec.output_path
+    output_path = Path(spec.output_path)
+    assert output_path.read_text(encoding="utf-8") == "success\n"
+    assert output_path.with_suffix(output_path.suffix + ".done").exists()
+    assert len(attempts) == 2
+    assert "Retrying OligoFormer TargetScan context shard 7" in capfd.readouterr().out
+
+
 def test_targetscan_context_worker_commits_once_per_worker(tmp_path: Path, monkeypatch):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
@@ -2337,6 +2375,53 @@ def test_targetscan_ref_shard_size_uses_prepare_node_fanout(monkeypatch):
     assert oligoformer_app._targetscan_ref_shard_size(28_352, 100) == 100
 
 
+def test_targetscan_prepare_streams_results_in_node_sized_map_batches(monkeypatch):
+    map_batches = []
+
+    class FakePrepareBatchShard:
+        def map(self, specs):
+            batch = list(specs)
+            map_batches.append(batch)
+            return iter(batch)
+
+        def remote(self, _spec):
+            raise AssertionError("TargetScan preparation must not block per input")
+
+    monkeypatch.setattr(
+        oligoformer_app,
+        "prepare_oligoformer_targetscan_batch_shard",
+        FakePrepareBatchShard(),
+    )
+    monkeypatch.setenv(
+        oligoformer_app.APP_INFO.targetscan_prepare_nodes_env,
+        "2",
+    )
+    specs = [
+        oligoformer_app.TargetscanBatchSpec(
+            run_root="run",
+            output_dir="output",
+            stem="target",
+            ref_shard_size=95,
+            shard_index=index,
+            sirna_path="sirna.fa",
+            sirna_count=1,
+            utr_path="utr.fa",
+            orf_path="orf.fa",
+            rnaplfold_cache_dir="",
+        )
+        for index in range(5)
+    ]
+
+    plans = oligoformer_app._run_targetscan_prepare_batches(specs)
+
+    assert [[spec.shard_index for spec in batch] for batch in map_batches] == [
+        [0, 1],
+        [2, 3],
+        [4],
+    ]
+    assert plans == specs
+
+
 def test_targetscan_batch_reuses_seed_checkpoint_after_interruption(
     tmp_path: Path,
     monkeypatch,
@@ -2471,6 +2556,133 @@ def test_pita_prepare_rejects_missing_reference_files(
         )
 
     assert commands == []
+
+
+def test_pita_prepare_reuses_completed_stage0_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+):
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    repo_dir.joinpath("off-target", "pita").mkdir(parents=True)
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_write_pita_stage0_script",
+        lambda *_args: None,
+    )
+    monkeypatch.setenv(
+        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
+        "2",
+    )
+    utr_path = tmp_path / "human_UTR.txt"
+    orf_path = tmp_path / "human_ORF.txt"
+    utr_path.write_text(">utr\nAAAA\n", encoding="utf-8")
+    orf_path.write_text(">orf\nAAAA\n", encoding="utf-8")
+    spec = oligoformer_app.OffTargetShardSpec(
+        run_root=str(tmp_path / "run"),
+        output_dir=str(tmp_path / "final"),
+        stem="target",
+        index=3,
+        record_name="RNA3",
+        record_sequence="AUGCUAGCUAGCUAGCUAG",
+        utr_path=str(utr_path),
+        orf_path=str(orf_path),
+        row_shard_size=1000,
+    )
+    commands = []
+
+    def fake_run_command(cmd, **_kwargs):
+        commands.append(cmd)
+        shard_root = tmp_path / "first"
+        shard_root.joinpath("target_shard_00003_utr.stab").write_text(
+            "utr1\tAAAA\nutr2\tCCCC\nutr3\tGGGG\n",
+            encoding="utf-8",
+        )
+        shard_root.joinpath("target_shard_00003_mir.stab").write_text(
+            "RNA3\tUUUU\n",
+            encoding="utf-8",
+        )
+        cache_dir = oligoformer_app._off_target_shard_cache_dir(spec)
+        cache_dir.joinpath("target_shard_00003_ext_utr.stab").write_text(
+            "utr\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
+    first_root = tmp_path / "first"
+    first_root.joinpath("off-target", "pita").mkdir(parents=True)
+    first = oligoformer_app._prepare_pita_target_discovery_plan(spec, first_root)
+    second = oligoformer_app._prepare_pita_target_discovery_plan(
+        spec,
+        tmp_path / "second",
+    )
+
+    assert len(commands) == 1
+    assert len(first.utr_shards) == 2
+    assert second.utr_shards == first.utr_shards
+    assert all(
+        Path(shard.input_path).is_relative_to(
+            oligoformer_app._off_target_shard_cache_dir(spec)
+        )
+        for shard in second.utr_shards
+    )
+    assert (
+        oligoformer_app
+        ._off_target_shard_cache_dir(spec)
+        .joinpath("pita_stage0.done")
+        .read_text(encoding="utf-8")
+        == "2"
+    )
+
+
+def test_pita_prepare_wrapper_removes_per_sirna_worktree(
+    tmp_path: Path,
+    monkeypatch,
+):
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    repo_dir.joinpath("off-target", "pita").mkdir(parents=True)
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+    spec = oligoformer_app.OffTargetShardSpec(
+        run_root="run",
+        output_dir="output",
+        stem="target",
+        index=4,
+        record_name="RNA4",
+        record_sequence="AUGCUAGCUAGCUAGCUAG",
+        utr_path="utr.fa",
+        orf_path="orf.fa",
+        row_shard_size=1000,
+    )
+    persistent_path = tmp_path / "outputs-volume" / "persistent.utr.stab"
+    persistent_path.parent.mkdir(parents=True)
+    persistent_path.write_text("utr\n", encoding="utf-8")
+
+    def fake_prepare(inner_spec, shard_root):
+        assert inner_spec is spec
+        shard_root.joinpath("large-transient.stab").write_text(
+            "transient\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            utr_shards=(SimpleNamespace(input_path=str(persistent_path)),)
+        )
+
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_prepare_pita_target_discovery_plan",
+        fake_prepare,
+    )
+    prepare_root = tmp_path / "prepare"
+
+    plan = oligoformer_app._prepare_pita_target_discovery_plan_for_spec(
+        spec=spec,
+        prepare_root=prepare_root,
+    )
+
+    assert Path(plan.utr_shards[0].input_path).exists()
+    assert not prepare_root.joinpath("target_shard_00004").exists()
 
 
 def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(

@@ -1889,6 +1889,37 @@ def _pita_prepare_utr_shard_specs(
     return tuple(specs)
 
 
+def _cached_pita_prepare_utr_shard_specs(
+    *,
+    shard_dir: Path,
+    mir_stab_path: Path,
+    logs_dir: Path,
+    expected_count: int,
+) -> tuple[PitaPrepareUtrShardSpec, ...] | None:
+    """Rebuild a PITA stage0 plan from a complete persistent checkpoint."""
+    input_paths = sorted(shard_dir.glob("*.utr.stab"))
+    if len(input_paths) != expected_count or any(
+        path.stat().st_size == 0 for path in input_paths
+    ):
+        return None
+    return tuple(
+        PitaPrepareUtrShardSpec(
+            shard_index=shard_index,
+            input_path=str(input_path),
+            mir_stab_path=str(mir_stab_path),
+            output_path=str(
+                shard_dir / f"{input_path.name.removesuffix('.utr.stab')}.potential.tsv"
+            ),
+            log_path=str(
+                logs_dir
+                / "pita_prepare_utr_shards"
+                / f"{input_path.name.removesuffix('.utr.stab')}.log"
+            ),
+        )
+        for shard_index, input_path in enumerate(input_paths)
+    )
+
+
 def _run_pita_prepare_utr_shard(spec: PitaPrepareUtrShardSpec) -> str:
     """Run one local UTR STAB shard through PITA potential-target discovery."""
     output_path = Path(spec.output_path)
@@ -2096,6 +2127,9 @@ def _prepare_pita_target_discovery_plan(
     potential_targets_path = cache_dir / "potential_targets.tsv"
     ext_utr_path = cache_dir / f"{spec.stem}_shard_{spec.index:05d}_ext_utr.stab"
     marker_path = cache_dir / "pita_prepare.done"
+    stage0_marker_path = cache_dir / "pita_stage0.done"
+    cached_mir_stab_path = cache_dir / f"{spec.stem}_shard_{spec.index:05d}_mir.stab"
+    stage0_shard_dir = cache_dir / "pita_prepare_utr_shards"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     if (
@@ -2108,6 +2142,31 @@ def _prepare_pita_target_discovery_plan(
             utr_shards=(),
             row_count=int(marker_path.read_text(encoding="utf-8")),
         )
+
+    if (
+        stage0_marker_path.exists()
+        and cached_mir_stab_path.exists()
+        and ext_utr_path.exists()
+    ):
+        try:
+            expected_count = int(stage0_marker_path.read_text(encoding="utf-8"))
+        except ValueError:
+            expected_count = -1
+        cached_utr_shards = _cached_pita_prepare_utr_shard_specs(
+            shard_dir=stage0_shard_dir,
+            mir_stab_path=cached_mir_stab_path,
+            logs_dir=logs_dir,
+            expected_count=expected_count,
+        )
+        if cached_utr_shards is not None:
+            print(
+                f"💊 Reusing OligoFormer PITA stage0 checkpoint for {spec.record_name}"
+            )
+            return PitaPreparePlan(
+                spec=spec,
+                utr_shards=cached_utr_shards,
+                row_count=None,
+            )
 
     pita_root = shard_root / "off-target/pita"
     sirna_file = (
@@ -2153,18 +2212,18 @@ def _prepare_pita_target_discovery_plan(
             "OligoFormer PITA stage 0 did not produce expected files: "
             + ", ".join(missing_stage0_outputs)
         )
-    cached_mir_stab_path = cache_dir / f"{spec.stem}_shard_{spec.index:05d}_mir.stab"
     cached_mir_stab_path.write_bytes(mir_stab_path.read_bytes())
     utr_shards = _pita_prepare_utr_shard_specs(
         utr_stab_path=utr_stab_path,
         mir_stab_path=cached_mir_stab_path,
-        shard_dir=cache_dir / "pita_prepare_utr_shards",
+        shard_dir=stage0_shard_dir,
         logs_dir=logs_dir,
         shard_size=_positive_int_from_env(
             APP_INFO.off_target_pita_prepare_utr_shard_size_env,
             APP_INFO.default_pita_prepare_utr_shard_size,
         ),
     )
+    stage0_marker_path.write_text(str(len(utr_shards)), encoding="utf-8")
     return PitaPreparePlan(
         spec=spec,
         utr_shards=utr_shards,
@@ -2253,6 +2312,8 @@ def _targetscan_context_shard_specs(
 def _run_targetscan_context_shard(spec: TargetscanContextShardSpec) -> str:
     """Run one TargetScan context-score shard on a CPU node."""
     import shutil
+    import subprocess as sp
+    from time import sleep
 
     output_path = Path(spec.output_path)
     marker_path = output_path.with_suffix(output_path.suffix + ".done")
@@ -2284,22 +2345,51 @@ def _run_targetscan_context_shard(spec: TargetscanContextShardSpec) -> str:
             (workdir / "RNAplfold_in_out").symlink_to(Path(spec.rnaplfold_cache_dir))
 
         tmp_output_path = workdir / "Targets.BL_PCT.context_scores.txt"
-        run_command(
-            [
-                "perl",
-                "targetscan_70_context_scores.pl",
-                "sirnas_for_context_scores.txt",
-                "UTR.txt",
-                "predicted_targets.txt",
-                "ORF.length.txt",
-                "ORF_8mer_counts.txt",
-                str(tmp_output_path),
-            ],
-            cwd=workdir,
-            output_mode="log",
-            log_file=spec.log_path,
-            show_command=False,
+        cmd = [
+            "perl",
+            "targetscan_70_context_scores.pl",
+            "sirnas_for_context_scores.txt",
+            "UTR.txt",
+            "predicted_targets.txt",
+            "ORF.length.txt",
+            "ORF_8mer_counts.txt",
+            str(tmp_output_path),
+        ]
+        attempts = _positive_int_from_env(
+            APP_INFO.targetscan_context_attempts_env,
+            APP_INFO.default_targetscan_context_attempts,
         )
+        transient_return_codes = {-2, -15}
+        for attempt in range(1, attempts + 1):
+            tmp_output_path.unlink(missing_ok=True)
+            try:
+                run_command(
+                    cmd,
+                    cwd=workdir,
+                    output_mode="log",
+                    log_file=spec.log_path,
+                    show_command=False,
+                    warn_on_error=False,
+                )
+            except sp.CalledProcessError as exc:
+                tmp_output_path.unlink(missing_ok=True)
+                can_retry = (
+                    exc.returncode in transient_return_codes and attempt < attempts
+                )
+                if can_retry:
+                    print(
+                        "💊 Retrying OligoFormer TargetScan context shard "
+                        f"{spec.shard_index} after signal {-exc.returncode}; "
+                        f"log: {spec.log_path}"
+                    )
+                    sleep(min(30, 2 ** (attempt - 1)))
+                    continue
+                raise RuntimeError(
+                    "OligoFormer TargetScan context shard "
+                    f"{spec.shard_index} failed with return code {exc.returncode}. "
+                    f"Check log file {spec.log_path}."
+                ) from exc
+            break
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(tmp_output_path.read_bytes())
 
@@ -2808,11 +2898,13 @@ def _run_targetscan_prepare_batches(
         f"{len(specs)} reference shards of up to {specs[0].ref_shard_size} UTRs "
         f"on up to {node_count} CPU nodes"
     )
-    plans = bounded_map(
-        specs,
-        lambda spec: prepare_oligoformer_targetscan_batch_shard.remote(spec),
-        max_parallel=node_count,
-    )
+    plans = []
+    for start in range(0, len(specs), node_count):
+        plans.extend(
+            prepare_oligoformer_targetscan_batch_shard.map(
+                specs[start : start + node_count]
+            )
+        )
     print(
         "💊 Prepared all OligoFormer TargetScan reference shards: "
         f"{len(plans)}/{len(specs)}"
@@ -3210,7 +3302,10 @@ def _prepare_pita_target_discovery_plan_for_spec(
     off_target_root = shard_root / "off-target"
     off_target_root.mkdir(parents=True)
     shutil.copytree(CONF.git_clone_dir / "off-target/pita", off_target_root / "pita")
-    return _prepare_pita_target_discovery_plan(spec, shard_root)
+    try:
+        return _prepare_pita_target_discovery_plan(spec, shard_root)
+    finally:
+        shutil.rmtree(shard_root, ignore_errors=True)
 
 
 @app.function(
@@ -3303,16 +3398,21 @@ def run_oligoformer_pita_branch(
         prefix=f"oligoformer_{shard_specs[0].stem}_off_target_prepare_"
     ) as tmpdir:
         prepare_root = Path(tmpdir)
-        pita_plans = bounded_map(
-            shard_specs,
-            lambda spec: _prepare_pita_target_discovery_plan_for_spec(
-                spec=spec,
-                prepare_root=prepare_root,
-            ),
-            max_parallel=prep_workers,
-        )
+        pita_plans = []
+        checkpoint_size = prep_workers * 4
+        for start in range(0, len(shard_specs), checkpoint_size):
+            pita_plans.extend(
+                bounded_map(
+                    shard_specs[start : start + checkpoint_size],
+                    lambda spec: _prepare_pita_target_discovery_plan_for_spec(
+                        spec=spec,
+                        prepare_root=prepare_root,
+                    ),
+                    max_parallel=prep_workers,
+                )
+            )
+            CONF.output_volume.commit()
 
-    CONF.output_volume.commit()
     pita_utr_shards = [
         shard
         for plan in pita_plans

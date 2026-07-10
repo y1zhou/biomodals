@@ -185,7 +185,8 @@ class AppInfo:
     targetscan_species_id: str = "9606"
     targetscan_version: str = "8.0"
     off_target_cache_salt: str = (
-        "targetscan-8.0-viennarna-2.7.2-semantic-topn-targetscan-polars-v1"
+        "targetscan-8.0-viennarna-2.7.2-semantic-topn-targetscan-polars-"
+        "pita-ref-mount-v2"
     )
     postprocess_cache_salt: str = "final-tables-v3"
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
@@ -2079,6 +2080,17 @@ def _prepare_pita_target_discovery_plan(
     shard_root: Path,
 ) -> PitaPreparePlan:
     """Prepare local PITA stage0 files and return target-discovery shards."""
+    invalid_refs = [
+        str(path)
+        for path in (Path(spec.utr_path), Path(spec.orf_path))
+        if not path.is_file() or path.stat().st_size == 0
+    ]
+    if invalid_refs:
+        raise FileNotFoundError(
+            "OligoFormer PITA reference files are missing or empty: "
+            + ", ".join(invalid_refs)
+        )
+
     cache_dir = _off_target_shard_cache_dir(spec)
     logs_dir = _off_target_shard_logs_dir(spec)
     potential_targets_path = cache_dir / "potential_targets.tsv"
@@ -3264,7 +3276,7 @@ def run_oligoformer_targetscan_branch(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
     timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
 def run_oligoformer_pita_branch(
     shard_specs: list[OffTargetShardSpec],

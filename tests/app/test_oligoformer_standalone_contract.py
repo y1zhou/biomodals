@@ -2425,6 +2425,54 @@ def test_targetscan_batch_reuses_seed_checkpoint_after_interruption(
     assert "Reusing OligoFormer TargetScan seed checkpoint" in capsys.readouterr().out
 
 
+def test_pita_branch_mounts_model_references():
+    assert (
+        oligoformer_app.CONF.model_volume_mountpoint
+        in oligoformer_app.run_oligoformer_pita_branch.spec.volumes
+    )
+
+
+def test_pita_prepare_rejects_missing_reference_files(
+    tmp_path: Path,
+    monkeypatch,
+):
+    volume = FakeVolume()
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_write_pita_stage0_script",
+        lambda *_args: None,
+    )
+    commands = []
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_command",
+        lambda *args, **_kwargs: commands.append(args),
+    )
+    spec = oligoformer_app.OffTargetShardSpec(
+        run_root=str(tmp_path / "run"),
+        output_dir=str(tmp_path / "outputs"),
+        stem="target",
+        index=0,
+        record_name="RNA0",
+        record_sequence="AUGCUAGCUAGCUAGCUAG",
+        utr_path=str(tmp_path / "missing_utr.fa"),
+        orf_path=str(tmp_path / "missing_orf.fa"),
+        row_shard_size=1000,
+    )
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="PITA reference files are missing or empty",
+    ):
+        oligoformer_app._prepare_pita_target_discovery_plan(
+            spec,
+            tmp_path / "prepare",
+        )
+
+    assert commands == []
+
+
 def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
     tmp_path: Path, monkeypatch
 ):

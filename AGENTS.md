@@ -9,10 +9,10 @@
 - Use `orjson` for non-Pydantic JSON serialization and deserialization. For
   Pydantic models, serialize with `model_dump_json()` and parse JSON bytes or
   strings with `model_validate_json(...)`.
-- CI runs `prek` against `.pre-commit-config.yaml`; after code edits, run `prek run --files <changed files>` when practical.
-- For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` when practical.
-- Keep generated archives, large run outputs, Modal result directories, and local test data out of commits unless the user explicitly asks for them.
-- Avoid extracting trivial helper functions that are only a couple of lines and used once or twice; inline the logic and add comments when that is clearer.
+- When you have made significant edits and are ready to make commits:
+  - CI runs `prek` against `.pre-commit-config.yaml`; run `prek run --files <changed files>` before making commits.
+  - For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` before making commits.
+  - Keep generated archives, large run outputs, Modal result directories, and local test data out of commits unless the user explicitly asks for them.
 
 ## Instruction maintenance
 

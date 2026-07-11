@@ -32,7 +32,8 @@ DEFAULT_MRNA_FASTA = REPO_ROOT / "examples/data/sirna_target.fa"
 DEFAULT_UTR_REF = REPO_ROOT / "examples/data/oligoformer_offtarget_utr.fa"
 DEFAULT_ORF_REF = REPO_ROOT / "examples/data/oligoformer_offtarget_orf.fa"
 FINAL_TABLE_SUFFIXES = ("", "_ranked", "_ranked_filtered")
-VERIFIER_VERSION = "oligoformer-upstream-equivalence-v3"
+VERIFIER_VERSION = "oligoformer-upstream-equivalence-v4"
+SANDBOX_APP_NAME = "oligoformer-upstream-equivalence"
 
 FLOAT_TOLERANCES: dict[str, float] = {
     "efficacy": 1e-1,
@@ -105,17 +106,26 @@ def _hash_path(path: Path) -> str:
 def verifier_cache_key(
     *,
     mrna_fasta: Path,
+    sirna_fasta: Path | None,
     utr_ref: Path,
     orf_ref: Path,
+    all_human: bool,
+    reference_identity: str | None,
     top_n: int,
     targetscan_ref_shard_size: int | None,
 ) -> str:
     """Return a stable cache key for verifier inputs."""
+    if all_human and reference_identity is None:
+        raise ValueError("full-human verification requires a reference identity")
     payload = {
         "version": VERIFIER_VERSION,
         "mrna": _hash_path(mrna_fasta),
-        "utr": _hash_path(utr_ref),
-        "orf": _hash_path(orf_ref),
+        "sirna": _hash_path(sirna_fasta) if sirna_fasta is not None else None,
+        "references": (
+            {"all_human": True, "identity": reference_identity}
+            if all_human
+            else {"utr": _hash_path(utr_ref), "orf": _hash_path(orf_ref)}
+        ),
         "top_n": top_n,
         "targetscan_ref_shard_size": targetscan_ref_shard_size,
     }
@@ -356,6 +366,7 @@ def _run_upstream(config: dict[str, Any], artifact_root: Path) -> None:
     if upstream_done.exists() and not config["force"]:
         return
 
+    shutil.rmtree(upstream_output_dir, ignore_errors=True)
     upstream_output_dir.mkdir(parents=True, exist_ok=True)
     _ensure_rnafm_runtime(config)
 
@@ -369,6 +380,10 @@ def _run_upstream(config: dict[str, Any], artifact_root: Path) -> None:
         "1",
         "-i1",
         config["mrna_fasta"],
+    ]
+    if config["sirna_fasta"] is not None:
+        cmd.extend(["-i2", config["sirna_fasta"]])
+    cmd.extend([
         "--output_dir",
         f"{upstream_output_dir}/",
         "-off",
@@ -379,7 +394,7 @@ def _run_upstream(config: dict[str, Any], artifact_root: Path) -> None:
         config["utr_ref"],
         "--orf",
         config["orf_ref"],
-    ]
+    ])
     _run_logged(
         cmd,
         cwd=repo_dir,
@@ -422,8 +437,11 @@ def run_remote_worker(config_path: Path) -> int:
 
     input_dir = artifact_root / "inputs"
     _copy_required(Path(config["mrna_fasta"]), input_dir / "mrna.fa")
-    _copy_required(Path(config["utr_ref"]), input_dir / "utr.fa")
-    _copy_required(Path(config["orf_ref"]), input_dir / "orf.fa")
+    if config["sirna_fasta"] is not None:
+        _copy_required(Path(config["sirna_fasta"]), input_dir / "sirna.fa")
+    if not config["all_human"]:
+        _copy_required(Path(config["utr_ref"]), input_dir / "utr.fa")
+        _copy_required(Path(config["orf_ref"]), input_dir / "orf.fa")
     _copy_app_artifacts(config, artifact_root)
     _run_upstream(config, artifact_root)
     comparisons = _compare_artifacts(config, artifact_root)
@@ -451,8 +469,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse verifier command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mrna-fasta", type=Path, default=DEFAULT_MRNA_FASTA)
+    parser.add_argument("--sirna-fasta", type=Path)
     parser.add_argument("--utr-ref", type=Path, default=DEFAULT_UTR_REF)
     parser.add_argument("--orf-ref", type=Path, default=DEFAULT_ORF_REF)
+    parser.add_argument("--all-human", action="store_true")
     parser.add_argument("--top-n", type=int, default=-1)
     parser.add_argument("--targetscan-ref-shard-size", type=int, default=1000)
     parser.add_argument("--timeout", type=int, default=7200)
@@ -466,29 +486,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _stream_process(process) -> None:
-    """Stream a Modal sandbox process to local stdout."""
-    for line in process.stdout:
-        print(line, end="")
-    process.wait()
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"sandbox verifier failed with exit code {process.returncode}"
-        )
-
-
 def _run_biomodals_app(args: argparse.Namespace):
     """Run or reuse Biomodals OligoFormer artifacts."""
     from biomodals.app.score import oligoformer_app
 
     oligoformer_app.download_oligoformer_models.remote(force=False)
+    mrna_fasta_bytes = args.mrna_fasta.read_bytes()
+    sirna_fasta_bytes = (
+        args.sirna_fasta.read_bytes() if args.sirna_fasta is not None else None
+    )
+    utr_bytes = None if args.all_human else args.utr_ref.read_bytes()
+    orf_bytes = None if args.all_human else args.orf_ref.read_bytes()
     plan = oligoformer_app.prepare_oligoformer_run.remote(
-        mrna_fasta_bytes=args.mrna_fasta.read_bytes(),
+        mrna_fasta_bytes=mrna_fasta_bytes,
+        sirna_fasta_bytes=sirna_fasta_bytes,
         off_target=True,
         toxicity=True,
-        all_human=False,
-        utr_bytes=args.utr_ref.read_bytes(),
-        orf_bytes=args.orf_ref.read_bytes(),
+        all_human=args.all_human,
+        utr_bytes=utr_bytes,
+        orf_bytes=orf_bytes,
         top_n=args.top_n,
         force=args.force,
     )
@@ -501,17 +517,18 @@ def _run_biomodals_app(args: argparse.Namespace):
             plan=efficacy_plan,
             off_target=True,
             toxicity=True,
-            all_human=False,
+            all_human=args.all_human,
             top_n=args.top_n,
             targetscan_ref_shard_size=args.targetscan_ref_shard_size,
         )
         plan = oligoformer_app.prepare_oligoformer_run.remote(
-            mrna_fasta_bytes=args.mrna_fasta.read_bytes(),
+            mrna_fasta_bytes=mrna_fasta_bytes,
+            sirna_fasta_bytes=sirna_fasta_bytes,
             off_target=True,
             toxicity=True,
-            all_human=False,
-            utr_bytes=args.utr_ref.read_bytes(),
-            orf_bytes=args.orf_ref.read_bytes(),
+            all_human=args.all_human,
+            utr_bytes=utr_bytes,
+            orf_bytes=orf_bytes,
             top_n=args.top_n,
             force=False,
         )
@@ -521,32 +538,40 @@ def _run_biomodals_app(args: argparse.Namespace):
 def _run_local(args: argparse.Namespace) -> int:
     """Run app artifacts and sandbox oracle from the local machine."""
     import modal
+    from modal.stream_type import StreamType
 
     from biomodals.app.score import oligoformer_app
 
-    for path in (args.mrna_fasta, args.utr_ref, args.orf_ref):
+    input_paths = [args.mrna_fasta]
+    if args.sirna_fasta is not None:
+        input_paths.append(args.sirna_fasta)
+    if not args.all_human:
+        input_paths.extend((args.utr_ref, args.orf_ref))
+    for path in input_paths:
         if not path.exists():
             raise FileNotFoundError(path)
     if args.top_n != -1 and args.top_n < 1:
         raise ValueError("top_n must be -1 or a positive integer")
 
-    key = verifier_cache_key(
-        mrna_fasta=args.mrna_fasta,
-        utr_ref=args.utr_ref,
-        orf_ref=args.orf_ref,
-        top_n=args.top_n,
-        targetscan_ref_shard_size=args.targetscan_ref_shard_size,
-    )
-    artifact_root = (
-        Path(oligoformer_app.CONF.output_volume_mountpoint)
-        / "upstream_equivalence"
-        / key
-    )
-    print(f"OligoFormer upstream-equivalence key: {key}")
-
     with modal.enable_output():
         with oligoformer_app.app.run():
             plan = _run_biomodals_app(args)
+            key = verifier_cache_key(
+                mrna_fasta=args.mrna_fasta,
+                sirna_fasta=args.sirna_fasta,
+                utr_ref=args.utr_ref,
+                orf_ref=args.orf_ref,
+                all_human=args.all_human,
+                reference_identity=plan.reference_identity,
+                top_n=args.top_n,
+                targetscan_ref_shard_size=args.targetscan_ref_shard_size,
+            )
+            artifact_root = (
+                Path(oligoformer_app.CONF.output_volume_mountpoint)
+                / "upstream_equivalence"
+                / key
+            )
+            print(f"OligoFormer upstream-equivalence key: {key}", flush=True)
             config = {
                 "force": args.force,
                 "artifact_root": str(artifact_root),
@@ -554,9 +579,23 @@ def _run_local(args: argparse.Namespace) -> int:
                 "output_dir": plan.output_dir,
                 "output_stems": list(plan.output_stems),
                 "top_n": args.top_n,
+                "all_human": args.all_human,
                 "mrna_fasta": "/tmp/oligoformer_verifier/mrna.fa",
-                "utr_ref": "/tmp/oligoformer_verifier/utr.fa",
-                "orf_ref": "/tmp/oligoformer_verifier/orf.fa",
+                "sirna_fasta": (
+                    "/tmp/oligoformer_verifier/sirna.fa"
+                    if args.sirna_fasta is not None
+                    else None
+                ),
+                "utr_ref": (
+                    str(oligoformer_app.APP_INFO.model_ref_dir / "human_UTR.txt")
+                    if args.all_human
+                    else "/tmp/oligoformer_verifier/utr.fa"
+                ),
+                "orf_ref": (
+                    str(oligoformer_app.APP_INFO.model_ref_dir / "human_ORF.txt")
+                    if args.all_human
+                    else "/tmp/oligoformer_verifier/orf.fa"
+                ),
                 "repo_dir": str(oligoformer_app.CONF.git_clone_dir),
                 "output_volume_mountpoint": oligoformer_app.CONF.output_volume_mountpoint,
                 "model_rnafm_redevelop_dir": str(
@@ -575,10 +614,16 @@ def _run_local(args: argparse.Namespace) -> int:
                     model_volume=True,
                 ).items()
             }
+            sandbox_app = modal.App.lookup(
+                SANDBOX_APP_NAME,
+                create_if_missing=True,
+            )
             sandbox = modal.Sandbox.create(
                 "sleep",
                 "86400",
-                app=oligoformer_app.app,
+                app=sandbox_app,
+                name=f"oligoformer-upstream-{key[:12]}",
+                tags={"verifier_key": key},
                 image=oligoformer_app.runtime_image,
                 volumes=cast(Any, sandbox_volumes),
                 timeout=args.timeout,
@@ -586,7 +631,13 @@ def _run_local(args: argparse.Namespace) -> int:
                 gpu=oligoformer_app.CONF.gpu,
                 memory=(1024, 32768),
             )
+            process_started = False
+            process_finished = False
             try:
+                print(
+                    f"OligoFormer upstream-equivalence Sandbox: {sandbox.object_id}",
+                    flush=True,
+                )
                 mkdir = sandbox.exec("mkdir", "-p", "/tmp/oligoformer_verifier")
                 mkdir.wait()
                 if mkdir.returncode != 0:
@@ -597,12 +648,17 @@ def _run_local(args: argparse.Namespace) -> int:
                 sandbox.filesystem.copy_from_local(
                     args.mrna_fasta, "/tmp/oligoformer_verifier/mrna.fa"
                 )
-                sandbox.filesystem.copy_from_local(
-                    args.utr_ref, "/tmp/oligoformer_verifier/utr.fa"
-                )
-                sandbox.filesystem.copy_from_local(
-                    args.orf_ref, "/tmp/oligoformer_verifier/orf.fa"
-                )
+                if args.sirna_fasta is not None:
+                    sandbox.filesystem.copy_from_local(
+                        args.sirna_fasta, "/tmp/oligoformer_verifier/sirna.fa"
+                    )
+                if not args.all_human:
+                    sandbox.filesystem.copy_from_local(
+                        args.utr_ref, "/tmp/oligoformer_verifier/utr.fa"
+                    )
+                    sandbox.filesystem.copy_from_local(
+                        args.orf_ref, "/tmp/oligoformer_verifier/orf.fa"
+                    )
                 sandbox.filesystem.write_text(
                     json.dumps(config), "/tmp/oligoformer_verifier/config.json"
                 )
@@ -612,19 +668,35 @@ def _run_local(args: argparse.Namespace) -> int:
                     "--remote-worker",
                     "/tmp/oligoformer_verifier/config.json",
                     timeout=args.timeout,
-                    pty=True,
                     workdir=str(oligoformer_app.CONF.git_clone_dir),
+                    stdout=StreamType.DEVNULL,
+                    stderr=StreamType.DEVNULL,
                 )
-                _stream_process(process)
+                process_started = True
+                process.wait()
+                process_finished = True
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        "sandbox verifier failed with exit code "
+                        f"{process.returncode}; artifacts: {artifact_root}"
+                    )
                 args.summary_out.parent.mkdir(parents=True, exist_ok=True)
                 sandbox.filesystem.copy_to_local(
                     "/tmp/oligoformer_upstream_equivalence_summary.json",
                     args.summary_out,
                 )
             finally:
-                try:
-                    sandbox.terminate()
-                finally:
+                if process_finished or not process_started:
+                    try:
+                        sandbox.terminate()
+                    finally:
+                        sandbox.detach()
+                else:
+                    print(
+                        "OligoFormer verifier client exited before process "
+                        f"completion; preserving Sandbox {sandbox.object_id}",
+                        flush=True,
+                    )
                     sandbox.detach()
 
     print(f"OligoFormer upstream-equivalence summary: {args.summary_out}")

@@ -41,7 +41,44 @@ def test_default_fixture_paths_exist():
     assert verifier.DEFAULT_MRNA_FASTA.exists()
     assert verifier.DEFAULT_UTR_REF.exists()
     assert verifier.DEFAULT_ORF_REF.exists()
-    assert verifier._parse_args([]).top_n == -1
+    args = verifier._parse_args([])
+    assert args.top_n == -1
+    assert args.sirna_fasta is None
+    assert not args.all_human
+
+
+def test_verifier_cache_key_includes_custom_sirnas_and_human_ref_identity(
+    tmp_path: Path,
+):
+    verifier = _load_verifier()
+    mrna = tmp_path / "mrna.fa"
+    sirna = tmp_path / "sirna.fa"
+    unused_ref = tmp_path / "unused.fa"
+    mrna.write_text(">target\nAUGC\n", encoding="utf-8")
+    sirna.write_text(">guide\nAUGC\n", encoding="utf-8")
+
+    base = verifier.verifier_cache_key(
+        mrna_fasta=mrna,
+        sirna_fasta=sirna,
+        utr_ref=unused_ref,
+        orf_ref=unused_ref,
+        all_human=True,
+        reference_identity="refs-v1",
+        top_n=-1,
+        targetscan_ref_shard_size=1000,
+    )
+    changed = verifier.verifier_cache_key(
+        mrna_fasta=mrna,
+        sirna_fasta=sirna,
+        utr_ref=unused_ref,
+        orf_ref=unused_ref,
+        all_human=True,
+        reference_identity="refs-v2",
+        top_n=-1,
+        targetscan_ref_shard_size=1000,
+    )
+
+    assert base != changed
 
 
 def test_copy_app_artifacts_uses_final_variant_output_dir(tmp_path: Path):

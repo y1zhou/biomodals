@@ -11,6 +11,7 @@ This reference is the maintained app-development standard for files under `src/b
 - [Image Construction](#image-construction)
 - [Volumes](#volumes)
 - [Remote Functions](#remote-functions)
+- [Long-Running Fanout And Volume I/O](#long-running-fanout-and-volume-io)
 - [Helper APIs](#helper-apis)
 - [Local Entrypoint](#local-entrypoint)
 - [Data Flow](#data-flow)
@@ -207,6 +208,45 @@ Resource pattern:
     volumes=CONF.mounts(model_volume=True),
 )
 ```
+
+## Long-Running Fanout And Volume I/O
+
+- Prefer Modal-native `Function.map()` or `Function.starmap()` for large sets of
+  independent calls to the same function. Batch fine-grained tasks into bounded
+  per-container work instead of driving hundreds of blocking `.remote()` calls
+  from a local thread pool.
+- Bound both remote container count and local workers per container. Log the
+  logical task count, remote batch count, and local worker count so the
+  `containers × workers` cost and wall-time tradeoff is visible.
+- Keep fanout return payloads compact. Return counts, status records, or marker
+  paths instead of transferring large lists of deterministic output paths.
+- Treat volume visibility as an explicit barrier: writers call `commit()`, and
+  containers that need later writes call `reload()` before consuming them.
+  Close all open volume files before `reload()`.
+- Call `warmup_directory(...)` immediately before reading file contents in
+  bulk. Do not warm directories for filename traversal, globbing, marker or
+  existence checks, or other metadata-only operations.
+- Make interruptible fanout resumable with stable output paths, unique sibling
+  temporary files, atomic replacement, and a completion marker written last.
+  After fanout, verify every expected output or marker and retry only missing or
+  transiently interrupted shards.
+- Check persistent caches and completion markers before expensive staging,
+  copying, or preprocessing.
+- Log phase boundaries and progress for preparation, fanout, consolidation,
+  merge, cleanup, packaging, and local download. Remote compute may finish well
+  before a large archive finishes downloading to the local output directory.
+- For long-running Sandbox verification, write logs and the final summary to a
+  durable volume and use `ContainerProcess.wait()` without a live stdout stream
+  when real-time output is unnecessary. If work must survive local client or
+  `app.run()` teardown, create the Sandbox under a persistent app; `detach()`
+  alone does not make a Sandbox outlive its owning ephemeral app.
+- Commit compact final artifacts and their completion marker before deleting
+  transient trees. Avoid putting serial deletion of very large shard trees on
+  the critical path when cleanup can safely be deferred or distributed.
+- For orchestration changes, validate one representative production-shaped run.
+  Check the downloaded archive's schema, row counts, nulls, identity joins,
+  ordering, and domain-specific invariants rather than treating successful
+  function completion as sufficient evidence.
 
 ## Helper APIs
 

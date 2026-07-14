@@ -5187,94 +5187,115 @@ def run_oligoformer_pita_branch(
         "💊 Preparing OligoFormer PITA inputs for "
         f"{len(shard_specs)} siRNAs with {prep_workers} local workers"
     )
+    candidate_wave_size = prep_workers * 4
+    shard_results: list[OffTargetShardResult] = []
     with TemporaryDirectory(
         prefix=f"oligoformer_{shard_specs[0].stem}_off_target_prepare_"
     ) as tmpdir:
         prepare_root = Path(tmpdir)
         reference = _prepare_pita_reference_plan(shard_specs[0], prepare_root)
         CONF.output_volume.commit()
-        pita_plans = []
-        checkpoint_size = prep_workers * 4
-        for start in range(0, len(shard_specs), checkpoint_size):
-            pita_plans.extend(
-                bounded_map(
-                    shard_specs[start : start + checkpoint_size],
-                    lambda spec: _prepare_pita_target_discovery_plan_for_spec(
-                        spec=spec,
-                        prepare_root=prepare_root,
-                        reference=reference,
-                    ),
-                    max_parallel=prep_workers,
-                )
+        for start in range(0, len(shard_specs), candidate_wave_size):
+            wave_specs = shard_specs[start : start + candidate_wave_size]
+            print(
+                "💊 Running OligoFormer PITA candidate wave "
+                f"{start // candidate_wave_size + 1} with {len(wave_specs)} siRNAs"
+            )
+            pita_plans = bounded_map(
+                wave_specs,
+                lambda spec: _prepare_pita_target_discovery_plan_for_spec(
+                    spec=spec,
+                    prepare_root=prepare_root,
+                    reference=reference,
+                ),
+                max_parallel=prep_workers,
             )
             CONF.output_volume.commit()
 
-    pita_utr_shards = [
-        shard
-        for plan in pita_plans
-        for shard in sorted(plan.utr_shards, key=lambda item: item.shard_index)
-    ]
-    _run_pita_prepare_utr_shard_batches(
-        pita_utr_shards,
-        max_process_slots=max_process_slots,
-    )
-    prepared_shards = _run_pita_consolidate_batches(
-        pita_plans,
-        max_process_slots=max_process_slots,
-    )
-
-    row_shards = [row for prepared in prepared_shards for row in prepared.row_shards]
-    configured_row_nodes = min(
-        node_count,
-        _bounded_node_count(
-            len(row_shards),
-            env_name=APP_INFO.off_target_nodes_env,
-            default=APP_INFO.default_off_target_nodes,
-        ),
-    )
-    row_node_count, row_local_workers = _bounded_worker_topology(
-        task_count=len(row_shards),
-        configured_nodes=max(1, configured_row_nodes),
-        configured_workers=local_workers,
-        max_process_slots=max_process_slots,
-    )
-    row_batches = _batch_items_for_local_workers(
-        row_shards,
-        max_nodes=max(1, row_node_count),
-        local_workers=row_local_workers,
-    )
-    if row_batches:
-        print(
-            "💊 Running OligoFormer PITA scoring for "
-            f"{len(row_shards)} row shards on up to {len(row_batches)} CPU nodes "
-            f"with {row_local_workers} workers each"
-        )
-        completed_rows = sum(
-            run_oligoformer_pita_row_shard_batch.starmap(
-                (list(batch), row_local_workers) for batch in row_batches
+            pita_utr_shards = [
+                shard
+                for plan in pita_plans
+                for shard in sorted(
+                    plan.utr_shards,
+                    key=lambda item: item.shard_index,
+                )
+            ]
+            _run_pita_prepare_utr_shard_batches(
+                pita_utr_shards,
+                max_process_slots=max_process_slots,
             )
-        )
-        if completed_rows != len(row_shards):
-            raise RuntimeError(
-                "OligoFormer PITA scoring reported "
-                f"{completed_rows} completed row shards; expected {len(row_shards)}"
+            prepared_shards = _run_pita_consolidate_batches(
+                pita_plans,
+                max_process_slots=max_process_slots,
             )
 
-    finalize_batches, finalize_workers = batches_for_total_concurrency(
-        prepared_shards,
-        max_batches=node_count,
-        max_workers_per_batch=row_local_workers,
-        total_concurrency=max_process_slots or node_count * local_workers,
-    )
-    print(
-        "💊 Finalizing OligoFormer PITA tables for "
-        f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} batches with "
-        f"{finalize_workers} workers each"
-    )
-    result_batches = finalize_oligoformer_pita_shard_batch.starmap(
-        (list(batch), finalize_workers) for batch in finalize_batches
-    )
-    return [result for batch in result_batches for result in batch]
+            row_shards = [
+                row for prepared in prepared_shards for row in prepared.row_shards
+            ]
+            configured_row_nodes = min(
+                node_count,
+                _bounded_node_count(
+                    len(row_shards),
+                    env_name=APP_INFO.off_target_nodes_env,
+                    default=APP_INFO.default_off_target_nodes,
+                ),
+            )
+            row_node_count, row_local_workers = _bounded_worker_topology(
+                task_count=len(row_shards),
+                configured_nodes=max(1, configured_row_nodes),
+                configured_workers=local_workers,
+                max_process_slots=max_process_slots,
+            )
+            row_batches = _batch_items_for_local_workers(
+                row_shards,
+                max_nodes=max(1, row_node_count),
+                local_workers=row_local_workers,
+            )
+            if row_batches:
+                print(
+                    "💊 Running OligoFormer PITA scoring for "
+                    f"{len(row_shards)} row shards on up to "
+                    f"{len(row_batches)} CPU nodes with "
+                    f"{row_local_workers} workers each"
+                )
+                completed_rows = sum(
+                    run_oligoformer_pita_row_shard_batch.starmap(
+                        (list(batch), row_local_workers) for batch in row_batches
+                    )
+                )
+                if completed_rows != len(row_shards):
+                    raise RuntimeError(
+                        "OligoFormer PITA scoring reported "
+                        f"{completed_rows} completed row shards; expected "
+                        f"{len(row_shards)}"
+                    )
+
+            finalize_batches, finalize_workers = batches_for_total_concurrency(
+                prepared_shards,
+                max_batches=node_count,
+                max_workers_per_batch=row_local_workers,
+                total_concurrency=max_process_slots or node_count * local_workers,
+            )
+            print(
+                "💊 Finalizing OligoFormer PITA tables for "
+                f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} "
+                f"batches with {finalize_workers} workers each"
+            )
+            result_batches = finalize_oligoformer_pita_shard_batch.starmap(
+                (list(batch), finalize_workers) for batch in finalize_batches
+            )
+            shard_results.extend(result for batch in result_batches for result in batch)
+            del (
+                finalize_batches,
+                pita_plans,
+                pita_utr_shards,
+                prepared_shards,
+                result_batches,
+                row_batches,
+                row_shards,
+                wave_specs,
+            )
+    return shard_results
 
 
 def _run_off_target_shards(

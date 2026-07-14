@@ -3397,6 +3397,175 @@ def test_pita_branch_mounts_model_references():
     )
 
 
+def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
+    tmp_path: Path,
+    monkeypatch,
+):
+    volume = FakeVolume()
+    repo_dir = tmp_path / "repo"
+    events: list[str] = []
+    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
+    monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_prep_workers_env, "1")
+
+    shard_specs = [
+        oligoformer_app.OffTargetShardSpec(
+            run_root=str(tmp_path / "run"),
+            output_dir=str(tmp_path / "outputs"),
+            stem="target",
+            index=index,
+            record_name=f"RNA{index}",
+            record_sequence="AUGCUAGCUAGCUAGCUAG",
+            utr_path=str(tmp_path / "UTR.fa"),
+            orf_path=str(tmp_path / "ORF.fa"),
+            row_shard_size=1000,
+        )
+        for index in range(5)
+    ]
+
+    def fake_reference(spec, _prepare_root):
+        events.append(f"reference:{spec.index}")
+        return oligoformer_app.PitaReferencePlan((), "reference_ext_utr.stab")
+
+    def fake_plan(*, spec, prepare_root, reference):
+        del prepare_root, reference
+        events.append(f"plan:{spec.index}")
+        return oligoformer_app.PitaPreparePlan(
+            spec=spec,
+            utr_shards=(
+                oligoformer_app.PitaPrepareUtrShardSpec(
+                    shard_index=0,
+                    input_path=f"candidate_{spec.index}.utr.stab",
+                    mir_stab_path=f"candidate_{spec.index}.mir.stab",
+                    output_path=f"candidate_{spec.index}.potential.tsv",
+                    log_path=f"candidate_{spec.index}.log",
+                ),
+            ),
+            row_count=None,
+        )
+
+    def candidate_indexes(items):
+        return ",".join(str(item.spec.index) for item in items)
+
+    def fake_discovery(shards, *, max_process_slots=None):
+        assert max_process_slots == 1
+        indexes = [
+            Path(shard.output_path).name.split(".", 1)[0].removeprefix("candidate_")
+            for shard in shards
+        ]
+        events.append(f"discover:{','.join(indexes)}")
+
+    def fake_consolidate(plans, *, max_process_slots=None):
+        assert max_process_slots == 1
+        events.append(f"consolidate:{candidate_indexes(plans)}")
+        prepared = []
+        for plan in plans:
+            spec = plan.spec
+            row = oligoformer_app.PitaRowShardSpec(
+                run_root=spec.run_root,
+                stem=spec.stem,
+                sirna_index=spec.index,
+                record_name=spec.record_name,
+                shard_index=0,
+                start_row=0,
+                end_row=1,
+                potential_targets_path=f"candidate_{spec.index}.potential.tsv",
+                input_path=f"candidate_{spec.index}.row.tsv",
+                ext_utr_path="reference_ext_utr.stab",
+                output_path=f"candidate_{spec.index}.scored.tsv",
+                log_path=f"candidate_{spec.index}.log",
+            )
+            prepared.append(
+                oligoformer_app.PreparedOffTargetShard(
+                    index=spec.index,
+                    record_name=spec.record_name,
+                    cache_dir=str(tmp_path / f"candidate_{spec.index}"),
+                    logs_dir=str(tmp_path / "logs"),
+                    pita_path=str(tmp_path / f"candidate_{spec.index}" / "pita.tab"),
+                    row_shards=(row,),
+                )
+            )
+        return prepared
+
+    class FakeRowBatch:
+        def starmap(self, inputs):
+            results = []
+            for rows, workers in inputs:
+                assert workers == 1
+                events.append("rows:" + ",".join(str(row.sirna_index) for row in rows))
+                results.append(len(rows))
+            return results
+
+    class FakeFinalizeBatch:
+        def starmap(self, inputs):
+            results = []
+            for prepared, workers in inputs:
+                assert workers == 1
+                events.append(
+                    "finalize:" + ",".join(str(item.index) for item in prepared)
+                )
+                results.append([
+                    oligoformer_app.OffTargetShardResult(
+                        index=item.index,
+                        pita_path=item.pita_path,
+                    )
+                    for item in prepared
+                ])
+            return results
+
+    monkeypatch.setattr(oligoformer_app, "_prepare_pita_reference_plan", fake_reference)
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_prepare_pita_target_discovery_plan_for_spec",
+        fake_plan,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_run_pita_prepare_utr_shard_batches",
+        fake_discovery,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_run_pita_consolidate_batches",
+        fake_consolidate,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_pita_row_shard_batch",
+        FakeRowBatch(),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "finalize_oligoformer_pita_shard_batch",
+        FakeFinalizeBatch(),
+    )
+
+    results = oligoformer_app.run_oligoformer_pita_branch.get_raw_f()(
+        shard_specs,
+        node_count=1,
+        local_workers=1,
+        max_process_slots=1,
+    )
+
+    assert [result.index for result in results] == list(range(5))
+    assert events.index("finalize:0,1,2,3") < events.index("plan:4")
+    assert events == [
+        "reference:0",
+        "plan:0",
+        "plan:1",
+        "plan:2",
+        "plan:3",
+        "discover:0,1,2,3",
+        "consolidate:0,1,2,3",
+        "rows:0,1,2,3",
+        "finalize:0,1,2,3",
+        "plan:4",
+        "discover:4",
+        "consolidate:4",
+        "rows:4",
+        "finalize:4",
+    ]
+
+
 def test_pita_prepare_rejects_missing_reference_files(
     tmp_path: Path,
     monkeypatch,

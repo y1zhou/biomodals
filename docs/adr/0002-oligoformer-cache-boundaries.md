@@ -3,11 +3,18 @@
 OligoFormer performance work will keep immutable upstream assets in the standard
 model volume and store run-specific cached intermediates in the app output
 volume. RNA-FM weights and full-human off-target references belong in the model
-volume. The converted TargetScan references carry both declared source metadata
-and SHA-256 digests of their actual converted bytes; that identity is mirrored
-into the output volume so input preparation can derive a fail-closed evidence
-key without mounting the model volume. Setup commits the converted bytes and
-their marker to the model volume before publishing the matching identity to the
+volume. The extracted RNA-FM tree carries a SHA-256 content identity in the
+model volume; setup commits that tree and identity before mirroring the identity
+to the output volume. Efficacy preparation includes the mirrored identity in
+its cache key, and GPU workers reload the model volume, require the two copies
+of the identity to match, and expose the mounted tree to upstream through a
+read-only symlink instead of copying it into the container filesystem.
+
+The converted TargetScan references carry both declared source metadata and
+SHA-256 digests of their actual converted bytes; that identity is mirrored into
+the output volume so input preparation can derive a fail-closed evidence key
+without mounting the model volume. Setup commits the converted bytes and their
+marker to the model volume before publishing the matching identity to the
 output volume. Identity publication, RNAplfold invalidation, and RNAplfold
 construction share one stable global reference-state generation, so different
 reference versions cannot write the same cache tree concurrently. The derived
@@ -23,7 +30,8 @@ derived results into an image or model cache. Three cache identities separate
 the reusable stages:
 
 1. The efficacy key covers app and upstream versions, input mRNA and optional
-   siRNA FASTA content, and functionality-filter behavior.
+   siRNA FASTA content, functionality-filter behavior, and the published
+   RNA-FM model-tree content identity.
 2. The evidence key builds on the efficacy key and adds off-target mode,
    `top_n`, candidate-binding semantics, and either custom-reference content or
    the persisted converted-human-reference identity.
@@ -43,7 +51,8 @@ run reuses its generation, including when all-human model setup requires
 re-planning.
 
 The run plan carries all three keys, the frozen semantic configuration used to
-derive them, and the exact converted-human reference digest when applicable.
+derive them, the exact RNA-FM model-tree identity, and the exact converted-human
+reference digest when applicable.
 Efficacy and post-processing functions reject caller settings that differ from
 the prepared plan. Full-human evidence construction revalidates the pinned
 digest and holds the global reference-state generation until evidence is
@@ -76,14 +85,17 @@ post-processing. If efficacy or merged human off-target evidence is already
 ready, the entrypoint skips the corresponding model or reference setup.
 
 Concurrent evidence variants can share an efficacy key, and concurrent
-final-table variants can share an evidence key. Both efficacy and evidence
-generation—and identical final-table generation—therefore acquire
-stage-specific distributed build generations with an atomic Modal Dict
-insertion. The same mechanism serializes the global RNAplfold reference cache.
-A writer commits all output files and the completion marker before recording its
-generation complete; waiters then reload and recheck the output volume. Failed
-or timed-out generations advance through append-only status records, avoiding
-unsafe compare-then-delete lock recovery.
+final-table variants can share an evidence key. Efficacy, evidence, and
+identical final-table builders therefore use stage-specific distributed
+generations with an atomic Modal Dict insertion; waiters coalesce behind the
+active builder, then reload and recheck its publication. The same primitive has
+an exclusive mode for the mutable global reference state: an unrelated
+all-human reader waiting behind an active generation preserves its request and
+acquires the next generation instead of treating the first reader's completion
+as its own. A writer commits all outputs and completion metadata before
+recording its generation complete. Failed or timed-out generations advance
+through append-only status records, avoiding unsafe compare-then-delete lock
+recovery.
 
 When final output files are already present in the output-volume cache, reruns
 should skip GPU efficacy and CPU post-processing compute. They still need a

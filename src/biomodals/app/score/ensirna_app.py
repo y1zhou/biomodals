@@ -1779,9 +1779,11 @@ def build_ensirna_prepared_inputs(
     )
     layout = _layout_for_cache_key(cache_key)
     CONF.output_volume.reload()
-    published_cache_invalid = _prepared_marker_path(layout).is_file()
+    prepared_ready = (
+        _cached_preparation_plan(cache_key=cache_key, layout=layout) is not None
+    )
     with _cache_build_lock(
-        "prepared", cache_key, rebuild=published_cache_invalid
+        "prepared", cache_key, rebuild=not prepared_ready
     ) as owns_build:
         CONF.output_volume.reload()
         if cached := _cached_preparation_plan(cache_key=cache_key, layout=layout):
@@ -1836,11 +1838,9 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
     cache_key = str(prepared_metadata["cache_key"])
 
     result_xlsx = layout.outputs_dir / "mrna_result.xlsx"
-    result_needs_repair = (
-        result_xlsx.exists() or _result_marker_path(layout).exists()
-    ) and not _result_ready(layout, cache_key)
+    result_ready = _result_ready(layout, cache_key)
     with _cache_build_lock(
-        "inference", cache_key, rebuild=force or result_needs_repair
+        "inference", cache_key, rebuild=force or not result_ready
     ) as owns_build:
         CONF.output_volume.reload()
         if not force and _result_ready(layout, cache_key):

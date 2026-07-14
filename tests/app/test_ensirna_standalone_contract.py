@@ -45,6 +45,32 @@ def make_test_layout(
     return ensirna_app._layout_for_cache_key(TEST_CACHE_KEY)
 
 
+def install_completed_cache_generation(monkeypatch, stage: str, identity: str):
+    lock_key = ensirna_app.hash_string(f"{stage}\n{identity}")
+    values = {
+        f"{lock_key}:head": 0,
+        f"{lock_key}:owner:0": {"id": "original", "acquired_at": 0.0},
+        f"{lock_key}:status:0": {"state": "complete", "recorded_at": 1.0},
+    }
+
+    class FakeDict:
+        def get(self, key, default=None):
+            return values.get(key, default)
+
+        def put(self, key, value, *, skip_if_exists=False):
+            if skip_if_exists and key in values:
+                return False
+            values[key] = value
+            return True
+
+    monkeypatch.setattr(
+        ensirna_app.modal.Dict,
+        "from_name",
+        lambda *_args, **_kwargs: FakeDict(),
+    )
+    return lock_key, values
+
+
 def write_prepared_marker(
     layout,
     *,
@@ -409,6 +435,73 @@ def test_cache_builder_waiters_share_one_repair_generation(monkeypatch) -> None:
     assert ownership == [True, False]
     assert any(key.endswith(":owner:1") for key in values)
     assert not any(key.endswith(":owner:2") for key in values)
+
+
+def test_preparation_repairs_wholly_missing_completed_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_volume = FakeVolume()
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=output_volume, output_volume_mountpoint=str(tmp_path)
+        ),
+    )
+    fasta = b">m\nAUGCUAGCUAGCUAGCUAGC\n"
+    cache_key = ensirna_app._cache_key_for_fasta(fasta)
+    layout = ensirna_app._layout_for_cache_key(cache_key)
+    lock_key, lock_values = install_completed_cache_generation(
+        monkeypatch, "prepared", cache_key
+    )
+    plan = ensirna_app.EnsirnaPreparationPlan(
+        cache_key=cache_key,
+        prepared_dir=str(layout.run_root),
+        json_path=str(layout.outputs_dir / "mrna.json"),
+        processed_dir=str(layout.outputs_dir / "mrna_processed"),
+        candidate_count=1,
+        chunk_count=0,
+        chunks=[],
+        cached=False,
+    )
+
+    class FakePrepare:
+        def remote(self, **_kwargs):
+            return plan
+
+    class FakeFinalize:
+        def remote(self, stage_plan):
+            return stage_plan
+
+    class FakePreprocess:
+        def remote(self, stage_plan):
+            layout.outputs_dir.mkdir(parents=True)
+            Path(stage_plan.json_path).write_text('{"siRNA":"m_0"}\n', encoding="utf-8")
+            processed_dir = Path(stage_plan.processed_dir)
+            processed_dir.mkdir()
+            part = processed_dir / "part_0.pkl"
+            part.write_bytes(b"processed")
+            processed_dir.joinpath("_metainfo").write_text(
+                '{"num_entry":1,"file_names":["'
+                + str(part)
+                + '"],"file_num_entries":[1]}',
+                encoding="utf-8",
+            )
+            ensirna_app._write_prepared_marker(
+                layout=layout, plan=stage_plan, json_records=1
+            )
+            return stage_plan
+
+    monkeypatch.setattr(ensirna_app, "ensirna_prepare_inputs", FakePrepare())
+    monkeypatch.setattr(ensirna_app, "ensirna_finalize_prepared_inputs", FakeFinalize())
+    monkeypatch.setattr(ensirna_app, "ensirna_preprocess_dataset", FakePreprocess())
+
+    result = ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(fasta)
+
+    assert result.cache_key == cache_key
+    assert lock_values[f"{lock_key}:status:1"]["state"] == "complete"
+    assert not any(key.endswith(":owner:2") for key in lock_values)
 
 
 def test_preparation_coordinator_preserves_partial_generation_on_retry(
@@ -1461,8 +1554,59 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
     )
 
     assert repaired == b"xlsx"
-    assert lock_rebuilds == [False, True]
+    assert lock_rebuilds == [True, True]
     assert run_count == 2
+
+
+def test_inference_repairs_wholly_missing_completed_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_volume = FakeVolume()
+    ensirna_dir = tmp_path / "ENsiRNA"
+    checkpoint_dir = tmp_path / "models" / "pkl"
+    (ensirna_dir / "pkl").mkdir(parents=True)
+    checkpoint_dir.mkdir(parents=True)
+    for filename in ensirna_app.APP_INFO.checkpoint_filenames:
+        checkpoint_dir.joinpath(filename).write_bytes(b"checkpoint")
+    layout = make_test_layout(tmp_path, monkeypatch, output_volume=output_volume)
+    monkeypatch.setattr(
+        ensirna_app,
+        "APP_INFO",
+        replace(
+            ensirna_app.APP_INFO,
+            ensirna_dir=ensirna_dir,
+            checkpoint_dir=checkpoint_dir,
+        ),
+    )
+    processed_dir = layout.outputs_dir / "mrna_processed"
+    processed_dir.mkdir(parents=True)
+    layout.outputs_dir.joinpath("mrna.json").write_text(
+        '{"siRNA":"m_0"}\n', encoding="utf-8"
+    )
+    part = processed_dir / "part_0.pkl"
+    part.write_bytes(b"processed")
+    processed_dir.joinpath("_metainfo").write_text(
+        '{"num_entry":1,"file_names":["' + str(part) + '"],"file_num_entries":[1]}',
+        encoding="utf-8",
+    )
+    write_prepared_marker(layout, candidate_count=1, chunk_count=1)
+    lock_key, lock_values = install_completed_cache_generation(
+        monkeypatch, "inference", TEST_CACHE_KEY
+    )
+
+    def fake_run_command(cmd, **_kwargs):
+        Path(cmd[cmd.index("--save_dir") + 1], "mrna_result.xlsx").write_bytes(b"xlsx")
+
+    monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
+
+    result = ensirna_app.run_ensirna_inference.get_raw_f()(
+        prepared_dir=str(layout.run_root)
+    )
+
+    assert result == b"xlsx"
+    assert lock_values[f"{lock_key}:status:1"]["state"] == "complete"
+    assert not any(key.endswith(":owner:2") for key in lock_values)
 
 
 def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:

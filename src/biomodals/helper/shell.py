@@ -43,8 +43,10 @@ def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
 def run_command(
     cmd: list[str] | str,
     *,
-    output_mode: Literal["tee", "capture", "inherit", "discard"] = "tee",
+    output_mode: Literal["tee", "capture", "log", "inherit", "discard"] = "tee",
     log_file: str | Path | None = None,
+    show_command: bool = True,
+    warn_on_error: bool = True,
     **kwargs,
 ) -> list[str]:
     """Run a shell command with explicit subprocess output handling.
@@ -52,10 +54,15 @@ def run_command(
     Args:
         cmd: Command to run, either as a string or a list of arguments.
         output_mode: ``tee`` captures and streams raw output, ``capture`` captures
-            without streaming, ``inherit`` attaches the child to parent streams,
-            and ``discard`` drops child output while waiting for completion.
+            without streaming, ``log`` writes raw output only to ``log_file``,
+            ``inherit`` attaches the child to parent streams, and ``discard``
+            drops child output while waiting for completion.
         log_file: Optional file that receives command timing metadata and raw
-            child output. Only valid with ``tee`` or ``capture`` modes.
+            child output. Only valid with ``tee``, ``capture``, or ``log`` modes.
+        show_command: Whether to print the command banner to stdout before
+            running. Command metadata is still written to ``log_file``.
+        warn_on_error: Whether to emit a warning with the log path before
+            raising on non-zero exit.
         **kwargs: Additional keyword arguments to pass to `subprocess.Popen`.
             For example, you can use `cwd` to specify the working directory, or
             `env` to specify environment variables.
@@ -79,12 +86,15 @@ def run_command(
         cmd = shlex.split(cmd)
 
     cmd_str = shlex.join(cmd)
-    sys.stdout.write(f"Running command: {cmd_str}\n")
-    sys.stdout.flush()
-    if output_mode not in {"tee", "capture", "inherit", "discard"}:
+    if show_command:
+        sys.stdout.write(f"Running command: {cmd_str}\n")
+        sys.stdout.flush()
+    if output_mode not in {"tee", "capture", "log", "inherit", "discard"}:
         raise ValueError(f"Unsupported command output mode: {output_mode}")
+    if output_mode == "log" and log_file is None:
+        raise ValueError("output_mode='log' requires log_file")
     if log_file is not None and output_mode in {"inherit", "discard"}:
-        raise ValueError("log_file requires output_mode='tee' or 'capture'")
+        raise ValueError("log_file requires output_mode='tee', 'capture', or 'log'")
     kwargs["env"] = _build_env(kwargs.get("env", None))
     if output_mode == "inherit":
         kwargs.setdefault("stdout", None)
@@ -111,6 +121,9 @@ def run_command(
     log_path = Path(log_file).expanduser() if log_file is not None else None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        if show_command:
+            sys.stdout.write(f"Saving logs to: {log_path}\n")
+            sys.stdout.flush()
     now = time()
     banner = "=" * 100
     log_handle = log_path.open("ab", buffering=0) if log_path is not None else None
@@ -140,12 +153,13 @@ def run_command(
                     except AttributeError:
                         sys.stdout.write(text)
                     sys.stdout.flush()
-                output_buffer += text
-                while "\n" in output_buffer:
-                    line, output_buffer = output_buffer.split("\n", 1)
-                    all_outputs.append(line.removesuffix("\r"))
+                if output_mode != "log":
+                    output_buffer += text
+                    while "\n" in output_buffer:
+                        line, output_buffer = output_buffer.split("\n", 1)
+                        all_outputs.append(line.removesuffix("\r"))
 
-            if output_buffer:
+            if output_mode != "log" and output_buffer:
                 all_outputs.append(output_buffer.removesuffix("\r"))
 
             p.wait()
@@ -162,12 +176,17 @@ def run_command(
 
     if return_code != 0:
         if log_path is not None:
-            warnings.warn(
-                f"Command '{cmd_str}' failed with return code {return_code}. "
-                f"Check log file {log_path} for details.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            if warn_on_error:
+                message = f"Command failed with return code {return_code}."
+                if show_command:
+                    message = (
+                        f"Command '{cmd_str}' failed with return code {return_code}."
+                    )
+                warnings.warn(
+                    f"{message} Check log file {log_path} for details.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         raise sp.CalledProcessError(return_code, cmd)
 
     return all_outputs
@@ -201,6 +220,14 @@ def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
     """Warm up the disk cache for all files in a directory matching a pattern."""
     if not Path(dir_path).exists():
         raise FileNotFoundError(dir_path)
+    fd_binary = shutil.which("fd") or shutil.which("fdfind")
+    if fd_binary is None:
+        warnings.warn(
+            "Neither 'fd' nor 'fdfind' is installed. Skipping directory warmup.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
     fd_args = [
         "-tf",
         "-j256",
@@ -211,11 +238,12 @@ def warmup_directory(dir_path: str | Path, file_pattern: str = ".") -> None:
         "bs=1M",
         "status=none",
     ]
-    try:
-        find_with_fd(dir_path, file_pattern, *fd_args)
-    except FileNotFoundError as e:
-        warnings.warn(str(e), RuntimeWarning, stacklevel=2)
-        return
+    run_command(
+        [fd_binary, file_pattern, *fd_args],
+        output_mode="capture",
+        cwd=str(dir_path),
+        show_command=False,
+    )
 
 
 @timed_function

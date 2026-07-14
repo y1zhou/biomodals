@@ -1,4 +1,4 @@
 interface:
   display_name: "Biomodals App Development"
-  short_description: "Build Biomodals apps and workflow outputs"
-  default_prompt: "Use $biomodals-app-development to create or review a Biomodals Modal app, and ask whether it should expose workflow-compatible AppRunResult functions."
+  short_description: "Build safe, scalable Biomodals Modal apps"
+  default_prompt: "Use $biomodals-app-development to create or review a Biomodals Modal app."

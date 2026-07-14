@@ -11,6 +11,7 @@ def patch_image_for_helper(
     copy_patch_files: bool = False,
     include_workflow_modules: bool = False,
     skip_deps: Iterable[str] | None = None,
+    ignore_dep_versions: bool = False,
 ) -> Image:
     """Patch a Modal Image to include helper dependencies.
 
@@ -28,6 +29,9 @@ def patch_image_for_helper(
         skip_deps: A list of package names to skip when installing
             `biomodals` dependencies. By default, all dependencies are included.
             This is to help with older project apps on Python <3.12.
+        ignore_dep_versions: Whether to install `biomodals` dependencies without
+            their version specifiers. This is useful for older app images where
+            the pinned/latest dependency versions require newer Python versions.
     """
     # This is a bit hacky, but because Modal's .add_local_python_source()
     # does not install the package, the metadata.requires call would not work
@@ -44,6 +48,23 @@ def patch_image_for_helper(
         mods.append("biomodals.workflow")
 
     new_image = image.apt_install("zstd", "fd-find")
+    if ignore_dep_versions:
+        import re
+
+        requirement_name_pattern = re.compile(r"^\s*([\w_\-.]+(?:\[[^\]]+\])?)")
+        stripped_deps = []
+        for dep in helper_deps:
+            requirement, separator, marker = dep.partition(";")
+            match = requirement_name_pattern.match(requirement)
+            if match is None or " @ " in requirement:
+                stripped_deps.append(dep)
+                continue
+            stripped = match.group(1)
+            if separator:
+                stripped = f"{stripped} ; {marker.strip()}"
+            stripped_deps.append(stripped)
+        helper_deps = stripped_deps
+
     if skip_deps is not None:
         import re
 

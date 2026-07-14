@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import niquests
 
@@ -60,21 +61,53 @@ async def _download_file(
     import aiofiles
 
     try:
-        response = await session.get(url, stream=True)
-        response.raise_for_status()
-        if (
-            force
-            or (not local_path.exists())
-            or (
-                "content-length" in response.headers
-                and int(response.headers["content-length"]) != local_path.stat().st_size
-            )
-        ):
+        if not await _should_download(session, url, local_path, force):
+            return
+
+        response = None
+        try:
+            response = await session.get(url, stream=True)
+            response.raise_for_status()
             async with aiofiles.open(local_path, "wb") as f:
                 async for chunk in await response.iter_content():
                     await f.write(chunk)
+        finally:
+            if response is not None:
+                await response.close()
     except Exception as e:
         raise RuntimeError(f"Download for {url} to {local_path} failed.") from e
+
+
+async def _should_download(
+    session: niquests.AsyncSession, url: str, local_path: Path, force: bool
+) -> bool:
+    """Return whether a remote URL should be downloaded."""
+    if force or not local_path.exists():
+        return True
+    try:
+        remote_size = await _remote_content_length(session, url)
+    except Exception:
+        return False
+    return remote_size is not None and remote_size != local_path.stat().st_size
+
+
+async def _remote_content_length(
+    session: niquests.AsyncSession, url: str
+) -> int | None:
+    """Return a URL's content length from HEAD metadata when available."""
+    response = None
+    try:
+        response = cast(
+            niquests.AsyncResponse,
+            await session.head(url, allow_redirects=True),
+        )
+        response.raise_for_status()
+        if "content-length" not in response.headers:
+            return None
+        return int(response.headers["content-length"])
+    finally:
+        if response is not None:
+            await response.close()
 
 
 def download_files(

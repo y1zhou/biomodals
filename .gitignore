@@ -224,3 +224,4 @@ __marimo__/
 # Agent-generated local files
 PLAN.md
 .claude/settings.local.json
+.agents/skills/modal

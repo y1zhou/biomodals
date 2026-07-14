@@ -177,6 +177,11 @@ class AppInfo:
         return f"{self.mamba_root}/bin:/root/.local/bin:$PATH"
 
     @property
+    def mamba_lib_path(self) -> str:
+        """Return the micromamba library path required by ViennaRNA."""
+        return f"{self.mamba_root}/lib"
+
+    @property
     def rosetta_rna_denovo(self) -> Path:
         """Return the ENsiRNA-expected Rosetta rna_denovo path."""
         return self.rosetta_compat_root / (
@@ -1206,12 +1211,17 @@ runtime_image = (
     .apt_install("git", "curl", "ca-certificates", "build-essential", "zstd")
     .env(
         CONF.default_env
-        | {"MAMBA_ROOT_PREFIX": APP_INFO.mamba_root, "PATH": APP_INFO.mamba_bin_path}
+        | {
+            "MAMBA_ROOT_PREFIX": APP_INFO.mamba_root,
+            "PATH": APP_INFO.mamba_bin_path,
+            "LD_LIBRARY_PATH": APP_INFO.mamba_lib_path,
+        }
     )
     .run_commands("curl -L micro.mamba.pm/install.sh | bash")
     .micromamba_install(
         *APP_INFO.conda_packages, channels=list(APP_INFO.conda_channels)
     )
+    .run_commands(f"micromamba run -n {APP_INFO.conda_env_name} python -c 'import RNA'")
     .run_commands(
         " && ".join((
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",

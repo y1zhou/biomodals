@@ -119,6 +119,9 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert "tanwenchong/ensirna:v2" not in source
     assert '"MAMBA_ROOT_PREFIX": APP_INFO.mamba_root' in source
     assert '"PATH": APP_INFO.mamba_bin_path' in source
+    assert ensirna_app.APP_INFO.mamba_lib_path == "/root/micromamba/lib"
+    assert '"LD_LIBRARY_PATH": APP_INFO.mamba_lib_path' in source
+    assert "python -c 'import RNA'" in source
     assert "def rosetta_extract_shim" in source
     assert "rna_denovo.static.linuxgccrelease" in source
     assert "def get_pdb_runtime_patch" in source

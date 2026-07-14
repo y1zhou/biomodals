@@ -23,7 +23,8 @@
 
 ### Modal platform
 
-This repo is built on Modal, a serverless cloud platform for running Python code. See `docs/agents/modal.md`.
+This repo is built on Modal, a serverless cloud platform for running Python
+code. Use the repo-local Modal skill at `.agents/skills/modal/SKILL.md`.
 
 ## Biomodals app development
 

@@ -2,6 +2,10 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+import ast
+import base64
+import gzip
+import re
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -223,6 +227,97 @@ def test_runtime_patch_contract_pins_sources_and_compiles_both_modules(
         exec(app_info.get_pdb_runtime_patch, {})  # noqa: S102
     with pytest.raises(SystemExit, match="dataset.py source hash mismatch"):
         exec(app_info.dataset_runtime_patch, {})  # noqa: S102
+
+
+def test_pinned_get_pdb_patch_repairs_only_mismatched_features(tmp_path: Path) -> None:
+    fixture_path = (
+        Path(__file__).parents[1] / "fixtures" / "ensirna" / "get_pdb.py.gz.b64"
+    )
+    pinned_source = gzip.decompress(base64.b64decode(fixture_path.read_bytes()))
+    assert ensirna_app._bytes_sha256(pinned_source) == (
+        ensirna_app.APP_INFO.get_pdb_source_sha256
+    )
+    ensirna_dir = tmp_path / "ENsiRNA"
+    source_path = ensirna_dir / "data" / "get_pdb.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(pinned_source)
+    app_info = replace(ensirna_app.APP_INFO, ensirna_dir=ensirna_dir)
+    original_source = source_path.read_text(encoding="utf-8")
+
+    def source_function(source: str, name: str, rnaplex_output: str = ""):
+        function = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        )
+        namespace = {
+            "re": re,
+            "subprocess": SimpleNamespace(
+                run=lambda *_args, **_kwargs: SimpleNamespace(stdout=rnaplex_output)
+            ),
+        }
+        exec(  # noqa: S102
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                source_path,
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace[name]
+
+    candidate = {
+        "siRNA": "target_0",
+        "sense seq": "a" * 19,
+        "anti seq": "u" * 19,
+    }
+    exact_rnaplex = f"{'(' * 19}&{')' * 19} 1,19 : 1,19 (-1.0)\n"
+    short_rnaplex = f".{'(' * 19}&{')' * 19} 1,19 : 1,19 (-1.0)\n"
+    long_rnaplex = f"{'(' * 19}&.{')' * 19} 1,19 : 1,19 (-1.0)\n"
+    original_exact = source_function(original_source, "get_anti_start", exact_rnaplex)(
+        None, candidate
+    )
+    assert original_exact is not None
+    assert (
+        source_function(original_source, "get_anti_start", short_rnaplex)(
+            None, candidate
+        )
+        is None
+    )
+    assert (
+        source_function(original_source, "get_anti_start", long_rnaplex)(
+            None, candidate
+        )
+        is None
+    )
+
+    exec(app_info.get_pdb_runtime_patch, {})  # noqa: S102
+    patched_source = source_path.read_text(encoding="utf-8")
+    assert (
+        source_function(patched_source, "get_anti_start", exact_rnaplex)(
+            None, candidate
+        )
+        == original_exact
+    )
+    short_positions, short_chain = source_function(
+        patched_source, "get_anti_start", short_rnaplex
+    )(None, candidate)
+    long_positions, long_chain = source_function(
+        patched_source, "get_anti_start", long_rnaplex
+    )(None, candidate)
+    expected_length = 61 + 19 + 19 + 1 + 1
+    assert len(short_positions) == len(short_chain) == expected_length
+    assert short_positions[-1] == short_positions[-2] - 1
+    assert short_chain[-1] == 3
+    assert len(long_positions) == len(long_chain) == expected_length
+    assert long_positions[-1] == 1
+    assert long_chain[-1] == 3
+
+    fit_secstruct = source_function(patched_source, "_fit_secstruct")
+    assert fit_secstruct("((..))", 6) == "((..))"
+    assert fit_secstruct("((", 4) == "((.."
+    assert fit_secstruct("..((..", 2) == "(("
 
 
 def test_download_ensirna_models_writes_to_model_volume(monkeypatch) -> None:

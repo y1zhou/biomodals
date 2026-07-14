@@ -19,6 +19,11 @@ dependencies = [
     "uniaf3>=0.2.0",
 ]
 
+[project.optional-dependencies]
+api = [
+    "fastapi[standard]>=0.139.0,<1",
+]
+
 [project.scripts]
 biomodals = "biomodals.cli:app"
 
@@ -28,6 +33,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "fastapi[standard]>=0.139.0,<1",
     "ipykernel>=7.2.0",
     "pytest>=9.0.3",
 ]

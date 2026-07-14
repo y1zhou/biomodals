@@ -30,3 +30,8 @@ The skill routes app work to focused references under
 - If an app needs to intentionally deviate from the skill, add a focused note under `docs/agents/` explaining why and link it from this document.
 - Keep local entrypoints CLI-only. Workflow reuse should happen through remote
   app functions that return shared schemas from `biomodals.schema`.
+
+## Documented Deviations
+
+- [GROMACS API service](gromacs-api-service.md) intentionally exposes an ASGI
+  web function instead of a `submit_<tool>_task` local entrypoint.

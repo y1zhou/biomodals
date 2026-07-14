@@ -13,16 +13,26 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
+from biomodals.helper.app_run import (
+    AppRunLayout,
+    volume_app_output,
+)
 from biomodals.helper.constant import MAX_TIMEOUT
-from biomodals.helper.shell import run_command
+from biomodals.helper.pdb import validate_pdb_content
+from biomodals.helper.shell import run_command, sanitize_filename
 from biomodals.helper.task_budget import bounded_map
-from biomodals.schema import ArtifactFile
+from biomodals.schema import (
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+)
 
 ##########################################
 # Modal configs
@@ -208,6 +218,13 @@ biotite_image = (
     .pipe(patch_image_for_helper)
 )
 
+coordinator_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .env(CONF.default_env)
+    .pipe(patch_image_for_helper)
+)
+
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
@@ -221,6 +238,17 @@ def file1_needs_update(file1: Path, file2: Path) -> bool:
     if not file2.exists():
         raise FileNotFoundError(f"File not found for timestamp comparison: {file2}")
     return file1.stat().st_mtime < file2.stat().st_mtime
+
+
+def _validated_run_name(run_name: str) -> str:
+    safe_run_name = sanitize_filename(run_name)
+    if safe_run_name != run_name or len(run_name) > 128:
+        raise ValueError("run_name must be a safe filename of at most 128 characters")
+    return safe_run_name
+
+
+def _validate_pdb_content(pdb_content: bytes) -> None:
+    validate_pdb_content(pdb_content, max_bytes=10 * 1024 * 1024)
 
 
 ##########################################
@@ -250,6 +278,9 @@ def prepare_tpr_gpu(
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
+    run_name = _validated_run_name(run_name)
+    _validate_pdb_content(pdb_content)
+    CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
@@ -325,6 +356,9 @@ def prepare_tpr_cpu(
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
+    run_name = _validated_run_name(run_name)
+    _validate_pdb_content(pdb_content)
+    CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
@@ -399,6 +433,7 @@ def find_traj_last_time_ns(traj_file: str) -> float:
     """
     import shutil
 
+    CONF.output_volume.reload()
     traj_path = Path(traj_file)
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
@@ -449,6 +484,8 @@ def production_run_gpu(
     """Production Gromacs run."""
     import shutil
 
+    run_name = _validated_run_name(run_name)
+    CONF.output_volume.reload()
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
@@ -520,6 +557,8 @@ def production_run_cpu(
     """Production Gromacs run."""
     import shutil
 
+    run_name = _validated_run_name(run_name)
+    CONF.output_volume.reload()
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
@@ -592,6 +631,7 @@ def postprocess_traj(
 
     Remove PBC for the protein chains (best-effort), and dump centered structures.
     """
+    CONF.output_volume.reload()
     script_path = Path(APP_INFO.gmx_scripts) / "postprocess-traj.sh"
     if not script_path.exists():
         raise FileNotFoundError(f"Gromacs script not found: {script_path}")
@@ -640,6 +680,9 @@ def collect_traj_stats(
     import matplotlib.pyplot as plt  # type: ignore[ty:unresolved-import]
     import numpy as np
 
+    run_name = _validated_run_name(run_name)
+    out_vol = CONF.output_volume
+    out_vol.reload()
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
@@ -652,6 +695,7 @@ def collect_traj_stats(
     if file1_needs_update(processed_traj_path, traj_path):
         # remove outdated processed trajectory
         processed_traj_path.unlink(missing_ok=True)
+        out_vol.commit()
     if not processed_traj_path.exists():
         postprocess_traj.remote(
             str(traj_path),
@@ -660,7 +704,6 @@ def collect_traj_stats(
             ref_struct_file=str(work_path / f"{run_name}.pdb"),
         )
 
-    out_vol = CONF.output_volume
     out_vol.reload()
     traj_1st_frame_pdb_path = work_path / f"{traj_prefix}{run_name}_nopbc_centered.pdb"
     if not traj_1st_frame_pdb_path.exists():
@@ -804,6 +847,117 @@ def collect_traj_stats(
     return str(work_path)
 
 
+def _run_gromacs_job(
+    *,
+    pdb_content: bytes,
+    run_name: str,
+    simulation_time_ns: int = 5,
+    run_pdbfixer: bool = False,
+    cpu_only: bool = False,
+    num_threads: int = APP_INFO.gmx_threads,
+    use_openmp_threads: bool = False,
+    ld_seed: int = -1,
+    gen_seed: int = -1,
+    genion_seed: int = 0,
+    max_parallel_analysis: int | None = None,
+) -> AppRunResult:
+    """Run one complete GROMACS job through the shared app functions."""
+    run_name = _validated_run_name(run_name)
+    _validate_pdb_content(pdb_content)
+    if simulation_time_ns < 1:
+        raise ValueError("simulation_time_ns must be at least 1")
+    if not 1 <= num_threads <= APP_INFO.gmx_threads:
+        raise ValueError(f"num_threads must be between 1 and {APP_INFO.gmx_threads}")
+
+    print("🧬 Preparing Gromacs production run...")
+    prepare_tpr_conf = {
+        "pdb_content": pdb_content,
+        "run_name": run_name,
+        "simulation_time_ns": simulation_time_ns,
+        "run_pdbfixer": run_pdbfixer,
+        "num_threads": num_threads,
+        "use_openmp_threads": use_openmp_threads,
+        "ld_seed": ld_seed,
+        "gen_seed": gen_seed,
+        "genion_seed": genion_seed,
+    }
+    prepare_function = prepare_tpr_cpu if cpu_only else prepare_tpr_gpu
+    remote_workdir = prepare_function.remote(**prepare_tpr_conf)
+
+    bounded_map(
+        ["nvt_", "npt_"],
+        lambda prefix: collect_traj_stats.remote(prefix, run_name=run_name),
+        max_parallel=max_parallel_analysis,
+    )
+
+    print("🧬 Starting Gromacs production MD simulation...")
+    production_function = production_run_cpu if cpu_only else production_run_gpu
+    production_function.remote(
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+    )
+
+    print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
+    collect_traj_stats.remote(
+        "production_",
+        run_name=run_name,
+        save_processed_traj=True,
+    )
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name="gromacs_run",
+                kind=ArtifactKind.DIRECTORY,
+                remote_path=remote_workdir,
+                mount_root=CONF.output_volume_mountpoint,
+                volume_name=CONF.output_volume_name,
+                metadata={"run_name": run_name},
+                files=cast(
+                    list[ArtifactFile | str],
+                    production_workflow_files(run_name),
+                ),
+            )
+        ],
+    )
+
+
+@app.function(
+    image=coordinator_image,
+    cpu=0.125,
+    memory=(512, 4096),
+    timeout=CONF.timeout,
+    max_containers=20,
+)
+def run_gromacs_job(
+    pdb_content: bytes,
+    run_name: str,
+    simulation_time_ns: int = 5,
+    run_pdbfixer: bool = False,
+    cpu_only: bool = False,
+    num_threads: int = APP_INFO.gmx_threads,
+    use_openmp_threads: bool = False,
+    ld_seed: int = -1,
+    gen_seed: int = -1,
+    genion_seed: int = 0,
+) -> AppRunResult:
+    """Run one durable GROMACS job suitable for detached API submission."""
+    return _run_gromacs_job(
+        pdb_content=pdb_content,
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        run_pdbfixer=run_pdbfixer,
+        cpu_only=cpu_only,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        ld_seed=ld_seed,
+        gen_seed=gen_seed,
+        genion_seed=genion_seed,
+    )
+
+
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
@@ -850,57 +1004,18 @@ def submit_gromacs_task(
     if run_name is None:
         run_name = pdb_path.stem
 
-    print("🧬 Preparing Gromacs production run...")
-    prepare_tpr_conf = {
-        "pdb_content": pdb_str,
-        "run_name": run_name,
-        "simulation_time_ns": simulation_time_ns,
-        "run_pdbfixer": run_pdbfixer,
-        "num_threads": num_threads,
-        "use_openmp_threads": use_openmp_threads,
-        "ld_seed": ld_seed,
-        "gen_seed": gen_seed,
-        "genion_seed": genion_seed,
-    }
-    if cpu_only:
-        remote_workdir = prepare_tpr_cpu.remote(**prepare_tpr_conf)
-    else:
-        remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
-
-    bounded_map(
-        ["nvt_", "npt_"],
-        lambda prefix: collect_traj_stats.remote(prefix, run_name=run_name),
-        max_parallel=max_parallel_analysis,
+    result = _run_gromacs_job(
+        pdb_content=pdb_str,
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        run_pdbfixer=run_pdbfixer,
+        cpu_only=cpu_only,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        ld_seed=ld_seed,
+        gen_seed=gen_seed,
+        genion_seed=genion_seed,
+        max_parallel_analysis=max_parallel_analysis,
     )
-
-    print("🧬 Starting Gromacs production MD simulation...")
-    if cpu_only:
-        _ = production_run_cpu.remote(
-            run_name=run_name,
-            simulation_time_ns=simulation_time_ns,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
-        )
-    else:
-        _ = production_run_gpu.remote(
-            run_name=run_name,
-            simulation_time_ns=simulation_time_ns,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
-        )
-
-    print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
-    bounded_map(
-        ["production_"],
-        lambda prefix: collect_traj_stats.remote(
-            run_name=run_name,
-            traj_prefix=prefix,
-            save_processed_traj=True,
-        ),
-        max_parallel=max_parallel_analysis,
-    )
-
-    remote_vol = volume_path_from_mount_path(
-        remote_workdir, CONF.output_volume_mountpoint, CONF.output_volume_name
-    )
+    remote_vol = result.outputs[0].storage
     print(f"🧬 Gromacs preparation complete! Check data in {remote_vol}")

@@ -181,7 +181,9 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert "https://download.pytorch.org/whl/cu118" in source
     assert "rna-fm" in source
     assert "ENSIRNA_RNAFM_DEVICE" in source
-    assert "ENSIRNA_PDB_CORES" in source
+    assert "ENSIRNA_PDB_CORES" not in source
+    assert '"--num-cores"' in source
+    assert "cpu=(0.125, 32.125)" in source
     assert '"data.dataset"' in source
     assert '"data.get_pdb"' in source
     assert '"run.py"' in source
@@ -294,6 +296,12 @@ def test_pinned_get_pdb_patch_repairs_only_mismatched_features(tmp_path: Path) -
 
     exec(app_info.get_pdb_runtime_patch, {})  # noqa: S102
     patched_source = source_path.read_text(encoding="utf-8")
+    assert "def __init__(self,excel_dir,pdb_dir,num_cores=1):" in patched_source
+    assert "parser.add_argument('--num-cores', type=int, default=1" in patched_source
+    assert "Data_Prepare(filename,args.pdb_dir,args.num_cores).process()" in (
+        patched_source
+    )
+    assert "processes=min(self.num_cores, len(chunks))," in patched_source
     assert (
         source_function(patched_source, "get_anti_start", exact_rnaplex)(
             None, candidate
@@ -570,7 +578,8 @@ def test_preparation_repairs_wholly_missing_completed_publication(
             return stage_plan
 
     class FakePreprocess:
-        def remote(self, stage_plan):
+        def remote(self, stage_plan, *, preprocess_shard_size):
+            assert preprocess_shard_size == ensirna_app.APP_INFO.preprocess_shard_size
             layout.outputs_dir.mkdir(parents=True)
             Path(stage_plan.json_path).write_text('{"siRNA":"m_0"}\n', encoding="utf-8")
             processed_dir = Path(stage_plan.processed_dir)
@@ -632,7 +641,9 @@ def test_preparation_coordinator_preserves_partial_generation_on_retry(
             return self.result
 
     class FakeStage:
-        def remote(self, *_args, **_kwargs):
+        def remote(self, *_args, **kwargs):
+            if "preprocess_shard_size" in kwargs:
+                captured["preprocess_shard_size"] = kwargs["preprocess_shard_size"]
             return plan
 
     @contextmanager
@@ -644,13 +655,39 @@ def test_preparation_coordinator_preserves_partial_generation_on_retry(
     monkeypatch.setattr(ensirna_app, "ensirna_finalize_prepared_inputs", FakeStage())
     monkeypatch.setattr(ensirna_app, "ensirna_preprocess_dataset", FakeStage())
 
-    ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(b">m\nAUGCUAGCUAGCUAGCUAGC\n")
+    ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(
+        b">m\nAUGCUAGCUAGCUAGCUAGC\n",
+        preprocess_shard_size=17,
+    )
 
     assert captured["prepare"] == {
         "mrna_fasta_bytes": b">m\nAUGCUAGCUAGCUAGCUAGC\n",
         "max_prepare_jobs": 4,
         "force_generation": None,
     }
+    assert captured["preprocess_shard_size"] == 17
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"prepare_workers": 0}, "prepare_workers must be between"),
+        ({"pdb_cores": 0}, "pdb_cores must be between"),
+        (
+            {"prepare_workers": 3, "pdb_cores": 32},
+            "prepare_workers * pdb_cores must not exceed",
+        ),
+        ({"preprocess_shard_size": 0}, "preprocess_shard_size must be at least 1"),
+    ),
+)
+def test_preparation_coordinator_rejects_invalid_runtime_budget(
+    kwargs: dict[str, int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(
+            b">m\nAUGCUAGCUAGCUAGCUAGC\n",
+            **kwargs,
+        )
 
 
 def test_corrupt_published_part_is_invalidated_and_recomputed(
@@ -710,7 +747,8 @@ def test_corrupt_published_part_is_invalidated_and_recomputed(
             return _plan
 
     class FakePreprocess:
-        def remote(self, _plan):
+        def remote(self, _plan, *, preprocess_shard_size):
+            assert preprocess_shard_size == ensirna_app.APP_INFO.preprocess_shard_size
             processed_dir.mkdir(parents=True)
             part.write_bytes(b"recomputed")
             processed_dir.joinpath("_metainfo").write_text(
@@ -1071,7 +1109,7 @@ def test_prepare_pdb_chunk_runs_rosetta_on_cpu(
     def fake_run_command(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["cwd"] = kwargs["cwd"]
-        captured["env"] = kwargs["env"]
+        captured["kwargs"] = kwargs
         staged_pdb_dir = Path(cmd[cmd.index("-p") + 1])
         captured["staged_pdb_dir"] = staged_pdb_dir
         assert staged_pdb_dir != pdb_dir
@@ -1104,7 +1142,8 @@ def test_prepare_pdb_chunk_runs_rosetta_on_cpu(
         "data.get_pdb",
     ]
     assert captured["cwd"] == ensirna_dir
-    assert captured["env"] == {ensirna_app.APP_INFO.pdb_cores_env: "3"}
+    assert captured["cmd"][-2:] == ["--num-cores", "3"]
+    assert "env" not in captured["kwargs"]
     assert (pdb_dir / "m_0.pdb").read_text(encoding="utf-8") == "PDB"
     assert ensirna_app._json_records(chunk_csv.with_suffix(".json"))[0][
         "pdb_data_path"
@@ -1426,7 +1465,6 @@ def test_preprocess_dataset_checkpoints_independent_rnafm_shards(
             ensirna_app.APP_INFO,
             ensirna_dir=ensirna_dir,
             rnafm_cache_path=rnafm_cache,
-            preprocess_shard_size=1,
         ),
     )
     layout.outputs_dir.mkdir(parents=True)
@@ -1463,7 +1501,7 @@ def test_preprocess_dataset_checkpoints_independent_rnafm_shards(
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
-    ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan)
+    ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan, preprocess_shard_size=1)
 
     assert len(calls) == 2
     assert ensirna_app._processed_manifest_valid(Path(plan.processed_dir), 2)
@@ -1487,7 +1525,6 @@ def test_preprocess_dataset_recomputes_same_size_corrupted_partial_shard(
             ensirna_app.APP_INFO,
             ensirna_dir=ensirna_dir,
             rnafm_cache_path=rnafm_cache,
-            preprocess_shard_size=1,
         ),
     )
     layout.outputs_dir.mkdir(parents=True)
@@ -1525,7 +1562,9 @@ def test_preprocess_dataset_recomputes_same_size_corrupted_partial_shard(
 
     monkeypatch.setattr(ensirna_app, "run_command", interrupted_run)
     with pytest.raises(RuntimeError, match="simulated interruption"):
-        ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan)
+        ensirna_app.ensirna_preprocess_dataset.get_raw_f()(
+            plan, preprocess_shard_size=1
+        )
 
     first_part = (
         Path(plan.processed_dir) / "shards" / "shard_0000" / "processed" / "part_0.pkl"
@@ -1552,7 +1591,7 @@ def test_preprocess_dataset_recomputes_same_size_corrupted_partial_shard(
         )
 
     monkeypatch.setattr(ensirna_app, "run_command", retry_run)
-    ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan)
+    ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan, preprocess_shard_size=1)
 
     assert len(retry_inputs) == 2
     assert "target_0" in retry_inputs[0]
@@ -1744,13 +1783,17 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
         mrna_fasta=str(input_fasta),
         out_dir=str(tmp_path),
         run_name="demo",
+        prepare_workers=2,
+        pdb_cores=3,
+        preprocess_shard_size=17,
     )
 
     assert captured["download_force"] is False
     assert captured["build"] == {
         "mrna_fasta_bytes": b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-        "prepare_workers": 4,
-        "pdb_cores": 1,
+        "prepare_workers": 2,
+        "pdb_cores": 3,
+        "preprocess_shard_size": 17,
         "force_generation": None,
     }
     assert captured["run"] == {"prepared_dir": "/remote/prepared", "force": False}

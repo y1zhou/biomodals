@@ -89,11 +89,10 @@ class AppInfo:
     cache_lock_poll_seconds: float = 5.0
     cache_lock_stale_seconds: float = MAX_TIMEOUT + 600
     max_prepare_jobs: int = 64
-    max_pdb_cores: int = 16
+    max_pdb_cores: int = 32
     max_total_pdb_cores: int = 64
     preprocess_shard_size: int = 1024
     rnafm_device_env: str = "ENSIRNA_RNAFM_DEVICE"
-    pdb_cores_env: str = "ENSIRNA_PDB_CORES"
     rosetta_compat_root: Path = Path(
         "/app/ENsiRNA-main/rosetta/rosetta.binary.linux.release-371"
     )
@@ -268,12 +267,37 @@ if actual_sha256 != expected_sha256:
         f"expected {{expected_sha256}}, got {{actual_sha256}}"
     )
 text = source.decode("utf-8").replace("\\r\\n", "\\n")
+init_old = '''    def __init__(self,excel_dir,pdb_dir):
+'''
+init_new = '''    def __init__(self,excel_dir,pdb_dir,num_cores=1):
+'''
 cores_old = '''        self.num_cores = multiprocessing.cpu_count()
 '''
-cores_new = '''        self.num_cores = max(
+cores_new = '''        if num_cores < 1:
+            raise ValueError('num_cores must be at least 1')
+        self.num_cores = num_cores
+'''
+pool_old = '''        self.chunk_size = max(1, total_rows // self.num_cores)
+        chunks = self.chunk_dataframe(df, self.chunk_size)
+        with multiprocessing.Pool(processes=len(chunks)) as pool:
+'''
+pool_new = '''        self.chunk_size = max(
             1,
-            int(os.environ.get({self.pdb_cores_env!r}, multiprocessing.cpu_count())),
+            (total_rows + self.num_cores - 1) // self.num_cores,
         )
+        chunks = self.chunk_dataframe(df, self.chunk_size)
+        with multiprocessing.Pool(
+            processes=min(self.num_cores, len(chunks)),
+        ) as pool:
+'''
+parser_old = '''    parser.add_argument('-p','--pdb_dir', type=str, default=None, help='Path to save processed data')
+'''
+parser_new = '''    parser.add_argument('-p','--pdb_dir', type=str, default=None, help='Path to save processed data')
+    parser.add_argument('--num-cores', type=int, default=1, help='Local PDB worker processes')
+'''
+call_old = '''        Data_Prepare(filename,args.pdb_dir).process()
+'''
+call_new = '''        Data_Prepare(filename,args.pdb_dir,args.num_cores).process()
 '''
 old = '''        if len(sec_pos) != 61+len(seq2)+len(seq1)+1+1:
             print('!=',data['siRNA'],len(sec_pos),len(seq2))
@@ -310,15 +334,27 @@ rosetta_cmd_old = '''        subprocess.run([FF,'-sequence',seq,'-secstruct',sec
 '''
 rosetta_cmd_new = '''        subprocess.run([FF,'-sequence',seq,'-secstruct',secondary_seq,'-minimize_rna','-out:file:silent','default.out'])
 '''
+if init_old not in text:
+    raise SystemExit("expected ENsiRNA get_pdb constructor not found")
 if cores_old not in text:
     raise SystemExit("expected ENsiRNA get_pdb CPU core block not found")
+if pool_old not in text:
+    raise SystemExit("expected ENsiRNA get_pdb process-pool block not found")
+if parser_old not in text:
+    raise SystemExit("expected ENsiRNA get_pdb argument parser not found")
+if call_old not in text:
+    raise SystemExit("expected ENsiRNA get_pdb entrypoint call not found")
 if old not in text:
     raise SystemExit("expected ENsiRNA get_pdb length check not found")
 if secstruct_old not in text:
     raise SystemExit("expected ENsiRNA secondary structure block not found")
 if rosetta_cmd_old not in text:
     raise SystemExit("expected ENsiRNA Rosetta command not found")
+text = text.replace(init_old, init_new)
 text = text.replace(cores_old, cores_new)
+text = text.replace(pool_old, pool_new)
+text = text.replace(parser_old, parser_new)
+text = text.replace(call_old, call_new)
 text = text.replace(old, new)
 text = text.replace(secstruct_old, secstruct_new)
 text = text.replace(rosetta_cmd_old, rosetta_cmd_new)
@@ -1426,7 +1462,7 @@ def ensirna_prepare_inputs(
 
 
 @app.function(
-    cpu=(0.125, 16.125),
+    cpu=(0.125, 32.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
     volumes=CONF.mounts(output_volume=True),
@@ -1434,7 +1470,7 @@ def ensirna_prepare_inputs(
 def ensirna_prepare_pdb_chunk(
     chunk: EnsirnaPdbChunkSpec, pdb_cores: int = 1
 ) -> dict[str, int | str]:
-    """Run Rosetta PDB generation for one CSV chunk on CPU."""
+    """Run one PDB chunk with a bounded local Rosetta process pool."""
     from uuid import uuid4
 
     import orjson
@@ -1466,9 +1502,10 @@ def ensirna_prepare_pdb_chunk(
                     str(staging_csv),
                     "-p",
                     str(staging_pdb_dir),
+                    "--num-cores",
+                    str(pdb_cores),
                 ],
                 cwd=APP_INFO.ensirna_dir,
-                env={APP_INFO.pdb_cores_env: str(pdb_cores)},
                 output_mode="inherit",
             )
             if not _chunk_artifacts_valid(
@@ -1586,11 +1623,14 @@ def ensirna_finalize_prepared_inputs(
 )
 def ensirna_preprocess_dataset(
     plan: EnsirnaPreparationPlan,
+    preprocess_shard_size: int = APP_INFO.preprocess_shard_size,
 ) -> EnsirnaPreparationPlan:
     """Build resumable RNA-FM preprocessing shards on GPU."""
     import orjson
 
     layout = _validate_preparation_plan(plan)
+    if preprocess_shard_size < 1:
+        raise ValueError("preprocess_shard_size must be at least 1")
     CONF.output_volume.reload()
     if cached_plan := _cached_preparation_plan(cache_key=plan.cache_key, layout=layout):
         return cached_plan
@@ -1616,10 +1656,8 @@ def ensirna_preprocess_dataset(
     shards_dir.mkdir(parents=True, exist_ok=True)
     part_paths: list[str] = []
     part_counts: list[int] = []
-    for shard_index, offset in enumerate(
-        range(0, json_records, APP_INFO.preprocess_shard_size)
-    ):
-        shard_lines = json_lines[offset : offset + APP_INFO.preprocess_shard_size]
+    for shard_index, offset in enumerate(range(0, json_records, preprocess_shard_size)):
+        shard_lines = json_lines[offset : offset + preprocess_shard_size]
         shard_count = len(shard_lines)
         shard_content = b"\n".join(shard_lines) + b"\n"
         shard_input_sha256 = _bytes_sha256(shard_content)
@@ -1759,6 +1797,7 @@ def build_ensirna_prepared_inputs(
     mrna_fasta_bytes: bytes,
     prepare_workers: int = 4,
     pdb_cores: int = 1,
+    preprocess_shard_size: int = APP_INFO.preprocess_shard_size,
     force_generation: str | None = None,
 ) -> EnsirnaPreparationPlan:
     """Own and orchestrate one complete content-addressed preparation build."""
@@ -1773,6 +1812,8 @@ def build_ensirna_prepared_inputs(
             "prepare_workers * pdb_cores must not exceed "
             f"{APP_INFO.max_total_pdb_cores}"
         )
+    if preprocess_shard_size < 1:
+        raise ValueError("preprocess_shard_size must be at least 1")
 
     cache_key = _cache_key_for_fasta(
         mrna_fasta_bytes, force_generation=force_generation
@@ -1803,7 +1844,10 @@ def build_ensirna_prepared_inputs(
         )
         print(
             f"💊 Preparing {plan.candidate_count} siRNAs across "
-            f"{plan.chunk_count} CPU chunks ({pdb_cores} cores each)"
+            f"{plan.chunk_count} CPU chunks (up to "
+            f"{min(prepare_workers, plan.chunk_count)} containers, "
+            f"{pdb_cores} local processes each, "
+            f"{min(prepare_workers, plan.chunk_count) * pdb_cores} process slots)"
         )
 
         def run_chunk(chunk: EnsirnaPdbChunkSpec) -> dict[str, int | str]:
@@ -1811,7 +1855,10 @@ def build_ensirna_prepared_inputs(
 
         bounded_map(plan.chunks, run_chunk, max_parallel=prepare_workers)
         finalized = ensirna_finalize_prepared_inputs.remote(plan)
-        return ensirna_preprocess_dataset.remote(finalized)
+        return ensirna_preprocess_dataset.remote(
+            finalized,
+            preprocess_shard_size=preprocess_shard_size,
+        )
 
 
 @app.function(
@@ -1915,6 +1962,7 @@ def submit_ensirna_task(
     run_name: str | None = None,
     prepare_workers: int = 4,
     pdb_cores: int = 1,
+    preprocess_shard_size: int = APP_INFO.preprocess_shard_size,
     force: bool = False,
 ) -> None:
     """Run ENsiRNA siRNA candidate design.
@@ -1925,9 +1973,12 @@ def submit_ensirna_task(
             will be saved in the current working directory.
         run_name: Optional run name for output files. Defaults to the mRNA FASTA
             filename stem.
-        prepare_workers: Maximum number of CPU Modal workers for Rosetta PDB
+        prepare_workers: Maximum concurrent Modal containers used for Rosetta PDB
             preparation chunks.
-        pdb_cores: CPU cores used inside each PDB preparation worker.
+        pdb_cores: Local Rosetta worker processes per preparation container. The
+            product of this value and prepare_workers cannot exceed 64.
+        preprocess_shard_size: Candidate records checkpointed per RNA-FM shard;
+            completed preparation caches remain reusable across values.
         force: Rebuild prepared artifacts and rerun inference instead of using
             matching cached Modal volume outputs.
     """
@@ -1951,6 +2002,7 @@ def submit_ensirna_task(
         mrna_fasta_bytes=input_path.read_bytes(),
         prepare_workers=prepare_workers,
         pdb_cores=pdb_cores,
+        preprocess_shard_size=preprocess_shard_size,
         force_generation=uuid4().hex if force else None,
     )
     if prepared_plan.cached:

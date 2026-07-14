@@ -23,8 +23,9 @@ Apply this common contract, then load specialized references from `SKILL.md`.
 - Use `copy_patch_files=True` only for build-time helper imports. Include sibling
   modules as described in `multi-module.md`.
 - Create `app = modal.App(CONF.name, image=image, tags=CONF.tags)`.
-- Declare realistic timeout/CPU/memory; add GPU only where needed and bound
-  environment overrides by those resources.
+- Declare realistic timeout/CPU/memory; add GPU only where needed. Pass
+  scheduling and sharding controls as validated runtime arguments rather than
+  image environment variables, and bound them by those resources.
 
 ## Trust boundaries
 

@@ -8,7 +8,12 @@ or fine-grained retry.
 - Use `map()`/`starmap()` when the caller consumes one-/multi-argument results.
   Use `spawn_map()` only when workers persist results; detached work needs a
   persistent app context and separate consolidation.
-- Apply run-specific caps with `with_options(max_containers=n)`.
+- Pass run-specific container fanout, shard sizes, and local worker counts as
+  validated function arguments. Keep a broad static CPU range on the function
+  when those values only control in-container concurrency; this avoids creating
+  a separate function pool for every tuning combination.
+- Use `with_options(...)` only when the run needs a distinct Modal resource or
+  autoscaling pool, not merely to choose local worker counts.
 - Use `@modal.concurrent(...)` only for thread-safe synchronous work or
   nonblocking async work. Do not stack it on a resource-saturating subprocess
   pool.
@@ -28,8 +33,11 @@ total process slots = Σ(
 
 - Allocate the budget among simultaneous branches before launch; per-function
   caps do not cap a run.
-- Clamp environment overrides to declared resources, reject nonpositive values,
-  and reserve headroom.
+- Keep operational topology out of scientific cache identities. Do not forward
+  tuning environment variables through image construction: changing them
+  fingerprints the image. Prefer CLI arguments bundled into a small serializable
+  execution config, validate them against declared resource limits, reject
+  nonpositive values, and reserve headroom.
 - Log task counts/batches, container caps, concurrent inputs, local workers, and
   effective slots.
 - Batch fine tasks into bounded per-container work. Split along every large

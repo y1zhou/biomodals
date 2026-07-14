@@ -53,9 +53,12 @@ The RNAplfold cache is partitioned into deterministic reference shards. Each
 shard marker binds the reference identity and shard input digest to every
 expected output name, nonzero size, and publication-time SHA-256; a top marker
 binds the exact set of shard markers. Routine readiness re-hashes the small
-inputs and manifests and checks every output's recorded size, avoiding a full
-human-cache reread. A damaged shard repairs only missing or invalid outputs, and
-setup overrides cannot exceed 32 nodes or 8 local workers.
+inputs and manifests, then checks that every expected output exists and matches
+its positive recorded size, avoiding a full human-cache reread. The recorded
+output hashes remain available for explicit deep validation; routine readiness
+detects missing and size-invalid outputs but does not re-hash every output.
+Routine repair reruns only outputs that fail those readiness checks, and setup
+overrides cannot exceed 32 nodes or 8 local workers.
 
 An all-human run plan pins that content identity. Before constructing evidence,
 post-processing reacquires the stable global reference-state generation,
@@ -76,8 +79,15 @@ and run plans pin those directories directly.
 Stages whose row counts are known only after discovery use two independent
 expansion hierarchies. TargetScan emits bounded candidate-batch by
 reference-shard waves, then context-score row shards. PITA prepares one shared
-reference STAB plan, expands that into per-siRNA target-discovery shards, then
-emits potential-target energy row shards. Both shapes keep initial fanout
+reference STAB plan, then runs bounded end-to-end candidate waves. A PITA wave
+contains at most four times the effective preparation-worker count; that count
+is itself bounded by 32, the candidate count, the configured preparation
+workers, and the PITA share of the run-wide process slots. The current maximum
+is therefore 128 candidates per wave. Candidate preparation, UTR target
+discovery, consolidation, potential-target row scoring, and per-candidate
+finalization all complete before the next wave is planned. Of the per-wave
+candidate products, only lightweight `OffTargetShardResult` path/index records
+remain in coordinator memory across waves. Both backend shapes keep fanout
 bounded while allowing heavy work to split by observed row count.
 
 The remote `run_oligoformer_postprocess` function owns this off-target tile
@@ -111,10 +121,12 @@ append-only status records instead of deleting a possibly replaced lock.
 The tiled implementation is intended to preserve upstream-equivalent scores
 except for the explicit TargetScan reducer correction below. It does not add
 approximate prefilters or heuristic pruning. Earlier pinned-upstream exercises
-compared raw and final artifacts for maintained fixtures; focused site-type and
-boundary tests establish the corrected 7mer and 8mer behavior. A future
-independent scientific comparison must apply the same projected-score
-correction to its upstream oracle before claiming equivalence.
+compared final tables for maintained fixtures; the retired verifier did not
+compare raw PITA or TargetScan evidence. Focused site-type and boundary tests
+establish the corrected 7mer and 8mer behavior. A future independent scientific
+comparison must apply the same projected-score correction to its upstream
+oracle and compare raw evidence as well as final tables before claiming
+equivalence.
 
 TargetScan and PITA run as independent Modal branch functions because their
 inputs and outputs do not depend on each other. `run_oligoformer_postprocess`
@@ -198,13 +210,13 @@ changes while reusing valid efficacy and merged off-target evidence.
 
 TargetScan branch-reduction optimization keeps the reducer semantics unchanged:
 only the placement changes from serial in the parent branch node to bounded
-parallel remote finalizers. The one-time direct-upstream sandbox verifier used
-during broader equivalence work has served its purpose and is not retained as a
-permanent maintenance tool. Focused regression tests now protect the corrected
-site-type thresholds, candidate identities, raw PITA and TargetScan evidence,
-and final filter semantics. Any future scientific reducer change requires a new
-independent pinned-upstream comparison rather than treating the app as its own
-oracle.
+parallel remote finalizers. The one-time direct-upstream sandbox verifier
+compared final output tables only. It served its purpose during broader
+equivalence work and is not retained as a permanent maintenance tool. Focused
+regression tests now protect the corrected site-type thresholds, candidate
+identities, raw PITA and TargetScan evidence, and final filter semantics. Any
+future scientific reducer change requires a new independent pinned-upstream
+comparison rather than treating the app as its own oracle.
 
 Only after both off-target branches have produced and committed their complete
 merged evidence, and the final outputs and their manifest are committed, may

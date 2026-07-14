@@ -47,6 +47,10 @@ def _run_config(**changes):
     return replace(oligoformer_app.OligoformerRunConfig(), **changes)
 
 
+def _execution_config(**changes):
+    return replace(oligoformer_app.DEFAULT_EXECUTION_CONFIG, **changes)
+
+
 def _write_valid_output_bundle(output_dir: Path, stem: str = "target") -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     contents = (
@@ -623,9 +627,9 @@ def test_targetscan_rnaplfold_preparation_is_single_writer(monkeypatch, tmp_path
     def fake_ready():
         return ready
 
-    def fake_build(force):
+    def fake_build(force, execution):
         nonlocal ready
-        build_calls.append(force)
+        build_calls.append((force, execution))
         ready = True
         output_volume.commit()
 
@@ -657,7 +661,7 @@ def test_targetscan_rnaplfold_preparation_is_single_writer(monkeypatch, tmp_path
     raw_f(force=False)
     raw_f(force=False)
 
-    assert build_calls == [False]
+    assert build_calls == [(False, oligoformer_app.DEFAULT_EXECUTION_CONFIG)]
     assert any(
         isinstance(value, dict) and value.get("state") == "complete"
         for value in values.values()
@@ -1187,13 +1191,24 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         evidence_ready=False,
         final_ready=False,
     )
+    execution = _execution_config(
+        off_target_prep_workers=2,
+        off_target_nodes=4,
+        off_target_workers=32,
+    )
 
     def fake_run_targetscan_prepare_batches(
         specs: list[oligoformer_app.TargetscanBatchSpec],
         *,
         max_process_slots: int | None = None,
+        execution: oligoformer_app.OligoformerExecutionConfig,
     ):
         assert max_process_slots == 32
+        assert execution == _execution_config(
+            off_target_prep_workers=2,
+            off_target_nodes=4,
+            off_target_workers=32,
+        )
         targetscan_plan_calls.extend(specs)
         spec = specs[0]
         captured["targetscan_sirnas"] = Path(spec.sirna_path).read_text(
@@ -1299,7 +1314,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             return fake_dicts[name]
 
     class FakeTargetscanContextQueueWorker:
-        def remote(self, queue_name: str, local_workers: int):
+        def remote(self, queue_name: str, local_workers: int, attempts: int):
+            assert attempts == execution.targetscan_context_attempts
             targetscan_worker_calls.append((queue_name, local_workers))
             queue = FakeQueue.from_name(queue_name)
             outputs = []
@@ -1322,8 +1338,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
                 outputs.append(spec.output_path)
             return outputs
 
-        def spawn(self, queue_name: str, local_workers: int):
-            return FakeCall(self.remote, (queue_name, local_workers), {})
+        def spawn(self, queue_name: str, local_workers: int, attempts: int):
+            return FakeCall(self.remote, (queue_name, local_workers, attempts), {})
 
     class FakeFinalizeTargetscanBatch:
         def remote(
@@ -1356,7 +1372,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     def fake_prepare_pita_reference_plan(
         spec: oligoformer_app.OffTargetShardSpec,
         _prepare_root: Path,
+        inner_execution: oligoformer_app.OligoformerExecutionConfig,
     ):
+        assert inner_execution == execution
         reference_calls.append(spec)
         reference_dir = layout.prep_dir / "off_target" / spec.stem / "pita_reference"
         reference_dir.mkdir(parents=True, exist_ok=True)
@@ -1373,7 +1391,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         spec: oligoformer_app.OffTargetShardSpec,
         _shard_root: Path,
         reference: oligoformer_app.PitaReferencePlan,
+        inner_execution: oligoformer_app.OligoformerExecutionConfig,
     ):
+        assert inner_execution == execution
         assert reference.ext_utr_path.endswith("reference_ext_utr.stab")
         pita_plan_calls.append(spec)
         cache_dir = oligoformer_app._off_target_shard_cache_dir(spec)
@@ -1415,7 +1435,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             self,
             specs: list[oligoformer_app.PitaPrepareUtrShardSpec],
             local_workers: int,
+            attempts: int,
         ):
+            assert attempts == execution.pita_row_attempts
             pita_prepare_batch_calls.append((list(specs), local_workers))
             outputs = []
             for spec in specs:
@@ -1457,7 +1479,9 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
             self,
             row_shards: list[oligoformer_app.PitaRowShardSpec],
             local_workers: int,
+            attempts: int,
         ):
+            assert attempts == execution.pita_row_attempts
             row_batch_calls.append((list(row_shards), local_workers))
             outputs = []
             for row in row_shards:
@@ -1620,15 +1644,12 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
         "_cleanup_off_target_transients",
         track_cleanup,
     )
-    monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_prep_workers_env, "2")
-    monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_nodes_env, "4")
-    monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_workers_env, "32")
-
     result = oligoformer_app.run_oligoformer_postprocess.get_raw_f()(
         plan=plan,
         off_target=True,
         toxicity=True,
         top_n=-1,
+        execution=execution,
     )
 
     final_table = final_output_dir.joinpath("target.txt").read_text(encoding="utf-8")
@@ -1636,6 +1657,8 @@ def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkey
     assert result == b"archive"
     assert len(targetscan_branch.spawn_calls) == 1
     assert len(pita_branch.spawn_calls) == 1
+    assert targetscan_branch.spawn_calls[0][1]["execution"] == execution
+    assert pita_branch.spawn_calls[0][1]["execution"] == execution
     assert gather_calls == []
     assert (
         targetscan_branch.spawn_calls[0][1]["max_process_slots"]
@@ -1760,35 +1783,143 @@ def test_run_off_target_shards_reuses_merged_raw_evidence(tmp_path: Path, monkey
     )
 
 
-@pytest.mark.parametrize("process_slots", [1, 65])
-def test_run_off_target_shards_rejects_unsafe_process_slot_budget(
+def test_run_off_target_shards_preserves_pita_row_fanout_topology(
     tmp_path: Path,
     monkeypatch,
-    process_slots: int,
 ):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.off_target_process_slots_env,
-        str(process_slots),
+    execution = _execution_config(
+        off_target_nodes=4,
+        off_target_workers=2,
+        off_target_process_slots=4,
+    )
+    branch_calls = []
+
+    class FakeCall:
+        def get(self):
+            return []
+
+        def cancel(self):
+            raise AssertionError("successful branches must not be cancelled")
+
+    class FakeBranch:
+        def __init__(self, name):
+            self.name = name
+
+        def spawn(self, *args, **kwargs):
+            branch_calls.append((self.name, args, kwargs))
+            return FakeCall()
+
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_pita_branch",
+        FakeBranch("pita"),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "run_oligoformer_targetscan_branch",
+        FakeBranch("targetscan"),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_raw_off_target_ready",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_targetscan_batch_spec_waves",
+        lambda **_kwargs: iter([[object()]]),
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_merge_pita_shards",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_merge_targetscan_batch_outputs",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_publish_off_target_manifest",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_copy_merged_off_target_evidence",
+        lambda *_args, **_kwargs: None,
     )
 
-    with pytest.raises(ValueError, match="PROCESS_SLOTS"):
-        oligoformer_app._run_off_target_shards(
-            run_root=str(tmp_path / "run"),
-            records=[
-                oligoformer_app.OffTargetSirnaRecord(
-                    "RNA0",
-                    "AUGCUAGCUAGCUAGCUAG",
-                )
-            ],
-            stem="target",
-            utr_path=str(tmp_path / "utr.txt"),
-            orf_path=str(tmp_path / "orf.txt"),
-            infer_dir=tmp_path / "infer",
-            output_dir=tmp_path / "output",
-            logs_dir=tmp_path / "logs",
-        )
+    oligoformer_app._run_off_target_shards(
+        run_root=str(tmp_path / "run"),
+        records=[
+            oligoformer_app.OffTargetSirnaRecord(
+                "RNA0",
+                "AUGCUAGCUAGCUAGCUAG",
+            )
+        ],
+        stem="target",
+        utr_path=str(tmp_path / "utr.fa"),
+        orf_path=str(tmp_path / "orf.fa"),
+        infer_dir=tmp_path / "infer",
+        output_dir=tmp_path / "outputs",
+        logs_dir=tmp_path / "logs",
+        execution=execution,
+    )
+
+    pita_call = next(call for call in branch_calls if call[0] == "pita")
+    assert pita_call[2] == {
+        "node_count": 4,
+        "local_workers": 2,
+        "max_process_slots": 2,
+        "execution": execution,
+    }
+
+
+@pytest.mark.parametrize(
+    ("process_slots", "message"),
+    [(1, "at least 2"), (65, "must not exceed")],
+)
+def test_execution_config_rejects_unsafe_process_slot_budget(
+    process_slots: int,
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        _execution_config(off_target_process_slots=process_slots)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    oligoformer_app.OligoformerExecutionConfig.__slots__,
+)
+def test_execution_config_rejects_nonpositive_values(field_name: str):
+    with pytest.raises(ValueError, match=field_name):
+        _execution_config(**{field_name: 0})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "off_target_workers",
+        "off_target_prep_workers",
+        "pita_prepare_workers",
+        "targetscan_rnaplfold_nodes",
+        "targetscan_rnaplfold_workers",
+        "targetscan_context_workers",
+    ],
+)
+def test_execution_config_rejects_cpu_envelope_overrides(field_name: str):
+    with pytest.raises(ValueError, match=field_name):
+        _execution_config(**{field_name: 33})
+
+
+def test_runtime_image_does_not_bake_oligoformer_tuning_environment():
+    source = Path(oligoformer_app.__file__).read_text(encoding="utf-8")
+
+    assert "OLIGOFORMER_" not in source
+    assert "tuning_env_names" not in source
 
 
 def test_off_target_manifest_detects_corrupt_evidence_before_cleanup(tmp_path: Path):
@@ -2370,8 +2501,10 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
 
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_nodes_env, "2")
-    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_workers_env, "2")
+    execution = _execution_config(
+        targetscan_context_nodes=2,
+        targetscan_context_workers=2,
+    )
 
     fake_queues = {}
     deleted_queues = []
@@ -2418,7 +2551,8 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
             return fake_queues[name]
 
     class FakeTargetscanContextQueueWorker:
-        def remote(self, queue_name: str, local_workers: int):
+        def remote(self, queue_name: str, local_workers: int, attempts: int):
+            assert attempts == execution.targetscan_context_attempts
             worker_calls.append((queue_name, local_workers))
             queue = FakeQueue.from_name(queue_name)
             outputs = []
@@ -2443,10 +2577,10 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
                 outputs.append(spec.output_path)
             return outputs
 
-        def spawn(self, queue_name: str, local_workers: int):
+        def spawn(self, queue_name: str, local_workers: int, attempts: int):
             class FakeCall:
                 def get(self_inner):
-                    return self.remote(queue_name, local_workers)
+                    return self.remote(queue_name, local_workers, attempts)
 
                 def cancel(self_inner, terminate_containers=False):
                     del terminate_containers
@@ -2471,7 +2605,10 @@ def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monke
         for index in range(3)
     ]
 
-    outputs = oligoformer_app._run_targetscan_context_batches(shards)
+    outputs = oligoformer_app._run_targetscan_context_batches(
+        shards,
+        execution=execution,
+    )
 
     assert outputs == [shard.output_path for shard in shards]
     assert len(worker_calls) == 2
@@ -2490,12 +2627,14 @@ def test_run_targetscan_context_batches_retries_failed_workers(
 ):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_nodes_env, "1")
-    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_workers_env, "1")
-    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_attempts_env, "2")
+    execution = _execution_config(
+        targetscan_context_nodes=1,
+        targetscan_context_workers=1,
+        targetscan_context_attempts=2,
+    )
     ready_outputs: set[str] = set()
     queues = {}
-    attempts = []
+    worker_attempts = []
 
     class FakeQueueInstance:
         def put_many(self, items):
@@ -2527,10 +2666,11 @@ def test_run_targetscan_context_batches_retries_failed_workers(
             del terminate_containers
 
     class FakeWorker:
-        def spawn(self, queue_name: str, local_workers: int):
+        def spawn(self, queue_name: str, local_workers: int, attempts: int):
             del queue_name, local_workers
-            attempts.append(len(attempts) + 1)
-            return FakeCall(attempts[-1])
+            assert attempts == execution.targetscan_context_attempts
+            worker_attempts.append(len(worker_attempts) + 1)
+            return FakeCall(worker_attempts[-1])
 
     shard = oligoformer_app.TargetscanContextShardSpec(
         shard_index=0,
@@ -2552,10 +2692,11 @@ def test_run_targetscan_context_batches_retries_failed_workers(
         lambda spec: spec.output_path in ready_outputs,
     )
 
-    assert oligoformer_app._run_targetscan_context_batches([shard]) == [
-        shard.output_path
-    ]
-    assert attempts == [1, 2]
+    assert oligoformer_app._run_targetscan_context_batches(
+        [shard],
+        execution=execution,
+    ) == [shard.output_path]
+    assert worker_attempts == [1, 2]
     assert queues == {}
 
 
@@ -2587,9 +2728,10 @@ def test_targetscan_context_shard_retries_interrupted_commands_atomically(
 
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
     monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
-    monkeypatch.setenv(oligoformer_app.APP_INFO.targetscan_context_attempts_env, "2")
-
-    assert oligoformer_app._run_targetscan_context_shard(spec) == spec.output_path
+    assert (
+        oligoformer_app._run_targetscan_context_shard(spec, attempts=2)
+        == spec.output_path
+    )
     output_path = Path(spec.output_path)
     assert output_path.read_text(encoding="utf-8") == "success\n"
     assert output_path.with_suffix(output_path.suffix + ".done").exists()
@@ -2598,7 +2740,10 @@ def test_targetscan_context_shard_retries_interrupted_commands_atomically(
 
     output_path.write_text("corrupt\n", encoding="utf-8")
     assert not oligoformer_app._targetscan_context_shard_ready(spec)
-    assert oligoformer_app._run_targetscan_context_shard(spec) == spec.output_path
+    assert (
+        oligoformer_app._run_targetscan_context_shard(spec, attempts=2)
+        == spec.output_path
+    )
     assert output_path.read_text(encoding="utf-8") == "success\n"
     assert len(attempts) == 3
 
@@ -2636,12 +2781,12 @@ def test_targetscan_context_worker_commits_once_per_worker(tmp_path: Path, monke
     monkeypatch.setattr(
         oligoformer_app,
         "_run_targetscan_context_shard",
-        lambda spec: spec.output_path,
+        lambda spec, attempts: spec.output_path,
     )
 
     completed = (
         oligoformer_app.run_oligoformer_targetscan_context_queue_worker.get_raw_f()(
-            "queue", local_workers=1
+            "queue", local_workers=1, attempts=2
         )
     )
 
@@ -2657,13 +2802,6 @@ def test_run_targetscan_context_batches_caps_default_queue_workers(
 
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_context_nodes_env, raising=False
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_context_workers_env, raising=False
-    )
-
     fake_queues = {}
     deleted_queues = []
     ready_outputs = set()
@@ -2711,7 +2849,11 @@ def test_run_targetscan_context_batches_caps_default_queue_workers(
             return fake_queues[name]
 
     class FakeTargetscanContextQueueWorker:
-        def remote(self, queue_name: str, local_workers: int):
+        def remote(self, queue_name: str, local_workers: int, attempts: int):
+            assert (
+                attempts
+                == oligoformer_app.DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts
+            )
             worker_calls.append((queue_name, local_workers))
             queue = FakeQueue.from_name(queue_name)
             outputs = []
@@ -2726,10 +2868,10 @@ def test_run_targetscan_context_batches_caps_default_queue_workers(
                 ready_outputs.add(spec.output_path)
                 outputs.append(spec.output_path)
 
-        def spawn(self, queue_name: str, local_workers: int):
+        def spawn(self, queue_name: str, local_workers: int, attempts: int):
             class FakeCall:
                 def get(self_inner):
-                    return self.remote(queue_name, local_workers)
+                    return self.remote(queue_name, local_workers, attempts)
 
                 def cancel(self_inner, terminate_containers=False):
                     del terminate_containers
@@ -2811,199 +2953,38 @@ def test_merge_pita_shards_sorts_like_upstream_score_table(tmp_path: Path):
     ]
 
 
-def test_oligoformer_off_target_defaults_use_distributed_cpu_nodes(monkeypatch):
-    monkeypatch.delenv(oligoformer_app.APP_INFO.off_target_nodes_env, raising=False)
-    monkeypatch.delenv(oligoformer_app.APP_INFO.off_target_workers_env, raising=False)
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.off_target_prep_workers_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_nodes_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_workers_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.off_target_row_shard_size_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_rnaplfold_nodes_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_rnaplfold_workers_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_rnaplfold_shard_size_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_prepare_nodes_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_prepare_ref_shard_size_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_context_nodes_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_context_workers_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_context_shard_size_env,
-        raising=False,
-    )
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_merge_nodes_env,
-        raising=False,
-    )
+def test_oligoformer_execution_defaults_use_distributed_cpu_nodes():
+    execution = oligoformer_app.OligoformerExecutionConfig()
 
+    assert execution == oligoformer_app.DEFAULT_EXECUTION_CONFIG
+    assert oligoformer_app._bounded_node_count(100, execution.off_target_nodes) == 32
     assert (
         oligoformer_app._bounded_node_count(
             100,
-            env_name=oligoformer_app.APP_INFO.off_target_nodes_env,
-            default=oligoformer_app.APP_INFO.default_off_target_nodes,
-        )
-        == 32
-    )
-    assert (
-        oligoformer_app._bounded_node_count(
-            100,
-            env_name=oligoformer_app.APP_INFO.off_target_pita_prepare_nodes_env,
-            default=oligoformer_app.APP_INFO.default_pita_prepare_nodes,
-        )
-        == 32
-    )
-    assert (
-        oligoformer_app._bounded_node_count(
-            100,
-            env_name=oligoformer_app.APP_INFO.targetscan_rnaplfold_nodes_env,
-            default=oligoformer_app.APP_INFO.default_targetscan_rnaplfold_nodes,
-        )
-        == 32
-    )
-    assert (
-        oligoformer_app._bounded_node_count(
-            100,
-            env_name=oligoformer_app.APP_INFO.targetscan_prepare_nodes_env,
-            default=oligoformer_app.APP_INFO.default_targetscan_prepare_nodes,
-        )
-        == 32
-    )
-    assert (
-        oligoformer_app._bounded_node_count(
-            100,
-            env_name=oligoformer_app.APP_INFO.targetscan_context_nodes_env,
-            default=oligoformer_app.APP_INFO.default_targetscan_context_nodes,
+            execution.targetscan_context_nodes,
         )
         == 100
     )
     assert (
-        oligoformer_app._bounded_node_count(
+        oligoformer_app._targetscan_ref_shard_size(
             100,
-            env_name=oligoformer_app.APP_INFO.targetscan_merge_nodes_env,
-            default=oligoformer_app.APP_INFO.default_targetscan_merge_nodes,
+            prepare_nodes=execution.targetscan_prepare_nodes,
         )
-        == 16
+        == 4
     )
     assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_workers_env,
-            oligoformer_app.APP_INFO.default_off_target_workers_per_node,
-        )
-        == 32
-    )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_prep_workers_env,
-            oligoformer_app.APP_INFO.default_off_target_prep_workers,
-        )
-        == 16
-    )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_pita_prepare_workers_env,
-            oligoformer_app.APP_INFO.default_pita_prepare_workers,
+        oligoformer_app._targetscan_rnaplfold_node_count(
+            1000,
+            execution.targetscan_rnaplfold_nodes,
         )
         == 32
     )
     assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
-            oligoformer_app.APP_INFO.default_pita_prepare_utr_shard_size,
-        )
-        == 1000
-    )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_row_shard_size_env,
-            oligoformer_app.APP_INFO.default_pita_row_shard_size,
-        )
-        == 1000
-    )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_row_attempts_env,
-            oligoformer_app.APP_INFO.default_pita_row_attempts,
-        )
-        == 3
-    )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.targetscan_rnaplfold_workers_env,
-            oligoformer_app.APP_INFO.default_targetscan_rnaplfold_workers,
+        oligoformer_app._targetscan_rnaplfold_worker_count(
+            execution.targetscan_rnaplfold_workers
         )
         == 8
     )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.targetscan_rnaplfold_shard_size_env,
-            oligoformer_app.APP_INFO.default_targetscan_rnaplfold_shard_size,
-        )
-        == 500
-    )
-    assert oligoformer_app._targetscan_ref_shard_size(100) == 4
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.targetscan_context_workers_env,
-            oligoformer_app.APP_INFO.default_targetscan_context_workers,
-        )
-        == 32
-    )
-    assert (
-        oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.targetscan_context_shard_size_env,
-            oligoformer_app.APP_INFO.default_targetscan_context_shard_size,
-        )
-        == 500
-    )
-
-
-def test_targetscan_rnaplfold_parallelism_overrides_are_clamped(monkeypatch):
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_rnaplfold_nodes_env,
-        "999",
-    )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_rnaplfold_workers_env,
-        "999",
-    )
-
-    assert oligoformer_app._targetscan_rnaplfold_node_count(1000) == 32
-    assert oligoformer_app._targetscan_rnaplfold_worker_count() == 8
 
 
 def test_targetscan_batch_specs_split_transcript_aligned_refs(
@@ -3012,10 +2993,6 @@ def test_targetscan_batch_specs_split_transcript_aligned_refs(
 ):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_prepare_ref_shard_size_env,
-        "2",
-    )
     run_root = tmp_path / "run"
     output_dir = run_root / "outputs"
     utr_path = tmp_path / "UTR.fa"
@@ -3039,6 +3016,7 @@ def test_targetscan_batch_specs_split_transcript_aligned_refs(
         records=records,
         utr_path=str(utr_path),
         orf_path=str(orf_path),
+        ref_shard_size=2,
     )
 
     assert [spec.shard_index for spec in specs] == [0, 1]
@@ -3077,6 +3055,7 @@ def test_targetscan_batch_specs_split_transcript_aligned_refs(
         records=records,
         utr_path=str(utr_path),
         orf_path=str(orf_path),
+        ref_shard_size=2,
     )
     assert Path(repaired_specs[0].utr_path).read_text(encoding="utf-8") == (
         ">tx1\nAAAA\n>tx2\nCCCC\n"
@@ -3108,10 +3087,7 @@ def test_targetscan_batch_specs_tile_candidate_and_reference_shards(
 ):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_candidate_shard_size_env,
-        "2",
-    )
+    execution = _execution_config(targetscan_candidate_shard_size=2)
     utr_path = tmp_path / "UTR.fa"
     orf_path = tmp_path / "ORF.fa"
     utr_path.write_text(">tx1\nAAAA\n>tx2\nCCCC\n", encoding="utf-8")
@@ -3129,6 +3105,7 @@ def test_targetscan_batch_specs_tile_candidate_and_reference_shards(
         utr_path=str(utr_path),
         orf_path=str(orf_path),
         ref_shard_size=1,
+        execution=execution,
     )
 
     assert len(specs) == 4
@@ -3161,10 +3138,7 @@ def test_targetscan_multi_candidate_reference_tiles_merge_all_pairs(
 ):
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_candidate_shard_size_env,
-        "2",
-    )
+    execution = _execution_config(targetscan_candidate_shard_size=2)
     utr_path = tmp_path / "UTR.fa"
     orf_path = tmp_path / "ORF.fa"
     utr_path.write_text(">tx1\nAAAA\n>tx2\nCCCC\n", encoding="utf-8")
@@ -3183,6 +3157,7 @@ def test_targetscan_multi_candidate_reference_tiles_merge_all_pairs(
             orf_path=str(orf_path),
             ref_shard_size=1,
             max_tiles_per_wave=1,
+            execution=execution,
         )
     )
     tile_paths = []
@@ -3218,17 +3193,14 @@ def test_targetscan_multi_candidate_reference_tiles_merge_all_pairs(
     assert [len(wave) for wave in waves] == [1, 1, 1, 1]
 
 
-def test_targetscan_ref_shard_size_uses_prepare_node_fanout(monkeypatch):
-    monkeypatch.delenv(
-        oligoformer_app.APP_INFO.targetscan_prepare_ref_shard_size_env,
-        raising=False,
+def test_targetscan_ref_shard_size_uses_prepare_node_fanout():
+    assert (
+        oligoformer_app._targetscan_ref_shard_size(
+            28_352,
+            prepare_nodes=300,
+        )
+        == 95
     )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_prepare_nodes_env,
-        "300",
-    )
-
-    assert oligoformer_app._targetscan_ref_shard_size(28_352) == 95
     assert oligoformer_app._targetscan_ref_shard_size(28_352, 100) == 100
 
 
@@ -3249,10 +3221,7 @@ def test_targetscan_prepare_streams_results_in_node_sized_map_batches(monkeypatc
         "prepare_oligoformer_targetscan_batch_shard",
         FakePrepareBatchShard(),
     )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.targetscan_prepare_nodes_env,
-        "2",
-    )
+    execution = _execution_config(targetscan_prepare_nodes=2)
     specs = [
         oligoformer_app.TargetscanBatchSpec(
             run_root="run",
@@ -3269,7 +3238,10 @@ def test_targetscan_prepare_streams_results_in_node_sized_map_batches(monkeypatc
         for index in range(5)
     ]
 
-    plans = oligoformer_app._run_targetscan_prepare_batches(specs)
+    plans = oligoformer_app._run_targetscan_prepare_batches(
+        specs,
+        execution=execution,
+    )
 
     assert [[spec.shard_index for spec in batch] for batch in map_batches] == [
         [0, 1],
@@ -3397,6 +3369,27 @@ def test_pita_branch_mounts_model_references():
     )
 
 
+def test_pita_branch_rejects_nonpositive_node_count():
+    spec = oligoformer_app.OffTargetShardSpec(
+        run_root="run",
+        output_dir="outputs",
+        stem="target",
+        index=0,
+        record_name="RNA0",
+        record_sequence="AUGCUAGCUAGCUAGCUAG",
+        utr_path="utr.fa",
+        orf_path="orf.fa",
+        row_shard_size=1000,
+    )
+
+    with pytest.raises(ValueError, match="node_count must be a positive integer"):
+        oligoformer_app.run_oligoformer_pita_branch.get_raw_f()(
+            [spec],
+            node_count=0,
+            local_workers=1,
+        )
+
+
 def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
     tmp_path: Path,
     monkeypatch,
@@ -3405,7 +3398,7 @@ def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
     repo_dir = tmp_path / "repo"
     events: list[str] = []
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
-    monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_prep_workers_env, "1")
+    expected_execution = _execution_config(off_target_prep_workers=1)
 
     shard_specs = [
         oligoformer_app.OffTargetShardSpec(
@@ -3422,11 +3415,13 @@ def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
         for index in range(5)
     ]
 
-    def fake_reference(spec, _prepare_root):
+    def fake_reference(spec, _prepare_root, inner_execution):
+        assert inner_execution == expected_execution
         events.append(f"reference:{spec.index}")
         return oligoformer_app.PitaReferencePlan((), "reference_ext_utr.stab")
 
-    def fake_plan(*, spec, prepare_root, reference):
+    def fake_plan(*, spec, prepare_root, reference, execution):
+        assert execution == expected_execution
         del prepare_root, reference
         events.append(f"plan:{spec.index}")
         return oligoformer_app.PitaPreparePlan(
@@ -3446,16 +3441,18 @@ def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
     def candidate_indexes(items):
         return ",".join(str(item.spec.index) for item in items)
 
-    def fake_discovery(shards, *, max_process_slots=None):
+    def fake_discovery(shards, *, max_process_slots=None, execution):
         assert max_process_slots == 1
+        assert execution == expected_execution
         indexes = [
             Path(shard.output_path).name.split(".", 1)[0].removeprefix("candidate_")
             for shard in shards
         ]
         events.append(f"discover:{','.join(indexes)}")
 
-    def fake_consolidate(plans, *, max_process_slots=None):
+    def fake_consolidate(plans, *, max_process_slots=None, execution):
         assert max_process_slots == 1
+        assert execution == expected_execution
         events.append(f"consolidate:{candidate_indexes(plans)}")
         prepared = []
         for plan in plans:
@@ -3489,8 +3486,9 @@ def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
     class FakeRowBatch:
         def starmap(self, inputs):
             results = []
-            for rows, workers in inputs:
+            for rows, workers, attempts in inputs:
                 assert workers == 1
+                assert attempts == expected_execution.pita_row_attempts
                 events.append("rows:" + ",".join(str(row.sirna_index) for row in rows))
                 results.append(len(rows))
             return results
@@ -3544,6 +3542,7 @@ def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
         node_count=1,
         local_workers=1,
         max_process_slots=1,
+        execution=expected_execution,
     )
 
     assert [result.index for result in results] == list(range(5))
@@ -3616,10 +3615,7 @@ def test_pita_reference_stage0_is_reused_across_candidates(
     repo_dir.joinpath("off-target", "pita").mkdir(parents=True)
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
     monkeypatch.setattr(oligoformer_app, "_write_pita_stage0_script", lambda *_: None)
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
-        "2",
-    )
+    execution = _execution_config(pita_prepare_utr_shard_size=2)
     utr_path = tmp_path / "UTR.fa"
     orf_path = tmp_path / "ORF.fa"
     utr_path.write_text(">utr\nAAAA\n", encoding="utf-8")
@@ -3652,8 +3648,16 @@ def test_pita_reference_stage0_is_reused_across_candidates(
 
     monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
 
-    first = oligoformer_app._prepare_pita_reference_plan(spec, tmp_path / "prepare")
-    second = oligoformer_app._prepare_pita_reference_plan(spec, tmp_path / "prepare2")
+    first = oligoformer_app._prepare_pita_reference_plan(
+        spec,
+        tmp_path / "prepare",
+        execution,
+    )
+    second = oligoformer_app._prepare_pita_reference_plan(
+        spec,
+        tmp_path / "prepare2",
+        execution,
+    )
 
     assert len(commands) == 1
     assert first == second
@@ -3664,6 +3668,7 @@ def test_pita_reference_stage0_is_reused_across_candidates(
     repaired = oligoformer_app._prepare_pita_reference_plan(
         spec,
         tmp_path / "prepare3",
+        execution,
     )
     assert len(commands) == 2
     assert repaired == first
@@ -3685,10 +3690,7 @@ def test_pita_prepare_reuses_completed_stage0_checkpoint(
         "_write_pita_stage0_script",
         lambda *_args: None,
     )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
-        "2",
-    )
+    execution = _execution_config(pita_prepare_utr_shard_size=2)
     utr_path = tmp_path / "human_UTR.txt"
     orf_path = tmp_path / "human_ORF.txt"
     utr_path.write_text(">utr\nAAAA\n", encoding="utf-8")
@@ -3726,10 +3728,15 @@ def test_pita_prepare_reuses_completed_stage0_checkpoint(
     monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
     first_root = tmp_path / "first"
     first_root.joinpath("off-target", "pita").mkdir(parents=True)
-    first = oligoformer_app._prepare_pita_target_discovery_plan(spec, first_root)
+    first = oligoformer_app._prepare_pita_target_discovery_plan(
+        spec,
+        first_root,
+        execution=execution,
+    )
     second = oligoformer_app._prepare_pita_target_discovery_plan(
         spec,
         tmp_path / "second",
+        execution=execution,
     )
 
     assert len(commands) == 1
@@ -3779,9 +3786,10 @@ def test_pita_prepare_wrapper_removes_per_sirna_worktree(
     persistent_path.parent.mkdir(parents=True)
     persistent_path.write_text("utr\n", encoding="utf-8")
 
-    def fake_prepare(inner_spec, shard_root, reference=None):
+    def fake_prepare(inner_spec, shard_root, reference=None, execution=None):
         assert inner_spec is spec
         assert reference is None
+        assert execution == oligoformer_app.DEFAULT_EXECUTION_CONFIG
         shard_root.joinpath("large-transient.stab").write_text(
             "transient\n",
             encoding="utf-8",
@@ -3822,7 +3830,8 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
     mir_stab_path.write_text("RNA0\tUUUU\n", encoding="utf-8")
 
     class FakePitaPrepareUtrShardBatch:
-        def _run(self, specs, local_workers):
+        def _run(self, specs, local_workers, attempts):
+            assert attempts == execution.pita_row_attempts
             remote_batches.append((specs, local_workers))
             outputs = []
             for spec in specs:
@@ -3851,17 +3860,10 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
         "run_oligoformer_pita_prepare_utr_shard_batch",
         FakePitaPrepareUtrShardBatch(),
     )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
-        "2",
-    )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_workers_env,
-        "2",
-    )
-    monkeypatch.setenv(
-        oligoformer_app.APP_INFO.off_target_pita_prepare_nodes_env,
-        "2",
+    execution = _execution_config(
+        pita_prepare_nodes=2,
+        pita_prepare_workers=2,
+        pita_prepare_utr_shard_size=2,
     )
 
     specs = oligoformer_app._pita_prepare_utr_shard_specs(
@@ -3869,13 +3871,13 @@ def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
         mir_stab_path=mir_stab_path,
         shard_dir=tmp_path / "cache" / "pita_prepare_utr_shards",
         logs_dir=tmp_path / "logs",
-        shard_size=oligoformer_app._positive_int_from_env(
-            oligoformer_app.APP_INFO.off_target_pita_prepare_utr_shard_size_env,
-            oligoformer_app.APP_INFO.default_pita_prepare_utr_shard_size,
-        ),
+        shard_size=execution.pita_prepare_utr_shard_size,
     )
     volume.commit()
-    oligoformer_app._run_pita_prepare_utr_shard_batches(list(specs))
+    oligoformer_app._run_pita_prepare_utr_shard_batches(
+        list(specs),
+        execution=execution,
+    )
 
     assert all(Path(spec.output_path).exists() for spec in specs)
     remote_specs = [spec for batch, _workers in remote_batches for spec in batch]
@@ -4049,9 +4051,8 @@ def test_pita_row_shard_retries_interrupted_commands_atomically(
 
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
     monkeypatch.setattr(oligoformer_app, "run_command", fake_run_command)
-    monkeypatch.setenv(oligoformer_app.APP_INFO.off_target_row_attempts_env, "2")
 
-    assert oligoformer_app._run_pita_row_shard(spec) == str(output_path)
+    assert oligoformer_app._run_pita_row_shard(spec, attempts=2) == str(output_path)
     assert output_path.read_text(encoding="utf-8") == "success\n"
     assert output_path.with_suffix(output_path.suffix + ".done").exists()
     assert list(output_path.parent.glob("*.tmp.*")) == []
@@ -4059,7 +4060,7 @@ def test_pita_row_shard_retries_interrupted_commands_atomically(
     assert "Retrying OligoFormer PITA row shard RNA0:0" in capfd.readouterr().out
 
     output_path.write_text("corrupt\n", encoding="utf-8")
-    assert oligoformer_app._run_pita_row_shard(spec) == str(output_path)
+    assert oligoformer_app._run_pita_row_shard(spec, attempts=2) == str(output_path)
     assert output_path.read_text(encoding="utf-8") == "success\n"
     assert len(attempts) == 3
 
@@ -4327,6 +4328,28 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
         final_ready=False,
     )
     efficacy_plan = replace(plan, efficacy_ready=True)
+    execution_kwargs = {
+        "off_target_nodes": 2,
+        "off_target_workers": 3,
+        "off_target_process_slots": 10,
+        "off_target_prep_workers": 4,
+        "pita_prepare_nodes": 5,
+        "pita_prepare_workers": 6,
+        "pita_prepare_utr_shard_size": 7,
+        "pita_row_shard_size": 8,
+        "pita_row_attempts": 18,
+        "targetscan_rnaplfold_nodes": 9,
+        "targetscan_rnaplfold_workers": 10,
+        "targetscan_rnaplfold_shard_size": 11,
+        "targetscan_prepare_nodes": 12,
+        "targetscan_candidate_shard_size": 13,
+        "targetscan_context_nodes": 14,
+        "targetscan_context_workers": 15,
+        "targetscan_context_shard_size": 16,
+        "targetscan_context_attempts": 19,
+        "targetscan_merge_nodes": 17,
+    }
+    expected_execution = _execution_config(**execution_kwargs)
 
     class FakeDownloadModels:
         def remote(self, *, force):
@@ -4365,10 +4388,19 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
     raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
     assert raw_f is not None
 
-    raw_f(mrna_fasta=str(input_fasta), out_dir=str(tmp_path), run_name="demo")
+    raw_f(
+        mrna_fasta=str(input_fasta),
+        out_dir=str(tmp_path),
+        run_name="demo",
+        **execution_kwargs,
+    )
 
     assert calls[0][0] == "prepare"
     assert calls[0][1]["top_n"] == oligoformer_app.APP_INFO.default_top_n
+    assert "execution" not in calls[0][1]
+    assert set(oligoformer_app.OligoformerExecutionConfig.__slots__).isdisjoint(
+        calls[0][1]
+    )
     assert calls[1] == ("download", False)
     assert calls[2][0] == "prepare"
     assert calls[3] == (
@@ -4377,6 +4409,7 @@ def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) 
     )
     assert calls[4][0] == "postprocess"
     assert calls[4][1]["plan"] == efficacy_plan
+    assert calls[4][1]["execution"] == expected_execution
     assert (tmp_path / "demo_oligoformer.tar.zst").read_bytes() == b"archive"
 
 
@@ -4561,6 +4594,11 @@ def test_submit_oligoformer_overlaps_human_reference_prep_with_efficacy(
         output_dir="/remote/refreshed-run/outputs/postprocess",
     )
     efficacy_plan = replace(refreshed_plan, efficacy_ready=True)
+    expected_execution = _execution_config(
+        targetscan_rnaplfold_nodes=7,
+        targetscan_rnaplfold_workers=6,
+        targetscan_rnaplfold_shard_size=123,
+    )
 
     class FakeCall:
         def __init__(self, name: str, result):
@@ -4590,13 +4628,15 @@ def test_submit_oligoformer_overlaps_human_reference_prep_with_efficacy(
             return FakeCall("efficacy", efficacy_plan)
 
     class FakeReferencePrep:
-        def spawn(self, *, force):
+        def spawn(self, *, force, execution):
+            assert execution == expected_execution
             events.append(("spawn-reference", force))
             return FakeCall("reference", None)
 
     class FakePostprocess:
         def remote(self, **kwargs):
             assert kwargs["plan"] == efficacy_plan
+            assert kwargs["execution"] == expected_execution
             events.append("postprocess")
             return b"archive"
 
@@ -4629,6 +4669,9 @@ def test_submit_oligoformer_overlaps_human_reference_prep_with_efficacy(
         run_name="human",
         off_target=True,
         all_human=True,
+        targetscan_rnaplfold_nodes=7,
+        targetscan_rnaplfold_workers=6,
+        targetscan_rnaplfold_shard_size=123,
     )
 
     assert events[:5] == [

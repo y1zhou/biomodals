@@ -872,6 +872,33 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
     assert model_volume.reload_count == 1
 
 
+def test_rnafm_runtime_keeps_relative_data_in_writable_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo_dir = tmp_path / "repo"
+    info = oligoformer_app.AppInfo(
+        repo_rnafm_dir=repo_dir / "RNA-FM",
+        model_rnafm_dir=tmp_path / "models" / "RNA-FM",
+    )
+    info.model_rnafm_redevelop_dir.mkdir(parents=True)
+    info.model_rnafm_redevelop_dir.joinpath("model.pt").write_text(
+        "weights", encoding="utf-8"
+    )
+    monkeypatch.setattr(oligoformer_app, "APP_INFO", info)
+
+    oligoformer_app._ensure_rnafm_runtime()
+
+    assert not info.repo_rnafm_dir.is_symlink()
+    assert (
+        info.repo_rnafm_redevelop_dir.joinpath("model.pt").read_text(encoding="utf-8")
+        == "weights"
+    )
+    assert (
+        info.repo_rnafm_redevelop_dir.joinpath("../../data").resolve()
+        == (repo_dir / "data").resolve()
+    )
+
+
 def test_run_oligoformer_efficacy_rejects_mismatched_plan_settings():
     plan = oligoformer_app.OligoformerRunPlan(
         cache_key="abc123",

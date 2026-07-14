@@ -7,8 +7,10 @@ volume. The extracted RNA-FM tree carries a SHA-256 content identity in the
 model volume; setup commits that tree and identity before mirroring the identity
 to the output volume. Efficacy preparation includes the mirrored identity in
 its cache key, and GPU workers reload the model volume, require the two copies
-of the identity to match, and expose the mounted tree to upstream through a
-read-only symlink instead of copying it into the container filesystem.
+of the identity to match, and copy the mounted tree into the ephemeral writable
+checkout. The copy is required because upstream RNA-FM creates `../../data`
+relative to its physical directory; a symlink into the read-only model volume
+redirects that write into the model mount.
 
 The converted TargetScan references carry both declared source metadata and
 SHA-256 digests of their actual converted bytes; that identity is mirrored into

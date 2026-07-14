@@ -1993,7 +1993,7 @@ def prepare_oligoformer_targetscan_rnaplfold_cache(force: bool = False) -> None:
 # Inference functions
 ##########################################
 def _ensure_rnafm_runtime() -> None:
-    """Expose read-only RNA-FM weights at the path expected by upstream."""
+    """Copy RNA-FM into the writable checkout expected by upstream."""
     import shutil
 
     if APP_INFO.repo_rnafm_dir.is_symlink():
@@ -2001,10 +2001,7 @@ def _ensure_rnafm_runtime() -> None:
     elif APP_INFO.repo_rnafm_dir.exists():
         shutil.rmtree(APP_INFO.repo_rnafm_dir)
     APP_INFO.repo_rnafm_dir.parent.mkdir(parents=True, exist_ok=True)
-    APP_INFO.repo_rnafm_dir.symlink_to(
-        APP_INFO.model_rnafm_dir,
-        target_is_directory=True,
-    )
+    shutil.copytree(APP_INFO.model_rnafm_dir, APP_INFO.repo_rnafm_dir)
 
 
 def _ensure_human_refs() -> None:

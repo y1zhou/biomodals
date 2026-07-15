@@ -1,6 +1,8 @@
 # biomodals
 
 Bioinformatics tools running on modal.
+Note that this repository is heavily refactored from [the upstream repository](https://github.com/hgbrian/biomodals).
+All new apps have the `_app.py` suffix to distinguish from the original ones.
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/y1zhou/biomodals)
 
@@ -51,5 +53,17 @@ uv run biomodals workflow run ppiflow --dry-run -- \
   --steps-yaml examples/data/ppiflow_workflow_steps.yaml
 ```
 
-Note that this repository is heavily refactored from [the upstream repository](https://github.com/hgbrian/biomodals).
-All new apps have the `_app.py` suffix to distinguish from the original ones.
+## API server
+
+Start the GROMACS API as a hot-reloading Modal development endpoint:
+
+```bash
+uv run modal serve -m biomodals.app.service.gromacs_api_app
+```
+
+Modal prints the temporary API URL. Requests require proxy-token credentials,
+which you can create with:
+
+```bash
+uv run modal workspace proxy-tokens create
+```

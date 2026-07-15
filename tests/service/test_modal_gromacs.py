@@ -17,13 +17,11 @@ from biomodals.schema import (
     ArtifactKind,
     VolumePath,
 )
-from biomodals.service.gromacs_api import (
+from biomodals.service.gromacs import (
     GromacsJobOptions,
     JobNotFoundError,
-    JobState,
-)
-from biomodals.service.modal_gromacs import (
     JobRegistry,
+    JobState,
     ModalGromacsBackend,
     ModalJobRecord,
     create_deployed_app,

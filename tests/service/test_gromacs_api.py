@@ -8,8 +8,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from biomodals.service.gromacs_api import (
-    ErrorResponse,
+from biomodals.service.api import ErrorResponse
+from biomodals.service.gromacs import (
     GromacsJobOptions,
     JobArtifact,
     JobArtifactFile,

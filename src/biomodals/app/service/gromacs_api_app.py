@@ -69,8 +69,7 @@ job_registry = modal.Dict.from_name(
 @modal.asgi_app(requires_proxy_auth=True)
 def api():
     """Return the proxy-authenticated FastAPI application."""
-    from biomodals.service.gromacs_api import create_app
-    from biomodals.service.modal_gromacs import ModalGromacsBackend
+    from biomodals.service.gromacs import ModalGromacsBackend, create_app
 
     return create_app(
         ModalGromacsBackend(gromacs_app.run_gromacs_job, job_registry),

@@ -1,37 +1,256 @@
-"""Modal adapter for the provider-neutral GROMACS job API.
+"""HTTP routes and Modal adapter for asynchronous GROMACS jobs.
 
-To run the control plane outside Modal after deploying ``GromacsAPI``, set
-``BIOMODALS_API_KEY`` and use
-``uv run --extra api uvicorn --factory biomodals.service.modal_gromacs:create_deployed_app``.
-The factory fails closed when that bearer token is absent. Set
-``BIOMODALS_GROMACS_APP`` when targeting a separately deployed GROMACS app.
+Run an external control plane with
+``uv run --extra api uvicorn --factory biomodals.service.gromacs:create_deployed_app``.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Mapping
 from os import environ
-from typing import Any, Protocol, cast
+from typing import Annotated, Any, Protocol, cast
 from uuid import uuid4
 
 import modal
-from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, ValidationError
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from biomodals.helper.pdb import validate_pdb_content
 from biomodals.schema import AppRunResult
-from biomodals.service.gromacs_api import (
-    GromacsJobOptions,
-    JobArtifact,
-    JobArtifactFile,
-    JobBackendUnavailableError,
-    JobNotFoundError,
-    JobResult,
-    JobSnapshot,
-    JobState,
-    JobStatus,
-    create_app,
+from biomodals.service.api import (
+    MAX_MULTIPART_OVERHEAD_BYTES,
+    ErrorResponse,
+    create_api,
+    model_response,
 )
+
+if sys.version_info >= (3, 11):  # noqa: UP036
+    from enum import StrEnum
+else:
+    from backports.strenum import StrEnum  # noqa: UP035,I001
+
+MAX_PDB_BYTES = 10 * 1024 * 1024
+
+
+class JobNotFoundError(LookupError):
+    """Raised when the GROMACS backend cannot resolve a public job id."""
+
+    def __init__(self, job_id: str) -> None:
+        """Remember the missing id for the HTTP error response."""
+        self.job_id = job_id
+        super().__init__(f"Job '{job_id}' was not found")
+
+
+class JobBackendUnavailableError(RuntimeError):
+    """Raised when the GROMACS backend cannot currently answer a request."""
+
+
+class JobState(StrEnum):
+    """Provider-neutral states exposed by the GROMACS job API."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    PARTIAL = "partial"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class GromacsJobOptions(BaseModel):
+    """Bounded user settings accepted by the public API."""
+
+    model_config = ConfigDict(frozen=True)
+
+    simulation_time_ns: int = Field(default=5, ge=1, le=100)
+    run_pdbfixer: bool = False
+    cpu_only: bool = False
+
+
+class JobStatus(BaseModel):
+    """Current state of one submitted job."""
+
+    job_id: str
+    status: JobState
+    run_name: str | None = None
+    detail: str | None = None
+
+
+class JobArtifactFile(BaseModel):
+    """One provider-neutral file in an output artifact."""
+
+    path: str
+    role: str | None = None
+    media_type: str | None = None
+
+
+class JobArtifact(BaseModel):
+    """One named output and its file manifest."""
+
+    name: str
+    kind: str
+    files: list[JobArtifactFile] = Field(default_factory=list)
+
+
+class JobResult(BaseModel):
+    """Portable result returned after a GROMACS job completes."""
+
+    run_name: str
+    artifacts: list[JobArtifact] = Field(default_factory=list)
+
+
+class JobSnapshot(JobStatus):
+    """Backend snapshot used by status and result routes."""
+
+    result: JobResult | None = None
+
+
+class JobBackend(Protocol):
+    """Compute boundary used by the HTTP layer."""
+
+    async def submit(
+        self,
+        pdb_content: bytes,
+        options: GromacsJobOptions,
+    ) -> JobStatus:
+        """Submit a GROMACS job without waiting for its result."""
+        ...
+
+    async def inspect(self, job_id: str) -> JobSnapshot:
+        """Poll one job without waiting for completion."""
+        ...
+
+    async def cancel(self, job_id: str) -> JobStatus:
+        """Request cancellation of one job."""
+        ...
+
+
+async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
+    content = bytearray()
+    while chunk := await upload.read(min(1024 * 1024, max_bytes + 1)):
+        content.extend(chunk)
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"PDB upload exceeds the {max_bytes}-byte limit",
+            )
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="PDB upload is empty",
+        )
+    try:
+        validate_pdb_content(bytes(content), max_bytes=max_bytes)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    return bytes(content)
+
+
+def create_app(
+    backend: JobBackend,
+    *,
+    max_pdb_bytes: int = MAX_PDB_BYTES,
+    api_key: str | None = None,
+    trusted_proxy_auth: bool = False,
+) -> FastAPI:
+    """Create a FastAPI app around a pluggable GROMACS job backend."""
+    web_app = create_api(
+        title="Biomodals GROMACS API",
+        version="1.0.0",
+        max_body_bytes=max_pdb_bytes + MAX_MULTIPART_OVERHEAD_BYTES,
+        api_key=api_key,
+        trusted_proxy_auth=trusted_proxy_auth,
+    )
+
+    @web_app.exception_handler(JobNotFoundError)
+    async def job_not_found(
+        _request: Request,
+        exc: JobNotFoundError,
+    ) -> Response:
+        return model_response(
+            ErrorResponse(detail=str(exc)),
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    @web_app.exception_handler(JobBackendUnavailableError)
+    async def backend_unavailable(
+        _request: Request,
+        _exc: JobBackendUnavailableError,
+    ) -> Response:
+        return model_response(
+            ErrorResponse(detail="Job backend is temporarily unavailable"),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    @web_app.post(
+        "/jobs",
+        response_model=JobStatus,
+        response_model_exclude_none=True,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def submit_job(
+        pdb: Annotated[UploadFile, File(description="Input structure in PDB format")],
+        simulation_time_ns: Annotated[int, Form(ge=1, le=100)] = 5,
+        run_pdbfixer: Annotated[bool, Form()] = False,
+        cpu_only: Annotated[bool, Form()] = False,
+    ) -> JobStatus:
+        try:
+            pdb_content = await _read_pdb(pdb, max_bytes=max_pdb_bytes)
+        finally:
+            await pdb.close()
+        return await backend.submit(
+            pdb_content,
+            GromacsJobOptions(
+                simulation_time_ns=simulation_time_ns,
+                run_pdbfixer=run_pdbfixer,
+                cpu_only=cpu_only,
+            ),
+        )
+
+    @web_app.get(
+        "/jobs/{job_id}",
+        response_model=JobStatus,
+        response_model_exclude_none=True,
+    )
+    async def inspect_job(job_id: str) -> JobStatus:
+        return await backend.inspect(job_id)
+
+    @web_app.get(
+        "/jobs/{job_id}/result",
+        response_model=JobResult,
+        response_model_exclude_none=True,
+        responses={status.HTTP_202_ACCEPTED: {"model": JobStatus}},
+    )
+    async def get_job_result(job_id: str) -> JobResult | Response:
+        snapshot = await backend.inspect(job_id)
+        if snapshot.status == JobState.PENDING:
+            return model_response(
+                JobStatus.model_validate(snapshot),
+                status_code=status.HTTP_202_ACCEPTED,
+            )
+        if snapshot.result is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Job is {snapshot.status}",
+            )
+        return snapshot.result
+
+    @web_app.delete(
+        "/jobs/{job_id}",
+        response_model=JobStatus,
+        response_model_exclude_none=True,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def cancel_job(job_id: str) -> JobStatus:
+        return await backend.cancel(job_id)
+
+    return web_app
+
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_JOB_DICT = "biomodals-gromacs-api-jobs"

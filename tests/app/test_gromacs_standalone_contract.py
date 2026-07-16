@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.schema import VolumePath
 
 VALID_PDB = (
     b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n"
@@ -94,7 +95,7 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     ]
 
 
-def test_run_gromacs_job_returns_durable_output_manifest(monkeypatch) -> None:
+def test_internal_gromacs_job_keeps_durable_directory_output(monkeypatch) -> None:
     analysis_stats = []
 
     class FakePrepare:
@@ -114,7 +115,7 @@ def test_run_gromacs_job_returns_durable_output_manifest(monkeypatch) -> None:
     monkeypatch.setattr(gromacs_app, "production_run_cpu", FakeProduction())
     monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
 
-    result = gromacs_app.run_gromacs_job.get_raw_f()(
+    result = gromacs_app._run_gromacs_job(
         pdb_content=VALID_PDB,
         run_name="api-123",
         simulation_time_ns=3,
@@ -126,6 +127,7 @@ def test_run_gromacs_job_returns_durable_output_manifest(monkeypatch) -> None:
     output = result.outputs[0]
     assert output.name == "gromacs_run"
     assert output.storage.kind.value == "volume_path"
+    assert isinstance(output.storage, VolumePath)
     assert output.storage.path == "api-123"
     assert output.metadata["run_name"] == "api-123"
     assert output.metadata["files"][0] == {

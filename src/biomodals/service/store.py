@@ -39,6 +39,10 @@ class JobNotCancellableError(RuntimeError):
     """Raised when cancellation is requested for a terminal job."""
 
 
+class JobSubmissionConflictError(RuntimeError):
+    """Raised when a stale submitter tries to attach a provider call."""
+
+
 class JobState(StrEnum):
     """Durable provider-neutral job states."""
 
@@ -104,6 +108,8 @@ class JobRecord:
     state: JobState
     modal_call_id: str | None
     run_name: str | None
+    submission_token: str | None
+    submission_lease_until: int | None
     result_volume_name: str | None
     result_volume_path: str | None
     result_filename: str | None
@@ -207,6 +213,8 @@ class ServiceStore:
                         state TEXT NOT NULL,
                         modal_call_id TEXT,
                         run_name TEXT,
+                        submission_token TEXT,
+                        submission_lease_until INTEGER,
                         result_volume_name TEXT,
                         result_volume_path TEXT,
                         result_filename TEXT,
@@ -227,7 +235,7 @@ class ServiceStore:
                     CREATE INDEX jobs_active
                         ON jobs(owner_user_id, workload, state);
 
-                    PRAGMA user_version = 2;
+                    PRAGMA user_version = 3;
                     COMMIT;
                     """
                 )
@@ -236,11 +244,23 @@ class ServiceStore:
                     """
                     BEGIN IMMEDIATE;
                     ALTER TABLE jobs ADD COLUMN intermediates_cleaned_at INTEGER;
-                    PRAGMA user_version = 2;
+                    ALTER TABLE jobs ADD COLUMN submission_token TEXT;
+                    ALTER TABLE jobs ADD COLUMN submission_lease_until INTEGER;
+                    PRAGMA user_version = 3;
                     COMMIT;
                     """
                 )
-            elif version != 2:
+            elif version == 2:
+                conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE jobs ADD COLUMN submission_token TEXT;
+                    ALTER TABLE jobs ADD COLUMN submission_lease_until INTEGER;
+                    PRAGMA user_version = 3;
+                    COMMIT;
+                    """
+                )
+            elif version != 3:
                 raise RuntimeError(f"Unsupported service database version: {version}")
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
             if path.exists():
@@ -543,14 +563,16 @@ class ServiceStore:
                 INSERT INTO jobs (
                     job_id, owner_user_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json, state,
-                    modal_call_id, run_name, result_volume_name,
+                    modal_call_id, run_name, submission_token,
+                    submission_lease_until, result_volume_name,
                     result_volume_path, result_filename, result_size_bytes,
                     result_sha256, warnings_json, error_code, error_message,
                     created_at, updated_at, completed_at, cancel_requested_at,
                     intermediates_cleaned_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, NULL
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL,
+                    NULL, NULL
                 )
                 """,
                 (
@@ -669,24 +691,70 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
         return _job_from_row(row)
 
-    def mark_submitted(
+    def claim_submission(
         self,
         job_id: UUID,
         *,
-        modal_call_id: str,
         run_name: str,
-        now: int | None = None,
+        submission_token: str,
+        now: int,
+        lease_seconds: int = 120,
+    ) -> JobRecord | None:
+        """Lease one queued provider submission to a single request handler."""
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET run_name = ?, submission_token = ?,
+                    submission_lease_until = ?, updated_at = ?
+                WHERE job_id = ?
+                  AND state = ?
+                  AND modal_call_id IS NULL
+                  AND (run_name IS NULL OR run_name = ?)
+                  AND (
+                      submission_lease_until IS NULL
+                      OR submission_lease_until <= ?
+                  )
+                """,
+                (
+                    run_name,
+                    submission_token,
+                    now + lease_seconds,
+                    now,
+                    str(job_id),
+                    JobState.QUEUED.value,
+                    run_name,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return _job_from_row(row)
+
+    def release_submission(
+        self,
+        job_id: UUID,
+        *,
+        submission_token: str,
+        now: int,
     ) -> JobRecord:
-        """Attach provider identifiers after a successful asynchronous spawn."""
-        updated_at = int(time.time()) if now is None else now
+        """Release a failed submission attempt without losing the queued job."""
         with self._transaction() as conn:
             conn.execute(
                 """
                 UPDATE jobs
-                SET modal_call_id = ?, run_name = ?, updated_at = ?
-                WHERE job_id = ?
+                SET submission_token = NULL, submission_lease_until = NULL,
+                    updated_at = ?
+                WHERE job_id = ? AND submission_token = ?
+                  AND modal_call_id IS NULL
                 """,
-                (modal_call_id, run_name, updated_at, str(job_id)),
+                (now, str(job_id), submission_token),
             )
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -694,6 +762,54 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
+        return _job_from_row(row)
+
+    def mark_submitted(
+        self,
+        job_id: UUID,
+        *,
+        modal_call_id: str,
+        run_name: str,
+        submission_token: str | None = None,
+        now: int | None = None,
+    ) -> JobRecord:
+        """Attach provider identifiers after a successful asynchronous spawn."""
+        updated_at = int(time.time()) if now is None else now
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET modal_call_id = ?, run_name = ?, submission_token = NULL,
+                    submission_lease_until = NULL, updated_at = ?
+                WHERE job_id = ?
+                  AND state IN (?, ?, ?, ?)
+                  AND modal_call_id IS NULL
+                  AND (run_name IS NULL OR run_name = ?)
+                  AND (? IS NULL OR submission_token = ?)
+                """,
+                (
+                    modal_call_id,
+                    run_name,
+                    updated_at,
+                    str(job_id),
+                    *(state.value for state in ACTIVE_JOB_STATES),
+                    run_name,
+                    submission_token,
+                    submission_token,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            if cursor.rowcount != 1 and (
+                row["modal_call_id"] != modal_call_id or row["run_name"] != run_name
+            ):
+                raise JobSubmissionConflictError(
+                    f"Submission lease is no longer valid for job {job_id}"
+                )
         return _job_from_row(row)
 
     def request_cancel(
@@ -923,6 +1039,8 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         state=JobState(row["state"]),
         modal_call_id=row["modal_call_id"],
         run_name=row["run_name"],
+        submission_token=row["submission_token"],
+        submission_lease_until=row["submission_lease_until"],
         result_volume_name=row["result_volume_name"],
         result_volume_path=row["result_volume_path"],
         result_filename=row["result_filename"],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -15,13 +16,18 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
+from biomodals.service.artifacts import (
+    ArtifactCache,
+    ArtifactIntegrityError,
+    ArtifactLease,
+)
 from biomodals.service.auth import (
     SESSION_ABSOLUTE_LIFETIME_SECONDS,
     AuthenticatedSession,
     AuthService,
     InvalidCredentialsError,
     InvalidPasswordTokenError,
+    PasswordExecutor,
     PasswordPolicyError,
     Principal,
 )
@@ -42,6 +48,8 @@ LOGGER = logging.getLogger(__name__)
 SESSION_COOKIE = "biomodals-session"
 SECURE_SESSION_COOKIE = "__Host-biomodals-session"
 CSRF_COOKIE = "biomodals-csrf"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_ARCHIVE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip")
 
 
 class ErrorResponse(BaseModel):
@@ -187,12 +195,10 @@ def _download_headers(job_sha256: str, size_bytes: int) -> dict[str, str]:
 def _cached_archive_response(
     request: Request,
     *,
-    path,
-    job_id: str,
+    lease: ArtifactLease,
     filename: str,
     sha256: str,
     size_bytes: int,
-    cache: ArtifactCache,
 ) -> StreamingResponse:
     """Stream a held local archive, including one standard byte range."""
     first = 0
@@ -203,7 +209,7 @@ def _cached_archive_response(
         unit, separator, raw_range = range_header.partition("=")
         start_text, dash, end_text = raw_range.partition("-")
         if unit != "bytes" or not separator or not dash or "," in raw_range:
-            cache.release(job_id)
+            lease.close()
             raise HTTPException(
                 status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
                 headers={"Content-Range": f"bytes */{size_bytes}"},
@@ -218,13 +224,13 @@ def _cached_archive_response(
             else:
                 raise ValueError
         except ValueError as exc:
-            cache.release(job_id)
+            lease.close()
             raise HTTPException(
                 status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
                 headers={"Content-Range": f"bytes */{size_bytes}"},
             ) from exc
         if first < 0 or first >= size_bytes or last < first:
-            cache.release(job_id)
+            lease.close()
             raise HTTPException(
                 status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
                 headers={"Content-Range": f"bytes */{size_bytes}"},
@@ -244,16 +250,15 @@ def _cached_archive_response(
     async def content():
         remaining = length
         try:
-            with path.open("rb") as archive:
-                archive.seek(first)
-                while remaining:
-                    chunk = archive.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        raise RuntimeError("Cached archive ended unexpectedly")
-                    remaining -= len(chunk)
-                    yield chunk
+            lease.seek(first)
+            while remaining:
+                chunk = lease.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("Cached archive ended unexpectedly")
+                remaining -= len(chunk)
+                yield chunk
         finally:
-            cache.release(job_id)
+            lease.close()
 
     return StreamingResponse(
         content(),
@@ -281,9 +286,14 @@ def create_app(
         raise ValueError("reconcile_interval_seconds must be positive")
     if any(workload.max_body_bytes < 1 for workload in workloads):
         raise ValueError("Workload body limits must be positive")
+    if cache is None and any(
+        workload.read_artifact is not None for workload in workloads
+    ):
+        raise ValueError("A verified artifact cache is required for downloads")
     if not allowed_origin or allowed_origin.endswith("/"):
         raise ValueError("allowed_origin must be an exact origin without a slash")
     session_cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
+    password_executor = PasswordExecutor()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -302,8 +312,11 @@ def create_app(
             yield
         finally:
             stop.set()
-            if task is not None:
-                await task
+            try:
+                if task is not None:
+                    await task
+            finally:
+                await password_executor.shutdown()
 
     app = FastAPI(
         title="Biomodals API",
@@ -332,7 +345,11 @@ def create_app(
     async def login(request: Request, credentials: LoginRequest) -> Response:
         await require_origin(request)
         try:
-            issued = auth.login(credentials.email, credentials.password)
+            issued = await password_executor.run(
+                auth.login,
+                credentials.email,
+                credentials.password,
+            )
         except InvalidCredentialsError as exc:
             LOGGER.warning("Rejected login attempt")
             raise HTTPException(401, "Invalid email or password") from exc
@@ -367,7 +384,11 @@ def create_app(
     ) -> PrincipalView:
         await require_origin(request)
         try:
-            principal = auth.set_password(submission.token, submission.password)
+            principal = await password_executor.run(
+                auth.set_password,
+                submission.token,
+                submission.password,
+            )
         except PasswordPolicyError as exc:
             raise HTTPException(400, str(exc)) from exc
         except InvalidPasswordTokenError as exc:
@@ -434,13 +455,11 @@ def create_app(
         except JobNotCancellableError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         registration = registrations.get(job.workload)
-        if job.modal_call_id is None:
-            job = store.set_job_state(
-                job.job_id,
-                JobState.CANCELLED,
-                now=int(time.time()),
-            )
-        elif registration is not None and registration.cancel is not None:
+        if (
+            job.modal_call_id is not None
+            and registration is not None
+            and registration.cancel is not None
+        ):
             try:
                 await registration.cancel(job)
             except Exception:
@@ -460,81 +479,59 @@ def create_app(
             raise HTTPException(409, f"Job is {job.state.value}")
         if (
             job.result_filename is None
+            or _ARCHIVE_FILENAME.fullmatch(job.result_filename) is None
             or job.result_size_bytes is None
+            or type(job.result_size_bytes) is not int
+            or job.result_size_bytes < 1
             or job.result_sha256 is None
-            or "/" in job.result_filename
-            or "\\" in job.result_filename
-            or '"' in job.result_filename
-            or "\r" in job.result_filename
-            or "\n" in job.result_filename
+            or _SHA256.fullmatch(job.result_sha256) is None
         ):
             raise HTTPException(502, "Result archive is unavailable")
-        headers = _download_headers(job.result_sha256, job.result_size_bytes)
         if cache is not None:
-            cached = cache.acquire(
-                str(job.job_id),
-                size_bytes=job.result_size_bytes,
-                sha256=job.result_sha256,
-            )
+            try:
+                cached = cache.acquire(
+                    str(job.job_id),
+                    size_bytes=job.result_size_bytes,
+                    sha256=job.result_sha256,
+                )
+            except ArtifactIntegrityError as exc:
+                raise HTTPException(502, "Result archive metadata is invalid") from exc
             if cached is not None:
                 return _cached_archive_response(
                     request,
-                    path=cached,
-                    job_id=str(job.job_id),
+                    lease=cached,
                     filename=job.result_filename,
                     sha256=job.result_sha256,
                     size_bytes=job.result_size_bytes,
-                    cache=cache,
                 )
 
         registration = registrations.get(job.workload)
         if registration is None or registration.read_artifact is None:
             raise HTTPException(503, "Result storage is temporarily unavailable")
+        if cache is None:  # guarded during app construction for registered workloads
+            raise HTTPException(503, "Result storage is temporarily unavailable")
         chunks = registration.read_artifact(job)
-        if cache is not None:
-            try:
-                cached = await cache.store(
-                    str(job.job_id),
-                    size_bytes=job.result_size_bytes,
-                    sha256=job.result_sha256,
-                    chunks=chunks,
-                )
-            except ArtifactIntegrityError as exc:
-                LOGGER.exception("Artifact integrity failure for job %s", job.job_id)
-                raise HTTPException(502, "Result archive failed verification") from exc
-            except Exception as exc:
-                LOGGER.exception("Could not restore artifact for job %s", job.job_id)
-                raise HTTPException(
-                    503, "Result storage is temporarily unavailable"
-                ) from exc
-            if cached is not None:
-                held = cache.acquire(
-                    str(job.job_id),
-                    size_bytes=job.result_size_bytes,
-                    sha256=job.result_sha256,
-                )
-                if held is None:  # pragma: no cover - atomic cache publication
-                    raise HTTPException(
-                        503, "Result storage is temporarily unavailable"
-                    )
-                return _cached_archive_response(
-                    request,
-                    path=held,
-                    job_id=str(job.job_id),
-                    filename=job.result_filename,
-                    sha256=job.result_sha256,
-                    size_bytes=job.result_size_bytes,
-                    cache=cache,
-                )
-        return StreamingResponse(
-            chunks,
-            media_type="application/zip",
-            headers={
-                **headers,
-                "Content-Disposition": (
-                    f'attachment; filename="{job.result_filename}"'
-                ),
-            },
+        try:
+            cached = await cache.store(
+                str(job.job_id),
+                size_bytes=job.result_size_bytes,
+                sha256=job.result_sha256,
+                chunks=chunks,
+            )
+        except ArtifactIntegrityError as exc:
+            LOGGER.exception("Artifact integrity failure for job %s", job.job_id)
+            raise HTTPException(502, "Result archive failed verification") from exc
+        except Exception as exc:
+            LOGGER.exception("Could not restore artifact for job %s", job.job_id)
+            raise HTTPException(
+                503, "Result storage is temporarily unavailable"
+            ) from exc
+        return _cached_archive_response(
+            request,
+            lease=cached,
+            filename=job.result_filename,
+            sha256=job.result_sha256,
+            size_bytes=job.result_size_bytes,
         )
 
     for workload in workloads:

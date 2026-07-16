@@ -27,7 +27,7 @@ def test_cache_verifies_download_before_atomic_publish(tmp_path: Path) -> None:
     cache = ArtifactCache(tmp_path, max_bytes=100)
     content = b"valid zip bytes"
 
-    path = asyncio.run(
+    lease = asyncio.run(
         cache.store(
             "11111111-1111-4111-8111-111111111111",
             size_bytes=len(content),
@@ -36,8 +36,10 @@ def test_cache_verifies_download_before_atomic_publish(tmp_path: Path) -> None:
         )
     )
 
+    path = lease.path
     assert path is not None
-    assert path.read_bytes() == content
+    assert lease.read(len(content)) == content
+    lease.close()
     assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert list(tmp_path.glob("*.part")) == []
@@ -76,7 +78,7 @@ def test_cache_revalidates_an_existing_file_before_serving(tmp_path: Path) -> No
     assert not path.exists()
 
 
-def test_oversized_result_bypasses_cache_without_consuming_source(
+def test_oversized_result_is_verified_without_becoming_cached(
     tmp_path: Path,
 ) -> None:
     cache = ArtifactCache(tmp_path, max_bytes=3)
@@ -87,7 +89,7 @@ def test_oversized_result_bypasses_cache_without_consuming_source(
         consumed = True
         yield b"large"
 
-    result = asyncio.run(
+    lease = asyncio.run(
         cache.store(
             "11111111-1111-4111-8111-111111111111",
             size_bytes=5,
@@ -96,15 +98,34 @@ def test_oversized_result_bypasses_cache_without_consuming_source(
         )
     )
 
-    assert result is None
-    assert consumed is False
+    assert consumed is True
+    assert lease.path is None
+    assert lease.read(5) == b"large"
+    assert list(tmp_path.iterdir()) == []
+    lease.close()
+
+
+def test_oversized_corrupt_result_is_rejected(tmp_path: Path) -> None:
+    cache = ArtifactCache(tmp_path, max_bytes=3)
+
+    with pytest.raises(ArtifactIntegrityError):
+        asyncio.run(
+            cache.store(
+                "11111111-1111-4111-8111-111111111111",
+                size_bytes=5,
+                sha256=digest(b"other"),
+                chunks=chunks(b"large"),
+            )
+        )
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_cache_evicts_least_recently_used_inactive_result(tmp_path: Path) -> None:
     cache = ArtifactCache(tmp_path, max_bytes=8)
     first_content = b"first"
     second_content = b"next"
-    first = asyncio.run(
+    first_lease = asyncio.run(
         cache.store(
             "11111111-1111-4111-8111-111111111111",
             size_bytes=len(first_content),
@@ -112,10 +133,12 @@ def test_cache_evicts_least_recently_used_inactive_result(tmp_path: Path) -> Non
             chunks=chunks(first_content),
         )
     )
+    first = first_lease.path
     assert first is not None
+    first_lease.close()
     os.utime(first, (1, 1))
 
-    second = asyncio.run(
+    second_lease = asyncio.run(
         cache.store(
             "22222222-2222-4222-8222-222222222222",
             size_bytes=len(second_content),
@@ -124,14 +147,16 @@ def test_cache_evicts_least_recently_used_inactive_result(tmp_path: Path) -> Non
         )
     )
 
+    second = second_lease.path
     assert second is not None and second.exists()
     assert not first.exists()
+    second_lease.close()
 
 
 def test_cache_does_not_evict_an_active_download(tmp_path: Path) -> None:
     cache = ArtifactCache(tmp_path, max_bytes=8)
     first_content = b"first"
-    first = asyncio.run(
+    first_lease = asyncio.run(
         cache.store(
             "11111111-1111-4111-8111-111111111111",
             size_bytes=len(first_content),
@@ -139,11 +164,11 @@ def test_cache_does_not_evict_an_active_download(tmp_path: Path) -> None:
             chunks=chunks(first_content),
         )
     )
+    first = first_lease.path
     assert first is not None
-    assert cache.acquire("11111111-1111-4111-8111-111111111111") == first
 
     second_content = b"next"
-    second = asyncio.run(
+    second_lease = asyncio.run(
         cache.store(
             "22222222-2222-4222-8222-222222222222",
             size_bytes=len(second_content),
@@ -152,6 +177,82 @@ def test_cache_does_not_evict_an_active_download(tmp_path: Path) -> None:
         )
     )
 
+    second = second_lease.path
     assert second is not None
     assert first.exists()
-    cache.release("11111111-1111-4111-8111-111111111111")
+    first_lease.close()
+    assert not first.exists()
+    second_lease.close()
+
+
+def test_cache_refuses_symlinks_without_touching_their_target(tmp_path: Path) -> None:
+    cache = ArtifactCache(tmp_path, max_bytes=100)
+    job_id = "11111111-1111-4111-8111-111111111111"
+    target = tmp_path / "secret"
+    target.write_bytes(b"expected")
+    (tmp_path / f"{job_id}.zip").symlink_to(target)
+
+    assert (
+        cache.acquire(
+            job_id,
+            size_bytes=len(b"expected"),
+            sha256=digest(b"expected"),
+        )
+        is None
+    )
+    assert target.read_bytes() == b"expected"
+
+
+def test_lease_streams_verified_descriptor_after_path_replacement(
+    tmp_path: Path,
+) -> None:
+    cache = ArtifactCache(tmp_path, max_bytes=100)
+    job_id = "11111111-1111-4111-8111-111111111111"
+    content = b"verified"
+    lease = asyncio.run(
+        cache.store(
+            job_id,
+            size_bytes=len(content),
+            sha256=digest(content),
+            chunks=chunks(content),
+        )
+    )
+    path = lease.path
+    assert path is not None
+    target = tmp_path / "secret"
+    target.write_bytes(b"not verified")
+    path.unlink()
+    path.symlink_to(target)
+
+    assert lease.read(len(content)) == content
+    lease.close()
+    assert target.read_bytes() == b"not verified"
+
+
+@pytest.mark.parametrize(
+    ("size_bytes", "sha256"),
+    [
+        (0, digest(b"x")),
+        (-1, digest(b"x")),
+        (True, digest(b"x")),
+        (1, digest(b"x").upper()),
+        (1, "g" * 64),
+        (1, "0" * 63),
+    ],
+)
+def test_cache_rejects_invalid_metadata(
+    tmp_path: Path,
+    size_bytes: int,
+    sha256: str,
+) -> None:
+    cache = ArtifactCache(tmp_path, max_bytes=100)
+
+    with pytest.raises(ArtifactIntegrityError, match="Invalid artifact metadata"):
+        asyncio.run(
+            cache.store(
+                "11111111-1111-4111-8111-111111111111",
+                size_bytes=size_bytes,
+                sha256=sha256,
+                chunks=chunks(b"x"),
+            )
+        )

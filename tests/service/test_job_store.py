@@ -1,6 +1,6 @@
 """Private durable-job repository contracts."""
 
-# ruff: noqa: D101,D102,D103
+# ruff: noqa: D101,D102,D103,S105,S106
 
 from pathlib import Path
 from uuid import UUID
@@ -103,3 +103,65 @@ def test_cancellation_is_preserved_as_a_state_transition(tmp_path: Path) -> None
     store.set_job_state(job.job_id, JobState.CANCELLED, now=1_800_000_003)
     with pytest.raises(JobNotCancellableError):
         store.request_cancel(alice, job.job_id, now=1_800_000_004)
+
+
+def test_submission_lease_is_stable_retryable_and_single_writer(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
+    run_name = f"api-{job.job_id.hex}"
+
+    claimed = store.claim_submission(
+        job.job_id,
+        run_name=run_name,
+        submission_token="first",
+        now=100,
+        lease_seconds=20,
+    )
+    concurrent = store.claim_submission(
+        job.job_id,
+        run_name=run_name,
+        submission_token="second",
+        now=110,
+        lease_seconds=20,
+    )
+    retry = store.claim_submission(
+        job.job_id,
+        run_name=run_name,
+        submission_token="retry",
+        now=120,
+        lease_seconds=20,
+    )
+
+    assert claimed is not None
+    assert claimed.run_name == run_name
+    assert concurrent is None
+    assert retry is not None
+    assert retry.submission_token == "retry"
+
+
+def test_cancel_during_spawn_keeps_call_attached_for_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
+    run_name = f"api-{job.job_id.hex}"
+    store.claim_submission(
+        job.job_id,
+        run_name=run_name,
+        submission_token="submitter",
+        now=100,
+    )
+
+    store.request_cancel(alice, job.job_id, now=101)
+    attached = store.mark_submitted(
+        job.job_id,
+        modal_call_id="fc-live",
+        run_name=run_name,
+        submission_token="submitter",
+        now=102,
+    )
+
+    assert attached.state == JobState.CANCEL_REQUESTED
+    assert attached.modal_call_id == "fc-live"

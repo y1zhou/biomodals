@@ -45,6 +45,7 @@ class FakeGromacsAdapter:
         self.cancellations: list[str] = []
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
+        self.failures_remaining = 0
 
     async def submit(
         self,
@@ -54,6 +55,9 @@ class FakeGromacsAdapter:
         run_name: str,
     ) -> SubmittedCall:
         self.submissions.append((pdb_content, run_name, options))
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary Modal failure")
         return SubmittedCall(
             modal_call_id=f"fc-{len(self.submissions)}",
             run_name=run_name,
@@ -338,6 +342,26 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert pdb_content == VALID_PDB
     assert run_name
     assert options == GromacsJobOptions(simulation_time_ns=3, cpu_only=True)
+
+
+def test_failed_spawn_can_retry_the_same_stable_run(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    key = str(uuid4())
+    adapter.failures_remaining = 1
+
+    failed = _submit(client, csrf_token, idempotency_key=key)
+    retried = _submit(client, csrf_token, idempotency_key=key)
+
+    assert failed.status_code == 503
+    assert retried.status_code == 202
+    assert retried.json()["state"] == "queued"
+    assert len(adapter.submissions) == 2
+    assert adapter.submissions[0][1] == adapter.submissions[1][1]
+    assert adapter.submissions[0][1] == f"api-{UUID(retried.json()['job_id']).hex}"
 
 
 def test_my_jobs_and_job_lookup_are_private_to_the_cookie_owner(

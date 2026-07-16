@@ -155,6 +155,12 @@ graph is inactive. If a verified result archive wins a cancellation race, the
 completed result wins. Terminal jobs are preserved and there is no job-delete
 endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
 
+Submission uses a short SQLite lease and the stable run name
+`api-<job UUID>`. An idempotent replay cannot create a second call while that
+lease is active, and a replay after a process failure can safely retry the same
+run. If the call was accepted before its ID reached SQLite, reconciliation can
+recover the verified archive by stable run name.
+
 The supported `FunctionCall` API does not expose a backend log stream. Live
 stdout streaming is therefore deferred. A sanitized `run.log` is included in
 completed or partial result archives instead of integrating Modal's CLI log
@@ -170,6 +176,14 @@ an opaque run directory on the `Gromacs-outputs` Volume and returns one archive
 artifact with its filename, byte size, and SHA-256 digest. The archive is the
 durable success boundary; the control plane does not mark a job complete until
 that contract validates.
+
+Retries can overlap only in the narrow failure window between Modal accepting a
+call and SQLite recording its call ID. GROMACS therefore writes a unique
+candidate, then uses atomic `Modal Dict.put(..., skip_if_exists=True)` to elect
+one durable candidate per run name. All publishers copy only those elected
+bytes to `result.zip`, so concurrent Volume commits cannot select different
+archives. The Dict is a compute-side publication registry, not the job database.
+[Modal: Dicts](https://modal.com/docs/guide/dicts)
 
 The ZIP contains an explicit allowlist of final outputs, including:
 
@@ -189,7 +203,9 @@ LRU cache with atomic publication and size/SHA-256 verification:
 
 1. a cache hit is served as a local file;
 2. a miss streams the ZIP from the recorded Modal Volume;
-3. an archive larger than the cache target is streamed without retention; and
+3. an archive larger than the cache target is downloaded to an unlinked
+   temporary file, verified, streamed through that held descriptor, and not
+   retained; and
 4. eviction never deletes the Modal source.
 
 The cache can be deleted or rebuilt without losing a job. Intermediate cleanup
@@ -265,5 +281,6 @@ provisioning example.
 | One Modal `asgi_app` with deployed-Function adapters | Viable future host, but unnecessary while the internal Linux host is the accepted ingress. |
 | One external FastAPI server with explicit workload modules | **Selected.** It matches the network, scale, UX, and portability requirements. |
 | Modal Dict as the job database | Rejected. Job history and ownership must outlive short Modal call/Dict retention. |
+| Modal Dict as an atomic final-archive publication registry | **Selected.** It elects one compute-side candidate without moving identity or job state into Modal. |
 | PostgreSQL and multiple API workers | Deferred. It adds operations without benefit at the current scale; it becomes necessary before horizontal API scaling. |
 | SSE/WebSockets or Modal log streaming | Deferred. Polling coarse SQLite state is enough for v1, and the public Modal call API has no supported log stream. |

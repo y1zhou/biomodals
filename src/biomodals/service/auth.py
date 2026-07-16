@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from hmac import compare_digest
+from threading import BoundedSemaphore, Lock
+from typing import TypeVar, cast
 from uuid import UUID
 
 from pwdlib import PasswordHash
@@ -24,6 +28,9 @@ SESSION_IDLE_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
 SESSION_ABSOLUTE_LIFETIME_SECONDS = 90 * 24 * 60 * 60
 MIN_PASSWORD_CHARACTERS = 15
 MAX_PASSWORD_CHARACTERS = 128
+PASSWORD_WORKER_COUNT = 2
+
+_T = TypeVar("_T")
 
 # A fixed, valid Argon2id hash keeps unknown-user login work comparable without
 # generating a new hash for every request. Its password is deliberately unused.
@@ -52,6 +59,74 @@ class InvalidPasswordTokenError(ValueError):
 
 class PasswordPolicyError(ValueError):
     """Raised when a proposed password does not meet the local policy."""
+
+
+class PasswordExecutor:
+    """Keep expensive password operations off the API event loop."""
+
+    def __init__(self, *, workers: int = PASSWORD_WORKER_COUNT) -> None:
+        """Create a fixed-size pool and matching cross-loop capacity gate."""
+        if workers < 1:
+            raise ValueError("Password worker count must be positive")
+        self._workers = workers
+        self._capacity = BoundedSemaphore(workers)
+        self._state_lock = Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="biomodals-password",
+        )
+        self._closed = False
+
+    async def run(
+        self,
+        operation: Callable[..., _T],
+        /,
+        *args: object,
+    ) -> _T:
+        """Run one operation while bounding active and queued password work."""
+        self._ensure_open()
+        while not self._capacity.acquire(blocking=False):
+            self._ensure_open()
+            await asyncio.sleep(0.01)
+        try:
+            self._ensure_open()
+            future = self._executor.submit(
+                self._invoke,
+                operation,
+                args,
+            )
+        except BaseException:
+            self._capacity.release()
+            raise
+        while not future.done():
+            await asyncio.sleep(0.01)
+        return cast("_T", future.result())
+
+    async def shutdown(self) -> None:
+        """Wait for active operations, then stop and join every worker thread."""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        for _ in range(self._workers):
+            while not self._capacity.acquire(blocking=False):
+                await asyncio.sleep(0.01)
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def _ensure_open(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Password executor is closed")
+
+    def _invoke(
+        self,
+        operation: Callable[..., _T],
+        args: tuple[object, ...],
+    ) -> _T:
+        try:
+            return operation(*args)
+        finally:
+            self._capacity.release()
 
 
 @dataclass(frozen=True, slots=True)

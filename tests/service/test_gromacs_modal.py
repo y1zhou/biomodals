@@ -1,10 +1,13 @@
 """Modal boundary and reconciliation contracts for GROMACS jobs."""
 
-# ruff: noqa: D101,D102,D103,D107
+# ruff: noqa: D101,D102,D103,D107,S106
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -84,6 +87,115 @@ class FakeFunction:
     async def _spawn(self, **kwargs):
         self.spawn_kwargs = kwargs
         return self.call
+
+
+def _valid_archive_bytes() -> tuple[bytes, str]:
+    prefix = f"production_{RUN_NAME}"
+    members = {
+        "input.pdb": b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n",
+        "parameters.json": b"{}\n",
+        "provenance.json": b"{}\n",
+        "run.log": b"completed\n",
+        "outputs/production.mdp": b"integrator = md\n",
+        f"outputs/{prefix}.xtc": b"trajectory",
+        f"outputs/{prefix}.tpr": b"topology",
+        f"outputs/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
+        f"outputs/rmsd_{prefix}.csv": b"time,rmsd\n",
+        f"outputs/rg_{prefix}.csv": b"time,rg\n",
+        f"outputs/rmsf_{prefix}.csv": b"residue,rmsf\n",
+    }
+    roles = {
+        "input.pdb": "input_structure",
+        "parameters.json": "normalized_parameters",
+        "provenance.json": "provenance",
+        "run.log": "run_log",
+        "outputs/production.mdp": "production_parameters",
+        f"outputs/{prefix}.xtc": "trajectory",
+        f"outputs/{prefix}.tpr": "production_topology",
+        f"outputs/{prefix}_nopbc_centered.pdb": "centered_structure",
+        f"outputs/rmsd_{prefix}.csv": "rmsd",
+        f"outputs/rg_{prefix}.csv": "radius_of_gyration",
+        f"outputs/rmsf_{prefix}.csv": "rmsf",
+    }
+    records = [
+        {
+            "path": name,
+            "role": roles[name],
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for name, content in members.items()
+    ]
+    manifest = orjson.dumps({
+        "archive_schema_version": 1,
+        "run_name": RUN_NAME,
+        "files": records,
+    })
+    checksums = "".join([
+        *(f"{record['sha256']}  {record['path']}\n" for record in records),
+        f"{hashlib.sha256(manifest).hexdigest()}  manifest.json\n",
+    ]).encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+        archive.writestr("manifest.json", manifest)
+        archive.writestr("checksums.sha256", checksums)
+    request_digest = hashlib.sha256()
+    request_digest.update(len(members["input.pdb"]).to_bytes(8, "big"))
+    request_digest.update(members["input.pdb"])
+    request_digest.update(members["parameters.json"])
+    return output.getvalue(), request_digest.hexdigest()
+
+
+def _result_marker(archive_bytes: bytes, request_sha256: str) -> bytes:
+    return orjson.dumps({
+        "archive_schema_version": 1,
+        "request_sha256": request_sha256,
+        "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        "size_bytes": len(archive_bytes),
+    })
+
+
+def _replace_archive_member(
+    archive_bytes: bytes,
+    name: str,
+    content: bytes,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as source:
+        members = [
+            (info.filename, content if info.filename == name else source.read(info))
+            for info in source.infolist()
+        ]
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member_name, member_content in members:
+            archive.writestr(member_name, member_content)
+    return output.getvalue()
+
+
+def _install_volume(
+    monkeypatch: pytest.MonkeyPatch,
+    files: dict[str, bytes],
+) -> None:
+    class FakeVolume:
+        def __init__(self) -> None:
+            self.read_file = AsyncMethod(self._read_file)
+
+        async def _read_file(self, path: str):
+            if path not in files:
+                raise modal.exception.NotFoundError(path)
+            yield files[path]
+
+    monkeypatch.setattr(
+        modal.Volume,
+        "from_name",
+        lambda name, *, environment_name: (
+            FakeVolume()
+            if (name, environment_name) == ("Gromacs-outputs", "department-dev")
+            else (_ for _ in ()).throw(AssertionError(name))
+        ),
+    )
 
 
 def _adapter(
@@ -325,22 +437,38 @@ def test_cancel_stops_root_and_only_active_descendants() -> None:
     ]
 
 
-def test_final_archive_accepts_only_expected_immutable_zip(tmp_path: Path) -> None:
+def test_final_archive_accepts_only_expected_immutable_zip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _store, job = _submitted_job(tmp_path)
     adapter = _adapter({})
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                archive_bytes, request_sha256
+            ),
+            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
+        },
+    )
     result = _archive_result(
         status=AppRunStatus.PARTIAL,
+        size_bytes=len(archive_bytes),
+        sha256=archive_sha256,
         warnings=["RMSF analysis was unavailable"],
     )
 
-    archive = adapter.final_archive(job, result)
+    archive = asyncio.run(adapter.final_archive(job, result))
 
     assert archive.state == JobState.PARTIAL
     assert archive.volume_name == "Gromacs-outputs"
     assert archive.path == f"api-results/{RUN_NAME}/result.zip"
     assert archive.filename == f"{RUN_NAME}.zip"
-    assert archive.size_bytes == 123
-    assert archive.sha256 == SHA256
+    assert archive.size_bytes == len(archive_bytes)
+    assert archive.sha256 == archive_sha256
     assert archive.warnings_json == '["RMSF analysis was unavailable"]'
 
 
@@ -366,15 +494,32 @@ def test_final_archive_rejects_invalid_contract(
     _store, job = _submitted_job(tmp_path)
 
     with pytest.raises(ValueError):
-        _adapter({}).final_archive(job, result)
+        asyncio.run(_adapter({}).final_archive(job, result))
 
 
-def test_completed_archive_wins_cancel_race(tmp_path: Path) -> None:
+def test_completed_archive_wins_cancel_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, job = _submitted_job(tmp_path, cancel_requested=True)
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                archive_bytes, request_sha256
+            ),
+            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
+        },
+    )
     root_node = CallNode("fc-root", modal.call_graph.InputStatus.PENDING)
     root = FakeCall(
         "fc-root",
-        result=_archive_result(),
+        result=_archive_result(
+            size_bytes=len(archive_bytes),
+            sha256=archive_sha256,
+        ),
         graph=[root_node],
     )
     reconciler = GromacsReconciler(store, _adapter({"fc-root": root}), now=lambda: 10)
@@ -398,28 +543,16 @@ def test_expired_call_output_recovers_completed_archive_from_volume_marker(
         result=modal.exception.OutputExpiredError("expired"),
     )
     adapter = _adapter({"fc-root": root})
-    marker = orjson.dumps({
-        "archive_schema_version": 1,
-        "archive_sha256": SHA256,
-        "size_bytes": 123,
-    })
-
-    class FakeVolume:
-        def __init__(self) -> None:
-            self.read_file = AsyncMethod(self._read_file)
-
-        async def _read_file(self, path: str):
-            assert path == f"api-results/{RUN_NAME}/result.json"
-            yield marker
-
-    monkeypatch.setattr(
-        modal.Volume,
-        "from_name",
-        lambda name, *, environment_name: (
-            FakeVolume()
-            if (name, environment_name) == ("Gromacs-outputs", "department-dev")
-            else (_ for _ in ()).throw(AssertionError(name))
-        ),
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                archive_bytes, request_sha256
+            ),
+            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
+        },
     )
     reconciler = GromacsReconciler(store, adapter, now=lambda: 10)
 
@@ -429,7 +562,117 @@ def test_expired_call_output_recovers_completed_archive_from_volume_marker(
     assert completed is not None
     assert completed.state == JobState.SUCCEEDED
     assert completed.result_volume_path == f"api-results/{RUN_NAME}/result.zip"
-    assert completed.result_sha256 == SHA256
+    assert completed.result_sha256 == archive_sha256
+
+
+def test_expired_call_rejects_marker_when_archive_bytes_are_corrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(tmp_path)
+    root = FakeCall(
+        "fc-root",
+        result=modal.exception.OutputExpiredError("expired"),
+    )
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    corrupt = bytearray(archive_bytes)
+    corrupt[-1] ^= 1
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                archive_bytes, request_sha256
+            ),
+            f"api-results/{RUN_NAME}/result.zip": bytes(corrupt),
+        },
+    )
+    reconciler = GromacsReconciler(
+        store,
+        _adapter({"fc-root": root}),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+
+    failed = store.get_job(job.owner_user_id, job.job_id)
+    assert failed is not None
+    assert failed.state == JobState.FAILED
+    assert failed.error_code == "result_expired"
+
+
+def test_recovery_rejects_self_consistent_marker_for_invalid_zip_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(tmp_path)
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        manifest = orjson.loads(archive.read("manifest.json"))
+    manifest["files"][0]["sha256"] = "0" * 64
+    invalid_archive = _replace_archive_member(
+        archive_bytes,
+        "manifest.json",
+        orjson.dumps(manifest),
+    )
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                invalid_archive, request_sha256
+            ),
+            f"api-results/{RUN_NAME}/result.zip": invalid_archive,
+        },
+    )
+
+    with pytest.raises(ValueError, match="does not match manifest"):
+        asyncio.run(_adapter({}).recover_archive(job))
+
+
+def test_reconciler_recovers_orphaned_submission_by_stable_run_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ServiceStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    user = store.create_user(
+        email="alice@example.com",
+        display_name="Alice",
+        token_digest=b"setup-token-digest",
+        token_expires_at=3_600,
+        now=1,
+    )
+    admission = store.admit_job(
+        owner_user_id=user.user_id,
+        workload="gromacs",
+        display_name="Simulation",
+        idempotency_key=str(uuid4()),
+        request_hash="request-digest",
+        parameters_json="{}",
+        active_limit=2,
+        now=2,
+    )
+    store.claim_submission(
+        admission.job.job_id,
+        run_name=RUN_NAME,
+        submission_token="lost-submitter",
+        now=3,
+    )
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                archive_bytes, request_sha256
+            ),
+            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
+        },
+    )
+
+    asyncio.run(GromacsReconciler(store, _adapter({}), now=lambda: 10).reconcile())
+
+    completed = store.get_job(user.user_id, admission.job.job_id)
+    assert completed is not None
+    assert completed.state == JobState.SUCCEEDED
 
 
 def test_cancelled_is_terminal_only_after_call_graph_is_inactive(

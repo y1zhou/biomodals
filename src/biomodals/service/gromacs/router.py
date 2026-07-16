@@ -32,6 +32,7 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobRecord,
+    JobState,
     ServiceStore,
 )
 
@@ -171,27 +172,48 @@ def create_router(
         except JobLimitExceededError as exc:
             raise HTTPException(409, str(exc)) from exc
 
-        if not admission.created:
+        if (
+            admission.job.modal_call_id is not None
+            or admission.job.state != JobState.QUEUED
+        ):
             return JobView.from_record(admission.job)
 
-        run_name = f"api-{uuid4().hex}"
+        run_name = admission.job.run_name or f"api-{admission.job.job_id.hex}"
+        submission_token = uuid4().hex
+        claimed = store.claim_submission(
+            admission.job.job_id,
+            run_name=run_name,
+            submission_token=submission_token,
+            now=now,
+        )
+        if claimed is None:
+            current = store.get_job(
+                session.principal.user_id,
+                admission.job.job_id,
+            )
+            if current is None:  # pragma: no cover - admission owns the row
+                raise HTTPException(404, "Job not found")
+            return JobView.from_record(current)
+
         try:
             submitted = await adapter.submit(
                 pdb_content,
                 options,
                 run_name=run_name,
             )
+            if submitted.run_name != run_name:
+                raise RuntimeError("Compute returned the wrong GROMACS run name")
             job = store.mark_submitted(
                 admission.job.job_id,
                 modal_call_id=submitted.modal_call_id,
                 run_name=submitted.run_name,
+                submission_token=submission_token,
             )
         except Exception as exc:
             LOGGER.exception("Could not submit GROMACS job %s", admission.job.job_id)
-            store.fail_job(
+            store.release_submission(
                 admission.job.job_id,
-                error_code="compute_unavailable",
-                error_message="GROMACS compute is temporarily unavailable",
+                submission_token=submission_token,
                 now=int(time.time()),
             )
             raise HTTPException(

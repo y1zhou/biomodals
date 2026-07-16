@@ -30,6 +30,7 @@ from biomodals.helper.shell import run_command
 app = typer.Typer()
 app_commands = typer.Typer(no_args_is_help=True)
 workflow_commands = typer.Typer(no_args_is_help=True)
+api_commands = typer.Typer(no_args_is_help=True)
 console = Console()
 
 
@@ -46,6 +47,37 @@ app.add_typer(app_commands, name="app", help="Discover and run Biomodals apps.")
 app.add_typer(
     workflow_commands, name="workflow", help="Discover Biomodals workflow entrypoints."
 )
+app.add_typer(api_commands, name="api", help="Run the Biomodals API server.")
+
+
+@api_commands.command(name="serve", help="Start the local Biomodals API server.")
+def serve_api(
+    host: Annotated[
+        str,
+        typer.Option(help="Address on which to listen."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(min=1, max=65535, help="TCP port on which to listen."),
+    ] = 8000,
+) -> None:
+    """Run the deployed-app FastAPI factory with one Uvicorn worker."""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        console.print(
+            "[bold red]Error[/bold red] API dependencies are not installed. "
+            "Run '[green]uv sync --extra api[/green]'."
+        )
+        raise typer.Exit(code=1) from exc
+
+    uvicorn.run(
+        "biomodals.service.api:create_deployed_app",
+        factory=True,
+        host=host,
+        port=port,
+        workers=1,
+    )
 
 
 ##########################################

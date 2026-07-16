@@ -1,0 +1,418 @@
+"""Modal SDK adapter and lifecycle reconciliation for GROMACS."""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from collections.abc import AsyncIterator, Callable, Iterable
+from dataclasses import dataclass
+from typing import Literal
+
+import modal
+import orjson
+
+from biomodals.schema import (
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    VolumePath,
+)
+from biomodals.service.gromacs.router import GromacsJobOptions
+from biomodals.service.store import JobRecord, JobState, ServiceStore
+
+LOGGER = logging.getLogger(__name__)
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_API_RUN_NAME = re.compile(r"api-[0-9a-f]{32}")
+_MODAL_SERVICE_ERRORS = (
+    modal.exception.AuthError,
+    modal.exception.ConnectionError,
+    modal.exception.InternalError,
+    modal.exception.InvalidError,
+    modal.exception.NotFoundError,
+    modal.exception.PermissionDeniedError,
+    modal.exception.ResourceExhaustedError,
+    modal.exception.ServiceError,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SubmittedModalCall:
+    """Identifiers persisted after detached submission."""
+
+    modal_call_id: str
+    run_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class PollOutcome:
+    """Sanitized state observed from one Modal call graph."""
+
+    kind: Literal["running", "completed", "cancelled", "failed", "expired"]
+    result: AppRunResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FinalArchive:
+    """Validated immutable artifact returned by the compute contract."""
+
+    state: JobState
+    volume_name: str
+    path: str
+    filename: str
+    size_bytes: int
+    sha256: str
+    warnings_json: str
+
+
+def _call_nodes(
+    roots: Iterable[modal.call_graph.InputInfo],
+) -> list[modal.call_graph.InputInfo]:
+    nodes: list[modal.call_graph.InputInfo] = []
+    pending = list(roots)
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        pending.extend(node.children)
+    return nodes
+
+
+class ModalGromacsAdapter:
+    """Invoke one separately deployed GROMACS App through the Modal SDK."""
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        environment_name: str,
+        function_name: str = "run_gromacs_job",
+        output_volume_name: str = "Gromacs-outputs",
+        call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
+    ) -> None:
+        """Resolve a deployed function in an explicit Modal Environment."""
+        self.environment_name = environment_name
+        self.output_volume_name = output_volume_name
+        self.function = modal.Function.from_name(
+            app_name,
+            function_name,
+            environment_name=environment_name,
+        )
+        self._call_resolver = call_resolver
+
+    async def submit(
+        self,
+        pdb_content: bytes,
+        options: GromacsJobOptions,
+        *,
+        run_name: str,
+    ) -> SubmittedModalCall:
+        """Spawn a detached GROMACS call without exposing its id to clients."""
+        call = await self.function.spawn.aio(
+            pdb_content=pdb_content,
+            run_name=run_name,
+            **options.model_dump(),
+        )
+        return SubmittedModalCall(modal_call_id=call.object_id, run_name=run_name)
+
+    async def poll(self, modal_call_id: str) -> PollOutcome:
+        """Poll without blocking and distinguish a poll timeout from failure."""
+        call = self._call_resolver(modal_call_id)
+        try:
+            raw_result = await call.get.aio(timeout=0)
+        except modal.exception.InputCancellation:
+            return PollOutcome("cancelled")
+        except (modal.exception.OutputExpiredError, modal.exception.NotFoundError):
+            return PollOutcome("expired")
+        except TimeoutError:
+            graph = await call.get_call_graph.aio()
+            nodes = _call_nodes(graph)
+            if not nodes or any(
+                node.status == modal.call_graph.InputStatus.PENDING for node in nodes
+            ):
+                return PollOutcome("running")
+            if any(
+                node.status == modal.call_graph.InputStatus.TERMINATED for node in nodes
+            ):
+                return PollOutcome("cancelled")
+            return PollOutcome("failed")
+        except _MODAL_SERVICE_ERRORS:
+            raise
+        except Exception:
+            return PollOutcome("failed")
+        try:
+            result = AppRunResult.model_validate(raw_result)
+        except Exception:
+            LOGGER.exception(
+                "GROMACS call %s returned an invalid result", modal_call_id
+            )
+            return PollOutcome("failed")
+        return PollOutcome("completed", result)
+
+    async def cancel(self, modal_call_id: str) -> None:
+        """Cancel the root and every currently visible active descendant."""
+        root = self._call_resolver(modal_call_id)
+        graph = await root.get_call_graph.aio()
+        nodes = _call_nodes(graph)
+        if nodes and not any(
+            node.status == modal.call_graph.InputStatus.PENDING for node in nodes
+        ):
+            return
+        call_ids = {
+            node.function_call_id
+            for node in nodes
+            if node.status == modal.call_graph.InputStatus.PENDING
+            and node.function_call_id
+        }
+        call_ids.discard(modal_call_id)
+        for call_id in sorted(call_ids):
+            call = self._call_resolver(call_id)
+            await call.cancel.aio(terminate_containers=False)
+        await root.cancel.aio(terminate_containers=False)
+
+    async def read_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
+        """Stream the recorded final ZIP from its authoritative Modal Volume."""
+        if (
+            job.result_volume_name != self.output_volume_name
+            or job.result_volume_path is None
+            or job.run_name is None
+            or job.result_volume_path != f"api-results/{job.run_name}/result.zip"
+        ):
+            raise ValueError("Job does not reference the configured GROMACS Volume")
+        volume = modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=self.environment_name,
+        )
+        async for chunk in volume.read_file.aio(job.result_volume_path):
+            yield chunk
+
+    async def cleanup_intermediates(self, job: JobRecord) -> None:
+        """Remove one retained run directory without touching its final ZIP."""
+        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+            raise ValueError("Job has no valid API run directory")
+        volume = modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=self.environment_name,
+        )
+        try:
+            await volume.remove_file.aio(job.run_name, recursive=True)
+        except modal.exception.NotFoundError:
+            pass
+
+    async def recover_archive(self, job: JobRecord) -> FinalArchive:
+        """Recover durable result metadata after Modal call output expiry."""
+        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+            raise ValueError("Job has no valid API run name")
+        marker_path = f"api-results/{job.run_name}/result.json"
+        volume = modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=self.environment_name,
+        )
+        marker_bytes = bytearray()
+        try:
+            async for chunk in volume.read_file.aio(marker_path):
+                marker_bytes.extend(chunk)
+                if len(marker_bytes) > 64 * 1024:
+                    raise ValueError("GROMACS result marker is too large")
+        except modal.exception.NotFoundError as exc:
+            raise ValueError("GROMACS result marker is missing") from exc
+        try:
+            marker = orjson.loads(marker_bytes)
+        except orjson.JSONDecodeError as exc:
+            raise ValueError("GROMACS result marker is invalid") from exc
+        size_bytes = marker.get("size_bytes") if isinstance(marker, dict) else None
+        sha256 = marker.get("archive_sha256") if isinstance(marker, dict) else None
+        if (
+            not isinstance(marker, dict)
+            or marker.get("archive_schema_version") != 1
+            or type(size_bytes) is not int
+            or size_bytes < 1
+            or not isinstance(sha256, str)
+            or _SHA256.fullmatch(sha256) is None
+        ):
+            raise ValueError("GROMACS result marker is invalid")
+        return FinalArchive(
+            state=JobState.SUCCEEDED,
+            volume_name=self.output_volume_name,
+            path=f"api-results/{job.run_name}/result.zip",
+            filename=f"{job.run_name}.zip",
+            size_bytes=size_bytes,
+            sha256=sha256,
+            warnings_json="[]",
+        )
+
+    def final_archive(self, job: JobRecord, result: AppRunResult) -> FinalArchive:
+        """Validate the stable compute-to-control-plane artifact contract."""
+        if result.status not in {AppRunStatus.SUCCEEDED, AppRunStatus.PARTIAL}:
+            raise ValueError("GROMACS call did not return a completed result")
+        if len(result.outputs) != 1:
+            raise ValueError("GROMACS call must return exactly one output")
+        output = result.outputs[0]
+        if output.kind != ArtifactKind.ARCHIVE or not isinstance(
+            output.storage, VolumePath
+        ):
+            raise ValueError("GROMACS call did not return a Volume archive")
+        expected_path = f"api-results/{job.run_name}/result.zip"
+        if (
+            output.storage.volume_name != self.output_volume_name
+            or output.storage.path != expected_path
+            or output.storage.media_type != "application/zip"
+        ):
+            raise ValueError("GROMACS archive location is not allowed")
+
+        filename = output.metadata.get("filename")
+        size_bytes = output.metadata.get("size_bytes")
+        sha256 = output.metadata.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or filename != f"{job.run_name}.zip"
+            or type(size_bytes) is not int
+            or size_bytes < 1
+            or not isinstance(sha256, str)
+            or _SHA256.fullmatch(sha256) is None
+        ):
+            raise ValueError("GROMACS archive metadata is invalid")
+        return FinalArchive(
+            state=(
+                JobState.PARTIAL
+                if result.status == AppRunStatus.PARTIAL
+                else JobState.SUCCEEDED
+            ),
+            volume_name=output.storage.volume_name,
+            path=output.storage.path,
+            filename=filename,
+            size_bytes=size_bytes,
+            sha256=sha256,
+            warnings_json=orjson.dumps(result.warnings).decode(),
+        )
+
+
+class GromacsReconciler:
+    """Refresh locally persisted GROMACS jobs from Modal in one process."""
+
+    def __init__(
+        self,
+        store: ServiceStore,
+        adapter: ModalGromacsAdapter,
+        *,
+        now: Callable[[], int] | None = None,
+        intermediate_retention_days: int | None = None,
+    ) -> None:
+        """Bind durable state to the provider adapter."""
+        self.store = store
+        self.adapter = adapter
+        self._now = now or (lambda: int(time.time()))
+        if intermediate_retention_days is not None and intermediate_retention_days < 1:
+            raise ValueError("intermediate_retention_days must be positive")
+        self.intermediate_retention_seconds = (
+            intermediate_retention_days * 24 * 60 * 60
+            if intermediate_retention_days is not None
+            else None
+        )
+
+    async def reconcile(self) -> None:
+        """Poll every active GROMACS call once."""
+        for job in self.store.list_reconcilable_jobs("gromacs"):
+            if job.modal_call_id is None:
+                continue
+            try:
+                if job.state == JobState.CANCEL_REQUESTED:
+                    try:
+                        await self.adapter.cancel(job.modal_call_id)
+                    except modal.exception.NotFoundError:
+                        outcome = PollOutcome("expired")
+                    else:
+                        outcome = await self.adapter.poll(job.modal_call_id)
+                else:
+                    outcome = await self.adapter.poll(job.modal_call_id)
+            except _MODAL_SERVICE_ERRORS:
+                LOGGER.exception(
+                    "Modal is unavailable while reconciling job %s", job.job_id
+                )
+                continue
+            if outcome.kind == "expired":
+                try:
+                    archive = await self.adapter.recover_archive(job)
+                except _MODAL_SERVICE_ERRORS:
+                    LOGGER.exception(
+                        "Modal is unavailable while recovering job %s", job.job_id
+                    )
+                    continue
+                except Exception:
+                    LOGGER.exception("Could not recover expired job %s", job.job_id)
+                    self.store.fail_job(
+                        job.job_id,
+                        error_code="result_expired",
+                        error_message="GROMACS result metadata is unavailable",
+                        now=self._now(),
+                    )
+                    continue
+                self._complete(job, archive)
+                continue
+            self._apply(job, outcome)
+        await self._cleanup_intermediates()
+
+    async def _cleanup_intermediates(self) -> None:
+        if self.intermediate_retention_seconds is None:
+            return
+        now = self._now()
+        jobs = self.store.list_intermediate_cleanup_candidates(
+            "gromacs",
+            completed_before=now - self.intermediate_retention_seconds,
+        )
+        for job in jobs:
+            try:
+                await self.adapter.cleanup_intermediates(job)
+            except _MODAL_SERVICE_ERRORS:
+                LOGGER.exception(
+                    "Modal is unavailable while cleaning job %s", job.job_id
+                )
+                continue
+            except Exception:
+                LOGGER.exception("Could not clean intermediates for job %s", job.job_id)
+                continue
+            self.store.mark_intermediates_cleaned(job.job_id, now=now)
+
+    def _apply(self, job: JobRecord, outcome: PollOutcome) -> None:
+        now = self._now()
+        if outcome.kind == "running":
+            if job.state != JobState.CANCEL_REQUESTED:
+                self.store.set_job_state(job.job_id, JobState.RUNNING, now=now)
+            return
+        if outcome.kind == "cancelled":
+            self.store.set_job_state(job.job_id, JobState.CANCELLED, now=now)
+            return
+        if outcome.kind == "failed" or outcome.result is None:
+            self.store.fail_job(
+                job.job_id,
+                error_code="compute_failed",
+                error_message="GROMACS job failed; see run.log if an archive is available",
+                now=now,
+            )
+            return
+
+        self.store.set_job_state(job.job_id, JobState.FINALIZING, now=now)
+        try:
+            archive = self.adapter.final_archive(job, outcome.result)
+        except Exception:
+            LOGGER.exception("GROMACS job %s returned an invalid archive", job.job_id)
+            self.store.fail_job(
+                job.job_id,
+                error_code="invalid_result",
+                error_message="GROMACS produced an invalid result archive",
+                now=now,
+            )
+            return
+        self._complete(job, archive)
+
+    def _complete(self, job: JobRecord, archive: FinalArchive) -> None:
+        self.store.complete_job(
+            job.job_id,
+            state=archive.state,
+            result_volume_name=archive.volume_name,
+            result_volume_path=archive.path,
+            result_filename=archive.filename,
+            result_size_bytes=archive.size_bytes,
+            result_sha256=archive.sha256,
+            warnings_json=archive.warnings_json,
+            now=self._now(),
+        )

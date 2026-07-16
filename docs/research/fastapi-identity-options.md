@@ -76,11 +76,11 @@ An administrator runs the CLI with the same `BIOMODALS_STATE_DIR` and
 `BIOMODALS_FRONTEND_URL` as the server:
 
 ```bash
-uv run biomodals-admin create-user alice@example.com \
+uv run biomodals api admin create-user alice@example.com \
   --display-name "Alice Example"
 
-uv run biomodals-admin reset-password alice@example.com
-uv run biomodals-admin disable-user alice@example.com
+uv run biomodals api admin reset-password alice@example.com
+uv run biomodals api admin disable-user alice@example.com
 ```
 
 `create-user` and `reset-password` print one URL exactly once. An administrator

@@ -92,14 +92,14 @@ There is no public registration. An administrator provisions an employee and
 delivers the printed one-hour password link through a trusted internal channel:
 
 ```bash
-uv run biomodals-admin create-user alice@example.com \
+uv run biomodals api admin create-user alice@example.com \
   --display-name "Alice Example"
 ```
 
 The admin command must use the same `BIOMODALS_STATE_DIR` and
 `BIOMODALS_FRONTEND_URL` as the server. Related commands are
-`biomodals-admin reset-password EMAIL` and
-`biomodals-admin disable-user EMAIL`.
+`biomodals api admin reset-password EMAIL` and
+`biomodals api admin disable-user EMAIL`.
 
 On the department server, run this command under a dedicated Linux and Modal
 service user, set an explicit `BIOMODALS_MODAL_ENVIRONMENT`, and supervise the

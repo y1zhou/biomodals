@@ -263,9 +263,11 @@ The application factory reads these settings:
 Start the development server with:
 
 ```bash
-uv run uvicorn biomodals.service.api:create_deployed_app \
-  --factory --host 127.0.0.1 --port 8000 --workers 1
+uv run biomodals api serve
 ```
+
+The command defaults to `127.0.0.1:8000`, accepts `--host` and `--port`, and
+keeps the required worker count at one.
 
 Production uses the same factory and worker count behind the internal HTTPS
 reverse proxy. See the root README for the complete local setup and account

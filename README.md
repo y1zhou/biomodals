@@ -77,9 +77,11 @@ export BIOMODALS_FRONTEND_URL="http://localhost:5173"
 export BIOMODALS_ALLOWED_ORIGIN="http://localhost:5173"
 export BIOMODALS_MODAL_ENVIRONMENT="main"
 
-uv run uvicorn biomodals.service.api:create_deployed_app \
-  --factory --host 127.0.0.1 --port 8000 --workers 1
+uv run biomodals api serve
 ```
+
+The server listens on `127.0.0.1:8000` by default. Use `--host` or `--port`
+to override either value; the command keeps the required worker count at one.
 
 Configure the frontend development server to proxy `/api` to
 `http://127.0.0.1:8000`. The browser then uses ordinary same-origin,

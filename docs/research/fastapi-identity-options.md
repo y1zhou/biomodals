@@ -1,90 +1,203 @@
-# FastAPI identity options for Biomodals
+# FastAPI identity design for Biomodals
 
-Status: research and provisional recommendation
-Research date: 2026-07-15
-Scope: local identities for a department-only API used by a few dozen employees
+Status: accepted for the department development service
 
-## Recommendation
+Decision date: 2026-07-16
 
-For the stated department-only development server, provision each employee an
-immutable user UUID and an individually revocable **opaque API token**. Keep
-users, token digests, and job ownership in local SQLite. Authenticate the
-`Authorization: Bearer` token through a shared repo-owned `Principal`
-dependency or middleware. Provision users and tokens through an admin CLI; do
-not expose public registration.
+Scope: browser login and private job ownership for a few dozen employees
 
-This is deliberately smaller than a username/password system: there is no
-password policy, reset flow, login throttling, JWT signing key, refresh-token
-flow, or browser cookie/CSRF policy to operate. A token should contain a public
-lookup identifier plus at least 32 random secret bytes, be shown once, and be
-stored only as a digest. HTTPS is still required because it is a bearer
-credential. FastAPI's security helpers parse the header, but the token store
-and principal mapping remain application responsibilities. [FastAPI security
-reference](https://fastapi.tiangolo.com/reference/security/) · [OWASP REST
-security](https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html)
+## Decision
 
-If employees instead need username/password login, use **FastAPI Users with its
-SQLAlchemy adapter and SQLite**, behind the same `Principal` boundary. Include
-its Bearer login router but omit public registration, and provision or disable
-accounts through an admin CLI using `UserManager`. Prefer its revocable
-database-token strategy to long-lived JWTs. FastAPI Users is the most complete
-FastAPI-native account package found, but it is officially in maintenance mode
-and is materially more machinery than personal tokens.
+Use administrator-provisioned company email accounts, Argon2id passwords, and
+opaque server-side browser sessions stored in the service's local SQLite
+database. There is no public registration, email delivery integration,
+personal API token, JWT, or external identity provider in v1.
 
-FastAPI Users supplies authentication and basic account state, not job
-authorization. On submission, the server must set `owner_id` from the
-authenticated principal. Every read, list, cancellation, and artifact query
-must constrain by both `job_id` and `owner_id` (returning 404 for another
-owner). Modal call IDs and client-supplied owner fields are not authorization.
+End users interact with a separate website, not the API directly. In
+production, the reverse proxy serves the frontend and `/api` on one internal
+HTTPS origin. The frontend development server likewise proxies `/api` to local
+FastAPI. This permits a conventional login form and host-only cookies without
+making Modal credentials or Modal-specific proxy headers part of the browser
+contract.
 
-This requirement strengthens the case for one unified API control plane.
-Separate public servers would otherwise duplicate the user database and token
-policy, or force the project to deploy a separate identity provider now.
+The implementation intentionally uses a small repo-owned identity boundary
+plus one cryptographic dependency:
 
-## Comparison
+- Python `secrets` creates high-entropy opaque tokens;
+- only SHA-256 token digests are stored;
+- [`pwdlib`](https://frankie567.github.io/pwdlib/) supplies its recommended
+  Argon2 password hasher and transparent rehash support; and
+- FastAPI dependencies turn an authenticated session into a minimal
+  `Principal(user_id, email, display_name)`.
 
-| Option | Authentication and API tokens | Users and provisioning | Authorization | Maintenance and fit |
-| --- | --- | --- | --- | --- |
-| **Repo-owned opaque tokens** | FastAPI parses Bearer credentials; `secrets`, `hashlib`/`hmac`, and SQLite provide generation, digest storage, lookup, and revocation. No JWT or password flow. | Admin CLI creates stable UUID users and one or more named tokens per user. | The token resolves to a `Principal`; per-job ownership remains application code. | **Best fit if users accept issued tokens.** Smallest surface and no new runtime dependency, but its focused token schema and tests are ours to maintain. [FastAPI security](https://fastapi.tiangolo.com/reference/security/) · [Python `secrets`](https://docs.python.org/3/library/secrets.html) |
-| **keyshield** | Versioned API keys, Argon2/bcrypt hashing with a pepper, expiry, revocation, scopes, FastAPI dependencies, and a Typer CLI. | Manages keys, not employee accounts; Biomodals must associate each key with a stable user. Its current SQLAlchemy repository adds an ORM and async driver. | Returns an API-key record; the app must map it to a principal and enforce job ownership. | Closest third-party personal-token implementation, but young (**2.0.0, 2026-03-06**) and larger than the required token table. Worth a pilot, not an automatic choice. [documentation and PyPI](https://pypi.org/project/keyshield/) · [source](https://github.com/Athroniaeth/keyshield) |
-| **FastAPI Users** | Bearer or cookie transport; JWT, database, and Redis strategies. Database tokens are revocable; JWTs are not individually revocable. | SQLAlchemy and Beanie adapters; password hashing; login, registration, reset, verification, and user routers. Users can be created programmatically, so the registration router can remain absent. | Dependencies support active, verified, and superuser checks. Per-job ownership remains application code. | **Best fit if users require password login.** PyPI lists **15.0.5 (2026-03-27)**, but the project is explicitly in maintenance mode. [features and maintenance notice](https://fastapi-users.github.io/fastapi-users/latest/) · [authentication strategies](https://fastapi-users.github.io/fastapi-users/latest/configuration/authentication/) · [programmatic provisioning](https://fastapi-users.github.io/fastapi-users/latest/cookbook/create-user-programmatically/) · [PyPI](https://pypi.org/project/fastapi-users/) |
-| **FastAPI-Login** | Thin JWT issuer/validator with header or cookie lookup and optional scopes. No built-in refresh or token revocation. | The application writes credential checking and a `user_loader`; it supplies all storage and provisioning. | Route dependency and scopes only; ownership is application code. | Too little benefit over the built-in baseline. Latest PyPI release is **1.10.3 (2024-12-14)**. [official usage](https://github.com/maxrdu/fastapi_login#usage) · [PyPI](https://pypi.org/project/fastapi-login/) |
-| **AuthX** | JWT access/refresh tokens, several token locations, blocklists, scopes, and policy hooks. | Official examples make the application validate passwords and load users; no account database or admin provisioning is supplied. | Useful token/scopes toolkit, but resource ownership remains application code. | Actively released (**1.7.1, 2026-06-27**), but it does not solve the missing identity store. [official docs](https://authx.yezz.me/) · [basic example](https://github.com/yezz123/authx/blob/main/docs/get-started/basic-usage.md) · [PyPI](https://pypi.org/project/authx/) |
-| **Authlib** | Standards-focused OAuth/OIDC client, server, resource-server, and JOSE toolkit. FastAPI support is chiefly an OAuth client integration. | No local account database or provisioning workflow. Building an authorization server still requires those pieces. | OAuth scopes are available, but app resources remain app-owned. | Strong future choice for company OIDC, not a local identity implementation. **1.7.2 (2026-05-06)**. [client roles](https://docs.authlib.org/en/latest/oauth2/client/index.html) · [FastAPI client](https://docs.authlib.org/en/latest/client/fastapi.html) · [PyPI](https://pypi.org/project/Authlib/) |
-| **oauth2-proxy** | Reverse-proxy sessions against an OAuth/OIDC provider; can additionally use an htpasswd file and validate issuer-backed JWTs. It forwards trusted identity headers upstream. | No real local user-management plane; htpasswd administration is file based. | Coarse proxy rules only; FastAPI must still enforce job ownership and must trust headers only from the proxy. | Poor fit without an IdP and awkward for CLI clients. **7.15.2 (2026-04-14)** fixed several critical authentication bypasses, so patch discipline is essential. [configuration](https://oauth2-proxy.github.io/oauth2-proxy/configuration/overview/) · [release](https://github.com/oauth2-proxy/oauth2-proxy/releases/tag/v7.15.2) |
-| **Authelia** | Reverse-proxy cookies/basic auth and an OIDC provider with authorization-code, device-code, client-credentials, and bearer-token support. | File or LDAP users; file users use modern password hashes but are configuration-managed rather than managed by FastAPI. | Proxy access rules plus user/group headers; FastAPI still owns object authorization. | Viable shared identity service if several internal applications need it, but extra service/proxy configuration is excessive for this API alone. Latest release shown is **4.39.20 (2026-05-26)**. [file users](https://www.authelia.com/configuration/first-factor/file/) · [proxy identity](https://www.authelia.com/integration/proxies/introduction/) · [OIDC grants](https://www.authelia.com/integration/openid-connect/introduction/) · [releases](https://github.com/authelia/authelia/releases) |
-| **authentik** | Full OAuth/OIDC provider and proxy, including device-code flow for CLIs and client credentials. | Admin UI/API for users, groups, roles, passwords, sessions, and service accounts. | Policies and application bindings; FastAPI still enforces individual job ownership. | Most complete and most operationally expensive. Consider if the department wants a reusable IdP for several services. Latest release is **2026.5.2 (2026-05-28)**. [users](https://docs.goauthentik.io/users-sources/user/user_basic_operations/) · [OAuth/OIDC flows](https://docs.goauthentik.io/add-secure-apps/providers/oauth2/) · [service accounts](https://docs.goauthentik.io/sys-mgmt/service-accounts/) · [releases](https://github.com/goauthentik/authentik/releases) |
-| **FastAPI security + pwdlib + PyJWT** | FastAPI documents OAuth2 password login and JWT Bearer validation; `pwdlib` provides recommended Argon2 hashing and PyJWT signs/verifies tokens. | The project must build the user table, provisioning, password policy, disable/reset flows, login throttling, and migrations. | Everything beyond token decoding is application code. | Least package-level lock-in for password login, but the largest amount of security-sensitive account code to own. Prefer FastAPI Users if passwords are required. [FastAPI tutorial](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/) · [pwdlib](https://frankie567.github.io/pwdlib/reference/pwdlib/) · [PyJWT](https://pyjwt.readthedocs.io/en/stable/) |
+This was selected over FastAPI Users after the browser and lifecycle
+requirements became concrete. FastAPI Users is a credible general account
+package, but its built-in strategies do not directly provide the chosen
+sliding idle timeout, absolute lifetime, session-wide revocation, CSRF binding,
+and atomic one-time reset semantics. Supplying those pieces would retain most
+of the custom security-sensitive code while also adding an ORM, async SQLite
+driver, and a maintenance-mode framework.
+[FastAPI Users: features and maintenance notice](https://fastapi-users.github.io/fastapi-users/latest/)
 
-## Proposed boundary
+## User and ownership model
 
-Keep the scientific routers independent of the selected identity package:
+Each employee has an immutable random UUID. Normalized company email is a
+unique login identifier and display metadata; it is not the ownership key.
+Disabled users and their jobs remain in the database. User deletion is outside
+v1.
+
+Every job stores the submitter's UUID. Every list, detail, cancellation, and
+download query constrains both `owner_user_id` and `job_id`. A job belonging to
+another user produces the same `404` as a nonexistent job, and the service
+performs that check before resolving any Modal call or Volume path. Clients
+cannot submit an owner field. Account administrators can provision, reset, and
+disable accounts, but that role does not grant job inspection.
 
 ```text
-Authorization: Bearer ...
+browser session cookie
         |
-identity adapter (local opaque tokens initially)
-        |
-Principal(id, username, is_admin)
-        |
-app/workflow router -> owner-scoped job registry -> Modal compute app
+        v
+opaque-token digest -> session -> Principal(user UUID)
+                                      |
+                                      v
+                           owner-scoped job query
+                                      |
+                                      v
+                           internal Modal adapter
 ```
 
-This makes migration to password login or company OIDC an adapter change:
-FastAPI Users, Authlib, or an upstream proxy can produce the same `Principal`,
-while job ownership and HTTP contracts remain unchanged. User credentials and
-bearer tokens stay on the internal server; only the server's Modal credential
-crosses into the Modal SDK.
+This `Principal` boundary also leaves a clean migration path: company OIDC or
+a trusted identity proxy can produce the same principal later without changing
+workload routers or job ownership.
 
-## Decision still required
+## Manual account lifecycle
 
-Choose the client login experience before implementation:
+An administrator runs the CLI with the same `BIOMODALS_STATE_DIR` and
+`BIOMODALS_FRONTEND_URL` as the server:
 
-1. **Personal API tokens (recommended):** an admin verifies the employee out of
-   band and issues one or more named, long-lived tokens that can be revoked
-   independently. This is simplest for curl, Python clients, and unattended
-   scripts, but it has no interactive login or self-service recovery.
-2. **Session tokens:** users post username/password, receive an expiring bearer
-   token, and repeat login when it expires. This is friendlier for an
-   interactive UI but makes the server responsible for password and login
-   lifecycle. FastAPI Users is the preferred implementation for this branch.
+```bash
+uv run biomodals-admin create-user alice@example.com \
+  --display-name "Alice Example"
+
+uv run biomodals-admin reset-password alice@example.com
+uv run biomodals-admin disable-user alice@example.com
+```
+
+`create-user` and `reset-password` print one URL exactly once. An administrator
+delivers it through company chat or in person after identifying the employee.
+The link expires after one hour and has this shape:
+
+```text
+https://biomodals.internal/reset-password#token=<random-token>
+```
+
+The secret is in the URL fragment, which is not sent to the web server or
+included in ordinary proxy request logs. Merely opening the link does not
+consume it, so link previewers and security scanners are harmless. The
+frontend reads the fragment and submits the token with the chosen password to
+`POST /api/v1/auth/set-password`; that successful POST consumes the token.
+Expired, reused, and unknown links receive the same error.
+
+A successful password setup or reset atomically:
+
+1. stores the new Argon2id hash;
+2. deletes all setup/reset links for that user; and
+3. revokes all of that user's sessions.
+
+Disabling an account likewise revokes its sessions and password links. There
+is no automated "Forgot password" request endpoint: the website tells the
+employee to contact an administrator. This avoids account enumeration and
+email infrastructure in the first version.
+
+## Password policy
+
+Passwords contain 15 to 128 Unicode characters. Spaces and passphrases are
+allowed, and password managers work normally. There are no required uppercase,
+digit, symbol, or periodic-rotation rules. A small local denylist rejects
+obvious common values. Passwords are never logged or stored in plaintext.
+
+This favors length and compromised/common-password screening over composition
+rules, consistent with current NIST guidance. The local denylist is deliberately
+small for v1 and can be replaced with a larger offline corpus without changing
+the API. [NIST SP 800-63B](https://pages.nist.gov/800-63-4/sp800-63b.html)
+
+Login performs a dummy Argon2 verification for unknown or unactivated users so
+timing and messages reveal less account state. Password verification happens
+before a short `BEGIN IMMEDIATE` transaction; the transaction rechecks the
+stored hash and active flag before issuing a session, preventing a concurrent
+reset or disable from losing its revocation guarantee.
+
+## Browser sessions and CSRF
+
+Login returns two independent random values as cookies:
+
+- the session token is `HttpOnly`, host-only, `SameSite=Lax`, and `Path=/`;
+- the CSRF token is readable by the frontend and must be echoed in
+  `X-CSRF-Token` for state-changing requests.
+
+With `BIOMODALS_SECURE_COOKIES=true`, the session cookie is named
+`__Host-biomodals-session` and has the `Secure` attribute. Local HTTP
+development uses `biomodals-session` with secure cookies disabled. Neither
+cookie sets a `Domain` attribute.
+
+Unsafe routes require both the session-bound CSRF value and an exact match to
+`BIOMODALS_ALLOWED_ORIGIN`. Login and password setup also require that exact
+Origin. CORS is not enabled; the frontend uses the same-origin `/api` proxy.
+These controls remain required even though the service is internal.
+
+The server stores session and CSRF digests, never the bearer values. A session
+expires after 30 days without use or 90 days after login, whichever occurs
+first. Successful authentication slides only the idle deadline. Logout revokes
+one session; password reset and account disable revoke every session
+immediately.
+
+## Login throttling decision
+
+There is deliberately no login throttling or lockout in v1. The service is
+reachable only on the company network, has a few dozen manually provisioned
+users, and the product owner explicitly preferred avoiding lockout and
+throttling machinery for this department server.
+
+This is a documented risk acceptance, not a general recommendation for
+password services. Failed logins still use a generic response and are recorded
+without credentials. Revisit rate limiting before exposing the service to a
+larger network, adding automated clients, or observing password-guessing
+activity. OWASP otherwise recommends controls against automated attacks.
+[OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+
+## Persistence and backup
+
+The same local SQLite database stores users, password-link digests, session
+digests, and private job metadata. The essential tables are:
+
+| Table | Important fields |
+| --- | --- |
+| `users` | immutable UUID, normalized unique email, display name, Argon2id hash, active flag, timestamps |
+| `password_tokens` | SHA-256 token digest, user UUID, expiry |
+| `sessions` | SHA-256 session digest, user UUID, CSRF digest, created/last-seen/absolute-expiry timestamps |
+| `jobs` | owner UUID, public job UUID, workload, state and internal provider/artifact metadata |
+
+SQLite runs in WAL mode on local disk with foreign keys and a busy timeout. Run
+one FastAPI worker. The state directory is separate from the rebuildable
+artifact cache and must be included in company backups. Backups must use a
+SQLite-aware backup or snapshot: copying only `service.sqlite3` while its WAL
+is active can omit committed data.
+
+## Options considered
+
+| Option | Assessment for this service |
+| --- | --- |
+| **Repo-owned opaque sessions + `pwdlib`** | **Selected.** It implements the exact cookie, reset, revocation and SQLite transaction semantics with one focused dependency and no client-facing vendor contract. |
+| FastAPI Users | Best-known FastAPI account package and supports cookie/database strategies, but is in maintenance mode and still requires custom session/reset/CSRF behavior for this design. |
+| Long-lived personal API tokens | Smaller backend, but rejected for the primary UX because employees use a website and should not copy or store secrets manually. May be added separately for technical automation later. |
+| JWT access/refresh tokens (`AuthX`, FastAPI-Login, PyJWT) | Stateless validation is attractive, but immediate reset/disable revocation and browser refresh-token handling add complexity without benefit at this scale. |
+| `keyshield` API keys | Useful API-key lifecycle package, but it manages keys rather than the interactive employee accounts and cookie sessions required here. [keyshield](https://pypi.org/project/keyshield/) |
+| `oauth2-proxy` | Good companion to an existing OIDC provider, but there is no usable company IdP for this development server. FastAPI would still own per-job authorization. [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/) |
+| Authelia | Viable shared file/LDAP identity service for several internal apps, but another service and reverse-proxy policy layer is excessive for this API alone. [Authelia](https://www.authelia.com/) |
+| authentik | Full user-management and OIDC product with the best admin UX of the evaluated self-hosted options, but substantially more operational machinery than a few dozen manual accounts. [authentik](https://goauthentik.io/) |
+| Authlib/company OIDC | Preferred future direction when a supported company identity provider exists. It avoids maintaining passwords locally, but does not provide a local account database by itself. [Authlib](https://docs.authlib.org/) |
+
+The selected design is intentionally scoped to this private, single-host
+department service. An Internet-facing or multi-application identity platform
+should adopt a maintained external IdP rather than extending this code into a
+general authentication server.

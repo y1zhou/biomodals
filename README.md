@@ -55,15 +55,51 @@ uv run biomodals workflow run ppiflow --dry-run -- \
 
 ## API server
 
-Start the GROMACS API as a hot-reloading Modal development endpoint:
+The API is one local FastAPI control plane for GROMACS and future workloads.
+It submits scientific work to separately deployed Modal Apps; it is not a
+Modal web endpoint.
+
+Install the API dependencies and deploy the GROMACS compute App in the Modal
+Environment that the server will use:
 
 ```bash
-uv run modal serve -m biomodals.app.service.gromacs_api_app
+uv sync --extra api
+MODAL_ENVIRONMENT=main uv run biomodals app deploy gromacs
 ```
 
-Modal prints the temporary API URL. Requests require proxy-token credentials,
-which you can create with:
+For local frontend development, keep durable SQLite state and the final-result
+cache in separate directories, then start exactly one Uvicorn worker:
 
 ```bash
-uv run modal workspace proxy-tokens create
+export BIOMODALS_STATE_DIR="$PWD/.biomodals/state"
+export BIOMODALS_CACHE_DIR="$PWD/.biomodals/cache"
+export BIOMODALS_FRONTEND_URL="http://localhost:5173"
+export BIOMODALS_ALLOWED_ORIGIN="http://localhost:5173"
+export BIOMODALS_MODAL_ENVIRONMENT="main"
+
+uv run uvicorn biomodals.service.api:create_deployed_app \
+  --factory --host 127.0.0.1 --port 8000 --workers 1
 ```
+
+Configure the frontend development server to proxy `/api` to
+`http://127.0.0.1:8000`. The browser then uses ordinary same-origin,
+HTTP-only session cookies. `BIOMODALS_SECURE_COOKIES` defaults to `false` for
+local HTTP; set it to `true` behind the production HTTPS reverse proxy.
+
+There is no public registration. An administrator provisions an employee and
+delivers the printed one-hour password link through a trusted internal channel:
+
+```bash
+uv run biomodals-admin create-user alice@example.com \
+  --display-name "Alice Example"
+```
+
+The admin command must use the same `BIOMODALS_STATE_DIR` and
+`BIOMODALS_FRONTEND_URL` as the server. Related commands are
+`biomodals-admin reset-password EMAIL` and
+`biomodals-admin disable-user EMAIL`.
+
+On the department server, run this command under a dedicated Linux and Modal
+service user, set an explicit `BIOMODALS_MODAL_ENVIRONMENT`, and supervise the
+single process with systemd. The local cache contains only final ZIP files;
+Modal Volume storage remains authoritative for results and intermediates.

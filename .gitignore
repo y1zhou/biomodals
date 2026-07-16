@@ -153,6 +153,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.biomodals/
 .venv
 env/
 venv/

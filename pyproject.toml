@@ -22,10 +22,12 @@ dependencies = [
 [project.optional-dependencies]
 api = [
     "fastapi[standard]>=0.139.0,<1",
+    "pwdlib[argon2]>=0.3.0,<0.4",
 ]
 
 [project.scripts]
 biomodals = "biomodals.cli:app"
+biomodals-admin = "biomodals.service.admin:app"
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10.0"]
@@ -35,6 +37,7 @@ build-backend = "uv_build"
 dev = [
     "fastapi[standard]>=0.139.0,<1",
     "ipykernel>=7.2.0",
+    "pwdlib[argon2]>=0.3.0,<0.4",
     "pytest>=9.0.3",
 ]
 

@@ -27,7 +27,6 @@ api = [
 
 [project.scripts]
 biomodals = "biomodals.cli:app"
-biomodals-admin = "biomodals.service.admin:app"
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10.0"]

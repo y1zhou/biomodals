@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from typer.testing import CliRunner
 
-from biomodals.service.admin import app
+from biomodals.cli import app
 from biomodals.service.auth import AuthService, InvalidPasswordTokenError
 from biomodals.service.store import ServiceStore
 
@@ -31,6 +31,8 @@ def test_create_user_prints_setup_link_once(monkeypatch, tmp_path) -> None:
     result = runner.invoke(
         app,
         [
+            "api",
+            "admin",
             "create-user",
             "Scientist@Example.com",
             "--display-name",
@@ -52,11 +54,21 @@ def test_reset_password_replaces_prior_link(monkeypatch, tmp_path) -> None:
     store = _configure(monkeypatch, tmp_path)
     created = runner.invoke(
         app,
-        ["create-user", "scientist@example.com", "--display-name", "Scientist"],
+        [
+            "api",
+            "admin",
+            "create-user",
+            "scientist@example.com",
+            "--display-name",
+            "Scientist",
+        ],
     )
     first_link = created.output.strip()
 
-    reset = runner.invoke(app, ["reset-password", "scientist@example.com"])
+    reset = runner.invoke(
+        app,
+        ["api", "admin", "reset-password", "scientist@example.com"],
+    )
 
     assert reset.exit_code == 0, reset.output
     second_link = reset.output.strip()
@@ -73,13 +85,23 @@ def test_disable_user_revokes_access(monkeypatch, tmp_path) -> None:
     store = _configure(monkeypatch, tmp_path)
     created = runner.invoke(
         app,
-        ["create-user", "scientist@example.com", "--display-name", "Scientist"],
+        [
+            "api",
+            "admin",
+            "create-user",
+            "scientist@example.com",
+            "--display-name",
+            "Scientist",
+        ],
     )
     auth = AuthService(store, frontend_url="https://biomodals.internal")
     auth.set_password(_token(created.output.strip()), "a long unique passphrase")
     session = auth.login("scientist@example.com", "a long unique passphrase")
 
-    result = runner.invoke(app, ["disable-user", "scientist@example.com"])
+    result = runner.invoke(
+        app,
+        ["api", "admin", "disable-user", "scientist@example.com"],
+    )
 
     assert result.exit_code == 0, result.output
     assert result.output == "Disabled scientist@example.com\n"
@@ -90,7 +112,10 @@ def test_unknown_user_reports_clean_error(monkeypatch, tmp_path) -> None:
     """Expected administration errors are concise and omit tracebacks."""
     _configure(monkeypatch, tmp_path)
 
-    result = runner.invoke(app, ["reset-password", "missing@example.com"])
+    result = runner.invoke(
+        app,
+        ["api", "admin", "reset-password", "missing@example.com"],
+    )
 
     assert result.exit_code == 1
     assert result.output == "Error: Active user not found\n"

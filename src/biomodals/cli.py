@@ -24,6 +24,7 @@ from biomodals.helper.cli_command import (
     resolve_workflow_entrypoint,
 )
 from biomodals.helper.shell import run_command
+from biomodals.service.admin import app as admin_commands
 
 # ruff: noqa: S603
 
@@ -47,7 +48,12 @@ app.add_typer(app_commands, name="app", help="Discover and run Biomodals apps.")
 app.add_typer(
     workflow_commands, name="workflow", help="Discover Biomodals workflow entrypoints."
 )
-app.add_typer(api_commands, name="api", help="Run the Biomodals API server.")
+app.add_typer(api_commands, name="api", help="Run and administer the Biomodals API.")
+api_commands.add_typer(
+    admin_commands,
+    name="admin",
+    help="Manually manage Biomodals API users.",
+)
 
 
 @api_commands.command(name="serve", help="Start the local Biomodals API server.")

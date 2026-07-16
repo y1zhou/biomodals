@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NoReturn
 
 import typer
 
-from biomodals.service.auth import AuthService
 from biomodals.service.config import ServiceSettings
 from biomodals.service.store import ServiceStore
+
+if TYPE_CHECKING:
+    from biomodals.service.auth import AuthService
 
 app = typer.Typer(
     add_completion=False,
@@ -18,6 +20,8 @@ app = typer.Typer(
 
 
 def _auth_service() -> AuthService:
+    from biomodals.service.auth import AuthService
+
     settings = ServiceSettings.from_environment()
     store = ServiceStore(settings.database_path)
     store.initialize()
@@ -67,7 +71,3 @@ def disable_user(
     except (LookupError, ValueError) as exc:
         _fail(exc)
     typer.echo(f"Disabled {principal.email}")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    app()

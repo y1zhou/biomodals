@@ -33,6 +33,20 @@ class FakeVolume:
         self.reload_count += 1
 
 
+class FakePublications:
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+
+    def put(self, key: str, value: object, *, skip_if_exists: bool) -> bool:
+        if skip_if_exists and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    def get(self, key: str) -> object:
+        return self.values[key]
+
+
 def _install_fake_gromacs_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -40,7 +54,7 @@ def _install_fake_gromacs_run(
     omit: str | None = None,
 ) -> tuple[FakeVolume, dict[str, int]]:
     volume = FakeVolume()
-    calls = {"prepare": 0, "production": 0, "analysis": 0}
+    calls = {"prepare": 0, "production": 0, "analysis": 0, "warmup": 0}
     mountpoint = tmp_path / "Gromacs-outputs"
     run_root = mountpoint / "api-123"
 
@@ -69,6 +83,9 @@ def _install_fake_gromacs_run(
                 "rmsd_production_api-123.csv": b"time_ns,rmsd\n0,0\n",
                 "rg_production_api-123.csv": b"time_ns,rg\n0,1\n",
                 "rmsf_production_api-123.csv": b"residue_index,rmsf\n1,0\n",
+                "production_api-123.log": (
+                    f"Working directory: {run_root}\nStep 1000 complete\n".encode()
+                ),
                 "production_api-123.cpt": b"must not be downloaded",
                 "rmsd_production_api-123.png": b"must not be downloaded",
             }
@@ -90,6 +107,14 @@ def _install_fake_gromacs_run(
     monkeypatch.setattr(gromacs_app, "prepare_tpr_cpu", FakePrepare())
     monkeypatch.setattr(gromacs_app, "production_run_cpu", FakeProduction())
     monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
+    monkeypatch.setattr(gromacs_app, "api_result_publications", FakePublications())
+    monkeypatch.setattr(
+        gromacs_app,
+        "warmup_directory",
+        lambda _path, *, file_pattern: calls.__setitem__(
+            "warmup", calls["warmup"] + int(bool(file_pattern))
+        ),
+    )
     return volume, calls
 
 
@@ -190,6 +215,8 @@ def test_run_gromacs_job_publishes_one_verified_allowlisted_zip(
 
         log = archive.read("run.log").decode()
         assert "status: succeeded" in log
+        assert "Step 1000 complete" in log
+        assert "<run-directory>" in log
         assert str(tmp_path) not in log
         assert "Modal" not in log
 
@@ -201,8 +228,8 @@ def test_run_gromacs_job_publishes_one_verified_allowlisted_zip(
     assert not any(
         ".cpt" in member or member.endswith(".png") for member in expected_members
     )
-    assert calls == {"prepare": 1, "production": 1, "analysis": 3}
-    assert volume.commit_count == 2
+    assert calls == {"prepare": 1, "production": 1, "analysis": 3, "warmup": 1}
+    assert volume.commit_count == 3
     assert volume.reload_count >= 2
     assert archive_path.with_name("result.json").is_file()
 
@@ -222,7 +249,31 @@ def test_run_gromacs_job_reuses_immutable_completed_archive(
 
     assert second.outputs[0].metadata == first.outputs[0].metadata
     assert archive_path.read_bytes() == first_bytes
-    assert calls == {"prepare": 1, "production": 1, "analysis": 3}
+    assert calls == {"prepare": 1, "production": 1, "analysis": 3, "warmup": 1}
+
+
+def test_publication_registry_restores_the_first_elected_archive_after_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_gromacs_run(monkeypatch, tmp_path)
+    first = _run_api_job()
+    archive_path = (
+        Path(gromacs_app.CONF.output_volume_mountpoint) / first.outputs[0].storage.path
+    )
+    marker_path = archive_path.with_name("result.json")
+    first_bytes = archive_path.read_bytes()
+    archive_path.unlink()
+    marker_path.unlink()
+
+    retried = _run_api_job()
+
+    assert archive_path.read_bytes() == first_bytes
+    assert (
+        retried.outputs[0].metadata["sha256"] == hashlib.sha256(first_bytes).hexdigest()
+    )
+    run_root = archive_path.parents[2] / "api-123"
+    assert len(list(run_root.glob(".api-result-candidate-*.zip"))) == 2
 
 
 def test_run_gromacs_job_does_not_publish_incomplete_allowlist(
@@ -243,3 +294,64 @@ def test_run_gromacs_job_does_not_publish_incomplete_allowlist(
     )
     assert not result_dir.joinpath("result.zip").exists()
     assert not result_dir.joinpath("result.json").exists()
+
+
+def _rewrite_archive_member(archive_path: Path, name: str, content: bytes) -> None:
+    temporary = archive_path.with_name(f".{archive_path.name}.rewrite")
+    with zipfile.ZipFile(archive_path) as source:
+        members = [
+            (info, content if info.filename == name else source.read(info.filename))
+            for info in source.infolist()
+        ]
+    with zipfile.ZipFile(temporary, mode="w", allowZip64=True) as destination:
+        for info, member_content in members:
+            destination.writestr(info, member_content)
+    temporary.replace(archive_path)
+
+
+@pytest.mark.parametrize("field", ["size_bytes", "sha256"])
+def test_run_gromacs_job_rejects_manifest_that_disagrees_with_member_bytes(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_gromacs_run(monkeypatch, tmp_path)
+    first = _run_api_job()
+    archive_path = (
+        Path(gromacs_app.CONF.output_volume_mountpoint) / first.outputs[0].storage.path
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        manifest = orjson.loads(archive.read("manifest.json"))
+    manifest["files"][0][field] = (
+        manifest["files"][0][field] + 1 if field == "size_bytes" else "0" * 64
+    )
+    _rewrite_archive_member(
+        archive_path,
+        "manifest.json",
+        orjson.dumps(manifest, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS)
+        + b"\n",
+    )
+
+    with pytest.raises(RuntimeError, match="manifest does not match input.pdb"):
+        _run_api_job()
+
+
+def test_run_gromacs_job_rejects_inconsistent_checksum_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_gromacs_run(monkeypatch, tmp_path)
+    first = _run_api_job()
+    archive_path = (
+        Path(gromacs_app.CONF.output_volume_mountpoint) / first.outputs[0].storage.path
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        checksums = archive.read("checksums.sha256")
+    _rewrite_archive_member(
+        archive_path,
+        "checksums.sha256",
+        b"0" * 64 + checksums[64:],
+    )
+
+    with pytest.raises(RuntimeError, match="checksums are inconsistent"):
+        _run_api_job()

@@ -12,6 +12,8 @@
 
 import hashlib
 import os
+import re
+import stat
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,7 +32,7 @@ from biomodals.helper.app_run import (
 )
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.pdb import validate_pdb_content
-from biomodals.helper.shell import run_command, sanitize_filename
+from biomodals.helper.shell import run_command, sanitize_filename, warmup_directory
 from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import (
     AppRunResult,
@@ -74,10 +76,12 @@ class AppInfo:
 APP_INFO = AppInfo()
 
 _API_ARCHIVE_SCHEMA_VERSION = 1
+_API_PUBLICATION_SCHEMA_VERSION = 1
 _API_RESULTS_DIR = "api-results"
 _API_ARCHIVE_FILENAME = "result.zip"
 _API_RESULT_MARKER_FILENAME = "result.json"
 _ARCHIVE_CHUNK_SIZE = 1024 * 1024
+_RUN_LOG_TAIL_BYTES = 1024 * 1024
 
 
 def prepared_workflow_files(run_name: str) -> list[ArtifactFile]:
@@ -238,6 +242,10 @@ coordinator_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+api_result_publications = modal.Dict.from_name(
+    f"{CONF.name}-api-result-publications",
+    create_if_missing=True,
+)
 
 
 ##########################################
@@ -328,6 +336,39 @@ def _write_bytes_member(
     }
 
 
+def _sanitized_run_log(
+    source_root: Path,
+    *,
+    run_name: str,
+    header: str,
+) -> bytes:
+    """Append a bounded, path-scrubbed tail of the real GROMACS log."""
+    log_path = source_root / f"production_{run_name}.log"
+    if not log_path.is_file() or log_path.is_symlink():
+        return f"{header}\nGROMACS production log was not available.\n".encode()
+    descriptor = os.open(log_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise RuntimeError("GROMACS production log is not a regular file")
+        os.lseek(
+            descriptor,
+            max(file_stat.st_size - _RUN_LOG_TAIL_BYTES, 0),
+            os.SEEK_SET,
+        )
+        content = os.read(descriptor, _RUN_LOG_TAIL_BYTES)
+    finally:
+        os.close(descriptor)
+    text = content.decode("utf-8", errors="replace")
+    text = text.replace(str(source_root), "<run-directory>")
+    text = text.replace(CONF.output_volume_mountpoint, "<volume>")
+    text = re.sub(r"[^\x09\x0a\x20-\x7e]", "?", text.replace("\r", ""))
+    return (
+        f"{header}\n--- GROMACS production log (last {_RUN_LOG_TAIL_BYTES} bytes) ---\n"
+        f"{text.rstrip()}\n"
+    ).encode("ascii")
+
+
 def _file_record(
     *,
     source: Path,
@@ -368,20 +409,41 @@ def _required_api_output_files(
     return files
 
 
-def _expected_api_archive_members(run_name: str) -> list[str]:
+def _expected_api_manifest_files(run_name: str) -> list[tuple[str, str]]:
+    """Return the ordered member names and roles recorded by the manifest."""
     return [
-        "input.pdb",
-        "parameters.json",
-        "provenance.json",
-        "run.log",
-        "outputs/production.mdp",
+        ("input.pdb", "input_structure"),
+        ("parameters.json", "normalized_parameters"),
+        ("provenance.json", "provenance"),
+        ("run.log", "run_log"),
+        ("outputs/production.mdp", "production_parameters"),
         *(
-            f"outputs/{artifact.path}"
+            (f"outputs/{artifact.path}", artifact.role or "output")
             for artifact in production_workflow_files(run_name)
         ),
+    ]
+
+
+def _expected_api_archive_members(run_name: str) -> list[str]:
+    return [
+        *(path for path, _role in _expected_api_manifest_files(run_name)),
         "manifest.json",
         "checksums.sha256",
     ]
+
+
+def _zip_member_facts(
+    archive: zipfile.ZipFile,
+    name: str,
+) -> tuple[int, str]:
+    """Read one member fully, checking its CRC while computing size and SHA-256."""
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with archive.open(name) as member:
+        while chunk := member.read(_ARCHIVE_CHUNK_SIZE):
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    return size_bytes, digest.hexdigest()
 
 
 def _validate_api_archive(
@@ -391,19 +453,71 @@ def _validate_api_archive(
     pdb_content: bytes,
     parameters_json: bytes,
 ) -> None:
-    """Validate archive members, CRCs, and request identity."""
+    """Validate archive members, manifests, checksums, and request identity."""
     expected_members = _expected_api_archive_members(run_name)
+    expected_manifest_files = _expected_api_manifest_files(run_name)
     try:
         with zipfile.ZipFile(archive_path) as archive:
             if archive.namelist() != expected_members:
                 raise RuntimeError("GROMACS result archive has unexpected members")
-            if broken_member := archive.testzip():
-                raise RuntimeError(
-                    f"GROMACS result archive CRC failed for {broken_member}"
-                )
-            if archive.read("input.pdb") != pdb_content:
+
+            try:
+                manifest = orjson.loads(archive.read("manifest.json"))
+            except orjson.JSONDecodeError as exc:
+                raise RuntimeError("GROMACS result manifest is invalid") from exc
+            if (
+                not isinstance(manifest, dict)
+                or set(manifest) != {"archive_schema_version", "run_name", "files"}
+                or manifest.get("archive_schema_version") != _API_ARCHIVE_SCHEMA_VERSION
+                or manifest.get("run_name") != run_name
+                or not isinstance(manifest.get("files"), list)
+                or len(manifest["files"]) != len(expected_manifest_files)
+            ):
+                raise RuntimeError("GROMACS result manifest is invalid")
+
+            member_facts: dict[str, tuple[int, str]] = {}
+            for record, (expected_path, expected_role) in zip(
+                manifest["files"], expected_manifest_files, strict=True
+            ):
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"path", "role", "size_bytes", "sha256"}
+                    or record.get("path") != expected_path
+                    or record.get("role") != expected_role
+                    or type(record.get("size_bytes")) is not int
+                    or record["size_bytes"] < 0
+                    or not isinstance(record.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
+                ):
+                    raise RuntimeError("GROMACS result manifest is invalid")
+                facts = _zip_member_facts(archive, expected_path)
+                if facts != (record["size_bytes"], record["sha256"]):
+                    raise RuntimeError(
+                        f"GROMACS result manifest does not match {expected_path}"
+                    )
+                member_facts[expected_path] = facts
+
+            manifest_facts = _zip_member_facts(archive, "manifest.json")
+            checksum_members = [
+                *(path for path, _role in expected_manifest_files),
+                "manifest.json",
+            ]
+            expected_checksums = "".join(
+                f"{(manifest_facts if path == 'manifest.json' else member_facts[path])[1]}  {path}\n"
+                for path in checksum_members
+            ).encode("ascii")
+            if archive.read("checksums.sha256") != expected_checksums:
+                raise RuntimeError("GROMACS result checksums are inconsistent")
+
+            if member_facts["input.pdb"] != (
+                len(pdb_content),
+                hashlib.sha256(pdb_content).hexdigest(),
+            ):
                 raise RuntimeError("Existing GROMACS archive belongs to another input")
-            if archive.read("parameters.json") != parameters_json:
+            if member_facts["parameters.json"] != (
+                len(parameters_json),
+                hashlib.sha256(parameters_json).hexdigest(),
+            ):
                 raise RuntimeError("Existing GROMACS archive uses different parameters")
     except zipfile.BadZipFile as exc:
         raise RuntimeError("GROMACS result archive is invalid") from exc
@@ -420,6 +534,151 @@ def _api_result_paths(run_name: str) -> tuple[Path, Path]:
         result_dir / _API_ARCHIVE_FILENAME,
         result_dir / _API_RESULT_MARKER_FILENAME,
     )
+
+
+def _select_api_archive_candidate(
+    *,
+    run_name: str,
+    request_sha256: str,
+    candidate_path: Path,
+    archive_sha256: str,
+    size_bytes: int,
+) -> dict[str, str | int]:
+    """Atomically elect one durable candidate for a stable API run name."""
+    mount_root = Path(CONF.output_volume_mountpoint).resolve()
+    candidate_relative = candidate_path.resolve().relative_to(mount_root).as_posix()
+    record: dict[str, str | int] = {
+        "publication_schema_version": _API_PUBLICATION_SCHEMA_VERSION,
+        "run_name": run_name,
+        "request_sha256": request_sha256,
+        "candidate_path": candidate_relative,
+        "archive_sha256": archive_sha256,
+        "size_bytes": size_bytes,
+    }
+    created = api_result_publications.put(
+        run_name,
+        record,
+        skip_if_exists=True,
+    )
+    selected = record if created else api_result_publications.get(run_name)
+    selected_sha256 = (
+        selected.get("archive_sha256") if isinstance(selected, dict) else None
+    )
+    selected_size = selected.get("size_bytes") if isinstance(selected, dict) else None
+    if (
+        not isinstance(selected, dict)
+        or set(selected) != set(record)
+        or selected.get("publication_schema_version") != _API_PUBLICATION_SCHEMA_VERSION
+        or selected.get("run_name") != run_name
+        or selected.get("request_sha256") != request_sha256
+        or not isinstance(selected.get("candidate_path"), str)
+        or not isinstance(selected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", selected_sha256) is None
+        or type(selected_size) is not int
+        or selected_size < 1
+    ):
+        raise RuntimeError("GROMACS result publication record is invalid")
+    return cast("dict[str, str | int]", selected)
+
+
+def _selected_candidate_path(
+    publication: dict[str, str | int],
+    *,
+    run_name: str,
+) -> Path:
+    mount_root = Path(CONF.output_volume_mountpoint).resolve()
+    run_root = (mount_root / run_name).resolve()
+    candidate = (mount_root / str(publication["candidate_path"])).resolve()
+    try:
+        candidate.relative_to(run_root)
+    except ValueError as exc:
+        raise RuntimeError("GROMACS publication candidate escapes its run") from exc
+    if not candidate.is_file() or candidate.is_symlink():
+        raise RuntimeError("GROMACS publication candidate is missing")
+    return candidate
+
+
+def _copy_verified_candidate(
+    source: Path,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    """Copy through no-follow descriptors and verify the copied bytes."""
+    source_descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    destination_descriptor: int | None = None
+    try:
+        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+            raise RuntimeError("GROMACS publication candidate is not a file")
+        destination_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        digest = hashlib.sha256()
+        size_bytes = 0
+        while chunk := os.read(source_descriptor, _ARCHIVE_CHUNK_SIZE):
+            size_bytes += len(chunk)
+            digest.update(chunk)
+            remaining = memoryview(chunk)
+            while remaining:
+                remaining = remaining[os.write(destination_descriptor, remaining) :]
+        os.close(destination_descriptor)
+        destination_descriptor = None
+        if size_bytes != expected_size or digest.hexdigest() != expected_sha256:
+            raise RuntimeError("GROMACS publication candidate changed while copying")
+        os.replace(temporary, destination)
+    finally:
+        os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_selected_api_archive(
+    *,
+    publication: dict[str, str | int],
+    run_name: str,
+    pdb_content: bytes,
+    parameters_json: bytes,
+) -> tuple[Path, str, int]:
+    """Publish the elected bytes; concurrent publishers copy identical data."""
+    archive_path, _marker_path = _api_result_paths(run_name)
+    expected_sha256 = str(publication["archive_sha256"])
+    expected_size = int(publication["size_bytes"])
+    CONF.output_volume.reload()
+    if archive_path.exists():
+        _validate_api_archive(
+            archive_path,
+            run_name=run_name,
+            pdb_content=pdb_content,
+            parameters_json=parameters_json,
+        )
+        if (
+            archive_path.stat().st_size != expected_size
+            or _sha256_file(archive_path) != expected_sha256
+        ):
+            raise RuntimeError("Published GROMACS result differs from elected bytes")
+        return archive_path, expected_sha256, expected_size
+
+    candidate = _selected_candidate_path(publication, run_name=run_name)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    _copy_verified_candidate(
+        candidate,
+        archive_path,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    )
+    _validate_api_archive(
+        archive_path,
+        run_name=run_name,
+        pdb_content=pdb_content,
+        parameters_json=parameters_json,
+    )
+    CONF.output_volume.commit()
+    return archive_path, expected_sha256, expected_size
 
 
 def _publish_api_result_marker(
@@ -541,6 +800,16 @@ def _package_gromacs_api_archive(
 ) -> AppRunResult:
     """Publish the API-only final ZIP and its completion marker."""
     required_files = _required_api_output_files(source_root, run_name)
+    production_log_name = f"production_{run_name}.log"
+    warmup_pattern = (
+        "^(?:"
+        + "|".join([
+            *(re.escape(source.name) for source, _name, _role in required_files),
+            re.escape(production_log_name),
+        ])
+        + ")$"
+    )
+    warmup_directory(source_root, file_pattern=warmup_pattern)
 
     started_at_text = started_at.isoformat().replace("+00:00", "Z")
     completed_at_text = completed_at.isoformat().replace("+00:00", "Z")
@@ -552,114 +821,124 @@ def _package_gromacs_api_archive(
         "started_at": started_at_text,
         "completed_at": completed_at_text,
     })
-    run_log = (
+    run_log_header = (
         "Biomodals GROMACS job\n"
         f"run_name: {run_name}\n"
         "status: succeeded\n"
         f"started_at: {started_at_text}\n"
         f"completed_at: {completed_at_text}\n"
         f"gromacs_version: {CONF.version}\n"
-    ).encode()
+    )
+    run_log = _sanitized_run_log(
+        source_root,
+        run_name=run_name,
+        header=run_log_header,
+    )
 
-    archive_path, marker_path = _api_result_paths(run_name)
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = archive_path.with_name(f".{archive_path.name}.{uuid4().hex}.tmp")
+    _archive_path, marker_path = _api_result_paths(run_name)
+    candidate = source_root / f".api-result-candidate-{uuid4().hex}.zip"
     records: list[dict[str, str | int]] = []
-    try:
-        with zipfile.ZipFile(
-            temporary,
-            mode="x",
-            compression=zipfile.ZIP_DEFLATED,
-            allowZip64=True,
-        ) as archive:
-            records.append(
-                _write_bytes_member(
-                    archive,
-                    name="input.pdb",
-                    content=pdb_content,
-                    role="input_structure",
-                )
-            )
-            records.append(
-                _write_bytes_member(
-                    archive,
-                    name="parameters.json",
-                    content=parameters_json,
-                    role="normalized_parameters",
-                )
-            )
-            records.append(
-                _write_bytes_member(
-                    archive,
-                    name="provenance.json",
-                    content=provenance_json,
-                    role="provenance",
-                )
-            )
-            records.append(
-                _write_bytes_member(
-                    archive,
-                    name="run.log",
-                    content=run_log,
-                    role="run_log",
-                )
-            )
-            for source, name, role in required_files:
-                records.append(_file_record(source=source, name=name, role=role))
-                archive.write(
-                    source,
-                    arcname=name,
-                    compress_type=(
-                        zipfile.ZIP_STORED
-                        if source.suffix.lower() in {".tpr", ".xtc"}
-                        else zipfile.ZIP_DEFLATED
-                    ),
-                )
-
-            manifest_json = _json_document({
-                "archive_schema_version": _API_ARCHIVE_SCHEMA_VERSION,
-                "run_name": run_name,
-                "files": records,
-            })
-            manifest_record = _write_bytes_member(
-                archive,
-                name="manifest.json",
-                content=manifest_json,
-                role="manifest",
-            )
-            checksum_records = [*records, manifest_record]
-            checksums = "".join(
-                f"{record['sha256']}  {record['path']}\n" for record in checksum_records
-            ).encode("ascii")
+    with zipfile.ZipFile(
+        candidate,
+        mode="x",
+        compression=zipfile.ZIP_DEFLATED,
+        allowZip64=True,
+    ) as archive:
+        records.append(
             _write_bytes_member(
                 archive,
-                name="checksums.sha256",
-                content=checksums,
-                role="checksums",
+                name="input.pdb",
+                content=pdb_content,
+                role="input_structure",
+            )
+        )
+        records.append(
+            _write_bytes_member(
+                archive,
+                name="parameters.json",
+                content=parameters_json,
+                role="normalized_parameters",
+            )
+        )
+        records.append(
+            _write_bytes_member(
+                archive,
+                name="provenance.json",
+                content=provenance_json,
+                role="provenance",
+            )
+        )
+        records.append(
+            _write_bytes_member(
+                archive,
+                name="run.log",
+                content=run_log,
+                role="run_log",
+            )
+        )
+        for source, name, role in required_files:
+            records.append(_file_record(source=source, name=name, role=role))
+            archive.write(
+                source,
+                arcname=name,
+                compress_type=(
+                    zipfile.ZIP_STORED
+                    if source.suffix.lower() in {".tpr", ".xtc"}
+                    else zipfile.ZIP_DEFLATED
+                ),
             )
 
-        _validate_api_archive(
-            temporary,
-            run_name=run_name,
-            pdb_content=pdb_content,
-            parameters_json=parameters_json,
+        manifest_json = _json_document({
+            "archive_schema_version": _API_ARCHIVE_SCHEMA_VERSION,
+            "run_name": run_name,
+            "files": records,
+        })
+        manifest_record = _write_bytes_member(
+            archive,
+            name="manifest.json",
+            content=manifest_json,
+            role="manifest",
         )
-        if archive_path.exists():
-            raise RuntimeError("GROMACS result archive was published concurrently")
-        os.replace(temporary, archive_path)
-        CONF.output_volume.commit()
+        checksum_records = [*records, manifest_record]
+        checksums = "".join(
+            f"{record['sha256']}  {record['path']}\n" for record in checksum_records
+        ).encode("ascii")
+        _write_bytes_member(
+            archive,
+            name="checksums.sha256",
+            content=checksums,
+            role="checksums",
+        )
 
-        archive_sha256 = _sha256_file(archive_path)
-        size_bytes = archive_path.stat().st_size
-        _publish_api_result_marker(
-            marker_path,
-            request_sha256=request_sha256,
-            archive_sha256=archive_sha256,
-            size_bytes=size_bytes,
-            completed_at=completed_at_text,
-        )
-    finally:
-        temporary.unlink(missing_ok=True)
+    _validate_api_archive(
+        candidate,
+        run_name=run_name,
+        pdb_content=pdb_content,
+        parameters_json=parameters_json,
+    )
+    candidate_sha256 = _sha256_file(candidate)
+    candidate_size = candidate.stat().st_size
+    CONF.output_volume.commit()
+    publication = _select_api_archive_candidate(
+        run_name=run_name,
+        request_sha256=request_sha256,
+        candidate_path=candidate,
+        archive_sha256=candidate_sha256,
+        size_bytes=candidate_size,
+    )
+    archive_path, archive_sha256, size_bytes = _publish_selected_api_archive(
+        publication=publication,
+        run_name=run_name,
+        pdb_content=pdb_content,
+        parameters_json=parameters_json,
+    )
+    _publish_api_result_marker(
+        marker_path,
+        request_sha256=request_sha256,
+        archive_sha256=archive_sha256,
+        size_bytes=size_bytes,
+        completed_at=completed_at_text,
+    )
 
     return _archive_app_result(
         run_name=run_name,

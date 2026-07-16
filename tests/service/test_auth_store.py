@@ -64,9 +64,10 @@ def test_setup_link_is_one_time_and_passwords_use_argon2id(tmp_path: Path) -> No
     assert principal.email == "alice@example.com"
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
-    assert store.get_user_by_email(principal.email).password_hash.startswith(
-        "$argon2id$"
-    )
+    user = store.get_user_by_email(principal.email)
+    assert user is not None
+    assert user.password_hash is not None
+    assert user.password_hash.startswith("$argon2id$")
     with pytest.raises(InvalidPasswordTokenError):
         auth.set_password(token, "another correct horse staple")
 

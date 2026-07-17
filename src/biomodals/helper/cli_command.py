@@ -101,6 +101,8 @@ def build_modal_deploy_command(
     app_path: str | Path,
     name: str | None,
     tag: str | None,
+    env: str | None = None,
+    strategy: str | None = None,
 ) -> tuple[str, ...]:
     """Build the command for `biomodals app deploy` without side effects."""
     cmd = _modal_base_command(modal_mode="deploy", detach=False, python_executable=None)
@@ -108,5 +110,9 @@ def build_modal_deploy_command(
         cmd.extend(["--name", name])
     if tag:
         cmd.extend(["--tag", tag])
+    if env:
+        cmd.extend(["--env", env])
+    if strategy:
+        cmd.extend(["--strategy", strategy])
     cmd.append(str(app_path))
     return tuple(cmd)

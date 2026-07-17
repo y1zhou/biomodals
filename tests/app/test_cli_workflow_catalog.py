@@ -56,6 +56,10 @@ def test_app_deploy_command_is_namespaced() -> None:
 
     assert result.exit_code == 0
     assert "Name or path of the app to deploy" in result.output
+    assert "--env" in result.output
+    assert "--strategy" in result.output
+    assert "rolling" in result.output
+    assert "recreate" in result.output
 
 
 def test_top_level_deploy_remains_app_compatibility_alias() -> None:

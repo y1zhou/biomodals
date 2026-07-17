@@ -586,10 +586,24 @@ def deploy_app(
         str | None,
         typer.Option("--tag", "-t", help="Tag the deployment with a version."),
     ] = None,
+    env: Annotated[
+        str | None,
+        typer.Option("--env", "-e", help="Modal Environment to deploy into."),
+    ] = None,
+    strategy: Annotated[
+        Literal["rolling", "recreate"] | None,
+        typer.Option("--strategy", help="Deployment strategy."),
+    ] = None,
 ):
     """Deploy a biomodals application to Modal."""
     app = _load_entry("app", app_name_or_path)
-    cmd = build_modal_deploy_command(app_path=app.path, name=name, tag=tag)
+    cmd = build_modal_deploy_command(
+        app_path=app.path,
+        name=name,
+        tag=tag,
+        env=env,
+        strategy=strategy,
+    )
     run_command(list(cmd), output_mode="inherit")
 
 

@@ -8,6 +8,10 @@ from uuid import UUID
 import pytest
 
 from biomodals.service.auth import AuthService
+from biomodals.service.runtime_config import (
+    DatabaseOverridableSetting,
+    JobAdmissionConfiguration,
+)
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
@@ -18,7 +22,11 @@ from biomodals.service.store import (
 
 
 def owner(auth: AuthService, email: str) -> UUID:
-    link = auth.create_user(email, display_name=email.partition("@")[0])
+    link = auth.create_user(
+        email,
+        display_name=email.partition("@")[0],
+        is_admin=not auth.store.list_users(),
+    )
     token = link.partition("#token=")[2]
     return auth.set_password(token, "correct horse battery staple").principal.user_id
 
@@ -36,15 +44,33 @@ def admit(
     *,
     key: str,
     request_hash: str = "a" * 64,
+    workload: str = "gromacs",
+    user_limit: int = 2,
+    workload_limit: int = 10,
+    global_limit: int = 20,
 ):
+    store.update_user(
+        owner_user_id,
+        active_job_limit=user_limit,
+        now=1_799_999_999,
+    )
+    configuration = JobAdmissionConfiguration(
+        workload=workload,
+        modal_environment=DatabaseOverridableSetting("production", False),
+        modal_app_name=DatabaseOverridableSetting("Gromacs", False),
+        workload_active_job_limit=DatabaseOverridableSetting(
+            workload_limit,
+            False,
+        ),
+        global_active_job_limit=DatabaseOverridableSetting(global_limit, False),
+    )
     return store.admit_job(
         owner_user_id=owner_user_id,
-        workload="gromacs",
         display_name="protein · 2026-07-16",
         idempotency_key=key,
         request_hash=request_hash,
         parameters_json='{"simulation_time_ns":5}',
-        active_limit=2,
+        configuration=configuration,
         now=1_800_000_000,
     )
 
@@ -69,15 +95,78 @@ def test_idempotency_is_scoped_to_owner_and_payload(tmp_path: Path) -> None:
         )
 
 
-def test_active_limit_is_transactional_per_owner_and_workload(tmp_path: Path) -> None:
+def test_user_active_limit_is_transactional_across_workloads(tmp_path: Path) -> None:
     store, alice, bob = make_store(tmp_path)
     admit(store, alice, key="11111111-1111-4111-8111-111111111111")
-    admit(store, alice, key="22222222-2222-4222-8222-222222222222")
+    admit(
+        store,
+        alice,
+        key="22222222-2222-4222-8222-222222222222",
+        workload="another-tool",
+    )
 
     with pytest.raises(JobLimitExceededError):
         admit(store, alice, key="33333333-3333-4333-8333-333333333333")
 
     assert admit(store, bob, key="33333333-3333-4333-8333-333333333333").created
+
+
+def test_tool_and_global_active_limits_span_users_and_workloads(tmp_path: Path) -> None:
+    store, alice, bob = make_store(tmp_path)
+    admit(
+        store,
+        alice,
+        key="11111111-1111-4111-8111-111111111111",
+        workload_limit=1,
+    )
+
+    with pytest.raises(JobLimitExceededError, match="Tool"):
+        admit(
+            store,
+            bob,
+            key="22222222-2222-4222-8222-222222222222",
+            workload_limit=1,
+        )
+
+    admit(
+        store,
+        bob,
+        key="33333333-3333-4333-8333-333333333333",
+        workload="another-tool",
+        global_limit=2,
+    )
+    with pytest.raises(JobLimitExceededError, match="Global"):
+        admit(
+            store,
+            bob,
+            key="44444444-4444-4444-8444-444444444444",
+            workload="third-tool",
+            user_limit=3,
+            global_limit=2,
+        )
+
+
+def test_job_captures_modal_configuration_at_admission(tmp_path: Path) -> None:
+    store, alice, _bob = make_store(tmp_path)
+
+    job = store.admit_job(
+        owner_user_id=alice,
+        display_name="Simulation",
+        idempotency_key="11111111-1111-4111-8111-111111111111",
+        request_hash="a" * 64,
+        parameters_json="{}",
+        configuration=JobAdmissionConfiguration(
+            workload="gromacs",
+            modal_environment=DatabaseOverridableSetting("department", False),
+            modal_app_name=DatabaseOverridableSetting("GromacsDeployed", False),
+            workload_active_job_limit=DatabaseOverridableSetting(2, False),
+            global_active_job_limit=DatabaseOverridableSetting(10, False),
+        ),
+        now=1,
+    ).job
+
+    assert job.modal_environment == "department"
+    assert job.modal_app_name == "GromacsDeployed"
 
 
 def test_job_queries_never_cross_owner_boundaries(tmp_path: Path) -> None:

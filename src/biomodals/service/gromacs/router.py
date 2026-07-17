@@ -34,6 +34,10 @@ from biomodals.service.api import (
 )
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.jobs import JobView, Reconciler, WorkloadRegistration
+from biomodals.service.runtime_config import (
+    ModalConfigurationSnapshot,
+    RuntimeConfiguration,
+)
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
@@ -98,6 +102,7 @@ class GromacsAdapter(Protocol):
         options: GromacsJobOptions,
         *,
         run_name: str,
+        modal_configuration: ModalConfigurationSnapshot,
     ) -> SubmittedCall:
         """Spawn one detached scientific job."""
         ...
@@ -155,7 +160,6 @@ def _request_identity(
 def create_router(
     adapter: GromacsAdapter,
     *,
-    active_limit: int,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
     """Create the GROMACS router around an injectable compute adapter."""
@@ -203,16 +207,17 @@ def create_router(
             options=options,
         )
         store: ServiceStore = request.app.state.store
+        configuration: RuntimeConfiguration = request.app.state.configuration
+        admission_configuration = configuration.admission_configuration("gromacs")
         now = int(time.time())
         try:
             admission = store.admit_job(
                 owner_user_id=session.principal.user_id,
-                workload="gromacs",
                 display_name=normalized_name,
                 idempotency_key=str(idempotency_key),
                 request_hash=request_hash,
                 parameters_json=parameters_json,
-                active_limit=active_limit,
+                configuration=admission_configuration,
                 now=now,
             )
         except IdempotencyConflictError as exc:
@@ -252,6 +257,7 @@ def create_router(
                 pdb_content,
                 options,
                 run_name=run_name,
+                modal_configuration=claimed.modal_configuration,
             )
             if submitted.run_name != run_name:
                 raise RuntimeError("Compute returned the wrong GROMACS run name")
@@ -281,7 +287,6 @@ def create_router(
 def create_registration(
     adapter: GromacsAdapter,
     *,
-    active_limit: int,
     reconciler: Reconciler | None = None,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> WorkloadRegistration:
@@ -296,7 +301,6 @@ def create_registration(
         name="gromacs",
         router=create_router(
             adapter,
-            active_limit=active_limit,
             max_pdb_bytes=max_pdb_bytes,
         ),
         reconciler=reconciler,

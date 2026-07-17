@@ -64,21 +64,25 @@ Environment that the server will use:
 
 ```bash
 uv sync --extra api
-MODAL_ENVIRONMENT=main uv run biomodals app deploy gromacs
+MODAL_ENVIRONMENT=production uv run biomodals app deploy gromacs
 ```
 
-For local frontend development, keep durable SQLite state and the final-result
-cache in separate directories, then start exactly one Uvicorn worker:
+For local frontend development, copy the documented configuration, fill in a
+Modal service-user token, and point the API at that file. Explicit process
+environment variables override values in the file:
 
 ```bash
-export BIOMODALS_STATE_DIR="$PWD/.biomodals/state"
-export BIOMODALS_CACHE_DIR="$PWD/.biomodals/cache"
-export BIOMODALS_FRONTEND_URL="http://localhost:5173"
-export BIOMODALS_ALLOWED_ORIGIN="http://localhost:5173"
-export BIOMODALS_MODAL_ENVIRONMENT="main"
+cp .env.example .env
+# Edit .env and replace both Modal token placeholders.
+export BIOMODALS_API_CONF_ENV="$PWD/.env"
 
 uv run biomodals api serve
 ```
+
+The backend refuses to start unless both `MODAL_TOKEN_ID` and
+`MODAL_TOKEN_SECRET` are present. The token secret remains process-only and is
+never stored in SQLite or returned by the API. `BIOMODALS_PUBLIC_URL` is the
+single browser origin used for Password Links and mutation Origin checks.
 
 The server listens on `127.0.0.1:8000` by default. Use `--host` or `--port`
 to override either value; the command keeps the required worker count at one.
@@ -93,15 +97,21 @@ delivers the printed one-hour password link through a trusted internal channel:
 
 ```bash
 uv run biomodals api admin create-user alice@example.com \
-  --display-name "Alice Example"
+  --display-name "Alice Example" --admin
 ```
 
-The admin command must use the same `BIOMODALS_STATE_DIR` and
-`BIOMODALS_FRONTEND_URL` as the server. Related commands are
-`biomodals api admin reset-password EMAIL` and
-`biomodals api admin disable-user EMAIL`.
+The admin command must use the same `BIOMODALS_API_CONF_ENV` or explicit state
+configuration as the server. Related commands include `reset-password`,
+`disable-user`, `enable-user`, `promote-user`, and `demote-user`. The final
+active administrator cannot be disabled or demoted, and the first User must be
+created with `--admin`.
+
+Administrators can manage Users and non-secret live Modal configuration in the
+web interface. Runtime setting precedence is process environment, database
+Admin value, configured `.env` file, then built-in default. Process-controlled
+fields are read-only in the Admin interface.
 
 On the department server, run this command under a dedicated Linux and Modal
-service user, set an explicit `BIOMODALS_MODAL_ENVIRONMENT`, and supervise the
+service user, set an explicit Modal Environment, and supervise the
 single process with systemd. The local cache contains only final ZIP files;
 Modal Volume storage remains authoritative for results and intermediates.

@@ -1,6 +1,6 @@
 """Unified browser API contracts for authentication and private jobs."""
 
-# ruff: noqa: D101,D102,D103,D107
+# ruff: noqa: D101,D102,D103,D107,S105
 
 from __future__ import annotations
 
@@ -17,8 +17,13 @@ from fastapi import FastAPI
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService
+from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.jobs import WorkloadRegistration
+from biomodals.service.runtime_config import (
+    ModalConfigurationSnapshot,
+    RuntimeConfiguration,
+)
 from biomodals.service.store import JobState, ServiceStore
 
 ORIGIN = "https://biomodals.internal"
@@ -42,6 +47,7 @@ class FakeGromacsAdapter:
 
     def __init__(self) -> None:
         self.submissions: list[tuple[bytes, str, GromacsJobOptions]] = []
+        self.submission_configurations: list[tuple[str, str]] = []
         self.cancellations: list[str] = []
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
@@ -53,8 +59,13 @@ class FakeGromacsAdapter:
         options: GromacsJobOptions,
         *,
         run_name: str,
+        modal_configuration: ModalConfigurationSnapshot,
     ) -> SubmittedCall:
         self.submissions.append((pdb_content, run_name, options))
+        self.submission_configurations.append((
+            modal_configuration.app_name,
+            modal_configuration.environment,
+        ))
         if self.failures_remaining:
             self.failures_remaining -= 1
             raise RuntimeError("temporary Modal failure")
@@ -98,6 +109,9 @@ class APIClient:
     def post(self, url: str, **kwargs) -> httpx.Response:
         return self.request("POST", url, **kwargs)
 
+    def patch(self, url: str, **kwargs) -> httpx.Response:
+        return self.request("PATCH", url, **kwargs)
+
     def delete(self, url: str, **kwargs) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
 
@@ -106,8 +120,12 @@ def _password_token(link: str) -> str:
     return parse_qs(urlparse(link).fragment)["token"][0]
 
 
-def _activate(auth: AuthService, email: str) -> None:
-    link = auth.create_user(email, display_name=email.partition("@")[0].title())
+def _activate(auth: AuthService, email: str, *, is_admin: bool = False) -> None:
+    link = auth.create_user(
+        email,
+        display_name=email.partition("@")[0].title(),
+        is_admin=is_admin or not auth.store.list_users(),
+    )
     auth.set_password(_password_token(link), PASSWORD)
 
 
@@ -118,17 +136,22 @@ def _service(
 ) -> tuple[APIClient, AuthService, ServiceStore, FakeGromacsAdapter]:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
+    settings = ServiceSettings.from_environment({
+        "MODAL_TOKEN_ID": "test-token-id",
+        "MODAL_TOKEN_SECRET": "test-token-secret",
+    })
+    configuration = RuntimeConfiguration(store, settings)
     auth = AuthService(store, frontend_url=ORIGIN)
     adapter = FakeGromacsAdapter()
     registration = create_registration(
         adapter,
-        active_limit=2,
         max_pdb_bytes=max_pdb_bytes,
     )
     assert isinstance(registration, WorkloadRegistration)
     app = create_app(
         store=store,
         auth=auth,
+        configuration=configuration,
         workloads=[registration],
         allowed_origin=ORIGIN,
         secure_cookies=True,
@@ -227,7 +250,11 @@ def test_one_time_password_link_and_logout_complete_browser_flow(
     tmp_path: Path,
 ) -> None:
     client, auth, _store, _adapter = _service(tmp_path)
-    link = auth.create_user("alice@example.com", display_name="Alice")
+    link = auth.create_user(
+        "alice@example.com",
+        display_name="Alice",
+        is_admin=True,
+    )
     token = _password_token(link)
 
     missing_origin = client.post(
@@ -292,11 +319,232 @@ def test_openapi_exposes_the_set_password_minimum(tmp_path: Path) -> None:
     assert password_schema["minLength"] == 15
 
 
+def test_admin_user_management_requires_admin_and_preserves_last_admin(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    _activate(auth, "ordinary@example.com")
+    csrf_token = _login(client, "ordinary@example.com")
+
+    assert client.get("/api/v1/admin/users").status_code == 403
+    client.cookies.clear()
+    csrf_token = _login(client, "alice@example.com")
+    created = client.post(
+        "/api/v1/admin/users",
+        headers=_unsafe_headers(csrf_token),
+        json={
+            "email": "new@example.com",
+            "display_name": "New User",
+            "active_job_limit": 4,
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["user"]["active_job_limit"] == 4
+    assert created.json()["password_link"].startswith(f"{ORIGIN}/set-password#token=")
+    new_user_id = created.json()["user"]["user_id"]
+
+    invalid = client.post(
+        "/api/v1/admin/users",
+        headers=_unsafe_headers(csrf_token),
+        json={"email": "invalid", "display_name": "   "},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["code"] == "user_invalid"
+
+    users = client.get("/api/v1/admin/users")
+    assert users.status_code == 200
+    assert {user["email"] for user in users.json()} == {
+        "alice@example.com",
+        "new@example.com",
+        "ordinary@example.com",
+    }
+    alice_id = next(
+        user["user_id"] for user in users.json() if user["email"] == "alice@example.com"
+    )
+
+    last_admin = client.patch(
+        f"/api/v1/admin/users/{alice_id}",
+        headers=_unsafe_headers(csrf_token),
+        json={"is_admin": False},
+    )
+    assert last_admin.status_code == 409
+    assert last_admin.json()["code"] == "last_active_admin"
+
+    promoted = client.patch(
+        f"/api/v1/admin/users/{new_user_id}",
+        headers=_unsafe_headers(csrf_token),
+        json={"is_admin": True, "active_job_limit": 6},
+    )
+    assert promoted.status_code == 200
+    assert promoted.json()["is_admin"] is True
+    assert promoted.json()["active_job_limit"] == 6
+
+    disabled = client.patch(
+        f"/api/v1/admin/users/{new_user_id}",
+        headers=_unsafe_headers(csrf_token),
+        json={"active": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["active"] is False
+    unavailable_link = client.post(
+        f"/api/v1/admin/users/{new_user_id}/password-link",
+        headers=_unsafe_headers(csrf_token),
+    )
+    assert unavailable_link.status_code == 409
+    assert unavailable_link.json()["code"] == "user_inactive"
+
+    enabled = client.patch(
+        f"/api/v1/admin/users/{new_user_id}",
+        headers=_unsafe_headers(csrf_token),
+        json={"active": True},
+    )
+    assert enabled.status_code == 200
+    password_link = client.post(
+        f"/api/v1/admin/users/{new_user_id}/password-link",
+        headers=_unsafe_headers(csrf_token),
+    )
+    assert password_link.status_code == 200
+    assert password_link.json()["password_link"].startswith(
+        f"{ORIGIN}/set-password#token="
+    )
+
+
+def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
+    tmp_path: Path,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+
+    initial = client.get("/api/v1/admin/modal")
+    assert initial.status_code == 200
+    assert initial.json()["environment"]["service_token_id"] == "test-token-id"
+    assert "test-token-secret" not in initial.text
+    assert initial.json()["tools"][0]["workload"] == "gromacs"
+
+    environment = client.patch(
+        "/api/v1/admin/modal/environment",
+        headers=_unsafe_headers(csrf_token),
+        json={
+            "modal_environment": "department-a",
+            "global_active_job_limit": 9,
+        },
+    )
+    tool = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=_unsafe_headers(csrf_token),
+        json={"modal_app_name": "GromacsA", "active_job_limit": 3},
+    )
+    assert environment.json()["modal_environment"] == {
+        "value": "department-a",
+        "source": "database",
+        "editable": True,
+    }
+    assert tool.json()["modal_app_name"]["value"] == "GromacsA"
+
+    first = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    assert first.status_code == 202
+    first_job_id = UUID(first.json()["job_id"])
+    store.set_job_state(first_job_id, JobState.RUNNING, now=1_800_000_001)
+    assert adapter.submission_configurations == [("GromacsA", "department-a")]
+
+    client.patch(
+        "/api/v1/admin/modal/environment",
+        headers=_unsafe_headers(csrf_token),
+        json={"modal_environment": "department-b"},
+    )
+    client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=_unsafe_headers(csrf_token),
+        json={"modal_app_name": "GromacsB"},
+    )
+    second = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+
+    assert second.status_code == 202
+    assert adapter.submission_configurations == [
+        ("GromacsA", "department-a"),
+        ("GromacsB", "department-b"),
+    ]
+    first_job = store.get_job(
+        UUID(client.get("/api/v1/auth/me").json()["user_id"]),
+        first_job_id,
+    )
+    assert first_job is not None
+    assert first_job.modal_environment == "department-a"
+    assert first_job.modal_app_name == "GromacsA"
+    current = client.get("/api/v1/admin/modal").json()
+    assert current["tools"][0]["running_jobs"] == 1
+
+
+def test_modal_admin_rejects_blank_runtime_settings(tmp_path: Path) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+
+    environment = client.patch(
+        "/api/v1/admin/modal/environment",
+        headers=_unsafe_headers(csrf_token),
+        json={"modal_environment": "   "},
+    )
+    tool = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=_unsafe_headers(csrf_token),
+        json={"modal_app_name": "   "},
+    )
+
+    assert environment.status_code == 400
+    assert environment.json()["code"] == "setting_invalid"
+    assert tool.status_code == 400
+    assert tool.json()["code"] == "setting_invalid"
+
+
+def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    schema = client.get("/openapi.json").json()
+
+    assert (
+        schema["components"]["schemas"]["PrincipalView"]["properties"]["is_admin"][
+            "type"
+        ]
+        == "boolean"
+    )
+    for path in (
+        "/api/v1/admin/users",
+        "/api/v1/admin/users/{user_id}",
+        "/api/v1/admin/users/{user_id}/password-link",
+        "/api/v1/admin/modal",
+        "/api/v1/admin/modal/environment",
+        "/api/v1/admin/modal/tools/{workload}",
+    ):
+        assert path in schema["paths"]
+
+    expected_conflicts = {
+        ("/api/v1/admin/users", "post"): "user_already_exists",
+        ("/api/v1/admin/users/{user_id}", "patch"): "last_active_admin",
+        (
+            "/api/v1/admin/users/{user_id}/password-link",
+            "post",
+        ): "user_inactive",
+    }
+    for (path, method), expected_code in expected_conflicts.items():
+        response = schema["paths"][path][method]["responses"]["409"]
+        response_schema = response["content"]["application/json"]["schema"]
+        model_name = response_schema["$ref"].rsplit("/", maxsplit=1)[-1]
+        code_schema = schema["components"]["schemas"][model_name]["properties"]["code"]
+        assert code_schema["const"] == expected_code
+
+
 def test_password_setup_exposes_coded_errors_and_cookie_contract(
     tmp_path: Path,
 ) -> None:
     client, auth, _store, _adapter = _service(tmp_path)
-    link = auth.create_user("alice@example.com", display_name="Alice")
+    link = auth.create_user(
+        "alice@example.com",
+        display_name="Alice",
+        is_admin=True,
+    )
     token = _password_token(link)
 
     wrong_origin = client.post(

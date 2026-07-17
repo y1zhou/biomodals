@@ -136,6 +136,7 @@ class Principal:
     user_id: UUID
     email: str
     display_name: str
+    is_admin: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +175,14 @@ class AuthService:
         self._now = now or (lambda: int(time.time()))
         self._password_hash = PasswordHash.recommended()
 
-    def create_user(self, email: str, *, display_name: str) -> str:
+    def create_user(
+        self,
+        email: str,
+        *,
+        display_name: str,
+        is_admin: bool = False,
+        active_job_limit: int = 2,
+    ) -> str:
         """Provision a user and return a one-hour password setup link."""
         normalized_email = _normalize_email(email)
         normalized_name = display_name.strip()
@@ -188,6 +196,8 @@ class AuthService:
             token_digest=_token_digest(token),
             token_expires_at=now + PASSWORD_TOKEN_LIFETIME_SECONDS,
             now=now,
+            is_admin=is_admin,
+            active_job_limit=active_job_limit,
         )
         return self._password_link(token)
 
@@ -291,6 +301,23 @@ class AuthService:
         )
         return _principal(user)
 
+    def enable_user(self, email: str) -> Principal:
+        """Enable an account without changing its existing credentials."""
+        user = self.store.enable_user(
+            _normalize_email(email),
+            now=self._now(),
+        )
+        return _principal(user)
+
+    def set_user_admin(self, email: str, *, is_admin: bool) -> Principal:
+        """Promote or demote an account while retaining an active admin."""
+        user = self.store.set_user_admin(
+            _normalize_email(email),
+            is_admin=is_admin,
+            now=self._now(),
+        )
+        return _principal(user)
+
     def _password_link(self, token: str) -> str:
         return f"{self.frontend_url}/set-password#token={token}"
 
@@ -328,6 +355,7 @@ def _principal(user: UserRecord) -> Principal:
         user_id=user.user_id,
         email=user.email,
         display_name=user.display_name,
+        is_admin=user.is_admin,
     )
 
 

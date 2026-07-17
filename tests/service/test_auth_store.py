@@ -49,14 +49,18 @@ def activated_user(
     email: str = "alice@example.com",
     password: str = "correct horse battery staple",
 ) -> None:
-    link = auth.create_user(email, display_name="Alice")
+    link = auth.create_user(email, display_name="Alice", is_admin=True)
     auth.set_password(reset_token(link), password)
 
 
 def test_setup_link_is_one_time_and_passwords_use_argon2id(tmp_path: Path) -> None:
     clock = Clock()
     auth, store = make_auth(tmp_path, clock)
-    link = auth.create_user("Alice@Example.com", display_name="Alice")
+    link = auth.create_user(
+        "Alice@Example.com",
+        display_name="Alice",
+        is_admin=True,
+    )
     token = reset_token(link)
 
     principal = auth.set_password(token, "correct horse battery staple").principal
@@ -74,7 +78,13 @@ def test_setup_link_is_one_time_and_passwords_use_argon2id(tmp_path: Path) -> No
 
 def test_password_policy_prefers_long_passphrases(tmp_path: Path) -> None:
     auth, _store = make_auth(tmp_path, Clock())
-    token = reset_token(auth.create_user("alice@example.com", display_name="Alice"))
+    token = reset_token(
+        auth.create_user(
+            "alice@example.com",
+            display_name="Alice",
+            is_admin=True,
+        )
+    )
 
     with pytest.raises(PasswordPolicyError):
         auth.set_password(token, "Password1!")
@@ -127,6 +137,11 @@ def test_reset_and_disable_revoke_all_sessions(tmp_path: Path) -> None:
     clock = Clock()
     auth, _store = make_auth(tmp_path, clock)
     activated_user(auth)
+    auth.create_user(
+        "backup-admin@example.com",
+        display_name="Backup Admin",
+        is_admin=True,
+    )
     first = auth.login("alice@example.com", "correct horse battery staple")
     second = auth.login("alice@example.com", "correct horse battery staple")
 

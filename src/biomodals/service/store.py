@@ -14,6 +14,11 @@ from uuid import UUID, uuid4
 
 import orjson
 
+from biomodals.service.runtime_config import (
+    JobAdmissionConfiguration,
+    ModalConfigurationSnapshot,
+)
+
 
 class UserAlreadyExistsError(ValueError):
     """Raised when an administrator tries to reuse an email address."""
@@ -21,6 +26,14 @@ class UserAlreadyExistsError(ValueError):
 
 class UserNotFoundError(LookupError):
     """Raised when an administrator names an unknown user."""
+
+
+class FirstUserMustBeAdminError(ValueError):
+    """Raised when bootstrap would leave the service without an administrator."""
+
+
+class LastActiveAdminError(RuntimeError):
+    """Raised when a change would leave no active administrator."""
 
 
 class IdempotencyConflictError(ValueError):
@@ -79,6 +92,8 @@ class UserRecord:
     display_name: str
     password_hash: str | None
     active: bool
+    is_admin: bool
+    active_job_limit: int
     created_at: int
     updated_at: int
 
@@ -106,6 +121,8 @@ class JobRecord:
     request_hash: str
     parameters_json: str
     state: JobState
+    modal_environment: str
+    modal_app_name: str
     modal_call_id: str | None
     run_name: str | None
     submission_token: str | None
@@ -136,6 +153,14 @@ class JobRecord:
             raise ValueError("warnings_json must contain a JSON string list")
         return value
 
+    @property
+    def modal_configuration(self) -> ModalConfigurationSnapshot:
+        """Return the provider identity captured when this Job was admitted."""
+        return ModalConfigurationSnapshot(
+            environment=self.modal_environment,
+            app_name=self.modal_app_name,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class JobAdmission:
@@ -143,6 +168,15 @@ class JobAdmission:
 
     job: JobRecord
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkloadConfigurationRecord:
+    """Optional database overrides for one fixed API workload."""
+
+    workload: str
+    modal_app_name: str | None
+    active_job_limit: int | None
 
 
 class ServiceStore:
@@ -178,6 +212,9 @@ class ServiceStore:
                         display_name TEXT NOT NULL,
                         password_hash TEXT,
                         active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                        is_admin INTEGER NOT NULL CHECK (is_admin IN (0, 1)),
+                        active_job_limit INTEGER NOT NULL
+                            CHECK (active_job_limit >= 1),
                         created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL
                     );
@@ -211,6 +248,8 @@ class ServiceStore:
                         request_hash TEXT NOT NULL,
                         parameters_json TEXT NOT NULL,
                         state TEXT NOT NULL,
+                        modal_environment TEXT NOT NULL,
+                        modal_app_name TEXT NOT NULL,
                         modal_call_id TEXT,
                         run_name TEXT,
                         submission_token TEXT,
@@ -233,35 +272,29 @@ class ServiceStore:
                     CREATE INDEX jobs_owner_created
                         ON jobs(owner_user_id, created_at DESC);
                     CREATE INDEX jobs_active
-                        ON jobs(owner_user_id, workload, state);
+                        ON jobs(state, owner_user_id, workload);
 
-                    PRAGMA user_version = 3;
+                    CREATE TABLE service_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+
+                    CREATE TABLE workload_settings (
+                        workload TEXT PRIMARY KEY,
+                        modal_app_name TEXT,
+                        active_job_limit INTEGER
+                            CHECK (active_job_limit IS NULL OR active_job_limit >= 1)
+                    );
+
+                    PRAGMA user_version = 4;
                     COMMIT;
                     """
                 )
-            elif version == 1:
-                conn.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    ALTER TABLE jobs ADD COLUMN intermediates_cleaned_at INTEGER;
-                    ALTER TABLE jobs ADD COLUMN submission_token TEXT;
-                    ALTER TABLE jobs ADD COLUMN submission_lease_until INTEGER;
-                    PRAGMA user_version = 3;
-                    COMMIT;
-                    """
+            elif version != 4:
+                raise RuntimeError(
+                    "Unsupported pre-release service database version "
+                    f"{version}; initialize fresh state"
                 )
-            elif version == 2:
-                conn.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    ALTER TABLE jobs ADD COLUMN submission_token TEXT;
-                    ALTER TABLE jobs ADD COLUMN submission_lease_until INTEGER;
-                    PRAGMA user_version = 3;
-                    COMMIT;
-                    """
-                )
-            elif version != 3:
-                raise RuntimeError(f"Unsupported service database version: {version}")
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
             if path.exists():
                 path.chmod(0o600)
@@ -274,19 +307,37 @@ class ServiceStore:
         token_digest: bytes,
         token_expires_at: int,
         now: int,
+        is_admin: bool = False,
+        active_job_limit: int = 2,
     ) -> UserRecord:
         """Atomically create an inactive-password user and setup token."""
+        if active_job_limit < 1:
+            raise ValueError("active_job_limit must be positive")
         user_id = uuid4()
         try:
             with self._transaction() as conn:
+                if not is_admin:
+                    first_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+                    if first_user is None:
+                        raise FirstUserMustBeAdminError(
+                            "The first User must be provisioned as an administrator"
+                        )
                 conn.execute(
                     """
                     INSERT INTO users (
                         user_id, email, display_name, password_hash, active,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, NULL, 1, ?, ?)
+                        is_admin, active_job_limit, created_at, updated_at
+                    ) VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?)
                     """,
-                    (str(user_id), email, display_name, now, now),
+                    (
+                        str(user_id),
+                        email,
+                        display_name,
+                        int(is_admin),
+                        active_job_limit,
+                        now,
+                        now,
+                    ),
                 )
                 conn.execute(
                     """
@@ -310,6 +361,23 @@ class ServiceStore:
                 (email,),
             ).fetchone()
         return _user_from_row(row) if row is not None else None
+
+    def get_user(self, user_id: UUID) -> UserRecord | None:
+        """Load one user by stable identifier."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (str(user_id),),
+            ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def list_users(self) -> list[UserRecord]:
+        """List every user in deterministic email order."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY email, user_id"
+            ).fetchall()
+        return [_user_from_row(row) for row in rows]
 
     def issue_password_token(
         self,
@@ -504,43 +572,182 @@ class ServiceStore:
 
     def disable_user(self, email: str, *, now: int) -> UserRecord:
         """Disable a user and revoke all sessions and password links."""
+        user = self.get_user_by_email(email)
+        if user is None:
+            raise UserNotFoundError(f"User not found: {email}")
+        return self.update_user(user.user_id, active=False, now=now)
+
+    def enable_user(self, email: str, *, now: int) -> UserRecord:
+        """Enable a previously disabled user without changing credentials."""
+        user = self.get_user_by_email(email)
+        if user is None:
+            raise UserNotFoundError(f"User not found: {email}")
+        return self.update_user(user.user_id, active=True, now=now)
+
+    def set_user_admin(self, email: str, *, is_admin: bool, now: int) -> UserRecord:
+        """Promote or demote a user while preserving an active administrator."""
+        user = self.get_user_by_email(email)
+        if user is None:
+            raise UserNotFoundError(f"User not found: {email}")
+        return self.update_user(user.user_id, is_admin=is_admin, now=now)
+
+    def update_user(
+        self,
+        user_id: UUID,
+        *,
+        active: bool | None = None,
+        is_admin: bool | None = None,
+        active_job_limit: int | None = None,
+        now: int,
+    ) -> UserRecord:
+        """Update one user atomically and never remove the final active admin."""
+        if active_job_limit is not None and active_job_limit < 1:
+            raise ValueError("active_job_limit must be positive")
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT user_id FROM users WHERE email = ?",
-                (email,),
+                "SELECT * FROM users WHERE user_id = ?",
+                (str(user_id),),
             ).fetchone()
             if row is None:
-                raise UserNotFoundError(f"User not found: {email}")
-            user_id = str(row["user_id"])
+                raise UserNotFoundError(f"User not found: {user_id}")
+            target_active = bool(row["active"]) if active is None else active
+            target_admin = bool(row["is_admin"]) if is_admin is None else is_admin
+            if (
+                bool(row["active"])
+                and bool(row["is_admin"])
+                and not (target_active and target_admin)
+            ):
+                active_admins = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM users WHERE active = 1 AND is_admin = 1"
+                    ).fetchone()[0]
+                )
+                if active_admins <= 1:
+                    raise LastActiveAdminError(
+                        "The last active administrator cannot be disabled or demoted"
+                    )
+            target_limit = (
+                int(row["active_job_limit"])
+                if active_job_limit is None
+                else active_job_limit
+            )
             conn.execute(
                 """
-                UPDATE users SET active = 0, updated_at = ? WHERE user_id = ?
+                UPDATE users
+                SET active = ?, is_admin = ?, active_job_limit = ?, updated_at = ?
+                WHERE user_id = ?
                 """,
-                (now, user_id),
+                (
+                    int(target_active),
+                    int(target_admin),
+                    target_limit,
+                    now,
+                    str(user_id),
+                ),
             )
-            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-            conn.execute("DELETE FROM password_tokens WHERE user_id = ?", (user_id,))
+            if not target_active:
+                conn.execute(
+                    "DELETE FROM sessions WHERE user_id = ?",
+                    (str(user_id),),
+                )
+                conn.execute(
+                    "DELETE FROM password_tokens WHERE user_id = ?",
+                    (str(user_id),),
+                )
             updated = conn.execute(
                 "SELECT * FROM users WHERE user_id = ?",
-                (user_id,),
+                (str(user_id),),
             ).fetchone()
         return _user_from_row(updated)
+
+    def get_service_setting(self, key: str) -> str | None:
+        """Load one optional database Admin setting."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM service_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def set_service_settings(self, settings: dict[str, str]) -> None:
+        """Create or replace several non-secret settings atomically."""
+        if any(not key or not value for key, value in settings.items()):
+            raise ValueError("Service setting keys and values must not be empty")
+        with self._transaction() as conn:
+            conn.executemany(
+                """
+                INSERT INTO service_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                settings.items(),
+            )
+
+    def get_workload_configuration(
+        self,
+        workload: str,
+    ) -> WorkloadConfigurationRecord | None:
+        """Load optional database overrides for one workload."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM workload_settings WHERE workload = ?",
+                (workload,),
+            ).fetchone()
+        if row is None:
+            return None
+        return WorkloadConfigurationRecord(
+            workload=str(row["workload"]),
+            modal_app_name=row["modal_app_name"],
+            active_job_limit=row["active_job_limit"],
+        )
+
+    def set_workload_configuration(
+        self,
+        workload: str,
+        *,
+        modal_app_name: str | None = None,
+        active_job_limit: int | None = None,
+    ) -> None:
+        """Create or update supplied non-secret workload overrides atomically."""
+        if not workload:
+            raise ValueError("workload must not be empty")
+        if modal_app_name is not None and not modal_app_name:
+            raise ValueError("modal_app_name must not be empty")
+        if active_job_limit is not None and active_job_limit < 1:
+            raise ValueError("active_job_limit must be positive")
+        if modal_app_name is None and active_job_limit is None:
+            return
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO workload_settings (
+                    workload, modal_app_name, active_job_limit
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(workload) DO UPDATE SET
+                    modal_app_name = COALESCE(
+                        excluded.modal_app_name,
+                        workload_settings.modal_app_name
+                    ),
+                    active_job_limit = COALESCE(
+                        excluded.active_job_limit,
+                        workload_settings.active_job_limit
+                    )
+                """,
+                (workload, modal_app_name, active_job_limit),
+            )
 
     def admit_job(
         self,
         *,
         owner_user_id: UUID,
-        workload: str,
         display_name: str,
         idempotency_key: str,
         request_hash: str,
         parameters_json: str,
-        active_limit: int,
+        configuration: JobAdmissionConfiguration,
         now: int,
     ) -> JobAdmission:
-        """Atomically apply idempotency and an owner/workload active limit."""
-        if active_limit < 1:
-            raise ValueError("active_limit must be positive")
+        """Atomically apply idempotency and every active Job admission limit."""
+        workload = configuration.workload
         with self._transaction() as conn:
             existing = conn.execute(
                 """
@@ -556,24 +763,94 @@ class ServiceStore:
                     )
                 return JobAdmission(job=_job_from_row(existing), created=False)
 
+            user = conn.execute(
+                "SELECT active_job_limit FROM users WHERE user_id = ?",
+                (str(owner_user_id),),
+            ).fetchone()
+            if user is None:
+                raise UserNotFoundError(f"User not found: {owner_user_id}")
+            user_active_job_limit = int(user["active_job_limit"])
+
+            service_rows = conn.execute(
+                """
+                SELECT key, value FROM service_settings
+                WHERE key IN ('modal_environment', 'global_active_job_limit')
+                """
+            ).fetchall()
+            service_settings = {
+                str(row["key"]): str(row["value"]) for row in service_rows
+            }
+            workload_row = conn.execute(
+                "SELECT * FROM workload_settings WHERE workload = ?",
+                (workload,),
+            ).fetchone()
+            stored_environment = service_settings.get("modal_environment")
+            stored_global_limit = service_settings.get("global_active_job_limit")
+            modal_environment = configuration.modal_environment.resolve(
+                stored_environment
+            )
+            global_active_job_limit = configuration.global_active_job_limit.resolve(
+                int(stored_global_limit) if stored_global_limit is not None else None
+            )
+            modal_app_name = configuration.modal_app_name.resolve(
+                workload_row["modal_app_name"] if workload_row is not None else None
+            )
+            workload_active_job_limit = configuration.workload_active_job_limit.resolve(
+                int(workload_row["active_job_limit"])
+                if workload_row is not None
+                and workload_row["active_job_limit"] is not None
+                else None
+            )
+            limits = (
+                user_active_job_limit,
+                workload_active_job_limit,
+                global_active_job_limit,
+            )
+            if any(limit < 1 for limit in limits):
+                raise ValueError("active job limits must be positive")
+            if not modal_environment.strip() or not modal_app_name.strip():
+                raise ValueError("Modal Job configuration must not be empty")
+
             placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
-            active_count = int(
+            states = tuple(state.value for state in ACTIVE_JOB_STATES)
+            user_active_count = int(
                 conn.execute(
                     f"""
                     SELECT COUNT(*) FROM jobs
-                    WHERE owner_user_id = ? AND workload = ?
-                      AND state IN ({placeholders})
+                    WHERE owner_user_id = ? AND state IN ({placeholders})
                     """,  # noqa: S608 - placeholders are generated, not user input
-                    (
-                        str(owner_user_id),
-                        workload,
-                        *(state.value for state in ACTIVE_JOB_STATES),
-                    ),
+                    (str(owner_user_id), *states),
                 ).fetchone()[0]
             )
-            if active_count >= active_limit:
+            if user_active_count >= user_active_job_limit:
                 raise JobLimitExceededError(
-                    f"Active {workload} job limit ({active_limit}) reached"
+                    f"User active Job limit ({user_active_job_limit}) reached"
+                )
+            workload_active_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM jobs
+                    WHERE workload = ? AND state IN ({placeholders})
+                    """,  # noqa: S608 - placeholders are generated, not user input
+                    (workload, *states),
+                ).fetchone()[0]
+            )
+            if workload_active_count >= workload_active_job_limit:
+                raise JobLimitExceededError(
+                    f"{workload} Tool active Job limit "
+                    f"({workload_active_job_limit}) reached"
+                )
+            global_active_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM jobs WHERE state IN ({placeholders})
+                    """,  # noqa: S608 - placeholders are generated, not user input
+                    states,
+                ).fetchone()[0]
+            )
+            if global_active_count >= global_active_job_limit:
+                raise JobLimitExceededError(
+                    f"Global active Job limit ({global_active_job_limit}) reached"
                 )
 
             job_id = uuid4()
@@ -582,16 +859,17 @@ class ServiceStore:
                 INSERT INTO jobs (
                     job_id, owner_user_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json, state,
-                    modal_call_id, run_name, submission_token,
+                    modal_environment, modal_app_name, modal_call_id, run_name,
+                    submission_token,
                     submission_lease_until, result_volume_name,
                     result_volume_path, result_filename, result_size_bytes,
                     result_sha256, warnings_json, error_code, error_message,
                     created_at, updated_at, completed_at, cancel_requested_at,
                     intermediates_cleaned_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL,
-                    NULL, NULL
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?,
+                    NULL, NULL, NULL
                 )
                 """,
                 (
@@ -603,6 +881,8 @@ class ServiceStore:
                     request_hash,
                     parameters_json,
                     JobState.QUEUED.value,
+                    modal_environment.strip(),
+                    modal_app_name.strip(),
                     now,
                     now,
                 ),
@@ -635,6 +915,23 @@ class ServiceStore:
                 (str(owner_user_id),),
             ).fetchall()
         return [_job_from_row(row) for row in rows]
+
+    def count_running_jobs(self, workload: str | None = None) -> int:
+        """Count Jobs last observed running, optionally for one workload."""
+        with self._connection() as conn:
+            if workload is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE state = ?",
+                    (JobState.RUNNING.value,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM jobs WHERE state = ? AND workload = ?
+                    """,
+                    (JobState.RUNNING.value, workload),
+                ).fetchone()
+            return int(row[0])
 
     def list_reconcilable_jobs(
         self,
@@ -1041,6 +1338,8 @@ def _user_from_row(row: sqlite3.Row) -> UserRecord:
         display_name=str(row["display_name"]),
         password_hash=row["password_hash"],
         active=bool(row["active"]),
+        is_admin=bool(row["is_admin"]),
+        active_job_limit=int(row["active_job_limit"]),
         created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
     )
@@ -1056,6 +1355,8 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         request_hash=str(row["request_hash"]),
         parameters_json=str(row["parameters_json"]),
         state=JobState(row["state"]),
+        modal_environment=str(row["modal_environment"]),
+        modal_app_name=str(row["modal_app_name"]),
         modal_call_id=row["modal_call_id"],
         run_name=row["run_name"],
         submission_token=row["submission_token"],

@@ -14,6 +14,8 @@ import pytest
 
 from biomodals.service.api import create_app
 from biomodals.service.auth import AuthService, IssuedSession, Principal
+from biomodals.service.config import ServiceSettings
+from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import ServiceStore
 
 ORIGIN = "https://biomodals.internal"
@@ -48,6 +50,7 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
         user_id=uuid4(),
         email="alice@example.com",
         display_name="Alice",
+        is_admin=False,
     )
     release = threading.Event()
     two_started = threading.Event()
@@ -76,6 +79,10 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
     app = create_app(
         store=store,
         auth=auth,
+        configuration=RuntimeConfiguration(
+            store,
+            ServiceSettings.from_environment({}),
+        ),
         workloads=[],
         allowed_origin=ORIGIN,
         secure_cookies=True,

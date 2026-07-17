@@ -22,6 +22,7 @@ from biomodals.schema import (
 )
 from biomodals.service.gromacs.archive import validate_gromacs_archive
 from biomodals.service.gromacs.router import GromacsJobOptions
+from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 
 LOGGER = logging.getLogger(__name__)
@@ -102,11 +103,15 @@ class ModalGromacsAdapter:
         function_name: str = "run_gromacs_job",
         output_volume_name: str = "Gromacs-outputs",
         call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
+        function_resolver: Callable[..., modal.Function] | None = None,
     ) -> None:
         """Resolve a deployed function in an explicit Modal Environment."""
         self.environment_name = environment_name
+        self.app_name = app_name
+        self.function_name = function_name
         self.output_volume_name = output_volume_name
-        self.function = modal.Function.from_name(
+        self._function_resolver = function_resolver or modal.Function.from_name
+        self.function = self._function_resolver(
             app_name,
             function_name,
             environment_name=environment_name,
@@ -119,9 +124,20 @@ class ModalGromacsAdapter:
         options: GromacsJobOptions,
         *,
         run_name: str,
+        modal_configuration: ModalConfigurationSnapshot,
     ) -> SubmittedModalCall:
         """Spawn a detached GROMACS call without exposing its id to clients."""
-        call = await self.function.spawn.aio(
+        function = (
+            self.function
+            if modal_configuration.app_name == self.app_name
+            and modal_configuration.environment == self.environment_name
+            else self._function_resolver(
+                modal_configuration.app_name,
+                self.function_name,
+                environment_name=modal_configuration.environment,
+            )
+        )
+        call = await function.spawn.aio(
             pdb_content=pdb_content,
             run_name=run_name,
             **options.model_dump(),
@@ -200,7 +216,7 @@ class ModalGromacsAdapter:
             raise ValueError("Job does not reference the configured GROMACS Volume")
         volume = modal.Volume.from_name(
             self.output_volume_name,
-            environment_name=self.environment_name,
+            environment_name=job.modal_environment,
         )
         async for chunk in volume.read_file.aio(job.result_volume_path):
             yield chunk
@@ -211,7 +227,7 @@ class ModalGromacsAdapter:
             raise ValueError("Job has no valid API run directory")
         volume = modal.Volume.from_name(
             self.output_volume_name,
-            environment_name=self.environment_name,
+            environment_name=job.modal_environment,
         )
         try:
             await volume.remove_file.aio(job.run_name, recursive=True)
@@ -225,7 +241,7 @@ class ModalGromacsAdapter:
         marker_path = f"api-results/{job.run_name}/result.json"
         volume = modal.Volume.from_name(
             self.output_volume_name,
-            environment_name=self.environment_name,
+            environment_name=job.modal_environment,
         )
         marker_bytes = bytearray()
         try:
@@ -274,7 +290,7 @@ class ModalGromacsAdapter:
         archive_path = f"api-results/{job.run_name}/result.zip"
         volume = modal.Volume.from_name(
             self.output_volume_name,
-            environment_name=self.environment_name,
+            environment_name=job.modal_environment,
         )
         digest = hashlib.sha256()
         size_bytes = 0

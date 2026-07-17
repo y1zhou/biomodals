@@ -39,6 +39,7 @@ from biomodals.service.jobs import (
     WorkloadRegistration,
     reconciliation_loop,
 )
+from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobNotCancellableError,
     JobNotFoundError,
@@ -113,6 +114,7 @@ class PrincipalView(BaseModel):
     user_id: UUID
     email: str
     display_name: str
+    is_admin: bool
 
     @classmethod
     def from_principal(cls, principal: Principal) -> PrincipalView:
@@ -121,6 +123,7 @@ class PrincipalView(BaseModel):
             user_id=principal.user_id,
             email=principal.email,
             display_name=principal.display_name,
+            is_admin=principal.is_admin,
         )
 
 
@@ -352,6 +355,7 @@ def create_app(
     *,
     store: ServiceStore,
     auth: AuthService,
+    configuration: RuntimeConfiguration,
     workloads: Sequence[WorkloadRegistration],
     allowed_origin: str,
     secure_cookies: bool,
@@ -405,6 +409,7 @@ def create_app(
     )
     app.state.store = store
     app.state.auth = auth
+    app.state.configuration = configuration
     app.state.allowed_origin = allowed_origin
     app.state.session_cookie_name = session_cookie_name
     app.state.workloads = registrations
@@ -749,29 +754,35 @@ def create_app(
 
     for workload in workloads:
         app.include_router(workload.router)
+    from biomodals.service.admin_api import create_admin_router
+
+    app.include_router(create_admin_router())
     _document_required_csrf_header(app)
     return app
 
 
 def create_deployed_app() -> FastAPI:
     """Create the local Linux service backed by deployed Modal compute Apps."""
+    settings = ServiceSettings.from_environment()
+    settings.install_modal_credentials()
+
     from biomodals.service.gromacs import (
         GromacsReconciler,
         ModalGromacsAdapter,
         create_registration,
     )
 
-    settings = ServiceSettings.from_environment()
     store = ServiceStore(settings.database_path)
     store.initialize()
-    auth = AuthService(store, frontend_url=settings.frontend_url)
+    configuration = RuntimeConfiguration(store, settings)
+    auth = AuthService(store, frontend_url=settings.public_url)
+    gromacs_configuration = configuration.workload("gromacs")
     adapter = ModalGromacsAdapter(
-        app_name=settings.gromacs_app_name,
-        environment_name=settings.modal_environment,
+        app_name=gromacs_configuration.modal_app_name.value,
+        environment_name=configuration.modal_environment().value,
     )
     registration = create_registration(
         adapter,
-        active_limit=settings.gromacs_active_limit,
         reconciler=GromacsReconciler(
             store,
             adapter,
@@ -784,8 +795,9 @@ def create_deployed_app() -> FastAPI:
     return create_app(
         store=store,
         auth=auth,
+        configuration=configuration,
         workloads=[registration],
-        allowed_origin=settings.allowed_origin,
+        allowed_origin=settings.public_url,
         secure_cookies=settings.secure_cookies,
         cache=cache,
         reconcile_interval_seconds=settings.reconcile_interval_seconds,

@@ -19,13 +19,13 @@ app = typer.Typer(
 )
 
 
-def _auth_service() -> AuthService:
+def _auth_service(settings: ServiceSettings | None = None) -> AuthService:
     from biomodals.service.auth import AuthService
 
-    settings = ServiceSettings.from_environment()
+    settings = settings or ServiceSettings.from_environment()
     store = ServiceStore(settings.database_path)
     store.initialize()
-    return AuthService(store, frontend_url=settings.frontend_url)
+    return AuthService(store, frontend_url=settings.public_url)
 
 
 def _fail(exc: Exception) -> NoReturn:
@@ -40,10 +40,32 @@ def create_user(
         str,
         typer.Option("--display-name", help="Name shown in the web application."),
     ],
+    admin: Annotated[
+        bool,
+        typer.Option("--admin", help="Provision an administrator."),
+    ] = False,
+    active_job_limit: Annotated[
+        int | None,
+        typer.Option(
+            "--active-job-limit",
+            min=1,
+            help="Maximum non-terminal Jobs owned across all Tools.",
+        ),
+    ] = None,
 ) -> None:
     """Create a user and print their one-time password setup link."""
     try:
-        link = _auth_service().create_user(email, display_name=display_name)
+        settings = ServiceSettings.from_environment()
+        link = _auth_service(settings).create_user(
+            email,
+            display_name=display_name,
+            is_admin=admin,
+            active_job_limit=(
+                settings.default_user_active_job_limit
+                if active_job_limit is None
+                else active_job_limit
+            ),
+        )
     except (LookupError, ValueError) as exc:
         _fail(exc)
     typer.echo(link)
@@ -68,6 +90,42 @@ def disable_user(
     """Disable a user and revoke their sessions and password links."""
     try:
         principal = _auth_service().disable_user(email)
-    except (LookupError, ValueError) as exc:
+    except (LookupError, RuntimeError, ValueError) as exc:
         _fail(exc)
     typer.echo(f"Disabled {principal.email}")
+
+
+@app.command("enable-user")
+def enable_user(
+    email: Annotated[str, typer.Argument(help="Company email address.")],
+) -> None:
+    """Enable an existing user without changing their password."""
+    try:
+        principal = _auth_service().enable_user(email)
+    except (LookupError, ValueError) as exc:
+        _fail(exc)
+    typer.echo(f"Enabled {principal.email}")
+
+
+@app.command("promote-user")
+def promote_user(
+    email: Annotated[str, typer.Argument(help="Company email address.")],
+) -> None:
+    """Grant administrator access to one existing user."""
+    try:
+        principal = _auth_service().set_user_admin(email, is_admin=True)
+    except (LookupError, ValueError) as exc:
+        _fail(exc)
+    typer.echo(f"Promoted {principal.email}")
+
+
+@app.command("demote-user")
+def demote_user(
+    email: Annotated[str, typer.Argument(help="Company email address.")],
+) -> None:
+    """Remove administrator access while preserving another active admin."""
+    try:
+        principal = _auth_service().set_user_admin(email, is_admin=False)
+    except (LookupError, RuntimeError, ValueError) as exc:
+        _fail(exc)
+    typer.echo(f"Demoted {principal.email}")

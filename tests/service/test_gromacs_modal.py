@@ -26,11 +26,26 @@ from biomodals.schema import (
 )
 from biomodals.service.gromacs.modal import GromacsReconciler, ModalGromacsAdapter
 from biomodals.service.gromacs.router import GromacsJobOptions
+from biomodals.service.runtime_config import (
+    DatabaseOverridableSetting,
+    JobAdmissionConfiguration,
+    ModalConfigurationSnapshot,
+)
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 
 RUN_NAME = "api-0123456789abcdef0123456789abcdef"
 SHA256 = "a" * 64
 _PENDING = object()
+
+
+def _admission_configuration() -> JobAdmissionConfiguration:
+    return JobAdmissionConfiguration(
+        workload="gromacs",
+        modal_environment=DatabaseOverridableSetting("department-dev", False),
+        modal_app_name=DatabaseOverridableSetting("GromacsAPI", False),
+        workload_active_job_limit=DatabaseOverridableSetting(10, False),
+        global_active_job_limit=DatabaseOverridableSetting(10, False),
+    )
 
 
 class AsyncMethod:
@@ -258,15 +273,16 @@ def _submitted_job(
         token_digest=b"setup-token-digest",
         token_expires_at=3_600,
         now=1,
+        is_admin=True,
+        active_job_limit=10,
     )
     admission = store.admit_job(
         owner_user_id=user.user_id,
-        workload="gromacs",
         display_name="Simulation",
         idempotency_key=str(uuid4()),
         request_hash="request-digest",
         parameters_json="{}",
-        active_limit=2,
+        configuration=_admission_configuration(),
         now=2,
     )
     job = store.mark_submitted(
@@ -290,12 +306,11 @@ def _terminal_job(
 ) -> JobRecord:
     admission = store.admit_job(
         owner_user_id=owner_user_id,
-        workload="gromacs",
         display_name=run_name,
         idempotency_key=str(uuid4()),
         request_hash=f"digest-{run_name}",
         parameters_json="{}",
-        active_limit=2,
+        configuration=_admission_configuration(),
         now=completed_at - 2,
     )
     job = store.mark_submitted(
@@ -371,6 +386,10 @@ def test_submit_spawns_detached_call_with_normalized_options(
                 cpu_only=True,
             ),
             run_name=RUN_NAME,
+            modal_configuration=ModalConfigurationSnapshot(
+                environment="department-dev",
+                app_name="GromacsAPI",
+            ),
         )
     )
 
@@ -640,15 +659,16 @@ def test_reconciler_recovers_orphaned_submission_by_stable_run_name(
         token_digest=b"setup-token-digest",
         token_expires_at=3_600,
         now=1,
+        is_admin=True,
+        active_job_limit=10,
     )
     admission = store.admit_job(
         owner_user_id=user.user_id,
-        workload="gromacs",
         display_name="Simulation",
         idempotency_key=str(uuid4()),
         request_hash="request-digest",
         parameters_json="{}",
-        active_limit=2,
+        configuration=_admission_configuration(),
         now=2,
     )
     store.claim_submission(
@@ -719,6 +739,8 @@ def test_intermediate_cleanup_is_opt_in_and_preserves_final_archives(
         token_digest=b"setup-token-digest",
         token_expires_at=3_600,
         now=1,
+        is_admin=True,
+        active_job_limit=10,
     )
     due_succeeded = _terminal_job(
         store,

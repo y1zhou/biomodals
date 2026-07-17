@@ -597,7 +597,7 @@ def test_expired_call_rejects_marker_when_archive_bytes_are_corrupt(
     failed = store.get_job(job.owner_user_id, job.job_id)
     assert failed is not None
     assert failed.state == JobState.FAILED
-    assert failed.error_code == "result_expired"
+    assert failed.error_code == "result_unavailable"
 
 
 def test_recovery_rejects_self_consistent_marker_for_invalid_zip_manifest(

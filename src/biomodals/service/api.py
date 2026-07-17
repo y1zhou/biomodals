@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -28,6 +28,7 @@ from biomodals.service.auth import (
     AuthService,
     InvalidCredentialsError,
     InvalidPasswordTokenError,
+    IssuedSession,
     PasswordExecutor,
     PasswordPolicyError,
     Principal,
@@ -51,7 +52,7 @@ SECURE_SESSION_COOKIE = "__Host-biomodals-session"
 CSRF_COOKIE = "biomodals-csrf"
 _CSRF_HEADER_DESCRIPTION = (
     f"Required for authenticated mutations. Copy the value of the `{CSRF_COOKIE}` "
-    "cookie set by a successful login."
+    "cookie set by a successful login or Password Setup."
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARCHIVE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip")
@@ -61,6 +62,47 @@ class ErrorResponse(BaseModel):
     """Stable JSON error response."""
 
     detail: str
+
+
+class CodedErrorResponse(ErrorResponse):
+    """Recoverable error with a stable machine-readable code."""
+
+    code: str
+
+
+class OriginErrorResponse(CodedErrorResponse):
+    """Browser origin rejected before an unsafe request."""
+
+    code: Literal["origin_not_allowed"]
+
+
+class MutationForbiddenResponse(CodedErrorResponse):
+    """Unsafe request rejected for origin or CSRF state."""
+
+    code: Literal["csrf_invalid", "origin_not_allowed"]
+
+
+class PasswordErrorResponse(CodedErrorResponse):
+    """Password Setup errors with distinct recovery behavior."""
+
+    code: Literal["password_link_invalid", "password_policy_rejected"]
+
+
+class JobNotCancellableResponse(CodedErrorResponse):
+    """Cancellation raced with a state that no longer accepts it."""
+
+    code: Literal["job_not_cancellable"]
+
+
+class CodedAPIError(Exception):
+    """Signal one flat coded response from a route or dependency."""
+
+    def __init__(self, status_code: int, code: str, detail: str) -> None:
+        """Capture the response status, stable code, and safe detail."""
+        super().__init__(detail)
+        self.status_code = status_code
+        self.code = code
+        self.detail = detail
 
 
 class PrincipalView(BaseModel):
@@ -125,7 +167,10 @@ class _RequestSizeMiddleware:
                 too_large = False
             if too_large:
                 await model_response(
-                    ErrorResponse(detail="Request body is too large"),
+                    CodedErrorResponse(
+                        code="payload_too_large",
+                        detail="Request body is too large",
+                    ),
                     status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 )(scope, receive, send)
                 return
@@ -145,7 +190,10 @@ class _RequestSizeMiddleware:
             await self.app(scope, limited_receive, send)
         except _RequestBodyTooLarge:
             await model_response(
-                ErrorResponse(detail="Request body is too large"),
+                CodedErrorResponse(
+                    code="payload_too_large",
+                    detail="Request body is too large",
+                ),
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             )(scope, receive, send)
 
@@ -157,7 +205,11 @@ class _RequestBodyTooLarge(Exception):
 async def require_origin(request: Request) -> None:
     """Require the exact configured browser Origin on unsafe requests."""
     if request.headers.get("Origin") != request.app.state.allowed_origin:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Request origin is not allowed")
+        raise CodedAPIError(
+            status.HTTP_403_FORBIDDEN,
+            "origin_not_allowed",
+            "Request origin is not allowed",
+        )
 
 
 async def require_session(request: Request) -> AuthenticatedSession:
@@ -184,7 +236,11 @@ async def require_unsafe_session(
     session = await require_session(request)
     auth: AuthService = request.app.state.auth
     if csrf_token is None or not auth.verify_csrf(session, csrf_token):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "CSRF validation failed")
+        raise CodedAPIError(
+            status.HTTP_403_FORBIDDEN,
+            "csrf_invalid",
+            "CSRF validation failed",
+        )
     return session
 
 
@@ -353,6 +409,14 @@ def create_app(
     app.state.session_cookie_name = session_cookie_name
     app.state.workloads = registrations
     app.state.cache = cache
+
+    @app.exception_handler(CodedAPIError)
+    async def coded_api_error(_request: Request, exc: CodedAPIError) -> Response:
+        return model_response(
+            CodedErrorResponse(code=exc.code, detail=exc.detail),
+            status_code=exc.status_code,
+        )
+
     app.add_middleware(
         _RequestSizeMiddleware,
         max_body_bytes=max(
@@ -361,38 +425,7 @@ def create_app(
         ),
     )
 
-    @app.get("/api/v1/health", include_in_schema=False)
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.post(
-        "/api/v1/auth/login",
-        response_model=PrincipalView,
-        responses={
-            status.HTTP_200_OK: {
-                "headers": {
-                    "Set-Cookie": {
-                        "description": (
-                            "Sets the HttpOnly session cookie and the readable "
-                            f"`{CSRF_COOKIE}` cookie used as `X-CSRF-Token`."
-                        ),
-                        "schema": {"type": "string"},
-                    }
-                }
-            }
-        },
-    )
-    async def login(request: Request, credentials: LoginRequest) -> Response:
-        await require_origin(request)
-        try:
-            issued = await password_executor.run(
-                auth.login,
-                credentials.email,
-                credentials.password,
-            )
-        except InvalidCredentialsError as exc:
-            LOGGER.warning("Rejected login attempt")
-            raise HTTPException(401, "Invalid email or password") from exc
+    def session_response(issued: IssuedSession) -> Response:
         response = model_response(
             PrincipalView.from_principal(issued.principal),
             status_code=status.HTTP_200_OK,
@@ -417,31 +450,104 @@ def create_app(
         )
         return response
 
-    @app.post("/api/v1/auth/set-password", response_model=PrincipalView)
+    @app.get("/api/v1/health", include_in_schema=False)
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post(
+        "/api/v1/auth/login",
+        response_model=PrincipalView,
+        responses={
+            status.HTTP_200_OK: {
+                "headers": {
+                    "Set-Cookie": {
+                        "description": (
+                            "Sets the HttpOnly session cookie and the readable "
+                            f"`{CSRF_COOKIE}` cookie used as `X-CSRF-Token`."
+                        ),
+                        "schema": {"type": "string"},
+                    }
+                }
+            },
+            status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+            status.HTTP_403_FORBIDDEN: {"model": OriginErrorResponse},
+        },
+    )
+    async def login(request: Request, credentials: LoginRequest) -> Response:
+        await require_origin(request)
+        try:
+            issued = await password_executor.run(
+                auth.login,
+                credentials.email,
+                credentials.password,
+            )
+        except InvalidCredentialsError as exc:
+            LOGGER.warning("Rejected login attempt")
+            raise HTTPException(401, "Invalid email or password") from exc
+        return session_response(issued)
+
+    @app.post(
+        "/api/v1/auth/set-password",
+        response_model=PrincipalView,
+        responses={
+            status.HTTP_200_OK: {
+                "headers": {
+                    "Set-Cookie": {
+                        "description": (
+                            "Sets the HttpOnly session cookie and the readable "
+                            f"`{CSRF_COOKIE}` cookie used as `X-CSRF-Token`."
+                        ),
+                        "schema": {"type": "string"},
+                    }
+                }
+            },
+            status.HTTP_400_BAD_REQUEST: {"model": PasswordErrorResponse},
+            status.HTTP_403_FORBIDDEN: {"model": OriginErrorResponse},
+        },
+    )
     async def set_password(
         request: Request,
         submission: SetPasswordRequest,
-    ) -> PrincipalView:
+    ) -> Response:
         await require_origin(request)
         try:
-            principal = await password_executor.run(
+            issued = await password_executor.run(
                 auth.set_password,
                 submission.token,
                 submission.password,
             )
         except PasswordPolicyError as exc:
-            raise HTTPException(400, str(exc)) from exc
+            raise CodedAPIError(
+                status.HTTP_400_BAD_REQUEST,
+                "password_policy_rejected",
+                str(exc),
+            ) from exc
         except InvalidPasswordTokenError as exc:
-            raise HTTPException(400, "Password link is invalid or expired") from exc
-        return PrincipalView.from_principal(principal)
+            raise CodedAPIError(
+                status.HTTP_400_BAD_REQUEST,
+                "password_link_invalid",
+                "Password link is invalid or expired",
+            ) from exc
+        return session_response(issued)
 
-    @app.get("/api/v1/auth/me", response_model=PrincipalView)
+    @app.get(
+        "/api/v1/auth/me",
+        response_model=PrincipalView,
+        responses={status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse}},
+    )
     async def me(
         session: Annotated[AuthenticatedSession, Depends(require_session)],
     ) -> PrincipalView:
         return PrincipalView.from_principal(session.principal)
 
-    @app.post("/api/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+    @app.post(
+        "/api/v1/auth/logout",
+        status_code=status.HTTP_204_NO_CONTENT,
+        responses={
+            status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+            status.HTTP_403_FORBIDDEN: {"model": MutationForbiddenResponse},
+        },
+    )
     async def logout(
         request: Request,
         _session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
@@ -453,7 +559,12 @@ def create_app(
         response.delete_cookie(CSRF_COOKIE, path="/")
         return response
 
-    @app.get("/api/v1/jobs", response_model=list[JobView])
+    @app.get(
+        "/api/v1/jobs",
+        response_model=list[JobView],
+        response_model_exclude_none=True,
+        responses={status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse}},
+    )
     async def list_jobs(
         session: Annotated[AuthenticatedSession, Depends(require_session)],
     ) -> list[JobView]:
@@ -462,7 +573,15 @@ def create_app(
             for job in store.list_jobs(session.principal.user_id)
         ]
 
-    @app.get("/api/v1/jobs/{job_id}", response_model=JobView)
+    @app.get(
+        "/api/v1/jobs/{job_id}",
+        response_model=JobView,
+        response_model_exclude_none=True,
+        responses={
+            status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+            status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+        },
+    )
     async def inspect_job(
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_session)],
@@ -475,7 +594,14 @@ def create_app(
     @app.post(
         "/api/v1/jobs/{job_id}/cancel",
         response_model=JobView,
+        response_model_exclude_none=True,
         status_code=status.HTTP_202_ACCEPTED,
+        responses={
+            status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+            status.HTTP_403_FORBIDDEN: {"model": MutationForbiddenResponse},
+            status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+            status.HTTP_409_CONFLICT: {"model": JobNotCancellableResponse},
+        },
     )
     async def cancel_job(
         job_id: UUID,
@@ -493,7 +619,11 @@ def create_app(
         except JobNotFoundError as exc:
             raise _not_found() from exc
         except JobNotCancellableError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+            raise CodedAPIError(
+                status.HTTP_409_CONFLICT,
+                "job_not_cancellable",
+                str(exc),
+            ) from exc
         registration = registrations.get(job.workload)
         if (
             job.modal_call_id is not None

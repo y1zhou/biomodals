@@ -59,7 +59,7 @@ def test_setup_link_is_one_time_and_passwords_use_argon2id(tmp_path: Path) -> No
     link = auth.create_user("Alice@Example.com", display_name="Alice")
     token = reset_token(link)
 
-    principal = auth.set_password(token, "correct horse battery staple")
+    principal = auth.set_password(token, "correct horse battery staple").principal
 
     assert principal.email == "alice@example.com"
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700

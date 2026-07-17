@@ -7,7 +7,7 @@ import logging
 from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from biomodals.service.store import JobRecord, JobState
 
 LOGGER = logging.getLogger(__name__)
+JobErrorCode = Literal["compute_failed", "result_invalid", "result_unavailable"]
 
 
 class JobView(BaseModel):
@@ -30,7 +31,8 @@ class JobView(BaseModel):
     updated_at: datetime
     completed_at: datetime | None = None
     warnings: list[str] = Field(default_factory=list)
-    detail: str | None = None
+    error_code: JobErrorCode | None = None
+    error_message: str | None = None
     download_url: str | None = None
 
     @classmethod
@@ -50,7 +52,8 @@ class JobView(BaseModel):
                 else None
             ),
             warnings=warnings,
-            detail=record.error_message,
+            error_code=cast(JobErrorCode | None, record.error_code),
+            error_message=record.error_message,
             download_url=(
                 f"/api/v1/jobs/{record.job_id}/download"
                 if record.state in {JobState.SUCCEEDED, JobState.PARTIAL}

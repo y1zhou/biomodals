@@ -204,18 +204,28 @@ class AuthService:
         )
         return self._password_link(token)
 
-    def set_password(self, token: str, password: str) -> Principal:
-        """Consume a one-time link and revoke all existing browser sessions."""
+    def set_password(self, token: str, password: str) -> IssuedSession:
+        """Replace credentials and issue one fresh browser session."""
         _validate_password(password)
         password_hash = self._password_hash.hash(password)
+        session_token = _new_token()
+        csrf_token = _new_token()
+        now = self._now()
         user = self.store.set_password_from_token(
             _token_digest(token),
             password_hash=password_hash,
-            now=self._now(),
+            session_token_digest=_token_digest(session_token),
+            csrf_digest=_token_digest(csrf_token),
+            now=now,
+            absolute_expires_at=now + SESSION_ABSOLUTE_LIFETIME_SECONDS,
         )
         if user is None:
             raise InvalidPasswordTokenError("Password link is invalid or expired")
-        return _principal(user)
+        return IssuedSession(
+            session_token=session_token,
+            csrf_token=csrf_token,
+            principal=_principal(user),
+        )
 
     def login(self, email: str, password: str) -> IssuedSession:
         """Verify a password and issue opaque server-side session credentials."""
@@ -282,7 +292,7 @@ class AuthService:
         return _principal(user)
 
     def _password_link(self, token: str) -> str:
-        return f"{self.frontend_url}/reset-password#token={token}"
+        return f"{self.frontend_url}/set-password#token={token}"
 
 
 def _new_token() -> str:

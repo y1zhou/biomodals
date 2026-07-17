@@ -70,11 +70,7 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
         finally:
             with lock:
                 active -= 1
-        if auth_method == "login":
-            result = IssuedSession("session", "csrf", principal)
-        else:
-            result = principal
-        return result
+        return IssuedSession("session", "csrf", principal)
 
     monkeypatch.setattr(auth, auth_method, slow_password_operation)
     app = create_app(

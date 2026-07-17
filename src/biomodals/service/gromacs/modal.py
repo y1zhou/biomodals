@@ -415,8 +415,10 @@ class GromacsReconciler:
                         )
                         self.store.fail_job(
                             job.job_id,
-                            error_code="invalid_result",
-                            error_message="GROMACS produced an invalid result archive",
+                            error_code="result_invalid",
+                            error_message=(
+                                "GROMACS completed, but its result archive was invalid."
+                            ),
                             now=self._now(),
                         )
                     else:
@@ -443,8 +445,10 @@ class GromacsReconciler:
                 except ArchiveNotReadyError:
                     self.store.fail_job(
                         job.job_id,
-                        error_code="result_expired",
-                        error_message="GROMACS result metadata is unavailable",
+                        error_code="result_unavailable",
+                        error_message=(
+                            "GROMACS completed, but its result could not be recovered."
+                        ),
                         now=self._now(),
                     )
                     continue
@@ -457,8 +461,10 @@ class GromacsReconciler:
                     LOGGER.exception("Could not recover expired job %s", job.job_id)
                     self.store.fail_job(
                         job.job_id,
-                        error_code="result_expired",
-                        error_message="GROMACS result metadata is unavailable",
+                        error_code="result_unavailable",
+                        error_message=(
+                            "GROMACS completed, but its result could not be recovered."
+                        ),
                         now=self._now(),
                     )
                     continue
@@ -501,7 +507,7 @@ class GromacsReconciler:
             self.store.fail_job(
                 job.job_id,
                 error_code="compute_failed",
-                error_message="GROMACS job failed; see run.log if an archive is available",
+                error_message="GROMACS could not complete the simulation.",
                 now=now,
             )
             return
@@ -516,8 +522,8 @@ class GromacsReconciler:
             LOGGER.exception("GROMACS job %s returned an invalid archive", job.job_id)
             self.store.fail_job(
                 job.job_id,
-                error_code="invalid_result",
-                error_message="GROMACS produced an invalid result archive",
+                error_code="result_invalid",
+                error_message="GROMACS completed, but its result archive was invalid.",
                 now=now,
             )
             return

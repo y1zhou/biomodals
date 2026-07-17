@@ -343,9 +343,12 @@ class ServiceStore:
         token_digest: bytes,
         *,
         password_hash: str,
+        session_token_digest: bytes,
+        csrf_digest: bytes,
         now: int,
+        absolute_expires_at: int,
     ) -> UserRecord | None:
-        """Consume a valid token, set the hash, and revoke user credentials."""
+        """Replace credentials and establish one fresh session atomically."""
         with self._transaction() as conn:
             row = conn.execute(
                 """
@@ -372,6 +375,22 @@ class ServiceStore:
             )
             conn.execute("DELETE FROM password_tokens WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    token_digest, user_id, csrf_digest, created_at,
+                    last_seen_at, absolute_expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_token_digest,
+                    user_id,
+                    csrf_digest,
+                    now,
+                    now,
+                    absolute_expires_at,
+                ),
+            )
             updated = conn.execute(
                 "SELECT * FROM users WHERE user_id = ?",
                 (user_id,),
@@ -832,7 +851,7 @@ class ServiceStore:
             state = JobState(row["state"])
             if state == JobState.CANCEL_REQUESTED:
                 return _job_from_row(row)
-            if state in TERMINAL_JOB_STATES:
+            if state not in (JobState.QUEUED, JobState.RUNNING):
                 raise JobNotCancellableError(f"Job is already {state.value}")
             conn.execute(
                 """

@@ -178,6 +178,15 @@ def _jobs(response) -> list[dict[str, object]]:
     return body if isinstance(body, list) else body["jobs"]
 
 
+def _response_codes(schema: dict, path: str, status_code: int) -> list[str]:
+    response = schema["paths"][path]["post"]["responses"][str(status_code)]
+    reference = response["content"]["application/json"]["schema"]["$ref"]
+    code = schema["components"]["schemas"][reference.rsplit("/", 1)[1]]["properties"][
+        "code"
+    ]
+    return code["enum"] if "enum" in code else [code["const"]]
+
+
 def test_login_requires_the_frontend_origin_and_sets_hardened_cookies(
     tmp_path: Path,
 ) -> None:
@@ -248,6 +257,30 @@ def test_one_time_password_link_and_logout_complete_browser_flow(
     assert client.get("/api/v1/auth/me").status_code == 401
 
 
+def test_password_reset_establishes_fresh_session_and_revokes_old_one(
+    tmp_path: Path,
+) -> None:
+    old_client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    _login(old_client, "alice@example.com")
+    link = auth.create_password_reset("alice@example.com")
+    reset_client = APIClient(old_client.app)
+
+    response = reset_client.post(
+        "/api/v1/auth/set-password",
+        headers={"Origin": ORIGIN},
+        json={"token": _password_token(link), "password": PASSWORD},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["email"] == "alice@example.com"
+    assert reset_client.get("/api/v1/auth/me").status_code == 200
+    assert old_client.get("/api/v1/auth/me").status_code == 401
+    set_cookies = response.headers.get_list("set-cookie")
+    assert any(item.startswith(f"{SESSION_COOKIE}=") for item in set_cookies)
+    assert any(item.startswith(f"{CSRF_COOKIE}=") for item in set_cookies)
+
+
 def test_openapi_exposes_the_set_password_minimum(tmp_path: Path) -> None:
     client, _auth, _store, _adapter = _service(tmp_path)
 
@@ -257,6 +290,55 @@ def test_openapi_exposes_the_set_password_minimum(tmp_path: Path) -> None:
     ]["password"]
 
     assert password_schema["minLength"] == 15
+
+
+def test_password_setup_exposes_coded_errors_and_cookie_contract(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    link = auth.create_user("alice@example.com", display_name="Alice")
+    token = _password_token(link)
+
+    wrong_origin = client.post(
+        "/api/v1/auth/set-password",
+        json={"token": token, "password": PASSWORD},
+    )
+    rejected_password = client.post(
+        "/api/v1/auth/set-password",
+        headers={"Origin": ORIGIN},
+        json={"token": token, "password": "passwordpassword"},
+    )
+    invalid_link = client.post(
+        "/api/v1/auth/set-password",
+        headers={"Origin": ORIGIN},
+        json={"token": "not-valid", "password": PASSWORD},
+    )
+    schema = client.get("/openapi.json").json()
+    responses = schema["paths"]["/api/v1/auth/set-password"]["post"]["responses"]
+
+    assert wrong_origin.json() == {
+        "code": "origin_not_allowed",
+        "detail": "Request origin is not allowed",
+    }
+    assert rejected_password.json() == {
+        "code": "password_policy_rejected",
+        "detail": "Choose a less common password",
+    }
+    assert invalid_link.json() == {
+        "code": "password_link_invalid",
+        "detail": "Password link is invalid or expired",
+    }
+    password_error_ref = responses["400"]["content"]["application/json"]["schema"][
+        "$ref"
+    ]
+    password_error = schema["components"]["schemas"][
+        password_error_ref.rsplit("/", 1)[1]
+    ]
+    assert password_error["properties"]["code"]["enum"] == [
+        "password_link_invalid",
+        "password_policy_rejected",
+    ]
+    assert "Set-Cookie" in responses["200"]["headers"]
 
 
 def test_openapi_documents_csrf_cookie_and_required_header(tmp_path: Path) -> None:
@@ -274,11 +356,20 @@ def test_openapi_documents_csrf_cookie_and_required_header(tmp_path: Path) -> No
         "/api/v1/gromacs/jobs",
     )
     for path in mutations:
-        parameters = schema["paths"][path]["post"]["parameters"]
+        operation = schema["paths"][path]["post"]
+        parameters = operation["parameters"]
         csrf = next(item for item in parameters if item["name"] == "X-CSRF-Token")
         assert csrf["required"] is True
         assert csrf["schema"] == {"type": "string"}
         assert "biomodals-csrf" in csrf["description"]
+        forbidden_ref = operation["responses"]["403"]["content"]["application/json"][
+            "schema"
+        ]["$ref"]
+        forbidden = schema["components"]["schemas"][forbidden_ref.rsplit("/", 1)[1]]
+        assert forbidden["properties"]["code"]["enum"] == [
+            "csrf_invalid",
+            "origin_not_allowed",
+        ]
 
 
 def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
@@ -293,6 +384,39 @@ def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
     assert responses["206"]["content"] == binary_zip
     assert "Content-Disposition" in responses["206"]["headers"]
     assert "Content-Range" in responses["206"]["headers"]
+
+
+def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+    schema = client.get("/openapi.json").json()
+    expected = {
+        ("/api/v1/auth/login", "post"): {"401", "403", "422"},
+        ("/api/v1/auth/set-password", "post"): {"400", "403", "422"},
+        ("/api/v1/auth/me", "get"): {"401"},
+        ("/api/v1/auth/logout", "post"): {"401", "403"},
+        ("/api/v1/jobs", "get"): {"401"},
+        ("/api/v1/jobs/{job_id}", "get"): {"401", "404", "422"},
+        ("/api/v1/jobs/{job_id}/cancel", "post"): {
+            "401",
+            "403",
+            "404",
+            "409",
+            "422",
+        },
+        ("/api/v1/gromacs/jobs", "post"): {
+            "400",
+            "401",
+            "403",
+            "409",
+            "413",
+            "422",
+            "503",
+        },
+    }
+
+    for (path, method), statuses in expected.items():
+        documented = set(schema["paths"][path][method]["responses"])
+        assert statuses <= documented, (path, statuses - documented)
 
 
 def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(
@@ -324,8 +448,11 @@ def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(
     )
 
     assert no_origin.status_code == 403
+    assert no_origin.json()["code"] == "origin_not_allowed"
     assert no_csrf.status_code == 403
+    assert no_csrf.json()["code"] == "csrf_invalid"
     assert wrong_origin.status_code == 403
+    assert wrong_origin.json()["code"] == "origin_not_allowed"
     assert adapter.submissions == []
 
 
@@ -352,8 +479,43 @@ def test_upload_and_total_request_size_are_bounded_before_submission(
     )
 
     assert oversized_pdb.status_code == 413
+    assert oversized_pdb.json()["code"] == "payload_too_large"
     assert oversized_body.status_code == 413
+    assert oversized_body.json()["code"] == "payload_too_large"
     assert adapter.submissions == []
+
+
+def test_semantic_pdb_and_active_limit_errors_match_openapi(tmp_path: Path) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    headers = _unsafe_headers(
+        csrf_token,
+        **{"Idempotency-Key": str(uuid4())},
+    )
+
+    invalid_pdb = client.post(
+        "/api/v1/gromacs/jobs",
+        headers=headers,
+        files={"pdb": ("invalid.pdb", b"not a PDB", "chemical/x-pdb")},
+    )
+    _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    over_limit = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    schema = client.get("/openapi.json").json()
+    path = "/api/v1/gromacs/jobs"
+
+    assert invalid_pdb.status_code == 400
+    assert invalid_pdb.json()["code"] == "pdb_invalid"
+    assert over_limit.status_code == 409
+    assert over_limit.json()["code"] == "active_job_limit_reached"
+    assert _response_codes(schema, path, 400) == ["pdb_invalid"]
+    assert _response_codes(schema, path, 409) == [
+        "idempotency_conflict",
+        "active_job_limit_reached",
+    ]
+    assert _response_codes(schema, path, 413) == ["payload_too_large"]
+    assert _response_codes(schema, path, 503) == ["compute_unavailable"]
 
 
 def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
@@ -382,6 +544,7 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert first.json()["display_name"] == "First simulation"
     assert first.json()["state"] == "queued"
     assert conflict.status_code == 409
+    assert conflict.json()["code"] == "idempotency_conflict"
     assert missing_key.status_code == 422
     assert malformed_key.status_code == 422
     assert len(adapter.submissions) == 1
@@ -429,6 +592,7 @@ def test_failed_spawn_can_retry_the_same_stable_run(
     retried = _submit(client, csrf_token, idempotency_key=key)
 
     assert failed.status_code == 503
+    assert failed.json()["code"] == "compute_unavailable"
     assert retried.status_code == 202
     assert retried.json()["state"] == "queued"
     assert len(adapter.submissions) == 2
@@ -477,6 +641,41 @@ def test_my_jobs_and_job_lookup_are_private_to_the_cookie_owner(
     assert adapter.cancellations == []
 
 
+def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:
+    client, auth, store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+
+    assert "detail" not in submitted.json()
+    assert "error_code" not in submitted.json()
+    assert "error_message" not in submitted.json()
+
+    store.fail_job(
+        job_id,
+        error_code="compute_failed",
+        error_message="GROMACS could not complete the simulation.",
+        now=1_800_000_001,
+    )
+    failed = client.get(f"/api/v1/jobs/{job_id}")
+    schema = client.get("/openapi.json").json()
+    error_code = schema["components"]["schemas"]["JobView"]["properties"]["error_code"]
+    allowed_codes = next(item["enum"] for item in error_code["anyOf"] if "enum" in item)
+
+    assert failed.status_code == 200
+    assert failed.json()["error_code"] == "compute_failed"
+    assert failed.json()["error_message"] == (
+        "GROMACS could not complete the simulation."
+    )
+    assert "detail" not in failed.json()
+    assert allowed_codes == [
+        "compute_failed",
+        "result_invalid",
+        "result_unavailable",
+    ]
+
+
 def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     client, auth, store, _adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
@@ -513,6 +712,26 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
         headers=_unsafe_headers(csrf_token),
     )
     assert terminal.status_code == 409
+    assert terminal.json()["code"] == "job_not_cancellable"
+
+    second = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+    )
+    second_id = UUID(second.json()["job_id"])
+    store.set_job_state(second_id, JobState.FINALIZING, now=1_800_000_001)
+    finalizing = client.post(
+        f"/api/v1/jobs/{second_id}/cancel",
+        headers=_unsafe_headers(csrf_token),
+    )
+    schema = client.get("/openapi.json").json()
+
+    assert finalizing.status_code == 409
+    assert finalizing.json()["code"] == "job_not_cancellable"
+    assert _response_codes(schema, "/api/v1/jobs/{job_id}/cancel", 409) == [
+        "job_not_cancellable"
+    ]
 
 
 def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> None:

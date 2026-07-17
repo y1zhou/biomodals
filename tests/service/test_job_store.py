@@ -20,7 +20,7 @@ from biomodals.service.store import (
 def owner(auth: AuthService, email: str) -> UUID:
     link = auth.create_user(email, display_name=email.partition("@")[0])
     token = link.partition("#token=")[2]
-    return auth.set_password(token, "correct horse battery staple").user_id
+    return auth.set_password(token, "correct horse battery staple").principal.user_id
 
 
 def make_store(tmp_path: Path) -> tuple[ServiceStore, UUID, UUID]:

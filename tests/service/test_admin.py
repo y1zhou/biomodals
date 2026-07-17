@@ -42,7 +42,7 @@ def test_create_user_prints_setup_link_once(monkeypatch, tmp_path) -> None:
 
     assert result.exit_code == 0, result.output
     link = result.output.strip()
-    assert link.startswith("https://biomodals.internal/reset-password#token=")
+    assert link.startswith("https://biomodals.internal/set-password#token=")
     assert result.output.count(link) == 1
     user = store.get_user_by_email("scientist@example.com")
     assert user is not None

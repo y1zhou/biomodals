@@ -103,7 +103,7 @@ def build_modal_deploy_command(
     tag: str | None,
 ) -> tuple[str, ...]:
     """Build the command for `biomodals app deploy` without side effects."""
-    cmd = ["modal", "deploy"]
+    cmd = _modal_base_command(modal_mode="deploy", detach=False, python_executable=None)
     if name:
         cmd.extend(["--name", name])
     if tag:

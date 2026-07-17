@@ -248,6 +248,17 @@ def test_one_time_password_link_and_logout_complete_browser_flow(
     assert client.get("/api/v1/auth/me").status_code == 401
 
 
+def test_openapi_exposes_the_set_password_minimum(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    schema = client.get("/openapi.json").json()
+    password_schema = schema["components"]["schemas"]["SetPasswordRequest"][
+        "properties"
+    ]["password"]
+
+    assert password_schema["minLength"] == 15
+
+
 def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(
     tmp_path: Path,
 ) -> None:

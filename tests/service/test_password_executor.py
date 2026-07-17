@@ -30,7 +30,7 @@ ORIGIN = "https://biomodals.internal"
         (
             "set_password",
             "/api/v1/auth/set-password",
-            {"token": "not-used", "password": "not-used"},
+            {"token": "not-used", "password": "not-used-password"},
         ),
     ],
 )

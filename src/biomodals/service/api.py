@@ -22,6 +22,7 @@ from biomodals.service.artifacts import (
     ArtifactLease,
 )
 from biomodals.service.auth import (
+    MIN_PASSWORD_CHARACTERS,
     SESSION_ABSOLUTE_LIFETIME_SECONDS,
     AuthenticatedSession,
     AuthService,
@@ -88,7 +89,7 @@ class SetPasswordRequest(BaseModel):
     """One-time password setup or reset submission."""
 
     token: str = Field(min_length=1, max_length=256)
-    password: str = Field(max_length=128)
+    password: str = Field(min_length=MIN_PASSWORD_CHARACTERS, max_length=128)
 
 
 def model_response(model: BaseModel, *, status_code: int) -> Response:

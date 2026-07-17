@@ -259,6 +259,28 @@ def test_openapi_exposes_the_set_password_minimum(tmp_path: Path) -> None:
     assert password_schema["minLength"] == 15
 
 
+def test_openapi_documents_csrf_cookie_and_required_header(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    schema = client.get("/openapi.json").json()
+    login_headers = schema["paths"]["/api/v1/auth/login"]["post"]["responses"]["200"][
+        "headers"
+    ]
+    assert "biomodals-csrf" in login_headers["Set-Cookie"]["description"]
+
+    mutations = (
+        "/api/v1/auth/logout",
+        "/api/v1/jobs/{job_id}/cancel",
+        "/api/v1/gromacs/jobs",
+    )
+    for path in mutations:
+        parameters = schema["paths"][path]["post"]["parameters"]
+        csrf = next(item for item in parameters if item["name"] == "X-CSRF-Token")
+        assert csrf["required"] is True
+        assert csrf["schema"] == {"type": "string"}
+        assert "biomodals-csrf" in csrf["description"]
+
+
 def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(
     tmp_path: Path,
 ) -> None:

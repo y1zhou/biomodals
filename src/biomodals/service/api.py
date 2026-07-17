@@ -49,6 +49,10 @@ LOGGER = logging.getLogger(__name__)
 SESSION_COOKIE = "biomodals-session"
 SECURE_SESSION_COOKIE = "__Host-biomodals-session"
 CSRF_COOKIE = "biomodals-csrf"
+_CSRF_HEADER_DESCRIPTION = (
+    f"Required for authenticated mutations. Copy the value of the `{CSRF_COOKIE}` "
+    "cookie set by a successful login."
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ARCHIVE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip")
 
@@ -170,7 +174,10 @@ async def require_session(request: Request) -> AuthenticatedSession:
 
 async def require_unsafe_session(
     request: Request,
-    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+    csrf_token: Annotated[
+        str | None,
+        Header(alias="X-CSRF-Token", description=_CSRF_HEADER_DESCRIPTION),
+    ] = None,
 ) -> AuthenticatedSession:
     """Authenticate a state-changing browser request and its CSRF token."""
     await require_origin(request)
@@ -183,6 +190,22 @@ async def require_unsafe_session(
 
 def _not_found() -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
+
+
+def _document_required_csrf_header(app: FastAPI) -> None:
+    """Align OpenAPI with the custom 403 behavior for a missing CSRF header."""
+    schema = app.openapi()
+    for path_item in schema["paths"].values():
+        for operation in path_item.values():
+            if not isinstance(operation, dict):
+                continue
+            for parameter in operation.get("parameters", []):
+                if (
+                    parameter.get("in") == "header"
+                    and parameter.get("name") == "X-CSRF-Token"
+                ):
+                    parameter["required"] = True
+                    parameter["schema"] = {"type": "string"}
 
 
 def _download_headers(job_sha256: str, size_bytes: int) -> dict[str, str]:
@@ -342,7 +365,23 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/api/v1/auth/login", response_model=PrincipalView)
+    @app.post(
+        "/api/v1/auth/login",
+        response_model=PrincipalView,
+        responses={
+            status.HTTP_200_OK: {
+                "headers": {
+                    "Set-Cookie": {
+                        "description": (
+                            "Sets the HttpOnly session cookie and the readable "
+                            f"`{CSRF_COOKIE}` cookie used as `X-CSRF-Token`."
+                        ),
+                        "schema": {"type": "string"},
+                    }
+                }
+            }
+        },
+    )
     async def login(request: Request, credentials: LoginRequest) -> Response:
         await require_origin(request)
         try:
@@ -537,6 +576,7 @@ def create_app(
 
     for workload in workloads:
         app.include_router(workload.router)
+    _document_required_csrf_header(app)
     return app
 
 

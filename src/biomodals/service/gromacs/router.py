@@ -38,6 +38,7 @@ from biomodals.service.store import (
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+MAX_SIMULATION_TIME_NS = 200
 LOGGER = logging.getLogger(__name__)
 
 
@@ -46,7 +47,7 @@ class GromacsJobOptions(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    simulation_time_ns: int = Field(default=5, ge=1, le=100)
+    simulation_time_ns: int = Field(default=5, ge=1, le=MAX_SIMULATION_TIME_NS)
     run_pdbfixer: bool = False
     cpu_only: bool = False
 
@@ -133,7 +134,7 @@ def create_router(
         idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
         pdb: Annotated[UploadFile, File(description="Input PDB structure")],
         display_name: Annotated[str | None, Form(max_length=120)] = None,
-        simulation_time_ns: Annotated[int, Form(ge=1, le=100)] = 5,
+        simulation_time_ns: Annotated[int, Form(ge=1, le=MAX_SIMULATION_TIME_NS)] = 5,
         run_pdbfixer: Annotated[bool, Form()] = False,
         cpu_only: Annotated[bool, Form()] = False,
     ) -> JobView:

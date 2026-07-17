@@ -344,6 +344,31 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert options == GromacsJobOptions(simulation_time_ns=3, cpu_only=True)
 
 
+def test_gromacs_simulation_time_accepts_200_ns_and_rejects_201(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+
+    accepted = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+        simulation_time_ns=200,
+    )
+    rejected = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+        simulation_time_ns=201,
+    )
+
+    assert accepted.status_code == 202
+    assert rejected.status_code == 422
+    assert adapter.submissions[0][2].simulation_time_ns == 200
+
+
 def test_failed_spawn_can_retry_the_same_stable_run(
     tmp_path: Path,
 ) -> None:

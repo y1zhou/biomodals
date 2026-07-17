@@ -506,7 +506,50 @@ def create_app(
                 LOGGER.exception("Could not yet cancel job %s", job.job_id)
         return JobView.from_record(job)
 
-    @app.get("/api/v1/jobs/{job_id}/download")
+    @app.get(
+        "/api/v1/jobs/{job_id}/download",
+        response_class=StreamingResponse,
+        responses={
+            status.HTTP_200_OK: {
+                "description": "Complete ZIP result archive.",
+                "headers": {
+                    "Content-Disposition": {
+                        "description": (
+                            "Browser attachment using the server-provided result "
+                            "filename."
+                        ),
+                        "schema": {"type": "string"},
+                    }
+                },
+                "content": {
+                    "application/zip": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                },
+            },
+            status.HTTP_206_PARTIAL_CONTENT: {
+                "description": "Requested byte range of the ZIP result archive.",
+                "headers": {
+                    "Content-Disposition": {
+                        "description": (
+                            "Browser attachment using the server-provided result "
+                            "filename."
+                        ),
+                        "schema": {"type": "string"},
+                    },
+                    "Content-Range": {
+                        "description": "Byte range returned from the complete archive.",
+                        "schema": {"type": "string"},
+                    },
+                },
+                "content": {
+                    "application/zip": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                },
+            },
+        },
+    )
     async def download_job(
         request: Request,
         job_id: UUID,

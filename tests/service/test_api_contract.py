@@ -281,6 +281,20 @@ def test_openapi_documents_csrf_cookie_and_required_header(tmp_path: Path) -> No
         assert "biomodals-csrf" in csrf["description"]
 
 
+def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    schema = client.get("/openapi.json").json()
+    responses = schema["paths"]["/api/v1/jobs/{job_id}/download"]["get"]["responses"]
+    binary_zip = {"application/zip": {"schema": {"type": "string", "format": "binary"}}}
+
+    assert responses["200"]["content"] == binary_zip
+    assert "Content-Disposition" in responses["200"]["headers"]
+    assert responses["206"]["content"] == binary_zip
+    assert "Content-Disposition" in responses["206"]["headers"]
+    assert "Content-Range" in responses["206"]["headers"]
+
+
 def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(
     tmp_path: Path,
 ) -> None:
@@ -534,6 +548,9 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     assert first.status_code == 200
     assert first.content == content
     assert first.headers["content-type"] == "application/zip"
+    assert first.headers["content-disposition"] == (
+        'attachment; filename="simulation.zip"'
+    )
     assert first.headers["cache-control"] == "private, no-store"
     assert first.headers["etag"] == f'"{hashlib.sha256(content).hexdigest()}"'
     assert second.content == content

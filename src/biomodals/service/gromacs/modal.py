@@ -249,7 +249,7 @@ class ModalGromacsAdapter:
                 marker_bytes.extend(chunk)
                 if len(marker_bytes) > 64 * 1024:
                     raise ValueError("GROMACS result marker is too large")
-        except modal.exception.NotFoundError as exc:
+        except FileNotFoundError as exc:
             raise ArchiveNotReadyError("GROMACS result marker is missing") from exc
         try:
             marker = orjson.loads(marker_bytes)
@@ -304,7 +304,7 @@ class ModalGromacsAdapter:
                         )
                     digest.update(chunk)
                     archive.write(chunk)
-            except modal.exception.NotFoundError as exc:
+            except FileNotFoundError as exc:
                 raise ArchiveNotReadyError("GROMACS result archive is missing") from exc
             if (
                 size_bytes != marker.size_bytes
@@ -416,6 +416,13 @@ class GromacsReconciler:
         """Poll every active GROMACS call once."""
         for job in self.store.list_reconcilable_jobs("gromacs"):
             if job.modal_call_id is None:
+                if job.state == JobState.CANCEL_REQUESTED:
+                    self.store.set_job_state(
+                        job.job_id,
+                        JobState.CANCELLED,
+                        now=self._now(),
+                    )
+                    continue
                 if job.run_name is not None:
                     try:
                         archive = await self.adapter.recover_archive(job)

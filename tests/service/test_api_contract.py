@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
@@ -19,6 +20,7 @@ from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
+from biomodals.service.gromacs.modal import GromacsReconciler
 from biomodals.service.jobs import WorkloadRegistration
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
@@ -49,6 +51,7 @@ class FakeGromacsAdapter:
         self.submissions: list[tuple[bytes, str, GromacsJobOptions]] = []
         self.submission_configurations: list[tuple[str, str]] = []
         self.cancellations: list[str] = []
+        self.recovery_attempts: list[UUID] = []
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
         self.failures_remaining = 0
@@ -76,6 +79,10 @@ class FakeGromacsAdapter:
 
     async def cancel(self, modal_call_id: str) -> None:
         self.cancellations.append(modal_call_id)
+
+    async def recover_archive(self, job) -> None:
+        self.recovery_attempts.append(job.job_id)
+        raise AssertionError("an unsubmitted cancellation must not touch Modal")
 
     async def read_artifact(self, _job):
         self.downloads += 1
@@ -846,6 +853,42 @@ def test_failed_spawn_can_retry_the_same_stable_run(
     assert len(adapter.submissions) == 2
     assert adapter.submissions[0][1] == adapter.submissions[1][1]
     assert adapter.submissions[0][1] == f"api-{UUID(retried.json()['job_id']).hex}"
+
+
+def test_cancel_after_failed_spawn_finishes_without_modal_access(
+    tmp_path: Path,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    adapter.failures_remaining = 1
+
+    failed = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    assert failed.status_code == 503
+
+    [job] = _jobs(client.get("/api/v1/jobs"))
+    job_id = UUID(str(job["job_id"]))
+    cancelling = client.post(
+        f"/api/v1/jobs/{job_id}/cancel",
+        headers=_unsafe_headers(csrf_token),
+    )
+    assert cancelling.status_code == 202
+    assert cancelling.json()["state"] == "cancel_requested"
+
+    asyncio.run(
+        GromacsReconciler(
+            store,
+            cast(Any, adapter),
+            now=lambda: 1_800_000_001,
+        ).reconcile()
+    )
+
+    cancelled = client.get(f"/api/v1/jobs/{job_id}")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "cancelled"
+    assert cancelled.json()["completed_at"] == "2027-01-15T08:00:01Z"
+    assert adapter.cancellations == []
+    assert adapter.recovery_attempts == []
 
 
 def test_my_jobs_and_job_lookup_are_private_to_the_cookie_owner(

@@ -24,7 +24,11 @@ from biomodals.schema import (
     ArtifactKind,
     VolumePath,
 )
-from biomodals.service.gromacs.modal import GromacsReconciler, ModalGromacsAdapter
+from biomodals.service.gromacs.modal import (
+    ArchiveNotReadyError,
+    GromacsReconciler,
+    ModalGromacsAdapter,
+)
 from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
@@ -199,7 +203,7 @@ def _install_volume(
 
         async def _read_file(self, path: str):
             if path not in files:
-                raise modal.exception.NotFoundError(path)
+                raise FileNotFoundError(path)
             yield files[path]
 
     monkeypatch.setattr(
@@ -644,6 +648,17 @@ def test_recovery_rejects_self_consistent_marker_for_invalid_zip_manifest(
     )
 
     with pytest.raises(ValueError, match="does not match manifest"):
+        asyncio.run(_adapter({}).recover_archive(job))
+
+
+def test_missing_recovery_marker_is_not_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _store, job = _submitted_job(tmp_path)
+    _install_volume(monkeypatch, {})
+
+    with pytest.raises(ArchiveNotReadyError, match="marker is missing"):
         asyncio.run(_adapter({}).recover_archive(job))
 
 

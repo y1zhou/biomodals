@@ -286,7 +286,7 @@ def test_job_atomically_advances_one_active_provider_operation(
         job.job_id,
         modal_call_id="fc-prepare",
         provider_operation="prepare_tpr_cpu",
-        run_name=f"api-{job.job_id.hex}",
+        run_name=f"simulation-{job.job_id.hex}",
         now=100,
     )
     claimed = store.claim_provider_advance(
@@ -307,9 +307,32 @@ def test_job_atomically_advances_one_active_provider_operation(
 
     assert attached.provider_operation == "prepare_tpr_cpu"
     assert claimed is not None
+    assert claimed.stage_history[-1].completed_at == 101
     assert advanced.modal_call_id == "fc-production"
     assert advanced.provider_operation == "production_run_cpu"
     assert advanced.submission_lease_until is None
+    assert [
+        (stage.provider_operation, stage.started_at, stage.completed_at)
+        for stage in advanced.stage_history
+    ] == [
+        ("prepare_tpr_cpu", 100, 101),
+        ("production_run_cpu", 102, None),
+    ]
+
+    finalizing = store.set_job_state(
+        job.job_id,
+        JobState.FINALIZING,
+        now=103,
+    )
+
+    assert [
+        (stage.provider_operation, stage.started_at, stage.completed_at)
+        for stage in finalizing.stage_history
+    ] == [
+        ("prepare_tpr_cpu", 100, 101),
+        ("production_run_cpu", 102, 103),
+        ("result_packaging", 103, None),
+    ]
 
 
 def test_provider_advance_lease_requires_explicit_release_before_retry(
@@ -321,7 +344,7 @@ def test_provider_advance_lease_requires_explicit_release_before_retry(
         job.job_id,
         modal_call_id="fc-prepare",
         provider_operation="prepare_tpr_cpu",
-        run_name=f"api-{job.job_id.hex}",
+        run_name=f"simulation-{job.job_id.hex}",
         now=100,
     )
 

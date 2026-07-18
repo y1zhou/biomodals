@@ -6,6 +6,7 @@ import hashlib
 import logging
 import re
 import time
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Protocol
@@ -50,6 +51,39 @@ MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 MAX_SIMULATION_TIME_NS = 200
 LOGGER = logging.getLogger(__name__)
+_RUN_NAME_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_RUN_NAME_SUFFIX = re.compile(r"[0-9a-f]{32}")
+_LEGACY_RUN_NAME = re.compile(r"api-[0-9a-f]{32}")
+_MAX_RUN_NAME_SLUG_LENGTH = 64
+
+
+def gromacs_run_name(display_name: str, job_id: UUID) -> str:
+    """Build a readable, path-safe name with collision-proof job identity."""
+    ascii_name = (
+        unicodedata
+        .normalize("NFKD", display_name)
+        .encode("ascii", "ignore")
+        .decode()
+        .lower()
+    )
+    slug = _RUN_NAME_SEPARATOR.sub("-", ascii_name).strip("-")
+    slug = slug[:_MAX_RUN_NAME_SLUG_LENGTH].rstrip("-")
+    return f"{slug or 'gromacs-simulation'}-{job_id.hex}"
+
+
+def is_gromacs_run_name(value: str) -> bool:
+    """Return whether a service-generated GROMACS run name is path-safe."""
+    if _LEGACY_RUN_NAME.fullmatch(value):
+        return True
+    slug, separator, suffix = value.rpartition("-")
+    return bool(
+        separator
+        and 1 <= len(slug) <= _MAX_RUN_NAME_SLUG_LENGTH
+        and _RUN_NAME_SEPARATOR.sub("-", slug) == slug
+        and not slug.startswith("-")
+        and not slug.endswith("-")
+        and _RUN_NAME_SUFFIX.fullmatch(suffix)
+    )
 
 
 class GromacsJobOptions(BaseModel):
@@ -240,7 +274,10 @@ def create_router(
         ):
             return JobView.from_record(admission.job)
 
-        run_name = admission.job.run_name or f"api-{admission.job.job_id.hex}"
+        run_name = admission.job.run_name or gromacs_run_name(
+            admission.job.display_name,
+            admission.job.job_id,
+        )
         submission_token = uuid4().hex
         claimed = store.claim_submission(
             admission.job.job_id,

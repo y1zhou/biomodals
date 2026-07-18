@@ -150,9 +150,12 @@ completes, the reconciler resolves the next deployed Function by name and
 atomically replaces the stored active operation and call identifier. Exactly
 one direct stage is the durable active operation at a time. `JobView` exposes a
 sanitized stage code and the associated deployed Function name so the Job
-detail page can show the current sequential step. Modal call IDs, App and
-Environment names, Volume names and paths, dashboard links, tracebacks, and
-internal filesystem paths remain private.
+detail page can show the current sequential step. SQLite also retains an
+ordered `stage_history` timing record: a stage starts when its direct call is
+durably attached, completes when the reconciler records its observed
+completion, and result packaging spans `finalizing` through archive
+publication. Modal call IDs, App and Environment names, Volume names and paths,
+dashboard links, tracebacks, and internal filesystem paths remain private.
 
 The GROMACS API sequence is:
 
@@ -202,13 +205,20 @@ the control plane cannot prove inactivity or issue a targeted cancellation. A
 Cancellation request therefore remains pending through the submission lease
 and becomes `failed`, not falsely `cancelled`, when that lease expires.
 
-Initial submission uses a short SQLite lease and the stable run name
-`api-<job UUID>`. An idempotent replay cannot create a second call while that
-lease is active. If the process dies after claiming the Job but before storing
-a Modal call ID, reconciliation leaves the Job queued until the lease expires
-and then fails it with `compute_failed`. It does not automatically resubmit an
-operation whose provider outcome cannot be proven, because doing so could
-duplicate paid compute. The User must start a new Submission explicitly.
+Initial submission uses a short SQLite lease and a stable run name made from a
+sanitized display-name slug plus the full Job UUID, for example
+`kinase-trial-<job UUID without hyphens>`. The deployed GROMACS App uses that
+single value for both its Volume directory and scientific filenames, so the
+UUID suffix prevents repeated display names from silently reusing another
+Job's checkpoints. The API does not change the established App interface.
+Legacy `api-<job UUID>` names remain valid for stored Result recovery.
+
+An idempotent replay cannot create a second call while the lease is active. If
+the process dies after claiming the Job but before storing a Modal call ID,
+reconciliation leaves the Job queued until the lease expires and then fails it
+with `compute_failed`. It does not automatically resubmit an operation whose
+provider outcome cannot be proven, because doing so could duplicate paid
+compute. The User must start a new Submission explicitly.
 
 Every later stage transition takes the same kind of durable lease before
 calling `.spawn()`. A returned call ID atomically replaces the prior completed

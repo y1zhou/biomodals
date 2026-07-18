@@ -126,6 +126,7 @@ class JobRecord:
     modal_call_id: str | None
     provider_operation: str | None
     run_name: str | None
+    stage_history_json: str
     submission_token: str | None
     submission_lease_until: int | None
     result_volume_name: str | None
@@ -155,6 +156,11 @@ class JobRecord:
         return value
 
     @property
+    def stage_history(self) -> list[JobStageRecord]:
+        """Decode the ordered stage transitions retained for this job."""
+        return _stage_history_from_json(self.stage_history_json)
+
+    @property
     def modal_configuration(self) -> ModalConfigurationSnapshot:
         """Return the provider identity captured when this Job was admitted."""
         return ModalConfigurationSnapshot(
@@ -172,12 +178,104 @@ class JobAdmission:
 
 
 @dataclass(frozen=True, slots=True)
+class JobStageRecord:
+    """One durable workload operation and its observed timing."""
+
+    provider_operation: str
+    started_at: int
+    completed_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkloadConfigurationRecord:
     """Optional database overrides for one fixed API workload."""
 
     workload: str
     modal_app_name: str | None
     active_job_limit: int | None
+
+
+def _stage_history_from_json(value: str) -> list[JobStageRecord]:
+    document = orjson.loads(value)
+    if not isinstance(document, list):
+        raise ValueError("stage_history_json must contain a JSON list")
+    history: list[JobStageRecord] = []
+    for item in document:
+        if not isinstance(item, dict) or set(item) != {
+            "provider_operation",
+            "started_at",
+            "completed_at",
+        }:
+            raise ValueError("stage_history_json contains an invalid stage")
+        provider_operation = item["provider_operation"]
+        started_at = item["started_at"]
+        completed_at = item["completed_at"]
+        if (
+            not isinstance(provider_operation, str)
+            or not provider_operation
+            or not isinstance(started_at, int)
+            or isinstance(started_at, bool)
+            or (
+                completed_at is not None
+                and (
+                    not isinstance(completed_at, int)
+                    or isinstance(completed_at, bool)
+                    or completed_at < started_at
+                )
+            )
+        ):
+            raise ValueError("stage_history_json contains an invalid stage")
+        history.append(
+            JobStageRecord(
+                provider_operation=provider_operation,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        )
+    return history
+
+
+def _transition_stage_history_json(
+    value: str,
+    *,
+    now: int,
+    complete_operation: str | None = None,
+    start_operation: str | None = None,
+) -> str:
+    history = _stage_history_from_json(value)
+    if complete_operation is not None:
+        for index in range(len(history) - 1, -1, -1):
+            stage = history[index]
+            if (
+                stage.provider_operation == complete_operation
+                and stage.completed_at is None
+            ):
+                history[index] = JobStageRecord(
+                    provider_operation=stage.provider_operation,
+                    started_at=stage.started_at,
+                    completed_at=max(now, stage.started_at),
+                )
+                break
+    if start_operation is not None and not (
+        history
+        and history[-1].provider_operation == start_operation
+        and history[-1].completed_at is None
+    ):
+        history.append(
+            JobStageRecord(
+                provider_operation=start_operation,
+                started_at=now,
+                completed_at=None,
+            )
+        )
+    return orjson.dumps([
+        {
+            "provider_operation": stage.provider_operation,
+            "started_at": stage.started_at,
+            "completed_at": stage.completed_at,
+        }
+        for stage in history
+    ]).decode()
 
 
 class ServiceStore:
@@ -254,6 +352,7 @@ class ServiceStore:
                         modal_call_id TEXT,
                         provider_operation TEXT,
                         run_name TEXT,
+                        stage_history_json TEXT NOT NULL DEFAULT '[]',
                         submission_token TEXT,
                         submission_lease_until INTEGER,
                         result_volume_name TEXT,
@@ -288,7 +387,7 @@ class ServiceStore:
                             CHECK (active_job_limit IS NULL OR active_job_limit >= 1)
                     );
 
-                    PRAGMA user_version = 5;
+                    PRAGMA user_version = 6;
                     COMMIT;
                     """
                 )
@@ -297,11 +396,23 @@ class ServiceStore:
                     """
                     BEGIN IMMEDIATE;
                     ALTER TABLE jobs ADD COLUMN provider_operation TEXT;
-                    PRAGMA user_version = 5;
+                    ALTER TABLE jobs ADD COLUMN stage_history_json TEXT NOT NULL
+                        DEFAULT '[]';
+                    PRAGMA user_version = 6;
                     COMMIT;
                     """
                 )
-            elif version != 5:
+            elif version == 5:
+                conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE jobs ADD COLUMN stage_history_json TEXT NOT NULL
+                        DEFAULT '[]';
+                    PRAGMA user_version = 6;
+                    COMMIT;
+                    """
+                )
+            elif version != 6:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
                     f"{version}; initialize fresh state"
@@ -1142,6 +1253,20 @@ class ServiceStore:
                 raise JobSubmissionConflictError(
                     f"Submission lease is no longer valid for job {job_id}"
                 )
+            if cursor.rowcount == 1:
+                history_json = _transition_stage_history_json(
+                    str(row["stage_history_json"]),
+                    now=updated_at,
+                    start_operation=provider_operation,
+                )
+                conn.execute(
+                    "UPDATE jobs SET stage_history_json = ? WHERE job_id = ?",
+                    (history_json, str(job_id)),
+                )
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?",
+                    (str(job_id),),
+                ).fetchone()
         return _job_from_row(row)
 
     def claim_provider_advance(
@@ -1183,7 +1308,68 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
+            history_json = _transition_stage_history_json(
+                str(row["stage_history_json"]),
+                now=now,
+                complete_operation=row["provider_operation"],
+            )
+            conn.execute(
+                "UPDATE jobs SET stage_history_json = ? WHERE job_id = ?",
+                (history_json, str(job_id)),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
         return _job_from_row(row)
+
+    def mark_provider_operation_completed(
+        self,
+        job_id: UUID,
+        *,
+        expected_modal_call_id: str,
+        now: int,
+    ) -> JobRecord | None:
+        """Record an observed completion without claiming the next operation."""
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            if (
+                row["modal_call_id"] != expected_modal_call_id
+                or JobState(row["state"]) in TERMINAL_JOB_STATES
+            ):
+                return None
+            history_json = _transition_stage_history_json(
+                str(row["stage_history_json"]),
+                now=now,
+                complete_operation=row["provider_operation"],
+            )
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET stage_history_json = ?, updated_at = ?
+                WHERE job_id = ? AND modal_call_id = ?
+                  AND state IN (?, ?, ?, ?)
+                """,
+                (
+                    history_json,
+                    now,
+                    str(job_id),
+                    expected_modal_call_id,
+                    *(state.value for state in ACTIVE_JOB_STATES),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            updated = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return _job_from_row(updated)
 
     def release_provider_advance(
         self,
@@ -1229,6 +1415,12 @@ class ServiceStore:
         if not provider_operation:
             raise ValueError("Provider operation must not be empty")
         with self._transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if previous is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
             cursor = conn.execute(
                 """
                 UPDATE jobs
@@ -1254,12 +1446,24 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
             if cursor.rowcount != 1:
                 raise JobSubmissionConflictError(
                     f"Provider operation changed concurrently for job {job_id}"
                 )
+            history_json = _transition_stage_history_json(
+                str(previous["stage_history_json"]),
+                now=now,
+                complete_operation=previous["provider_operation"],
+                start_operation=provider_operation,
+            )
+            conn.execute(
+                "UPDATE jobs SET stage_history_json = ? WHERE job_id = ?",
+                (history_json, str(job_id)),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
         return _job_from_row(row)
 
     def request_cancel(
@@ -1324,14 +1528,24 @@ class ServiceStore:
                 and state not in TERMINAL_JOB_STATES
             ):
                 return _job_from_row(row)
+            history_json = str(row["stage_history_json"])
+            if state == JobState.FINALIZING:
+                history_json = _transition_stage_history_json(
+                    history_json,
+                    now=now,
+                    complete_operation=row["provider_operation"],
+                    start_operation="result_packaging",
+                )
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, updated_at = ?, completed_at = ?
+                SET state = ?, stage_history_json = ?, updated_at = ?,
+                    completed_at = ?
                 WHERE job_id = ?
                 """,
                 (
                     state.value,
+                    history_json,
                     now,
                     now if state in TERMINAL_JOB_STATES else None,
                     str(job_id),
@@ -1368,13 +1582,25 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if JobState(row["state"]) in (JobState.SUCCEEDED, JobState.PARTIAL):
                 return _job_from_row(row)
+            history_json = _transition_stage_history_json(
+                str(row["stage_history_json"]),
+                now=now,
+                complete_operation=row["provider_operation"],
+                start_operation="result_packaging",
+            )
+            history_json = _transition_stage_history_json(
+                history_json,
+                now=now,
+                complete_operation="result_packaging",
+            )
             conn.execute(
                 """
                 UPDATE jobs
                 SET state = ?, result_volume_name = ?, result_volume_path = ?,
                     result_filename = ?, result_size_bytes = ?,
                     result_sha256 = ?, warnings_json = ?, error_code = NULL,
-                    error_message = NULL, updated_at = ?, completed_at = ?
+                    error_message = NULL, stage_history_json = ?, updated_at = ?,
+                    completed_at = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -1385,6 +1611,7 @@ class ServiceStore:
                     result_size_bytes,
                     result_sha256,
                     warnings_json,
+                    history_json,
                     now,
                     now,
                     str(job_id),
@@ -1495,6 +1722,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         modal_call_id=row["modal_call_id"],
         provider_operation=row["provider_operation"],
         run_name=row["run_name"],
+        stage_history_json=str(row["stage_history_json"]),
         submission_token=row["submission_token"],
         submission_lease_until=row["submission_lease_until"],
         result_volume_name=row["result_volume_name"],

@@ -12,7 +12,7 @@ from typing import Literal, Protocol, cast
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
-from biomodals.service.store import JobRecord, JobState
+from biomodals.service.store import JobRecord, JobStageRecord, JobState
 
 LOGGER = logging.getLogger(__name__)
 JobErrorCode = Literal["compute_failed", "result_invalid", "result_unavailable"]
@@ -34,15 +34,20 @@ DeployedFunctionName = Literal[
 
 
 class JobStageView(BaseModel):
-    """Safe current execution stage without a provider call identifier."""
+    """Safe execution stage timing without a provider call identifier."""
 
     model_config = ConfigDict(frozen=True)
 
     code: JobStageCode
     function_name: DeployedFunctionName | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
-_GROMACS_STAGES: dict[str, tuple[JobStageCode, DeployedFunctionName]] = {
+_GROMACS_STAGES: dict[
+    str,
+    tuple[JobStageCode, DeployedFunctionName | None],
+] = {
     "prepare_tpr_cpu": ("preparation", "prepare_tpr_cpu"),
     "prepare_tpr_gpu": ("preparation", "prepare_tpr_gpu"),
     "collect_traj_stats:nvt_": ("nvt_analysis", "collect_traj_stats"),
@@ -53,10 +58,35 @@ _GROMACS_STAGES: dict[str, tuple[JobStageCode, DeployedFunctionName]] = {
         "production_analysis",
         "collect_traj_stats",
     ),
+    "result_packaging": ("result_packaging", None),
 }
 
 
-def _job_stage(record: JobRecord) -> JobStageView | None:
+def _stage_view(
+    provider_operation: str,
+    event: JobStageRecord | None = None,
+) -> JobStageView | None:
+    stage = _GROMACS_STAGES.get(provider_operation)
+    if stage is None:
+        return None
+    return JobStageView(
+        code=stage[0],
+        function_name=stage[1],
+        started_at=(
+            datetime.fromtimestamp(event.started_at, UTC) if event is not None else None
+        ),
+        completed_at=(
+            datetime.fromtimestamp(event.completed_at, UTC)
+            if event is not None and event.completed_at is not None
+            else None
+        ),
+    )
+
+
+def _job_stage(
+    record: JobRecord,
+    history: Sequence[JobStageRecord],
+) -> JobStageView | None:
     if record.workload != "gromacs":
         return None
     if record.state in {
@@ -68,9 +98,31 @@ def _job_stage(record: JobRecord) -> JobStageView | None:
         and record.error_code in {"result_invalid", "result_unavailable"}
         and record.provider_operation in {None, "collect_traj_stats:production_"}
     ):
-        return JobStageView(code="result_packaging")
-    stage = _GROMACS_STAGES.get(record.provider_operation or "")
-    return JobStageView(code=stage[0], function_name=stage[1]) if stage else None
+        provider_operation = "result_packaging"
+    else:
+        provider_operation = record.provider_operation or ""
+    event = next(
+        (
+            candidate
+            for candidate in reversed(history)
+            if candidate.provider_operation == provider_operation
+        ),
+        None,
+    )
+    return _stage_view(provider_operation, event)
+
+
+def _job_stage_history(
+    record: JobRecord,
+    history: Sequence[JobStageRecord],
+) -> list[JobStageView]:
+    if record.workload != "gromacs":
+        return []
+    return [
+        stage
+        for event in history
+        if (stage := _stage_view(event.provider_operation, event)) is not None
+    ]
 
 
 class JobView(BaseModel):
@@ -83,6 +135,7 @@ class JobView(BaseModel):
     display_name: str
     state: JobState
     stage: JobStageView | None = None
+    stage_history: list[JobStageView] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
@@ -95,12 +148,14 @@ class JobView(BaseModel):
     def from_record(cls, record: JobRecord) -> JobView:
         """Build a safe public view without exposing Modal identifiers or paths."""
         warnings = record.warnings
+        stage_history = record.stage_history
         return cls(
             job_id=str(record.job_id),
             workload=record.workload,
             display_name=record.display_name,
             state=record.state,
-            stage=_job_stage(record),
+            stage=_job_stage(record, stage_history),
+            stage_history=_job_stage_history(record, stage_history),
             created_at=datetime.fromtimestamp(record.created_at, UTC),
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),
             completed_at=(

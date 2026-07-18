@@ -34,7 +34,7 @@ from biomodals.service.runtime_config import (
 )
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 
-RUN_NAME = "api-0123456789abcdef0123456789abcdef"
+RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 SHA256 = "a" * 64
 _PENDING = object()
 
@@ -795,6 +795,7 @@ def test_completed_stage_does_not_advance_after_cancellation(tmp_path: Path) -> 
     assert cancelled is not None
     assert cancelled.state == JobState.CANCELLED
     assert cancelled.modal_call_id == "fc-root"
+    assert cancelled.stage_history[-1].completed_at == 10
 
 
 def test_completed_archive_wins_cancel_race(
@@ -1069,28 +1070,28 @@ def test_intermediate_cleanup_is_opt_in_and_preserves_final_archives(
     due_succeeded = _terminal_job(
         store,
         user.user_id,
-        run_name=f"api-{'1' * 32}",
+        run_name=f"first-simulation-{'1' * 32}",
         state=JobState.SUCCEEDED,
         completed_at=100,
     )
     due_partial = _terminal_job(
         store,
         user.user_id,
-        run_name=f"api-{'2' * 32}",
+        run_name=f"second-simulation-{'2' * 32}",
         state=JobState.PARTIAL,
         completed_at=200,
     )
     recent_succeeded = _terminal_job(
         store,
         user.user_id,
-        run_name=f"api-{'3' * 32}",
+        run_name=f"recent-simulation-{'3' * 32}",
         state=JobState.SUCCEEDED,
         completed_at=now - 60,
     )
     due_failed = _terminal_job(
         store,
         user.user_id,
-        run_name=f"api-{'4' * 32}",
+        run_name=f"failed-simulation-{'4' * 32}",
         state=JobState.FAILED,
         completed_at=300,
     )

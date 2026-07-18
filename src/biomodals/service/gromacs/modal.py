@@ -22,6 +22,7 @@ from biomodals.service.gromacs.archive import (
 from biomodals.service.gromacs.router import (
     GromacsJobOptions,
     SubmissionOutcomeUnknownError,
+    is_gromacs_run_name,
 )
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import (
@@ -33,7 +34,6 @@ from biomodals.service.store import (
 
 LOGGER = logging.getLogger(__name__)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_API_RUN_NAME = re.compile(r"api-[0-9a-f]{32}")
 _NVT_ANALYSIS = "collect_traj_stats:nvt_"
 _NPT_ANALYSIS = "collect_traj_stats:npt_"
 _PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
@@ -286,7 +286,7 @@ class ModalGromacsAdapter:
             job.result_volume_name != self.output_volume_name
             or job.result_volume_path is None
             or job.run_name is None
-            or _API_RUN_NAME.fullmatch(job.run_name) is None
+            or not is_gromacs_run_name(job.run_name)
             or job.result_volume_path != f"api-results/{job.run_name}/result.zip"
             or job.result_filename != f"{job.run_name}.zip"
             or type(job.result_size_bytes) is not int
@@ -304,7 +304,7 @@ class ModalGromacsAdapter:
 
     async def cleanup_intermediates(self, job: JobRecord) -> None:
         """Remove one retained run directory without touching its final ZIP."""
-        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+        if job.run_name is None or not is_gromacs_run_name(job.run_name):
             raise ValueError("Job has no valid API run directory")
         volume = modal.Volume.from_name(
             self.output_volume_name,
@@ -322,7 +322,7 @@ class ModalGromacsAdapter:
         completed_at: int,
     ) -> FinalArchive:
         """Build and publish a ZIP from the established app's Volume files."""
-        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+        if job.run_name is None or not is_gromacs_run_name(job.run_name):
             raise ValueError("Job has no valid API run name")
         volume = modal.Volume.from_name(
             self.output_volume_name,
@@ -374,7 +374,7 @@ class ModalGromacsAdapter:
 
     async def _result_marker(self, job: JobRecord) -> _ResultMarker:
         """Read and validate the completion marker for one stable run."""
-        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+        if job.run_name is None or not is_gromacs_run_name(job.run_name):
             raise ValueError("Job has no valid API run name")
         marker_path = f"api-results/{job.run_name}/result.json"
         volume = modal.Volume.from_name(
@@ -423,7 +423,7 @@ class ModalGromacsAdapter:
         marker: _ResultMarker,
     ) -> None:
         """Verify Volume bytes and the complete ZIP contract before success."""
-        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+        if job.run_name is None or not is_gromacs_run_name(job.run_name):
             raise ValueError("Job has no valid API run name")
         archive_path = f"api-results/{job.run_name}/result.zip"
         volume = modal.Volume.from_name(
@@ -563,7 +563,7 @@ class GromacsReconciler:
                         error_code="result_unavailable",
                         error_message=(
                             "GROMACS completed, but its stage result expired before "
-                            "the Job could continue."
+                            "the job could continue."
                         ),
                         now=self._now(),
                     )
@@ -603,11 +603,18 @@ class GromacsReconciler:
                 _FINAL_OPERATION,
             }:
                 if job.state == JobState.CANCEL_REQUESTED:
-                    self.store.set_job_state(
+                    now = self._now()
+                    completed = self.store.mark_provider_operation_completed(
                         job.job_id,
-                        JobState.CANCELLED,
-                        now=self._now(),
+                        expected_modal_call_id=job.modal_call_id or "",
+                        now=now,
                     )
+                    if completed is not None:
+                        self.store.set_job_state(
+                            job.job_id,
+                            JobState.CANCELLED,
+                            now=now,
+                        )
                 else:
                     await self._advance(job)
                 continue

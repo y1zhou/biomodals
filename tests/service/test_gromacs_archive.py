@@ -15,7 +15,7 @@ from biomodals.service.gromacs.archive import (
     write_gromacs_archive,
 )
 
-RUN_NAME = "api-0123456789abcdef0123456789abcdef"
+RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
 PARAMETERS = '{"cpu_only":false,"simulation_time_ns":5}'
 

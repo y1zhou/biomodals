@@ -196,6 +196,7 @@ def _submit(
     *,
     idempotency_key: str | None = None,
     simulation_time_ns: int = 3,
+    display_name: str = "First simulation",
 ):
     headers = _unsafe_headers(csrf_token)
     if idempotency_key is not None:
@@ -205,7 +206,7 @@ def _submit(
         headers=headers,
         files={"pdb": ("protein.pdb", VALID_PDB, "chemical/x-pdb")},
         data={
-            "display_name": "First simulation",
+            "display_name": display_name,
             "simulation_time_ns": str(simulation_time_ns),
             "cpu_only": "true",
         },
@@ -807,10 +808,10 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert first.json()["workload"] == "gromacs"
     assert first.json()["display_name"] == "First simulation"
     assert first.json()["state"] == "queued"
-    assert first.json()["stage"] == {
-        "code": "preparation",
-        "function_name": "prepare_tpr_cpu",
-    }
+    assert first.json()["stage"]["code"] == "preparation"
+    assert first.json()["stage"]["function_name"] == "prepare_tpr_cpu"
+    assert first.json()["stage"]["started_at"]
+    assert first.json()["stage_history"] == [first.json()["stage"]]
     assert conflict.status_code == 409
     assert conflict.json()["code"] == "idempotency_conflict"
     assert missing_key.status_code == 422
@@ -818,7 +819,7 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert len(adapter.submissions) == 1
     pdb_content, run_name, options = adapter.submissions[0]
     assert pdb_content == VALID_PDB
-    assert run_name
+    assert run_name == f"first-simulation-{UUID(first.json()['job_id']).hex}"
     assert options == GromacsJobOptions(simulation_time_ns=3, cpu_only=True)
 
 
@@ -854,7 +855,14 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     assert analyzing.json()["stage"] == {
         "code": "nvt_analysis",
         "function_name": "collect_traj_stats",
+        "started_at": "2027-01-15T08:00:01Z",
     }
+    preparation, nvt_analysis = analyzing.json()["stage_history"]
+    assert preparation["code"] == "preparation"
+    assert preparation["function_name"] == "prepare_tpr_cpu"
+    assert preparation["started_at"]
+    assert preparation["completed_at"] == "2027-01-15T08:00:01Z"
+    assert nvt_analysis == analyzing.json()["stage"]
     assert "modal_call_id" not in analyzing.json()
     assert "provider_operation" not in analyzing.json()
 
@@ -869,6 +877,7 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     assert unavailable.json()["stage"] == {
         "code": "nvt_analysis",
         "function_name": "collect_traj_stats",
+        "started_at": "2027-01-15T08:00:01Z",
     }
 
     submitted_packaging = _submit(
@@ -884,7 +893,14 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     )
     packaging = client.get(f"/api/v1/jobs/{packaging_job_id}")
 
-    assert packaging.json()["stage"] == {"code": "result_packaging"}
+    assert packaging.json()["stage"] == {
+        "code": "result_packaging",
+        "started_at": "2027-01-15T08:00:03Z",
+    }
+    assert packaging.json()["stage_history"][-2]["completed_at"] == (
+        "2027-01-15T08:00:03Z"
+    )
+    assert packaging.json()["stage_history"][-1] == packaging.json()["stage"]
 
     schema = client.get("/openapi.json").json()
     stage_schema = schema["components"]["schemas"]["JobStageView"]
@@ -896,6 +912,34 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
         "production_analysis",
         "result_packaging",
     ]
+    assert stage_schema["properties"]["started_at"]["anyOf"][0]["format"] == (
+        "date-time"
+    )
+    assert stage_schema["properties"]["completed_at"]["anyOf"][0]["format"] == (
+        "date-time"
+    )
+    assert schema["components"]["schemas"]["JobView"]["properties"]["stage_history"][
+        "items"
+    ]["$ref"].endswith("/JobStageView")
+
+
+def test_gromacs_run_name_is_readable_sanitized_and_unique(tmp_path: Path) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+
+    response = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+        display_name="  Kinase / alpha: trial #1  ",
+    )
+
+    assert response.status_code == 202
+    assert response.json()["display_name"] == "Kinase / alpha: trial #1"
+    assert adapter.submissions[0][1] == (
+        f"kinase-alpha-trial-1-{UUID(response.json()['job_id']).hex}"
+    )
 
 
 def test_gromacs_simulation_time_accepts_200_ns_and_rejects_201(
@@ -941,7 +985,9 @@ def test_failed_spawn_can_retry_the_same_stable_run(
     assert retried.json()["state"] == "queued"
     assert len(adapter.submissions) == 2
     assert adapter.submissions[0][1] == adapter.submissions[1][1]
-    assert adapter.submissions[0][1] == f"api-{UUID(retried.json()['job_id']).hex}"
+    assert adapter.submissions[0][1] == (
+        f"first-simulation-{UUID(retried.json()['job_id']).hex}"
+    )
 
 
 def test_unknown_spawn_outcome_is_not_retried(

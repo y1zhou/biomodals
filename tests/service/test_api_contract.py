@@ -802,6 +802,10 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert first.json()["workload"] == "gromacs"
     assert first.json()["display_name"] == "First simulation"
     assert first.json()["state"] == "queued"
+    assert first.json()["stage"] == {
+        "code": "preparation",
+        "function_name": "prepare_tpr_cpu",
+    }
     assert conflict.status_code == 409
     assert conflict.json()["code"] == "idempotency_conflict"
     assert missing_key.status_code == 422
@@ -811,6 +815,73 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert pdb_content == VALID_PDB
     assert run_name
     assert options == GromacsJobOptions(simulation_time_ns=3, cpu_only=True)
+
+
+def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> None:
+    client, auth, store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+    )
+    job_id = UUID(submitted.json()["job_id"])
+
+    store.replace_provider_call(
+        job_id,
+        expected_modal_call_id="fc-1",
+        modal_call_id="fc-2",
+        provider_operation="collect_traj_stats:nvt_",
+        now=1_800_000_001,
+    )
+    analyzing = client.get(f"/api/v1/jobs/{job_id}")
+
+    assert analyzing.json()["stage"] == {
+        "code": "nvt_analysis",
+        "function_name": "collect_traj_stats",
+    }
+    assert "modal_call_id" not in analyzing.json()
+    assert "provider_operation" not in analyzing.json()
+
+    store.fail_job(
+        job_id,
+        error_code="result_unavailable",
+        error_message="The stage result expired.",
+        now=1_800_000_002,
+    )
+    unavailable = client.get(f"/api/v1/jobs/{job_id}")
+
+    assert unavailable.json()["stage"] == {
+        "code": "nvt_analysis",
+        "function_name": "collect_traj_stats",
+    }
+
+    submitted_packaging = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+    )
+    packaging_job_id = UUID(submitted_packaging.json()["job_id"])
+    store.set_job_state(
+        packaging_job_id,
+        JobState.FINALIZING,
+        now=1_800_000_003,
+    )
+    packaging = client.get(f"/api/v1/jobs/{packaging_job_id}")
+
+    assert packaging.json()["stage"] == {"code": "result_packaging"}
+
+    schema = client.get("/openapi.json").json()
+    stage_schema = schema["components"]["schemas"]["JobStageView"]
+    assert stage_schema["properties"]["code"]["enum"] == [
+        "preparation",
+        "nvt_analysis",
+        "npt_analysis",
+        "production",
+        "production_analysis",
+        "result_packaging",
+    ]
 
 
 def test_gromacs_simulation_time_accepts_200_ns_and_rejects_201(

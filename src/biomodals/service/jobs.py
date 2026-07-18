@@ -16,6 +16,61 @@ from biomodals.service.store import JobRecord, JobState
 
 LOGGER = logging.getLogger(__name__)
 JobErrorCode = Literal["compute_failed", "result_invalid", "result_unavailable"]
+JobStageCode = Literal[
+    "preparation",
+    "nvt_analysis",
+    "npt_analysis",
+    "production",
+    "production_analysis",
+    "result_packaging",
+]
+DeployedFunctionName = Literal[
+    "prepare_tpr_cpu",
+    "prepare_tpr_gpu",
+    "collect_traj_stats",
+    "production_run_cpu",
+    "production_run_gpu",
+]
+
+
+class JobStageView(BaseModel):
+    """Safe current execution stage without a provider call identifier."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: JobStageCode
+    function_name: DeployedFunctionName | None = None
+
+
+_GROMACS_STAGES: dict[str, tuple[JobStageCode, DeployedFunctionName]] = {
+    "prepare_tpr_cpu": ("preparation", "prepare_tpr_cpu"),
+    "prepare_tpr_gpu": ("preparation", "prepare_tpr_gpu"),
+    "collect_traj_stats:nvt_": ("nvt_analysis", "collect_traj_stats"),
+    "collect_traj_stats:npt_": ("npt_analysis", "collect_traj_stats"),
+    "production_run_cpu": ("production", "production_run_cpu"),
+    "production_run_gpu": ("production", "production_run_gpu"),
+    "collect_traj_stats:production_": (
+        "production_analysis",
+        "collect_traj_stats",
+    ),
+}
+
+
+def _job_stage(record: JobRecord) -> JobStageView | None:
+    if record.workload != "gromacs":
+        return None
+    if record.state in {
+        JobState.FINALIZING,
+        JobState.SUCCEEDED,
+        JobState.PARTIAL,
+    } or (
+        record.state == JobState.FAILED
+        and record.error_code in {"result_invalid", "result_unavailable"}
+        and record.provider_operation in {None, "collect_traj_stats:production_"}
+    ):
+        return JobStageView(code="result_packaging")
+    stage = _GROMACS_STAGES.get(record.provider_operation or "")
+    return JobStageView(code=stage[0], function_name=stage[1]) if stage else None
 
 
 class JobView(BaseModel):
@@ -27,6 +82,7 @@ class JobView(BaseModel):
     workload: str
     display_name: str
     state: JobState
+    stage: JobStageView | None = None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
@@ -44,6 +100,7 @@ class JobView(BaseModel):
             workload=record.workload,
             display_name=record.display_name,
             state=record.state,
+            stage=_job_stage(record),
             created_at=datetime.fromtimestamp(record.created_at, UTC),
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),
             completed_at=(

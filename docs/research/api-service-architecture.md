@@ -148,10 +148,11 @@ The submit route persists the job, spawns the first Modal stage, stores its
 Function name and call identifier internally, and returns `202`. When that call
 completes, the reconciler resolves the next deployed Function by name and
 atomically replaces the stored active operation and call identifier. Exactly
-one direct stage is the durable active operation at a time. Modal Function
-names, call IDs, Volume names and paths, dashboard links, tracebacks, and
-internal filesystem paths are never part of the public response or OpenAPI
-schema.
+one direct stage is the durable active operation at a time. `JobView` exposes a
+sanitized stage code and the associated deployed Function name so the Job
+detail page can show the current sequential step. Modal call IDs, App and
+Environment names, Volume names and paths, dashboard links, tracebacks, and
+internal filesystem paths remain private.
 
 The GROMACS API sequence is:
 

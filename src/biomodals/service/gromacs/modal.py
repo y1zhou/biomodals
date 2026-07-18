@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
 import re
 import tempfile
@@ -48,6 +47,10 @@ _MODAL_SERVICE_ERRORS = (
     modal.exception.PermissionDeniedError,
     modal.exception.ResourceExhaustedError,
     modal.exception.ServiceError,
+)
+_MODAL_PUBLICATION_ERRORS = _MODAL_SERVICE_ERRORS + (
+    modal.exception.ExecutionError,
+    modal.exception.VolumeUploadTimeoutError,
 )
 
 
@@ -332,7 +335,10 @@ class ModalGromacsAdapter:
 
         archive_path = f"api-results/{job.run_name}/result.zip"
         marker_path = f"api-results/{job.run_name}/result.json"
-        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as archive:
+        with (
+            tempfile.NamedTemporaryFile() as archive,
+            tempfile.NamedTemporaryFile() as marker_file,
+        ):
             archive_handle = cast("BinaryIO", archive)
             built = await write_gromacs_archive(
                 archive_handle,
@@ -349,10 +355,12 @@ class ModalGromacsAdapter:
                 "archive_sha256": built.sha256,
                 "size_bytes": built.size_bytes,
             })
-            archive_handle.seek(0)
+            marker_file.write(marker)
+            archive_handle.flush()
+            marker_file.flush()
             async with volume.batch_upload.aio(force=True) as upload:
-                upload.put_file(archive_handle, archive_path)
-                upload.put_file(io.BytesIO(marker), marker_path)
+                upload.put_file(archive.name, archive_path)
+                upload.put_file(marker_file.name, marker_path)
 
         return FinalArchive(
             state=JobState.SUCCEEDED,
@@ -728,7 +736,7 @@ class GromacsReconciler:
         except ArchiveNotReadyError:
             LOGGER.info("GROMACS archive is not visible yet for job %s", job.job_id)
             return
-        except _MODAL_SERVICE_ERRORS:
+        except _MODAL_PUBLICATION_ERRORS:
             LOGGER.exception("Modal is unavailable while publishing job %s", job.job_id)
             return
         except Exception:

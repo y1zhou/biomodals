@@ -124,12 +124,15 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
         "provenance.json": b"{}\n",
         "run.log": b"completed\n",
         "outputs/production.mdp": b"integrator = md\n",
-        f"outputs/{prefix}.xtc": b"trajectory",
+        f"outputs/{prefix}_nopbc.xtc": b"processed trajectory",
         f"outputs/{prefix}.tpr": b"topology",
         f"outputs/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
         f"outputs/rmsd_{prefix}.csv": b"time,rmsd\n",
+        f"outputs/rmsd_{prefix}.png": b"rmsd plot",
         f"outputs/rg_{prefix}.csv": b"time,rg\n",
+        f"outputs/rg_{prefix}.png": b"rg plot",
         f"outputs/rmsf_{prefix}.csv": b"residue,rmsf\n",
+        f"outputs/rmsf_{prefix}.png": b"rmsf plot",
     }
     roles = {
         "input.pdb": "input_structure",
@@ -137,12 +140,15 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
         "provenance.json": "provenance",
         "run.log": "run_log",
         "outputs/production.mdp": "production_parameters",
-        f"outputs/{prefix}.xtc": "trajectory",
+        f"outputs/{prefix}_nopbc.xtc": "trajectory",
         f"outputs/{prefix}.tpr": "production_topology",
         f"outputs/{prefix}_nopbc_centered.pdb": "centered_structure",
         f"outputs/rmsd_{prefix}.csv": "rmsd",
+        f"outputs/rmsd_{prefix}.png": "rmsd_plot",
         f"outputs/rg_{prefix}.csv": "radius_of_gyration",
+        f"outputs/rg_{prefix}.png": "radius_of_gyration_plot",
         f"outputs/rmsf_{prefix}.csv": "rmsf",
+        f"outputs/rmsf_{prefix}.png": "rmsf_plot",
     }
     records = [
         {
@@ -222,8 +228,8 @@ def _install_volume(
             class Upload:
                 @staticmethod
                 def put_file(source, path: str) -> None:
-                    source.seek(0)
-                    files[path] = source.read()
+                    assert isinstance(source, (str, Path))
+                    files[path] = Path(source).read_bytes()
 
             yield Upload()
 
@@ -245,12 +251,15 @@ def _established_output_files() -> dict[str, bytes]:
             b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
         ),
         f"{RUN_NAME}/production.mdp": b"integrator = md\n",
-        f"{RUN_NAME}/{prefix}.xtc": b"trajectory",
+        f"{RUN_NAME}/{prefix}_nopbc.xtc": b"processed trajectory",
         f"{RUN_NAME}/{prefix}.tpr": b"topology",
         f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
         f"{RUN_NAME}/rmsd_{prefix}.csv": b"time,rmsd\n",
+        f"{RUN_NAME}/rmsd_{prefix}.png": b"rmsd plot",
         f"{RUN_NAME}/rg_{prefix}.csv": b"time,rg\n",
+        f"{RUN_NAME}/rg_{prefix}.png": b"rg plot",
         f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue,rmsf\n",
+        f"{RUN_NAME}/rmsf_{prefix}.png": b"rmsf plot",
     }
 
 
@@ -633,7 +642,10 @@ def test_service_packages_and_publishes_established_app_outputs(
     assert marker["archive_sha256"] == archive.sha256
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as result:
         assert result.read("input.pdb") == files[f"{RUN_NAME}/{RUN_NAME}.pdb"]
-        assert result.read(f"outputs/production_{RUN_NAME}.xtc") == b"trajectory"
+        assert (
+            result.read(f"outputs/production_{RUN_NAME}_nopbc.xtc")
+            == b"processed trajectory"
+        )
 
 
 def test_reconciler_advances_completed_stage_to_one_direct_named_call(
@@ -814,9 +826,17 @@ def test_completed_archive_wins_cancel_race(
     assert ("cancel", "fc-root", False) in root.events
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        modal.exception.ConnectionError("temporary"),
+        modal.exception.ExecutionError("upload failed"),
+    ],
+)
 def test_transient_archive_publication_error_remains_finalizing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
@@ -825,7 +845,7 @@ def test_transient_archive_publication_error_remains_finalizing(
     adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
 
     async def unavailable(*_args, **_kwargs):
-        raise modal.exception.ConnectionError("temporary")
+        raise error
 
     monkeypatch.setattr(adapter, "publish_archive", unavailable)
 

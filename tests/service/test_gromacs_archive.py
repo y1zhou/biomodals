@@ -25,12 +25,16 @@ def test_service_packages_established_remote_files_deterministically() -> None:
     remote_files = {
         f"{RUN_NAME}/{RUN_NAME}.pdb": PDB,
         f"{RUN_NAME}/production.mdp": b"integrator = md\n",
-        f"{RUN_NAME}/{prefix}.xtc": b"trajectory",
+        f"{RUN_NAME}/{prefix}.xtc": b"full trajectory",
+        f"{RUN_NAME}/{prefix}_nopbc.xtc": b"processed trajectory",
         f"{RUN_NAME}/{prefix}.tpr": b"topology",
         f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
         f"{RUN_NAME}/rmsd_{prefix}.csv": b"time,rmsd\n",
+        f"{RUN_NAME}/rmsd_{prefix}.png": b"rmsd plot",
         f"{RUN_NAME}/rg_{prefix}.csv": b"time,rg\n",
+        f"{RUN_NAME}/rg_{prefix}.png": b"rg plot",
         f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue,rmsf\n",
+        f"{RUN_NAME}/rmsf_{prefix}.png": b"rmsf plot",
     }
 
     def build() -> tuple[bytes, BuiltGromacsArchive]:
@@ -64,5 +68,9 @@ def test_service_packages_established_remote_files_deterministically() -> None:
     assert validate_gromacs_archive(io.BytesIO(first_bytes), run_name=RUN_NAME)
     with zipfile.ZipFile(io.BytesIO(first_bytes)) as archive:
         assert archive.read("input.pdb") == PDB
-        assert archive.read(f"outputs/{prefix}.xtc") == b"trajectory"
+        assert f"outputs/{prefix}.xtc" not in archive.namelist()
+        assert archive.read(f"outputs/{prefix}_nopbc.xtc") == b"processed trajectory"
+        assert archive.read(f"outputs/rmsd_{prefix}.png") == b"rmsd plot"
+        assert archive.read(f"outputs/rg_{prefix}.png") == b"rg plot"
+        assert archive.read(f"outputs/rmsf_{prefix}.png") == b"rmsf plot"
         assert archive.read("parameters.json") == PARAMETERS.encode()

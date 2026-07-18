@@ -45,12 +45,15 @@ def _expected_manifest_files(run_name: str) -> list[tuple[str, str]]:
         ("provenance.json", "provenance"),
         ("run.log", "run_log"),
         ("outputs/production.mdp", "production_parameters"),
-        (f"outputs/{prefix}.xtc", "trajectory"),
+        (f"outputs/{prefix}_nopbc.xtc", "trajectory"),
         (f"outputs/{prefix}.tpr", "production_topology"),
         (f"outputs/{prefix}_nopbc_centered.pdb", "centered_structure"),
         (f"outputs/rmsd_{prefix}.csv", "rmsd"),
+        (f"outputs/rmsd_{prefix}.png", "rmsd_plot"),
         (f"outputs/rg_{prefix}.csv", "radius_of_gyration"),
+        (f"outputs/rg_{prefix}.png", "radius_of_gyration_plot"),
         (f"outputs/rmsf_{prefix}.csv", "rmsf"),
+        (f"outputs/rmsf_{prefix}.png", "rmsf_plot"),
     ]
 
 

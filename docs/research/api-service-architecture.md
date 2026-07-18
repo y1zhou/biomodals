@@ -222,9 +222,9 @@ requires provider-side idempotent submission or an external durable worker
 before enabling multiple API processes.
 
 The supported `FunctionCall` API does not expose a backend log stream. Live
-stdout streaming is therefore deferred. A sanitized `run.log` is included in
-completed or partial result archives instead of integrating Modal's CLI log
-command into the service.
+stdout streaming is therefore deferred. A small service-generated `run.log`
+records the completed job identity and status instead of integrating Modal's
+CLI log command into the service.
 
 ## Artifact and storage contract
 
@@ -248,12 +248,15 @@ GROMACS App.
 The ZIP contains an explicit allowlist of final outputs, including:
 
 - the exact submitted PDB and normalized parameters;
-- production trajectory, structure, topology and analysis outputs;
-- provenance such as app/version and timestamps;
+- the processed no-PBC production trajectory, centered structure, production
+  topology and parameters;
+- RMSD, radius-of-gyration and RMSF data as CSV files and plots as PNG files;
+- provenance such as the Modal App name and timestamps;
 - a manifest and checksums; and
-- a sanitized `run.log`.
+- a service-generated `run.log`.
 
-It does not recursively package the working directory, credentials, internal
+It excludes the larger raw production trajectory and does not recursively
+package equilibration outputs, the working directory, credentials, internal
 storage paths, databases, or large shared caches.
 
 Modal Volume storage is authoritative. Scientific cache files, databases, and

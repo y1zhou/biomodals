@@ -18,11 +18,16 @@ pattern.
 
 Scientific compute remains in separately deployed Modal Apps. Each workload
 module contributes an `APIRouter` and a narrow Modal adapter to the control
-plane. The adapter resolves a deployed Function with
+plane. The adapter resolves each deployed stage by its Function name with
 `modal.Function.from_name()`, submits it with `.spawn()`, and reconciles the
-detached `FunctionCall`. This keeps the HTTP contract and account data local
-while preserving independent compute images, scaling, and deployment
-lifecycles. [Modal: invoking deployed Functions](https://modal.com/docs/guide/trigger-deployed-functions)
+detached `FunctionCall`. GROMACS has no API-only coordinator or packaging
+Function. The control plane mirrors the established `submit_gromacs_task`
+local entrypoint by calling the existing preparation, trajectory-analysis, and
+production Functions sequentially. After the last Function succeeds, the
+control plane packages the established Volume outputs itself. The GROMACS App
+and its command-line behavior remain unchanged. This keeps the HTTP contract
+and account data local while preserving independent compute images, scaling,
+and deployment lifecycles. [Modal: invoking deployed Functions](https://modal.com/docs/guide/trigger-deployed-functions)
 
 No Modal Web Function, webhook, `@modal.asgi_app`, or
 `@modal.fastapi_endpoint` is needed for this deployment. Those components are
@@ -39,7 +44,13 @@ frontend + /api reverse proxy (one internal origin)
         v
 one FastAPI process
   |-- shared auth, jobs, downloads, SQLite, reconciler
-  |-- /api/v1/gromacs/*   -> GROMACS adapter   -> deployed Gromacs Modal App
+  |-- /api/v1/gromacs/*   -> GROMACS adapter
+  |                            |-> prepare_tpr_{cpu,gpu}
+  |                            |-> collect_traj_stats(nvt_)
+  |                            |-> collect_traj_stats(npt_)
+  |                            |-> production_run_{cpu,gpu}
+  |                            |-> collect_traj_stats(production_)
+  |                            `-> service-built result.zip
   `-- /api/v1/alphafold3/* -> future AF3 adapter -> deployed AF3 Modal App
                                       |
                                       `-> Modal Volumes (authoritative data)
@@ -133,10 +144,40 @@ Every list, inspect, cancel, and download lookup is constrained by both
 `404` as a missing job, before the server resolves any Modal identifier.
 Account administration does not grant access to employee jobs.
 
-The submit route persists the job, spawns the Modal Function, stores its call
-identifier internally, and returns `202`. Modal call IDs, Volume names and
-paths, dashboard links, tracebacks, and internal filesystem paths are never
-part of the public response.
+The submit route persists the job, spawns the first Modal stage, stores its
+Function name and call identifier internally, and returns `202`. When that call
+completes, the reconciler resolves the next deployed Function by name and
+atomically replaces the stored active operation and call identifier. Exactly
+one direct stage is the durable active operation at a time. Modal Function
+names, call IDs, Volume names and paths, dashboard links, tracebacks, and
+internal filesystem paths are never part of the public response or OpenAPI
+schema.
+
+The GROMACS API sequence is:
+
+```text
+prepare_tpr_cpu|gpu
+  -> collect_traj_stats(traj_prefix="nvt_")
+  -> collect_traj_stats(traj_prefix="npt_")
+  -> production_run_cpu|gpu
+  -> collect_traj_stats(
+       traj_prefix="production_",
+       save_processed_traj=true
+     )
+  -> service builds and publishes result.zip
+```
+
+This is the same sequence and argument shape as the GROMACS App's established
+`submit_gromacs_task` local entrypoint, except that the API deliberately waits
+for each call before starting the next one. `collect_traj_stats` remains free to
+use its own established implementation details, including its internal call to
+`postprocess_traj`; the API does not duplicate or alter those details.
+
+There is deliberately no deployed `run_gromacs_job` Function wrapping these
+calls. Such a wrapper adds a second Modal call layer, obscures which resource
+stage is active, and makes the local durable Job record cease to be the
+orchestration authority. Likewise, archive construction is control-plane work,
+not a new Function added to the scientific App.
 
 One in-process reconciler polls active Modal calls approximately every ten
 seconds. Public states are intentionally coarse:
@@ -149,17 +190,24 @@ queued/running/finalizing -> cancel_requested -> cancelled
 ```
 
 Cancellation is idempotent while it is pending. The adapter asks Modal to
-cancel the root and currently visible active descendants with
-`terminate_containers=False`; the job becomes `cancelled` only after the call
-graph is inactive. If a verified result archive wins a cancellation race, the
-completed result wins. Terminal jobs are preserved and there is no job-delete
-endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
+cancel the currently recorded direct call and any visible active descendants
+with `terminate_containers=False`; the job becomes `cancelled` only after the
+call graph is inactive. If a verified result archive wins a cancellation race,
+the completed result wins. Terminal jobs are preserved and there is no
+job-delete endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
 
-Submission uses a short SQLite lease and the stable run name
+Initial submission uses a short SQLite lease and the stable run name
 `api-<job UUID>`. An idempotent replay cannot create a second call while that
 lease is active, and a replay after a process failure can safely retry the same
 run. If the call was accepted before its ID reached SQLite, reconciliation can
-recover the verified archive by stable run name.
+recover the verified archive by stable run name. Later stage transitions use
+the stored operation and call ID as an atomic compare-and-replace boundary.
+The required single API worker means routine reconciliation passes cannot race;
+if a process dies in the narrow interval after a stage spawn but before its ID
+is recorded, recovery may retry that resume-aware stage under the same run name.
+The two calls can overlap briefly in that failure window. Eliminating that
+single-host limitation requires provider-side idempotent submission or an
+external durable worker before enabling multiple API processes.
 
 The supported `FunctionCall` API does not expose a backend log stream. Live
 stdout streaming is therefore deferred. A sanitized `run.log` is included in
@@ -169,21 +217,21 @@ command into the service.
 ## Artifact and storage contract
 
 Each successfully completed job produces exactly one immutable,
-browser-friendly ZIP inside the Modal compute job. A workload may also use the
-generic `partial` terminal state for a downloadable result with warnings;
-GROMACS v1 itself emits `succeeded`. The GROMACS entrypoint writes its ZIP under
-an opaque run directory on the `Gromacs-outputs` Volume and returns one archive
-artifact with its filename, byte size, and SHA-256 digest. The archive is the
+browser-friendly ZIP. A workload may also use the generic `partial` terminal
+state for a downloadable result with warnings; GROMACS v1 itself emits
+`succeeded`. After the final established App call returns, the control plane
+streams an explicit allowlist of files from `Gromacs-outputs` into a
+deterministic local ZIP, validates it, then uploads `result.zip` followed by a
+small completion marker under `api-results/<run_name>/`. The marker records the
+request identity, byte size, and SHA-256 digest. The archive and marker are the
 durable success boundary; the control plane does not mark a job complete until
-that contract validates.
+the ZIP contract validates.
 
-Retries can overlap only in the narrow failure window between Modal accepting a
-call and SQLite recording its call ID. GROMACS therefore writes a unique
-candidate, then uses atomic `Modal Dict.put(..., skip_if_exists=True)` to elect
-one durable candidate per run name. All publishers copy only those elected
-bytes to `result.zip`, so concurrent Volume commits cannot select different
-archives. The Dict is a compute-side publication registry, not the job database.
-[Modal: Dicts](https://modal.com/docs/guide/dicts)
+Packaging can be repeated safely for the same completed run because the member
+order, metadata, and contents are deterministic for the recorded job. The
+single-worker control plane remains responsible for preventing ordinary
+concurrent publication. No API-specific registry or Function is added to the
+GROMACS App.
 
 The ZIP contains an explicit allowlist of final outputs, including:
 
@@ -196,10 +244,12 @@ The ZIP contains an explicit allowlist of final outputs, including:
 It does not recursively package the working directory, credentials, internal
 storage paths, databases, or large shared caches.
 
-Modal Volume storage is authoritative. Intermediate outputs, scientific cache
-files, and databases remain on Modal and are not downloaded to the Linux host.
-The configurable local directory caches final ZIPs only. It is a size-bounded
-LRU cache with atomic publication and size/SHA-256 verification:
+Modal Volume storage is authoritative. Scientific cache files, databases, and
+unselected intermediates remain on Modal. The selected final files stream
+through a spooled temporary file on the Linux host only while the service builds
+the ZIP; they are not added to its durable job database. The configurable local
+directory caches final ZIPs only. It is a size-bounded LRU cache with atomic
+publication and size/SHA-256 verification:
 
 1. a cache hit is served as a local file;
 2. a miss streams the ZIP from the recorded Modal Volume;

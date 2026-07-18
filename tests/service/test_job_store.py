@@ -182,7 +182,12 @@ def test_job_queries_never_cross_owner_boundaries(tmp_path: Path) -> None:
 def test_cancellation_is_preserved_as_a_state_transition(tmp_path: Path) -> None:
     store, alice, _bob = make_store(tmp_path)
     job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
-    store.mark_submitted(job.job_id, modal_call_id="fc-123", run_name="api-123")
+    store.mark_submitted(
+        job.job_id,
+        modal_call_id="fc-123",
+        provider_operation="prepare_tpr_gpu",
+        run_name="api-123",
+    )
 
     requested = store.request_cancel(alice, job.job_id, now=1_800_000_001)
     repeated = store.request_cancel(alice, job.job_id, now=1_800_000_002)
@@ -247,6 +252,7 @@ def test_cancel_during_spawn_keeps_call_attached_for_reconciliation(
     attached = store.mark_submitted(
         job.job_id,
         modal_call_id="fc-live",
+        provider_operation="prepare_tpr_gpu",
         run_name=run_name,
         submission_token="submitter",
         now=102,
@@ -254,3 +260,29 @@ def test_cancel_during_spawn_keeps_call_attached_for_reconciliation(
 
     assert attached.state == JobState.CANCEL_REQUESTED
     assert attached.modal_call_id == "fc-live"
+
+
+def test_job_atomically_advances_one_active_provider_operation(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
+    attached = store.mark_submitted(
+        job.job_id,
+        modal_call_id="fc-prepare",
+        provider_operation="prepare_tpr_cpu",
+        run_name=f"api-{job.job_id.hex}",
+        now=100,
+    )
+
+    advanced = store.replace_provider_call(
+        job.job_id,
+        expected_modal_call_id="fc-prepare",
+        modal_call_id="fc-production",
+        provider_operation="production_run_cpu",
+        now=101,
+    )
+
+    assert attached.provider_operation == "prepare_tpr_cpu"
+    assert advanced.modal_call_id == "fc-production"
+    assert advanced.provider_operation == "production_run_cpu"

@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import io
 import zipfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -17,13 +18,6 @@ import modal
 import orjson
 import pytest
 
-from biomodals.schema import (
-    AppOutput,
-    AppRunResult,
-    AppRunStatus,
-    ArtifactKind,
-    VolumePath,
-)
 from biomodals.service.gromacs.modal import (
     ArchiveNotReadyError,
     GromacsReconciler,
@@ -200,11 +194,24 @@ def _install_volume(
     class FakeVolume:
         def __init__(self) -> None:
             self.read_file = AsyncMethod(self._read_file)
+            self.batch_upload = AsyncMethod(self._batch_upload)
 
         async def _read_file(self, path: str):
             if path not in files:
                 raise FileNotFoundError(path)
             yield files[path]
+
+        @asynccontextmanager
+        async def _batch_upload(self, *, force: bool):
+            assert force is True
+
+            class Upload:
+                @staticmethod
+                def put_file(source, path: str) -> None:
+                    source.seek(0)
+                    files[path] = source.read()
+
+            yield Upload()
 
     monkeypatch.setattr(
         modal.Volume,
@@ -217,50 +224,34 @@ def _install_volume(
     )
 
 
+def _established_output_files() -> dict[str, bytes]:
+    prefix = f"production_{RUN_NAME}"
+    return {
+        f"{RUN_NAME}/{RUN_NAME}.pdb": (
+            b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
+        ),
+        f"{RUN_NAME}/production.mdp": b"integrator = md\n",
+        f"{RUN_NAME}/{prefix}.xtc": b"trajectory",
+        f"{RUN_NAME}/{prefix}.tpr": b"topology",
+        f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
+        f"{RUN_NAME}/rmsd_{prefix}.csv": b"time,rmsd\n",
+        f"{RUN_NAME}/rg_{prefix}.csv": b"time,rg\n",
+        f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue,rmsf\n",
+    }
+
+
 def _adapter(
     calls: dict[str, FakeCall],
     *,
     output_volume_name: str = "Gromacs-outputs",
+    function_resolver=None,
 ) -> ModalGromacsAdapter:
     return ModalGromacsAdapter(
         app_name="GromacsAPI",
         environment_name="department-dev",
         output_volume_name=output_volume_name,
         call_resolver=cast(Any, calls.__getitem__),
-    )
-
-
-def _archive_result(
-    *,
-    status: AppRunStatus = AppRunStatus.SUCCEEDED,
-    volume_name: str = "Gromacs-outputs",
-    path: str = f"api-results/{RUN_NAME}/result.zip",
-    media_type: str | None = "application/zip",
-    kind: ArtifactKind = ArtifactKind.ARCHIVE,
-    filename: str = f"{RUN_NAME}.zip",
-    size_bytes: int = 123,
-    sha256: str = SHA256,
-    warnings: list[str] | None = None,
-) -> AppRunResult:
-    return AppRunResult(
-        status=status,
-        outputs=[
-            AppOutput(
-                name="gromacs_run",
-                kind=kind,
-                storage=VolumePath(
-                    volume_name=volume_name,
-                    path=path,
-                    media_type=media_type,
-                ),
-                metadata={
-                    "filename": filename,
-                    "size_bytes": size_bytes,
-                    "sha256": sha256,
-                },
-            )
-        ],
-        warnings=warnings or [],
+        function_resolver=function_resolver,
     )
 
 
@@ -268,6 +259,7 @@ def _submitted_job(
     tmp_path: Path,
     *,
     cancel_requested: bool = False,
+    provider_operation: str = "prepare_tpr_gpu",
 ) -> tuple[ServiceStore, JobRecord]:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
@@ -292,6 +284,7 @@ def _submitted_job(
     job = store.mark_submitted(
         admission.job.job_id,
         modal_call_id="fc-root",
+        provider_operation=provider_operation,
         run_name=RUN_NAME,
         now=3,
     )
@@ -320,6 +313,7 @@ def _terminal_job(
     job = store.mark_submitted(
         admission.job.job_id,
         modal_call_id=f"fc-{run_name}",
+        provider_operation="collect_traj_stats:production_",
         run_name=run_name,
         now=completed_at - 1,
     )
@@ -342,10 +336,10 @@ def _terminal_job(
     )
 
 
-def test_adapter_looks_up_named_function_in_explicit_environment(
+def test_submit_resolves_the_deployed_prepare_function_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    function = FakeFunction(FakeCall("fc-root"))
+    function = FakeFunction(FakeCall("fc-prepare"))
     lookups: list[tuple[str, str, str | None]] = []
 
     def from_name(
@@ -361,14 +355,38 @@ def test_adapter_looks_up_named_function_in_explicit_environment(
 
     adapter = ModalGromacsAdapter(
         app_name="GromacsAPI",
-        function_name="run_gromacs_job",
         environment_name="department-dev",
     )
 
-    assert adapter.function is function
+    assert lookups == []
+
+    submitted = asyncio.run(
+        adapter.submit(
+            b"PDB content",
+            GromacsJobOptions(
+                simulation_time_ns=3,
+                run_pdbfixer=True,
+                cpu_only=True,
+            ),
+            run_name=RUN_NAME,
+            modal_configuration=ModalConfigurationSnapshot(
+                environment="department-dev",
+                app_name="GromacsAPI",
+            ),
+        )
+    )
+
     assert lookups == [
-        ("GromacsAPI", "run_gromacs_job", "department-dev"),
+        ("GromacsAPI", "prepare_tpr_cpu", "department-dev"),
     ]
+    assert submitted.modal_call_id == "fc-prepare"
+    assert submitted.provider_operation == "prepare_tpr_cpu"
+    assert function.spawn_kwargs == {
+        "pdb_content": b"PDB content",
+        "run_name": RUN_NAME,
+        "simulation_time_ns": 3,
+        "run_pdbfixer": True,
+    }
 
 
 def test_submit_spawns_detached_call_with_normalized_options(
@@ -404,7 +422,70 @@ def test_submit_spawns_detached_call_with_normalized_options(
         "run_name": RUN_NAME,
         "simulation_time_ns": 3,
         "run_pdbfixer": True,
-        "cpu_only": True,
+    }
+
+
+def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
+    store, job = _submitted_job(tmp_path)
+    lookups: list[tuple[str, str, str | None]] = []
+    functions: list[FakeFunction] = []
+
+    def from_name(
+        app_name: str,
+        function_name: str,
+        *,
+        environment_name: str | None = None,
+    ):
+        lookups.append((app_name, function_name, environment_name))
+        function = FakeFunction(FakeCall(f"fc-{len(functions) + 1}"))
+        functions.append(function)
+        return function
+
+    adapter = ModalGromacsAdapter(
+        app_name="GromacsAPI",
+        environment_name="department-dev",
+        function_resolver=from_name,
+    )
+
+    operations = (
+        "collect_traj_stats:nvt_",
+        "collect_traj_stats:npt_",
+        "production_run_gpu",
+        "collect_traj_stats:production_",
+    )
+    for index, operation in enumerate(operations, start=1):
+        submitted = asyncio.run(adapter.advance(job))
+        assert submitted.provider_operation == operation
+        job = store.replace_provider_call(
+            job.job_id,
+            expected_modal_call_id=job.modal_call_id or "",
+            modal_call_id=f"fc-{index}",
+            provider_operation=operation,
+            now=3 + index,
+        )
+
+    assert [function_name for _, function_name, _ in lookups] == [
+        "collect_traj_stats",
+        "collect_traj_stats",
+        "production_run_gpu",
+        "collect_traj_stats",
+    ]
+    assert functions[0].spawn_kwargs == {
+        "traj_prefix": "nvt_",
+        "run_name": RUN_NAME,
+    }
+    assert functions[1].spawn_kwargs == {
+        "traj_prefix": "npt_",
+        "run_name": RUN_NAME,
+    }
+    assert functions[2].spawn_kwargs == {
+        "run_name": RUN_NAME,
+        "simulation_time_ns": 5,
+    }
+    assert functions[3].spawn_kwargs == {
+        "traj_prefix": "production_",
+        "run_name": RUN_NAME,
+        "save_processed_traj": True,
     }
 
 
@@ -460,89 +541,108 @@ def test_cancel_stops_root_and_only_active_descendants() -> None:
     ]
 
 
-def test_final_archive_accepts_only_expected_immutable_zip(
+def test_service_packages_and_publishes_established_app_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _store, job = _submitted_job(tmp_path)
-    adapter = _adapter({})
-    archive_bytes, request_sha256 = _valid_archive_bytes()
-    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
-    _install_volume(
-        monkeypatch,
-        {
-            f"api-results/{RUN_NAME}/result.json": _result_marker(
-                archive_bytes, request_sha256
-            ),
-            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
-        },
+    _store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
     )
-    result = _archive_result(
-        status=AppRunStatus.PARTIAL,
-        size_bytes=len(archive_bytes),
-        sha256=archive_sha256,
-        warnings=["RMSF analysis was unavailable"],
-    )
+    files = _established_output_files()
+    _install_volume(monkeypatch, files)
 
-    archive = asyncio.run(adapter.final_archive(job, result))
+    archive = asyncio.run(_adapter({}).publish_archive(job, completed_at=10))
 
-    assert archive.state == JobState.PARTIAL
-    assert archive.volume_name == "Gromacs-outputs"
+    archive_bytes = files[f"api-results/{RUN_NAME}/result.zip"]
+    marker = orjson.loads(files[f"api-results/{RUN_NAME}/result.json"])
+    assert archive.state == JobState.SUCCEEDED
     assert archive.path == f"api-results/{RUN_NAME}/result.zip"
-    assert archive.filename == f"{RUN_NAME}.zip"
     assert archive.size_bytes == len(archive_bytes)
-    assert archive.sha256 == archive_sha256
-    assert archive.warnings_json == '["RMSF analysis was unavailable"]'
+    assert archive.sha256 == hashlib.sha256(archive_bytes).hexdigest()
+    assert marker["archive_sha256"] == archive.sha256
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as result:
+        assert result.read("input.pdb") == files[f"{RUN_NAME}/{RUN_NAME}.pdb"]
+        assert result.read(f"outputs/production_{RUN_NAME}.xtc") == b"trajectory"
 
 
-@pytest.mark.parametrize(
-    "result",
-    [
-        AppRunResult(status=AppRunStatus.FAILED),
-        AppRunResult(status=AppRunStatus.SUCCEEDED),
-        _archive_result(kind=ArtifactKind.DIRECTORY),
-        _archive_result(volume_name="Other-volume"),
-        _archive_result(path="api-results/another-run/result.zip"),
-        _archive_result(media_type=None),
-        _archive_result(filename="../result.zip"),
-        _archive_result(size_bytes=0),
-        _archive_result(size_bytes=True),
-        _archive_result(sha256="A" * 64),
-    ],
-)
-def test_final_archive_rejects_invalid_contract(
+def test_reconciler_advances_completed_stage_to_one_direct_named_call(
     tmp_path: Path,
-    result: AppRunResult,
 ) -> None:
-    _store, job = _submitted_job(tmp_path)
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="/volumes/Gromacs-outputs/api-run")
+    analysis = FakeFunction(FakeCall("fc-analysis"))
+    lookups: list[tuple[str, str, str | None]] = []
 
-    with pytest.raises(ValueError):
-        asyncio.run(_adapter({}).final_archive(job, result))
+    def from_name(
+        app_name: str,
+        function_name: str,
+        *,
+        environment_name: str | None = None,
+    ) -> FakeFunction:
+        lookups.append((app_name, function_name, environment_name))
+        return analysis
+
+    reconciler = GromacsReconciler(
+        store,
+        _adapter({"fc-root": prepare}, function_resolver=from_name),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+
+    advanced = store.get_job(job.owner_user_id, job.job_id)
+    assert advanced is not None
+    assert advanced.modal_call_id == "fc-analysis"
+    assert advanced.provider_operation == "collect_traj_stats:nvt_"
+    assert lookups == [("GromacsAPI", "collect_traj_stats", "department-dev")]
+    assert analysis.spawn_kwargs == {
+        "traj_prefix": "nvt_",
+        "run_name": RUN_NAME,
+    }
+
+
+def test_completed_stage_does_not_advance_after_cancellation(tmp_path: Path) -> None:
+    store, job = _submitted_job(tmp_path, cancel_requested=True)
+    root_node = CallNode("fc-root", modal.call_graph.InputStatus.SUCCESS)
+    prepare = FakeCall(
+        "fc-root",
+        result="/volumes/Gromacs-outputs/api-run",
+        graph=[root_node],
+    )
+
+    def unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("cancelled Job must not launch another Modal stage")
+
+    reconciler = GromacsReconciler(
+        store,
+        _adapter({"fc-root": prepare}, function_resolver=unexpected_lookup),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+
+    cancelled = store.get_job(job.owner_user_id, job.job_id)
+    assert cancelled is not None
+    assert cancelled.state == JobState.CANCELLED
+    assert cancelled.modal_call_id == "fc-root"
 
 
 def test_completed_archive_wins_cancel_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store, job = _submitted_job(tmp_path, cancel_requested=True)
-    archive_bytes, request_sha256 = _valid_archive_bytes()
-    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
-    _install_volume(
-        monkeypatch,
-        {
-            f"api-results/{RUN_NAME}/result.json": _result_marker(
-                archive_bytes, request_sha256
-            ),
-            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
-        },
+    store, job = _submitted_job(
+        tmp_path,
+        cancel_requested=True,
+        provider_operation="collect_traj_stats:production_",
     )
+    files = _established_output_files()
+    _install_volume(monkeypatch, files)
     root_node = CallNode("fc-root", modal.call_graph.InputStatus.PENDING)
     root = FakeCall(
         "fc-root",
-        result=_archive_result(
-            size_bytes=len(archive_bytes),
-            sha256=archive_sha256,
-        ),
+        result=f"/volumes/Gromacs-outputs/{RUN_NAME}",
         graph=[root_node],
     )
     reconciler = GromacsReconciler(store, _adapter({"fc-root": root}), now=lambda: 10)
@@ -553,6 +653,7 @@ def test_completed_archive_wins_cancel_race(
     assert completed is not None
     assert completed.state == JobState.SUCCEEDED
     assert completed.result_volume_path == f"api-results/{RUN_NAME}/result.zip"
+    assert f"api-results/{RUN_NAME}/result.zip" in files
     assert ("cancel", "fc-root", False) in root.events
 
 
@@ -560,7 +661,10 @@ def test_expired_call_output_recovers_completed_archive_from_volume_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store, job = _submitted_job(tmp_path)
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
     root = FakeCall(
         "fc-root",
         result=modal.exception.OutputExpiredError("expired"),
@@ -592,7 +696,10 @@ def test_expired_call_rejects_marker_when_archive_bytes_are_corrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store, job = _submitted_job(tmp_path)
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
     root = FakeCall(
         "fc-root",
         result=modal.exception.OutputExpiredError("expired"),

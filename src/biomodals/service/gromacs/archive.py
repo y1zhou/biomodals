@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import stat
 import zipfile
+from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import BinaryIO, cast
@@ -14,6 +15,10 @@ import orjson
 _CHUNK_SIZE = 1024 * 1024
 _SHA256_LENGTH = 64
 _SMALL_DOCUMENT_LIMIT = 1024 * 1024
+_MAX_PDB_BYTES = 10 * 1024 * 1024
+_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+
+ReadRemoteFile = Callable[[str], AsyncIterable[bytes]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +26,15 @@ class ValidatedGromacsArchive:
     """Request identity recovered from a fully checked result ZIP."""
 
     request_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltGromacsArchive:
+    """Metadata for one deterministic service-built result ZIP."""
+
+    request_sha256: str
+    size_bytes: int
+    sha256: str
 
 
 def _expected_manifest_files(run_name: str) -> list[tuple[str, str]]:
@@ -77,6 +91,170 @@ def _member_digest(
             size += len(chunk)
             digest.update(chunk)
     return size, digest.hexdigest()
+
+
+def _zip_info(name: str, *, stored: bool = False) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, date_time=_ZIP_TIMESTAMP)
+    info.create_system = 3
+    info.external_attr = 0o100600 << 16
+    info.compress_type = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    return info
+
+
+def _write_bytes(
+    archive: zipfile.ZipFile,
+    *,
+    name: str,
+    role: str,
+    content: bytes,
+) -> dict[str, str | int]:
+    archive.writestr(_zip_info(name), content)
+    return {
+        "path": name,
+        "role": role,
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+async def _read_bounded(
+    read_file: ReadRemoteFile,
+    path: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    content = bytearray()
+    async for chunk in read_file(path):
+        content.extend(chunk)
+        if len(content) > max_bytes:
+            raise ValueError(f"Remote GROMACS file is too large: {path}")
+    return bytes(content)
+
+
+async def _write_remote(
+    archive: zipfile.ZipFile,
+    *,
+    read_file: ReadRemoteFile,
+    remote_path: str,
+    name: str,
+    role: str,
+) -> dict[str, str | int]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with archive.open(
+        _zip_info(name, stored=PurePosixPath(name).suffix in {".tpr", ".xtc"}),
+        mode="w",
+        force_zip64=True,
+    ) as destination:
+        async for chunk in read_file(remote_path):
+            size_bytes += len(chunk)
+            digest.update(chunk)
+            destination.write(chunk)
+    return {
+        "path": name,
+        "role": role,
+        "size_bytes": size_bytes,
+        "sha256": digest.hexdigest(),
+    }
+
+
+async def write_gromacs_archive(
+    handle: object,
+    *,
+    run_name: str,
+    parameters_json: str,
+    modal_app_name: str,
+    started_at: int,
+    completed_at: int,
+    read_file: ReadRemoteFile,
+) -> BuiltGromacsArchive:
+    """Package the established GROMACS app's expected Volume files."""
+    binary_handle = cast("BinaryIO", handle)
+    binary_handle.seek(0)
+    binary_handle.truncate(0)
+    input_bytes = await _read_bounded(
+        read_file,
+        f"{run_name}/{run_name}.pdb",
+        max_bytes=_MAX_PDB_BYTES,
+    )
+    parameters_bytes = parameters_json.encode()
+    provenance_bytes = (
+        orjson.dumps(
+            {
+                "archive_schema_version": 1,
+                "modal_app_name": modal_app_name,
+                "started_at": started_at,
+                "completed_at": completed_at,
+            },
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+        )
+        + b"\n"
+    )
+    run_log = (
+        f"Biomodals GROMACS job\nrun_name: {run_name}\nstatus: succeeded\n"
+    ).encode()
+
+    records: list[dict[str, str | int]] = []
+    with zipfile.ZipFile(binary_handle, mode="w", allowZip64=True) as archive:
+        for name, role, content in (
+            ("input.pdb", "input_structure", input_bytes),
+            ("parameters.json", "normalized_parameters", parameters_bytes),
+            ("provenance.json", "provenance", provenance_bytes),
+            ("run.log", "run_log", run_log),
+        ):
+            records.append(_write_bytes(archive, name=name, role=role, content=content))
+        for name, role in _expected_manifest_files(run_name)[4:]:
+            records.append(
+                await _write_remote(
+                    archive,
+                    read_file=read_file,
+                    remote_path=f"{run_name}/{PurePosixPath(name).name}",
+                    name=name,
+                    role=role,
+                )
+            )
+
+        manifest_bytes = (
+            orjson.dumps(
+                {
+                    "archive_schema_version": 1,
+                    "run_name": run_name,
+                    "files": records,
+                },
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            )
+            + b"\n"
+        )
+        manifest_record = _write_bytes(
+            archive,
+            name="manifest.json",
+            role="manifest",
+            content=manifest_bytes,
+        )
+        checksums = "".join(
+            f"{record['sha256']}  {record['path']}\n"
+            for record in (*records, manifest_record)
+        ).encode()
+        _write_bytes(
+            archive,
+            name="checksums.sha256",
+            role="checksums",
+            content=checksums,
+        )
+
+    validated = validate_gromacs_archive(binary_handle, run_name=run_name)
+    binary_handle.seek(0)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    while chunk := binary_handle.read(_CHUNK_SIZE):
+        size_bytes += len(chunk)
+        digest.update(chunk)
+    binary_handle.seek(0)
+    return BuiltGromacsArchive(
+        request_sha256=validated.request_sha256,
+        size_bytes=size_bytes,
+        sha256=digest.hexdigest(),
+    )
 
 
 def _manifest_records(document: object) -> list[dict[str, object]]:

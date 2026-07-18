@@ -91,6 +91,7 @@ class SubmittedCall(Protocol):
 
     modal_call_id: str
     run_name: str
+    provider_operation: str
 
 
 class GromacsAdapter(Protocol):
@@ -264,6 +265,7 @@ def create_router(
             job = store.mark_submitted(
                 admission.job.job_id,
                 modal_call_id=submitted.modal_call_id,
+                provider_operation=submitted.provider_operation,
                 run_name=submitted.run_name,
                 submission_token=submission_token,
             )

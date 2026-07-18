@@ -124,6 +124,7 @@ class JobRecord:
     modal_environment: str
     modal_app_name: str
     modal_call_id: str | None
+    provider_operation: str | None
     run_name: str | None
     submission_token: str | None
     submission_lease_until: int | None
@@ -251,6 +252,7 @@ class ServiceStore:
                         modal_environment TEXT NOT NULL,
                         modal_app_name TEXT NOT NULL,
                         modal_call_id TEXT,
+                        provider_operation TEXT,
                         run_name TEXT,
                         submission_token TEXT,
                         submission_lease_until INTEGER,
@@ -286,11 +288,20 @@ class ServiceStore:
                             CHECK (active_job_limit IS NULL OR active_job_limit >= 1)
                     );
 
-                    PRAGMA user_version = 4;
+                    PRAGMA user_version = 5;
                     COMMIT;
                     """
                 )
-            elif version != 4:
+            elif version == 4:
+                conn.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE jobs ADD COLUMN provider_operation TEXT;
+                    PRAGMA user_version = 5;
+                    COMMIT;
+                    """
+                )
+            elif version != 5:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
                     f"{version}; initialize fresh state"
@@ -859,8 +870,8 @@ class ServiceStore:
                 INSERT INTO jobs (
                     job_id, owner_user_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json, state,
-                    modal_environment, modal_app_name, modal_call_id, run_name,
-                    submission_token,
+                    modal_environment, modal_app_name, modal_call_id,
+                    provider_operation, run_name, submission_token,
                     submission_lease_until, result_volume_name,
                     result_volume_path, result_filename, result_size_bytes,
                     result_sha256, warnings_json, error_code, error_message,
@@ -868,8 +879,8 @@ class ServiceStore:
                     intermediates_cleaned_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?,
-                    NULL, NULL, NULL
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?,
+                    ?, NULL, NULL, NULL
                 )
                 """,
                 (
@@ -1085,18 +1096,23 @@ class ServiceStore:
         job_id: UUID,
         *,
         modal_call_id: str,
+        provider_operation: str,
         run_name: str,
         submission_token: str | None = None,
         now: int | None = None,
     ) -> JobRecord:
         """Attach provider identifiers after a successful asynchronous spawn."""
+        provider_operation = provider_operation.strip()
+        if not provider_operation:
+            raise ValueError("Provider operation must not be empty")
         updated_at = int(time.time()) if now is None else now
         with self._transaction() as conn:
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET modal_call_id = ?, run_name = ?, submission_token = NULL,
-                    submission_lease_until = NULL, updated_at = ?
+                SET modal_call_id = ?, provider_operation = ?, run_name = ?,
+                    submission_token = NULL, submission_lease_until = NULL,
+                    updated_at = ?
                 WHERE job_id = ?
                   AND state IN (?, ?, ?, ?)
                   AND modal_call_id IS NULL
@@ -1105,6 +1121,7 @@ class ServiceStore:
                 """,
                 (
                     modal_call_id,
+                    provider_operation,
                     run_name,
                     updated_at,
                     str(job_id),
@@ -1121,10 +1138,55 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if cursor.rowcount != 1 and (
-                row["modal_call_id"] != modal_call_id or row["run_name"] != run_name
+                row["modal_call_id"] != modal_call_id
+                or row["provider_operation"] != provider_operation
+                or row["run_name"] != run_name
             ):
                 raise JobSubmissionConflictError(
                     f"Submission lease is no longer valid for job {job_id}"
+                )
+        return _job_from_row(row)
+
+    def replace_provider_call(
+        self,
+        job_id: UUID,
+        *,
+        expected_modal_call_id: str,
+        modal_call_id: str,
+        provider_operation: str,
+        now: int,
+    ) -> JobRecord:
+        """Atomically move an active Job to its next provider operation."""
+        provider_operation = provider_operation.strip()
+        if not provider_operation:
+            raise ValueError("Provider operation must not be empty")
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET modal_call_id = ?, provider_operation = ?, updated_at = ?
+                WHERE job_id = ?
+                  AND modal_call_id = ?
+                  AND state IN (?, ?, ?, ?)
+                """,
+                (
+                    modal_call_id,
+                    provider_operation,
+                    now,
+                    str(job_id),
+                    expected_modal_call_id,
+                    *(state.value for state in ACTIVE_JOB_STATES),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            if cursor.rowcount != 1:
+                raise JobSubmissionConflictError(
+                    f"Provider operation changed concurrently for job {job_id}"
                 )
         return _job_from_row(row)
 
@@ -1358,6 +1420,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         modal_environment=str(row["modal_environment"]),
         modal_app_name=str(row["modal_app_name"]),
         modal_call_id=row["modal_call_id"],
+        provider_operation=row["provider_operation"],
         run_name=row["run_name"],
         submission_token=row["submission_token"],
         submission_lease_until=row["submission_lease_until"],

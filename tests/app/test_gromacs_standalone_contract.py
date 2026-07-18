@@ -6,15 +6,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from biomodals.app.bioinfo import gromacs_app
-from biomodals.schema import VolumePath
-
-VALID_PDB = (
-    b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n"
-    b"END\n"
-)
 
 
 def test_gromacs_declares_workflow_expected_files() -> None:
@@ -41,7 +33,7 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     monkeypatch,
 ) -> None:
     pdb_path = tmp_path / "input.pdb"
-    pdb_path.write_bytes(VALID_PDB)
+    pdb_path.write_text("ATOM\n", encoding="utf-8")
     prepare_kwargs = {}
     production_kwargs = {}
     analysis_stats = []
@@ -78,7 +70,7 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     )
 
     assert prepare_kwargs["run_name"] == "single"
-    assert prepare_kwargs["pdb_content"] == VALID_PDB
+    assert prepare_kwargs["pdb_content"] == b"ATOM\n"
     assert production_kwargs == {
         "run_name": "single",
         "simulation_time_ns": 3,
@@ -95,63 +87,6 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
     ]
 
 
-def test_internal_gromacs_job_keeps_durable_directory_output(monkeypatch) -> None:
-    analysis_stats = []
-
-    class FakePrepare:
-        def remote(self, **_kwargs):
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/api-123"
-
-    class FakeProduction:
-        def remote(self, **_kwargs):
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/api-123"
-
-    class FakeStats:
-        def remote(self, traj_prefix, **kwargs):
-            analysis_stats.append((traj_prefix, kwargs))
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/api-123"
-
-    monkeypatch.setattr(gromacs_app, "prepare_tpr_cpu", FakePrepare())
-    monkeypatch.setattr(gromacs_app, "production_run_cpu", FakeProduction())
-    monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
-
-    result = gromacs_app._run_gromacs_job(
-        pdb_content=VALID_PDB,
-        run_name="api-123",
-        simulation_time_ns=3,
-        cpu_only=True,
-    )
-
-    assert result.status.value == "succeeded"
-    assert len(result.outputs) == 1
-    output = result.outputs[0]
-    assert output.name == "gromacs_run"
-    assert output.storage.kind.value == "volume_path"
-    assert isinstance(output.storage, VolumePath)
-    assert output.storage.path == "api-123"
-    assert output.metadata["run_name"] == "api-123"
-    assert output.metadata["files"][0] == {
-        "path": "production_api-123.xtc",
-        "role": "trajectory",
-    }
-    assert analysis_stats == [
-        ("nvt_", {"run_name": "api-123"}),
-        ("npt_", {"run_name": "api-123"}),
-        (
-            "production_",
-            {"run_name": "api-123", "save_processed_traj": True},
-        ),
-    ]
-
-
-def test_run_gromacs_job_rejects_unsafe_run_name() -> None:
-    with pytest.raises(ValueError, match="run_name must be a safe filename"):
-        gromacs_app.run_gromacs_job.get_raw_f()(
-            pdb_content=VALID_PDB,
-            run_name="../escape",
-        )
-
-
 def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
     tmp_path: Path,
     monkeypatch,
@@ -164,13 +99,9 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
     class FakeVolume:
         def __init__(self) -> None:
             self.commit_count = 0
-            self.reload_count = 0
 
         def commit(self) -> None:
             self.commit_count += 1
-
-        def reload(self) -> None:
-            self.reload_count += 1
 
     volume = FakeVolume()
     monkeypatch.setattr(
@@ -193,7 +124,7 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
     monkeypatch.setattr(gromacs_app, "run_command", fake_run_command)
 
     result = gromacs_app.prepare_tpr_cpu.get_raw_f()(
-        pdb_content=VALID_PDB,
+        pdb_content=b"ATOM\n",
         run_name="prep",
         simulation_time_ns=1,
         num_threads=2,
@@ -203,13 +134,12 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
     input_path = run_root / "prep.pdb"
     staged_input_path = run_root / "inputs" / "prep.pdb"
     assert result == str(run_root)
-    assert input_path.read_bytes() == VALID_PDB
-    assert staged_input_path.read_bytes() == VALID_PDB
+    assert input_path.read_bytes() == b"ATOM\n"
+    assert staged_input_path.read_bytes() == b"ATOM\n"
     assert captured["cmd"][captured["cmd"].index("-i") + 1] == str(input_path)
     assert captured["cwd"] == str(run_root)
     assert captured["env"] == {"OMP_NUM_THREADS": None}
     assert volume.commit_count == 2
-    assert volume.reload_count == 1
 
 
 def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> None:
@@ -221,13 +151,9 @@ def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> No
     class FakeVolume:
         def __init__(self) -> None:
             self.commit_count = 0
-            self.reload_count = 0
 
         def commit(self) -> None:
             self.commit_count += 1
-
-        def reload(self) -> None:
-            self.reload_count += 1
 
     volume = FakeVolume()
     monkeypatch.setattr(
@@ -255,4 +181,3 @@ def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> No
     assert captured["cwd"] == str(work_path)
     assert result == str(work_path)
     assert volume.commit_count == 1
-    assert volume.reload_count == 1

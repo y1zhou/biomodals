@@ -3,31 +3,38 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import BinaryIO, Literal, cast
 
 import modal
 import orjson
 
-from biomodals.schema import (
-    AppRunResult,
-    AppRunStatus,
-    ArtifactKind,
-    VolumePath,
+from biomodals.service.gromacs.archive import (
+    validate_gromacs_archive,
+    write_gromacs_archive,
 )
-from biomodals.service.gromacs.archive import validate_gromacs_archive
 from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
-from biomodals.service.store import JobRecord, JobState, ServiceStore
+from biomodals.service.store import (
+    JobRecord,
+    JobState,
+    JobSubmissionConflictError,
+    ServiceStore,
+)
 
 LOGGER = logging.getLogger(__name__)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _API_RUN_NAME = re.compile(r"api-[0-9a-f]{32}")
+_NVT_ANALYSIS = "collect_traj_stats:nvt_"
+_NPT_ANALYSIS = "collect_traj_stats:npt_"
+_PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
+_FINAL_OPERATION = _PRODUCTION_ANALYSIS
 _MODAL_SERVICE_ERRORS = (
     modal.exception.AuthError,
     modal.exception.ConnectionError,
@@ -46,6 +53,7 @@ class SubmittedModalCall:
 
     modal_call_id: str
     run_name: str
+    provider_operation: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +61,6 @@ class PollOutcome:
     """Sanitized state observed from one Modal call graph."""
 
     kind: Literal["running", "completed", "cancelled", "failed", "expired"]
-    result: AppRunResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,22 +107,15 @@ class ModalGromacsAdapter:
         *,
         app_name: str,
         environment_name: str,
-        function_name: str = "run_gromacs_job",
         output_volume_name: str = "Gromacs-outputs",
         call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
         function_resolver: Callable[..., modal.Function] | None = None,
     ) -> None:
-        """Resolve a deployed function in an explicit Modal Environment."""
+        """Bind one deployed App in an explicit Modal Environment."""
         self.environment_name = environment_name
         self.app_name = app_name
-        self.function_name = function_name
         self.output_volume_name = output_volume_name
         self._function_resolver = function_resolver or modal.Function.from_name
-        self.function = self._function_resolver(
-            app_name,
-            function_name,
-            environment_name=environment_name,
-        )
         self._call_resolver = call_resolver
 
     async def submit(
@@ -126,25 +126,81 @@ class ModalGromacsAdapter:
         run_name: str,
         modal_configuration: ModalConfigurationSnapshot,
     ) -> SubmittedModalCall:
-        """Spawn a detached GROMACS call without exposing its id to clients."""
-        function = (
-            self.function
-            if modal_configuration.app_name == self.app_name
-            and modal_configuration.environment == self.environment_name
-            else self._function_resolver(
-                modal_configuration.app_name,
-                self.function_name,
-                environment_name=modal_configuration.environment,
-            )
+        """Spawn the first deployed compute stage without a remote coordinator."""
+        function_name = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
+        function = self._function_resolver(
+            modal_configuration.app_name,
+            function_name,
+            environment_name=modal_configuration.environment,
         )
         call = await function.spawn.aio(
             pdb_content=pdb_content,
             run_name=run_name,
-            **options.model_dump(),
+            simulation_time_ns=options.simulation_time_ns,
+            run_pdbfixer=options.run_pdbfixer,
         )
-        return SubmittedModalCall(modal_call_id=call.object_id, run_name=run_name)
+        return SubmittedModalCall(
+            modal_call_id=call.object_id,
+            run_name=run_name,
+            provider_operation=function_name,
+        )
 
-    async def poll(self, modal_call_id: str) -> PollOutcome:
+    async def advance(self, job: JobRecord) -> SubmittedModalCall:
+        """Spawn the deployed stage following one completed direct call."""
+        if job.run_name is None or job.provider_operation is None:
+            raise ValueError("GROMACS Job has no active provider operation")
+        options = GromacsJobOptions.model_validate_json(job.parameters_json)
+        if job.provider_operation in {"prepare_tpr_cpu", "prepare_tpr_gpu"}:
+            operation = _NVT_ANALYSIS
+        elif job.provider_operation == _NVT_ANALYSIS:
+            operation = _NPT_ANALYSIS
+        elif job.provider_operation == _NPT_ANALYSIS:
+            operation = (
+                "production_run_cpu" if options.cpu_only else "production_run_gpu"
+            )
+        elif job.provider_operation in {"production_run_cpu", "production_run_gpu"}:
+            operation = _PRODUCTION_ANALYSIS
+        else:
+            raise ValueError(
+                f"GROMACS operation cannot advance: {job.provider_operation}"
+            )
+
+        function_name, _, traj_prefix = operation.partition(":")
+        if function_name.startswith("production_run_"):
+            kwargs = {
+                "run_name": job.run_name,
+                "simulation_time_ns": options.simulation_time_ns,
+            }
+        elif operation == _PRODUCTION_ANALYSIS:
+            kwargs = {
+                "traj_prefix": traj_prefix,
+                "run_name": job.run_name,
+                "save_processed_traj": True,
+            }
+        else:
+            kwargs = {
+                "traj_prefix": traj_prefix,
+                "run_name": job.run_name,
+            }
+
+        function = self._function_resolver(
+            job.modal_app_name,
+            function_name,
+            environment_name=job.modal_environment,
+        )
+        call = await function.spawn.aio(**kwargs)
+        return SubmittedModalCall(
+            modal_call_id=call.object_id,
+            run_name=job.run_name,
+            provider_operation=operation,
+        )
+
+    async def poll(
+        self,
+        modal_call_id: str,
+        *,
+        provider_operation: str | None = None,
+    ) -> PollOutcome:
         """Poll without blocking and distinguish a poll timeout from failure."""
         call = self._call_resolver(modal_call_id)
         try:
@@ -169,14 +225,14 @@ class ModalGromacsAdapter:
             raise
         except Exception:
             return PollOutcome("failed")
-        try:
-            result = AppRunResult.model_validate(raw_result)
-        except Exception:
-            LOGGER.exception(
-                "GROMACS call %s returned an invalid result", modal_call_id
+        if not isinstance(raw_result, str):
+            LOGGER.error(
+                "GROMACS stage %s (%s) returned an invalid result",
+                provider_operation,
+                modal_call_id,
             )
             return PollOutcome("failed")
-        return PollOutcome("completed", result)
+        return PollOutcome("completed")
 
     async def cancel(self, modal_call_id: str) -> None:
         """Cancel the root and every currently visible active descendant."""
@@ -233,6 +289,58 @@ class ModalGromacsAdapter:
             await volume.remove_file.aio(job.run_name, recursive=True)
         except modal.exception.NotFoundError:
             pass
+
+    async def publish_archive(
+        self,
+        job: JobRecord,
+        *,
+        completed_at: int,
+    ) -> FinalArchive:
+        """Build and publish a ZIP from the established app's Volume files."""
+        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
+            raise ValueError("Job has no valid API run name")
+        volume = modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=job.modal_environment,
+        )
+
+        async def read_file(path: str):
+            async for chunk in volume.read_file.aio(path):
+                yield chunk
+
+        archive_path = f"api-results/{job.run_name}/result.zip"
+        marker_path = f"api-results/{job.run_name}/result.json"
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as archive:
+            archive_handle = cast("BinaryIO", archive)
+            built = await write_gromacs_archive(
+                archive_handle,
+                run_name=job.run_name,
+                parameters_json=job.parameters_json,
+                modal_app_name=job.modal_app_name,
+                started_at=job.created_at,
+                completed_at=completed_at,
+                read_file=read_file,
+            )
+            marker = orjson.dumps({
+                "archive_schema_version": 1,
+                "request_sha256": built.request_sha256,
+                "archive_sha256": built.sha256,
+                "size_bytes": built.size_bytes,
+            })
+            archive_handle.seek(0)
+            async with volume.batch_upload.aio(force=True) as upload:
+                upload.put_file(archive_handle, archive_path)
+                upload.put_file(io.BytesIO(marker), marker_path)
+
+        return FinalArchive(
+            state=JobState.SUCCEEDED,
+            volume_name=self.output_volume_name,
+            path=archive_path,
+            filename=f"{job.run_name}.zip",
+            size_bytes=built.size_bytes,
+            sha256=built.sha256,
+            warnings_json="[]",
+        )
 
     async def _result_marker(self, job: JobRecord) -> _ResultMarker:
         """Read and validate the completion marker for one stable run."""
@@ -329,65 +437,6 @@ class ModalGromacsAdapter:
             warnings_json="[]",
         )
 
-    async def final_archive(
-        self,
-        job: JobRecord,
-        result: AppRunResult,
-    ) -> FinalArchive:
-        """Validate the stable compute-to-control-plane artifact contract."""
-        if job.run_name is None or _API_RUN_NAME.fullmatch(job.run_name) is None:
-            raise ValueError("Job has no valid API run name")
-        if result.status not in {AppRunStatus.SUCCEEDED, AppRunStatus.PARTIAL}:
-            raise ValueError("GROMACS call did not return a completed result")
-        if len(result.outputs) != 1:
-            raise ValueError("GROMACS call must return exactly one output")
-        output = result.outputs[0]
-        if output.kind != ArtifactKind.ARCHIVE or not isinstance(
-            output.storage, VolumePath
-        ):
-            raise ValueError("GROMACS call did not return a Volume archive")
-        expected_path = f"api-results/{job.run_name}/result.zip"
-        if (
-            output.storage.volume_name != self.output_volume_name
-            or output.storage.path != expected_path
-            or output.storage.media_type != "application/zip"
-        ):
-            raise ValueError("GROMACS archive location is not allowed")
-
-        filename = output.metadata.get("filename")
-        size_bytes = output.metadata.get("size_bytes")
-        sha256 = output.metadata.get("sha256")
-        if (
-            not isinstance(filename, str)
-            or filename != f"{job.run_name}.zip"
-            or type(size_bytes) is not int
-            or size_bytes < 1
-            or not isinstance(sha256, str)
-            or _SHA256.fullmatch(sha256) is None
-        ):
-            raise ValueError("GROMACS archive metadata is invalid")
-        archive = FinalArchive(
-            state=(
-                JobState.PARTIAL
-                if result.status == AppRunStatus.PARTIAL
-                else JobState.SUCCEEDED
-            ),
-            volume_name=output.storage.volume_name,
-            path=output.storage.path,
-            filename=filename,
-            size_bytes=size_bytes,
-            sha256=sha256,
-            warnings_json=orjson.dumps(result.warnings).decode(),
-        )
-        marker = await self._result_marker(job)
-        if (
-            marker.size_bytes != archive.size_bytes
-            or marker.archive_sha256 != archive.sha256
-        ):
-            raise ValueError("GROMACS result metadata does not match its marker")
-        await self._verify_archive_bytes(job, marker)
-        return archive
-
 
 class GromacsReconciler:
     """Refresh locally persisted GROMACS jobs from Modal in one process."""
@@ -454,15 +503,39 @@ class GromacsReconciler:
                     except modal.exception.NotFoundError:
                         outcome = PollOutcome("expired")
                     else:
-                        outcome = await self.adapter.poll(job.modal_call_id)
+                        outcome = await self.adapter.poll(
+                            job.modal_call_id,
+                            provider_operation=job.provider_operation,
+                        )
                 else:
-                    outcome = await self.adapter.poll(job.modal_call_id)
+                    outcome = await self.adapter.poll(
+                        job.modal_call_id,
+                        provider_operation=job.provider_operation,
+                    )
             except _MODAL_SERVICE_ERRORS:
                 LOGGER.exception(
                     "Modal is unavailable while reconciling job %s", job.job_id
                 )
                 continue
             if outcome.kind == "expired":
+                if job.state == JobState.CANCEL_REQUESTED:
+                    self.store.set_job_state(
+                        job.job_id,
+                        JobState.CANCELLED,
+                        now=self._now(),
+                    )
+                    continue
+                if job.provider_operation not in {None, _FINAL_OPERATION}:
+                    self.store.fail_job(
+                        job.job_id,
+                        error_code="result_unavailable",
+                        error_message=(
+                            "GROMACS completed, but its stage result expired before "
+                            "the Job could continue."
+                        ),
+                        now=self._now(),
+                    )
+                    continue
                 try:
                     archive = await self.adapter.recover_archive(job)
                 except ArchiveNotReadyError:
@@ -493,8 +566,70 @@ class GromacsReconciler:
                     continue
                 self._complete(job, archive)
                 continue
+            if outcome.kind == "completed" and job.provider_operation not in {
+                None,
+                _FINAL_OPERATION,
+            }:
+                if job.state == JobState.CANCEL_REQUESTED:
+                    self.store.set_job_state(
+                        job.job_id,
+                        JobState.CANCELLED,
+                        now=self._now(),
+                    )
+                else:
+                    await self._advance(job)
+                continue
             await self._apply(job, outcome)
         await self._cleanup_intermediates()
+
+    async def _advance(self, job: JobRecord) -> None:
+        """Attach exactly one next direct Modal stage to a durable Job."""
+        try:
+            submitted = await self.adapter.advance(job)
+        except _MODAL_SERVICE_ERRORS:
+            LOGGER.exception("Modal is unavailable while advancing job %s", job.job_id)
+            return
+        except Exception:
+            LOGGER.exception("Could not advance GROMACS job %s", job.job_id)
+            self.store.fail_job(
+                job.job_id,
+                error_code="compute_failed",
+                error_message="GROMACS could not continue the simulation.",
+                now=self._now(),
+            )
+            return
+
+        try:
+            advanced = self.store.replace_provider_call(
+                job.job_id,
+                expected_modal_call_id=job.modal_call_id or "",
+                modal_call_id=submitted.modal_call_id,
+                provider_operation=submitted.provider_operation,
+                now=self._now(),
+            )
+        except JobSubmissionConflictError:
+            LOGGER.warning(
+                "Discarding duplicate GROMACS stage %s for job %s",
+                submitted.modal_call_id,
+                job.job_id,
+            )
+            try:
+                await self.adapter.cancel(submitted.modal_call_id)
+            except _MODAL_SERVICE_ERRORS:
+                LOGGER.exception(
+                    "Could not cancel duplicate GROMACS stage %s",
+                    submitted.modal_call_id,
+                )
+            return
+
+        if advanced.state == JobState.CANCEL_REQUESTED:
+            try:
+                await self.adapter.cancel(submitted.modal_call_id)
+            except _MODAL_SERVICE_ERRORS:
+                LOGGER.exception(
+                    "Could not cancel newly attached GROMACS stage %s",
+                    submitted.modal_call_id,
+                )
 
     async def _cleanup_intermediates(self) -> None:
         if self.intermediate_retention_seconds is None:
@@ -526,7 +661,7 @@ class GromacsReconciler:
         if outcome.kind == "cancelled":
             self.store.set_job_state(job.job_id, JobState.CANCELLED, now=now)
             return
-        if outcome.kind == "failed" or outcome.result is None:
+        if outcome.kind == "failed":
             self.store.fail_job(
                 job.job_id,
                 error_code="compute_failed",
@@ -537,7 +672,7 @@ class GromacsReconciler:
 
         self.store.set_job_state(job.job_id, JobState.FINALIZING, now=now)
         try:
-            archive = await self.adapter.final_archive(job, outcome.result)
+            archive = await self.adapter.publish_archive(job, completed_at=now)
         except ArchiveNotReadyError:
             LOGGER.info("GROMACS archive is not visible yet for job %s", job.job_id)
             return

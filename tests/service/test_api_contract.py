@@ -42,6 +42,7 @@ VALID_PDB = (
 class SubmittedCall:
     modal_call_id: str
     run_name: str
+    provider_operation: str
 
 
 class FakeGromacsAdapter:
@@ -75,6 +76,9 @@ class FakeGromacsAdapter:
         return SubmittedCall(
             modal_call_id=f"fc-{len(self.submissions)}",
             run_name=run_name,
+            provider_operation=(
+                "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
+            ),
         )
 
     async def cancel(self, modal_call_id: str) -> None:

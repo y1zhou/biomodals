@@ -187,7 +187,7 @@ seconds. Public states are intentionally coarse:
 queued -> running -> finalizing -> succeeded
                             |---> partial (downloadable, with warnings)
                             `---> failed
-queued/running/finalizing -> cancel_requested -> cancelled
+queued/running -> cancel_requested -> cancelled
 ```
 
 Cancellation is idempotent while it is pending. The adapter asks Modal to
@@ -197,18 +197,29 @@ call graph is inactive. If a verified result archive wins a cancellation race,
 the completed result wins. Terminal jobs are preserved and there is no
 job-delete endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
 
+If a submission may have reached Modal but no call ID was durably recorded,
+the control plane cannot prove inactivity or issue a targeted cancellation. A
+Cancellation request therefore remains pending through the submission lease
+and becomes `failed`, not falsely `cancelled`, when that lease expires.
+
 Initial submission uses a short SQLite lease and the stable run name
 `api-<job UUID>`. An idempotent replay cannot create a second call while that
-lease is active, and a replay after a process failure can safely retry the same
-run. If the call was accepted before its ID reached SQLite, reconciliation can
-recover the verified archive by stable run name. Later stage transitions use
-the stored operation and call ID as an atomic compare-and-replace boundary.
-The required single API worker means routine reconciliation passes cannot race;
-if a process dies in the narrow interval after a stage spawn but before its ID
-is recorded, recovery may retry that resume-aware stage under the same run name.
-The two calls can overlap briefly in that failure window. Eliminating that
-single-host limitation requires provider-side idempotent submission or an
-external durable worker before enabling multiple API processes.
+lease is active. If the process dies after claiming the Job but before storing
+a Modal call ID, reconciliation leaves the Job queued until the lease expires
+and then fails it with `compute_failed`. It does not automatically resubmit an
+operation whose provider outcome cannot be proven, because doing so could
+duplicate paid compute. The User must start a new Submission explicitly.
+
+Every later stage transition takes the same kind of durable lease before
+calling `.spawn()`. A returned call ID atomically replaces the prior completed
+call and clears the lease. If the process dies or Modal's response is ambiguous
+before that replacement, reconciliation waits for expiry and fails the Job; it
+does not spawn the stage again. Each established stage writes resume-aware
+output under the stable run name, but resume behavior is not treated as a
+provider idempotency guarantee. The required single API worker means routine
+reconciliation passes cannot race. Eliminating this untracked-call limitation
+requires provider-side idempotent submission or an external durable worker
+before enabling multiple API processes.
 
 The supported `FunctionCall` API does not expose a backend log stream. Live
 stdout streaming is therefore deferred. A sanitized `run.log` is included in
@@ -299,17 +310,27 @@ The application factory reads these settings:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `BIOMODALS_API_CONF_ENV` | unset | Optional path to a dotenv file; explicit process variables override file values |
+| `MODAL_TOKEN_ID` | required | Dedicated Modal service-user token identifier |
+| `MODAL_TOKEN_SECRET` | required | Dedicated Modal service-user token secret; never returned by the API or stored in SQLite |
 | `BIOMODALS_STATE_DIR` | `.biomodals/state` | Durable SQLite directory |
 | `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable final-ZIP cache directory |
 | `BIOMODALS_CACHE_MAX_BYTES` | `10737418240` | Local cache target (10 GiB) |
-| `BIOMODALS_FRONTEND_URL` | `http://localhost:5173` | Base URL written into one-time links |
-| `BIOMODALS_ALLOWED_ORIGIN` | frontend URL | Exact accepted browser Origin |
+| `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | One public origin for links, exact-Origin checks, and same-origin browser access |
 | `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
-| `BIOMODALS_MODAL_ENVIRONMENT` | `main` | Explicit Modal Environment for lookup/storage |
+| `BIOMODALS_MODAL_ENVIRONMENT` | `production` | Modal Environment default; configurable in Admin unless a process override is set |
 | `BIOMODALS_GROMACS_APP` | `Gromacs` | Deployed GROMACS Modal App name |
-| `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Active jobs admitted per user |
+| `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Workload-wide active Job limit default |
+| `BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT` | `10` | Global active Job limit default |
+| `BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT` | `2` | Active Job limit assigned to new Users by default |
 | `BIOMODALS_RECONCILE_SECONDS` | `10` | Modal reconciliation interval |
 | `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` | unset | Positive retention enables cleanup of published runs' intermediates |
+
+The Admin API stores editable runtime overrides for the Modal Environment,
+GROMACS App name, and Tool and Global limits in SQLite. Dotenv values are their
+host defaults. An explicit process variable has highest precedence and makes
+the corresponding Admin field read-only. Modal credentials remain process/file
+configuration only, and the API refuses to start unless both are present.
 
 Start the development server with:
 
@@ -334,6 +355,6 @@ provisioning example.
 | One Modal `asgi_app` with deployed-Function adapters | Viable future host, but unnecessary while the internal Linux host is the accepted ingress. |
 | One external FastAPI server with explicit workload modules | **Selected.** It matches the network, scale, UX, and portability requirements. |
 | Modal Dict as the job database | Rejected. Job history and ownership must outlive short Modal call/Dict retention. |
-| Modal Dict as an atomic final-archive publication registry | **Selected.** It elects one compute-side candidate without moving identity or job state into Modal. |
+| Modal Dict as an atomic final-archive publication registry | Rejected. The single control-plane reconciler publishes deterministic archives directly, so another registry adds no useful authority. |
 | PostgreSQL and multiple API workers | Deferred. It adds operations without benefit at the current scale; it becomes necessary before horizontal API scaling. |
 | SSE/WebSockets or Modal log streaming | Deferred. Polling coarse SQLite state is enough for v1, and the public Modal call API has no supported log stream. |

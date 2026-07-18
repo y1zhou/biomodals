@@ -199,7 +199,7 @@ def test_cancellation_is_preserved_as_a_state_transition(tmp_path: Path) -> None
         store.request_cancel(alice, job.job_id, now=1_800_000_004)
 
 
-def test_submission_lease_is_stable_retryable_and_single_writer(
+def test_submission_lease_requires_explicit_release_before_retry(
     tmp_path: Path,
 ) -> None:
     store, alice, _bob = make_store(tmp_path)
@@ -220,7 +220,7 @@ def test_submission_lease_is_stable_retryable_and_single_writer(
         now=110,
         lease_seconds=20,
     )
-    retry = store.claim_submission(
+    expired = store.claim_submission(
         job.job_id,
         run_name=run_name,
         submission_token="retry",
@@ -231,6 +231,21 @@ def test_submission_lease_is_stable_retryable_and_single_writer(
     assert claimed is not None
     assert claimed.run_name == run_name
     assert concurrent is None
+    assert expired is None
+
+    store.release_submission(
+        job.job_id,
+        submission_token="first",
+        now=120,
+    )
+    retry = store.claim_submission(
+        job.job_id,
+        run_name=run_name,
+        submission_token="retry",
+        now=120,
+        lease_seconds=20,
+    )
+
     assert retry is not None
     assert retry.submission_token == "retry"
 
@@ -274,15 +289,73 @@ def test_job_atomically_advances_one_active_provider_operation(
         run_name=f"api-{job.job_id.hex}",
         now=100,
     )
+    claimed = store.claim_provider_advance(
+        job.job_id,
+        expected_modal_call_id="fc-prepare",
+        submission_token="next-stage",
+        now=101,
+    )
 
     advanced = store.replace_provider_call(
         job.job_id,
         expected_modal_call_id="fc-prepare",
         modal_call_id="fc-production",
         provider_operation="production_run_cpu",
-        now=101,
+        submission_token="next-stage",
+        now=102,
     )
 
     assert attached.provider_operation == "prepare_tpr_cpu"
+    assert claimed is not None
     assert advanced.modal_call_id == "fc-production"
     assert advanced.provider_operation == "production_run_cpu"
+    assert advanced.submission_lease_until is None
+
+
+def test_provider_advance_lease_requires_explicit_release_before_retry(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
+    store.mark_submitted(
+        job.job_id,
+        modal_call_id="fc-prepare",
+        provider_operation="prepare_tpr_cpu",
+        run_name=f"api-{job.job_id.hex}",
+        now=100,
+    )
+
+    claimed = store.claim_provider_advance(
+        job.job_id,
+        expected_modal_call_id="fc-prepare",
+        submission_token="first",
+        now=101,
+        lease_seconds=20,
+    )
+    expired = store.claim_provider_advance(
+        job.job_id,
+        expected_modal_call_id="fc-prepare",
+        submission_token="second",
+        now=121,
+        lease_seconds=20,
+    )
+
+    assert claimed is not None
+    assert expired is None
+
+    store.release_provider_advance(
+        job.job_id,
+        expected_modal_call_id="fc-prepare",
+        submission_token="first",
+        now=121,
+    )
+    retried = store.claim_provider_advance(
+        job.job_id,
+        expected_modal_call_id="fc-prepare",
+        submission_token="second",
+        now=121,
+        lease_seconds=20,
+    )
+
+    assert retried is not None
+    assert retried.submission_token == "second"

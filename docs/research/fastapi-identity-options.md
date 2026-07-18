@@ -72,8 +72,9 @@ workload routers or job ownership.
 
 ## Manual account lifecycle
 
-An administrator runs the CLI with the same `BIOMODALS_STATE_DIR` and
-`BIOMODALS_FRONTEND_URL` as the server:
+An administrator runs the CLI with the same `BIOMODALS_API_CONF_ENV` (or
+equivalent explicit `BIOMODALS_STATE_DIR` and `BIOMODALS_PUBLIC_URL`) as the
+server:
 
 ```bash
 uv run biomodals api admin create-user alice@example.com \
@@ -88,7 +89,7 @@ delivers it through company chat or in person after identifying the employee.
 The link expires after one hour and has this shape:
 
 ```text
-https://biomodals.internal/reset-password#token=<random-token>
+https://biomodals.internal/set-password#token=<random-token>
 ```
 
 The secret is in the URL fragment, which is not sent to the web server or
@@ -141,9 +142,10 @@ development uses `biomodals-session` with secure cookies disabled. Neither
 cookie sets a `Domain` attribute.
 
 Unsafe routes require both the session-bound CSRF value and an exact match to
-`BIOMODALS_ALLOWED_ORIGIN`. Login and password setup also require that exact
-Origin. CORS is not enabled; the frontend uses the same-origin `/api` proxy.
-These controls remain required even though the service is internal.
+the origin configured by `BIOMODALS_PUBLIC_URL`. Login and password setup also
+require that exact Origin. CORS is not enabled; the frontend uses the
+same-origin `/api` proxy. These controls remain required even though the
+service is internal.
 
 The server stores session and CSRF digests, never the bearer values. A session
 expires after 30 days without use or 90 days after login, whichever occurs

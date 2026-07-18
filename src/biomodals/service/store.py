@@ -1040,10 +1040,8 @@ class ServiceStore:
                   AND state = ?
                   AND modal_call_id IS NULL
                   AND (run_name IS NULL OR run_name = ?)
-                  AND (
-                      submission_lease_until IS NULL
-                      OR submission_lease_until <= ?
-                  )
+                  AND submission_token IS NULL
+                  AND submission_lease_until IS NULL
                 """,
                 (
                     run_name,
@@ -1053,7 +1051,6 @@ class ServiceStore:
                     str(job_id),
                     JobState.QUEUED.value,
                     run_name,
-                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1147,6 +1144,76 @@ class ServiceStore:
                 )
         return _job_from_row(row)
 
+    def claim_provider_advance(
+        self,
+        job_id: UUID,
+        *,
+        expected_modal_call_id: str,
+        submission_token: str,
+        now: int,
+        lease_seconds: int = 120,
+    ) -> JobRecord | None:
+        """Lease one transition away from a completed provider call."""
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET submission_token = ?, submission_lease_until = ?, updated_at = ?
+                WHERE job_id = ?
+                  AND modal_call_id = ?
+                  AND state IN (?, ?)
+                  AND submission_token IS NULL
+                  AND submission_lease_until IS NULL
+                """,
+                (
+                    submission_token,
+                    now + lease_seconds,
+                    now,
+                    str(job_id),
+                    expected_modal_call_id,
+                    JobState.QUEUED.value,
+                    JobState.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return _job_from_row(row)
+
+    def release_provider_advance(
+        self,
+        job_id: UUID,
+        *,
+        expected_modal_call_id: str,
+        submission_token: str,
+        now: int,
+    ) -> JobRecord:
+        """Release a transition that failed before remote submission began."""
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET submission_token = NULL, submission_lease_until = NULL,
+                    updated_at = ?
+                WHERE job_id = ?
+                  AND modal_call_id = ?
+                  AND submission_token = ?
+                """,
+                (now, str(job_id), expected_modal_call_id, submission_token),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+        return _job_from_row(row)
+
     def replace_provider_call(
         self,
         job_id: UUID,
@@ -1154,6 +1221,7 @@ class ServiceStore:
         expected_modal_call_id: str,
         modal_call_id: str,
         provider_operation: str,
+        submission_token: str,
         now: int,
     ) -> JobRecord:
         """Atomically move an active Job to its next provider operation."""
@@ -1164,9 +1232,12 @@ class ServiceStore:
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET modal_call_id = ?, provider_operation = ?, updated_at = ?
+                SET modal_call_id = ?, provider_operation = ?,
+                    submission_token = NULL, submission_lease_until = NULL,
+                    updated_at = ?
                 WHERE job_id = ?
                   AND modal_call_id = ?
+                  AND submission_token = ?
                   AND state IN (?, ?, ?, ?)
                 """,
                 (
@@ -1175,6 +1246,7 @@ class ServiceStore:
                     now,
                     str(job_id),
                     expected_modal_call_id,
+                    submission_token,
                     *(state.value for state in ACTIVE_JOB_STATES),
                 ),
             )
@@ -1346,6 +1418,7 @@ class ServiceStore:
                 """
                 UPDATE jobs
                 SET state = ?, error_code = ?, error_message = ?,
+                    submission_token = NULL, submission_lease_until = NULL,
                     updated_at = ?, completed_at = ?
                 WHERE job_id = ?
                 """,

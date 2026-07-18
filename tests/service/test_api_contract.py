@@ -21,6 +21,7 @@ from biomodals.service.auth import AuthService
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.modal import GromacsReconciler
+from biomodals.service.gromacs.router import SubmissionOutcomeUnknownError
 from biomodals.service.jobs import WorkloadRegistration
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
@@ -56,6 +57,7 @@ class FakeGromacsAdapter:
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
         self.failures_remaining = 0
+        self.unknown_failures_remaining = 0
 
     async def submit(
         self,
@@ -70,6 +72,9 @@ class FakeGromacsAdapter:
             modal_configuration.app_name,
             modal_configuration.environment,
         ))
+        if self.unknown_failures_remaining:
+            self.unknown_failures_remaining -= 1
+            raise SubmissionOutcomeUnknownError("provider outcome unknown")
         if self.failures_remaining:
             self.failures_remaining -= 1
             raise RuntimeError("temporary Modal failure")
@@ -827,12 +832,21 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
         idempotency_key=str(uuid4()),
     )
     job_id = UUID(submitted.json()["job_id"])
+    transition_token = uuid4().hex
 
+    claimed = store.claim_provider_advance(
+        job_id,
+        expected_modal_call_id="fc-1",
+        submission_token=transition_token,
+        now=1_800_000_001,
+    )
+    assert claimed is not None
     store.replace_provider_call(
         job_id,
         expected_modal_call_id="fc-1",
         modal_call_id="fc-2",
         provider_operation="collect_traj_stats:nvt_",
+        submission_token=transition_token,
         now=1_800_000_001,
     )
     analyzing = client.get(f"/api/v1/jobs/{job_id}")
@@ -928,6 +942,29 @@ def test_failed_spawn_can_retry_the_same_stable_run(
     assert len(adapter.submissions) == 2
     assert adapter.submissions[0][1] == adapter.submissions[1][1]
     assert adapter.submissions[0][1] == f"api-{UUID(retried.json()['job_id']).hex}"
+
+
+def test_unknown_spawn_outcome_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    key = str(uuid4())
+    adapter.unknown_failures_remaining = 1
+
+    failed = _submit(client, csrf_token, idempotency_key=key)
+    replayed = _submit(client, csrf_token, idempotency_key=key)
+
+    assert failed.status_code == 503
+    assert failed.json()["code"] == "compute_unavailable"
+    assert replayed.status_code == 202
+    assert replayed.json()["state"] == "queued"
+    assert len(adapter.submissions) == 1
+    owner_id = UUID(client.get("/api/v1/auth/me").json()["user_id"])
+    job = store.get_job(owner_id, UUID(replayed.json()["job_id"]))
+    assert job is not None
+    assert job.submission_lease_until is not None
 
 
 def test_cancel_after_failed_spawn_finishes_without_modal_access(

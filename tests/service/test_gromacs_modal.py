@@ -23,7 +23,10 @@ from biomodals.service.gromacs.modal import (
     GromacsReconciler,
     ModalGromacsAdapter,
 )
-from biomodals.service.gromacs.router import GromacsJobOptions
+from biomodals.service.gromacs.router import (
+    GromacsJobOptions,
+    SubmissionOutcomeUnknownError,
+)
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
     JobAdmissionConfiguration,
@@ -100,6 +103,17 @@ class FakeFunction:
     async def _spawn(self, **kwargs):
         self.spawn_kwargs = kwargs
         return self.call
+
+
+class FailingFunction:
+    def __init__(self, error: Exception) -> None:
+        self.calls = 0
+        self.error = error
+        self.spawn = AsyncMethod(self._spawn)
+
+    async def _spawn(self, **_kwargs):
+        self.calls += 1
+        raise self.error
 
 
 def _valid_archive_bytes() -> tuple[bytes, str]:
@@ -425,6 +439,32 @@ def test_submit_spawns_detached_call_with_normalized_options(
     }
 
 
+def test_submit_marks_a_spawn_error_as_an_unknown_provider_outcome() -> None:
+    adapter = ModalGromacsAdapter(
+        app_name="GromacsAPI",
+        environment_name="department-dev",
+        function_resolver=cast(
+            Any,
+            lambda *_args, **_kwargs: FailingFunction(
+                modal.exception.ConnectionError("temporary")
+            ),
+        ),
+    )
+
+    with pytest.raises(SubmissionOutcomeUnknownError):
+        asyncio.run(
+            adapter.submit(
+                b"PDB content",
+                GromacsJobOptions(),
+                run_name=RUN_NAME,
+                modal_configuration=ModalConfigurationSnapshot(
+                    environment="department-dev",
+                    app_name="GromacsAPI",
+                ),
+            )
+        )
+
+
 def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
     store, job = _submitted_job(tmp_path)
     lookups: list[tuple[str, str, str | None]] = []
@@ -454,6 +494,14 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
         "collect_traj_stats:production_",
     )
     for index, operation in enumerate(operations, start=1):
+        submission_token = f"stage-{index}"
+        claimed = store.claim_provider_advance(
+            job.job_id,
+            expected_modal_call_id=job.modal_call_id or "",
+            submission_token=submission_token,
+            now=3 + index,
+        )
+        assert claimed is not None
         submitted = asyncio.run(adapter.advance(job))
         assert submitted.provider_operation == operation
         job = store.replace_provider_call(
@@ -461,6 +509,7 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
             expected_modal_call_id=job.modal_call_id or "",
             modal_call_id=f"fc-{index}",
             provider_operation=operation,
+            submission_token=submission_token,
             now=3 + index,
         )
 
@@ -513,6 +562,27 @@ def test_poll_uses_call_graph_to_classify_get_timeout(
 
     assert outcome.kind == expected_kind
     assert ("get", "fc-root", 0) in root.events
+
+
+def test_poll_waits_for_cancelled_call_graph_descendants() -> None:
+    active_child = CallNode("fc-child", modal.call_graph.InputStatus.PENDING)
+    root_node = CallNode(
+        "fc-root",
+        modal.call_graph.InputStatus.TERMINATED,
+        children=[active_child],
+    )
+    root = FakeCall(
+        "fc-root",
+        result=modal.exception.InputCancellation("cancelled"),
+        graph=[root_node],
+    )
+    adapter = _adapter({"fc-root": root})
+
+    assert asyncio.run(adapter.poll("fc-root")).kind == "running"
+    assert ("graph", "fc-root", None) in root.events
+
+    active_child.status = modal.call_graph.InputStatus.TERMINATED
+    assert asyncio.run(adapter.poll("fc-root")).kind == "cancelled"
 
 
 def test_cancel_stops_root_and_only_active_descendants() -> None:
@@ -602,6 +672,93 @@ def test_reconciler_advances_completed_stage_to_one_direct_named_call(
     }
 
 
+def test_reconciler_does_not_repeat_an_unknown_stage_submission(
+    tmp_path: Path,
+) -> None:
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="/volumes/Gromacs-outputs/api-run")
+    failing = FailingFunction(modal.exception.ConnectionError("temporary"))
+    now = 10
+    reconciler = GromacsReconciler(
+        store,
+        _adapter(
+            {"fc-root": prepare},
+            function_resolver=lambda *_args, **_kwargs: failing,
+        ),
+        now=lambda: now,
+    )
+
+    asyncio.run(reconciler.reconcile())
+    uncertain = store.get_job(job.owner_user_id, job.job_id)
+    assert uncertain is not None
+    assert uncertain.state == JobState.QUEUED
+    assert uncertain.submission_lease_until == 130
+    assert failing.calls == 1
+
+    now = 129
+    asyncio.run(reconciler.reconcile())
+    assert failing.calls == 1
+
+    now = 130
+    asyncio.run(reconciler.reconcile())
+    failed = store.get_job(job.owner_user_id, job.job_id)
+    assert failed is not None
+    assert failed.state == JobState.FAILED
+    assert failed.error_code == "compute_failed"
+    assert failed.error_message == (
+        "GROMACS stage submission was interrupted before remote compute could be "
+        "tracked."
+    )
+
+
+def test_untracked_cancellation_is_not_declared_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ServiceStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    user = store.create_user(
+        email="alice@example.com",
+        display_name="Alice",
+        token_digest=b"setup-token-digest",
+        token_expires_at=3_600,
+        now=1,
+        is_admin=True,
+        active_job_limit=10,
+    )
+    admission = store.admit_job(
+        owner_user_id=user.user_id,
+        display_name="Simulation",
+        idempotency_key=str(uuid4()),
+        request_hash="request-digest",
+        parameters_json="{}",
+        configuration=_admission_configuration(),
+        now=2,
+    )
+    store.claim_submission(
+        admission.job.job_id,
+        run_name=RUN_NAME,
+        submission_token="lost-submitter",
+        now=3,
+    )
+    store.request_cancel(user.user_id, admission.job.job_id, now=4)
+    _install_volume(monkeypatch, {})
+    now = 122
+    reconciler = GromacsReconciler(store, _adapter({}), now=lambda: now)
+
+    asyncio.run(reconciler.reconcile())
+    cancelling = store.get_job(user.user_id, admission.job.job_id)
+    assert cancelling is not None
+    assert cancelling.state == JobState.CANCEL_REQUESTED
+
+    now = 123
+    asyncio.run(reconciler.reconcile())
+    failed = store.get_job(user.user_id, admission.job.job_id)
+    assert failed is not None
+    assert failed.state == JobState.FAILED
+    assert failed.error_code == "compute_failed"
+
+
 def test_completed_stage_does_not_advance_after_cancellation(tmp_path: Path) -> None:
     store, job = _submitted_job(tmp_path, cancel_requested=True)
     root_node = CallNode("fc-root", modal.call_graph.InputStatus.SUCCESS)
@@ -655,6 +812,29 @@ def test_completed_archive_wins_cancel_race(
     assert completed.result_volume_path == f"api-results/{RUN_NAME}/result.zip"
     assert f"api-results/{RUN_NAME}/result.zip" in files
     assert ("cancel", "fc-root", False) in root.events
+
+
+def test_transient_archive_publication_error_remains_finalizing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
+
+    async def unavailable(*_args, **_kwargs):
+        raise modal.exception.ConnectionError("temporary")
+
+    monkeypatch.setattr(adapter, "publish_archive", unavailable)
+
+    asyncio.run(GromacsReconciler(store, adapter, now=lambda: 10).reconcile())
+
+    finalizing = store.get_job(job.owner_user_id, job.job_id)
+    assert finalizing is not None
+    assert finalizing.state == JobState.FINALIZING
+    assert finalizing.error_code is None
 
 
 def test_expired_call_output_recovers_completed_archive_from_volume_marker(
@@ -769,7 +949,7 @@ def test_missing_recovery_marker_is_not_ready(
         asyncio.run(_adapter({}).recover_archive(job))
 
 
-def test_reconciler_recovers_orphaned_submission_by_stable_run_name(
+def test_reconciler_fails_an_expired_untracked_submission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -799,22 +979,24 @@ def test_reconciler_recovers_orphaned_submission_by_stable_run_name(
         submission_token="lost-submitter",
         now=3,
     )
-    archive_bytes, request_sha256 = _valid_archive_bytes()
-    _install_volume(
-        monkeypatch,
-        {
-            f"api-results/{RUN_NAME}/result.json": _result_marker(
-                archive_bytes, request_sha256
-            ),
-            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
-        },
+    _install_volume(monkeypatch, {})
+    now = 122
+    reconciler = GromacsReconciler(store, _adapter({}), now=lambda: now)
+
+    asyncio.run(reconciler.reconcile())
+    queued = store.get_job(user.user_id, admission.job.job_id)
+    assert queued is not None
+    assert queued.state == JobState.QUEUED
+
+    now = 123
+    asyncio.run(reconciler.reconcile())
+    failed = store.get_job(user.user_id, admission.job.job_id)
+    assert failed is not None
+    assert failed.state == JobState.FAILED
+    assert failed.error_code == "compute_failed"
+    assert failed.error_message == (
+        "GROMACS submission was interrupted before remote compute could be tracked."
     )
-
-    asyncio.run(GromacsReconciler(store, _adapter({}), now=lambda: 10).reconcile())
-
-    completed = store.get_job(user.user_id, admission.job.job_id)
-    assert completed is not None
-    assert completed.state == JobState.SUCCEEDED
 
 
 def test_cancelled_is_terminal_only_after_call_graph_is_inactive(

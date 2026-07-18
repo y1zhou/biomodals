@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from typing import BinaryIO, Literal, cast
+from uuid import uuid4
 
 import modal
 import orjson
@@ -19,7 +20,10 @@ from biomodals.service.gromacs.archive import (
     validate_gromacs_archive,
     write_gromacs_archive,
 )
-from biomodals.service.gromacs.router import GromacsJobOptions
+from biomodals.service.gromacs.router import (
+    GromacsJobOptions,
+    SubmissionOutcomeUnknownError,
+)
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import (
     JobRecord,
@@ -133,14 +137,20 @@ class ModalGromacsAdapter:
             function_name,
             environment_name=modal_configuration.environment,
         )
-        call = await function.spawn.aio(
-            pdb_content=pdb_content,
-            run_name=run_name,
-            simulation_time_ns=options.simulation_time_ns,
-            run_pdbfixer=options.run_pdbfixer,
-        )
+        try:
+            call = await function.spawn.aio(
+                pdb_content=pdb_content,
+                run_name=run_name,
+                simulation_time_ns=options.simulation_time_ns,
+                run_pdbfixer=options.run_pdbfixer,
+            )
+            modal_call_id = call.object_id
+        except Exception as exc:
+            raise SubmissionOutcomeUnknownError(
+                "Modal did not return a durable FunctionCall handle"
+            ) from exc
         return SubmittedModalCall(
-            modal_call_id=call.object_id,
+            modal_call_id=modal_call_id,
             run_name=run_name,
             provider_operation=function_name,
         )
@@ -188,9 +198,15 @@ class ModalGromacsAdapter:
             function_name,
             environment_name=job.modal_environment,
         )
-        call = await function.spawn.aio(**kwargs)
+        try:
+            call = await function.spawn.aio(**kwargs)
+            modal_call_id = call.object_id
+        except Exception as exc:
+            raise SubmissionOutcomeUnknownError(
+                "Modal did not return a durable FunctionCall handle"
+            ) from exc
         return SubmittedModalCall(
-            modal_call_id=call.object_id,
+            modal_call_id=modal_call_id,
             run_name=job.run_name,
             provider_operation=operation,
         )
@@ -206,6 +222,12 @@ class ModalGromacsAdapter:
         try:
             raw_result = await call.get.aio(timeout=0)
         except modal.exception.InputCancellation:
+            graph = await call.get_call_graph.aio()
+            nodes = _call_nodes(graph)
+            if any(
+                node.status == modal.call_graph.InputStatus.PENDING for node in nodes
+            ):
+                return PollOutcome("running")
             return PollOutcome("cancelled")
         except (modal.exception.OutputExpiredError, modal.exception.NotFoundError):
             return PollOutcome("expired")
@@ -465,36 +487,38 @@ class GromacsReconciler:
         """Poll every active GROMACS call once."""
         for job in self.store.list_reconcilable_jobs("gromacs"):
             if job.modal_call_id is None:
+                now = self._now()
+                if job.submission_lease_until is not None:
+                    if job.submission_lease_until <= now:
+                        self.store.fail_job(
+                            job.job_id,
+                            error_code="compute_failed",
+                            error_message=(
+                                "GROMACS submission was interrupted before remote "
+                                "compute could be tracked."
+                            ),
+                            now=now,
+                        )
+                    continue
                 if job.state == JobState.CANCEL_REQUESTED:
                     self.store.set_job_state(
                         job.job_id,
                         JobState.CANCELLED,
-                        now=self._now(),
+                        now=now,
                     )
-                    continue
-                if job.run_name is not None:
-                    try:
-                        archive = await self.adapter.recover_archive(job)
-                    except ArchiveNotReadyError:
-                        pass
-                    except _MODAL_SERVICE_ERRORS:
-                        LOGGER.exception(
-                            "Modal is unavailable while recovering job %s", job.job_id
-                        )
-                    except Exception:
-                        LOGGER.exception(
-                            "Could not validate recovered job %s", job.job_id
-                        )
-                        self.store.fail_job(
-                            job.job_id,
-                            error_code="result_invalid",
-                            error_message=(
-                                "GROMACS completed, but its result archive was invalid."
-                            ),
-                            now=self._now(),
-                        )
-                    else:
-                        self._complete(job, archive)
+                continue
+            if job.submission_lease_until is not None:
+                now = self._now()
+                if job.submission_lease_until <= now:
+                    self.store.fail_job(
+                        job.job_id,
+                        error_code="compute_failed",
+                        error_message=(
+                            "GROMACS stage submission was interrupted before remote "
+                            "compute could be tracked."
+                        ),
+                        now=now,
+                    )
                 continue
             try:
                 if job.state == JobState.CANCEL_REQUESTED:
@@ -584,12 +608,39 @@ class GromacsReconciler:
 
     async def _advance(self, job: JobRecord) -> None:
         """Attach exactly one next direct Modal stage to a durable Job."""
+        submission_token = uuid4().hex
+        now = self._now()
+        claimed = self.store.claim_provider_advance(
+            job.job_id,
+            expected_modal_call_id=job.modal_call_id or "",
+            submission_token=submission_token,
+            now=now,
+        )
+        if claimed is None:
+            return
         try:
-            submitted = await self.adapter.advance(job)
+            submitted = await self.adapter.advance(claimed)
+        except SubmissionOutcomeUnknownError:
+            LOGGER.exception(
+                "Could not confirm the next GROMACS stage for job %s", job.job_id
+            )
+            return
         except _MODAL_SERVICE_ERRORS:
+            self.store.release_provider_advance(
+                job.job_id,
+                expected_modal_call_id=job.modal_call_id or "",
+                submission_token=submission_token,
+                now=self._now(),
+            )
             LOGGER.exception("Modal is unavailable while advancing job %s", job.job_id)
             return
         except Exception:
+            self.store.release_provider_advance(
+                job.job_id,
+                expected_modal_call_id=job.modal_call_id or "",
+                submission_token=submission_token,
+                now=self._now(),
+            )
             LOGGER.exception("Could not advance GROMACS job %s", job.job_id)
             self.store.fail_job(
                 job.job_id,
@@ -605,6 +656,7 @@ class GromacsReconciler:
                 expected_modal_call_id=job.modal_call_id or "",
                 modal_call_id=submitted.modal_call_id,
                 provider_operation=submitted.provider_operation,
+                submission_token=submission_token,
                 now=self._now(),
             )
         except JobSubmissionConflictError:
@@ -675,6 +727,9 @@ class GromacsReconciler:
             archive = await self.adapter.publish_archive(job, completed_at=now)
         except ArchiveNotReadyError:
             LOGGER.info("GROMACS archive is not visible yet for job %s", job.job_id)
+            return
+        except _MODAL_SERVICE_ERRORS:
+            LOGGER.exception("Modal is unavailable while publishing job %s", job.job_id)
             return
         except Exception:
             LOGGER.exception("GROMACS job %s returned an invalid archive", job.job_id)

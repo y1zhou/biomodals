@@ -86,6 +86,10 @@ class ComputeUnavailableResponse(CodedErrorResponse):
     code: Literal["compute_unavailable"]
 
 
+class SubmissionOutcomeUnknownError(RuntimeError):
+    """Raised when a remote call may exist but no durable handle was returned."""
+
+
 class SubmittedCall(Protocol):
     """Detached provider call returned after submission."""
 
@@ -260,15 +264,15 @@ def create_router(
                 run_name=run_name,
                 modal_configuration=claimed.modal_configuration,
             )
-            if submitted.run_name != run_name:
-                raise RuntimeError("Compute returned the wrong GROMACS run name")
-            job = store.mark_submitted(
-                admission.job.job_id,
-                modal_call_id=submitted.modal_call_id,
-                provider_operation=submitted.provider_operation,
-                run_name=submitted.run_name,
-                submission_token=submission_token,
+        except SubmissionOutcomeUnknownError as exc:
+            LOGGER.exception(
+                "Could not confirm GROMACS submission %s", admission.job.job_id
             )
+            raise CodedAPIError(
+                503,
+                "compute_unavailable",
+                "GROMACS compute submission could not be confirmed",
+            ) from exc
         except Exception as exc:
             LOGGER.exception("Could not submit GROMACS job %s", admission.job.job_id)
             store.release_submission(
@@ -280,6 +284,26 @@ def create_router(
                 503,
                 "compute_unavailable",
                 "GROMACS compute is temporarily unavailable",
+            ) from exc
+
+        try:
+            if submitted.run_name != run_name:
+                raise RuntimeError("Compute returned the wrong GROMACS run name")
+            job = store.mark_submitted(
+                admission.job.job_id,
+                modal_call_id=submitted.modal_call_id,
+                provider_operation=submitted.provider_operation,
+                run_name=submitted.run_name,
+                submission_token=submission_token,
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "Could not persist GROMACS submission %s", admission.job.job_id
+            )
+            raise CodedAPIError(
+                503,
+                "compute_unavailable",
+                "GROMACS compute submission could not be confirmed",
             ) from exc
         return JobView.from_record(job)
 

@@ -23,6 +23,13 @@ class SettingOverrideError(ValueError):
     """Raised when an administrator edits a process-controlled setting."""
 
 
+class _Unchanged:
+    """Sentinel distinguishing an omitted PATCH field from a null reset."""
+
+
+_UNCHANGED = _Unchanged()
+
+
 @dataclass(frozen=True, slots=True)
 class EffectiveSetting[Value: (str, int)]:
     """One effective value plus enough provenance for an honest Admin UI."""
@@ -162,21 +169,24 @@ class RuntimeConfiguration:
     def update_environment(
         self,
         *,
-        modal_environment: str | None = None,
-        global_active_job_limit: int | None = None,
+        modal_environment: str | None | _Unchanged = _UNCHANGED,
+        global_active_job_limit: int | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Atomically update supplied Environment fields after override checks."""
-        updates: dict[str, str] = {}
-        if modal_environment is not None:
+        updates: dict[str, str | None] = {}
+        if not isinstance(modal_environment, _Unchanged):
             self._ensure_editable("BIOMODALS_MODAL_ENVIRONMENT")
-            updates[self._MODAL_ENVIRONMENT_KEY] = _nonempty(
-                modal_environment,
-                "Modal environment",
+            updates[self._MODAL_ENVIRONMENT_KEY] = (
+                None
+                if modal_environment is None
+                else _nonempty(modal_environment, "Modal environment")
             )
-        if global_active_job_limit is not None:
+        if not isinstance(global_active_job_limit, _Unchanged):
             self._ensure_editable("BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT")
-            updates[self._GLOBAL_ACTIVE_LIMIT_KEY] = str(
-                _positive(global_active_job_limit, "Global active job limit")
+            updates[self._GLOBAL_ACTIVE_LIMIT_KEY] = (
+                None
+                if global_active_job_limit is None
+                else str(_positive(global_active_job_limit, "Global active job limit"))
             )
         self.store.set_service_settings(updates)
 
@@ -184,23 +194,28 @@ class RuntimeConfiguration:
         self,
         workload: str,
         *,
-        modal_app_name: str | None = None,
-        active_job_limit: int | None = None,
+        modal_app_name: str | None | _Unchanged = _UNCHANGED,
+        active_job_limit: int | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Atomically update supplied settings for one fixed workload."""
         if workload != "gromacs":
             raise ValueError(f"Unknown workload: {workload}")
-        if modal_app_name is not None:
+        updates: dict[str, str | int | None] = {}
+        if not isinstance(modal_app_name, _Unchanged):
             self._ensure_editable("BIOMODALS_GROMACS_APP")
-            modal_app_name = _nonempty(modal_app_name, "Modal app name")
-        if active_job_limit is not None:
+            updates["modal_app_name"] = (
+                None
+                if modal_app_name is None
+                else _nonempty(modal_app_name, "Modal app name")
+            )
+        if not isinstance(active_job_limit, _Unchanged):
             self._ensure_editable("BIOMODALS_GROMACS_ACTIVE_LIMIT")
-            active_job_limit = _positive(active_job_limit, "Tool active job limit")
-        self.store.set_workload_configuration(
-            workload,
-            modal_app_name=modal_app_name,
-            active_job_limit=active_job_limit,
-        )
+            updates["active_job_limit"] = (
+                None
+                if active_job_limit is None
+                else _positive(active_job_limit, "Tool active job limit")
+            )
+        self.store.set_workload_configuration(workload, updates)
 
     def _text_setting(
         self,

@@ -494,6 +494,63 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     assert current["tools"][0]["running_jobs"] == 1
 
 
+def test_modal_admin_updates_and_resets_each_field_independently(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+    headers = _unsafe_headers(csrf_token)
+
+    tool = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=headers,
+        json={"active_job_limit": 3},
+    ).json()
+    assert tool["active_job_limit"] == {
+        "value": 3,
+        "source": "database",
+        "editable": True,
+    }
+    assert tool["modal_app_name"] == {
+        "value": "Gromacs",
+        "source": "default",
+        "editable": True,
+    }
+
+    restored_tool = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=headers,
+        json={"active_job_limit": None},
+    ).json()
+    assert restored_tool["active_job_limit"] == {
+        "value": 2,
+        "source": "default",
+        "editable": True,
+    }
+    assert restored_tool["modal_app_name"]["source"] == "default"
+
+    environment = client.patch(
+        "/api/v1/admin/modal/environment",
+        headers=headers,
+        json={"global_active_job_limit": 12},
+    ).json()
+    assert environment["global_active_job_limit"]["source"] == "database"
+    assert environment["modal_environment"]["source"] == "default"
+
+    restored_environment = client.patch(
+        "/api/v1/admin/modal/environment",
+        headers=headers,
+        json={"global_active_job_limit": None},
+    ).json()
+    assert restored_environment["global_active_job_limit"] == {
+        "value": 10,
+        "source": "default",
+        "editable": True,
+    }
+    assert restored_environment["modal_environment"]["source"] == "default"
+
+
 def test_modal_admin_rejects_blank_runtime_settings(tmp_path: Path) -> None:
     client, auth, _store, _adapter = _service(tmp_path)
     _activate(auth, "alice@example.com", is_admin=True)

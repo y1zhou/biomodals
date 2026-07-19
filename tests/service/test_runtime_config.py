@@ -61,6 +61,41 @@ def test_database_overrides_file_and_updates_are_live(tmp_path: Path) -> None:
     assert workload.active_job_limit.value == 5
 
 
+def test_reset_removes_only_one_database_override(tmp_path: Path) -> None:
+    configuration = _configuration(
+        tmp_path,
+        config_file=(
+            "BIOMODALS_MODAL_ENVIRONMENT=file-env\n"
+            "BIOMODALS_GROMACS_APP=FileApp\n"
+            "BIOMODALS_GROMACS_ACTIVE_LIMIT=3\n"
+            "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=8\n"
+        ),
+    )
+    configuration.update_environment(
+        modal_environment="database-env",
+        global_active_job_limit=12,
+    )
+    configuration.set_workload(
+        "gromacs",
+        modal_app_name="DatabaseApp",
+        active_job_limit=5,
+    )
+
+    configuration.update_environment(global_active_job_limit=None)
+    configuration.set_workload("gromacs", active_job_limit=None)
+
+    modal_environment = configuration.modal_environment()
+    assert modal_environment.value == "database-env"
+    assert modal_environment.source == "database"
+    assert configuration.global_active_job_limit().value == 8
+    assert configuration.global_active_job_limit().source == "configuration_file"
+    workload = configuration.workload("gromacs")
+    assert workload.modal_app_name.value == "DatabaseApp"
+    assert workload.modal_app_name.source == "database"
+    assert workload.active_job_limit.value == 3
+    assert workload.active_job_limit.source == "configuration_file"
+
+
 def test_process_environment_is_effective_and_read_only(tmp_path: Path) -> None:
     configuration = _configuration(
         tmp_path,

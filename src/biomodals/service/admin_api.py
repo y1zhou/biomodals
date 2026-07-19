@@ -183,15 +183,33 @@ class AdminModalView(BaseModel):
 class UpdateAdminModalEnvironmentRequest(BaseModel):
     """Editable cross-Tool Modal configuration."""
 
-    modal_environment: str | None = Field(default=None, min_length=1, max_length=120)
-    global_active_job_limit: int | None = Field(default=None, ge=1)
+    modal_environment: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        description="Omit to keep unchanged; null restores the configured default.",
+    )
+    global_active_job_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Omit to keep unchanged; null restores the configured default.",
+    )
 
 
 class UpdateAdminModalToolRequest(BaseModel):
     """Editable per-Tool Modal configuration."""
 
-    modal_app_name: str | None = Field(default=None, min_length=1, max_length=120)
-    active_job_limit: int | None = Field(default=None, ge=1)
+    modal_app_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        description="Omit to keep unchanged; null restores the configured default.",
+    )
+    active_job_limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Omit to keep unchanged; null restores the configured default.",
+    )
 
 
 async def require_admin(
@@ -408,8 +426,7 @@ def create_admin_router() -> APIRouter:
         configuration: RuntimeConfiguration = request.app.state.configuration
         try:
             configuration.update_environment(
-                modal_environment=submission.modal_environment,
-                global_active_job_limit=submission.global_active_job_limit,
+                **submission.model_dump(exclude_unset=True)
             )
         except SettingOverrideError as exc:
             raise CodedAPIError(409, "setting_overridden", str(exc)) from exc
@@ -436,9 +453,7 @@ def create_admin_router() -> APIRouter:
         configuration: RuntimeConfiguration = request.app.state.configuration
         try:
             configuration.set_workload(
-                workload,
-                modal_app_name=submission.modal_app_name,
-                active_job_limit=submission.active_job_limit,
+                workload, **submission.model_dump(exclude_unset=True)
             )
         except SettingOverrideError as exc:
             raise CodedAPIError(409, "setting_overridden", str(exc)) from exc

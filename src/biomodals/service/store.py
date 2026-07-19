@@ -791,17 +791,21 @@ class ServiceStore:
             ).fetchone()
         return str(row["value"]) if row is not None else None
 
-    def set_service_settings(self, settings: dict[str, str]) -> None:
-        """Create or replace several non-secret settings atomically."""
-        if any(not key or not value for key, value in settings.items()):
+    def set_service_settings(self, settings: dict[str, str | None]) -> None:
+        """Create, replace, or remove non-secret settings atomically."""
+        if any(not key or value == "" for key, value in settings.items()):
             raise ValueError("Service setting keys and values must not be empty")
         with self._transaction() as conn:
+            conn.executemany(
+                "DELETE FROM service_settings WHERE key = ?",
+                ((key,) for key, value in settings.items() if value is None),
+            )
             conn.executemany(
                 """
                 INSERT INTO service_settings (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
-                settings.items(),
+                ((key, value) for key, value in settings.items() if value is not None),
             )
 
     def get_workload_configuration(
@@ -825,37 +829,58 @@ class ServiceStore:
     def set_workload_configuration(
         self,
         workload: str,
-        *,
-        modal_app_name: str | None = None,
-        active_job_limit: int | None = None,
+        settings: dict[str, str | int | None],
     ) -> None:
-        """Create or update supplied non-secret workload overrides atomically."""
+        """Create, update, or remove supplied workload overrides atomically."""
         if not workload:
             raise ValueError("workload must not be empty")
-        if modal_app_name is not None and not modal_app_name:
+        unknown = settings.keys() - {"modal_app_name", "active_job_limit"}
+        if unknown:
+            raise ValueError(f"Unknown workload settings: {', '.join(sorted(unknown))}")
+        modal_app_name = settings.get("modal_app_name")
+        active_job_limit = settings.get("active_job_limit")
+        if modal_app_name is not None and (
+            not isinstance(modal_app_name, str) or not modal_app_name
+        ):
             raise ValueError("modal_app_name must not be empty")
-        if active_job_limit is not None and active_job_limit < 1:
+        if active_job_limit is not None and (
+            type(active_job_limit) is not int or active_job_limit < 1
+        ):
             raise ValueError("active_job_limit must be positive")
-        if modal_app_name is None and active_job_limit is None:
+        if not settings:
             return
         with self._transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO workload_settings (
-                    workload, modal_app_name, active_job_limit
-                ) VALUES (?, ?, ?)
-                ON CONFLICT(workload) DO UPDATE SET
-                    modal_app_name = COALESCE(
-                        excluded.modal_app_name,
-                        workload_settings.modal_app_name
-                    ),
-                    active_job_limit = COALESCE(
-                        excluded.active_job_limit,
-                        workload_settings.active_job_limit
-                    )
-                """,
-                (workload, modal_app_name, active_job_limit),
+            row = conn.execute(
+                "SELECT * FROM workload_settings WHERE workload = ?",
+                (workload,),
+            ).fetchone()
+            next_modal_app_name = (
+                row["modal_app_name"]
+                if row is not None and "modal_app_name" not in settings
+                else modal_app_name
             )
+            next_active_job_limit = (
+                row["active_job_limit"]
+                if row is not None and "active_job_limit" not in settings
+                else active_job_limit
+            )
+            if next_modal_app_name is None and next_active_job_limit is None:
+                conn.execute(
+                    "DELETE FROM workload_settings WHERE workload = ?",
+                    (workload,),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO workload_settings (
+                        workload, modal_app_name, active_job_limit
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(workload) DO UPDATE SET
+                        modal_app_name = excluded.modal_app_name,
+                        active_job_limit = excluded.active_job_limit
+                    """,
+                    (workload, next_modal_app_name, next_active_job_limit),
+                )
 
     def admit_job(
         self,

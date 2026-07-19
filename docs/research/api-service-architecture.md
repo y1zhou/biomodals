@@ -345,6 +345,11 @@ host defaults. An explicit process variable has highest precedence and makes
 the corresponding Admin field read-only. Modal credentials remain process/file
 configuration only, and the API refuses to start unless both are present.
 
+Runtime-setting PATCH requests are field-specific. An omitted field remains
+unchanged; an explicit JSON `null` removes only that field's SQLite override,
+revealing its dotenv value or built-in default. Resetting one Tool setting
+therefore cannot change the provenance or effective value of another setting.
+
 Start the development server with:
 
 ```bash

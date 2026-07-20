@@ -177,12 +177,60 @@ class ArtifactCache:
         sha256: str,
     ) -> ArtifactLease | None:
         """Verify a cache hit outside the FastAPI event loop."""
+        known, lease = self._acquire_verified(
+            job_id,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+        if known:
+            return lease
         return await self.run_bounded(
             self.acquire,
             job_id,
             size_bytes=size_bytes,
             sha256=sha256,
         )
+
+    def _acquire_verified(
+        self,
+        job_id: str,
+        *,
+        size_bytes: int,
+        sha256: str,
+    ) -> tuple[bool, ArtifactLease | None]:
+        """Lease a process-verified hit without queueing behind another fill."""
+        self._validate_metadata(size_bytes=size_bytes, sha256=sha256)
+        path = self._path(job_id)
+        descriptor = self._open(path)
+        if descriptor is None:
+            return True, None
+        try:
+            fingerprint = self._fingerprint(
+                os.fstat(descriptor),
+                size_bytes,
+                sha256,
+            )
+            with self._state_lock:
+                if self._verified.get(job_id) != fingerprint:
+                    os.close(descriptor)
+                    return False, None
+                os.utime(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                self._verified[job_id] = self._fingerprint(
+                    os.fstat(descriptor),
+                    size_bytes,
+                    sha256,
+                )
+                self._active[job_id] = self._active.get(job_id, 0) + 1
+            return True, ArtifactLease(
+                descriptor,
+                path=path,
+                cache=self,
+                job_id=job_id,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     def _path(self, job_id: str) -> Path:
         normalized = str(UUID(job_id))

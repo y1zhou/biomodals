@@ -1611,13 +1611,38 @@ def test_local_result_storage_failures_are_503_and_preserve_the_job(
     )
 
 
-def test_large_result_validation_keeps_core_requests_responsive(
+def test_large_result_validation_keeps_core_requests_and_cache_hits_responsive(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     client, auth, store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
     csrf_token = _login(client, "alice@example.com")
+    cached_submission = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+        display_name="Cached result",
+    )
+    cached_job_id = UUID(cached_submission.json()["job_id"])
+    cached_archive = adapter.artifact_content
+    store.complete_job(
+        cached_job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{cached_job_id}/result.zip",
+        result_filename="cached.zip",
+        result_size_bytes=len(cached_archive),
+        result_sha256=hashlib.sha256(cached_archive).hexdigest(),
+        now=1_800_000_001,
+    )
+    assert (
+        client.post(
+            f"/api/v1/jobs/{cached_job_id}/prepare-download",
+            headers=_unsafe_headers(csrf_token),
+        ).status_code
+        == 204
+    )
     completed_submission = _submit(
         client,
         csrf_token,
@@ -1671,7 +1696,7 @@ def test_large_result_validation_keeps_core_requests_responsive(
             )
             assert await asyncio.to_thread(validation_started.wait, 5)
             try:
-                health, login, inspected, cancelled = await asyncio.wait_for(
+                health, login, inspected, cached, cancelled = await asyncio.wait_for(
                     asyncio.gather(
                         browser.get("/api/v1/health"),
                         browser.post(
@@ -1683,6 +1708,7 @@ def test_large_result_validation_keeps_core_requests_responsive(
                             },
                         ),
                         browser.get(f"/api/v1/jobs/{completed_job_id}"),
+                        browser.get(f"/api/v1/jobs/{cached_job_id}/download"),
                         browser.post(
                             f"/api/v1/jobs/{cancellable_job_id}/cancel",
                             headers=_unsafe_headers(csrf_token),
@@ -1693,6 +1719,8 @@ def test_large_result_validation_keeps_core_requests_responsive(
                 assert health.status_code == 200
                 assert login.status_code == 200
                 assert inspected.status_code == 200
+                assert cached.status_code == 200
+                assert cached.content == cached_archive
                 assert cancelled.status_code == 202
             finally:
                 release_validation.set()

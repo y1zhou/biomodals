@@ -8,6 +8,7 @@ import io
 import stat
 import struct
 import zipfile
+import zlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -138,30 +139,135 @@ def _read_prefix(archive: zipfile.ZipFile, name: str, size: int = 128) -> bytes:
         return member.read(size)
 
 
-def _validate_pdb(content: bytes, *, name: str) -> None:
-    try:
-        lines = content.decode("ascii").splitlines()
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"GROMACS archive PDB is invalid: {name}") from exc
-    if not any(line.startswith(("ATOM  ", "HETATM")) for line in lines):
+def _validate_pdb_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    *,
+    max_bytes: int | None = None,
+) -> None:
+    info = archive.getinfo(name)
+    if max_bytes is not None and info.file_size > max_bytes:
+        raise ValueError(f"GROMACS archive member is too large: {name}")
+    has_atom = False
+    with archive.open(info) as member:
+        for raw_line in member:
+            try:
+                line = raw_line.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"GROMACS archive PDB is invalid: {name}") from exc
+            has_atom = has_atom or line.startswith(("ATOM  ", "HETATM"))
+    if not has_atom:
         raise ValueError(f"GROMACS archive PDB has no atoms: {name}")
 
 
-def _validate_csv(content: bytes, *, name: str, header: tuple[str, str]) -> None:
+def _validate_csv_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    *,
+    header: tuple[str, str],
+) -> None:
     try:
-        rows = list(csv.reader(io.StringIO(content.decode("utf-8"))))
+        with (
+            archive.open(name) as member,
+            io.TextIOWrapper(member, encoding="utf-8", newline="") as text,
+        ):
+            rows = csv.reader(text)
+            if tuple(next(rows, ())) != header:
+                raise ValueError
+            row_count = 0
+            for row in rows:
+                if len(row) != 2:
+                    raise ValueError
+                float(row[0])
+                float(row[1])
+                row_count += 1
+            if row_count == 0:
+                raise ValueError
     except (UnicodeDecodeError, csv.Error) as exc:
         raise ValueError(f"GROMACS archive CSV is invalid: {name}") from exc
-    if len(rows) < 2 or tuple(rows[0]) != header:
-        raise ValueError(f"GROMACS archive CSV has the wrong schema: {name}")
-    try:
-        for row in rows[1:]:
-            if len(row) != 2:
-                raise ValueError
-            float(row[0])
-            float(row[1])
     except ValueError as exc:
-        raise ValueError(f"GROMACS archive CSV has invalid rows: {name}") from exc
+        raise ValueError(f"GROMACS archive CSV has the wrong schema: {name}") from exc
+
+
+def _validate_png_member(archive: zipfile.ZipFile, name: str) -> None:
+    """Validate one PNG envelope and every chunk CRC without decoding pixels."""
+    try:
+        info = archive.getinfo(name)
+        with archive.open(info) as member:
+            if member.read(8) != b"\x89PNG\r\n\x1a\n":
+                raise ValueError
+            first_chunk = True
+            has_image_data = False
+            while True:
+                header = member.read(8)
+                if len(header) != 8:
+                    raise ValueError
+                length, chunk_type = struct.unpack(">I4s", header)
+                if length > info.file_size:
+                    raise ValueError
+                crc = zlib.crc32(chunk_type)
+                remaining = length
+                ihdr = bytearray()
+                while remaining:
+                    content = member.read(min(_CHUNK_SIZE, remaining))
+                    if not content:
+                        raise ValueError
+                    if chunk_type == b"IHDR":
+                        ihdr.extend(content)
+                    crc = zlib.crc32(content, crc)
+                    remaining -= len(content)
+                expected_crc = member.read(4)
+                if (
+                    len(expected_crc) != 4
+                    or struct.unpack(">I", expected_crc)[0] != crc
+                ):
+                    raise ValueError
+                if first_chunk:
+                    if chunk_type != b"IHDR" or length != 13:
+                        raise ValueError
+                    width, height = struct.unpack(">II", ihdr[:8])
+                    if (
+                        width == 0
+                        or height == 0
+                        or ihdr[10] != 0
+                        or ihdr[11] != 0
+                        or ihdr[12] not in {0, 1}
+                    ):
+                        raise ValueError
+                    first_chunk = False
+                elif chunk_type == b"IHDR":
+                    raise ValueError
+                if chunk_type == b"IDAT" and length > 0:
+                    has_image_data = True
+                if chunk_type == b"IEND":
+                    if length != 0 or not has_image_data or member.read(1):
+                        raise ValueError
+                    return
+    except (IndexError, struct.error, ValueError) as exc:
+        raise ValueError(f"GROMACS archive PNG is invalid: {name}") from exc
+
+
+def _validate_xtc_member(archive: zipfile.ZipFile, name: str) -> None:
+    """Validate the fixed XDR header and complete first coordinate envelope."""
+    info = archive.getinfo(name)
+    prefix = _read_prefix(archive, name, 92)
+    if len(prefix) < 56:
+        raise ValueError("GROMACS trajectory is invalid")
+    magic, atom_count = struct.unpack(">ii", prefix[:8])
+    coordinate_count = struct.unpack(">i", prefix[52:56])[0]
+    if magic != 1995 or atom_count < 1 or coordinate_count != atom_count:
+        raise ValueError("GROMACS trajectory is invalid")
+    if atom_count <= 9:
+        minimum_size = 56 + 12 * atom_count
+    else:
+        if len(prefix) < 92:
+            raise ValueError("GROMACS trajectory is invalid")
+        payload_size = struct.unpack(">I", prefix[88:92])[0]
+        if payload_size == 0:
+            raise ValueError("GROMACS trajectory is invalid")
+        minimum_size = 92 + ((payload_size + 3) & ~3)
+    if info.file_size < minimum_size:
+        raise ValueError("GROMACS trajectory is invalid")
 
 
 def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
@@ -169,11 +275,8 @@ def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
     prefix = f"production_{run_name}"
     input_name = "input.pdb"
     centered_name = f"outputs/{prefix}_nopbc_centered.pdb"
-    _validate_pdb(
-        _read_small(archive, input_name, max_bytes=_MAX_PDB_BYTES),
-        name=input_name,
-    )
-    _validate_pdb(_read_small(archive, centered_name), name=centered_name)
+    _validate_pdb_member(archive, input_name, max_bytes=_MAX_PDB_BYTES)
+    _validate_pdb_member(archive, centered_name)
 
     mdp_name = "outputs/production.mdp"
     try:
@@ -188,13 +291,20 @@ def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
         raise ValueError("GROMACS production MDP has no parameters")
 
     xtc_name = f"outputs/{prefix}_nopbc.xtc"
-    xtc_prefix = _read_prefix(archive, xtc_name)
-    if len(xtc_prefix) < 16 or struct.unpack(">i", xtc_prefix[:4])[0] != 1995:
-        raise ValueError("GROMACS trajectory is invalid")
+    _validate_xtc_member(archive, xtc_name)
 
     tpr_name = f"outputs/{prefix}.tpr"
     tpr_prefix = _read_prefix(archive, tpr_name)
-    if len(tpr_prefix) < 16 or b"VERSION" not in tpr_prefix:
+    version_length = (
+        struct.unpack(">I", tpr_prefix[4:8])[0] if len(tpr_prefix) >= 8 else 0
+    )
+    if (
+        archive.getinfo(tpr_name).file_size < 128
+        or version_length < len("VERSION")
+        or version_length > 120
+        or len(tpr_prefix) < 8 + version_length
+        or not tpr_prefix[8 : 8 + version_length].startswith(b"VERSION")
+    ):
         raise ValueError("GROMACS production topology is invalid")
 
     csv_contracts = (
@@ -203,20 +313,14 @@ def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
         (f"outputs/rmsf_{prefix}.csv", ("residue_index", "rmsf")),
     )
     for name, header in csv_contracts:
-        _validate_csv(_read_small(archive, name), name=name, header=header)
+        _validate_csv_member(archive, name, header=header)
 
     for name in (
         f"outputs/rmsd_{prefix}.png",
         f"outputs/rg_{prefix}.png",
         f"outputs/rmsf_{prefix}.png",
     ):
-        png_prefix = _read_prefix(archive, name, 24)
-        if (
-            len(png_prefix) < 24
-            or png_prefix[:8] != b"\x89PNG\r\n\x1a\n"
-            or png_prefix[12:16] != b"IHDR"
-        ):
-            raise ValueError(f"GROMACS archive PNG is invalid: {name}")
+        _validate_png_member(archive, name)
 
     for name, expected_type in (
         ("metadata/parameters.json", dict),
@@ -290,6 +394,21 @@ async def _write_remote(
     name: str,
     role: str,
 ) -> dict[str, str | int]:
+    return await _write_remote_chunks(
+        archive,
+        chunks=read_file(remote_path),
+        name=name,
+        role=role,
+    )
+
+
+async def _write_remote_chunks(
+    archive: zipfile.ZipFile,
+    *,
+    chunks: AsyncIterable[bytes],
+    name: str,
+    role: str,
+) -> dict[str, str | int]:
     digest = hashlib.sha256()
     size_bytes = 0
     with archive.open(
@@ -297,7 +416,7 @@ async def _write_remote(
         mode="w",
         force_zip64=True,
     ) as destination:
-        async for chunk in read_file(remote_path):
+        async for chunk in chunks:
             size_bytes += len(chunk)
             digest.update(chunk)
             destination.write(chunk)
@@ -307,6 +426,36 @@ async def _write_remote(
         "size_bytes": size_bytes,
         "sha256": digest.hexdigest(),
     }
+
+
+async def _write_optional_remote(
+    archive: zipfile.ZipFile,
+    *,
+    read_file: ReadRemoteFile,
+    remote_path: str,
+    name: str,
+    role: str,
+) -> dict[str, str | int] | None:
+    chunks = read_file(remote_path).__aiter__()
+    try:
+        first = await anext(chunks)
+    except FileNotFoundError:
+        return None
+    except StopAsyncIteration:
+        first = None
+
+    async def with_first() -> AsyncIterator[bytes]:
+        if first is not None:
+            yield first
+        async for chunk in chunks:
+            yield chunk
+
+    return await _write_remote_chunks(
+        archive,
+        chunks=with_first(),
+        name=name,
+        role=role,
+    )
 
 
 async def write_gromacs_archive(
@@ -402,15 +551,15 @@ async def write_gromacs_archive(
         ):
             records.append(_write_bytes(archive, name=name, role=role, content=content))
         for remote_name, name, role in _optional_remote_files(run_name):
-            try:
-                content = await _read_bounded(
-                    read_file,
-                    f"{run_name}/{remote_name}",
-                    max_bytes=_SMALL_DOCUMENT_LIMIT,
-                )
-            except FileNotFoundError:
-                continue
-            records.append(_write_bytes(archive, name=name, role=role, content=content))
+            record = await _write_optional_remote(
+                archive,
+                read_file=read_file,
+                remote_path=f"{run_name}/{remote_name}",
+                name=name,
+                role=role,
+            )
+            if record is not None:
+                records.append(record)
 
         manifest_bytes = (
             orjson.dumps(

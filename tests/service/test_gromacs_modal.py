@@ -9,6 +9,7 @@ import hashlib
 import io
 import struct
 import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,9 +43,47 @@ from biomodals.service.store import JobRecord, JobState, ServiceStore, UserRecor
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 SHA256 = "a" * 64
 _PENDING = object()
-XTC = struct.pack(">i", 1995) + b"\0" * 28
-TPR = b"\0\0\0\x10VERSION 2026.1\0\0\0\0"
-PNG = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + b"\0" * 16
+XTC = struct.pack(
+    ">iiif9fi3f",
+    1995,
+    1,
+    0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    1,
+    0.0,
+    0.0,
+    0.0,
+)
+_TPR_VERSION = b"VERSION 2026.1"
+TPR = (struct.pack(">II", 15, len(_TPR_VERSION)) + _TPR_VERSION).ljust(128, b"\0")
+
+
+def _png_chunk(chunk_type: bytes, content: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type)
+    checksum = zlib.crc32(content, checksum)
+    return (
+        struct.pack(">I", len(content))
+        + chunk_type
+        + content
+        + struct.pack(">I", checksum)
+    )
+
+
+PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    + _png_chunk(b"IDAT", zlib.compress(b"\0\0\0\0\0"))
+    + _png_chunk(b"IEND", b"")
+)
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\nEND\n"
 
 

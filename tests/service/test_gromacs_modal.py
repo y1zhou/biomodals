@@ -25,6 +25,7 @@ from biomodals.service.gromacs.modal import (
     FinalArchive,
     GromacsReconciler,
     ModalGromacsAdapter,
+    PollOutcome,
 )
 from biomodals.service.gromacs.router import (
     GromacsJobOptions,
@@ -990,6 +991,37 @@ def test_cancel_wins_before_result_publication(
     assert ("cancel", "fc-root", False) in root.events
 
 
+def test_cancel_wins_after_final_stage_poll_before_state_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, stale_running = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    adapter = _adapter({"fc-root": FakeCall("fc-root", result="completed")})
+
+    async def unexpected_publication(*_args, **_kwargs):
+        raise AssertionError("accepted cancellation must prevent Result publication")
+
+    monkeypatch.setattr(adapter, "publish_archive", unexpected_publication)
+    store.request_cancel(stale_running.owner_user_id, stale_running.job_id, now=9)
+
+    asyncio.run(
+        GromacsReconciler(store, adapter, now=lambda: 10)._apply(
+            stale_running,
+            PollOutcome("completed"),
+        )
+    )
+
+    cancelled = store.get_job(stale_running.owner_user_id, stale_running.job_id)
+    assert cancelled is not None
+    assert cancelled.state == JobState.CANCELLED
+    assert cancelled.cancel_requested_at == 9
+    assert cancelled.result_volume_path is None
+    assert cancelled.stage_history[-1].outcome == "completed"
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -1385,6 +1417,7 @@ def test_cancelled_is_terminal_only_after_call_graph_is_inactive(
 
 def test_expired_provider_status_is_not_reported_as_confirmed_cancellation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, job = _submitted_job(tmp_path, cancel_requested=True)
     root = FakeCall(
@@ -1396,14 +1429,16 @@ def test_expired_provider_status_is_not_reported_as_confirmed_cancellation(
         _adapter({"fc-root": root}),
         now=lambda: 10,
     )
+    files = _established_output_files()
+    _install_volume(monkeypatch, files)
 
     asyncio.run(reconciler.reconcile())
 
     unresolved = store.get_job(job.owner_user_id, job.job_id)
     assert unresolved is not None
-    assert unresolved.state == JobState.FAILED
-    assert unresolved.error_code == "compute_failed"
-    assert "before cancellation could be confirmed" in (unresolved.error_message or "")
+    assert unresolved.state == JobState.CANCEL_REQUESTED
+    assert unresolved.error_code is None
+    assert f"api-results/{RUN_NAME}/result.zip" not in files
 
 
 def test_intermediate_cleanup_is_opt_in_and_preserves_final_archives(

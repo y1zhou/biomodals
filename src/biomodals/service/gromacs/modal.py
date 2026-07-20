@@ -804,43 +804,16 @@ class GromacsReconciler:
 
     async def _resolve_expired_cancellation(self, job: JobRecord) -> None:
         """Resolve lost provider status without claiming cancellation succeeded."""
-        now = self._now()
         if job.provider_operation == _FINAL_OPERATION:
             try:
-                try:
-                    archive = await self.adapter.recover_archive(job)
-                except Exception:
-                    archive = await self.adapter.publish_archive(
-                        job,
-                        completed_at=now,
-                    )
-            except FileNotFoundError:
-                LOGGER.exception(
-                    "Final output is incomplete for cancelling job %s",
-                    job.job_id,
-                )
-            except (ArchiveNotReadyError, OSError, *_MODAL_PUBLICATION_ERRORS):
-                LOGGER.exception(
-                    "Could not yet recover final output for cancelling job %s",
-                    job.job_id,
-                )
-                return
+                archive = await self.adapter.recover_archive(job)
             except Exception:
                 LOGGER.exception(
-                    "Could not establish a final Result for cancelling job %s",
+                    "Published Result is not yet recoverable for cancelling job %s",
                     job.job_id,
                 )
             else:
                 self._complete(job, archive)
-                return
-        self.store.fail_job(
-            job.job_id,
-            error_code="compute_failed",
-            error_message=(
-                "GROMACS remote status expired before cancellation could be confirmed."
-            ),
-            now=now,
-        )
 
     async def _advance(self, job: JobRecord) -> None:
         """Attach exactly one next direct Modal stage to a durable Job."""
@@ -981,11 +954,27 @@ class GromacsReconciler:
             )
             return
 
-        finalizing = self.store.set_job_state(
-            job.job_id,
-            JobState.FINALIZING,
-            now=now,
-        )
+        async with self.lifecycle_locks.for_job(job.job_id):
+            finalizing = self.store.set_job_state(
+                job.job_id,
+                JobState.FINALIZING,
+                now=now,
+            )
+            if finalizing.state == JobState.CANCEL_REQUESTED:
+                completed = self.store.mark_provider_operation_completed(
+                    job.job_id,
+                    expected_modal_call_id=job.modal_call_id or "",
+                    now=now,
+                )
+                if completed is not None:
+                    self.store.set_job_state(
+                        job.job_id,
+                        JobState.CANCELLED,
+                        now=now,
+                    )
+                return
+            if finalizing.state != JobState.FINALIZING:
+                return
         LOGGER.info(
             "event=finalization_started job_id=%s workload=gromacs "
             "stage=prepare_result",

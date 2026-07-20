@@ -7,7 +7,7 @@ Wants=network-online.target
 Image=localhost/biomodals-api:latest
 Environment=MODAL_TOKEN_ID=replace-with-service-token-id
 Environment=MODAL_TOKEN_SECRET=replace-with-service-token-secret
-Environment=BIOMODALS_PUBLIC_URL=https://aidd.y1zhou.com
+Environment=BIOMODALS_PUBLIC_URL=https://biomodals.example.com
 Environment=BIOMODALS_SECURE_COOKIES=true
 Environment=BIOMODALS_STATE_DIR=/var/lib/biomodals/state
 Environment=BIOMODALS_CACHE_DIR=/var/cache/biomodals

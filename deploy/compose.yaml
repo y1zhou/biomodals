@@ -6,7 +6,7 @@ services:
     environment:
       MODAL_TOKEN_ID: ${MODAL_TOKEN_ID:?MODAL_TOKEN_ID must be set}
       MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET:?MODAL_TOKEN_SECRET must be set}
-      BIOMODALS_PUBLIC_URL: https://aidd.y1zhou.com
+      BIOMODALS_PUBLIC_URL: https://biomodals.example.com
       BIOMODALS_SECURE_COOKIES: "true"
       BIOMODALS_STATE_DIR: /var/lib/biomodals/state
       BIOMODALS_CACHE_DIR: /var/cache/biomodals

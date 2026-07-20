@@ -526,8 +526,8 @@ fresh schema. This reset policy ends at the first release.
 
 Pre-release and production service definitions select distinct
 `BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` values. Pre-release sets
-`BIOMODALS_PUBLIC_URL=https://beta.aidd.y1zhou.com`; production uses
-`https://aidd.y1zhou.com`. A pre-release reset or cache clear therefore targets
+`BIOMODALS_PUBLIC_URL=https://beta.biomodals.example.com`; production uses
+`https://biomodals.example.com`. A pre-release reset or cache clear therefore targets
 only isolated host-local data and never falls back to production configuration,
 state, or cache. Modal Environment selection remains explicit and independent;
 an intentionally authorized pre-release service may still target the Modal

@@ -9,7 +9,7 @@ All three examples:
 
 - expose the API only on `127.0.0.1:4100` for a same-origin HTTPS reverse
   proxy;
-- use `https://aidd.y1zhou.com` as the browser origin;
+- use `https://biomodals.example.com` as the browser origin;
 - keep durable SQLite state separate from the rebuildable Result cache; and
 - contain only boot-critical process settings, so the Modal Environment, App
   name, and admission limits remain editable in the Admin interface.

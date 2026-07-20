@@ -3,7 +3,7 @@
 This is documentation and example configuration only. It does not authorize an
 agent or script to edit the live Caddyfile, install a systemd unit, start a
 production service, deploy a Modal App, or copy frontend files into
-`/srv/aidd.y1zhou.com`.
+`/srv/biomodals.example.com`.
 
 ## Host layout
 
@@ -16,7 +16,7 @@ are:
 - production Result cache: `/var/cache/biomodals/production`;
 - pre-release SQLite state: `/var/lib/biomodals/prerelease/state`;
 - pre-release Result cache: `/var/cache/biomodals/prerelease`; and
-- production frontend files: `/srv/aidd.y1zhou.com`.
+- production frontend files: `/srv/biomodals.example.com`.
 
 The tracked files under `deploy/` are production examples, not live
 configuration. Copy the selected systemd or Quadlet definition through an
@@ -27,7 +27,7 @@ development.
 
 Production and pre-release must never select the same service definition,
 database, or cache directory. A pre-release copy must use
-`https://beta.aidd.y1zhou.com`, loopback port `4144`, and the pre-release
+`https://beta.biomodals.example.com`, loopback port `4144`, and the pre-release
 paths above. An intentionally shared Modal Environment does not change this
 requirement.
 
@@ -60,7 +60,7 @@ record.
 ## Static frontend and reverse proxy
 
 Build the frontend repository with its committed Bun lockfile, then stage the
-contents of `dist/` into `/srv/aidd.y1zhou.com` as one reviewed release. The
+contents of `dist/` into `/srv/biomodals.example.com` as one reviewed release. The
 production browser always calls same-origin `/api/*`; it does not embed a
 separate API hostname.
 
@@ -69,7 +69,7 @@ configuration needs the equivalent behavior shown below, adapted by the
 Administrator rather than copied blindly:
 
 ```caddyfile
-aidd.y1zhou.com {
+biomodals.example.com {
 	encode zstd gzip
 
 	@api path /api/* /docs* /openapi.json /redoc*
@@ -90,7 +90,7 @@ aidd.y1zhou.com {
 	@document path / /index.html
 	header @document Cache-Control "no-cache"
 
-	root * /srv/aidd.y1zhou.com
+	root * /srv/biomodals.example.com
 	try_files {path} /index.html
 	file_server
 }

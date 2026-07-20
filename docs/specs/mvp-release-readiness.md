@@ -64,9 +64,9 @@ state and cache paths.
 
 ### Frontend deployment
 
-`beta.aidd.y1zhou.com` is a development-only Vite site and is not a production
+`beta.biomodals.example.com` is a development-only Vite site and is not a production
 release target. The production frontend is built into a static directory at
-`/srv/aidd.y1zhou.com` and served at `https://aidd.y1zhou.com`.
+`/srv/biomodals.example.com` and served at `https://biomodals.example.com`.
 
 The production server must provide SPA fallback for browser routes, proxy
 same-origin `/api/*` requests to FastAPI, cache hashed assets immutably, and
@@ -97,7 +97,7 @@ Policy with framing and plugins disabled, `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: strict-origin-when-cross-origin`, and a restrictive
 Permissions Policy.
 
-`aidd.y1zhou.com` must send HSTS, but the MVP policy must not use
+`biomodals.example.com` must send HSTS, but the MVP policy must not use
 `includeSubDomains` or preload until every affected subdomain has been audited.
 These are deployment requirements; the application repositories do not own the
 live Caddyfile.
@@ -117,8 +117,8 @@ the current partial development-only migration path.
 Pre-release and production must not share service configuration or host-local
 mutable state. Every pre-release service definition explicitly selects
 `BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` locations distinct from
-production. Its public URL is `https://beta.aidd.y1zhou.com`, while production
-uses `https://aidd.y1zhou.com`. This also prevents a pre-release Clear Result Cache
+production. Its public URL is `https://beta.biomodals.example.com`, while production
+uses `https://biomodals.example.com`. This also prevents a pre-release Clear Result Cache
 action from touching production files. Reset instructions name only the
 pre-release target; they must not operate on production configuration, state,
 or cache.

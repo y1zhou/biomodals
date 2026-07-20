@@ -12,6 +12,7 @@ import zipfile
 
 import pytest
 
+from biomodals.service.artifacts import ArtifactSourceMissingError
 from biomodals.service.gromacs.archive import (
     BuiltGromacsArchive,
     validate_gromacs_archive,
@@ -129,6 +130,33 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
         yield content
 
     with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            write_gromacs_archive(
+                io.BytesIO(),
+                run_name=RUN_NAME,
+                parameters_json=PARAMETERS,
+                modal_app_name="Gromacs",
+                job_id="11111111-1111-4111-8111-111111111111",
+                stages_json="[]",
+                started_at=1,
+                completed_at=2,
+                read_file=read_file,
+            )
+        )
+
+
+def test_missing_required_remote_output_has_a_distinct_failure() -> None:
+    remote_files = _remote_files()
+    del remote_files[f"{RUN_NAME}/production.mdp"]
+
+    async def read_file(path: str):
+        try:
+            content = remote_files[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+        yield content
+
+    with pytest.raises(ArtifactSourceMissingError):
         asyncio.run(
             write_gromacs_archive(
                 io.BytesIO(),

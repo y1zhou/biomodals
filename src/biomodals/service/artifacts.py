@@ -28,6 +28,10 @@ class ArtifactIntegrityError(RuntimeError):
     """Raised when Modal bytes do not match the recorded final artifact."""
 
 
+class ArtifactSourceMissingError(RuntimeError):
+    """Raised when an authoritative remote Result source is missing."""
+
+
 @dataclass(frozen=True, slots=True)
 class CacheUsage:
     """Filesystem-backed Result cache metrics."""

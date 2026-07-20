@@ -21,6 +21,7 @@ from biomodals.service.artifacts import (
     ArtifactCache,
     ArtifactIntegrityError,
     ArtifactLease,
+    ArtifactSourceMissingError,
 )
 from biomodals.service.auth import (
     MIN_PASSWORD_CHARACTERS,
@@ -923,6 +924,12 @@ def create_app(
                 "result_invalid",
                 "Result archive metadata is invalid",
             ) from exc
+        except OSError as exc:
+            raise CodedAPIError(
+                503,
+                "result_storage_unavailable",
+                "Result storage is temporarily unavailable",
+            ) from exc
         if existing is not None:
             try:
                 store.set_result_cached(job.job_id, cached=True)
@@ -951,11 +958,11 @@ def create_app(
         try:
             try:
                 cached = await fill(registration.read_artifact(job))
-            except (ArtifactIntegrityError, FileNotFoundError):
+            except (ArtifactIntegrityError, ArtifactSourceMissingError):
                 if registration.rebuild_artifact is None:
                     raise
                 cached = await fill(registration.rebuild_artifact(job))
-        except (ArtifactIntegrityError, FileNotFoundError, ValueError) as exc:
+        except (ArtifactIntegrityError, ArtifactSourceMissingError, ValueError) as exc:
             LOGGER.exception("Artifact integrity failure for job %s", job.job_id)
             store.block_job(
                 job.job_id,
@@ -1064,6 +1071,9 @@ def create_app(
                 },
             },
             status.HTTP_502_BAD_GATEWAY: {"model": ResultInvalidResponse},
+            status.HTTP_503_SERVICE_UNAVAILABLE: {
+                "model": ResultStorageUnavailableResponse
+            },
         },
     )
     async def download_job(
@@ -1104,6 +1114,12 @@ def create_app(
                     502,
                     "result_invalid",
                     "Result archive metadata is invalid",
+                ) from exc
+            except OSError as exc:
+                raise CodedAPIError(
+                    503,
+                    "result_storage_unavailable",
+                    "Result storage is temporarily unavailable",
                 ) from exc
             if cached is not None:
                 return _cached_archive_response(

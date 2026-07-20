@@ -1253,6 +1253,38 @@ def test_expired_call_output_recovers_completed_archive_from_volume_marker(
     assert completed.result_sha256 == archive_sha256
 
 
+def test_normal_cache_restore_requires_the_published_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, running = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    archive_bytes, _request_sha256 = _valid_archive_bytes()
+    completed = store.complete_job(
+        running.job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{RUN_NAME}/result.zip",
+        result_filename=f"{RUN_NAME}.zip",
+        result_size_bytes=len(archive_bytes),
+        result_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        now=10,
+    )
+    _install_volume(
+        monkeypatch,
+        {f"api-results/{RUN_NAME}/result.zip": archive_bytes},
+    )
+    adapter = _adapter({})
+
+    async def restore() -> bytes:
+        return b"".join([chunk async for chunk in adapter.read_artifact(completed)])
+
+    with pytest.raises(ArtifactIntegrityError, match="marker"):
+        asyncio.run(restore())
+
+
 def test_expired_call_rejects_marker_when_archive_bytes_are_corrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

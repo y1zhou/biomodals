@@ -20,6 +20,7 @@ from biomodals.service.artifacts import (
     ArtifactCache,
     ArtifactIntegrityError,
     ArtifactLease,
+    ArtifactSourceMissingError,
 )
 from biomodals.service.gromacs.archive import (
     BuiltGromacsArchive,
@@ -353,12 +354,30 @@ class ModalGromacsAdapter:
             or _SHA256.fullmatch(job.result_sha256) is None
         ):
             raise ValueError("Job does not reference the configured GROMACS Volume")
+        try:
+            marker = await self._result_marker(job)
+        except (ArchiveNotReadyError, ValueError) as exc:
+            raise ArtifactIntegrityError(
+                "GROMACS result marker is missing or invalid"
+            ) from exc
+        if (
+            marker.size_bytes != job.result_size_bytes
+            or marker.archive_sha256 != job.result_sha256
+        ):
+            raise ArtifactIntegrityError(
+                "GROMACS result marker does not match the recorded Result"
+            )
         volume = modal.Volume.from_name(
             self.output_volume_name,
             environment_name=job.modal_environment,
         )
-        async for chunk in volume.read_file.aio(job.result_volume_path):
-            yield chunk
+        try:
+            async for chunk in volume.read_file.aio(job.result_volume_path):
+                yield chunk
+        except FileNotFoundError as exc:
+            raise ArtifactSourceMissingError(
+                "Published GROMACS result archive is missing"
+            ) from exc
 
     async def cleanup_intermediates(self, job: JobRecord) -> None:
         """Remove one retained run directory without touching its final ZIP."""
@@ -1041,7 +1060,7 @@ class GromacsReconciler:
             LOGGER.exception("Modal is unavailable while publishing job %s", job.job_id)
             self._retry_finalization(job, now=now, category="modal_unavailable")
             return
-        except FileNotFoundError:
+        except ArtifactSourceMissingError:
             LOGGER.exception("GROMACS job %s is missing required output", job.job_id)
             self._mark_invalid_result(job, now=now)
             return

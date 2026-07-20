@@ -1521,6 +1521,66 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     assert [path.name for path in (tmp_path / "cache").iterdir()] == [f"{job_id}.zip"]
 
 
+def test_local_result_storage_failures_are_503_and_preserve_the_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    content = adapter.artifact_content
+    store.complete_job(
+        job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{job_id}/result.zip",
+        result_filename="simulation.zip",
+        result_size_bytes=len(content),
+        result_sha256=hashlib.sha256(content).hexdigest(),
+        now=1_800_000_001,
+    )
+    (tmp_path / "cache").rmdir()
+
+    unavailable_prepare = client.post(
+        f"/api/v1/jobs/{job_id}/prepare-download",
+        headers=_unsafe_headers(csrf_token),
+    )
+    preserved = store.get_job(
+        UUID(client.get("/api/v1/auth/me").json()["user_id"]), job_id
+    )
+
+    assert unavailable_prepare.status_code == 503
+    assert unavailable_prepare.json()["code"] == "result_storage_unavailable"
+    assert preserved is not None
+    assert preserved.state == JobState.SUCCEEDED
+    assert preserved.blocking_category is None
+
+    (tmp_path / "cache").mkdir()
+    assert (
+        client.post(
+            f"/api/v1/jobs/{job_id}/prepare-download",
+            headers=_unsafe_headers(csrf_token),
+        ).status_code
+        == 204
+    )
+    cache: ArtifactCache = client.app.state.cache
+
+    async def permission_denied(*_args, **_kwargs):
+        raise PermissionError("cache is not readable")
+
+    monkeypatch.setattr(cache, "acquire_async", permission_denied)
+    unavailable_download = client.get(f"/api/v1/jobs/{job_id}/download")
+    schema = client.get("/openapi.json").json()
+
+    assert unavailable_download.status_code == 503
+    assert unavailable_download.json()["code"] == "result_storage_unavailable"
+    assert (
+        "503" in schema["paths"]["/api/v1/jobs/{job_id}/download"]["get"]["responses"]
+    )
+
+
 def test_large_result_validation_keeps_core_requests_responsive(
     tmp_path: Path,
     monkeypatch,

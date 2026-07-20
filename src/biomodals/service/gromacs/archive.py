@@ -8,12 +8,14 @@ import io
 import stat
 import struct
 import zipfile
-from collections.abc import AsyncIterable, Awaitable, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import BinaryIO, Protocol, TypeVar, cast
 
 import orjson
+
+from biomodals.service.artifacts import ArtifactSourceMissingError
 
 _CHUNK_SIZE = 1024 * 1024
 _SHA256_LENGTH = 64
@@ -321,11 +323,21 @@ async def write_gromacs_archive(
     run_bounded: RunBounded | None = None,
 ) -> BuiltGromacsArchive:
     """Package the established GROMACS app's expected Volume files."""
+
+    async def read_required(path: str) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in read_file(path):
+                yield chunk
+        except FileNotFoundError as exc:
+            raise ArtifactSourceMissingError(
+                "A required GROMACS output is missing"
+            ) from exc
+
     binary_handle = cast("BinaryIO", handle)
     binary_handle.seek(0)
     binary_handle.truncate(0)
     input_bytes = await _read_bounded(
-        read_file,
+        read_required,
         f"{run_name}/{run_name}.pdb",
         max_bytes=_MAX_PDB_BYTES,
     )
@@ -376,7 +388,7 @@ async def write_gromacs_archive(
             records.append(
                 await _write_remote(
                     archive,
-                    read_file=read_file,
+                    read_file=read_required,
                     remote_path=f"{run_name}/{PurePosixPath(name).name}",
                     name=name,
                     role=role,

@@ -16,7 +16,11 @@ from uuid import uuid4
 import modal
 import orjson
 
-from biomodals.service.artifacts import ArtifactCache, ArtifactLease
+from biomodals.service.artifacts import (
+    ArtifactCache,
+    ArtifactIntegrityError,
+    ArtifactLease,
+)
 from biomodals.service.gromacs.archive import (
     BuiltGromacsArchive,
     validate_gromacs_archive,
@@ -1052,7 +1056,7 @@ class GromacsReconciler:
             LOGGER.exception("GROMACS job %s is missing required output", job.job_id)
             self._mark_invalid_result(job, now=now)
             return
-        except OSError:
+        except (OSError, ArtifactIntegrityError):
             LOGGER.exception(
                 "Local Result staging is unavailable for job %s",
                 job.job_id,

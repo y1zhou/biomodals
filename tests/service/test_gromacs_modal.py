@@ -19,7 +19,7 @@ import modal
 import orjson
 import pytest
 
-from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.modal import (
     ArchiveNotReadyError,
     FinalArchive,
@@ -1025,9 +1025,17 @@ def test_transient_archive_publication_error_remains_finalizing(
     assert finalizing.next_retry_at == 15
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("No space left on device"),
+        ArtifactIntegrityError("Staged artifact is unavailable"),
+    ],
+)
 def test_local_staging_failure_retries_and_blocks_without_losing_compute(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
@@ -1035,10 +1043,10 @@ def test_local_staging_failure_retries_and_blocks_without_losing_compute(
     )
     adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
 
-    async def disk_full(*_args, **_kwargs):
-        raise OSError("No space left on device")
+    async def staging_failure(*_args, **_kwargs):
+        raise failure
 
-    monkeypatch.setattr(adapter, "publish_archive", disk_full)
+    monkeypatch.setattr(adapter, "publish_archive", staging_failure)
     now = 10
     reconciler = GromacsReconciler(store, adapter, now=lambda: now)
     asyncio.run(reconciler.reconcile())

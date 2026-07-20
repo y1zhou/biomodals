@@ -72,7 +72,7 @@ Modal service-user token, and point the API at that file. Explicit process
 environment variables override values in the file:
 
 ```bash
-cp .env.example .env
+install -m 600 .env.example .env
 # Edit .env and replace both Modal token placeholders.
 export BIOMODALS_API_CONF_ENV="$PWD/.env"
 

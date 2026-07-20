@@ -87,7 +87,7 @@ across workloads. Shared policy belongs in the control plane:
 
 - cookie authentication, CSRF and exact-Origin validation;
 - immutable public job IDs and submitter ownership;
-- idempotent submissions and per-workload active-job limits;
+- idempotent submissions and User, Tool, and Global active-job limits;
 - common lifecycle, cancellation, error, and download behavior; and
 - one durable audit/provenance record.
 
@@ -103,7 +103,7 @@ src/biomodals/service/
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
   jobs.py            common job view and workload registration
-  artifacts.py       verified final-ZIP LRU cache
+  artifacts.py       verified final-ZIP staging and cache
   gromacs/
     router.py        GROMACS request schema and submission route
     modal.py         Modal invocation, polling, cancellation and artifacts
@@ -136,8 +136,17 @@ The browser supplies a UUID `Idempotency-Key` when submitting a job. The key is
 scoped to `(owner_user_id, workload)`. Repeating the same key and payload
 returns the existing job; reusing it with different inputs returns `409`.
 Admission and active-job limits are checked in one SQLite write transaction.
-The initial configurable limits are two active GROMACS jobs and one future
-AlphaFold 3 job per user.
+Limits are non-negative integers and zero intentionally blocks new Submissions
+within that scope. Lowering a User, Tool, or Global limit below its current
+count never cancels admitted work; new Submissions are rejected until the
+applicable count falls below the configured limit.
+
+Counts are scoped to this service's SQLite database. Global therefore means all
+Users and Tools admitted by one BioModals deployment, not a combined beta,
+production, or Modal-account total. Separate deployments that target the same
+Modal App do not coordinate admission. Pre-release examples set User, Tool,
+and Global defaults to one; provider-level limits or shared coordination remain
+outside this architecture.
 
 Every list, inspect, cancel, and download lookup is constrained by both
 `owner_user_id` and `job_id`. Looking up another user's job returns the same
@@ -152,10 +161,30 @@ one direct stage is the durable active operation at a time. `JobView` exposes a
 sanitized stage code and the associated deployed Function name so the Job
 detail page can show the current sequential step. SQLite also retains an
 ordered `stage_history` timing record: a stage starts when its direct call is
-durably attached, completes when the reconciler records its observed
-completion, and result packaging spans `finalizing` through archive
-publication. Modal call IDs, App and Environment names, Volume names and paths,
-dashboard links, tracebacks, and internal filesystem paths remain private.
+durably attached and ends when the reconciler records its observed terminal
+outcome. Each entry has `started_at`, nullable `ended_at`, and a nullable outcome
+of `completed`, `failed`, or `cancelled`; active and blocked work has no end or
+outcome. Result packaging spans `finalizing` through archive publication. Modal
+call IDs, App and Environment names, Volume names and paths, dashboard links,
+tracebacks, and internal filesystem paths remain private.
+
+The stable public GROMACS stage mapping is:
+
+| Stage code | Display label | Associated Function |
+| --- | --- | --- |
+| `prepare_simulation` | Prepare simulation | `prepare_tpr_cpu` or `prepare_tpr_gpu` |
+| `analyze_nvt` | Analyze NVT | `collect_traj_stats` |
+| `analyze_npt` | Analyze NPT | `collect_traj_stats` |
+| `run_production` | Run production | `production_run_cpu` or `production_run_gpu` |
+| `analyze_production` | Analyze production | `collect_traj_stats` |
+| `prepare_result` | Prepare result | none; local service work |
+
+The preparation Function internally performs preparation, minimization, NVT,
+and NPT execution. Those internal phases are not independent API-orchestrated
+calls and therefore are not public stages. The three trajectory-analysis calls
+share a Function name but remain distinct stages because their prefixes and
+positions differ. Nested App implementation calls such as `postprocess_traj`
+also remain outside the public timeline.
 
 The GROMACS API sequence is:
 
@@ -196,9 +225,20 @@ queued/running -> cancel_requested -> cancelled
 Cancellation is idempotent while it is pending. The adapter asks Modal to
 cancel the currently recorded direct call and any visible active descendants
 with `terminate_containers=False`; the job becomes `cancelled` only after the
-call graph is inactive. If a verified result archive wins a cancellation race,
-the completed result wins. Terminal jobs are preserved and there is no
+call graph is inactive. This cancels inputs without forcibly terminating
+workers that may contain unrelated inputs. `cancel_requested_at` is persisted
+before the provider request, transient failures are retried, and restart
+resumes reconciliation. No successor stage may be spawned after the durable
+request. If the active stage completed first, it is recorded as complete and
+the Job is then cancelled; if a verified Result archive was already published,
+the completed Result wins. Terminal jobs are preserved and there is no
 job-delete endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
+
+The service does not infer successful Cancellation from a timeout. A pending
+Cancellation continues consuming Active Job Limits until the outcome is known.
+After 15 minutes the owner-facing view uses the persisted timestamp to warn
+that Cancellation is taking longer than expected while reconciliation
+continues.
 
 If a submission may have reached Modal but no call ID was durably recorded,
 the control plane cannot prove inactivity or issue a targeted cancellation. A
@@ -249,39 +289,118 @@ request identity, byte size, and SHA-256 digest. The archive and marker are the
 durable success boundary; the control plane does not mark a job complete until
 the ZIP contract validates.
 
-Packaging can be repeated safely for the same completed run because the member
-order, metadata, and contents are deterministic for the recorded job. The
-single-worker control plane remains responsible for preventing ordinary
-concurrent publication. No API-specific registry or Function is added to the
-GROMACS App.
+When the final deployed Function completes, the control plane atomically stores
+`finalization_started_at` as it enters `finalizing`. Archive provenance uses
+that persisted value rather than the time of an individual packaging attempt.
+Packaging can therefore be repeated safely for the same completed run because
+the member order, ZIP metadata, timestamps, and contents are deterministic for
+the recorded Job. Unchanged Volume outputs reproduce the same archive bytes,
+size, and SHA-256 digest. The single-worker control plane remains responsible
+for preventing ordinary concurrent publication. No API-specific registry or
+Function is added to the GROMACS App.
 
-The ZIP contains an explicit allowlist of final outputs, including:
+The ZIP has exactly three top-level entries or namespaces:
 
-- the exact submitted PDB and normalized parameters;
-- the processed no-PBC production trajectory, centered structure, production
-  topology and parameters;
-- RMSD, radius-of-gyration and RMSF data as CSV files and plots as PNG files;
-- provenance such as the Modal App name and timestamps;
-- a manifest and checksums; and
-- a service-generated `run.log`.
+- `input.pdb` is the exact submitted structure;
+- `outputs/` contains the processed no-PBC production trajectory, centered
+  structure, production topology and parameters, plus RMSD,
+  radius-of-gyration, and RMSF CSV/PNG pairs; and
+- `metadata/` contains the normalized parameters, safe provenance,
+  service-generated run log, manifest, checksums, and any other explicitly
+  allowed debugging document that is not useful at the top level.
 
-It excludes the larger raw production trajectory and does not recursively
-package equilibration outputs, the working directory, credentials, internal
-storage paths, databases, or large shared caches.
+The `metadata/` allowlist is fixed rather than pattern-recursive:
+
+- `parameters.json` stores normalized Submission parameters;
+- `provenance.json` stores safe Job, Tool, deployed App, software-version, and
+  persisted timestamp facts;
+- `stages.json` stores public stage codes, deployed Function names,
+  started/ended timestamps, and terminal outcomes;
+- `run.log` is the service-generated lifecycle summary;
+- `manifest.json` and `checksums.sha256` verify the archive; and
+- `gromacs/` contains the existing minimization, NVT, NPT, and production text
+  logs plus the small minimization/equilibration `.mdp` files.
+
+The exact Input, required end-User outputs, every CSV/PNG analysis pair, and
+service-generated metadata are mandatory. Missing any of them at initial
+publication fails the Job with `result_invalid`. The allowlisted GROMACS logs
+and `.mdp` files are optional diagnostics: package them when present and list
+their exact membership in the manifest, but do not fail an otherwise valid
+Result when they are absent.
+
+No metadata document remains loose at the archive root. The allowlist excludes
+the larger raw production trajectory and does not recursively package
+equilibration outputs, the working directory, credentials, internal storage
+paths, databases, raw provider exceptions, or large shared caches. It also
+excludes equilibration trajectories, `.trr`, `.edr`, `.cpt`, and intermediate
+`.tpr` and structure files; deeper diagnosis uses the authoritative Modal
+Volume.
+
+Once published, archive membership is immutable. Reconstruction may neither
+add an optional diagnostic that was absent nor drop one that was present,
+because either would violate the recorded size and SHA-256 identity.
 
 Modal Volume storage is authoritative. Scientific cache files, databases, and
 unselected intermediates remain on Modal. The selected final files stream
-through a spooled temporary file on the Linux host only while the service builds
-the ZIP; they are not added to its durable job database. The configurable local
-directory caches final ZIPs only. It is a size-bounded LRU cache with atomic
-publication and size/SHA-256 verification:
+through staging below the configured local cache directory while the service
+builds the ZIP. A successfully published staged ZIP becomes the local cache
+entry instead of being downloaded back from Modal.
+
+The local Result Cache has atomic publication and size/SHA-256 verification but
+no automatic size-driven eviction:
 
 1. a cache hit is served as a local file;
-2. a miss streams the ZIP from the recorded Modal Volume;
-3. an archive larger than the cache target is downloaded to an unlinked
-   temporary file, verified, streamed through that held descriptor, and not
-   retained; and
-4. eviction never deletes the Modal source.
+2. a miss restores or reconstructs the ZIP from the recorded Modal Volume;
+3. every finalized Job records Result byte size and current local-cache
+   presence;
+4. active staging files and leased downloads are protected from cleanup; and
+5. clearing local cache data never deletes the Modal source or reruns
+   scientific compute.
+
+A cache miss first restores the published Modal ZIP and completion marker. If
+either is missing or corrupt, deterministic reconstruction reads the explicit
+raw-output allowlist and uses the persisted provenance timestamp. The backend
+republishes only if size and SHA-256 match the Job's recorded Result. A mismatch
+never replaces the Result or replays scientific compute: the previously
+completed Job becomes blocked under safe category `result_integrity` until the
+exact archive is restored, then returns to its prior completed state.
+Local staging and cache filesystem errors remain recoverable and eventually
+block under `local_storage`; they are not classified as invalid scientific
+Results.
+
+Browser download uses a two-step contract. Idempotent
+`POST /api/v1/jobs/{job_id}/prepare-download` fills and verifies the local cache
+through the per-Job coordination lock and returns `204`; the following GET
+streams the prepared file with normal browser download handling. Cache-fill
+work is shared so cancellation of one HTTP waiter does not cancel or corrupt
+the underlying fill. This adds neither scientific work nor an external task
+queue.
+
+The GET supplies a sanitized `Content-Disposition` filename of
+`<display-name>-results.zip`, falling back to `gromacs-results.zip`. It never
+exposes a Job UUID, Modal run name, or storage path. The filename is presentation
+only; the immutable manifest, byte size, and SHA-256 remain authoritative.
+
+The Admin Storage page shows published Result bytes, completed local cache
+bytes, active staging bytes, filesystem free space, and a process/file
+controlled soft-warning threshold. The threshold defaults to 1 TiB and warns
+on actual local usage without rejecting or deleting Results. Startup reconciles
+database cache-presence markers with actual files and cleans abandoned staging
+files.
+
+The frontend loads this snapshot on Storage-page entry, refetches on focus,
+offers manual Refresh with a last-updated time, and invalidates it after cache
+cleanup or a Result cache fill completed in the same browser session. It does
+not poll storage periodically or introduce push updates. Opening Clear Result
+Cache first obtains a fresh reclaimable count and byte estimate; the mutation
+returns actual entries and bytes removed and triggers another snapshot load.
+
+Whole-file ZIP validation, SHA-256 verification, cache reconciliation, and
+large directory scans run through one bounded artifact worker thread rather
+than blocking the single FastAPI event loop. Modal byte streams remain
+asynchronous. Cache fills use per-job coordination so unrelated downloads do
+not wait behind one large restore. This preserves the single-process
+architecture without introducing another service or task queue.
 
 The cache can be deleted or rebuilt without losing a job. Intermediate cleanup
 is disabled when `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` is unset or blank. A
@@ -291,6 +410,25 @@ many days. Final archives and shared scientific caches are outside that cleanup
 policy. [Modal: Volumes](https://modal.com/docs/guide/volumes)
 
 ## Local persistence and operations
+
+The service exposes separate unauthenticated operational probes. `/api/v1/health`
+is event-loop liveness only. `/api/v1/ready` reports success only after startup
+and while SQLite, configured cache storage, the bounded artifact worker, and the
+reconciler remain usable. A failed readiness response contains no path or
+configuration detail. Neither probe contacts Modal; startup and Admin setting
+preflight own deployed-resource validation. Both stable operations appear in
+OpenAPI, and deployment waits for readiness before admitting Users.
+
+Each HTTP request receives a server-generated request identifier returned in
+the OpenAPI-documented `X-Request-ID` response header and attached to related
+journald entries. Lifecycle records use consistent searchable fields such as
+`event`, `job_id`, `workload`, public stage code, and safe Blocking Category.
+They cover admission/idempotent replay, stage changes, Cancellation,
+finalization retry/block/recovery, Runtime Setting mutations, Result Cache
+cleanup, and readiness transitions. Password Links, session/CSRF values,
+request bodies, PDB content, Modal credentials, and secrets are never logged.
+No external metrics, tracing, error-reporting, or audit service is required for
+the MVP.
 
 SQLite is intentionally restricted to one FastAPI process on local disk. WAL,
 foreign keys, transactional admission, and a busy timeout provide the required
@@ -328,7 +466,7 @@ The application factory reads these settings:
 | `MODAL_TOKEN_SECRET` | required | Dedicated Modal service-user token secret; never returned by the API or stored in SQLite |
 | `BIOMODALS_STATE_DIR` | `.biomodals/state` | Durable SQLite directory |
 | `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable final-ZIP cache directory |
-| `BIOMODALS_CACHE_MAX_BYTES` | `10737418240` | Local cache target (10 GiB) |
+| `BIOMODALS_CACHE_WARNING_BYTES` | `1099511627776` | Soft warning threshold for local Result staging and cache usage (1 TiB) |
 | `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | One public origin for links, exact-Origin checks, and same-origin browser access |
 | `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
 | `BIOMODALS_MODAL_ENVIRONMENT` | `production` | Modal Environment default; configurable in Admin unless a process override is set |
@@ -344,6 +482,21 @@ GROMACS App name, and Tool and Global limits in SQLite. Dotenv values are their
 host defaults. An explicit process variable has highest precedence and makes
 the corresponding Admin field read-only. Modal credentials remain process/file
 configuration only, and the API refuses to start unless both are present.
+
+That full validation belongs specifically to `biomodals api serve`. Offline
+`biomodals api admin` account commands resolve the same configuration file,
+state path, process overrides, and public URL, then validate only their own
+dependencies. They neither require Modal credentials nor initialize the Modal
+client, reconciler, or deployed-resource preflight. Password Link creation
+still requires a valid public URL so its generated SPA route matches the
+deployed frontend.
+
+The configuration file and process environment are read once during startup;
+there is no file watcher or hot reload. Changing a file-controlled value or
+Modal credential requires restart, and the new process repeats configuration
+validation and Modal preflight before becoming ready. SQLite-backed Admin
+Runtime Settings retain their immediate behavior. Admin reads reflect the
+running process's loaded values rather than independently reparsing the file.
 
 Runtime-setting PATCH requests are field-specific. An omitted field remains
 unchanged; an explicit JSON `null` removes only that field's SQLite override,
@@ -362,6 +515,23 @@ keeps the required worker count at one.
 Production uses the same factory and worker count behind the internal HTTPS
 reverse proxy. See the root README for the complete local setup and account
 provisioning example.
+
+The SQLite schema has one supported pre-release version. Encountering another
+version is a startup error: the service reports the configured database
+location and exits, but never migrates, truncates, or deletes it automatically.
+During active development an Administrator may explicitly remove or relocate
+that exact database while the service is stopped, then restart to initialize a
+fresh schema. This reset policy ends at the first release.
+
+Pre-release and production examples select different absolute
+`BIOMODALS_API_CONF_ENV` files and distinct `BIOMODALS_STATE_DIR` and
+`BIOMODALS_CACHE_DIR` values. Pre-release sets
+`BIOMODALS_PUBLIC_URL=https://beta.aidd.y1zhou.com`; production uses
+`https://aidd.y1zhou.com`. A pre-release reset or cache clear therefore targets
+only isolated host-local data and never falls back to production configuration,
+state, or cache. Modal Environment selection remains explicit and independent;
+an intentionally authorized pre-release service may still target the Modal
+`production` Environment.
 
 ## Alternatives considered
 

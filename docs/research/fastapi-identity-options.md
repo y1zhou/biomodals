@@ -46,6 +46,13 @@ unique login identifier and display metadata; it is not the ownership key.
 Disabled users and their jobs remain in the database. User deletion is outside
 v1.
 
+User Status is `pending_setup`, `enabled`, or `disabled`. Provisioning
+creates a pending-setup User; successful Password Setup enables them. A disabled
+User cannot authenticate, consume a Password Link, or submit a Job. Re-enabling
+returns a User with an existing password to enabled and one without a password
+to pending setup. Administrator role is independent, but only an enabled
+Administrator satisfies the final-administrator safeguard.
+
 Every job stores the submitter's UUID. Every list, detail, cancellation, and
 download query constrains both `owner_user_id` and `job_id`. A job belonging to
 another user produces the same `404` as a nonexistent job, and the service
@@ -84,9 +91,10 @@ uv run biomodals api admin reset-password alice@example.com
 uv run biomodals api admin disable-user alice@example.com
 ```
 
-`create-user` and `reset-password` print one URL exactly once. An administrator
-delivers it through company chat or in person after identifying the employee.
-The link expires after one hour and has this shape:
+`create-user` and `reset-password` print one URL exactly once, accompanied by
+its absolute expiration time. An administrator delivers it through company
+chat or in person after identifying the employee. The link expires after one
+hour and has this shape:
 
 ```text
 https://biomodals.internal/set-password#token=<random-token>
@@ -98,6 +106,12 @@ consume it, so link previewers and security scanners are harmless. The
 frontend reads the fragment and submits the token with the chosen password to
 `POST /api/v1/auth/set-password`; that successful POST consumes the token.
 Expired, reused, and unknown links receive the same error.
+
+The equivalent create-user and replacement-link HTTP responses declare both
+the one-time URL and `expires_at` in OpenAPI. The frontend localizes the
+timestamp and adds "Valid for approximately one hour" without a live countdown.
+Closing the handoff dialog still destroys the only frontend copy of the URL;
+the non-secret expiration metadata cannot be used to retrieve it again.
 
 A successful password setup or reset atomically:
 
@@ -125,8 +139,21 @@ the API. [NIST SP 800-63B](https://pages.nist.gov/800-63-4/sp800-63b.html)
 Login performs a dummy Argon2 verification for unknown or unactivated users so
 timing and messages reveal less account state. Password verification happens
 before a short `BEGIN IMMEDIATE` transaction; the transaction rechecks the
-stored hash and active flag before issuing a session, preventing a concurrent
+stored hash and User Status before issuing a session, preventing a concurrent
 reset or disable from losing its revocation guarantee.
+
+Job admission likewise rechecks enabled User Status inside the same write
+transaction that applies idempotency and Active Job Limits. A session
+authenticated before an Administrator disables the User cannot admit paid work
+after that disable commits.
+
+Argon2 work runs through one process-local bounded executor: two operations may
+run and eight more may wait. Further login or Password Setup requests receive
+`503 authentication_busy` and a `Retry-After` header. Password Setup first
+checks the high-entropy Password Link digest before spending an Argon2 slot,
+then atomically rechecks and consumes the link while committing the password
+and replacement Session. This bound protects API responsiveness; it is not an
+account-lockout or per-User throttling policy.
 
 ## Browser sessions and CSRF
 
@@ -174,7 +201,7 @@ digests, and private job metadata. The essential tables are:
 
 | Table | Important fields |
 | --- | --- |
-| `users` | immutable UUID, normalized unique email, display name, Argon2id hash, active flag, timestamps |
+| `users` | immutable UUID, normalized unique email, display name, Argon2id hash, User Status, timestamps |
 | `password_tokens` | SHA-256 token digest, user UUID, expiry |
 | `sessions` | SHA-256 session digest, user UUID, CSRF digest, created/last-seen/absolute-expiry timestamps |
 | `jobs` | owner UUID, public job UUID, workload, state and internal provider/artifact metadata |

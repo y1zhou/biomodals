@@ -509,8 +509,9 @@ Start the development server with:
 uv run biomodals api serve
 ```
 
-The command defaults to `127.0.0.1:8000`, accepts `--host` and `--port`, and
-keeps the required worker count at one.
+The command defaults to the development address `127.0.0.1:4144`, accepts
+`--host` and `--port`, and keeps the required worker count at one. Production
+service definitions explicitly select port `4100`.
 
 Production uses the same factory and worker count behind the internal HTTPS
 reverse proxy. See the root README for the complete local setup and account

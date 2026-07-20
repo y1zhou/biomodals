@@ -15,7 +15,7 @@ Environment=BIOMODALS_CACHE_WARNING_BYTES=1099511627776
 Environment=BIOMODALS_RECONCILE_SECONDS=10
 Volume=/var/lib/biomodals/production/state:/var/lib/biomodals/state:Z
 Volume=/var/cache/biomodals/production:/var/cache/biomodals:Z
-PublishPort=127.0.0.1:8000:8000
+PublishPort=127.0.0.1:4100:4100
 
 [Service]
 Restart=on-failure

@@ -83,16 +83,18 @@ uv run biomodals api serve
 
 Explicit process environment variables override values in the file. Relative
 state and cache paths are resolved from the directory containing `.env`.
+The example keeps both under the repository-root `.biomodals/` directory.
 The backend refuses to start unless both `MODAL_TOKEN_ID` and
 `MODAL_TOKEN_SECRET` are present. The token secret remains process-only and is
 never stored in SQLite or returned by the API. `BIOMODALS_PUBLIC_URL` is the
 single browser origin used for Password Links and mutation Origin checks.
 
-The server listens on `127.0.0.1:8000` by default. Use `--host` or `--port`
-to override either value; the command keeps the required worker count at one.
+The development server listens on `127.0.0.1:4144` by default. Use `--host`
+or `--port` to override either value; the command keeps the required worker
+count at one.
 
 Configure the frontend development server to proxy `/api` to
-`http://127.0.0.1:8000`. The browser then uses ordinary same-origin,
+`http://127.0.0.1:4144`. The browser then uses ordinary same-origin,
 HTTP-only session cookies. `BIOMODALS_SECURE_COOKIES` defaults to `false` for
 local HTTP; set it to `true` behind the production HTTPS reverse proxy.
 
@@ -119,7 +121,7 @@ fields are read-only in the Admin interface.
 
 The [production deployment examples](deploy/README.md) cover a native systemd
 service, Docker Compose, and a Podman Quadlet. Each example binds the API only
-to `127.0.0.1:8000` for a same-origin HTTPS reverse proxy. Copy and review an
+to `127.0.0.1:4100` for a same-origin HTTPS reverse proxy. Copy and review an
 example before use; never commit real Modal credentials.
 
 Run the API as one process under a dedicated Linux and Modal service user. Only

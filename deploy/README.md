@@ -7,7 +7,7 @@ checking out this repository.
 
 All three examples:
 
-- expose the API only on `127.0.0.1:8000` for a same-origin HTTPS reverse
+- expose the API only on `127.0.0.1:4100` for a same-origin HTTPS reverse
   proxy;
 - use `https://aidd.y1zhou.com` as the browser origin;
 - keep durable SQLite state separate from the rebuildable Result cache; and
@@ -62,6 +62,6 @@ token placeholders. After `systemctl daemon-reload`, systemd generates
 Do not run `systemctl enable` on the generated service.
 
 For all three options, wait for
-`http://127.0.0.1:8000/api/v1/ready` before exposing a release. The
+`http://127.0.0.1:4100/api/v1/ready` before exposing a release. The
 [deployment runbook](../docs/deployment/mvp-runbook.md) covers the frontend
 proxy, pre-release isolation, verification, and rollback.

@@ -65,7 +65,7 @@ def serve_api(
     port: Annotated[
         int,
         typer.Option(min=1, max=65535, help="TCP port on which to listen."),
-    ] = 8000,
+    ] = 4144,
 ) -> None:
     """Run the deployed-app FastAPI factory with one Uvicorn worker."""
     try:

@@ -27,7 +27,7 @@ development.
 
 Production and pre-release must never select the same service definition,
 database, or cache directory. A pre-release copy must use
-`https://beta.aidd.y1zhou.com`, a separate loopback port, and the pre-release
+`https://beta.aidd.y1zhou.com`, loopback port `4144`, and the pre-release
 paths above. An intentionally shared Modal Environment does not change this
 requirement.
 
@@ -40,11 +40,12 @@ a fixed working directory, private umask, restart-on-failure, and journald
 output. Review and install only one alternative. A pre-release service must use
 its own copied configuration, host paths, public URL, and port.
 
-Before directing a browser to a candidate API, verify locally:
+Before directing a browser to the production API, verify it on port `4100`.
+Use port `4144` for the development or pre-release service:
 
 ```console
-curl --fail http://127.0.0.1:8000/api/v1/health
-curl --fail http://127.0.0.1:8000/api/v1/ready
+curl --fail http://127.0.0.1:4100/api/v1/health
+curl --fail http://127.0.0.1:4100/api/v1/ready
 ```
 
 Liveness only proves that the event loop responds. Readiness additionally
@@ -73,7 +74,7 @@ aidd.y1zhou.com {
 
 	@api path /api/* /docs* /openapi.json /redoc*
 	handle @api {
-		reverse_proxy 127.0.0.1:8000
+		reverse_proxy 127.0.0.1:4100
 	}
 
 	header {

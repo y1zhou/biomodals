@@ -27,7 +27,7 @@ def owner(auth: AuthService, email: str) -> UUID:
         display_name=email.partition("@")[0],
         is_admin=not auth.store.list_users(),
     )
-    token = link.partition("#token=")[2]
+    token = link.url.partition("#token=")[2]
     return auth.set_password(token, "correct horse battery staple").principal.user_id
 
 
@@ -36,6 +36,24 @@ def make_store(tmp_path: Path) -> tuple[ServiceStore, UUID, UUID]:
     store.initialize()
     auth = AuthService(store, frontend_url="https://biomodals.internal")
     return store, owner(auth, "alice@example.com"), owner(auth, "bob@example.com")
+
+
+def test_readiness_never_recreates_or_accepts_an_empty_database(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = ServiceStore(path)
+    store.initialize()
+    store.check_ready()
+
+    path.unlink()
+    with pytest.raises(RuntimeError, match="database is unavailable"):
+        store.check_ready()
+    assert not path.exists()
+
+    path.touch()
+    with pytest.raises(RuntimeError, match="schema is unavailable"):
+        store.check_ready()
 
 
 def admit(

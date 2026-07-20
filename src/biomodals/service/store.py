@@ -63,6 +63,7 @@ class JobState(StrEnum):
     RUNNING = "running"
     FINALIZING = "finalizing"
     CANCEL_REQUESTED = "cancel_requested"
+    BLOCKED = "blocked"
     SUCCEEDED = "succeeded"
     PARTIAL = "partial"
     FAILED = "failed"
@@ -81,6 +82,15 @@ TERMINAL_JOB_STATES = (
     JobState.FAILED,
     JobState.CANCELLED,
 )
+RECONCILABLE_JOB_STATES = (*ACTIVE_JOB_STATES, JobState.BLOCKED)
+
+
+class UserStatus(StrEnum):
+    """Explicit account lifecycle independent of Administrator role."""
+
+    PENDING_SETUP = "pending_setup"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,11 +101,16 @@ class UserRecord:
     email: str
     display_name: str
     password_hash: str | None
-    active: bool
+    status: UserStatus
     is_admin: bool
     active_job_limit: int
     created_at: int
     updated_at: int
+
+    @property
+    def active(self) -> bool:
+        """Compatibility predicate for code that needs an enabled account."""
+        return self.status == UserStatus.ENABLED
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +156,14 @@ class JobRecord:
     updated_at: int
     completed_at: int | None
     cancel_requested_at: int | None
+    finalization_started_at: int | None
+    finalization_retry_started_at: int | None
+    finalization_retry_count: int
+    blocked_at: int | None
+    next_retry_at: int | None
+    blocking_category: str | None
+    result_previous_state: JobState | None
+    result_cached: bool
     intermediates_cleaned_at: int | None
 
     @property
@@ -184,6 +207,7 @@ class JobStageRecord:
     provider_operation: str
     started_at: int
     completed_at: int | None
+    outcome: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +217,23 @@ class WorkloadConfigurationRecord:
     workload: str
     modal_app_name: str | None
     active_job_limit: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedResultUsage:
+    """Durable Result accounting independent of rebuildable cache files."""
+
+    entries: int
+    bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedJobSummary:
+    """Safe aggregate that exposes no owner or Job identifier."""
+
+    category: str
+    count: int
+    oldest_blocked_at: int
 
 
 def _stage_history_from_json(value: str) -> list[JobStageRecord]:
@@ -205,11 +246,13 @@ def _stage_history_from_json(value: str) -> list[JobStageRecord]:
             "provider_operation",
             "started_at",
             "completed_at",
+            "outcome",
         }:
             raise ValueError("stage_history_json contains an invalid stage")
         provider_operation = item["provider_operation"]
         started_at = item["started_at"]
         completed_at = item["completed_at"]
+        outcome = item["outcome"]
         if (
             not isinstance(provider_operation, str)
             or not provider_operation
@@ -223,6 +266,8 @@ def _stage_history_from_json(value: str) -> list[JobStageRecord]:
                     or completed_at < started_at
                 )
             )
+            or outcome not in {None, "completed", "failed", "cancelled"}
+            or (completed_at is None) != (outcome is None)
         ):
             raise ValueError("stage_history_json contains an invalid stage")
         history.append(
@@ -230,6 +275,7 @@ def _stage_history_from_json(value: str) -> list[JobStageRecord]:
                 provider_operation=provider_operation,
                 started_at=started_at,
                 completed_at=completed_at,
+                outcome=outcome,
             )
         )
     return history
@@ -240,6 +286,7 @@ def _transition_stage_history_json(
     *,
     now: int,
     complete_operation: str | None = None,
+    complete_outcome: str = "completed",
     start_operation: str | None = None,
 ) -> str:
     history = _stage_history_from_json(value)
@@ -254,6 +301,7 @@ def _transition_stage_history_json(
                     provider_operation=stage.provider_operation,
                     started_at=stage.started_at,
                     completed_at=max(now, stage.started_at),
+                    outcome=complete_outcome,
                 )
                 break
     if start_operation is not None and not (
@@ -266,6 +314,7 @@ def _transition_stage_history_json(
                 provider_operation=start_operation,
                 started_at=now,
                 completed_at=None,
+                outcome=None,
             )
         )
     return orjson.dumps([
@@ -273,6 +322,7 @@ def _transition_stage_history_json(
             "provider_operation": stage.provider_operation,
             "started_at": stage.started_at,
             "completed_at": stage.completed_at,
+            "outcome": stage.outcome,
         }
         for stage in history
     ]).decode()
@@ -310,10 +360,12 @@ class ServiceStore:
                         email TEXT NOT NULL UNIQUE,
                         display_name TEXT NOT NULL,
                         password_hash TEXT,
-                        active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                        status TEXT NOT NULL CHECK (
+                            status IN ('pending_setup', 'enabled', 'disabled')
+                        ),
                         is_admin INTEGER NOT NULL CHECK (is_admin IN (0, 1)),
                         active_job_limit INTEGER NOT NULL
-                            CHECK (active_job_limit >= 1),
+                            CHECK (active_job_limit >= 0),
                         created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL
                     );
@@ -367,6 +419,15 @@ class ServiceStore:
                         updated_at INTEGER NOT NULL,
                         completed_at INTEGER,
                         cancel_requested_at INTEGER,
+                        finalization_started_at INTEGER,
+                        finalization_retry_started_at INTEGER,
+                        finalization_retry_count INTEGER NOT NULL DEFAULT 0,
+                        blocked_at INTEGER,
+                        next_retry_at INTEGER,
+                        blocking_category TEXT,
+                        result_previous_state TEXT,
+                        result_cached INTEGER NOT NULL DEFAULT 0
+                            CHECK (result_cached IN (0, 1)),
                         intermediates_cleaned_at INTEGER,
                         UNIQUE (owner_user_id, workload, idempotency_key)
                     );
@@ -384,42 +445,109 @@ class ServiceStore:
                         workload TEXT PRIMARY KEY,
                         modal_app_name TEXT,
                         active_job_limit INTEGER
-                            CHECK (active_job_limit IS NULL OR active_job_limit >= 1)
+                            CHECK (active_job_limit IS NULL OR active_job_limit >= 0)
                     );
 
-                    PRAGMA user_version = 6;
+                    PRAGMA user_version = 7;
                     COMMIT;
                     """
                 )
-            elif version == 4:
-                conn.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    ALTER TABLE jobs ADD COLUMN provider_operation TEXT;
-                    ALTER TABLE jobs ADD COLUMN stage_history_json TEXT NOT NULL
-                        DEFAULT '[]';
-                    PRAGMA user_version = 6;
-                    COMMIT;
-                    """
-                )
-            elif version == 5:
-                conn.executescript(
-                    """
-                    BEGIN IMMEDIATE;
-                    ALTER TABLE jobs ADD COLUMN stage_history_json TEXT NOT NULL
-                        DEFAULT '[]';
-                    PRAGMA user_version = 6;
-                    COMMIT;
-                    """
-                )
-            elif version != 6:
+            elif version != 7:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
-                    f"{version}; initialize fresh state"
+                    f"{version} at {self.path}; stop the service and initialize "
+                    "fresh state explicitly"
                 )
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
             if path.exists():
                 path.chmod(0o600)
+
+    def check_ready(self) -> None:
+        """Verify the configured database and required schema without creating it."""
+        if not self.path.is_file() or self.path.is_symlink():
+            raise RuntimeError("SQLite database is unavailable")
+        database_uri = f"{self.path.resolve().as_uri()}?mode=rw"
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(
+                database_uri,
+                uri=True,
+                timeout=5,
+                isolation_level=None,
+            )
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 7:
+                raise RuntimeError("SQLite schema is unavailable")
+            conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError("SQLite readiness check failed") from exc
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def published_result_usage(self) -> PublishedResultUsage:
+        """Sum every published immutable Result recorded in SQLite."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(result_size_bytes), 0)
+                FROM jobs WHERE result_size_bytes IS NOT NULL
+                """
+            ).fetchone()
+        return PublishedResultUsage(entries=int(row[0]), bytes=int(row[1]))
+
+    def blocked_job_summaries(self) -> list[BlockedJobSummary]:
+        """Aggregate blocked Jobs by safe service-defined category."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT blocking_category, COUNT(*) AS count,
+                       MIN(blocked_at) AS oldest_blocked_at
+                FROM jobs
+                WHERE state = ? AND blocking_category IS NOT NULL
+                      AND blocked_at IS NOT NULL
+                GROUP BY blocking_category
+                ORDER BY blocking_category
+                """,
+                (JobState.BLOCKED.value,),
+            ).fetchall()
+        return [
+            BlockedJobSummary(
+                category=str(row["blocking_category"]),
+                count=int(row["count"]),
+                oldest_blocked_at=int(row["oldest_blocked_at"]),
+            )
+            for row in rows
+        ]
+
+    def set_result_cached(self, job_id: UUID, *, cached: bool) -> None:
+        """Persist whether the rebuildable local archive is currently present."""
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET result_cached = ? WHERE job_id = ?",
+                (int(cached), str(job_id)),
+            )
+
+    def mark_result_cache_cleared(self, job_ids: tuple[str, ...]) -> None:
+        """Exclude explicitly removed archives from future cached-size views."""
+        if not job_ids:
+            return
+        with self._transaction() as conn:
+            conn.executemany(
+                "UPDATE jobs SET result_cached = 0 WHERE job_id = ?",
+                ((job_id,) for job_id in job_ids),
+            )
+
+    def reconcile_result_cache(self, cached_job_ids: set[str]) -> None:
+        """Reconcile durable cache-presence markers with files at startup."""
+        with self._transaction() as conn:
+            conn.execute("UPDATE jobs SET result_cached = 0")
+            conn.executemany(
+                """
+                UPDATE jobs SET result_cached = 1
+                WHERE job_id = ? AND result_size_bytes IS NOT NULL
+                """,
+                ((job_id,) for job_id in cached_job_ids),
+            )
 
     def create_user(
         self,
@@ -432,9 +560,9 @@ class ServiceStore:
         is_admin: bool = False,
         active_job_limit: int = 2,
     ) -> UserRecord:
-        """Atomically create an inactive-password user and setup token."""
-        if active_job_limit < 1:
-            raise ValueError("active_job_limit must be positive")
+        """Atomically create a pending-setup user and its one-time token."""
+        if active_job_limit < 0:
+            raise ValueError("active_job_limit must be non-negative")
         user_id = uuid4()
         try:
             with self._transaction() as conn:
@@ -447,14 +575,15 @@ class ServiceStore:
                 conn.execute(
                     """
                     INSERT INTO users (
-                        user_id, email, display_name, password_hash, active,
+                        user_id, email, display_name, password_hash, status,
                         is_admin, active_job_limit, created_at, updated_at
-                    ) VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(user_id),
                         email,
                         display_name,
+                        UserStatus.PENDING_SETUP.value,
                         int(is_admin),
                         active_job_limit,
                         now,
@@ -511,11 +640,11 @@ class ServiceStore:
         """Replace a user's outstanding setup/reset links with one token."""
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT active FROM users WHERE user_id = ?",
+                "SELECT status FROM users WHERE user_id = ?",
                 (str(user_id),),
             ).fetchone()
-            if row is None or not bool(row["active"]):
-                raise UserNotFoundError("Active user not found")
+            if row is None or row["status"] == UserStatus.DISABLED.value:
+                raise UserNotFoundError("Enabled or pending-setup user not found")
             conn.execute(
                 "DELETE FROM password_tokens WHERE user_id = ?",
                 (str(user_id),),
@@ -545,9 +674,10 @@ class ServiceStore:
                 SELECT u.*
                 FROM password_tokens AS t
                 JOIN users AS u ON u.user_id = t.user_id
-                WHERE t.token_digest = ? AND t.expires_at > ? AND u.active = 1
+                WHERE t.token_digest = ? AND t.expires_at > ?
+                  AND u.status != ?
                 """,
-                (token_digest, now),
+                (token_digest, now, UserStatus.DISABLED.value),
             ).fetchone()
             if row is None:
                 conn.execute(
@@ -558,10 +688,10 @@ class ServiceStore:
             user_id = str(row["user_id"])
             conn.execute(
                 """
-                UPDATE users SET password_hash = ?, updated_at = ?
+                UPDATE users SET password_hash = ?, status = ?, updated_at = ?
                 WHERE user_id = ?
                 """,
-                (password_hash, now, user_id),
+                (password_hash, UserStatus.ENABLED.value, now, user_id),
             )
             conn.execute("DELETE FROM password_tokens WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
@@ -587,6 +717,21 @@ class ServiceStore:
             ).fetchone()
         return _user_from_row(updated)
 
+    def password_token_is_valid(self, token_digest: bytes, *, now: int) -> bool:
+        """Cheaply reject invalid links before performing Argon2 work."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM password_tokens AS t
+                JOIN users AS u ON u.user_id = t.user_id
+                WHERE t.token_digest = ? AND t.expires_at > ?
+                  AND u.status != ?
+                """,
+                (token_digest, now, UserStatus.DISABLED.value),
+            ).fetchone()
+        return row is not None
+
     def create_session_if_password_matches(
         self,
         user_id: UUID,
@@ -601,12 +746,12 @@ class ServiceStore:
         """Create a session only if login state did not change during hashing."""
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT active, password_hash FROM users WHERE user_id = ?",
+                "SELECT status, password_hash FROM users WHERE user_id = ?",
                 (str(user_id),),
             ).fetchone()
             if (
                 row is None
-                or not bool(row["active"])
+                or row["status"] != UserStatus.ENABLED.value
                 or row["password_hash"] != expected_password_hash
             ):
                 return False
@@ -662,7 +807,7 @@ class ServiceStore:
             if row is None:
                 return None
             expired = (
-                not bool(row["active"])
+                row["status"] != UserStatus.ENABLED.value
                 or now >= int(row["absolute_expires_at"])
                 or now >= int(row["last_seen_at"]) + idle_timeout_seconds
             )
@@ -723,8 +868,8 @@ class ServiceStore:
         now: int,
     ) -> UserRecord:
         """Update one user atomically and never remove the final active admin."""
-        if active_job_limit is not None and active_job_limit < 1:
-            raise ValueError("active_job_limit must be positive")
+        if active_job_limit is not None and active_job_limit < 0:
+            raise ValueError("active_job_limit must be non-negative")
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM users WHERE user_id = ?",
@@ -732,16 +877,26 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise UserNotFoundError(f"User not found: {user_id}")
-            target_active = bool(row["active"]) if active is None else active
+            current_status = UserStatus(row["status"])
+            target_status = current_status
+            if active is False:
+                target_status = UserStatus.DISABLED
+            elif active is True:
+                target_status = (
+                    UserStatus.ENABLED
+                    if row["password_hash"] is not None
+                    else UserStatus.PENDING_SETUP
+                )
             target_admin = bool(row["is_admin"]) if is_admin is None else is_admin
             if (
-                bool(row["active"])
+                current_status == UserStatus.ENABLED
                 and bool(row["is_admin"])
-                and not (target_active and target_admin)
+                and not (target_status == UserStatus.ENABLED and target_admin)
             ):
                 active_admins = int(
                     conn.execute(
-                        "SELECT COUNT(*) FROM users WHERE active = 1 AND is_admin = 1"
+                        "SELECT COUNT(*) FROM users WHERE status = ? AND is_admin = 1",
+                        (UserStatus.ENABLED.value,),
                     ).fetchone()[0]
                 )
                 if active_admins <= 1:
@@ -756,18 +911,18 @@ class ServiceStore:
             conn.execute(
                 """
                 UPDATE users
-                SET active = ?, is_admin = ?, active_job_limit = ?, updated_at = ?
+                SET status = ?, is_admin = ?, active_job_limit = ?, updated_at = ?
                 WHERE user_id = ?
                 """,
                 (
-                    int(target_active),
+                    target_status.value,
                     int(target_admin),
                     target_limit,
                     now,
                     str(user_id),
                 ),
             )
-            if not target_active:
+            if target_status == UserStatus.DISABLED:
                 conn.execute(
                     "DELETE FROM sessions WHERE user_id = ?",
                     (str(user_id),),
@@ -844,9 +999,9 @@ class ServiceStore:
         ):
             raise ValueError("modal_app_name must not be empty")
         if active_job_limit is not None and (
-            type(active_job_limit) is not int or active_job_limit < 1
+            type(active_job_limit) is not int or active_job_limit < 0
         ):
-            raise ValueError("active_job_limit must be positive")
+            raise ValueError("active_job_limit must be non-negative")
         if not settings:
             return
         with self._transaction() as conn:
@@ -911,11 +1066,13 @@ class ServiceStore:
                 return JobAdmission(job=_job_from_row(existing), created=False)
 
             user = conn.execute(
-                "SELECT active_job_limit FROM users WHERE user_id = ?",
+                "SELECT status, active_job_limit FROM users WHERE user_id = ?",
                 (str(owner_user_id),),
             ).fetchone()
             if user is None:
                 raise UserNotFoundError(f"User not found: {owner_user_id}")
+            if user["status"] != UserStatus.ENABLED.value:
+                raise UserNotFoundError(f"Enabled User not found: {owner_user_id}")
             user_active_job_limit = int(user["active_job_limit"])
 
             service_rows = conn.execute(
@@ -953,8 +1110,8 @@ class ServiceStore:
                 workload_active_job_limit,
                 global_active_job_limit,
             )
-            if any(limit < 1 for limit in limits):
-                raise ValueError("active job limits must be positive")
+            if any(limit < 0 for limit in limits):
+                raise ValueError("active job limits must be non-negative")
             if not modal_environment.strip() or not modal_app_name.strip():
                 raise ValueError("Modal Job configuration must not be empty")
 
@@ -1012,11 +1169,14 @@ class ServiceStore:
                     result_volume_path, result_filename, result_size_bytes,
                     result_sha256, warnings_json, error_code, error_message,
                     created_at, updated_at, completed_at, cancel_requested_at,
+                    finalization_started_at, finalization_retry_started_at,
+                    finalization_retry_count, blocked_at, next_retry_at, blocking_category,
+                    result_previous_state, result_cached,
                     intermediates_cleaned_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?,
-                    ?, NULL, NULL, NULL
+                    ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL
                 )
                 """,
                 (
@@ -1063,32 +1223,39 @@ class ServiceStore:
             ).fetchall()
         return [_job_from_row(row) for row in rows]
 
-    def count_running_jobs(self, workload: str | None = None) -> int:
-        """Count Jobs last observed running, optionally for one workload."""
+    def count_active_jobs(self, workload: str | None = None) -> int:
+        """Count Jobs that consume admission capacity."""
+        placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
+        states = tuple(state.value for state in ACTIVE_JOB_STATES)
         with self._connection() as conn:
             if workload is None:
                 row = conn.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE state = ?",
-                    (JobState.RUNNING.value,),
+                    f"SELECT COUNT(*) FROM jobs WHERE state IN ({placeholders})",  # noqa: S608
+                    states,
                 ).fetchone()
             else:
                 row = conn.execute(
-                    """
-                    SELECT COUNT(*) FROM jobs WHERE state = ? AND workload = ?
-                    """,
-                    (JobState.RUNNING.value, workload),
+                    f"""
+                    SELECT COUNT(*) FROM jobs
+                    WHERE state IN ({placeholders}) AND workload = ?
+                    """,  # noqa: S608
+                    (*states, workload),
                 ).fetchone()
             return int(row[0])
+
+    def count_running_jobs(self, workload: str | None = None) -> int:
+        """Backward-compatible alias for the admission-capacity count."""
+        return self.count_active_jobs(workload)
 
     def list_reconcilable_jobs(
         self,
         workload: str | None = None,
     ) -> list[JobRecord]:
         """List non-terminal jobs, optionally restricted to one workload."""
-        placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
+        placeholders = ", ".join("?" for _ in RECONCILABLE_JOB_STATES)
         workload_clause = "" if workload is None else " AND workload = ?"
         parameters: tuple[str, ...] = (
-            *(state.value for state in ACTIVE_JOB_STATES),
+            *(state.value for state in RECONCILABLE_JOB_STATES),
             *((workload,) if workload is not None else ()),
         )
         with self._connection() as conn:
@@ -1539,6 +1706,8 @@ class ServiceStore:
             raise ValueError("Use complete_job to record successful output")
         if state == JobState.FAILED:
             raise ValueError("Use fail_job to record a safe failure")
+        if state == JobState.BLOCKED:
+            raise ValueError("Use block_job to record a recoverable failure")
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1554,6 +1723,7 @@ class ServiceStore:
             ):
                 return _job_from_row(row)
             history_json = str(row["stage_history_json"])
+            finalization_started_at = row["finalization_started_at"]
             if state == JobState.FINALIZING:
                 history_json = _transition_stage_history_json(
                     history_json,
@@ -1561,11 +1731,19 @@ class ServiceStore:
                     complete_operation=row["provider_operation"],
                     start_operation="result_packaging",
                 )
+                finalization_started_at = finalization_started_at or now
+            elif state == JobState.CANCELLED:
+                history_json = _transition_stage_history_json(
+                    history_json,
+                    now=now,
+                    complete_operation=row["provider_operation"],
+                    complete_outcome="cancelled",
+                )
             conn.execute(
                 """
                 UPDATE jobs
                 SET state = ?, stage_history_json = ?, updated_at = ?,
-                    completed_at = ?
+                    completed_at = ?, finalization_started_at = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -1573,6 +1751,7 @@ class ServiceStore:
                     history_json,
                     now,
                     now if state in TERMINAL_JOB_STATES else None,
+                    finalization_started_at,
                     str(job_id),
                 ),
             )
@@ -1580,6 +1759,101 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
+        return _job_from_row(row)
+
+    def schedule_finalization_retry(
+        self,
+        job_id: UUID,
+        *,
+        now: int,
+        next_retry_at: int,
+    ) -> JobRecord:
+        """Persist a bounded retry schedule without losing compute outputs."""
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state = ?, finalization_started_at = COALESCE(
+                        finalization_started_at, ?
+                    ),
+                    finalization_retry_started_at = COALESCE(
+                        finalization_retry_started_at, ?
+                    ),
+                    finalization_retry_count = finalization_retry_count + 1,
+                    next_retry_at = ?, updated_at = ?
+                WHERE job_id = ? AND state IN (?, ?)
+                """,
+                (
+                    JobState.FINALIZING.value,
+                    now,
+                    now,
+                    next_retry_at,
+                    now,
+                    str(job_id),
+                    JobState.FINALIZING.value,
+                    JobState.BLOCKED.value,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+        return _job_from_row(row)
+
+    def block_job(
+        self,
+        job_id: UUID,
+        *,
+        category: str,
+        now: int,
+        next_retry_at: int,
+        previous_state: JobState | None = None,
+    ) -> JobRecord:
+        """Preserve outputs while recording a safe recoverable category."""
+        if not category.strip():
+            raise ValueError("Blocking category must not be empty")
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            current_state = JobState(row["state"])
+            if current_state in {JobState.FAILED, JobState.CANCELLED}:
+                return _job_from_row(row)
+            if current_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
+                if previous_state != current_state:
+                    raise ValueError(
+                        "A completed Result can only block with its current state"
+                    )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state = ?, blocked_at = COALESCE(blocked_at, ?),
+                    next_retry_at = ?, blocking_category = ?,
+                    result_previous_state = COALESCE(result_previous_state, ?),
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    JobState.BLOCKED.value,
+                    now,
+                    next_retry_at,
+                    category,
+                    previous_state.value if previous_state is not None else None,
+                    now,
+                    str(job_id),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
         return _job_from_row(row)
 
     def complete_job(
@@ -1593,6 +1867,7 @@ class ServiceStore:
         result_size_bytes: int,
         result_sha256: str,
         warnings_json: str = "[]",
+        result_cached: bool = False,
         now: int,
     ) -> JobRecord:
         """Record a verified immutable archive and its terminal job state."""
@@ -1606,6 +1881,15 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if JobState(row["state"]) in (JobState.SUCCEEDED, JobState.PARTIAL):
+                if result_cached and not bool(row["result_cached"]):
+                    conn.execute(
+                        "UPDATE jobs SET result_cached = 1 WHERE job_id = ?",
+                        (str(job_id),),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM jobs WHERE job_id = ?",
+                        (str(job_id),),
+                    ).fetchone()
                 return _job_from_row(row)
             history_json = _transition_stage_history_json(
                 str(row["stage_history_json"]),
@@ -1625,7 +1909,10 @@ class ServiceStore:
                     result_filename = ?, result_size_bytes = ?,
                     result_sha256 = ?, warnings_json = ?, error_code = NULL,
                     error_message = NULL, stage_history_json = ?, updated_at = ?,
-                    completed_at = ?
+                    completed_at = COALESCE(completed_at, ?), blocked_at = NULL,
+                    next_retry_at = NULL,
+                    blocking_category = NULL, result_previous_state = NULL,
+                    result_cached = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -1639,6 +1926,7 @@ class ServiceStore:
                     history_json,
                     now,
                     now,
+                    int(result_cached),
                     str(job_id),
                 ),
             )
@@ -1666,18 +1954,29 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if JobState(row["state"]) in TERMINAL_JOB_STATES:
                 return _job_from_row(row)
+            history_json = _transition_stage_history_json(
+                str(row["stage_history_json"]),
+                now=now,
+                complete_operation=(
+                    "result_packaging"
+                    if JobState(row["state"]) in {JobState.FINALIZING, JobState.BLOCKED}
+                    else row["provider_operation"]
+                ),
+                complete_outcome="failed",
+            )
             conn.execute(
                 """
                 UPDATE jobs
                 SET state = ?, error_code = ?, error_message = ?,
                     submission_token = NULL, submission_lease_until = NULL,
-                    updated_at = ?, completed_at = ?
+                    stage_history_json = ?, updated_at = ?, completed_at = ?
                 WHERE job_id = ?
                 """,
                 (
                     JobState.FAILED.value,
                     error_code,
                     error_message,
+                    history_json,
                     now,
                     now,
                     str(job_id),
@@ -1724,7 +2023,7 @@ def _user_from_row(row: sqlite3.Row) -> UserRecord:
         email=str(row["email"]),
         display_name=str(row["display_name"]),
         password_hash=row["password_hash"],
-        active=bool(row["active"]),
+        status=UserStatus(row["status"]),
         is_admin=bool(row["is_admin"]),
         active_job_limit=int(row["active_job_limit"]),
         created_at=int(row["created_at"]),
@@ -1762,5 +2061,17 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         updated_at=int(row["updated_at"]),
         completed_at=row["completed_at"],
         cancel_requested_at=row["cancel_requested_at"],
+        finalization_started_at=row["finalization_started_at"],
+        finalization_retry_started_at=row["finalization_retry_started_at"],
+        finalization_retry_count=int(row["finalization_retry_count"]),
+        blocked_at=row["blocked_at"],
+        next_retry_at=row["next_retry_at"],
+        blocking_category=row["blocking_category"],
+        result_previous_state=(
+            JobState(row["result_previous_state"])
+            if row["result_previous_state"] is not None
+            else None
+        ),
+        result_cached=bool(row["result_cached"]),
         intermediates_cleaned_at=row["intermediates_cleaned_at"],
     )

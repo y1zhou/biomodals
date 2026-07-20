@@ -223,6 +223,20 @@ def file1_needs_update(file1: Path, file2: Path) -> bool:
     return file1.stat().st_mtime < file2.stat().st_mtime
 
 
+def remove_stale_analysis_outputs(
+    csv_path: Path,
+    figure_path: Path,
+    trajectory_path: Path,
+    *,
+    make_figures: bool,
+) -> None:
+    """Invalidate each stale analysis member independently."""
+    if file1_needs_update(csv_path, trajectory_path):
+        csv_path.unlink(missing_ok=True)
+    if make_figures and file1_needs_update(figure_path, trajectory_path):
+        figure_path.unlink(missing_ok=True)
+
+
 ##########################################
 # Inference functions
 ##########################################
@@ -711,20 +725,23 @@ def collect_traj_stats(
     # RMSD vs. the initial frame
     rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{run_name}.png"
     rmsd_csv_path = rmsd_fig_path.with_suffix(".csv")
-    if file1_needs_update(rmsd_csv_path, traj_path):
-        rmsd_csv_path.unlink(missing_ok=True)
-        rmsd_fig_path.unlink(missing_ok=True)
-    if not rmsd_csv_path.exists():
+    remove_stale_analysis_outputs(
+        rmsd_csv_path,
+        rmsd_fig_path,
+        traj_path,
+        make_figures=make_figures,
+    )
+    if not rmsd_csv_path.exists() or (make_figures and not rmsd_fig_path.exists()):
         rmsd = struc.rmsd(trajectory[0], trajectory)
-        np.savetxt(
-            rmsd_csv_path,
-            np.column_stack((time, rmsd)),
-            fmt="%.5f",
-            delimiter=",",
-            header="time_ns,rmsd",
-            comments="",
-        )
-        out_vol.commit()
+        if not rmsd_csv_path.exists():
+            np.savetxt(
+                rmsd_csv_path,
+                np.column_stack((time, rmsd)),
+                fmt="%.5f",
+                delimiter=",",
+                header="time_ns,rmsd",
+                comments="",
+            )
 
         if not rmsd_fig_path.exists() and make_figures:
             figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
@@ -736,25 +753,28 @@ def collect_traj_stats(
             figure.savefig(rmsd_fig_path)
             plt.close(figure)
 
-            out_vol.commit()
+        out_vol.commit()
 
     # Radius of gyration
     rg_fig_path = work_path / f"rg_{traj_prefix}{run_name}.png"
     rg_csv_path = rg_fig_path.with_suffix(".csv")
-    if file1_needs_update(rg_csv_path, traj_path):
-        rg_csv_path.unlink(missing_ok=True)
-        rg_fig_path.unlink(missing_ok=True)
-    if not rg_csv_path.exists():
+    remove_stale_analysis_outputs(
+        rg_csv_path,
+        rg_fig_path,
+        traj_path,
+        make_figures=make_figures,
+    )
+    if not rg_csv_path.exists() or (make_figures and not rg_fig_path.exists()):
         rg = struc.gyration_radius(trajectory)
-        np.savetxt(
-            rg_csv_path,
-            np.column_stack((time, rg)),
-            fmt="%.5f",
-            delimiter=",",
-            header="time_ns,rg",
-            comments="",
-        )
-        out_vol.commit()
+        if not rg_csv_path.exists():
+            np.savetxt(
+                rg_csv_path,
+                np.column_stack((time, rg)),
+                fmt="%.5f",
+                delimiter=",",
+                header="time_ns,rg",
+                comments="",
+            )
         if not rg_fig_path.exists() and make_figures:
             figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
             ax.plot(time, rg, color=biotite.colors["dimgreen"])
@@ -765,29 +785,32 @@ def collect_traj_stats(
             figure.savefig(rg_fig_path)
             plt.close(figure)
 
-            out_vol.commit()
+        out_vol.commit()
 
     # RMSF of each residue
     rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{run_name}.png"
     rmsf_csv_path = rmsf_fig_path.with_suffix(".csv")
-    if file1_needs_update(rmsf_csv_path, traj_path):
-        rmsf_csv_path.unlink(missing_ok=True)
-        rmsf_fig_path.unlink(missing_ok=True)
-    if not rmsf_csv_path.exists():
+    remove_stale_analysis_outputs(
+        rmsf_csv_path,
+        rmsf_fig_path,
+        traj_path,
+        make_figures=make_figures,
+    )
+    if not rmsf_csv_path.exists() or (make_figures and not rmsf_fig_path.exists()):
         # Sidechain atoms fluctuate too much, so we only consider CA atoms
         ca_trajectory = trajectory[:, trajectory.atom_name == "CA"]
         rmsf = struc.rmsf(struc.average(ca_trajectory), ca_trajectory)
         res_count = struc.get_residue_count(trajectory)
         res_idx = np.arange(1, res_count + 1)
-        np.savetxt(
-            rmsf_csv_path,
-            np.column_stack((res_idx, rmsf)),
-            fmt="%.5f",
-            delimiter=",",
-            header="residue_index,rmsf",
-            comments="",
-        )
-        out_vol.commit()
+        if not rmsf_csv_path.exists():
+            np.savetxt(
+                rmsf_csv_path,
+                np.column_stack((res_idx, rmsf)),
+                fmt="%.5f",
+                delimiter=",",
+                header="residue_index,rmsf",
+                comments="",
+            )
         if not rmsf_fig_path.exists() and make_figures:
             # Sidechain atoms fluctuate too much, so we only consider CA atoms
             figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
@@ -799,7 +822,7 @@ def collect_traj_stats(
             figure.savefig(rmsf_fig_path)
             plt.close(figure)
 
-            out_vol.commit()
+        out_vol.commit()
 
     return str(work_path)
 

@@ -8,17 +8,46 @@ import hashlib
 import os
 import re
 import stat
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from shutil import disk_usage
+from threading import Lock
+from typing import TypeVar
 from uuid import UUID, uuid4
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 _WRITE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+_T = TypeVar("_T")
 
 
 class ArtifactIntegrityError(RuntimeError):
     """Raised when Modal bytes do not match the recorded final artifact."""
+
+
+@dataclass(frozen=True, slots=True)
+class CacheUsage:
+    """Filesystem-backed Result cache metrics."""
+
+    cached_entries: int
+    cached_bytes: int
+    staging_entries: int
+    staging_bytes: int
+    free_bytes: int
+    reclaimable_entries: int
+    reclaimable_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class CacheCleanup:
+    """Actual unleased cache entries removed by one cleanup."""
+
+    entries: int
+    bytes: int
+    job_ids: tuple[str, ...]
 
 
 class ArtifactLease:
@@ -64,17 +93,20 @@ class ArtifactLease:
 
 
 class ArtifactCache:
-    """Size-bounded LRU cache; Modal Volume storage remains authoritative."""
+    """Explicitly managed local cache; Modal Volume storage is authoritative."""
 
-    def __init__(self, directory: Path, *, max_bytes: int) -> None:
-        """Configure a cache directory and byte target."""
-        if max_bytes < 1:
-            raise ValueError("max_bytes must be at least 1")
+    def __init__(self, directory: Path) -> None:
+        """Configure a cache directory without automatic size eviction."""
         self.directory = directory
-        self.max_bytes = max_bytes
         self._active: dict[str, int] = {}
         self._verified: dict[str, tuple[int, str, int, int, int, int]] = {}
-        self._lock = asyncio.Lock()
+        self._fill_tasks: dict[str, asyncio.Task[None]] = {}
+        self._state_lock = Lock()
+        self._closed = False
+        self._worker = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="biomodals-artifact",
+        )
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             descriptor = os.open(
@@ -97,7 +129,56 @@ class ArtifactCache:
                 os.fchmod(descriptor, 0o600)
             finally:
                 os.close(descriptor)
-        self._evict(exclude=set())
+        with os.scandir(self.directory) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".part"):
+                    continue
+                file_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(file_stat.st_mode):
+                    os.unlink(entry.path)
+
+    def check_ready(self) -> None:
+        """Confirm the configured cache directory remains locally usable."""
+        descriptor = os.open(
+            self.directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        os.close(descriptor)
+        if not os.access(self.directory, os.R_OK | os.W_OK | os.X_OK):
+            raise RuntimeError("Artifact cache directory is not usable")
+
+    async def run_bounded(
+        self,
+        operation: Callable[..., _T],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> _T:
+        """Run whole-file or directory work on the single artifact worker."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._worker,
+            partial(operation, *args, **kwargs),
+        )
+
+    async def check_ready_async(self) -> None:
+        """Verify both cache storage and the bounded worker."""
+        await self.run_bounded(self.check_ready)
+
+    async def acquire_async(
+        self,
+        job_id: str,
+        *,
+        size_bytes: int,
+        sha256: str,
+    ) -> ArtifactLease | None:
+        """Verify a cache hit outside the FastAPI event loop."""
+        return await self.run_bounded(
+            self.acquire,
+            job_id,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
 
     def _path(self, job_id: str) -> Path:
         normalized = str(UUID(job_id))
@@ -121,21 +202,25 @@ class ArtifactCache:
         try:
             file_stat = os.fstat(descriptor)
             fingerprint = self._fingerprint(file_stat, size_bytes, sha256)
-            if self._verified.get(job_id) != fingerprint and not self._matches(
+            with self._state_lock:
+                already_verified = self._verified.get(job_id) == fingerprint
+            if not already_verified and not self._matches(
                 descriptor,
                 size_bytes=size_bytes,
                 sha256=sha256,
             ):
                 self._unlink_if_same(path, file_stat)
-                self._verified.pop(job_id, None)
+                with self._state_lock:
+                    self._verified.pop(job_id, None)
                 os.close(descriptor)
                 return None
             os.utime(descriptor)
             os.lseek(descriptor, 0, os.SEEK_SET)
-            self._verified[job_id] = self._fingerprint(
-                os.fstat(descriptor), size_bytes, sha256
-            )
-            self._active[job_id] = self._active.get(job_id, 0) + 1
+            with self._state_lock:
+                self._verified[job_id] = self._fingerprint(
+                    os.fstat(descriptor), size_bytes, sha256
+                )
+                self._active[job_id] = self._active.get(job_id, 0) + 1
             return ArtifactLease(
                 descriptor,
                 path=path,
@@ -154,59 +239,170 @@ class ArtifactCache:
         sha256: str,
         chunks: AsyncIterable[bytes],
     ) -> ArtifactLease:
-        """Download and verify an archive, caching it only when it fits."""
+        """Join one cancellation-safe, per-Job cache fill and lease its result."""
         self._validate_metadata(size_bytes=size_bytes, sha256=sha256)
-        destination = self._path(job_id)
-        async with self._lock:
-            existing = self.acquire(
-                job_id,
-                size_bytes=size_bytes,
-                sha256=sha256,
-            )
-            if existing is not None:
-                return existing
+        existing = await self.acquire_async(
+            job_id,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+        if existing is not None:
+            return existing
 
-            temporary = self.directory / f".{job_id}.{uuid4().hex}.part"
-            digest = hashlib.sha256()
-            written = 0
-            descriptor: int | None = None
-            try:
-                descriptor = os.open(temporary, _WRITE_FLAGS, 0o600)
-                with os.fdopen(descriptor, "wb", closefd=False) as output:
-                    async for chunk in chunks:
-                        written += len(chunk)
-                        digest.update(chunk)
-                        output.write(chunk)
-                if written != size_bytes or digest.hexdigest() != sha256:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Artifact cache is closed")
+            task = self._fill_tasks.get(job_id)
+            if task is not None and task.done():
+                self._fill_tasks.pop(job_id, None)
+                task = None
+            if task is None:
+                task = asyncio.create_task(
+                    self._fill(
+                        job_id,
+                        size_bytes=size_bytes,
+                        sha256=sha256,
+                        chunks=chunks,
+                    ),
+                    name=f"biomodals-artifact-fill-{job_id}",
+                )
+                self._fill_tasks[job_id] = task
+                task.add_done_callback(
+                    lambda completed, fill_job_id=job_id: self._fill_finished(
+                        fill_job_id,
+                        completed,
+                    )
+                )
+        await asyncio.shield(task)
+        lease = await self.acquire_async(
+            job_id,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+        if lease is None:  # pragma: no cover - protected fill invariant
+            raise ArtifactIntegrityError("Published cache entry disappeared")
+        return lease
+
+    async def _fill(
+        self,
+        job_id: str,
+        *,
+        size_bytes: int,
+        sha256: str,
+        chunks: AsyncIterable[bytes],
+    ) -> None:
+        """Stream one remote artifact into a private staging file."""
+        temporary = self.staging_path(job_id)
+        descriptor: int | None = None
+        written = 0
+        try:
+            descriptor = os.open(temporary, _WRITE_FLAGS, 0o600)
+            async for chunk in chunks:
+                written += len(chunk)
+                if written > size_bytes:
                     raise ArtifactIntegrityError(
-                        "Downloaded artifact failed its integrity check"
+                        "Downloaded artifact exceeded its recorded size"
                     )
-                os.lseek(descriptor, 0, os.SEEK_SET)
+                await self.run_bounded(self._write_all, descriptor, chunk)
+            if written != size_bytes:
+                raise ArtifactIntegrityError(
+                    "Downloaded artifact failed its integrity check"
+                )
+            await self.run_bounded(
+                self._publish_descriptor,
+                job_id,
+                temporary,
+                descriptor,
+                size_bytes,
+                sha256,
+                False,
+            )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
 
-                if size_bytes > self.max_bytes:
-                    temporary.unlink()
-                    lease = ArtifactLease(descriptor, path=None)
-                else:
-                    os.replace(temporary, destination)
-                    os.utime(descriptor)
-                    self._verified[job_id] = self._fingerprint(
-                        os.fstat(descriptor), size_bytes, sha256
-                    )
-                    self._active[job_id] = self._active.get(job_id, 0) + 1
-                    lease = ArtifactLease(
-                        descriptor,
-                        path=destination,
-                        cache=self,
-                        job_id=job_id,
-                    )
-                    self._evict(exclude={job_id})
-                descriptor = None
-                return lease
-            except BaseException:
-                if descriptor is not None:
-                    os.close(descriptor)
-                temporary.unlink(missing_ok=True)
-                raise
+    def staging_path(self, job_id: str) -> Path:
+        """Allocate a unique path counted as active Result staging."""
+        self._path(job_id)
+        return self.directory / f".{job_id}.{uuid4().hex}.part"
+
+    async def publish_staged(
+        self,
+        job_id: str,
+        path: Path,
+        *,
+        size_bytes: int,
+        sha256: str,
+    ) -> ArtifactLease:
+        """Verify and atomically adopt a locally built Result archive."""
+        self._validate_metadata(size_bytes=size_bytes, sha256=sha256)
+        descriptor = self._open_staging(path)
+        try:
+            await self.run_bounded(
+                self._publish_descriptor,
+                job_id,
+                path,
+                descriptor,
+                size_bytes,
+                sha256,
+                True,
+            )
+            return ArtifactLease(
+                descriptor,
+                path=self._path(job_id),
+                cache=self,
+                job_id=job_id,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _publish_descriptor(
+        self,
+        job_id: str,
+        source: Path,
+        descriptor: int,
+        size_bytes: int,
+        sha256: str,
+        lease: bool,
+    ) -> None:
+        """Verify one staged descriptor and publish it without a path race."""
+        if not self._matches(
+            descriptor,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        ):
+            raise ArtifactIntegrityError(
+                "Downloaded artifact failed its integrity check"
+            )
+        os.fchmod(descriptor, 0o600)
+        destination = self._path(job_id)
+        with self._state_lock:
+            os.replace(source, destination)
+            os.utime(descriptor)
+            self._verified[job_id] = self._fingerprint(
+                os.fstat(descriptor),
+                size_bytes,
+                sha256,
+            )
+            if lease:
+                self._active[job_id] = self._active.get(job_id, 0) + 1
+
+    def _open_staging(self, path: Path) -> int:
+        if path.parent != self.directory or not path.name.endswith(".part"):
+            raise ValueError("Staged artifact is outside the Result cache")
+        descriptor = self._open(path)
+        if descriptor is None:
+            raise ArtifactIntegrityError("Staged artifact is unavailable")
+        return descriptor
+
+    def _fill_finished(self, job_id: str, task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+        with self._state_lock:
+            if self._fill_tasks.get(job_id) is task:
+                self._fill_tasks.pop(job_id, None)
 
     def _open(self, path: Path) -> int | None:
         try:
@@ -236,12 +432,12 @@ class ArtifactCache:
         return digest.hexdigest() == sha256
 
     def _release(self, job_id: str) -> None:
-        references = self._active.get(job_id, 0)
-        if references <= 1:
-            self._active.pop(job_id, None)
-        else:
-            self._active[job_id] = references - 1
-        self._evict(exclude=set())
+        with self._state_lock:
+            references = self._active.get(job_id, 0)
+            if references <= 1:
+                self._active.pop(job_id, None)
+            else:
+                self._active[job_id] = references - 1
 
     def _archives(self) -> list[tuple[Path, os.stat_result]]:
         archives: list[tuple[Path, os.stat_result]] = []
@@ -256,21 +452,84 @@ class ArtifactCache:
                     archives.append((Path(entry.path), file_stat))
         return archives
 
-    def _evict(self, *, exclude: set[str]) -> None:
+    def usage(self) -> CacheUsage:
+        """Measure completed, staging, free, and currently reclaimable bytes."""
         archives = self._archives()
-        total = sum(file_stat.st_size for _path, file_stat in archives)
-        for path, file_stat in sorted(
-            archives,
-            key=lambda item: item[1].st_mtime,
-        ):
+        staging: list[os.stat_result] = []
+        with os.scandir(self.directory) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".part"):
+                    continue
+                file_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(file_stat.st_mode):
+                    staging.append(file_stat)
+        with self._state_lock:
+            protected = set(self._active) | set(self._fill_tasks)
+        reclaimable = [
+            file_stat for path, file_stat in archives if path.stem not in protected
+        ]
+        return CacheUsage(
+            cached_entries=len(archives),
+            cached_bytes=sum(item.st_size for _path, item in archives),
+            staging_entries=len(staging),
+            staging_bytes=sum(item.st_size for item in staging),
+            free_bytes=disk_usage(self.directory).free,
+            reclaimable_entries=len(reclaimable),
+            reclaimable_bytes=sum(item.st_size for item in reclaimable),
+        )
+
+    async def usage_async(self) -> CacheUsage:
+        """Measure cache storage on the bounded artifact worker."""
+        return await self.run_bounded(self.usage)
+
+    def clear(self) -> CacheCleanup:
+        """Remove every unleased completed archive and report actual recovery."""
+        entries = 0
+        reclaimed = 0
+        job_ids: list[str] = []
+        for path, file_stat in self._archives():
             job_id = path.stem
-            if total <= self.max_bytes:
-                return
-            if job_id in exclude or self._active.get(job_id, 0):
-                continue
-            if self._unlink_if_same(path, file_stat):
-                self._verified.pop(job_id, None)
-                total -= file_stat.st_size
+            with self._state_lock:
+                if self._active.get(job_id, 0) or job_id in self._fill_tasks:
+                    continue
+                if self._unlink_if_same(path, file_stat):
+                    self._verified.pop(job_id, None)
+                    entries += 1
+                    reclaimed += file_stat.st_size
+                    job_ids.append(job_id)
+        return CacheCleanup(
+            entries=entries,
+            bytes=reclaimed,
+            job_ids=tuple(job_ids),
+        )
+
+    async def clear_async(self) -> CacheCleanup:
+        """Clear unleased entries on the bounded artifact worker."""
+        return await self.run_bounded(self.clear)
+
+    async def shutdown(self) -> None:
+        """Finish queued artifact work and stop the single worker thread."""
+        with self._state_lock:
+            self._closed = True
+            fills = tuple(self._fill_tasks.values())
+        if fills:
+            await asyncio.gather(*fills, return_exceptions=True)
+        self._worker.shutdown(wait=True, cancel_futures=True)
+
+    def cached_job_ids(self) -> set[str]:
+        """Return canonical Job identifiers represented by local ZIP files."""
+        return {path.stem for path, _file_stat in self._archives()}
+
+    async def cached_job_ids_async(self) -> set[str]:
+        """Scan cache membership on the bounded artifact worker."""
+        return await self.run_bounded(self.cached_job_ids)
+
+    @staticmethod
+    def _write_all(descriptor: int, content: bytes) -> None:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
 
     @staticmethod
     def _validate_metadata(*, size_bytes: int, sha256: str) -> None:

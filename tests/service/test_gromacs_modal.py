@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import struct
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -18,8 +19,10 @@ import modal
 import orjson
 import pytest
 
+from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.gromacs.modal import (
     ArchiveNotReadyError,
+    FinalArchive,
     GromacsReconciler,
     ModalGromacsAdapter,
 )
@@ -27,16 +30,21 @@ from biomodals.service.gromacs.router import (
     GromacsJobOptions,
     SubmissionOutcomeUnknownError,
 )
+from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
     JobAdmissionConfiguration,
     ModalConfigurationSnapshot,
 )
-from biomodals.service.store import JobRecord, JobState, ServiceStore
+from biomodals.service.store import JobRecord, JobState, ServiceStore, UserRecord
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 SHA256 = "a" * 64
 _PENDING = object()
+XTC = struct.pack(">i", 1995) + b"\0" * 28
+TPR = b"\0\0\0\x10VERSION 2026.1\0\0\0\0"
+PNG = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + b"\0" * 16
+PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\nEND\n"
 
 
 def _admission_configuration() -> JobAdmissionConfiguration:
@@ -47,6 +55,20 @@ def _admission_configuration() -> JobAdmissionConfiguration:
         workload_active_job_limit=DatabaseOverridableSetting(10, False),
         global_active_job_limit=DatabaseOverridableSetting(10, False),
     )
+
+
+def _enable_created_user(store: ServiceStore, user: UserRecord) -> UserRecord:
+    enabled = store.set_password_from_token(
+        b"setup-token-digest",
+        password_hash="test-hash",
+        session_token_digest=b"test-session",
+        csrf_digest=b"test-csrf",
+        now=2,
+        absolute_expires_at=3_600,
+    )
+    assert enabled is not None
+    assert enabled.user_id == user.user_id
+    return enabled
 
 
 class AsyncMethod:
@@ -119,26 +141,28 @@ class FailingFunction:
 def _valid_archive_bytes() -> tuple[bytes, str]:
     prefix = f"production_{RUN_NAME}"
     members = {
-        "input.pdb": b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n",
-        "parameters.json": b"{}\n",
-        "provenance.json": b"{}\n",
-        "run.log": b"completed\n",
+        "input.pdb": PDB,
+        "metadata/parameters.json": b"{}\n",
+        "metadata/provenance.json": b"{}\n",
+        "metadata/stages.json": b"[]\n",
+        "metadata/run.log": b"completed\n",
         "outputs/production.mdp": b"integrator = md\n",
-        f"outputs/{prefix}_nopbc.xtc": b"processed trajectory",
-        f"outputs/{prefix}.tpr": b"topology",
-        f"outputs/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
-        f"outputs/rmsd_{prefix}.csv": b"time,rmsd\n",
-        f"outputs/rmsd_{prefix}.png": b"rmsd plot",
-        f"outputs/rg_{prefix}.csv": b"time,rg\n",
-        f"outputs/rg_{prefix}.png": b"rg plot",
-        f"outputs/rmsf_{prefix}.csv": b"residue,rmsf\n",
-        f"outputs/rmsf_{prefix}.png": b"rmsf plot",
+        f"outputs/{prefix}_nopbc.xtc": XTC,
+        f"outputs/{prefix}.tpr": TPR,
+        f"outputs/{prefix}_nopbc_centered.pdb": PDB,
+        f"outputs/rmsd_{prefix}.csv": b"time_ns,rmsd\n0.0,0.1\n",
+        f"outputs/rmsd_{prefix}.png": PNG,
+        f"outputs/rg_{prefix}.csv": b"time_ns,rg\n0.0,1.2\n",
+        f"outputs/rg_{prefix}.png": PNG,
+        f"outputs/rmsf_{prefix}.csv": b"residue_index,rmsf\n1,0.2\n",
+        f"outputs/rmsf_{prefix}.png": PNG,
     }
     roles = {
         "input.pdb": "input_structure",
-        "parameters.json": "normalized_parameters",
-        "provenance.json": "provenance",
-        "run.log": "run_log",
+        "metadata/parameters.json": "normalized_parameters",
+        "metadata/provenance.json": "provenance",
+        "metadata/stages.json": "stages",
+        "metadata/run.log": "run_log",
         "outputs/production.mdp": "production_parameters",
         f"outputs/{prefix}_nopbc.xtc": "trajectory",
         f"outputs/{prefix}.tpr": "production_topology",
@@ -160,30 +184,30 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
         for name, content in members.items()
     ]
     manifest = orjson.dumps({
-        "archive_schema_version": 1,
+        "archive_schema_version": 2,
         "run_name": RUN_NAME,
         "files": records,
     })
     checksums = "".join([
         *(f"{record['sha256']}  {record['path']}\n" for record in records),
-        f"{hashlib.sha256(manifest).hexdigest()}  manifest.json\n",
+        f"{hashlib.sha256(manifest).hexdigest()}  metadata/manifest.json\n",
     ]).encode()
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in members.items():
             archive.writestr(name, content)
-        archive.writestr("manifest.json", manifest)
-        archive.writestr("checksums.sha256", checksums)
+        archive.writestr("metadata/manifest.json", manifest)
+        archive.writestr("metadata/checksums.sha256", checksums)
     request_digest = hashlib.sha256()
     request_digest.update(len(members["input.pdb"]).to_bytes(8, "big"))
     request_digest.update(members["input.pdb"])
-    request_digest.update(members["parameters.json"])
+    request_digest.update(members["metadata/parameters.json"])
     return output.getvalue(), request_digest.hexdigest()
 
 
 def _result_marker(archive_bytes: bytes, request_sha256: str) -> bytes:
     return orjson.dumps({
-        "archive_schema_version": 1,
+        "archive_schema_version": 2,
         "request_sha256": request_sha256,
         "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
         "size_bytes": len(archive_bytes),
@@ -247,19 +271,17 @@ def _install_volume(
 def _established_output_files() -> dict[str, bytes]:
     prefix = f"production_{RUN_NAME}"
     return {
-        f"{RUN_NAME}/{RUN_NAME}.pdb": (
-            b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
-        ),
+        f"{RUN_NAME}/{RUN_NAME}.pdb": PDB,
         f"{RUN_NAME}/production.mdp": b"integrator = md\n",
-        f"{RUN_NAME}/{prefix}_nopbc.xtc": b"processed trajectory",
-        f"{RUN_NAME}/{prefix}.tpr": b"topology",
-        f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": b"MODEL\nEND\n",
-        f"{RUN_NAME}/rmsd_{prefix}.csv": b"time,rmsd\n",
-        f"{RUN_NAME}/rmsd_{prefix}.png": b"rmsd plot",
-        f"{RUN_NAME}/rg_{prefix}.csv": b"time,rg\n",
-        f"{RUN_NAME}/rg_{prefix}.png": b"rg plot",
-        f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue,rmsf\n",
-        f"{RUN_NAME}/rmsf_{prefix}.png": b"rmsf plot",
+        f"{RUN_NAME}/{prefix}_nopbc.xtc": XTC,
+        f"{RUN_NAME}/{prefix}.tpr": TPR,
+        f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": PDB,
+        f"{RUN_NAME}/rmsd_{prefix}.csv": b"time_ns,rmsd\n0.0,0.1\n",
+        f"{RUN_NAME}/rmsd_{prefix}.png": PNG,
+        f"{RUN_NAME}/rg_{prefix}.csv": b"time_ns,rg\n0.0,1.2\n",
+        f"{RUN_NAME}/rg_{prefix}.png": PNG,
+        f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue_index,rmsf\n1,0.2\n",
+        f"{RUN_NAME}/rmsf_{prefix}.png": PNG,
     }
 
 
@@ -286,14 +308,17 @@ def _submitted_job(
 ) -> tuple[ServiceStore, JobRecord]:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    user = store.create_user(
-        email="alice@example.com",
-        display_name="Alice",
-        token_digest=b"setup-token-digest",
-        token_expires_at=3_600,
-        now=1,
-        is_admin=True,
-        active_job_limit=10,
+    user = _enable_created_user(
+        store,
+        store.create_user(
+            email="alice@example.com",
+            display_name="Alice",
+            token_digest=b"setup-token-digest",
+            token_expires_at=3_600,
+            now=1,
+            is_admin=True,
+            active_job_limit=10,
+        ),
     )
     admission = store.admit_job(
         owner_user_id=user.user_id,
@@ -410,6 +435,58 @@ def test_submit_resolves_the_deployed_prepare_function_directly(
         "simulation_time_ns": 3,
         "run_pdbfixer": True,
     }
+
+
+def test_preflight_hydrates_volume_and_every_required_function_without_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str]] = []
+
+    class Hydratable:
+        def __init__(self, kind: str, name: str) -> None:
+            self.kind = kind
+            self.name = name
+            self.hydrate = AsyncMethod(self._hydrate)
+
+        async def _hydrate(self) -> None:
+            events.append((self.kind, self.name))
+
+    volume = Hydratable("volume", "Gromacs-outputs")
+
+    def resolve_function(
+        app_name: str,
+        function_name: str,
+        *,
+        environment_name: str,
+    ) -> modal.Function:
+        assert (app_name, environment_name) == ("CandidateApp", "candidate-env")
+        return cast(modal.Function, Hydratable("function", function_name))
+
+    monkeypatch.setattr(
+        modal.Volume,
+        "from_name",
+        lambda name, *, environment_name: (
+            volume
+            if (name, environment_name) == ("Gromacs-outputs", "candidate-env")
+            else (_ for _ in ()).throw(AssertionError(name))
+        ),
+    )
+    adapter = ModalGromacsAdapter(
+        app_name="GromacsAPI",
+        environment_name="department-dev",
+        function_resolver=resolve_function,
+    )
+
+    asyncio.run(adapter.preflight("CandidateApp", "candidate-env"))
+
+    assert events == [
+        ("volume", "Gromacs-outputs"),
+        ("function", "prepare_tpr_cpu"),
+        ("function", "prepare_tpr_gpu"),
+        ("function", "collect_traj_stats"),
+        ("function", "production_run_cpu"),
+        ("function", "production_run_gpu"),
+    ]
 
 
 def test_submit_spawns_detached_call_with_normalized_options(
@@ -558,6 +635,10 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
             [CallNode("fc-root", modal.call_graph.InputStatus.FAILURE)],
             "failed",
         ),
+        (
+            [CallNode("fc-root", modal.call_graph.InputStatus.SUCCESS)],
+            "running",
+        ),
     ],
 )
 def test_poll_uses_call_graph_to_classify_get_timeout(
@@ -642,10 +723,35 @@ def test_service_packages_and_publishes_established_app_outputs(
     assert marker["archive_sha256"] == archive.sha256
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as result:
         assert result.read("input.pdb") == files[f"{RUN_NAME}/{RUN_NAME}.pdb"]
-        assert (
-            result.read(f"outputs/production_{RUN_NAME}_nopbc.xtc")
-            == b"processed trajectory"
-        )
+        assert result.read(f"outputs/production_{RUN_NAME}_nopbc.xtc") == XTC
+
+
+def test_published_archive_is_promoted_into_the_local_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    files = _established_output_files()
+    _install_volume(monkeypatch, files)
+    cache = ArtifactCache(tmp_path / "cache")
+    adapter = ModalGromacsAdapter(
+        app_name="GromacsAPI",
+        environment_name="department-dev",
+        artifact_cache=cache,
+        call_resolver=cast(Any, {}.__getitem__),
+    )
+
+    archive = asyncio.run(adapter.publish_archive(job, completed_at=10))
+
+    cached = tmp_path / "cache" / f"{job.job_id}.zip"
+    assert archive.cache_lease is not None
+    assert cached.read_bytes() == files[f"api-results/{RUN_NAME}/result.zip"]
+    assert cache.clear().entries == 0
+    archive.cache_lease.close()
+    assert cache.clear().entries == 1
 
 
 def test_reconciler_advances_completed_stage_to_one_direct_named_call(
@@ -682,6 +788,60 @@ def test_reconciler_advances_completed_stage_to_one_direct_named_call(
         "traj_prefix": "nvt_",
         "run_name": RUN_NAME,
     }
+
+
+def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
+    tmp_path: Path,
+) -> None:
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="/volumes/Gromacs-outputs/api-run")
+    locks = JobLifecycleLocks()
+
+    async def scenario() -> None:
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+
+        class BlockingFunction:
+            def __init__(self) -> None:
+                self.spawn = AsyncMethod(self._spawn)
+
+            async def _spawn(self, **_kwargs):
+                spawn_started.set()
+                await release_spawn.wait()
+                return FakeCall("fc-successor")
+
+        reconciler = GromacsReconciler(
+            store,
+            _adapter(
+                {"fc-root": prepare},
+                function_resolver=lambda *_args, **_kwargs: BlockingFunction(),
+            ),
+            lifecycle_locks=locks,
+            now=lambda: 10,
+        )
+        reconciliation = asyncio.create_task(reconciler.reconcile())
+        await spawn_started.wait()
+
+        async def request_cancellation() -> None:
+            async with locks.for_job(job.job_id):
+                store.request_cancel(job.owner_user_id, job.job_id, now=11)
+
+        cancellation = asyncio.create_task(request_cancellation())
+        await asyncio.sleep(0)
+        before_release = store.get_job(job.owner_user_id, job.job_id)
+        assert before_release is not None
+        assert before_release.state != JobState.CANCEL_REQUESTED
+
+        release_spawn.set()
+        await reconciliation
+        await cancellation
+
+    asyncio.run(scenario())
+
+    cancelling = store.get_job(job.owner_user_id, job.job_id)
+    assert cancelling is not None
+    assert cancelling.state == JobState.CANCEL_REQUESTED
+    assert cancelling.modal_call_id == "fc-successor"
 
 
 def test_reconciler_does_not_repeat_an_unknown_stage_submission(
@@ -729,14 +889,17 @@ def test_untracked_cancellation_is_not_declared_complete(
 ) -> None:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    user = store.create_user(
-        email="alice@example.com",
-        display_name="Alice",
-        token_digest=b"setup-token-digest",
-        token_expires_at=3_600,
-        now=1,
-        is_admin=True,
-        active_job_limit=10,
+    user = _enable_created_user(
+        store,
+        store.create_user(
+            email="alice@example.com",
+            display_name="Alice",
+            token_digest=b"setup-token-digest",
+            token_expires_at=3_600,
+            now=1,
+            is_admin=True,
+            active_job_limit=10,
+        ),
     )
     admission = store.admit_job(
         owner_user_id=user.user_id,
@@ -798,7 +961,7 @@ def test_completed_stage_does_not_advance_after_cancellation(tmp_path: Path) -> 
     assert cancelled.stage_history[-1].completed_at == 10
 
 
-def test_completed_archive_wins_cancel_race(
+def test_cancel_wins_before_result_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -821,9 +984,9 @@ def test_completed_archive_wins_cancel_race(
 
     completed = store.get_job(job.owner_user_id, job.job_id)
     assert completed is not None
-    assert completed.state == JobState.SUCCEEDED
-    assert completed.result_volume_path == f"api-results/{RUN_NAME}/result.zip"
-    assert f"api-results/{RUN_NAME}/result.zip" in files
+    assert completed.state == JobState.CANCELLED
+    assert completed.result_volume_path is None
+    assert f"api-results/{RUN_NAME}/result.zip" not in files
     assert ("cancel", "fc-root", False) in root.events
 
 
@@ -856,6 +1019,163 @@ def test_transient_archive_publication_error_remains_finalizing(
     assert finalizing is not None
     assert finalizing.state == JobState.FINALIZING
     assert finalizing.error_code is None
+    assert finalizing.finalization_started_at == 10
+    assert finalizing.finalization_retry_started_at == 10
+    assert finalizing.finalization_retry_count == 1
+    assert finalizing.next_retry_at == 15
+
+
+def test_local_staging_failure_retries_and_blocks_without_losing_compute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
+
+    async def disk_full(*_args, **_kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(adapter, "publish_archive", disk_full)
+    now = 10
+    reconciler = GromacsReconciler(store, adapter, now=lambda: now)
+    asyncio.run(reconciler.reconcile())
+    retrying = store.get_job(job.owner_user_id, job.job_id)
+    assert retrying is not None
+    assert retrying.state == JobState.FINALIZING
+    assert retrying.error_code is None
+    assert retrying.next_retry_at == 15
+
+    now = 1_810
+    asyncio.run(reconciler.reconcile())
+    blocked = store.get_job(job.owner_user_id, job.job_id)
+    assert blocked is not None
+    assert blocked.state == JobState.BLOCKED
+    assert blocked.blocking_category == "local_storage"
+    assert blocked.error_code is None
+
+
+def test_transient_finalization_blocks_after_retry_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
+
+    async def unavailable(*_args, **_kwargs):
+        raise modal.exception.ConnectionError("temporary")
+
+    monkeypatch.setattr(adapter, "publish_archive", unavailable)
+    now = 10
+    reconciler = GromacsReconciler(store, adapter, now=lambda: now)
+    asyncio.run(reconciler.reconcile())
+    now = 1_810
+    asyncio.run(reconciler.reconcile())
+
+    blocked = store.get_job(job.owner_user_id, job.job_id)
+    assert blocked is not None
+    assert blocked.state == JobState.BLOCKED
+    assert blocked.blocking_category == "modal_unavailable"
+    assert blocked.blocked_at == 1_810
+    assert blocked.next_retry_at == 2_710
+    assert store.count_active_jobs("gromacs") == 0
+
+
+def test_permanent_finalization_block_recovers_without_new_compute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    root = FakeCall("fc-root", result=str(tmp_path))
+    adapter = _adapter({"fc-root": root})
+
+    async def forbidden(*_args, **_kwargs):
+        raise modal.exception.AuthError("permission denied")
+
+    monkeypatch.setattr(adapter, "publish_archive", forbidden)
+    now = 10
+    reconciler = GromacsReconciler(store, adapter, now=lambda: now)
+    asyncio.run(reconciler.reconcile())
+    blocked = store.get_job(job.owner_user_id, job.job_id)
+    assert blocked is not None
+    assert blocked.state == JobState.BLOCKED
+    assert blocked.blocking_category == "modal_configuration"
+    assert blocked.next_retry_at == 910
+
+    async def restored(*_args, **_kwargs):
+        return FinalArchive(
+            state=JobState.SUCCEEDED,
+            volume_name="Gromacs-outputs",
+            path=f"api-results/{RUN_NAME}/result.zip",
+            filename=f"{RUN_NAME}.zip",
+            size_bytes=123,
+            sha256=SHA256,
+            warnings_json="[]",
+        )
+
+    monkeypatch.setattr(adapter, "publish_archive", restored)
+    now = 910
+    asyncio.run(reconciler.reconcile())
+
+    recovered = store.get_job(job.owner_user_id, job.job_id)
+    assert recovered is not None
+    assert recovered.state == JobState.SUCCEEDED
+    assert recovered.blocking_category is None
+    assert [event for event in root.events if event[0] == "get"] == [
+        ("get", "fc-root", 0)
+    ]
+
+
+def test_result_integrity_recovery_preserves_published_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, running = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    files = _established_output_files()
+    _install_volume(monkeypatch, files)
+    adapter = _adapter({})
+    finalizing = store.set_job_state(running.job_id, JobState.FINALIZING, now=10)
+    published = asyncio.run(adapter.publish_archive(finalizing, completed_at=10))
+    completed = store.complete_job(
+        running.job_id,
+        state=published.state,
+        result_volume_name=published.volume_name,
+        result_volume_path=published.path,
+        result_filename=published.filename,
+        result_size_bytes=published.size_bytes,
+        result_sha256=published.sha256,
+        now=10,
+    )
+    store.block_job(
+        running.job_id,
+        category="result_integrity",
+        previous_state=JobState.SUCCEEDED,
+        now=20,
+        next_retry_at=30,
+    )
+    # Recovery must prefer the exact immutable ZIP and marker. Raw scientific
+    # intermediates may already have been cleaned and cannot be assumed present.
+    del files[f"{RUN_NAME}/production.mdp"]
+
+    asyncio.run(GromacsReconciler(store, adapter, now=lambda: 30).reconcile())
+
+    recovered = store.get_job(running.owner_user_id, running.job_id)
+    assert recovered is not None
+    assert recovered.state == JobState.SUCCEEDED
+    assert recovered.result_sha256 == completed.result_sha256
+    assert recovered.result_size_bytes == completed.result_size_bytes
+    assert recovered.completed_at == 10
 
 
 def test_expired_call_output_recovers_completed_archive_from_volume_marker(
@@ -928,7 +1248,7 @@ def test_expired_call_rejects_marker_when_archive_bytes_are_corrupt(
     failed = store.get_job(job.owner_user_id, job.job_id)
     assert failed is not None
     assert failed.state == JobState.FAILED
-    assert failed.error_code == "result_unavailable"
+    assert failed.error_code == "result_invalid"
 
 
 def test_recovery_rejects_self_consistent_marker_for_invalid_zip_manifest(
@@ -938,11 +1258,11 @@ def test_recovery_rejects_self_consistent_marker_for_invalid_zip_manifest(
     store, job = _submitted_job(tmp_path)
     archive_bytes, request_sha256 = _valid_archive_bytes()
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-        manifest = orjson.loads(archive.read("manifest.json"))
+        manifest = orjson.loads(archive.read("metadata/manifest.json"))
     manifest["files"][0]["sha256"] = "0" * 64
     invalid_archive = _replace_archive_member(
         archive_bytes,
-        "manifest.json",
+        "metadata/manifest.json",
         orjson.dumps(manifest),
     )
     _install_volume(
@@ -976,14 +1296,17 @@ def test_reconciler_fails_an_expired_untracked_submission(
 ) -> None:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    user = store.create_user(
-        email="alice@example.com",
-        display_name="Alice",
-        token_digest=b"setup-token-digest",
-        token_expires_at=3_600,
-        now=1,
-        is_admin=True,
-        active_job_limit=10,
+    user = _enable_created_user(
+        store,
+        store.create_user(
+            email="alice@example.com",
+            display_name="Alice",
+            token_digest=b"setup-token-digest",
+            token_expires_at=3_600,
+            now=1,
+            is_admin=True,
+            active_job_limit=10,
+        ),
     )
     admission = store.admit_job(
         owner_user_id=user.user_id,
@@ -1052,20 +1375,46 @@ def test_cancelled_is_terminal_only_after_call_graph_is_inactive(
     assert cancelled.state == JobState.CANCELLED
 
 
+def test_expired_provider_status_is_not_reported_as_confirmed_cancellation(
+    tmp_path: Path,
+) -> None:
+    store, job = _submitted_job(tmp_path, cancel_requested=True)
+    root = FakeCall(
+        "fc-root",
+        result=modal.exception.OutputExpiredError("expired"),
+    )
+    reconciler = GromacsReconciler(
+        store,
+        _adapter({"fc-root": root}),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+
+    unresolved = store.get_job(job.owner_user_id, job.job_id)
+    assert unresolved is not None
+    assert unresolved.state == JobState.FAILED
+    assert unresolved.error_code == "compute_failed"
+    assert "before cancellation could be confirmed" in (unresolved.error_message or "")
+
+
 def test_intermediate_cleanup_is_opt_in_and_preserves_final_archives(
     tmp_path: Path,
 ) -> None:
     now = 1_000_000
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    user = store.create_user(
-        email="alice@example.com",
-        display_name="Alice",
-        token_digest=b"setup-token-digest",
-        token_expires_at=3_600,
-        now=1,
-        is_admin=True,
-        active_job_limit=10,
+    user = _enable_created_user(
+        store,
+        store.create_user(
+            email="alice@example.com",
+            display_name="Alice",
+            token_digest=b"setup-token-digest",
+            token_expires_at=3_600,
+            now=1,
+            is_admin=True,
+            active_job_limit=10,
+        ),
     )
     due_succeeded = _terminal_job(
         store,

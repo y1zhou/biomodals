@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
@@ -17,7 +18,7 @@ from fastapi import FastAPI
 
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
-from biomodals.service.auth import AuthService
+from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.modal import GromacsReconciler
@@ -58,6 +59,14 @@ class FakeGromacsAdapter:
         self.artifact_content = b"PK\x03\x04verified archive"
         self.failures_remaining = 0
         self.unknown_failures_remaining = 0
+        self.preflights: list[tuple[str, str]] = []
+        self.preflight_failures_remaining = 0
+
+    async def preflight(self, app_name: str, environment_name: str) -> None:
+        self.preflights.append((app_name, environment_name))
+        if self.preflight_failures_remaining:
+            self.preflight_failures_remaining -= 1
+            raise RuntimeError("configured resource is unavailable")
 
     async def submit(
         self,
@@ -132,8 +141,9 @@ class APIClient:
         return self.request("DELETE", url, **kwargs)
 
 
-def _password_token(link: str) -> str:
-    return parse_qs(urlparse(link).fragment)["token"][0]
+def _password_token(link: str | IssuedPasswordLink) -> str:
+    url = link.url if isinstance(link, IssuedPasswordLink) else link
+    return parse_qs(urlparse(url).fragment)["token"][0]
 
 
 def _activate(auth: AuthService, email: str, *, is_admin: bool = False) -> None:
@@ -142,7 +152,7 @@ def _activate(auth: AuthService, email: str, *, is_admin: bool = False) -> None:
         display_name=email.partition("@")[0].title(),
         is_admin=is_admin or not auth.store.list_users(),
     )
-    auth.set_password(_password_token(link), PASSWORD)
+    auth.set_password(_password_token(link.url), PASSWORD)
 
 
 def _service(
@@ -171,7 +181,7 @@ def _service(
         workloads=[registration],
         allowed_origin=ORIGIN,
         secure_cookies=True,
-        cache=ArtifactCache(tmp_path / "cache", max_bytes=1024),
+        cache=ArtifactCache(tmp_path / "cache"),
     )
     return APIClient(app), auth, store, adapter
 
@@ -358,7 +368,9 @@ def test_admin_user_management_requires_admin_and_preserves_last_admin(
     )
     assert created.status_code == 201
     assert created.json()["user"]["active_job_limit"] == 4
+    assert created.json()["user"]["status"] == "pending_setup"
     assert created.json()["password_link"].startswith(f"{ORIGIN}/set-password#token=")
+    assert created.json()["expires_at"]
     new_user_id = created.json()["user"]["user_id"]
 
     invalid = client.post(
@@ -400,10 +412,10 @@ def test_admin_user_management_requires_admin_and_preserves_last_admin(
     disabled = client.patch(
         f"/api/v1/admin/users/{new_user_id}",
         headers=_unsafe_headers(csrf_token),
-        json={"active": False},
+        json={"status": "disabled"},
     )
     assert disabled.status_code == 200
-    assert disabled.json()["active"] is False
+    assert disabled.json()["status"] == "disabled"
     unavailable_link = client.post(
         f"/api/v1/admin/users/{new_user_id}/password-link",
         headers=_unsafe_headers(csrf_token),
@@ -414,9 +426,10 @@ def test_admin_user_management_requires_admin_and_preserves_last_admin(
     enabled = client.patch(
         f"/api/v1/admin/users/{new_user_id}",
         headers=_unsafe_headers(csrf_token),
-        json={"active": True},
+        json={"status": "enabled"},
     )
     assert enabled.status_code == 200
+    assert enabled.json()["status"] == "pending_setup"
     password_link = client.post(
         f"/api/v1/admin/users/{new_user_id}/password-link",
         headers=_unsafe_headers(csrf_token),
@@ -425,6 +438,7 @@ def test_admin_user_management_requires_admin_and_preserves_last_admin(
     assert password_link.json()["password_link"].startswith(
         f"{ORIGIN}/set-password#token="
     )
+    assert password_link.json()["expires_at"]
 
 
 def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
@@ -491,7 +505,7 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     assert first_job.modal_environment == "department-a"
     assert first_job.modal_app_name == "GromacsA"
     current = client.get("/api/v1/admin/modal").json()
-    assert current["tools"][0]["running_jobs"] == 1
+    assert current["tools"][0]["active_jobs"] == 2
 
 
 def test_modal_admin_updates_and_resets_each_field_independently(
@@ -610,6 +624,183 @@ def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> 
         assert code_schema["const"] == expected_code
 
 
+def test_modal_preflight_runs_only_for_changed_provider_fields(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+    headers = _unsafe_headers(csrf_token)
+
+    limit_only = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=headers,
+        json={"active_job_limit": 0},
+    )
+    adapter.preflight_failures_remaining = 1
+    rejected = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=headers,
+        json={"modal_app_name": "UnavailableApp"},
+    )
+    unchanged = client.get("/api/v1/admin/modal")
+    accepted = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=headers,
+        json={"modal_app_name": "AvailableApp"},
+    )
+
+    assert limit_only.status_code == 200
+    assert adapter.preflights == [
+        ("UnavailableApp", "production"),
+        ("AvailableApp", "production"),
+    ]
+    assert rejected.status_code == 400
+    assert rejected.json()["code"] == "modal_preflight_failed"
+    assert unchanged.json()["tools"][0]["modal_app_name"]["value"] == "Gromacs"
+    assert accepted.status_code == 200
+    assert accepted.json()["modal_app_name"]["value"] == "AvailableApp"
+
+
+def test_storage_metrics_and_explicit_cleanup_report_actual_reclamation(
+    tmp_path: Path,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    content = adapter.artifact_content
+    store.complete_job(
+        job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{job_id}/result.zip",
+        result_filename="result.zip",
+        result_size_bytes=len(content),
+        result_sha256=hashlib.sha256(content).hexdigest(),
+        now=1_800_000_001,
+    )
+    cache: ArtifactCache = client.app.state.cache
+
+    async def fill_cache() -> None:
+        async def chunks():
+            yield content
+
+        lease = await cache.store(
+            str(job_id),
+            size_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            chunks=chunks(),
+        )
+        try:
+            store.set_result_cached(job_id, cached=True)
+        finally:
+            lease.close()
+
+    asyncio.run(fill_cache())
+    metrics = client.get("/api/v1/admin/storage")
+    cleared = client.post(
+        "/api/v1/admin/storage/cache/clear",
+        headers=_unsafe_headers(csrf_token),
+    )
+    refreshed = client.get("/api/v1/admin/storage")
+
+    assert metrics.status_code == 200
+    assert metrics.json()["published_result_entries"] == 1
+    assert metrics.json()["published_result_bytes"] == len(content)
+    assert metrics.json()["local_cache_entries"] == 1
+    assert metrics.json()["local_cache_bytes"] == len(content)
+    assert metrics.json()["staging_entries"] == 0
+    assert metrics.json()["reclaimable_entries"] == 1
+    assert cleared.json() == {
+        "removed_entries": 1,
+        "removed_bytes": len(content),
+    }
+    assert refreshed.json()["local_cache_entries"] == 0
+    stored = store.get_job(
+        UUID(client.get("/api/v1/auth/me").json()["user_id"]),
+        job_id,
+    )
+    assert stored is not None and stored.result_cached is False
+
+
+def test_every_response_has_request_id_and_openapi_declares_session_cookie(
+    tmp_path: Path,
+) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    health = client.get("/api/v1/health")
+    unauthorized = client.get("/api/v1/jobs")
+    schema = client.get("/openapi.json").json()
+
+    assert UUID(health.headers["x-request-id"])
+    assert UUID(unauthorized.headers["x-request-id"])
+    assert schema["components"]["securitySchemes"]["SessionCookie"] == {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": SESSION_COOKIE,
+        "description": "Opaque BioModals browser session cookie.",
+    }
+    assert schema["paths"]["/api/v1/jobs"]["get"]["security"] == [{"SessionCookie": []}]
+    assert "security" not in schema["paths"]["/api/v1/health"]["get"]
+    for response in schema["paths"]["/api/v1/jobs"]["get"]["responses"].values():
+        assert response["headers"]["X-Request-ID"]["schema"]["format"] == "uuid"
+
+
+def test_unhandled_errors_keep_the_request_id_for_support_correlation(
+    tmp_path: Path,
+) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    async def crash() -> None:
+        raise RuntimeError("private diagnostic detail")
+
+    client.app.add_api_route("/api/v1/test-crash", crash)
+
+    async def scenario() -> httpx.Response:
+        transport = httpx.ASGITransport(
+            app=client.app,
+            raise_app_exceptions=False,
+        )
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=ORIGIN,
+        ) as browser:
+            return await browser.get("/api/v1/test-crash")
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    assert UUID(response.headers["x-request-id"])
+    assert "private diagnostic detail" not in response.text
+
+
+def test_health_is_live_before_startup_and_ready_is_local_after_preflight(
+    tmp_path: Path,
+) -> None:
+    client, _auth, _store, adapter = _service(tmp_path)
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=ORIGIN,
+        ) as browser:
+            assert (await browser.get("/api/v1/health")).status_code == 200
+            assert (await browser.get("/api/v1/ready")).status_code == 503
+            async with client.app.router.lifespan_context(client.app):
+                assert adapter.preflights == [("Gromacs", "production")]
+                ready = await browser.get("/api/v1/ready")
+                assert ready.status_code == 200
+                assert ready.json() == {"status": "ok"}
+                assert adapter.preflights == [("Gromacs", "production")]
+            assert (await browser.get("/api/v1/ready")).status_code == 503
+
+    asyncio.run(scenario())
+
+
 def test_password_setup_exposes_coded_errors_and_cookie_contract(
     tmp_path: Path,
 ) -> None:
@@ -688,10 +879,10 @@ def test_openapi_documents_csrf_cookie_and_required_header(tmp_path: Path) -> No
             "schema"
         ]["$ref"]
         forbidden = schema["components"]["schemas"][forbidden_ref.rsplit("/", 1)[1]]
-        assert forbidden["properties"]["code"]["enum"] == [
-            "csrf_invalid",
-            "origin_not_allowed",
-        ]
+        expected = ["csrf_invalid", "origin_not_allowed"]
+        if path == "/api/v1/gromacs/jobs":
+            expected.insert(0, "account_disabled")
+        assert forbidden["properties"]["code"]["enum"] == expected
 
 
 def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
@@ -724,6 +915,21 @@ def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> No
             "404",
             "409",
             "422",
+        },
+        ("/api/v1/jobs/{job_id}/prepare-download", "post"): {
+            "401",
+            "403",
+            "404",
+            "409",
+            "422",
+            "503",
+        },
+        ("/api/v1/jobs/{job_id}/download", "get"): {
+            "401",
+            "404",
+            "409",
+            "422",
+            "502",
         },
         ("/api/v1/gromacs/jobs", "post"): {
             "400",
@@ -865,7 +1071,7 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert first.json()["workload"] == "gromacs"
     assert first.json()["display_name"] == "First simulation"
     assert first.json()["state"] == "queued"
-    assert first.json()["stage"]["code"] == "preparation"
+    assert first.json()["stage"]["code"] == "prepare_simulation"
     assert first.json()["stage"]["function_name"] == "prepare_tpr_cpu"
     assert first.json()["stage"]["started_at"]
     assert first.json()["stage_history"] == [first.json()["stage"]]
@@ -910,31 +1116,34 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     analyzing = client.get(f"/api/v1/jobs/{job_id}")
 
     assert analyzing.json()["stage"] == {
-        "code": "nvt_analysis",
+        "code": "analyze_nvt",
         "function_name": "collect_traj_stats",
         "started_at": "2027-01-15T08:00:01Z",
     }
     preparation, nvt_analysis = analyzing.json()["stage_history"]
-    assert preparation["code"] == "preparation"
+    assert preparation["code"] == "prepare_simulation"
     assert preparation["function_name"] == "prepare_tpr_cpu"
     assert preparation["started_at"]
-    assert preparation["completed_at"] == "2027-01-15T08:00:01Z"
+    assert preparation["ended_at"] == "2027-01-15T08:00:01Z"
+    assert preparation["outcome"] == "completed"
     assert nvt_analysis == analyzing.json()["stage"]
     assert "modal_call_id" not in analyzing.json()
     assert "provider_operation" not in analyzing.json()
 
     store.fail_job(
         job_id,
-        error_code="result_unavailable",
-        error_message="The stage result expired.",
+        error_code="compute_failed",
+        error_message="The simulation failed.",
         now=1_800_000_002,
     )
     unavailable = client.get(f"/api/v1/jobs/{job_id}")
 
     assert unavailable.json()["stage"] == {
-        "code": "nvt_analysis",
+        "code": "analyze_nvt",
         "function_name": "collect_traj_stats",
         "started_at": "2027-01-15T08:00:01Z",
+        "ended_at": "2027-01-15T08:00:02Z",
+        "outcome": "failed",
     }
 
     submitted_packaging = _submit(
@@ -951,30 +1160,38 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     packaging = client.get(f"/api/v1/jobs/{packaging_job_id}")
 
     assert packaging.json()["stage"] == {
-        "code": "result_packaging",
+        "code": "prepare_result",
         "started_at": "2027-01-15T08:00:03Z",
     }
-    assert packaging.json()["stage_history"][-2]["completed_at"] == (
-        "2027-01-15T08:00:03Z"
-    )
+    assert packaging.json()["stage_history"][-2]["ended_at"] == ("2027-01-15T08:00:03Z")
+    assert packaging.json()["stage_history"][-2]["outcome"] == "completed"
     assert packaging.json()["stage_history"][-1] == packaging.json()["stage"]
+
+    store.block_job(
+        packaging_job_id,
+        category="modal_unavailable",
+        now=1_800_000_004,
+        next_retry_at=1_800_000_904,
+    )
+    blocked = client.get(f"/api/v1/jobs/{packaging_job_id}")
+    assert blocked.json()["state"] == "blocked"
+    assert blocked.json()["stage"] == {
+        "code": "prepare_result",
+        "started_at": "2027-01-15T08:00:03Z",
+    }
 
     schema = client.get("/openapi.json").json()
     stage_schema = schema["components"]["schemas"]["JobStageView"]
     assert stage_schema["properties"]["code"]["enum"] == [
-        "preparation",
-        "nvt_analysis",
-        "npt_analysis",
-        "production",
-        "production_analysis",
-        "result_packaging",
+        "prepare_simulation",
+        "analyze_nvt",
+        "analyze_npt",
+        "run_production",
+        "analyze_production",
+        "prepare_result",
     ]
-    assert stage_schema["properties"]["started_at"]["anyOf"][0]["format"] == (
-        "date-time"
-    )
-    assert stage_schema["properties"]["completed_at"]["anyOf"][0]["format"] == (
-        "date-time"
-    )
+    assert stage_schema["properties"]["started_at"]["format"] == "date-time"
+    assert stage_schema["properties"]["ended_at"]["anyOf"][0]["format"] == ("date-time")
     assert schema["components"]["schemas"]["JobView"]["properties"]["stage_history"][
         "items"
     ]["$ref"].endswith("/JobStageView")
@@ -1178,7 +1395,6 @@ def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:
     assert allowed_codes == [
         "compute_failed",
         "result_invalid",
-        "result_unavailable",
     ]
 
 
@@ -1262,19 +1478,32 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     _login(bob, "bob@example.com")
 
     hidden = bob.get(f"/api/v1/jobs/{job_id}/download")
+    unprepared = alice.get(f"/api/v1/jobs/{job_id}/download")
+    prepared = alice.post(
+        f"/api/v1/jobs/{job_id}/prepare-download",
+        headers=_unsafe_headers(alice_csrf),
+    )
     first = alice.get(f"/api/v1/jobs/{job_id}/download")
     second = alice.get(f"/api/v1/jobs/{job_id}/download")
     ranged = alice.get(
         f"/api/v1/jobs/{job_id}/download",
         headers={"Range": "bytes=2-5"},
     )
+    invalid_range = alice.get(
+        f"/api/v1/jobs/{job_id}/download",
+        headers={"Range": "bytes=999999-"},
+    )
+    schema = alice.get("/openapi.json").json()
 
     assert hidden.status_code == 404
+    assert unprepared.status_code == 409
+    assert unprepared.json()["code"] == "result_not_prepared"
+    assert prepared.status_code == 204
     assert first.status_code == 200
     assert first.content == content
     assert first.headers["content-type"] == "application/zip"
     assert first.headers["content-disposition"] == (
-        'attachment; filename="simulation.zip"'
+        'attachment; filename="first-simulation-results.zip"'
     )
     assert first.headers["cache-control"] == "private, no-store"
     assert first.headers["etag"] == f'"{hashlib.sha256(content).hexdigest()}"'
@@ -1282,5 +1511,101 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     assert ranged.status_code == 206
     assert ranged.content == content[2:6]
     assert ranged.headers["content-range"] == f"bytes 2-5/{len(content)}"
+    assert invalid_range.status_code == 416
+    assert invalid_range.headers["content-range"] == f"bytes */{len(content)}"
+    range_contract = schema["paths"]["/api/v1/jobs/{job_id}/download"]["get"][
+        "responses"
+    ]["416"]
+    assert range_contract["headers"]["Content-Range"]["schema"] == {"type": "string"}
     assert adapter.downloads == 1
     assert [path.name for path in (tmp_path / "cache").iterdir()] == [f"{job_id}.zip"]
+
+
+def test_large_result_validation_keeps_core_requests_responsive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    completed_submission = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+    )
+    completed_job_id = UUID(completed_submission.json()["job_id"])
+    large_archive = b"PK" + b"x" * (32 * 1024 * 1024)
+    adapter.artifact_content = large_archive
+    store.complete_job(
+        completed_job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{completed_job_id}/result.zip",
+        result_filename="simulation.zip",
+        result_size_bytes=len(large_archive),
+        result_sha256=hashlib.sha256(large_archive).hexdigest(),
+        now=1_800_000_001,
+    )
+    cancellable = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+        display_name="Cancellation target",
+    )
+    cancellable_job_id = cancellable.json()["job_id"]
+    cache: ArtifactCache = client.app.state.cache
+    original_matches = cache._matches
+    validation_started = Event()
+    release_validation = Event()
+
+    def delayed_match(*args, **kwargs):
+        validation_started.set()
+        matches = original_matches(*args, **kwargs)
+        release_validation.wait(timeout=5)
+        return matches
+
+    monkeypatch.setattr(cache, "_matches", delayed_match)
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=ORIGIN,
+            cookies=client.cookies,
+        ) as browser:
+            prepare = asyncio.create_task(
+                browser.post(
+                    f"/api/v1/jobs/{completed_job_id}/prepare-download",
+                    headers=_unsafe_headers(csrf_token),
+                )
+            )
+            assert await asyncio.to_thread(validation_started.wait, 5)
+            try:
+                health, login, inspected, cancelled = await asyncio.wait_for(
+                    asyncio.gather(
+                        browser.get("/api/v1/health"),
+                        browser.post(
+                            "/api/v1/auth/login",
+                            headers={"Origin": ORIGIN},
+                            json={
+                                "email": "alice@example.com",
+                                "password": PASSWORD,
+                            },
+                        ),
+                        browser.get(f"/api/v1/jobs/{completed_job_id}"),
+                        browser.post(
+                            f"/api/v1/jobs/{cancellable_job_id}/cancel",
+                            headers=_unsafe_headers(csrf_token),
+                        ),
+                    ),
+                    timeout=5,
+                )
+                assert health.status_code == 200
+                assert login.status_code == 200
+                assert inspected.status_code == 200
+                assert cancelled.status_code == 202
+            finally:
+                release_validation.set()
+            assert (await prepare).status_code == 204
+
+    asyncio.run(scenario())

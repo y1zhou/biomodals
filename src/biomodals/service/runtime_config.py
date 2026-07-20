@@ -186,7 +186,12 @@ class RuntimeConfiguration:
             updates[self._GLOBAL_ACTIVE_LIMIT_KEY] = (
                 None
                 if global_active_job_limit is None
-                else str(_positive(global_active_job_limit, "Global active job limit"))
+                else str(
+                    _nonnegative(
+                        global_active_job_limit,
+                        "Global active job limit",
+                    )
+                )
             )
         self.store.set_service_settings(updates)
 
@@ -213,7 +218,7 @@ class RuntimeConfiguration:
             updates["active_job_limit"] = (
                 None
                 if active_job_limit is None
-                else _positive(active_job_limit, "Tool active job limit")
+                else _nonnegative(active_job_limit, "Tool active job limit")
             )
         self.store.set_workload_configuration(workload, updates)
 
@@ -239,7 +244,7 @@ class RuntimeConfiguration:
             environment_name,
             stored,
             default,
-            _parse_positive,
+            _parse_nonnegative,
         )
 
     def _workload_text_setting(
@@ -262,7 +267,7 @@ class RuntimeConfiguration:
             environment_name,
             database_value,
             default,
-            _parse_positive,
+            _parse_nonnegative,
         )
 
     def _setting[Value: (str, int)](
@@ -309,13 +314,13 @@ def _nonempty(value: object, label: str) -> str:
     return normalized
 
 
-def _positive(value: int, label: str) -> int:
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{label} must be at least 1")
+def _nonnegative(value: int, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be at least 0")
     return value
 
 
-def _parse_positive(value: object, label: str) -> int:
+def _parse_nonnegative(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"{label} must be an integer")
-    return _positive(int(value), label)
+    return _nonnegative(int(value), label)

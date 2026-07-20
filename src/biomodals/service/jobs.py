@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
+from uuid import UUID
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,15 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from biomodals.service.store import JobRecord, JobStageRecord, JobState
 
 LOGGER = logging.getLogger(__name__)
-JobErrorCode = Literal["compute_failed", "result_invalid", "result_unavailable"]
+JobErrorCode = Literal["compute_failed", "result_invalid"]
 JobStageCode = Literal[
-    "preparation",
-    "nvt_analysis",
-    "npt_analysis",
-    "production",
-    "production_analysis",
-    "result_packaging",
+    "prepare_simulation",
+    "analyze_nvt",
+    "analyze_npt",
+    "run_production",
+    "analyze_production",
+    "prepare_result",
 ]
+JobStageOutcome = Literal["completed", "failed", "cancelled"]
 DeployedFunctionName = Literal[
     "prepare_tpr_cpu",
     "prepare_tpr_gpu",
@@ -33,6 +36,23 @@ DeployedFunctionName = Literal[
 ]
 
 
+class JobLifecycleLocks:
+    """Serialize paid provider transitions with durable cancellation per Job.
+
+    The MVP runs one API process and one reconciler, so an in-process lock is
+    the narrow synchronization boundary needed around the database transition
+    and its corresponding provider call. Durable state remains in SQLite.
+    """
+
+    def __init__(self) -> None:
+        """Create an initially empty lifecycle-lock registry."""
+        self._locks: dict[UUID, asyncio.Lock] = {}
+
+    def for_job(self, job_id: UUID) -> asyncio.Lock:
+        """Return the event-loop lock shared by HTTP and reconciliation work."""
+        return self._locks.setdefault(job_id, asyncio.Lock())
+
+
 class JobStageView(BaseModel):
     """Safe execution stage timing without a provider call identifier."""
 
@@ -40,25 +60,26 @@ class JobStageView(BaseModel):
 
     code: JobStageCode
     function_name: DeployedFunctionName | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+    outcome: JobStageOutcome | None = None
 
 
 _GROMACS_STAGES: dict[
     str,
     tuple[JobStageCode, DeployedFunctionName | None],
 ] = {
-    "prepare_tpr_cpu": ("preparation", "prepare_tpr_cpu"),
-    "prepare_tpr_gpu": ("preparation", "prepare_tpr_gpu"),
-    "collect_traj_stats:nvt_": ("nvt_analysis", "collect_traj_stats"),
-    "collect_traj_stats:npt_": ("npt_analysis", "collect_traj_stats"),
-    "production_run_cpu": ("production", "production_run_cpu"),
-    "production_run_gpu": ("production", "production_run_gpu"),
+    "prepare_tpr_cpu": ("prepare_simulation", "prepare_tpr_cpu"),
+    "prepare_tpr_gpu": ("prepare_simulation", "prepare_tpr_gpu"),
+    "collect_traj_stats:nvt_": ("analyze_nvt", "collect_traj_stats"),
+    "collect_traj_stats:npt_": ("analyze_npt", "collect_traj_stats"),
+    "production_run_cpu": ("run_production", "production_run_cpu"),
+    "production_run_gpu": ("run_production", "production_run_gpu"),
     "collect_traj_stats:production_": (
-        "production_analysis",
+        "analyze_production",
         "collect_traj_stats",
     ),
-    "result_packaging": ("result_packaging", None),
+    "result_packaging": ("prepare_result", None),
 }
 
 
@@ -67,19 +88,18 @@ def _stage_view(
     event: JobStageRecord | None = None,
 ) -> JobStageView | None:
     stage = _GROMACS_STAGES.get(provider_operation)
-    if stage is None:
+    if stage is None or event is None:
         return None
     return JobStageView(
         code=stage[0],
         function_name=stage[1],
-        started_at=(
-            datetime.fromtimestamp(event.started_at, UTC) if event is not None else None
-        ),
-        completed_at=(
+        started_at=datetime.fromtimestamp(event.started_at, UTC),
+        ended_at=(
             datetime.fromtimestamp(event.completed_at, UTC)
-            if event is not None and event.completed_at is not None
+            if event.completed_at is not None
             else None
         ),
+        outcome=cast(JobStageOutcome | None, event.outcome),
     )
 
 
@@ -91,11 +111,12 @@ def _job_stage(
         return None
     if record.state in {
         JobState.FINALIZING,
+        JobState.BLOCKED,
         JobState.SUCCEEDED,
         JobState.PARTIAL,
     } or (
         record.state == JobState.FAILED
-        and record.error_code in {"result_invalid", "result_unavailable"}
+        and record.error_code == "result_invalid"
         and record.provider_operation in {None, "collect_traj_stats:production_"}
     ):
         provider_operation = "result_packaging"
@@ -139,6 +160,9 @@ class JobView(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
+    blocked_at: datetime | None = None
+    next_retry_at: datetime | None = None
     warnings: list[str] = Field(default_factory=list)
     error_code: JobErrorCode | None = None
     error_message: str | None = None
@@ -148,6 +172,12 @@ class JobView(BaseModel):
     def from_record(cls, record: JobRecord) -> JobView:
         """Build a safe public view without exposing Modal identifiers or paths."""
         warnings = record.warnings
+        if (
+            record.state == JobState.CANCEL_REQUESTED
+            and record.cancel_requested_at is not None
+            and int(time.time()) - record.cancel_requested_at >= 15 * 60
+        ):
+            warnings.append("Cancellation is taking longer than expected.")
         stage_history = record.stage_history
         return cls(
             job_id=str(record.job_id),
@@ -161,6 +191,21 @@ class JobView(BaseModel):
             completed_at=(
                 datetime.fromtimestamp(record.completed_at, UTC)
                 if record.completed_at is not None
+                else None
+            ),
+            cancel_requested_at=(
+                datetime.fromtimestamp(record.cancel_requested_at, UTC)
+                if record.cancel_requested_at is not None
+                else None
+            ),
+            blocked_at=(
+                datetime.fromtimestamp(record.blocked_at, UTC)
+                if record.blocked_at is not None
+                else None
+            ),
+            next_retry_at=(
+                datetime.fromtimestamp(record.next_retry_at, UTC)
+                if record.next_retry_at is not None
                 else None
             ),
             warnings=warnings,
@@ -184,6 +229,7 @@ class Reconciler(Protocol):
 
 CancelJob = Callable[[JobRecord], Awaitable[None]]
 ReadArtifact = Callable[[JobRecord], AsyncIterable[bytes]]
+PreflightWorkload = Callable[[str, str], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,9 +238,12 @@ class WorkloadRegistration:
 
     name: str
     router: APIRouter
+    lifecycle_locks: JobLifecycleLocks
     reconciler: Reconciler | None = None
     cancel: CancelJob | None = None
     read_artifact: ReadArtifact | None = None
+    rebuild_artifact: ReadArtifact | None = None
+    preflight: PreflightWorkload | None = None
     max_body_bytes: int = 1024 * 1024
 
 

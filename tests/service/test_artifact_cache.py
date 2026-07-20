@@ -24,7 +24,7 @@ def digest(content: bytes) -> str:
 
 
 def test_cache_verifies_download_before_atomic_publish(tmp_path: Path) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=100)
+    cache = ArtifactCache(tmp_path)
     content = b"valid zip bytes"
 
     lease = asyncio.run(
@@ -46,7 +46,7 @@ def test_cache_verifies_download_before_atomic_publish(tmp_path: Path) -> None:
 
 
 def test_cache_discards_corrupt_download(tmp_path: Path) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=100)
+    cache = ArtifactCache(tmp_path)
 
     with pytest.raises(ArtifactIntegrityError):
         asyncio.run(
@@ -65,7 +65,7 @@ def test_cache_revalidates_an_existing_file_before_serving(tmp_path: Path) -> No
     job_id = "11111111-1111-4111-8111-111111111111"
     path = tmp_path / f"{job_id}.zip"
     path.write_bytes(b"corrupt")
-    cache = ArtifactCache(tmp_path, max_bytes=100)
+    cache = ArtifactCache(tmp_path)
 
     assert (
         cache.acquire(
@@ -78,10 +78,10 @@ def test_cache_revalidates_an_existing_file_before_serving(tmp_path: Path) -> No
     assert not path.exists()
 
 
-def test_oversized_result_is_verified_without_becoming_cached(
+def test_result_size_does_not_trigger_automatic_eviction(
     tmp_path: Path,
 ) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=3)
+    cache = ArtifactCache(tmp_path)
     consumed = False
 
     async def source():
@@ -99,14 +99,16 @@ def test_oversized_result_is_verified_without_becoming_cached(
     )
 
     assert consumed is True
-    assert lease.path is None
+    assert lease.path is not None
     assert lease.read(5) == b"large"
-    assert list(tmp_path.iterdir()) == []
+    assert [path.name for path in tmp_path.iterdir()] == [
+        "11111111-1111-4111-8111-111111111111.zip"
+    ]
     lease.close()
 
 
 def test_oversized_corrupt_result_is_rejected(tmp_path: Path) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=3)
+    cache = ArtifactCache(tmp_path)
 
     with pytest.raises(ArtifactIntegrityError):
         asyncio.run(
@@ -121,8 +123,8 @@ def test_oversized_corrupt_result_is_rejected(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
-def test_cache_evicts_least_recently_used_inactive_result(tmp_path: Path) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=8)
+def test_cache_keeps_completed_results_until_explicit_cleanup(tmp_path: Path) -> None:
+    cache = ArtifactCache(tmp_path)
     first_content = b"first"
     second_content = b"next"
     first_lease = asyncio.run(
@@ -149,12 +151,12 @@ def test_cache_evicts_least_recently_used_inactive_result(tmp_path: Path) -> Non
 
     second = second_lease.path
     assert second is not None and second.exists()
-    assert not first.exists()
+    assert first.exists()
     second_lease.close()
 
 
-def test_cache_does_not_evict_an_active_download(tmp_path: Path) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=8)
+def test_explicit_cleanup_protects_an_active_download(tmp_path: Path) -> None:
+    cache = ArtifactCache(tmp_path)
     first_content = b"first"
     first_lease = asyncio.run(
         cache.store(
@@ -179,14 +181,119 @@ def test_cache_does_not_evict_an_active_download(tmp_path: Path) -> None:
 
     second = second_lease.path
     assert second is not None
-    assert first.exists()
-    first_lease.close()
-    assert not first.exists()
     second_lease.close()
+    assert first.exists()
+    cleanup = cache.clear()
+    assert first.exists()
+    assert not second.exists()
+    assert cleanup.entries == 1
+    first_lease.close()
+    assert first.exists()
+
+
+def test_cancelled_waiter_does_not_cancel_shared_cache_fill(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        cache = ArtifactCache(tmp_path)
+        content = b"first-second"
+        started = asyncio.Event()
+        release = asyncio.Event()
+        fallback_consumed = False
+
+        async def source():
+            yield b"first-"
+            started.set()
+            await release.wait()
+            yield b"second"
+
+        async def fallback():
+            nonlocal fallback_consumed
+            fallback_consumed = True
+            yield content
+
+        first = asyncio.create_task(
+            cache.store(
+                "11111111-1111-4111-8111-111111111111",
+                size_bytes=len(content),
+                sha256=digest(content),
+                chunks=source(),
+            )
+        )
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(
+            cache.store(
+                "11111111-1111-4111-8111-111111111111",
+                size_bytes=len(content),
+                sha256=digest(content),
+                chunks=fallback(),
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        lease = await second
+
+        assert lease.read(len(content)) == content
+        assert fallback_consumed is False
+        lease.close()
+        await cache.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_failed_shared_fill_can_be_rebuilt_while_other_waiters_unwind(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        cache = ArtifactCache(tmp_path)
+        job_id = "11111111-1111-4111-8111-111111111111"
+        expected = b"recovered"
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def corrupt_source():
+            started.set()
+            await release.wait()
+            yield b"corrupt"
+
+        first = asyncio.create_task(
+            cache.store(
+                job_id,
+                size_bytes=len(expected),
+                sha256=digest(expected),
+                chunks=corrupt_source(),
+            )
+        )
+        await started.wait()
+        second = asyncio.create_task(
+            cache.store(
+                job_id,
+                size_bytes=len(expected),
+                sha256=digest(expected),
+                chunks=chunks(b"unused"),
+            )
+        )
+        release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, ArtifactIntegrityError) for result in results)
+
+        lease = await cache.store(
+            job_id,
+            size_bytes=len(expected),
+            sha256=digest(expected),
+            chunks=chunks(expected),
+        )
+        assert lease.read(len(expected)) == expected
+        lease.close()
+        await cache.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_cache_refuses_symlinks_without_touching_their_target(tmp_path: Path) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=100)
+    cache = ArtifactCache(tmp_path)
     job_id = "11111111-1111-4111-8111-111111111111"
     target = tmp_path / "secret"
     target.write_bytes(b"expected")
@@ -206,7 +313,7 @@ def test_cache_refuses_symlinks_without_touching_their_target(tmp_path: Path) ->
 def test_lease_streams_verified_descriptor_after_path_replacement(
     tmp_path: Path,
 ) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=100)
+    cache = ArtifactCache(tmp_path)
     job_id = "11111111-1111-4111-8111-111111111111"
     content = b"verified"
     lease = asyncio.run(
@@ -245,7 +352,7 @@ def test_cache_rejects_invalid_metadata(
     size_bytes: int,
     sha256: str,
 ) -> None:
-    cache = ArtifactCache(tmp_path, max_bytes=100)
+    cache = ArtifactCache(tmp_path)
 
     with pytest.raises(ArtifactIntegrityError, match="Invalid artifact metadata"):
         asyncio.run(

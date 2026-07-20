@@ -30,11 +30,16 @@ from biomodals.service.api import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
-    MutationForbiddenResponse,
+    request_id_from,
     require_unsafe_session,
 )
 from biomodals.service.auth import AuthenticatedSession
-from biomodals.service.jobs import JobView, Reconciler, WorkloadRegistration
+from biomodals.service.jobs import (
+    JobLifecycleLocks,
+    JobView,
+    Reconciler,
+    WorkloadRegistration,
+)
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
@@ -45,6 +50,7 @@ from biomodals.service.store import (
     JobRecord,
     JobState,
     ServiceStore,
+    UserNotFoundError,
 )
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
@@ -118,6 +124,12 @@ class ComputeUnavailableResponse(CodedErrorResponse):
     """Remote compute could not accept the durable Job."""
 
     code: Literal["compute_unavailable"]
+
+
+class SubmissionForbiddenResponse(CodedErrorResponse):
+    """Account state changed after browser Session authentication."""
+
+    code: Literal["account_disabled", "csrf_invalid", "origin_not_allowed"]
 
 
 class SubmissionOutcomeUnknownError(RuntimeError):
@@ -199,6 +211,7 @@ def _request_identity(
 def create_router(
     adapter: GromacsAdapter,
     *,
+    lifecycle_locks: JobLifecycleLocks,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
     """Create the GROMACS router around an injectable compute adapter."""
@@ -212,7 +225,7 @@ def create_router(
         responses={
             400: {"model": PdbInvalidResponse},
             401: {"model": ErrorResponse},
-            403: {"model": MutationForbiddenResponse},
+            403: {"model": SubmissionForbiddenResponse},
             409: {"model": SubmissionConflictResponse},
             413: {"model": PayloadTooLargeResponse},
             503: {"model": ComputeUnavailableResponse},
@@ -267,6 +280,20 @@ def create_router(
                 "active_job_limit_reached",
                 str(exc),
             ) from exc
+        except UserNotFoundError as exc:
+            raise CodedAPIError(
+                403,
+                "account_disabled",
+                "This account cannot submit new jobs",
+            ) from exc
+
+        LOGGER.info(
+            "event=job_admission job_id=%s workload=gromacs replay=%s "
+            "stage=prepare_simulation request_id=%s",
+            admission.job.job_id,
+            not admission.created,
+            request_id_from(request),
+        )
 
         if (
             admission.job.modal_call_id is not None
@@ -274,74 +301,101 @@ def create_router(
         ):
             return JobView.from_record(admission.job)
 
-        run_name = admission.job.run_name or gromacs_run_name(
-            admission.job.display_name,
-            admission.job.job_id,
-        )
-        submission_token = uuid4().hex
-        claimed = store.claim_submission(
-            admission.job.job_id,
-            run_name=run_name,
-            submission_token=submission_token,
-            now=now,
-        )
-        if claimed is None:
-            current = store.get_job(
-                session.principal.user_id,
+        async with lifecycle_locks.for_job(admission.job.job_id):
+            run_name = admission.job.run_name or gromacs_run_name(
+                admission.job.display_name,
                 admission.job.job_id,
             )
-            if current is None:  # pragma: no cover - admission owns the row
-                raise HTTPException(404, "Job not found")
-            return JobView.from_record(current)
-
-        try:
-            submitted = await adapter.submit(
-                pdb_content,
-                options,
+            submission_token = uuid4().hex
+            claimed = store.claim_submission(
+                admission.job.job_id,
                 run_name=run_name,
-                modal_configuration=claimed.modal_configuration,
-            )
-        except SubmissionOutcomeUnknownError as exc:
-            LOGGER.exception(
-                "Could not confirm GROMACS submission %s", admission.job.job_id
-            )
-            raise CodedAPIError(
-                503,
-                "compute_unavailable",
-                "GROMACS compute submission could not be confirmed",
-            ) from exc
-        except Exception as exc:
-            LOGGER.exception("Could not submit GROMACS job %s", admission.job.job_id)
-            store.release_submission(
-                admission.job.job_id,
                 submission_token=submission_token,
-                now=int(time.time()),
+                now=now,
             )
-            raise CodedAPIError(
-                503,
-                "compute_unavailable",
-                "GROMACS compute is temporarily unavailable",
-            ) from exc
+            if claimed is None:
+                current = store.get_job(
+                    session.principal.user_id,
+                    admission.job.job_id,
+                )
+                if current is None:  # pragma: no cover - admission owns the row
+                    raise HTTPException(404, "Job not found")
+                return JobView.from_record(current)
 
-        try:
-            if submitted.run_name != run_name:
-                raise RuntimeError("Compute returned the wrong GROMACS run name")
-            job = store.mark_submitted(
-                admission.job.job_id,
-                modal_call_id=submitted.modal_call_id,
-                provider_operation=submitted.provider_operation,
-                run_name=submitted.run_name,
-                submission_token=submission_token,
+            try:
+                submitted = await adapter.submit(
+                    pdb_content,
+                    options,
+                    run_name=run_name,
+                    modal_configuration=claimed.modal_configuration,
+                )
+            except SubmissionOutcomeUnknownError as exc:
+                LOGGER.exception(
+                    "Could not confirm GROMACS submission %s request_id=%s",
+                    admission.job.job_id,
+                    request_id_from(request),
+                )
+                raise CodedAPIError(
+                    503,
+                    "compute_unavailable",
+                    "GROMACS compute submission could not be confirmed",
+                ) from exc
+            except Exception as exc:
+                LOGGER.exception(
+                    "Could not submit GROMACS job %s request_id=%s",
+                    admission.job.job_id,
+                    request_id_from(request),
+                )
+                store.release_submission(
+                    admission.job.job_id,
+                    submission_token=submission_token,
+                    now=int(time.time()),
+                )
+                raise CodedAPIError(
+                    503,
+                    "compute_unavailable",
+                    "GROMACS compute is temporarily unavailable",
+                ) from exc
+
+            try:
+                if submitted.run_name != run_name:
+                    raise RuntimeError("Compute returned the wrong GROMACS run name")
+                job = store.mark_submitted(
+                    admission.job.job_id,
+                    modal_call_id=submitted.modal_call_id,
+                    provider_operation=submitted.provider_operation,
+                    run_name=submitted.run_name,
+                    submission_token=submission_token,
+                )
+            except Exception as exc:
+                LOGGER.exception(
+                    "Could not persist GROMACS submission %s request_id=%s",
+                    admission.job.job_id,
+                    request_id_from(request),
+                )
+                try:
+                    await adapter.cancel(submitted.modal_call_id)
+                except Exception:
+                    LOGGER.exception(
+                        "Could not cancel untracked GROMACS submission %s "
+                        "request_id=%s",
+                        submitted.modal_call_id,
+                        request_id_from(request),
+                    )
+                raise CodedAPIError(
+                    503,
+                    "compute_unavailable",
+                    "GROMACS compute submission could not be confirmed",
+                ) from exc
+            stage = JobView.from_record(job).stage
+            LOGGER.info(
+                "event=stage_attached job_id=%s workload=gromacs stage=%s "
+                "function=%s request_id=%s",
+                job.job_id,
+                stage.code if stage is not None else "none",
+                submitted.provider_operation.partition(":")[0],
+                request_id_from(request),
             )
-        except Exception as exc:
-            LOGGER.exception(
-                "Could not persist GROMACS submission %s", admission.job.job_id
-            )
-            raise CodedAPIError(
-                503,
-                "compute_unavailable",
-                "GROMACS compute submission could not be confirmed",
-            ) from exc
         return JobView.from_record(job)
 
     return router
@@ -351,6 +405,7 @@ def create_registration(
     adapter: GromacsAdapter,
     *,
     reconciler: Reconciler | None = None,
+    lifecycle_locks: JobLifecycleLocks | None = None,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> WorkloadRegistration:
     """Explicitly register GROMACS routes and lifecycle hooks."""
@@ -359,15 +414,25 @@ def create_registration(
         if job.modal_call_id is not None:
             await adapter.cancel(job.modal_call_id)
 
+    lifecycle_locks = lifecycle_locks or getattr(
+        reconciler,
+        "lifecycle_locks",
+        JobLifecycleLocks(),
+    )
     read_artifact = getattr(adapter, "read_artifact", None)
+    rebuild_artifact = getattr(adapter, "rebuild_artifact", None)
     return WorkloadRegistration(
         name="gromacs",
         router=create_router(
             adapter,
+            lifecycle_locks=lifecycle_locks,
             max_pdb_bytes=max_pdb_bytes,
         ),
+        lifecycle_locks=lifecycle_locks,
         reconciler=reconciler,
         cancel=cancel,
         read_artifact=read_artifact,
+        rebuild_artifact=rebuild_artifact,
+        preflight=getattr(adapter, "preflight", None),
         max_body_bytes=max_pdb_bytes + MAX_MULTIPART_OVERHEAD_BYTES,
     )

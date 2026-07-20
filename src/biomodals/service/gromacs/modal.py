@@ -9,13 +9,16 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import BinaryIO, Literal, cast
 from uuid import uuid4
 
 import modal
 import orjson
 
+from biomodals.service.artifacts import ArtifactCache, ArtifactLease
 from biomodals.service.gromacs.archive import (
+    BuiltGromacsArchive,
     validate_gromacs_archive,
     write_gromacs_archive,
 )
@@ -24,6 +27,7 @@ from biomodals.service.gromacs.router import (
     SubmissionOutcomeUnknownError,
     is_gromacs_run_name,
 )
+from biomodals.service.jobs import JobLifecycleLocks, JobView
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import (
     JobRecord,
@@ -38,6 +42,14 @@ _NVT_ANALYSIS = "collect_traj_stats:nvt_"
 _NPT_ANALYSIS = "collect_traj_stats:npt_"
 _PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
 _FINAL_OPERATION = _PRODUCTION_ANALYSIS
+_REQUIRED_FUNCTIONS = (
+    "prepare_tpr_cpu",
+    "prepare_tpr_gpu",
+    "collect_traj_stats",
+    "production_run_cpu",
+    "production_run_gpu",
+)
+_ARCHIVE_SCHEMA_VERSION = 2
 _MODAL_SERVICE_ERRORS = (
     modal.exception.AuthError,
     modal.exception.ConnectionError,
@@ -50,6 +62,20 @@ _MODAL_SERVICE_ERRORS = (
 )
 _MODAL_PUBLICATION_ERRORS = _MODAL_SERVICE_ERRORS + (
     modal.exception.ExecutionError,
+    modal.exception.VolumeUploadTimeoutError,
+)
+_PERMANENT_FINALIZATION_ERRORS = (
+    modal.exception.AuthError,
+    modal.exception.InvalidError,
+    modal.exception.NotFoundError,
+    modal.exception.PermissionDeniedError,
+)
+_TRANSIENT_FINALIZATION_ERRORS = (
+    modal.exception.ConnectionError,
+    modal.exception.ExecutionError,
+    modal.exception.InternalError,
+    modal.exception.ResourceExhaustedError,
+    modal.exception.ServiceError,
     modal.exception.VolumeUploadTimeoutError,
 )
 
@@ -81,6 +107,7 @@ class FinalArchive:
     size_bytes: int
     sha256: str
     warnings_json: str
+    cache_lease: ArtifactLease | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +119,10 @@ class _ResultMarker:
 
 class ArchiveNotReadyError(RuntimeError):
     """Raised when a stable run has not published its completion marker yet."""
+
+
+class ResultIdentityMismatchError(RuntimeError):
+    """Raised when reconstruction cannot reproduce a published Result."""
 
 
 def _call_nodes(
@@ -115,6 +146,7 @@ class ModalGromacsAdapter:
         app_name: str,
         environment_name: str,
         output_volume_name: str = "Gromacs-outputs",
+        artifact_cache: ArtifactCache | None = None,
         call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
         function_resolver: Callable[..., modal.Function] | None = None,
     ) -> None:
@@ -122,8 +154,24 @@ class ModalGromacsAdapter:
         self.environment_name = environment_name
         self.app_name = app_name
         self.output_volume_name = output_volume_name
+        self.artifact_cache = artifact_cache
         self._function_resolver = function_resolver or modal.Function.from_name
         self._call_resolver = call_resolver
+
+    async def preflight(self, app_name: str, environment_name: str) -> None:
+        """Hydrate required deployed resources without invoking compute."""
+        volume = modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=environment_name,
+        )
+        await volume.hydrate.aio()
+        for function_name in _REQUIRED_FUNCTIONS:
+            function = self._function_resolver(
+                app_name,
+                function_name,
+                environment_name=environment_name,
+            )
+            await function.hydrate.aio()
 
     async def submit(
         self,
@@ -245,7 +293,13 @@ class ModalGromacsAdapter:
                 node.status == modal.call_graph.InputStatus.TERMINATED for node in nodes
             ):
                 return PollOutcome("cancelled")
-            return PollOutcome("failed")
+            if any(
+                node.status == modal.call_graph.InputStatus.FAILURE for node in nodes
+            ):
+                return PollOutcome("failed")
+            # A SUCCESS graph can become visible just before get() can return
+            # retained output. Poll again rather than inventing a failure.
+            return PollOutcome("running")
         except _MODAL_SERVICE_ERRORS:
             raise
         except Exception:
@@ -324,6 +378,93 @@ class ModalGromacsAdapter:
         """Build and publish a ZIP from the established app's Volume files."""
         if job.run_name is None or not is_gromacs_run_name(job.run_name):
             raise ValueError("Job has no valid API run name")
+        archive_path = f"api-results/{job.run_name}/result.zip"
+        marker_path = f"api-results/{job.run_name}/result.json"
+        archive_file = tempfile.NamedTemporaryFile(
+            dir=(self.artifact_cache.directory if self.artifact_cache else None),
+            prefix=f".{job.job_id}.",
+            suffix=".part",
+            delete=False,
+        )
+        local_path = Path(archive_file.name)
+        cache_lease: ArtifactLease | None = None
+        try:
+            with (
+                archive_file as archive,
+                tempfile.NamedTemporaryFile(
+                    dir=(
+                        self.artifact_cache.directory if self.artifact_cache else None
+                    ),
+                    prefix=f".{job.job_id}.marker.",
+                    suffix=".part",
+                ) as marker_file,
+            ):
+                archive_handle = cast("BinaryIO", archive)
+                built = await self._build_archive(
+                    archive_handle,
+                    job,
+                    completed_at=completed_at,
+                )
+                restored_state = job.result_previous_state
+                if restored_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
+                    if (
+                        built.size_bytes != job.result_size_bytes
+                        or built.sha256 != job.result_sha256
+                    ):
+                        raise ResultIdentityMismatchError(
+                            "Rebuilt Result does not match its published identity"
+                        )
+                marker = orjson.dumps({
+                    "archive_schema_version": _ARCHIVE_SCHEMA_VERSION,
+                    "request_sha256": built.request_sha256,
+                    "archive_sha256": built.sha256,
+                    "size_bytes": built.size_bytes,
+                })
+                marker_file.write(marker)
+                archive_handle.flush()
+                marker_file.flush()
+                volume = modal.Volume.from_name(
+                    self.output_volume_name,
+                    environment_name=job.modal_environment,
+                )
+                async with volume.batch_upload.aio(force=True) as upload:
+                    upload.put_file(archive.name, archive_path)
+                    upload.put_file(marker_file.name, marker_path)
+            if self.artifact_cache is not None:
+                cache_lease = await self.artifact_cache.publish_staged(
+                    str(job.job_id),
+                    local_path,
+                    size_bytes=built.size_bytes,
+                    sha256=built.sha256,
+                )
+        finally:
+            local_path.unlink(missing_ok=True)
+
+        return FinalArchive(
+            state=(
+                job.result_previous_state
+                if job.result_previous_state in {JobState.SUCCEEDED, JobState.PARTIAL}
+                else JobState.SUCCEEDED
+            ),
+            volume_name=self.output_volume_name,
+            path=archive_path,
+            filename=f"{job.run_name}.zip",
+            size_bytes=built.size_bytes,
+            sha256=built.sha256,
+            warnings_json="[]",
+            cache_lease=cache_lease,
+        )
+
+    async def _build_archive(
+        self,
+        handle: BinaryIO,
+        job: JobRecord,
+        *,
+        completed_at: int,
+    ) -> BuiltGromacsArchive:
+        """Deterministically rebuild the immutable allowlist from raw outputs."""
+        if job.run_name is None:
+            raise ValueError("Job has no GROMACS run name")
         volume = modal.Volume.from_name(
             self.output_volume_name,
             environment_name=job.modal_environment,
@@ -333,44 +474,68 @@ class ModalGromacsAdapter:
             async for chunk in volume.read_file.aio(path):
                 yield chunk
 
-        archive_path = f"api-results/{job.run_name}/result.zip"
-        marker_path = f"api-results/{job.run_name}/result.json"
-        with (
-            tempfile.NamedTemporaryFile() as archive,
-            tempfile.NamedTemporaryFile() as marker_file,
-        ):
-            archive_handle = cast("BinaryIO", archive)
-            built = await write_gromacs_archive(
-                archive_handle,
-                run_name=job.run_name,
-                parameters_json=job.parameters_json,
-                modal_app_name=job.modal_app_name,
-                started_at=job.created_at,
-                completed_at=completed_at,
-                read_file=read_file,
+        stages = [
+            stage.model_dump(mode="json")
+            for stage in JobView.from_record(job).stage_history
+        ]
+        if stages and stages[-1]["code"] == "prepare_result":
+            stages[-1]["ended_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(completed_at),
             )
-            marker = orjson.dumps({
-                "archive_schema_version": 1,
-                "request_sha256": built.request_sha256,
-                "archive_sha256": built.sha256,
-                "size_bytes": built.size_bytes,
-            })
-            marker_file.write(marker)
-            archive_handle.flush()
-            marker_file.flush()
-            async with volume.batch_upload.aio(force=True) as upload:
-                upload.put_file(archive.name, archive_path)
-                upload.put_file(marker_file.name, marker_path)
-
-        return FinalArchive(
-            state=JobState.SUCCEEDED,
-            volume_name=self.output_volume_name,
-            path=archive_path,
-            filename=f"{job.run_name}.zip",
-            size_bytes=built.size_bytes,
-            sha256=built.sha256,
-            warnings_json="[]",
+            stages[-1]["outcome"] = "completed"
+        return await write_gromacs_archive(
+            handle,
+            run_name=job.run_name,
+            parameters_json=job.parameters_json,
+            modal_app_name=job.modal_app_name,
+            job_id=str(job.job_id),
+            stages_json=orjson.dumps(stages).decode(),
+            started_at=job.created_at,
+            completed_at=completed_at,
+            read_file=read_file,
+            run_bounded=(
+                self.artifact_cache.run_bounded
+                if self.artifact_cache is not None
+                else None
+            ),
         )
+
+    async def rebuild_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
+        """Rebuild exact recorded bytes from raw outputs without compute."""
+        if (
+            job.finalization_started_at is None
+            or job.result_size_bytes is None
+            or job.result_sha256 is None
+        ):
+            raise ValueError("Job lacks immutable Result identity")
+        archive_file = tempfile.NamedTemporaryFile(
+            dir=(self.artifact_cache.directory if self.artifact_cache else None),
+            prefix=f".{job.job_id}.rebuild.",
+            suffix=".part",
+            delete=False,
+        )
+        local_path = Path(archive_file.name)
+        try:
+            with archive_file as archive:
+                handle = cast("BinaryIO", archive)
+                built = await self._build_archive(
+                    handle,
+                    job,
+                    completed_at=job.finalization_started_at,
+                )
+                if (
+                    built.size_bytes != job.result_size_bytes
+                    or built.sha256 != job.result_sha256
+                ):
+                    raise ValueError(
+                        "Rebuilt Result does not match its published identity"
+                    )
+                handle.seek(0)
+                while chunk := handle.read(1024 * 1024):
+                    yield chunk
+        finally:
+            local_path.unlink(missing_ok=True)
 
     async def _result_marker(self, job: JobRecord) -> _ResultMarker:
         """Read and validate the completion marker for one stable run."""
@@ -402,7 +567,7 @@ class ModalGromacsAdapter:
         )
         if (
             not isinstance(marker, dict)
-            or marker.get("archive_schema_version") != 1
+            or marker.get("archive_schema_version") != _ARCHIVE_SCHEMA_VERSION
             or type(size_bytes) is not int
             or size_bytes < 1
             or not isinstance(archive_sha256, str)
@@ -430,35 +595,60 @@ class ModalGromacsAdapter:
             self.output_volume_name,
             environment_name=job.modal_environment,
         )
-        digest = hashlib.sha256()
         size_bytes = 0
-        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as archive:
-            try:
-                async for chunk in volume.read_file.aio(archive_path):
-                    size_bytes += len(chunk)
-                    if size_bytes > marker.size_bytes:
-                        raise ValueError(
-                            "GROMACS result archive is larger than recorded"
-                        )
-                    digest.update(chunk)
-                    archive.write(chunk)
-            except FileNotFoundError as exc:
-                raise ArchiveNotReadyError("GROMACS result archive is missing") from exc
-            if (
-                size_bytes != marker.size_bytes
-                or digest.hexdigest() != marker.archive_sha256
-            ):
-                raise ValueError("GROMACS result archive does not match its marker")
-            validated = validate_gromacs_archive(archive, run_name=job.run_name)
-        if validated.request_sha256 != marker.request_sha256:
-            raise ValueError("GROMACS result archive has the wrong request identity")
+        archive_file = tempfile.NamedTemporaryFile(
+            dir=(self.artifact_cache.directory if self.artifact_cache else None),
+            prefix=f".{job.job_id}.verify.",
+            suffix=".part",
+            delete=False,
+        )
+        local_path = Path(archive_file.name)
+        try:
+            with archive_file as archive:
+                archive_handle = cast("BinaryIO", archive)
+                try:
+                    async for chunk in volume.read_file.aio(archive_path):
+                        size_bytes += len(chunk)
+                        if size_bytes > marker.size_bytes:
+                            raise ValueError(
+                                "GROMACS result archive is larger than recorded"
+                            )
+                        archive_handle.write(chunk)
+                except FileNotFoundError as exc:
+                    raise ArchiveNotReadyError(
+                        "GROMACS result archive is missing"
+                    ) from exc
+                if size_bytes != marker.size_bytes:
+                    raise ValueError("GROMACS result archive does not match its marker")
+                if self.artifact_cache is None:
+                    _validate_published_archive(archive_handle, marker, job.run_name)
+                else:
+                    await self.artifact_cache.run_bounded(
+                        _validate_published_archive,
+                        archive_handle,
+                        marker,
+                        job.run_name,
+                    )
+        finally:
+            local_path.unlink(missing_ok=True)
 
     async def recover_archive(self, job: JobRecord) -> FinalArchive:
         """Recover and verify durable output after Modal call output expiry."""
         marker = await self._result_marker(job)
+        if job.result_previous_state in {JobState.SUCCEEDED, JobState.PARTIAL} and (
+            marker.size_bytes != job.result_size_bytes
+            or marker.archive_sha256 != job.result_sha256
+        ):
+            raise ResultIdentityMismatchError(
+                "Restored Result does not match its published identity"
+            )
         await self._verify_archive_bytes(job, marker)
         return FinalArchive(
-            state=JobState.SUCCEEDED,
+            state=(
+                job.result_previous_state
+                if job.result_previous_state in {JobState.SUCCEEDED, JobState.PARTIAL}
+                else JobState.SUCCEEDED
+            ),
             volume_name=self.output_volume_name,
             path=f"api-results/{job.run_name}/result.zip",
             filename=f"{job.run_name}.zip",
@@ -476,12 +666,14 @@ class GromacsReconciler:
         store: ServiceStore,
         adapter: ModalGromacsAdapter,
         *,
+        lifecycle_locks: JobLifecycleLocks | None = None,
         now: Callable[[], int] | None = None,
         intermediate_retention_days: int | None = None,
     ) -> None:
         """Bind durable state to the provider adapter."""
         self.store = store
         self.adapter = adapter
+        self.lifecycle_locks = lifecycle_locks or JobLifecycleLocks()
         self._now = now or (lambda: int(time.time()))
         if intermediate_retention_days is not None and intermediate_retention_days < 1:
             raise ValueError("intermediate_retention_days must be positive")
@@ -494,8 +686,12 @@ class GromacsReconciler:
     async def reconcile(self) -> None:
         """Poll every active GROMACS call once."""
         for job in self.store.list_reconcilable_jobs("gromacs"):
+            now = self._now()
+            if job.state in {JobState.FINALIZING, JobState.BLOCKED}:
+                if job.next_retry_at is None or job.next_retry_at <= now:
+                    await self._finalize(job)
+                continue
             if job.modal_call_id is None:
-                now = self._now()
                 if job.submission_lease_until is not None:
                     if job.submission_lease_until <= now:
                         self.store.fail_job(
@@ -551,78 +747,104 @@ class GromacsReconciler:
                 continue
             if outcome.kind == "expired":
                 if job.state == JobState.CANCEL_REQUESTED:
-                    self.store.set_job_state(
-                        job.job_id,
-                        JobState.CANCELLED,
-                        now=self._now(),
-                    )
+                    await self._resolve_expired_cancellation(job)
                     continue
                 if job.provider_operation not in {None, _FINAL_OPERATION}:
                     self.store.fail_job(
                         job.job_id,
-                        error_code="result_unavailable",
+                        error_code="compute_failed",
                         error_message=(
-                            "GROMACS completed, but its stage result expired before "
-                            "the job could continue."
+                            "GROMACS stage status expired before the simulation "
+                            "could continue."
                         ),
                         now=self._now(),
                     )
                     continue
+                finalizing = self.store.set_job_state(
+                    job.job_id,
+                    JobState.FINALIZING,
+                    now=self._now(),
+                )
                 try:
-                    archive = await self.adapter.recover_archive(job)
-                except ArchiveNotReadyError:
-                    self.store.fail_job(
-                        job.job_id,
-                        error_code="result_unavailable",
-                        error_message=(
-                            "GROMACS completed, but its result could not be recovered."
-                        ),
-                        now=self._now(),
-                    )
-                    continue
-                except _MODAL_SERVICE_ERRORS:
-                    LOGGER.exception(
-                        "Modal is unavailable while recovering job %s", job.job_id
-                    )
-                    continue
+                    archive = await self.adapter.recover_archive(finalizing)
                 except Exception:
-                    LOGGER.exception("Could not recover expired job %s", job.job_id)
-                    self.store.fail_job(
+                    # A valid marker is the durable success boundary. If it is
+                    # absent or invalid, rebuild from the authoritative raw
+                    # Volume outputs without replaying scientific compute.
+                    await self._finalize(finalizing)
+                else:
+                    self._complete(finalizing, archive)
+                continue
+            if outcome.kind == "completed" and job.state == JobState.CANCEL_REQUESTED:
+                now = self._now()
+                completed = self.store.mark_provider_operation_completed(
+                    job.job_id,
+                    expected_modal_call_id=job.modal_call_id or "",
+                    now=now,
+                )
+                if completed is not None:
+                    self.store.set_job_state(
                         job.job_id,
-                        error_code="result_unavailable",
-                        error_message=(
-                            "GROMACS completed, but its result could not be recovered."
-                        ),
-                        now=self._now(),
+                        JobState.CANCELLED,
+                        now=now,
                     )
-                    continue
-                self._complete(job, archive)
                 continue
             if outcome.kind == "completed" and job.provider_operation not in {
                 None,
                 _FINAL_OPERATION,
             }:
-                if job.state == JobState.CANCEL_REQUESTED:
-                    now = self._now()
-                    completed = self.store.mark_provider_operation_completed(
-                        job.job_id,
-                        expected_modal_call_id=job.modal_call_id or "",
-                        now=now,
-                    )
-                    if completed is not None:
-                        self.store.set_job_state(
-                            job.job_id,
-                            JobState.CANCELLED,
-                            now=now,
-                        )
-                else:
-                    await self._advance(job)
+                await self._advance(job)
                 continue
             await self._apply(job, outcome)
         await self._cleanup_intermediates()
 
+    async def _resolve_expired_cancellation(self, job: JobRecord) -> None:
+        """Resolve lost provider status without claiming cancellation succeeded."""
+        now = self._now()
+        if job.provider_operation == _FINAL_OPERATION:
+            try:
+                try:
+                    archive = await self.adapter.recover_archive(job)
+                except Exception:
+                    archive = await self.adapter.publish_archive(
+                        job,
+                        completed_at=now,
+                    )
+            except FileNotFoundError:
+                LOGGER.exception(
+                    "Final output is incomplete for cancelling job %s",
+                    job.job_id,
+                )
+            except (ArchiveNotReadyError, OSError, *_MODAL_PUBLICATION_ERRORS):
+                LOGGER.exception(
+                    "Could not yet recover final output for cancelling job %s",
+                    job.job_id,
+                )
+                return
+            except Exception:
+                LOGGER.exception(
+                    "Could not establish a final Result for cancelling job %s",
+                    job.job_id,
+                )
+            else:
+                self._complete(job, archive)
+                return
+        self.store.fail_job(
+            job.job_id,
+            error_code="compute_failed",
+            error_message=(
+                "GROMACS remote status expired before cancellation could be confirmed."
+            ),
+            now=now,
+        )
+
     async def _advance(self, job: JobRecord) -> None:
         """Attach exactly one next direct Modal stage to a durable Job."""
+        async with self.lifecycle_locks.for_job(job.job_id):
+            await self._advance_locked(job)
+
+    async def _advance_locked(self, job: JobRecord) -> None:
+        """Advance while excluding the durable cancellation transition."""
         submission_token = uuid4().hex
         now = self._now()
         claimed = self.store.claim_provider_advance(
@@ -689,6 +911,14 @@ class GromacsReconciler:
                 )
             return
 
+        stage = JobView.from_record(advanced).stage
+        LOGGER.info(
+            "event=stage_attached job_id=%s workload=gromacs stage=%s function=%s",
+            advanced.job_id,
+            stage.code if stage is not None else "none",
+            submitted.provider_operation.partition(":")[0],
+        )
+
         if advanced.state == JobState.CANCEL_REQUESTED:
             try:
                 await self.adapter.cancel(submitted.modal_call_id)
@@ -727,6 +957,10 @@ class GromacsReconciler:
             return
         if outcome.kind == "cancelled":
             self.store.set_job_state(job.job_id, JobState.CANCELLED, now=now)
+            LOGGER.info(
+                "event=job_cancelled job_id=%s workload=gromacs",
+                job.job_id,
+            )
             return
         if outcome.kind == "failed":
             self.store.fail_job(
@@ -735,37 +969,195 @@ class GromacsReconciler:
                 error_message="GROMACS could not complete the simulation.",
                 now=now,
             )
+            stage = JobView.from_record(job).stage
+            LOGGER.info(
+                "event=job_failed job_id=%s workload=gromacs stage=%s",
+                job.job_id,
+                stage.code if stage is not None else "none",
+            )
             return
 
-        self.store.set_job_state(job.job_id, JobState.FINALIZING, now=now)
+        finalizing = self.store.set_job_state(
+            job.job_id,
+            JobState.FINALIZING,
+            now=now,
+        )
+        LOGGER.info(
+            "event=finalization_started job_id=%s workload=gromacs "
+            "stage=prepare_result",
+            job.job_id,
+        )
+        await self._finalize(finalizing)
+
+    async def _finalize(self, job: JobRecord) -> None:
+        """Publish existing outputs with durable retry and blocking policy."""
+        now = self._now()
+        if job.state == JobState.BLOCKED:
+            if job.result_previous_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
+                try:
+                    recovered = await self.adapter.recover_archive(job)
+                except Exception:
+                    LOGGER.info(
+                        "Exact published Result is not yet recoverable for job %s; "
+                        "trying deterministic reconstruction",
+                        job.job_id,
+                    )
+                else:
+                    self._complete(job, recovered)
+                    return
+            job = self.store.schedule_finalization_retry(
+                job.job_id,
+                now=now,
+                next_retry_at=now,
+            )
+        completed_at = job.finalization_started_at or now
         try:
-            archive = await self.adapter.publish_archive(job, completed_at=now)
-        except ArchiveNotReadyError:
-            LOGGER.info("GROMACS archive is not visible yet for job %s", job.job_id)
+            archive = await self.adapter.publish_archive(
+                job,
+                completed_at=completed_at,
+            )
+        except ResultIdentityMismatchError:
+            LOGGER.warning(
+                "event=result_recovery_blocked job_id=%s workload=gromacs "
+                "blocking_category=result_integrity",
+                job.job_id,
+            )
+            self.store.block_job(
+                job.job_id,
+                category="result_integrity",
+                previous_state=job.result_previous_state,
+                now=now,
+                next_retry_at=now + 15 * 60,
+            )
             return
-        except _MODAL_PUBLICATION_ERRORS:
+        except _PERMANENT_FINALIZATION_ERRORS:
+            LOGGER.exception("GROMACS finalization is blocked for job %s", job.job_id)
+            self.store.block_job(
+                job.job_id,
+                category="modal_configuration",
+                now=now,
+                next_retry_at=now + 15 * 60,
+            )
+            LOGGER.info(
+                "event=finalization_blocked job_id=%s workload=gromacs "
+                "blocking_category=modal_configuration",
+                job.job_id,
+            )
+            return
+        except (ArchiveNotReadyError, *_TRANSIENT_FINALIZATION_ERRORS):
             LOGGER.exception("Modal is unavailable while publishing job %s", job.job_id)
+            self._retry_finalization(job, now=now, category="modal_unavailable")
+            return
+        except FileNotFoundError:
+            LOGGER.exception("GROMACS job %s is missing required output", job.job_id)
+            self._mark_invalid_result(job, now=now)
+            return
+        except OSError:
+            LOGGER.exception(
+                "Local Result staging is unavailable for job %s",
+                job.job_id,
+            )
+            self._retry_finalization(job, now=now, category="local_storage")
             return
         except Exception:
             LOGGER.exception("GROMACS job %s returned an invalid archive", job.job_id)
-            self.store.fail_job(
-                job.job_id,
-                error_code="result_invalid",
-                error_message="GROMACS completed, but its result archive was invalid.",
-                now=now,
-            )
+            self._mark_invalid_result(job, now=now)
             return
         self._complete(job, archive)
 
-    def _complete(self, job: JobRecord, archive: FinalArchive) -> None:
-        self.store.complete_job(
+    def _retry_finalization(
+        self,
+        job: JobRecord,
+        *,
+        now: int,
+        category: str,
+    ) -> None:
+        """Persist bounded retries for recoverable publication dependencies."""
+        retry_started_at = job.finalization_retry_started_at or now
+        if now - retry_started_at >= 30 * 60:
+            self.store.block_job(
+                job.job_id,
+                category=category,
+                now=now,
+                next_retry_at=now + 15 * 60,
+            )
+            LOGGER.info(
+                "event=finalization_blocked job_id=%s workload=gromacs "
+                "blocking_category=%s",
+                job.job_id,
+                category,
+            )
+            return
+        delay = min(15 * 60, 5 * 2**job.finalization_retry_count)
+        self.store.schedule_finalization_retry(
             job.job_id,
-            state=archive.state,
-            result_volume_name=archive.volume_name,
-            result_volume_path=archive.path,
-            result_filename=archive.filename,
-            result_size_bytes=archive.size_bytes,
-            result_sha256=archive.sha256,
-            warnings_json=archive.warnings_json,
-            now=self._now(),
+            now=now,
+            next_retry_at=now + delay,
         )
+        LOGGER.info(
+            "event=finalization_retry_scheduled job_id=%s workload=gromacs "
+            "blocking_category=%s delay_seconds=%s",
+            job.job_id,
+            category,
+            delay,
+        )
+
+    def _mark_invalid_result(self, job: JobRecord, *, now: int) -> None:
+        """Preserve an established Result identity or fail a first publication."""
+        if job.result_previous_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
+            self.store.block_job(
+                job.job_id,
+                category="result_integrity",
+                previous_state=job.result_previous_state,
+                now=now,
+                next_retry_at=now + 15 * 60,
+            )
+            return
+        self.store.fail_job(
+            job.job_id,
+            error_code="result_invalid",
+            error_message="GROMACS completed, but its result archive was invalid.",
+            now=now,
+        )
+
+    def _complete(self, job: JobRecord, archive: FinalArchive) -> None:
+        try:
+            self.store.complete_job(
+                job.job_id,
+                state=archive.state,
+                result_volume_name=archive.volume_name,
+                result_volume_path=archive.path,
+                result_filename=archive.filename,
+                result_size_bytes=archive.size_bytes,
+                result_sha256=archive.sha256,
+                warnings_json=archive.warnings_json,
+                result_cached=archive.cache_lease is not None,
+                now=self._now(),
+            )
+            LOGGER.info(
+                "event=result_published job_id=%s workload=gromacs state=%s "
+                "size_bytes=%s",
+                job.job_id,
+                archive.state.value,
+                archive.size_bytes,
+            )
+        finally:
+            if archive.cache_lease is not None:
+                archive.cache_lease.close()
+
+
+def _validate_published_archive(
+    handle: BinaryIO,
+    marker: _ResultMarker,
+    run_name: str,
+) -> None:
+    """Perform whole-file identity and ZIP checks off the event loop."""
+    handle.seek(0)
+    digest = hashlib.sha256()
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+    if digest.hexdigest() != marker.archive_sha256:
+        raise ValueError("GROMACS result archive does not match its marker")
+    validated = validate_gromacs_archive(handle, run_name=run_name)
+    if validated.request_sha256 != marker.request_sha256:
+        raise ValueError("GROMACS result archive has the wrong request identity")

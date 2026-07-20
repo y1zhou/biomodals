@@ -22,6 +22,7 @@ def _configuration(
     if config_file:
         path = tmp_path / "service.env"
         path.write_text(config_file)
+        path.chmod(0o600)
         environment["BIOMODALS_API_CONF_ENV"] = str(path)
     settings = ServiceSettings.from_environment(environment)
     store = ServiceStore(tmp_path / "state.sqlite3")
@@ -132,6 +133,15 @@ def test_admission_resolves_database_settings_inside_store_transaction(
         now=1,
         is_admin=True,
     )
+    activated = configuration.store.set_password_from_token(
+        b"token",
+        password_hash="test-hash",  # noqa: S106 - test-only hash
+        session_token_digest=b"session",
+        csrf_digest=b"csrf",
+        now=1,
+        absolute_expires_at=100,
+    )
+    assert activated is not None
     admission_configuration = configuration.admission_configuration("gromacs")
 
     configuration.update_environment(

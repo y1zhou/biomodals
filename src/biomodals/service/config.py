@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,17 @@ def _positive_integer(
     value = int(sources.value(name, str(default)))
     if value < 1:
         raise ValueError(f"{name} must be at least 1")
+    return value
+
+
+def _nonnegative_integer(
+    sources: ConfigurationSources,
+    name: str,
+    default: int,
+) -> int:
+    value = int(sources.value(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be at least 0")
     return value
 
 
@@ -105,6 +117,99 @@ def _public_url(sources: ConfigurationSources) -> str:
     return value
 
 
+def _configuration_sources(
+    environment: Mapping[str, str] | None = None,
+) -> tuple[ConfigurationSources, Path | None]:
+    """Load the private optional env file without validating unrelated values."""
+    process_environment = dict(os.environ if environment is None else environment)
+    file_environment: dict[str, str] = {}
+    configured_path = process_environment.get("BIOMODALS_API_CONF_ENV", "").strip()
+    configuration_base: Path | None = None
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"BIOMODALS_API_CONF_ENV file does not exist: {path}"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"BIOMODALS_API_CONF_ENV must name a regular file: {path}")
+        if metadata.st_uid != os.geteuid():
+            raise ValueError(
+                f"BIOMODALS_API_CONF_ENV must be owned by the service user: {path}"
+            )
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError(
+                "BIOMODALS_API_CONF_ENV must not grant group or world "
+                f"permissions: {path}"
+            )
+        path = path.resolve(strict=True)
+        configuration_base = path.parent
+        file_environment = {
+            key: value
+            for key, value in dotenv_values(path).items()
+            if value is not None
+        }
+    return ConfigurationSources(
+        process_environment, file_environment
+    ), configuration_base
+
+
+def _configured_path(
+    sources: ConfigurationSources,
+    configuration_base: Path | None,
+    name: str,
+    default: str,
+) -> Path:
+    value = Path(sources.value(name, default)).expanduser()
+    if configuration_base is not None and not value.is_absolute():
+        return configuration_base / value
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class AdminSettings:
+    """Only configuration dependencies needed by offline account commands."""
+
+    sources: ConfigurationSources = field(repr=False)
+    state_dir: Path
+
+    @classmethod
+    def from_environment(
+        cls,
+        environment: Mapping[str, str] | None = None,
+    ) -> AdminSettings:
+        """Load only the settings needed by offline administrator commands."""
+        sources, configuration_base = _configuration_sources(environment)
+        return cls(
+            sources=sources,
+            state_dir=_configured_path(
+                sources,
+                configuration_base,
+                "BIOMODALS_STATE_DIR",
+                ".biomodals/state",
+            ),
+        )
+
+    @property
+    def database_path(self) -> Path:
+        """Return the API service database path."""
+        return self.state_dir / "service.sqlite3"
+
+    def password_link_origin(self) -> str:
+        """Validate the public origin only for commands that create a link."""
+        return _public_url(self.sources)
+
+    def default_user_limit(self) -> int:
+        """Validate the default limit only when create-user actually needs it."""
+        return _nonnegative_integer(
+            self.sources,
+            "BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT",
+            2,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceSettings:
     """All host-specific settings and lower-precedence runtime defaults."""
@@ -112,7 +217,7 @@ class ServiceSettings:
     sources: ConfigurationSources = field(repr=False)
     state_dir: Path
     cache_dir: Path
-    cache_max_bytes: int
+    cache_warning_bytes: int
     public_url: str
     secure_cookies: bool
     modal_environment: str
@@ -131,27 +236,26 @@ class ServiceSettings:
         environment: Mapping[str, str] | None = None,
     ) -> ServiceSettings:
         """Load an explicit env file, then overlay the process environment."""
-        process_environment = dict(os.environ if environment is None else environment)
-        file_environment: dict[str, str] = {}
-        configured_path = process_environment.get("BIOMODALS_API_CONF_ENV", "").strip()
-        if configured_path:
-            path = Path(configured_path).expanduser()
-            if not path.is_file():
-                raise ValueError(f"BIOMODALS_API_CONF_ENV file does not exist: {path}")
-            file_environment = {
-                key: value
-                for key, value in dotenv_values(path).items()
-                if value is not None
-            }
-        sources = ConfigurationSources(process_environment, file_environment)
-        return cls(
+        sources, configuration_base = _configuration_sources(environment)
+
+        settings = cls(
             sources=sources,
-            state_dir=Path(sources.value("BIOMODALS_STATE_DIR", ".biomodals/state")),
-            cache_dir=Path(sources.value("BIOMODALS_CACHE_DIR", ".biomodals/cache")),
-            cache_max_bytes=_positive_integer(
+            state_dir=_configured_path(
                 sources,
-                "BIOMODALS_CACHE_MAX_BYTES",
-                10 * 1024**3,
+                configuration_base,
+                "BIOMODALS_STATE_DIR",
+                ".biomodals/state",
+            ),
+            cache_dir=_configured_path(
+                sources,
+                configuration_base,
+                "BIOMODALS_CACHE_DIR",
+                ".biomodals/cache",
+            ),
+            cache_warning_bytes=_positive_integer(
+                sources,
+                "BIOMODALS_CACHE_WARNING_BYTES",
+                1024**4,
             ),
             public_url=_public_url(sources),
             secure_cookies=_boolean(sources, "BIOMODALS_SECURE_COOKIES", False),
@@ -165,17 +269,17 @@ class ServiceSettings:
                 "BIOMODALS_GROMACS_APP",
                 "Gromacs",
             ),
-            gromacs_active_limit=_positive_integer(
+            gromacs_active_limit=_nonnegative_integer(
                 sources,
                 "BIOMODALS_GROMACS_ACTIVE_LIMIT",
                 2,
             ),
-            global_active_job_limit=_positive_integer(
+            global_active_job_limit=_nonnegative_integer(
                 sources,
                 "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT",
                 10,
             ),
-            default_user_active_job_limit=_positive_integer(
+            default_user_active_job_limit=_nonnegative_integer(
                 sources,
                 "BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT",
                 2,
@@ -194,6 +298,12 @@ class ServiceSettings:
                 sources.value("MODAL_TOKEN_SECRET", "").strip() or None
             ),
         )
+        public_scheme = urlsplit(settings.public_url).scheme
+        if (public_scheme == "https") != settings.secure_cookies:
+            raise ValueError(
+                "BIOMODALS_PUBLIC_URL and BIOMODALS_SECURE_COOKIES must agree"
+            )
+        return settings
 
     @property
     def database_path(self) -> Path:

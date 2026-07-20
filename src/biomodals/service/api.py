@@ -6,15 +6,16 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import AsyncIterator, Sequence
+import unicodedata
+from collections.abc import AsyncIterable, AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from biomodals.service.artifacts import (
     ArtifactCache,
@@ -30,6 +31,7 @@ from biomodals.service.auth import (
     InvalidPasswordTokenError,
     IssuedSession,
     PasswordExecutor,
+    PasswordExecutorBusyError,
     PasswordPolicyError,
     Principal,
 )
@@ -43,6 +45,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobNotCancellableError,
     JobNotFoundError,
+    JobRecord,
     JobState,
     ServiceStore,
 )
@@ -56,7 +59,7 @@ _CSRF_HEADER_DESCRIPTION = (
     "cookie set by a successful login or Password Setup."
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_ARCHIVE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip")
+_DOWNLOAD_NAME_SEPARATOR = re.compile(r"[^a-z0-9]+")
 
 
 class ErrorResponse(BaseModel):
@@ -86,7 +89,22 @@ class MutationForbiddenResponse(CodedErrorResponse):
 class PasswordErrorResponse(CodedErrorResponse):
     """Password Setup errors with distinct recovery behavior."""
 
-    code: Literal["password_link_invalid", "password_policy_rejected"]
+    code: Literal[
+        "password_link_invalid",
+        "password_policy_rejected",
+    ]
+
+
+class AuthenticationBusyResponse(CodedErrorResponse):
+    """Bounded Argon2 capacity is temporarily exhausted."""
+
+    code: Literal["authentication_busy"]
+
+
+class HealthView(BaseModel):
+    """Minimal local service probe."""
+
+    status: Literal["ok"]
 
 
 class JobNotCancellableResponse(CodedErrorResponse):
@@ -95,15 +113,47 @@ class JobNotCancellableResponse(CodedErrorResponse):
     code: Literal["job_not_cancellable"]
 
 
+class ResultPrepareConflictResponse(CodedErrorResponse):
+    """A Result cannot currently be prepared."""
+
+    code: Literal["result_invalid", "result_not_ready"]
+
+
+class ResultDownloadConflictResponse(CodedErrorResponse):
+    """A prepared Result is not currently downloadable."""
+
+    code: Literal["result_not_prepared", "result_not_ready"]
+
+
+class ResultInvalidResponse(CodedErrorResponse):
+    """A Result failed its immutable identity check."""
+
+    code: Literal["result_invalid"]
+
+
+class ResultStorageUnavailableResponse(CodedErrorResponse):
+    """Local or authoritative Result storage is temporarily unavailable."""
+
+    code: Literal["result_storage_unavailable"]
+
+
 class CodedAPIError(Exception):
     """Signal one flat coded response from a route or dependency."""
 
-    def __init__(self, status_code: int, code: str, detail: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        detail: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         """Capture the response status, stable code, and safe detail."""
         super().__init__(detail)
         self.status_code = status_code
         self.code = code
         self.detail = detail
+        self.headers = headers or {}
 
 
 class PrincipalView(BaseModel):
@@ -148,6 +198,11 @@ def model_response(model: BaseModel, *, status_code: int) -> Response:
         status_code=status_code,
         media_type="application/json",
     )
+
+
+def request_id_from(request: Request) -> str:
+    """Return the correlation ID installed before route handling."""
+    return str(getattr(request.state, "request_id", "unavailable"))
 
 
 class _RequestSizeMiddleware:
@@ -205,6 +260,38 @@ class _RequestBodyTooLarge(Exception):
     """Internal signal raised before an oversized body reaches a route."""
 
 
+class _RequestIdMiddleware:
+    """Attach one server-generated correlation identifier to every response."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_id = str(uuid4())
+        scope.setdefault("state", {})["request_id"] = request_id
+
+        async def send_with_request_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                if not any(name.lower() == b"x-request-id" for name, _ in headers):
+                    headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": headers}
+                LOGGER.info(
+                    "request_complete event=http_request request_id=%s method=%s "
+                    "path=%s status=%s",
+                    request_id,
+                    scope.get("method"),
+                    scope.get("path"),
+                    message.get("status"),
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+
+
 async def require_origin(request: Request) -> None:
     """Require the exact configured browser Origin on unsafe requests."""
     if request.headers.get("Origin") != request.app.state.allowed_origin:
@@ -251,10 +338,24 @@ def _not_found() -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
 
 
-def _document_required_csrf_header(app: FastAPI) -> None:
-    """Align OpenAPI with the custom 403 behavior for a missing CSRF header."""
+def _document_contract_headers(app: FastAPI, *, session_cookie_name: str) -> None:
+    """Align generated OpenAPI with middleware and custom CSRF behavior."""
     schema = app.openapi()
-    for path_item in schema["paths"].values():
+    components = schema.setdefault("components", {})
+    security_schemes = components.setdefault("securitySchemes", {})
+    security_schemes["SessionCookie"] = {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": session_cookie_name,
+        "description": "Opaque BioModals browser session cookie.",
+    }
+    public_operations = {
+        ("/api/v1/health", "get"),
+        ("/api/v1/ready", "get"),
+        ("/api/v1/auth/login", "post"),
+        ("/api/v1/auth/set-password", "post"),
+    }
+    for path, path_item in schema["paths"].items():
         for operation in path_item.values():
             if not isinstance(operation, dict):
                 continue
@@ -265,6 +366,20 @@ def _document_required_csrf_header(app: FastAPI) -> None:
                 ):
                     parameter["required"] = True
                     parameter["schema"] = {"type": "string"}
+            for response in operation.get("responses", {}).values():
+                response.setdefault("headers", {})["X-Request-ID"] = {
+                    "description": "Server-generated request correlation identifier.",
+                    "schema": {"type": "string", "format": "uuid"},
+                }
+        for method, operation in path_item.items():
+            if (
+                isinstance(operation, dict)
+                and method
+                in {"get", "post", "put", "patch", "delete", "options", "head"}
+                and path.startswith("/api/v1/")
+                and (path, method) not in public_operations
+            ):
+                operation["security"] = [{"SessionCookie": []}]
 
 
 def _download_headers(job_sha256: str, size_bytes: int) -> dict[str, str]:
@@ -273,6 +388,20 @@ def _download_headers(job_sha256: str, size_bytes: int) -> dict[str, str]:
         "ETag": f'"{job_sha256}"',
         "Content-Length": str(size_bytes),
     }
+
+
+def _download_filename(display_name: str) -> str:
+    """Build a friendly filename without provider paths or Job identity."""
+    ascii_name = (
+        unicodedata
+        .normalize("NFKD", display_name)
+        .encode("ascii", "ignore")
+        .decode()
+        .lower()
+    )
+    slug = _DOWNLOAD_NAME_SEPARATOR.sub("-", ascii_name).strip("-")
+    slug = slug[:120].rstrip("-")
+    return f"{slug or 'gromacs'}-results.zip"
 
 
 def _cached_archive_response(
@@ -294,7 +423,7 @@ def _cached_archive_response(
         if unit != "bytes" or not separator or not dash or "," in raw_range:
             lease.close()
             raise HTTPException(
-                status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                status.HTTP_416_RANGE_NOT_SATISFIABLE,
                 headers={"Content-Range": f"bytes */{size_bytes}"},
             )
         try:
@@ -309,13 +438,13 @@ def _cached_archive_response(
         except ValueError as exc:
             lease.close()
             raise HTTPException(
-                status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                status.HTTP_416_RANGE_NOT_SATISFIABLE,
                 headers={"Content-Range": f"bytes */{size_bytes}"},
             ) from exc
         if first < 0 or first >= size_bytes or last < first:
             lease.close()
             raise HTTPException(
-                status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                status.HTTP_416_RANGE_NOT_SATISFIABLE,
                 headers={"Content-Range": f"bytes */{size_bytes}"},
             )
         last = min(last, size_bytes - 1)
@@ -383,6 +512,14 @@ def create_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         stop = asyncio.Event()
         task: asyncio.Task[None] | None = None
+        for workload in workloads:
+            if workload.preflight is None:
+                continue
+            effective = configuration.workload(workload.name)
+            await workload.preflight(
+                effective.modal_app_name.value,
+                configuration.modal_environment().value,
+            )
         if any(workload.reconciler is not None for workload in workloads):
             task = asyncio.create_task(
                 reconciliation_loop(
@@ -392,20 +529,34 @@ def create_app(
                 ),
                 name="biomodals-job-reconciler",
             )
+        if cache is not None:
+            store.reconcile_result_cache(await cache.cached_job_ids_async())
+        _app.state.reconciler_task = task
+        _app.state.ready = True
+        LOGGER.info("event=readiness_changed ready=true")
         try:
             yield
         finally:
+            _app.state.ready = False
+            LOGGER.info("event=readiness_changed ready=false")
             stop.set()
             try:
                 if task is not None:
                     await task
             finally:
-                await password_executor.shutdown()
+                try:
+                    await password_executor.shutdown()
+                finally:
+                    if cache is not None:
+                        await cache.shutdown()
 
     app = FastAPI(
         title="Biomodals API",
         version="1.0.0",
         lifespan=lifespan,
+        responses={
+            status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
+        },
     )
     app.state.store = store
     app.state.auth = auth
@@ -414,13 +565,35 @@ def create_app(
     app.state.session_cookie_name = session_cookie_name
     app.state.workloads = registrations
     app.state.cache = cache
+    app.state.ready = False
+    app.state.reconciler_task = None
 
     @app.exception_handler(CodedAPIError)
     async def coded_api_error(_request: Request, exc: CodedAPIError) -> Response:
-        return model_response(
+        response = model_response(
             CodedErrorResponse(code=exc.code, detail=exc.detail),
             status_code=exc.status_code,
         )
+        response.headers.update(exc.headers)
+        return response
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> Response:
+        request_id = request_id_from(request)
+        LOGGER.exception(
+            "request_complete event=http_request request_id=%s method=%s "
+            "path=%s status=500",
+            request_id,
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
+        response = model_response(
+            ErrorResponse(detail="Internal Server Error"),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
 
     app.add_middleware(
         _RequestSizeMiddleware,
@@ -429,6 +602,7 @@ def create_app(
             default=1024 * 1024,
         ),
     )
+    app.add_middleware(_RequestIdMiddleware)
 
     def session_response(issued: IssuedSession) -> Response:
         response = model_response(
@@ -455,9 +629,27 @@ def create_app(
         )
         return response
 
-    @app.get("/api/v1/health", include_in_schema=False)
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    @app.get("/api/v1/health", response_model=HealthView, tags=["operations"])
+    async def health() -> HealthView:
+        return HealthView(status="ok")
+
+    @app.get(
+        "/api/v1/ready",
+        response_model=HealthView,
+        tags=["operations"],
+        responses={503: {"model": ErrorResponse}},
+    )
+    async def ready(request: Request) -> HealthView:
+        task: asyncio.Task[None] | None = request.app.state.reconciler_task
+        try:
+            if not request.app.state.ready or (task is not None and task.done()):
+                raise RuntimeError("Background service is unavailable")
+            store.check_ready()
+            if cache is not None:
+                await cache.check_ready_async()
+        except Exception as exc:
+            raise HTTPException(503, "Service is not ready") from exc
+        return HealthView(status="ok")
 
     @app.post(
         "/api/v1/auth/login",
@@ -476,6 +668,15 @@ def create_app(
             },
             status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
             status.HTTP_403_FORBIDDEN: {"model": OriginErrorResponse},
+            status.HTTP_503_SERVICE_UNAVAILABLE: {
+                "model": AuthenticationBusyResponse,
+                "headers": {
+                    "Retry-After": {
+                        "description": "Seconds before retrying authentication.",
+                        "schema": {"type": "integer"},
+                    }
+                },
+            },
         },
     )
     async def login(request: Request, credentials: LoginRequest) -> Response:
@@ -489,6 +690,13 @@ def create_app(
         except InvalidCredentialsError as exc:
             LOGGER.warning("Rejected login attempt")
             raise HTTPException(401, "Invalid email or password") from exc
+        except PasswordExecutorBusyError as exc:
+            raise CodedAPIError(
+                503,
+                "authentication_busy",
+                "Authentication is temporarily busy; try again shortly",
+                headers={"Retry-After": "1"},
+            ) from exc
         return session_response(issued)
 
     @app.post(
@@ -508,6 +716,15 @@ def create_app(
             },
             status.HTTP_400_BAD_REQUEST: {"model": PasswordErrorResponse},
             status.HTTP_403_FORBIDDEN: {"model": OriginErrorResponse},
+            status.HTTP_503_SERVICE_UNAVAILABLE: {
+                "model": AuthenticationBusyResponse,
+                "headers": {
+                    "Retry-After": {
+                        "description": "Seconds before retrying authentication.",
+                        "schema": {"type": "integer"},
+                    }
+                },
+            },
         },
     )
     async def set_password(
@@ -532,6 +749,13 @@ def create_app(
                 status.HTTP_400_BAD_REQUEST,
                 "password_link_invalid",
                 "Password link is invalid or expired",
+            ) from exc
+        except PasswordExecutorBusyError as exc:
+            raise CodedAPIError(
+                503,
+                "authentication_busy",
+                "Authentication is temporarily busy; try again shortly",
+                headers={"Retry-After": "1"},
             ) from exc
         return session_response(issued)
 
@@ -560,8 +784,20 @@ def create_app(
         token = request.cookies[session_cookie_name]
         auth.logout(token)
         response = Response(status_code=status.HTTP_204_NO_CONTENT)
-        response.delete_cookie(session_cookie_name, path="/")
-        response.delete_cookie(CSRF_COOKIE, path="/")
+        response.delete_cookie(
+            session_cookie_name,
+            path="/",
+            secure=secure_cookies,
+            httponly=True,
+            samesite="lax",
+        )
+        response.delete_cookie(
+            CSRF_COOKIE,
+            path="/",
+            secure=secure_cookies,
+            httponly=False,
+            samesite="lax",
+        )
         return response
 
     @app.get(
@@ -609,27 +845,42 @@ def create_app(
         },
     )
     async def cancel_job(
+        request: Request,
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
     ) -> JobView:
         existing = store.get_job(session.principal.user_id, job_id)
         if existing is None:
             raise _not_found()
-        try:
-            job = store.request_cancel(
-                session.principal.user_id,
-                job_id,
-                now=int(time.time()),
-            )
-        except JobNotFoundError as exc:
-            raise _not_found() from exc
-        except JobNotCancellableError as exc:
-            raise CodedAPIError(
-                status.HTTP_409_CONFLICT,
-                "job_not_cancellable",
-                str(exc),
-            ) from exc
-        registration = registrations.get(job.workload)
+        registration = registrations.get(existing.workload)
+        lifecycle_lock = (
+            registration.lifecycle_locks.for_job(job_id)
+            if registration is not None
+            else asyncio.Lock()
+        )
+        async with lifecycle_lock:
+            try:
+                job = store.request_cancel(
+                    session.principal.user_id,
+                    job_id,
+                    now=int(time.time()),
+                )
+            except JobNotFoundError as exc:
+                raise _not_found() from exc
+            except JobNotCancellableError as exc:
+                raise CodedAPIError(
+                    status.HTTP_409_CONFLICT,
+                    "job_not_cancellable",
+                    str(exc),
+                ) from exc
+        stage = JobView.from_record(job).stage
+        LOGGER.info(
+            "event=cancellation_requested job_id=%s workload=%s stage=%s request_id=%s",
+            job.job_id,
+            job.workload,
+            stage.code if stage is not None else "none",
+            request_id_from(request),
+        )
         if (
             job.modal_call_id is not None
             and registration is not None
@@ -640,6 +891,122 @@ def create_app(
             except Exception:
                 LOGGER.exception("Could not yet cancel job %s", job.job_id)
         return JobView.from_record(job)
+
+    async def prepare_cached_artifact(job: JobRecord) -> None:
+        if (
+            job.result_size_bytes is None
+            or type(job.result_size_bytes) is not int
+            or job.result_size_bytes < 1
+            or job.result_sha256 is None
+            or _SHA256.fullmatch(job.result_sha256) is None
+        ):
+            raise CodedAPIError(
+                409,
+                "result_invalid",
+                "Result archive metadata is invalid",
+            )
+        if cache is None:
+            raise CodedAPIError(
+                503,
+                "result_storage_unavailable",
+                "Result storage is temporarily unavailable",
+            )
+        try:
+            existing = await cache.acquire_async(
+                str(job.job_id),
+                size_bytes=job.result_size_bytes,
+                sha256=job.result_sha256,
+            )
+        except ArtifactIntegrityError as exc:
+            raise CodedAPIError(
+                409,
+                "result_invalid",
+                "Result archive metadata is invalid",
+            ) from exc
+        if existing is not None:
+            try:
+                store.set_result_cached(job.job_id, cached=True)
+            finally:
+                existing.close()
+            return
+        store.set_result_cached(job.job_id, cached=False)
+        registration = registrations.get(job.workload)
+        if registration is None or registration.read_artifact is None:
+            raise CodedAPIError(
+                503,
+                "result_storage_unavailable",
+                "Result storage is temporarily unavailable",
+            )
+        result_size_bytes = job.result_size_bytes
+        result_sha256 = job.result_sha256
+
+        async def fill(chunks: AsyncIterable[bytes]) -> ArtifactLease:
+            return await cache.store(
+                str(job.job_id),
+                size_bytes=result_size_bytes,
+                sha256=result_sha256,
+                chunks=chunks,
+            )
+
+        try:
+            try:
+                cached = await fill(registration.read_artifact(job))
+            except (ArtifactIntegrityError, FileNotFoundError):
+                if registration.rebuild_artifact is None:
+                    raise
+                cached = await fill(registration.rebuild_artifact(job))
+        except (ArtifactIntegrityError, FileNotFoundError, ValueError) as exc:
+            LOGGER.exception("Artifact integrity failure for job %s", job.job_id)
+            store.block_job(
+                job.job_id,
+                category="result_integrity",
+                previous_state=job.state,
+                now=int(time.time()),
+                next_retry_at=int(time.time()) + 15 * 60,
+            )
+            raise CodedAPIError(
+                409,
+                "result_invalid",
+                "Result archive failed verification",
+            ) from exc
+        except Exception as exc:
+            LOGGER.exception("Could not restore artifact for job %s", job.job_id)
+            raise CodedAPIError(
+                503,
+                "result_storage_unavailable",
+                "Result storage is temporarily unavailable",
+            ) from exc
+        try:
+            store.set_result_cached(job.job_id, cached=True)
+        finally:
+            cached.close()
+
+    @app.post(
+        "/api/v1/jobs/{job_id}/prepare-download",
+        status_code=status.HTTP_204_NO_CONTENT,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": MutationForbiddenResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ResultPrepareConflictResponse},
+            503: {"model": ResultStorageUnavailableResponse},
+        },
+    )
+    async def prepare_download(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
+    ) -> Response:
+        job = store.get_job(session.principal.user_id, job_id)
+        if job is None:
+            raise _not_found()
+        if job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}:
+            raise CodedAPIError(
+                409,
+                "result_not_ready",
+                f"Job is {job.state.value}",
+            )
+        await prepare_cached_artifact(job)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get(
         "/api/v1/jobs/{job_id}/download",
@@ -683,6 +1050,20 @@ def create_app(
                     }
                 },
             },
+            status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+            status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+            status.HTTP_409_CONFLICT: {"model": ResultDownloadConflictResponse},
+            status.HTTP_416_RANGE_NOT_SATISFIABLE: {
+                "model": ErrorResponse,
+                "description": "The requested byte range is invalid.",
+                "headers": {
+                    "Content-Range": {
+                        "description": "Unsatisfied range and complete archive size.",
+                        "schema": {"type": "string"},
+                    }
+                },
+            },
+            status.HTTP_502_BAD_GATEWAY: {"model": ResultInvalidResponse},
         },
     )
     async def download_job(
@@ -694,62 +1075,49 @@ def create_app(
         if job is None:
             raise _not_found()
         if job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}:
-            raise HTTPException(409, f"Job is {job.state.value}")
+            raise CodedAPIError(
+                409,
+                "result_not_ready",
+                f"Job is {job.state.value}",
+            )
         if (
-            job.result_filename is None
-            or _ARCHIVE_FILENAME.fullmatch(job.result_filename) is None
-            or job.result_size_bytes is None
+            job.result_size_bytes is None
             or type(job.result_size_bytes) is not int
             or job.result_size_bytes < 1
             or job.result_sha256 is None
             or _SHA256.fullmatch(job.result_sha256) is None
         ):
-            raise HTTPException(502, "Result archive is unavailable")
+            raise CodedAPIError(
+                502,
+                "result_invalid",
+                "Result archive is unavailable",
+            )
         if cache is not None:
             try:
-                cached = cache.acquire(
+                cached = await cache.acquire_async(
                     str(job.job_id),
                     size_bytes=job.result_size_bytes,
                     sha256=job.result_sha256,
                 )
             except ArtifactIntegrityError as exc:
-                raise HTTPException(502, "Result archive metadata is invalid") from exc
+                raise CodedAPIError(
+                    502,
+                    "result_invalid",
+                    "Result archive metadata is invalid",
+                ) from exc
             if cached is not None:
                 return _cached_archive_response(
                     request,
                     lease=cached,
-                    filename=job.result_filename,
+                    filename=_download_filename(job.display_name),
                     sha256=job.result_sha256,
                     size_bytes=job.result_size_bytes,
                 )
-
-        registration = registrations.get(job.workload)
-        if registration is None or registration.read_artifact is None:
-            raise HTTPException(503, "Result storage is temporarily unavailable")
-        if cache is None:  # guarded during app construction for registered workloads
-            raise HTTPException(503, "Result storage is temporarily unavailable")
-        chunks = registration.read_artifact(job)
-        try:
-            cached = await cache.store(
-                str(job.job_id),
-                size_bytes=job.result_size_bytes,
-                sha256=job.result_sha256,
-                chunks=chunks,
-            )
-        except ArtifactIntegrityError as exc:
-            LOGGER.exception("Artifact integrity failure for job %s", job.job_id)
-            raise HTTPException(502, "Result archive failed verification") from exc
-        except Exception as exc:
-            LOGGER.exception("Could not restore artifact for job %s", job.job_id)
-            raise HTTPException(
-                503, "Result storage is temporarily unavailable"
-            ) from exc
-        return _cached_archive_response(
-            request,
-            lease=cached,
-            filename=job.result_filename,
-            sha256=job.result_sha256,
-            size_bytes=job.result_size_bytes,
+        store.set_result_cached(job.job_id, cached=False)
+        raise CodedAPIError(
+            409,
+            "result_not_prepared",
+            "Prepare the result download before fetching it",
         )
 
     for workload in workloads:
@@ -757,7 +1125,7 @@ def create_app(
     from biomodals.service.admin_api import create_admin_router
 
     app.include_router(create_admin_router())
-    _document_required_csrf_header(app)
+    _document_contract_headers(app, session_cookie_name=session_cookie_name)
     return app
 
 
@@ -771,26 +1139,29 @@ def create_deployed_app() -> FastAPI:
         ModalGromacsAdapter,
         create_registration,
     )
+    from biomodals.service.jobs import JobLifecycleLocks
 
     store = ServiceStore(settings.database_path)
     store.initialize()
     configuration = RuntimeConfiguration(store, settings)
     auth = AuthService(store, frontend_url=settings.public_url)
     gromacs_configuration = configuration.workload("gromacs")
+    cache = ArtifactCache(settings.cache_dir / "results")
     adapter = ModalGromacsAdapter(
         app_name=gromacs_configuration.modal_app_name.value,
         environment_name=configuration.modal_environment().value,
+        artifact_cache=cache,
     )
+    lifecycle_locks = JobLifecycleLocks()
     registration = create_registration(
         adapter,
         reconciler=GromacsReconciler(
             store,
             adapter,
+            lifecycle_locks=lifecycle_locks,
             intermediate_retention_days=settings.intermediate_retention_days,
         ),
-    )
-    cache = ArtifactCache(
-        settings.cache_dir / "results", max_bytes=settings.cache_max_bytes
+        lifecycle_locks=lifecycle_locks,
     )
     return create_app(
         store=store,

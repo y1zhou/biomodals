@@ -29,6 +29,7 @@ SESSION_ABSOLUTE_LIFETIME_SECONDS = 90 * 24 * 60 * 60
 MIN_PASSWORD_CHARACTERS = 15
 MAX_PASSWORD_CHARACTERS = 128
 PASSWORD_WORKER_COUNT = 2
+PASSWORD_QUEUE_COUNT = 8
 
 _T = TypeVar("_T")
 
@@ -61,15 +62,27 @@ class PasswordPolicyError(ValueError):
     """Raised when a proposed password does not meet the local policy."""
 
 
+class PasswordExecutorBusyError(RuntimeError):
+    """Raised when both password workers and their bounded queue are full."""
+
+
 class PasswordExecutor:
     """Keep expensive password operations off the API event loop."""
 
-    def __init__(self, *, workers: int = PASSWORD_WORKER_COUNT) -> None:
+    def __init__(
+        self,
+        *,
+        workers: int = PASSWORD_WORKER_COUNT,
+        queued: int = PASSWORD_QUEUE_COUNT,
+    ) -> None:
         """Create a fixed-size pool and matching cross-loop capacity gate."""
         if workers < 1:
             raise ValueError("Password worker count must be positive")
+        if queued < 0:
+            raise ValueError("Password queue count must be non-negative")
         self._workers = workers
-        self._capacity = BoundedSemaphore(workers)
+        self._capacity_slots = workers + queued
+        self._capacity = BoundedSemaphore(self._capacity_slots)
         self._state_lock = Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=workers,
@@ -85,9 +98,8 @@ class PasswordExecutor:
     ) -> _T:
         """Run one operation while bounding active and queued password work."""
         self._ensure_open()
-        while not self._capacity.acquire(blocking=False):
-            self._ensure_open()
-            await asyncio.sleep(0.01)
+        if not self._capacity.acquire(blocking=False):
+            raise PasswordExecutorBusyError("Authentication service is busy")
         try:
             self._ensure_open()
             future = self._executor.submit(
@@ -108,7 +120,7 @@ class PasswordExecutor:
             if self._closed:
                 return
             self._closed = True
-        for _ in range(self._workers):
+        for _ in range(self._capacity_slots):
             while not self._capacity.acquire(blocking=False):
                 await asyncio.sleep(0.01)
         self._executor.shutdown(wait=True, cancel_futures=True)
@@ -149,6 +161,14 @@ class IssuedSession:
 
 
 @dataclass(frozen=True, slots=True)
+class IssuedPasswordLink:
+    """One-time URL and its non-secret absolute expiry."""
+
+    url: str
+    expires_at: int
+
+
+@dataclass(frozen=True, slots=True)
 class AuthenticatedSession:
     """Authenticated request context with a digest for CSRF validation."""
 
@@ -182,7 +202,7 @@ class AuthService:
         display_name: str,
         is_admin: bool = False,
         active_job_limit: int = 2,
-    ) -> str:
+    ) -> IssuedPasswordLink:
         """Provision a user and return a one-hour password setup link."""
         normalized_email = _normalize_email(email)
         normalized_name = display_name.strip()
@@ -190,39 +210,44 @@ class AuthService:
             raise ValueError("Display name is required")
         token = _new_token()
         now = self._now()
+        expires_at = now + PASSWORD_TOKEN_LIFETIME_SECONDS
         self.store.create_user(
             email=normalized_email,
             display_name=normalized_name,
             token_digest=_token_digest(token),
-            token_expires_at=now + PASSWORD_TOKEN_LIFETIME_SECONDS,
+            token_expires_at=expires_at,
             now=now,
             is_admin=is_admin,
             active_job_limit=active_job_limit,
         )
-        return self._password_link(token)
+        return IssuedPasswordLink(self._password_link(token), expires_at)
 
-    def create_password_reset(self, email: str) -> str:
+    def create_password_reset(self, email: str) -> IssuedPasswordLink:
         """Replace prior reset links and return a one-hour password link."""
         user = self.store.get_user_by_email(_normalize_email(email))
-        if user is None or not user.active:
-            raise UserNotFoundError("Active user not found")
+        if user is None or user.status.value == "disabled":
+            raise UserNotFoundError("Enabled or pending-setup user not found")
         token = _new_token()
+        expires_at = self._now() + PASSWORD_TOKEN_LIFETIME_SECONDS
         self.store.issue_password_token(
             user.user_id,
             token_digest=_token_digest(token),
-            expires_at=self._now() + PASSWORD_TOKEN_LIFETIME_SECONDS,
+            expires_at=expires_at,
         )
-        return self._password_link(token)
+        return IssuedPasswordLink(self._password_link(token), expires_at)
 
     def set_password(self, token: str, password: str) -> IssuedSession:
         """Replace credentials and issue one fresh browser session."""
         _validate_password(password)
+        now = self._now()
+        token_digest = _token_digest(token)
+        if not self.store.password_token_is_valid(token_digest, now=now):
+            raise InvalidPasswordTokenError("Password link is invalid or expired")
         password_hash = self._password_hash.hash(password)
         session_token = _new_token()
         csrf_token = _new_token()
-        now = self._now()
         user = self.store.set_password_from_token(
-            _token_digest(token),
+            token_digest,
             password_hash=password_hash,
             session_token_digest=_token_digest(session_token),
             csrf_digest=_token_digest(csrf_token),

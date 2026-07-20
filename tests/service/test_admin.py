@@ -17,11 +17,16 @@ runner = CliRunner()
 def _configure(monkeypatch, tmp_path) -> ServiceStore:
     monkeypatch.setenv("BIOMODALS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("BIOMODALS_PUBLIC_URL", "https://biomodals.internal")
+    monkeypatch.setenv("BIOMODALS_SECURE_COOKIES", "true")
     return ServiceStore(tmp_path / "state" / "service.sqlite3")
 
 
 def _token(link: str) -> str:
     return parse_qs(urlsplit(link).fragment)["token"][0]
+
+
+def _link(output: str) -> str:
+    return output.splitlines()[0]
 
 
 def test_create_user_prints_setup_link_once(monkeypatch, tmp_path) -> None:
@@ -42,9 +47,10 @@ def test_create_user_prints_setup_link_once(monkeypatch, tmp_path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    link = result.output.strip()
+    link = _link(result.output)
     assert link.startswith("https://biomodals.internal/set-password#token=")
     assert result.output.count(link) == 1
+    assert result.output.splitlines()[1].startswith("Expires at: ")
     user = store.get_user_by_email("scientist@example.com")
     assert user is not None
     assert user.display_name == "A Scientist"
@@ -88,7 +94,7 @@ def test_reset_password_replaces_prior_link(monkeypatch, tmp_path) -> None:
             "--admin",
         ],
     )
-    first_link = created.output.strip()
+    first_link = _link(created.output)
 
     reset = runner.invoke(
         app,
@@ -96,7 +102,7 @@ def test_reset_password_replaces_prior_link(monkeypatch, tmp_path) -> None:
     )
 
     assert reset.exit_code == 0, reset.output
-    second_link = reset.output.strip()
+    second_link = _link(reset.output)
     assert second_link != first_link
     assert reset.output.count(second_link) == 1
     auth = AuthService(store, frontend_url="https://biomodals.internal")
@@ -133,7 +139,7 @@ def test_disable_user_revokes_access(monkeypatch, tmp_path) -> None:
         ],
     )
     auth = AuthService(store, frontend_url="https://biomodals.internal")
-    auth.set_password(_token(created.output.strip()), "a long unique passphrase")
+    auth.set_password(_token(_link(created.output)), "a long unique passphrase")
     session = auth.login("scientist@example.com", "a long unique passphrase")
 
     result = runner.invoke(
@@ -146,6 +152,39 @@ def test_disable_user_revokes_access(monkeypatch, tmp_path) -> None:
     assert auth.authenticate(session.session_token) is None
 
 
+def test_offline_account_commands_ignore_unrelated_invalid_server_settings(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Emergency account changes depend only on their narrow local settings."""
+    store = _configure(monkeypatch, tmp_path)
+    created = runner.invoke(
+        app,
+        [
+            "api",
+            "admin",
+            "create-user",
+            "admin@example.com",
+            "--display-name",
+            "Admin",
+            "--admin",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+    monkeypatch.setenv("BIOMODALS_GROMACS_ACTIVE_LIMIT", "not-an-integer")
+    monkeypatch.setenv("BIOMODALS_CACHE_WARNING_BYTES", "also-invalid")
+
+    result = runner.invoke(
+        app,
+        ["api", "admin", "disable-user", "admin@example.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "Disabled admin@example.com\n"
+    user = store.get_user_by_email("admin@example.com")
+    assert user is not None and user.status.value == "disabled"
+
+
 def test_unknown_user_reports_clean_error(monkeypatch, tmp_path) -> None:
     """Expected administration errors are concise and omit tracebacks."""
     _configure(monkeypatch, tmp_path)
@@ -156,7 +195,7 @@ def test_unknown_user_reports_clean_error(monkeypatch, tmp_path) -> None:
     )
 
     assert result.exit_code == 1
-    assert result.output == "Error: Active user not found\n"
+    assert result.output == "Error: Enabled or pending-setup user not found\n"
 
 
 def test_cli_promotes_and_demotes_without_removing_last_admin(
@@ -189,6 +228,9 @@ def test_cli_promotes_and_demotes_without_removing_last_admin(
         ],
     )
     assert first.exit_code == second.exit_code == 0
+    auth = AuthService(store, frontend_url="https://biomodals.internal")
+    auth.set_password(_token(_link(first.output)), "first long unique passphrase")
+    auth.set_password(_token(_link(second.output)), "second long unique passphrase")
 
     refused = runner.invoke(
         app,

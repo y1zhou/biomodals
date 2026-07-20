@@ -12,6 +12,7 @@ from biomodals.service.auth import (
     AuthService,
     InvalidCredentialsError,
     InvalidPasswordTokenError,
+    IssuedPasswordLink,
     PasswordPolicyError,
 )
 from biomodals.service.store import ServiceStore
@@ -25,8 +26,8 @@ class Clock:
         return self.now
 
 
-def reset_token(link: str) -> str:
-    fragment = parse_qs(urlparse(link).fragment)
+def reset_token(link: IssuedPasswordLink) -> str:
+    fragment = parse_qs(urlparse(link.url).fragment)
     return fragment["token"][0]
 
 
@@ -137,10 +138,14 @@ def test_reset_and_disable_revoke_all_sessions(tmp_path: Path) -> None:
     clock = Clock()
     auth, _store = make_auth(tmp_path, clock)
     activated_user(auth)
-    auth.create_user(
+    backup_link = auth.create_user(
         "backup-admin@example.com",
         display_name="Backup Admin",
         is_admin=True,
+    )
+    auth.set_password(
+        reset_token(backup_link),
+        "backup correct horse passphrase",
     )
     first = auth.login("alice@example.com", "correct horse battery staple")
     second = auth.login("alice@example.com", "correct horse battery staple")

@@ -780,6 +780,7 @@ def test_route_lifecycle_logs_share_the_response_request_id(
 
 def test_unhandled_errors_keep_the_request_id_for_support_correlation(
     tmp_path: Path,
+    caplog,
 ) -> None:
     client, _auth, _store, _adapter = _service(tmp_path)
 
@@ -799,12 +800,19 @@ def test_unhandled_errors_keep_the_request_id_for_support_correlation(
         ) as browser:
             return await browser.get("/api/v1/test-crash")
 
-    response = asyncio.run(scenario())
+    with caplog.at_level(logging.INFO):
+        response = asyncio.run(scenario())
 
     assert response.status_code == 500
     assert response.json() == {"detail": "Internal Server Error"}
     assert UUID(response.headers["x-request-id"])
     assert "private diagnostic detail" not in response.text
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("event=unhandled_exception" in message for message in messages) == 1
+    assert (
+        sum("request_complete event=http_request" in message for message in messages)
+        == 1
+    )
 
 
 def test_health_is_live_before_startup_and_ready_is_local_after_preflight(
@@ -933,7 +941,7 @@ def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> No
     client, _auth, _store, _adapter = _service(tmp_path)
     schema = client.get("/openapi.json").json()
     expected = {
-        ("/api/v1/auth/login", "post"): {"401", "403", "422"},
+        ("/api/v1/auth/login", "post"): {"401", "403", "413", "422"},
         ("/api/v1/auth/set-password", "post"): {"400", "403", "422"},
         ("/api/v1/auth/me", "get"): {"401"},
         ("/api/v1/auth/logout", "post"): {"401", "403"},

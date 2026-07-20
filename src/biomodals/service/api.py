@@ -75,6 +75,12 @@ class CodedErrorResponse(ErrorResponse):
     code: str
 
 
+class PayloadTooLargeResponse(CodedErrorResponse):
+    """Request body exceeded the service-wide parsing limit."""
+
+    code: Literal["payload_too_large"]
+
+
 class OriginErrorResponse(CodedErrorResponse):
     """Browser origin rejected before an unsafe request."""
 
@@ -280,14 +286,16 @@ class _RequestIdMiddleware:
                 if not any(name.lower() == b"x-request-id" for name, _ in headers):
                     headers.append((b"x-request-id", request_id.encode("ascii")))
                 message = {**message, "headers": headers}
-                LOGGER.info(
-                    "request_complete event=http_request request_id=%s method=%s "
-                    "path=%s status=%s",
-                    request_id,
-                    scope.get("method"),
-                    scope.get("path"),
-                    message.get("status"),
-                )
+                if not scope["state"].get("completion_logged"):
+                    LOGGER.info(
+                        "request_complete event=http_request request_id=%s "
+                        "method=%s path=%s status=%s",
+                        request_id,
+                        scope.get("method"),
+                        scope.get("path"),
+                        message.get("status"),
+                    )
+                    scope["state"]["completion_logged"] = True
             await send(message)
 
         await self.app(scope, receive, send_with_request_id)
@@ -556,6 +564,7 @@ def create_app(
         version="1.0.0",
         lifespan=lifespan,
         responses={
+            status.HTTP_413_CONTENT_TOO_LARGE: {"model": PayloadTooLargeResponse},
             status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
         },
     )
@@ -582,13 +591,20 @@ def create_app(
     async def unexpected_error(request: Request, exc: Exception) -> Response:
         request_id = request_id_from(request)
         LOGGER.exception(
-            "request_complete event=http_request request_id=%s method=%s "
-            "path=%s status=500",
+            "event=unhandled_exception request_id=%s method=%s path=%s status=500",
             request_id,
             request.method,
             request.url.path,
             exc_info=exc,
         )
+        LOGGER.info(
+            "request_complete event=http_request request_id=%s method=%s "
+            "path=%s status=500",
+            request_id,
+            request.method,
+            request.url.path,
+        )
+        request.scope["state"]["completion_logged"] = True
         response = model_response(
             ErrorResponse(detail="Internal Server Error"),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

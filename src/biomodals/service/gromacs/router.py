@@ -30,6 +30,7 @@ from biomodals.service.api import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
+    PayloadTooLargeResponse,
     request_id_from,
     require_unsafe_session,
 )
@@ -112,12 +113,6 @@ class SubmissionConflictResponse(CodedErrorResponse):
     """Submission conflicts with idempotency or active-job state."""
 
     code: Literal["idempotency_conflict", "active_job_limit_reached"]
-
-
-class PayloadTooLargeResponse(CodedErrorResponse):
-    """Submission exceeded the configured request boundary."""
-
-    code: Literal["payload_too_large"]
 
 
 class ComputeUnavailableResponse(CodedErrorResponse):

@@ -689,7 +689,10 @@ def create_app(
                 credentials.password,
             )
         except InvalidCredentialsError as exc:
-            LOGGER.warning("Rejected login attempt")
+            LOGGER.warning(
+                "Rejected login attempt request_id=%s",
+                request_id_from(request),
+            )
             raise HTTPException(401, "Invalid email or password") from exc
         except PasswordExecutorBusyError as exc:
             raise CodedAPIError(
@@ -890,10 +893,14 @@ def create_app(
             try:
                 await registration.cancel(job)
             except Exception:
-                LOGGER.exception("Could not yet cancel job %s", job.job_id)
+                LOGGER.exception(
+                    "Could not yet cancel job %s request_id=%s",
+                    job.job_id,
+                    request_id_from(request),
+                )
         return JobView.from_record(job)
 
-    async def prepare_cached_artifact(job: JobRecord) -> None:
+    async def prepare_cached_artifact(job: JobRecord, *, request_id: str) -> None:
         if (
             job.result_size_bytes is None
             or type(job.result_size_bytes) is not int
@@ -963,7 +970,11 @@ def create_app(
                     raise
                 cached = await fill(registration.rebuild_artifact(job))
         except (ArtifactIntegrityError, ArtifactSourceMissingError, ValueError) as exc:
-            LOGGER.exception("Artifact integrity failure for job %s", job.job_id)
+            LOGGER.exception(
+                "Artifact integrity failure for job %s request_id=%s",
+                job.job_id,
+                request_id,
+            )
             store.block_job(
                 job.job_id,
                 category="result_integrity",
@@ -977,7 +988,11 @@ def create_app(
                 "Result archive failed verification",
             ) from exc
         except Exception as exc:
-            LOGGER.exception("Could not restore artifact for job %s", job.job_id)
+            LOGGER.exception(
+                "Could not restore artifact for job %s request_id=%s",
+                job.job_id,
+                request_id,
+            )
             raise CodedAPIError(
                 503,
                 "result_storage_unavailable",
@@ -1000,6 +1015,7 @@ def create_app(
         },
     )
     async def prepare_download(
+        request: Request,
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
     ) -> Response:
@@ -1012,7 +1028,7 @@ def create_app(
                 "result_not_ready",
                 f"Job is {job.state.value}",
             )
-        await prepare_cached_artifact(job)
+        await prepare_cached_artifact(job, request_id=request_id_from(request))
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get(

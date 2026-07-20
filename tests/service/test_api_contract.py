@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -746,6 +747,35 @@ def test_every_response_has_request_id_and_openapi_declares_session_cookie(
     assert "security" not in schema["paths"]["/api/v1/health"]["get"]
     for response in schema["paths"]["/api/v1/jobs"]["get"]["responses"].values():
         assert response["headers"]["X-Request-ID"]["schema"]["format"] == "uuid"
+
+
+def test_route_lifecycle_logs_share_the_response_request_id(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+
+    with caplog.at_level(logging.INFO):
+        response = client.patch(
+            "/api/v1/admin/modal/tools/gromacs",
+            headers=_unsafe_headers(csrf_token),
+            json={"active_job_limit": 3},
+        )
+
+    request_id = response.headers["x-request-id"]
+    lifecycle_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=runtime_setting_changed" in record.getMessage()
+    ]
+
+    assert UUID(request_id)
+    assert lifecycle_records == [
+        "event=runtime_setting_changed scope=tool workload=gromacs "
+        f"fields=active_job_limit request_id={request_id}"
+    ]
 
 
 def test_unhandled_errors_keep_the_request_id_for_support_correlation(

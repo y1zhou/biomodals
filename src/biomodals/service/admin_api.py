@@ -15,6 +15,7 @@ from biomodals.service.api import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
+    request_id_from,
     require_session,
     require_unsafe_session,
 )
@@ -522,9 +523,10 @@ def create_admin_router() -> APIRouter:
         store: ServiceStore = request.app.state.store
         store.mark_result_cache_cleared(result.job_ids)
         LOGGER.info(
-            "event=result_cache_cleared entries=%s bytes=%s",
+            "event=result_cache_cleared entries=%s bytes=%s request_id=%s",
             result.entries,
             result.bytes,
+            request_id_from(request),
         )
         return AdminCacheCleanupView(
             removed_entries=result.entries,
@@ -575,7 +577,10 @@ def create_admin_router() -> APIRouter:
                     ).modal_app_name.value
                     await registration.preflight(app_name, candidate_environment)
             except Exception as exc:
-                LOGGER.exception("Modal Environment preflight failed")
+                LOGGER.exception(
+                    "Modal Environment preflight failed request_id=%s",
+                    request_id_from(request),
+                )
                 raise CodedAPIError(
                     400,
                     "modal_preflight_failed",
@@ -590,8 +595,10 @@ def create_admin_router() -> APIRouter:
         except ValueError as exc:
             raise CodedAPIError(400, "setting_invalid", str(exc)) from exc
         LOGGER.info(
-            "event=runtime_setting_changed scope=modal_environment fields=%s",
+            "event=runtime_setting_changed scope=modal_environment fields=%s "
+            "request_id=%s",
             ",".join(sorted(submission.model_fields_set)),
+            request_id_from(request),
         )
         return _modal_view(configuration, request.app.state.store).environment
 
@@ -640,7 +647,11 @@ def create_admin_router() -> APIRouter:
                         configuration.modal_environment().value,
                     )
                 except Exception as exc:
-                    LOGGER.exception("Modal App preflight failed for %s", workload)
+                    LOGGER.exception(
+                        "Modal App preflight failed for %s request_id=%s",
+                        workload,
+                        request_id_from(request),
+                    )
                     raise CodedAPIError(
                         400,
                         "modal_preflight_failed",
@@ -655,9 +666,11 @@ def create_admin_router() -> APIRouter:
         except ValueError as exc:
             raise CodedAPIError(400, "setting_invalid", str(exc)) from exc
         LOGGER.info(
-            "event=runtime_setting_changed scope=tool workload=%s fields=%s",
+            "event=runtime_setting_changed scope=tool workload=%s fields=%s "
+            "request_id=%s",
             workload,
             ",".join(sorted(submission.model_fields_set)),
+            request_id_from(request),
         )
         view = _modal_view(configuration, request.app.state.store)
         return next(tool for tool in view.tools if tool.workload == workload)

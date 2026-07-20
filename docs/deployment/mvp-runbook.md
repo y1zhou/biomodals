@@ -11,37 +11,34 @@ Run the API as a dedicated `biomodals` Linux user. The recommended boundaries
 are:
 
 - application checkout: `/opt/biomodals/current/biomodals`;
-- production configuration: `/etc/biomodals/production.env`;
+- native production unit: `/etc/systemd/system/biomodals-api.service`;
 - production SQLite state: `/var/lib/biomodals/production/state`;
 - production Result cache: `/var/cache/biomodals/production`;
-- pre-release configuration: `/etc/biomodals/prerelease.env`;
 - pre-release SQLite state: `/var/lib/biomodals/prerelease/state`;
 - pre-release Result cache: `/var/cache/biomodals/prerelease`; and
 - production frontend files: `/srv/aidd.y1zhou.com`.
 
-Create each private configuration file directly with restrictive ownership and
-permissions. For example, run the equivalent of:
+The tracked files under `deploy/` are production examples, not live
+configuration. Copy the selected systemd or Quadlet definition through an
+administrator-approved path, replace its credential placeholders, and restrict
+the installed file to root. Docker Compose receives credentials from its
+invoking environment. The top-level `.env.example` is only for local
+development.
 
-```console
-install -o biomodals -g biomodals -m 600 /dev/null /etc/biomodals/production.env
-```
-
-Then enter the values from `deploy/production.env.example` through an
-administrator-approved secret-handling path. Do not first copy the public
-example with ordinary permissions. The API rejects a symlink, non-regular file,
-wrong owner, or any group/world permission before reading credentials.
-
-Production and pre-release must never select the same configuration, database,
-or cache directory. An intentionally shared Modal Environment does not change
-this requirement.
+Production and pre-release must never select the same service definition,
+database, or cache directory. A pre-release copy must use
+`https://beta.aidd.y1zhou.com`, a separate loopback port, and the pre-release
+paths above. An intentionally shared Modal Environment does not change this
+requirement.
 
 ## API service example
 
-`deploy/biomodals-api.service.example` documents the single-process MVP shape:
-one FastAPI worker, a fixed working directory, private umask, restart-on-failure,
-and journald output. Review and install it manually under a production-specific
-unit name. A separate pre-release unit must use its own environment file and
-port.
+[`deploy/README.md`](../../deploy/README.md) documents three alternatives:
+native systemd, Docker Compose, and a Podman Quadlet. The native unit keeps all
+boot-critical environment values in the unit and documents one FastAPI worker,
+a fixed working directory, private umask, restart-on-failure, and journald
+output. Review and install only one alternative. A pre-release service must use
+its own copied configuration, host paths, public URL, and port.
 
 Before directing a browser to a candidate API, verify locally:
 
@@ -132,8 +129,9 @@ The checklist must order these actions:
    verify SPA fallback, login/logout, and same-origin API access.
 
 Rollback restores the prior backend checkout and frontend static release as a
-pair, restores the prior environment file if it changed, restarts the one API
-process, and waits for readiness. Do not point a rolled-back binary at an
+pair, restores the prior service or container configuration if it changed,
+restarts the one API process, and waits for readiness. Do not point a
+rolled-back binary at an
 incompatible newer database. During the current disposable-state phase, stop
 the pre-release service and explicitly remove only the exact pre-release
 database named by its configuration when a schema reset is required. Never

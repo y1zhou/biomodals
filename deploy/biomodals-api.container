@@ -1,0 +1,26 @@
+[Unit]
+Description=BioModals API container
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/biomodals-api:latest
+Environment=MODAL_TOKEN_ID=replace-with-service-token-id
+Environment=MODAL_TOKEN_SECRET=replace-with-service-token-secret
+Environment=BIOMODALS_PUBLIC_URL=https://aidd.y1zhou.com
+Environment=BIOMODALS_SECURE_COOKIES=true
+Environment=BIOMODALS_STATE_DIR=/var/lib/biomodals/state
+Environment=BIOMODALS_CACHE_DIR=/var/cache/biomodals
+Environment=BIOMODALS_CACHE_WARNING_BYTES=1099511627776
+Environment=BIOMODALS_RECONCILE_SECONDS=10
+Volume=/var/lib/biomodals/production/state:/var/lib/biomodals/state:Z
+Volume=/var/cache/biomodals/production:/var/cache/biomodals:Z
+PublishPort=127.0.0.1:8000:8000
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

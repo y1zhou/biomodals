@@ -114,12 +114,11 @@ An Administrator must stop the service and explicitly remove or relocate that
 exact database before restart initializes the new schema. The MVP does not keep
 the current partial development-only migration path.
 
-Pre-release and production must not share a configuration file or host-local
-mutable state. Every pre-release service example explicitly selects its own
-absolute `BIOMODALS_API_CONF_ENV`, whose `BIOMODALS_STATE_DIR` and
-`BIOMODALS_CACHE_DIR` resolve to locations distinct from production. Its public
-URL is `https://beta.aidd.y1zhou.com`, while production uses
-`https://aidd.y1zhou.com`. This also prevents a pre-release Clear Result Cache
+Pre-release and production must not share service configuration or host-local
+mutable state. Every pre-release service definition explicitly selects
+`BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` locations distinct from
+production. Its public URL is `https://beta.aidd.y1zhou.com`, while production
+uses `https://aidd.y1zhou.com`. This also prevents a pre-release Clear Result Cache
 action from touching production files. Reset instructions name only the
 pre-release target; they must not operate on production configuration, state,
 or cache.
@@ -135,11 +134,12 @@ gate; the rebuildable Result cache remains excluded from backup.
 
 ### Deployment documentation only
 
-The current implementation cycle must add a production runbook and an example
-systemd unit. They must document a dedicated service user, private
-configuration file, absolute state and cache paths, one API worker, explicit
-working directory, restrictive umask, restart policy, journald logging, and
-safe update and rollback checks.
+The current implementation cycle must add a production runbook and example
+native and container service definitions. They must document a dedicated
+service user, private service configuration, absolute state and cache paths,
+one API worker, an explicit working directory where applicable, restart policy,
+logging, and safe update and rollback checks. The native systemd example also
+uses a restrictive umask and journald.
 
 These artifacts are examples only. This cycle must not install a unit, modify
 the live production host, start a production service, or deploy the production

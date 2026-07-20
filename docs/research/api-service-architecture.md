@@ -523,9 +523,8 @@ During active development an Administrator may explicitly remove or relocate
 that exact database while the service is stopped, then restart to initialize a
 fresh schema. This reset policy ends at the first release.
 
-Pre-release and production examples select different absolute
-`BIOMODALS_API_CONF_ENV` files and distinct `BIOMODALS_STATE_DIR` and
-`BIOMODALS_CACHE_DIR` values. Pre-release sets
+Pre-release and production service definitions select distinct
+`BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` values. Pre-release sets
 `BIOMODALS_PUBLIC_URL=https://beta.aidd.y1zhou.com`; production uses
 `https://aidd.y1zhou.com`. A pre-release reset or cache clear therefore targets
 only isolated host-local data and never falls back to production configuration,

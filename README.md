@@ -59,17 +59,19 @@ The API is one local FastAPI control plane for GROMACS and future workloads.
 It submits scientific work to separately deployed Modal Apps; it is not a
 Modal web endpoint.
 
+### Local development
+
 Install the API dependencies and deploy the GROMACS compute App in the Modal
-Environment that the server will use:
+Environment used by your development server:
 
 ```bash
 uv sync --extra api
 MODAL_ENVIRONMENT=production uv run biomodals app deploy gromacs
 ```
 
-For local frontend development, copy the documented configuration, fill in a
-Modal service-user token, and point the API at that file. Explicit process
-environment variables override values in the file:
+Copy [`.env.example`](.env.example), fill in a Modal service-user token, and
+point the API at the private file. The copied `.env` is ignored by Git and
+must remain readable only by its owner:
 
 ```bash
 install -m 600 .env.example .env
@@ -79,6 +81,8 @@ export BIOMODALS_API_CONF_ENV="$PWD/.env"
 uv run biomodals api serve
 ```
 
+Explicit process environment variables override values in the file. Relative
+state and cache paths are resolved from the directory containing `.env`.
 The backend refuses to start unless both `MODAL_TOKEN_ID` and
 `MODAL_TOKEN_SECRET` are present. The token secret remains process-only and is
 never stored in SQLite or returned by the API. `BIOMODALS_PUBLIC_URL` is the
@@ -111,7 +115,19 @@ web interface. Runtime setting precedence is process environment, database
 Admin value, configured `.env` file, then built-in default. Process-controlled
 fields are read-only in the Admin interface.
 
-On the department server, run this command under a dedicated Linux and Modal
-service user, set an explicit Modal Environment, and supervise the
-single process with systemd. The local cache contains only final ZIP files;
-Modal Volume storage remains authoritative for results and intermediates.
+### Production deployment
+
+The [production deployment examples](deploy/README.md) cover a native systemd
+service, Docker Compose, and a Podman Quadlet. Each example binds the API only
+to `127.0.0.1:8000` for a same-origin HTTPS reverse proxy. Copy and review an
+example before use; never commit real Modal credentials.
+
+Run the API as one process under a dedicated Linux and Modal service user. Only
+boot-critical host values belong in the service definition. Leaving the Modal
+Environment, deployed App name, and admission limits out of the process
+environment keeps those fields editable in the Admin interface.
+
+The local cache contains rebuildable Result ZIP files; Modal Volume storage
+remains authoritative for Results and intermediates. See the
+[MVP deployment runbook](docs/deployment/mvp-runbook.md) for readiness,
+change-aware manual checks, and rollback guidance.

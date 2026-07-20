@@ -1,0 +1,36 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Containerfile
+    environment:
+      MODAL_TOKEN_ID: ${MODAL_TOKEN_ID:?MODAL_TOKEN_ID must be set}
+      MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET:?MODAL_TOKEN_SECRET must be set}
+      BIOMODALS_PUBLIC_URL: https://aidd.y1zhou.com
+      BIOMODALS_SECURE_COOKIES: "true"
+      BIOMODALS_STATE_DIR: /var/lib/biomodals/state
+      BIOMODALS_CACHE_DIR: /var/cache/biomodals
+      BIOMODALS_CACHE_WARNING_BYTES: "1099511627776"
+      BIOMODALS_RECONCILE_SECONDS: "10"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - biomodals-state:/var/lib/biomodals/state
+      - biomodals-cache:/var/cache/biomodals
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          from urllib.request import urlopen;
+          urlopen("http://127.0.0.1:8000/api/v1/ready", timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  biomodals-state:
+  biomodals-cache:

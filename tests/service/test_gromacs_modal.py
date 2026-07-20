@@ -64,7 +64,7 @@ XTC = struct.pack(
     0.0,
 )
 _TPR_VERSION = b"VERSION 2026.1"
-TPR = (struct.pack(">II", 15, len(_TPR_VERSION)) + _TPR_VERSION).ljust(128, b"\0")
+TPR = (struct.pack(">II", 15, len(_TPR_VERSION)) + _TPR_VERSION).ljust(1024, b"\0")
 
 
 def _png_chunk(chunk_type: bytes, content: bytes) -> bytes:

@@ -299,7 +299,7 @@ def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
         struct.unpack(">I", tpr_prefix[4:8])[0] if len(tpr_prefix) >= 8 else 0
     )
     if (
-        archive.getinfo(tpr_name).file_size < 128
+        archive.getinfo(tpr_name).file_size < 1024
         or version_length < len("VERSION")
         or version_length > 120
         or len(tpr_prefix) < 8 + version_length

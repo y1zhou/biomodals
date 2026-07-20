@@ -205,12 +205,12 @@ class ArtifactCache:
         if descriptor is None:
             return True, None
         try:
-            fingerprint = self._fingerprint(
-                os.fstat(descriptor),
-                size_bytes,
-                sha256,
-            )
             with self._state_lock:
+                fingerprint = self._fingerprint(
+                    os.fstat(descriptor),
+                    size_bytes,
+                    sha256,
+                )
                 if self._verified.get(job_id) != fingerprint:
                     os.close(descriptor)
                     return False, None

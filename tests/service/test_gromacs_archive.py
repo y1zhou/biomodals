@@ -44,7 +44,7 @@ XTC = struct.pack(
     0.0,
 )
 _TPR_VERSION = b"VERSION 2026.1"
-TPR = (struct.pack(">II", 15, len(_TPR_VERSION)) + _TPR_VERSION).ljust(128, b"\0")
+TPR = (struct.pack(">II", 15, len(_TPR_VERSION)) + _TPR_VERSION).ljust(1024, b"\0")
 
 
 def _png_chunk(chunk_type: bytes, content: bytes) -> bytes:
@@ -153,10 +153,19 @@ def test_service_packages_established_remote_files_deterministically() -> None:
             b"\0\0\0\x10VERSION 2026.1\0\0\0\0",
             "topology is invalid",
         ),
+        ("topology", TPR[:128], "topology is invalid"),
         ("rmsd_plot", b"not-a-png", "PNG is invalid"),
         (
             "rmsd_plot",
             b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + b"\0" * 16,
+            "PNG is invalid",
+        ),
+        (
+            "rmsd_plot",
+            b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+            + _png_chunk(b"IDAT", b"")
+            + _png_chunk(b"IEND", b""),
             "PNG is invalid",
         ),
         ("rmsd", b"time_ns,rmsd\n", "wrong schema"),

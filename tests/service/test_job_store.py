@@ -21,6 +21,7 @@ from biomodals.service.store import (
     JobNotCancellableError,
     JobState,
     ServiceStore,
+    UserNotFoundError,
 )
 
 
@@ -150,6 +151,21 @@ def test_idempotency_is_scoped_to_owner_and_payload(tmp_path: Path) -> None:
             key="11111111-1111-4111-8111-111111111111",
             request_hash="b" * 64,
         )
+
+
+def test_disabled_user_cannot_replay_a_queued_admission(tmp_path: Path) -> None:
+    store, _alice, bob = make_store(tmp_path)
+    key = "11111111-1111-4111-8111-111111111111"
+    first = admit(store, bob, key=key)
+
+    store.update_user(bob, active=False, now=1_800_000_001)
+
+    with pytest.raises(UserNotFoundError, match="Enabled User"):
+        admit(store, bob, key=key)
+    preserved = store.get_job(bob, first.job.job_id)
+    assert preserved is not None
+    assert preserved.state == JobState.QUEUED
+    assert preserved.submission_token is None
 
 
 def test_user_active_limit_is_transactional_across_workloads(tmp_path: Path) -> None:

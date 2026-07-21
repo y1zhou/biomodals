@@ -523,7 +523,9 @@ confirmation states these consequences before committing the status change.
 Administrator role remains independent, but only an enabled Administrator
 satisfies the last-administrator safeguard. Job admission rechecks enabled
 status inside the same SQLite transaction that applies idempotency and Active
-Job Limits, so a concurrent disable prevents paid work from being admitted.
+Job Limits, including before returning a same-payload idempotent replay. A
+concurrent disable therefore prevents that request from claiming an
+unsubmitted Job's provider lease and initiating paid work.
 
 ### Admin Active Job capacity display
 

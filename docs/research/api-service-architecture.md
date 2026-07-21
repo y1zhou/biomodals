@@ -136,6 +136,9 @@ The browser supplies a UUID `Idempotency-Key` when submitting a job. The key is
 scoped to `(owner_user_id, workload)`. Repeating the same key and payload
 returns the existing job; reusing it with different inputs returns `409`.
 Admission and active-job limits are checked in one SQLite write transaction.
+That transaction also rechecks that the User is enabled before returning an
+existing same-payload admission, so a request racing with Disable cannot claim
+an unsubmitted Job's provider lease.
 Limits are non-negative integers and zero intentionally blocks new Submissions
 within that scope. Lowering a User, Tool, or Global limit below its current
 count never cancels admitted work; new Submissions are rejected until the

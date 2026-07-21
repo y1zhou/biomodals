@@ -1181,7 +1181,6 @@ class ServiceStore:
                     raise IdempotencyConflictError(
                         "Idempotency key was already used for another request"
                     )
-                return JobAdmission(job=_job_from_row(existing), created=False)
 
             user = conn.execute(
                 "SELECT status, active_job_limit FROM users WHERE user_id = ?",
@@ -1191,6 +1190,8 @@ class ServiceStore:
                 raise UserNotFoundError(f"User not found: {owner_user_id}")
             if user["status"] != UserStatus.ENABLED.value:
                 raise UserNotFoundError(f"Enabled User not found: {owner_user_id}")
+            if existing is not None:
+                return JobAdmission(job=_job_from_row(existing), created=False)
             user_active_job_limit = int(user["active_job_limit"])
 
             service_rows = conn.execute(

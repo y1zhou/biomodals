@@ -37,6 +37,7 @@ from biomodals.service.store import (
 
 LOGGER = logging.getLogger(__name__)
 BlockingCategory = Literal[
+    "internal_service",
     "local_storage",
     "modal_configuration",
     "modal_unavailable",
@@ -182,6 +183,7 @@ class AdminModalToolView(BaseModel):
 
     workload: str
     modal_app_name: TextSettingView
+    modal_app_version: IntegerSettingView
     active_jobs: int
     active_job_limit: IntegerSettingView
 
@@ -250,6 +252,14 @@ class UpdateAdminModalToolRequest(BaseModel):
         max_length=120,
         description="Omit to keep unchanged; null restores the configured default.",
     )
+    modal_app_version: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Exact Modal deployment version used for new Jobs. Omit to keep "
+            "unchanged; null restores the configured default."
+        ),
+    )
     active_job_limit: int | None = Field(
         default=None,
         ge=0,
@@ -312,6 +322,7 @@ def _modal_view(
             AdminModalToolView(
                 workload=workload.workload,
                 modal_app_name=_text_view(workload.modal_app_name),
+                modal_app_version=_integer_view(workload.modal_app_version),
                 active_jobs=store.count_active_jobs(workload.workload),
                 active_job_limit=_integer_view(workload.active_job_limit),
             )
@@ -572,10 +583,12 @@ def create_admin_router() -> APIRouter:
                 for workload_name, registration in registrations.items():
                     if registration.preflight is None:
                         continue
-                    app_name = configuration.workload(
-                        workload_name
-                    ).modal_app_name.value
-                    await registration.preflight(app_name, candidate_environment)
+                    effective = configuration.workload(workload_name)
+                    await registration.preflight(
+                        effective.modal_app_name.value,
+                        candidate_environment,
+                        effective.modal_app_version.value,
+                    )
             except Exception as exc:
                 LOGGER.exception(
                     "Modal Environment preflight failed request_id=%s",
@@ -622,29 +635,54 @@ def create_admin_router() -> APIRouter:
         registration = request.app.state.workloads.get(workload)
         if registration is None:
             raise HTTPException(404, "Tool not found")
-        if "modal_app_name" in submission.model_fields_set:
-            if not configuration.workload(workload).modal_app_name.editable:
+        provider_fields = {"modal_app_name", "modal_app_version"}
+        if submission.model_fields_set & provider_fields:
+            effective = configuration.workload(workload)
+            if (
+                "modal_app_name" in submission.model_fields_set
+                and not effective.modal_app_name.editable
+            ):
                 raise CodedAPIError(
                     409,
                     "setting_overridden",
                     "BIOMODALS_GROMACS_APP is controlled by an environment variable",
                 )
-            candidate_app_name = (
-                configuration.settings.gromacs_app_name
-                if submission.modal_app_name is None
-                else submission.modal_app_name.strip()
-            )
+            if (
+                "modal_app_version" in submission.model_fields_set
+                and not effective.modal_app_version.editable
+            ):
+                raise CodedAPIError(
+                    409,
+                    "setting_overridden",
+                    "BIOMODALS_GROMACS_APP_VERSION is controlled by an "
+                    "environment variable",
+                )
+            candidate_app_name = effective.modal_app_name.value
+            if "modal_app_name" in submission.model_fields_set:
+                candidate_app_name = (
+                    configuration.settings.gromacs_app_name
+                    if submission.modal_app_name is None
+                    else submission.modal_app_name.strip()
+                )
             if not candidate_app_name:
                 raise CodedAPIError(
                     400,
                     "setting_invalid",
                     "Modal app name must not be empty",
                 )
+            candidate_app_version = effective.modal_app_version.value
+            if "modal_app_version" in submission.model_fields_set:
+                candidate_app_version = (
+                    configuration.settings.gromacs_app_version
+                    if submission.modal_app_version is None
+                    else submission.modal_app_version
+                )
             if registration.preflight is not None:
                 try:
                     await registration.preflight(
                         candidate_app_name,
                         configuration.modal_environment().value,
+                        candidate_app_version,
                     )
                 except Exception as exc:
                     LOGGER.exception(

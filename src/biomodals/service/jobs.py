@@ -229,7 +229,7 @@ class Reconciler(Protocol):
 
 CancelJob = Callable[[JobRecord], Awaitable[None]]
 ReadArtifact = Callable[[JobRecord], AsyncIterable[bytes]]
-PreflightWorkload = Callable[[str, str], Awaitable[None]]
+PreflightWorkload = Callable[[str, str, int], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)

@@ -138,6 +138,7 @@ class JobRecord:
     state: JobState
     modal_environment: str
     modal_app_name: str
+    modal_app_version: int
     modal_call_id: str | None
     provider_operation: str | None
     run_name: str | None
@@ -189,6 +190,7 @@ class JobRecord:
         return ModalConfigurationSnapshot(
             environment=self.modal_environment,
             app_name=self.modal_app_name,
+            app_version=self.modal_app_version,
         )
 
 
@@ -216,6 +218,7 @@ class WorkloadConfigurationRecord:
 
     workload: str
     modal_app_name: str | None
+    modal_app_version: int | None
     active_job_limit: int | None
 
 
@@ -404,6 +407,8 @@ class ServiceStore:
                         state TEXT NOT NULL,
                         modal_environment TEXT NOT NULL,
                         modal_app_name TEXT NOT NULL,
+                        modal_app_version INTEGER NOT NULL
+                            CHECK (modal_app_version >= 1),
                         modal_call_id TEXT,
                         provider_operation TEXT,
                         run_name TEXT,
@@ -447,15 +452,20 @@ class ServiceStore:
                     CREATE TABLE workload_settings (
                         workload TEXT PRIMARY KEY,
                         modal_app_name TEXT,
+                        modal_app_version INTEGER
+                            CHECK (
+                                modal_app_version IS NULL
+                                OR modal_app_version >= 1
+                            ),
                         active_job_limit INTEGER
                             CHECK (active_job_limit IS NULL OR active_job_limit >= 0)
                     );
 
-                    PRAGMA user_version = 7;
+                    PRAGMA user_version = 8;
                     COMMIT;
                     """
                 )
-            elif version != 7:
+            elif version != 8:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
                     f"{version} at {self.path}; stop the service and initialize "
@@ -480,7 +490,7 @@ class ServiceStore:
                 timeout=5,
                 isolation_level=None,
             )
-            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 7:
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 8:
                 raise RuntimeError("SQLite schema is unavailable")
             conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         except sqlite3.Error as exc:
@@ -983,6 +993,7 @@ class ServiceStore:
         return WorkloadConfigurationRecord(
             workload=str(row["workload"]),
             modal_app_name=row["modal_app_name"],
+            modal_app_version=row["modal_app_version"],
             active_job_limit=row["active_job_limit"],
         )
 
@@ -994,15 +1005,24 @@ class ServiceStore:
         """Create, update, or remove supplied workload overrides atomically."""
         if not workload:
             raise ValueError("workload must not be empty")
-        unknown = settings.keys() - {"modal_app_name", "active_job_limit"}
+        unknown = settings.keys() - {
+            "modal_app_name",
+            "modal_app_version",
+            "active_job_limit",
+        }
         if unknown:
             raise ValueError(f"Unknown workload settings: {', '.join(sorted(unknown))}")
         modal_app_name = settings.get("modal_app_name")
+        modal_app_version = settings.get("modal_app_version")
         active_job_limit = settings.get("active_job_limit")
         if modal_app_name is not None and (
             not isinstance(modal_app_name, str) or not modal_app_name
         ):
             raise ValueError("modal_app_name must not be empty")
+        if modal_app_version is not None and (
+            type(modal_app_version) is not int or modal_app_version < 1
+        ):
+            raise ValueError("modal_app_version must be positive")
         if active_job_limit is not None and (
             type(active_job_limit) is not int or active_job_limit < 0
         ):
@@ -1019,12 +1039,21 @@ class ServiceStore:
                 if row is not None and "modal_app_name" not in settings
                 else modal_app_name
             )
+            next_modal_app_version = (
+                row["modal_app_version"]
+                if row is not None and "modal_app_version" not in settings
+                else modal_app_version
+            )
             next_active_job_limit = (
                 row["active_job_limit"]
                 if row is not None and "active_job_limit" not in settings
                 else active_job_limit
             )
-            if next_modal_app_name is None and next_active_job_limit is None:
+            if (
+                next_modal_app_name is None
+                and next_modal_app_version is None
+                and next_active_job_limit is None
+            ):
                 conn.execute(
                     "DELETE FROM workload_settings WHERE workload = ?",
                     (workload,),
@@ -1033,13 +1062,20 @@ class ServiceStore:
                 conn.execute(
                     """
                     INSERT INTO workload_settings (
-                        workload, modal_app_name, active_job_limit
-                    ) VALUES (?, ?, ?)
+                        workload, modal_app_name, modal_app_version,
+                        active_job_limit
+                    ) VALUES (?, ?, ?, ?)
                     ON CONFLICT(workload) DO UPDATE SET
                         modal_app_name = excluded.modal_app_name,
+                        modal_app_version = excluded.modal_app_version,
                         active_job_limit = excluded.active_job_limit
                     """,
-                    (workload, next_modal_app_name, next_active_job_limit),
+                    (
+                        workload,
+                        next_modal_app_name,
+                        next_modal_app_version,
+                        next_active_job_limit,
+                    ),
                 )
 
     def admit_job(
@@ -1104,6 +1140,12 @@ class ServiceStore:
             modal_app_name = configuration.modal_app_name.resolve(
                 workload_row["modal_app_name"] if workload_row is not None else None
             )
+            modal_app_version = configuration.modal_app_version.resolve(
+                int(workload_row["modal_app_version"])
+                if workload_row is not None
+                and workload_row["modal_app_version"] is not None
+                else None
+            )
             workload_active_job_limit = configuration.workload_active_job_limit.resolve(
                 int(workload_row["active_job_limit"])
                 if workload_row is not None
@@ -1119,6 +1161,8 @@ class ServiceStore:
                 raise ValueError("active job limits must be non-negative")
             if not modal_environment.strip() or not modal_app_name.strip():
                 raise ValueError("Modal Job configuration must not be empty")
+            if type(modal_app_version) is not int or modal_app_version < 1:
+                raise ValueError("Modal App version must be positive")
 
             placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
             states = tuple(state.value for state in ACTIVE_JOB_STATES)
@@ -1168,7 +1212,8 @@ class ServiceStore:
                 INSERT INTO jobs (
                     job_id, owner_user_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json, state,
-                    modal_environment, modal_app_name, modal_call_id,
+                    modal_environment, modal_app_name, modal_app_version,
+                    modal_call_id,
                     provider_operation, run_name, submission_token,
                     submission_lease_until, result_volume_name,
                     result_volume_path, result_filename, result_size_bytes,
@@ -1179,7 +1224,7 @@ class ServiceStore:
                     result_previous_state, result_cached,
                     intermediates_cleaned_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?,
                     ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL
                 )
@@ -1195,6 +1240,7 @@ class ServiceStore:
                     JobState.QUEUED.value,
                     modal_environment.strip(),
                     modal_app_name.strip(),
+                    modal_app_version,
                     now,
                     now,
                 ),
@@ -2048,6 +2094,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         state=JobState(row["state"]),
         modal_environment=str(row["modal_environment"]),
         modal_app_name=str(row["modal_app_name"]),
+        modal_app_version=int(row["modal_app_version"]),
         modal_call_id=row["modal_call_id"],
         provider_operation=row["provider_operation"],
         run_name=row["run_name"],

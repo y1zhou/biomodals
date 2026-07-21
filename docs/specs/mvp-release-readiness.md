@@ -250,12 +250,24 @@ detail, or storage path.
 ### Modal configuration preflight
 
 Changing the effective Modal Environment must preflight the output Volume and
-every required GROMACS Function in that Environment before committing. Changing
-the deployed App name preflights its required Functions in the current
-effective Environment. Limit-only changes do not validate unrelated fields.
-Startup performs the same read-only preflight for process/file-controlled
-settings. Validation never invokes a paid Function, and failure leaves the
-previous effective setting intact with a stable configuration error.
+every required GROMACS Function at the configured deployment version in that
+Environment before committing. Each Tool has a positive integer Modal App
+version alongside its App name. Changing either field preflights the candidate
+name/version pair in the current effective Environment. Limit-only changes do
+not validate unrelated fields. Startup performs the same read-only preflight
+for process/file-controlled settings. Validation never invokes a paid
+Function, and failure leaves the previous effective setting intact with a
+stable configuration error.
+
+Job admission snapshots the Modal Environment, App name, and exact deployment
+version in one transaction. Every direct deployed-Function lookup for that Job
+passes the snapshot as Modal's `version` argument, so an App redeployment cannot
+mix Function implementations within an in-flight workflow. Administrators use
+`modal app history <app> --env <environment> --json` to discover deployment
+version integers; the Admin Tool form configures and restores the value with
+the same field-specific source behavior as App name and limits. Result
+provenance records both the snapshotted deployment version and the GROMACS
+software version read from the production TPR header.
 
 The Admin interface displays a spinner and disables save/restore controls only
 for fields participating in a pending preflight. Unrelated fields retain their

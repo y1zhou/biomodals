@@ -222,6 +222,7 @@ class ServiceSettings:
     secure_cookies: bool
     modal_environment: str
     gromacs_app_name: str
+    gromacs_app_version: int
     gromacs_active_limit: int
     global_active_job_limit: int
     default_user_active_job_limit: int
@@ -268,6 +269,11 @@ class ServiceSettings:
                 sources,
                 "BIOMODALS_GROMACS_APP",
                 "Gromacs",
+            ),
+            gromacs_app_version=_positive_integer(
+                sources,
+                "BIOMODALS_GROMACS_APP_VERSION",
+                1,
             ),
             gromacs_active_limit=_nonnegative_integer(
                 sources,

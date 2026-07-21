@@ -11,6 +11,7 @@ import struct
 import zipfile
 import zlib
 
+import orjson
 import pytest
 
 from biomodals.service.artifacts import ArtifactSourceMissingError
@@ -106,6 +107,7 @@ def test_service_packages_established_remote_files_deterministically() -> None:
                 run_name=RUN_NAME,
                 parameters_json=PARAMETERS,
                 modal_app_name="Gromacs",
+                modal_app_version=17,
                 job_id="11111111-1111-4111-8111-111111111111",
                 stages_json="[]",
                 started_at=1,
@@ -131,6 +133,9 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         assert archive.read(f"outputs/rg_{prefix}.png") == PNG
         assert archive.read(f"outputs/rmsf_{prefix}.png") == PNG
         assert archive.read("metadata/parameters.json") == PARAMETERS.encode()
+        provenance = orjson.loads(archive.read("metadata/provenance.json"))
+        assert provenance["modal_app_version"] == 17
+        assert provenance["software_version"] == "GROMACS 2026.1"
         assert {name.split("/", 1)[0] for name in archive.namelist()} == {
             "input.pdb",
             "outputs",
@@ -200,6 +205,7 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
                 run_name=RUN_NAME,
                 parameters_json=PARAMETERS,
                 modal_app_name="Gromacs",
+                modal_app_version=17,
                 job_id="11111111-1111-4111-8111-111111111111",
                 stages_json="[]",
                 started_at=1,
@@ -234,6 +240,7 @@ def test_large_centered_structure_and_diagnostics_stream_without_a_size_cap() ->
             run_name=RUN_NAME,
             parameters_json=PARAMETERS,
             modal_app_name="Gromacs",
+            modal_app_version=17,
             job_id="11111111-1111-4111-8111-111111111111",
             stages_json="[]",
             started_at=1,
@@ -269,6 +276,7 @@ def test_missing_required_remote_output_has_a_distinct_failure() -> None:
                 run_name=RUN_NAME,
                 parameters_json=PARAMETERS,
                 modal_app_name="Gromacs",
+                modal_app_version=17,
                 job_id="11111111-1111-4111-8111-111111111111",
                 stages_json="[]",
                 started_at=1,

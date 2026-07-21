@@ -139,6 +139,23 @@ def _read_prefix(archive: zipfile.ZipFile, name: str, size: int = 128) -> bytes:
         return member.read(size)
 
 
+def _tpr_software_version(prefix: bytes) -> str:
+    """Recover the GROMACS version string embedded in a TPR XDR header."""
+    version_length = struct.unpack(">I", prefix[4:8])[0] if len(prefix) >= 8 else 0
+    if (
+        version_length < len("VERSION")
+        or version_length > 120
+        or len(prefix) < 8 + version_length
+        or not prefix[8 : 8 + version_length].startswith(b"VERSION")
+    ):
+        raise ValueError("GROMACS production topology is invalid")
+    try:
+        version = prefix[8 : 8 + version_length].decode("ascii").removeprefix("VERSION")
+    except UnicodeDecodeError as exc:
+        raise ValueError("GROMACS production topology is invalid") from exc
+    return f"GROMACS {version.strip()}".rstrip()
+
+
 def _validate_pdb_member(
     archive: zipfile.ZipFile,
     name: str,
@@ -295,17 +312,9 @@ def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
 
     tpr_name = f"outputs/{prefix}.tpr"
     tpr_prefix = _read_prefix(archive, tpr_name)
-    version_length = (
-        struct.unpack(">I", tpr_prefix[4:8])[0] if len(tpr_prefix) >= 8 else 0
-    )
-    if (
-        archive.getinfo(tpr_name).file_size < 1024
-        or version_length < len("VERSION")
-        or version_length > 120
-        or len(tpr_prefix) < 8 + version_length
-        or not tpr_prefix[8 : 8 + version_length].startswith(b"VERSION")
-    ):
+    if archive.getinfo(tpr_name).file_size < 1024:
         raise ValueError("GROMACS production topology is invalid")
+    _tpr_software_version(tpr_prefix)
 
     csv_contracts = (
         (f"outputs/rmsd_{prefix}.csv", ("time_ns", "rmsd")),
@@ -464,6 +473,7 @@ async def write_gromacs_archive(
     run_name: str,
     parameters_json: str,
     modal_app_name: str,
+    modal_app_version: int,
     job_id: str,
     stages_json: str,
     started_at: int,
@@ -504,21 +514,6 @@ async def write_gromacs_archive(
         )
         + b"\n"
     )
-    provenance_bytes = (
-        orjson.dumps(
-            {
-                "archive_schema_version": _ARCHIVE_SCHEMA_VERSION,
-                "job_id": job_id,
-                "tool": "gromacs",
-                "modal_app_name": modal_app_name,
-                "software_version": "GROMACS 2026.1",
-                "started_at": started_at,
-                "completed_at": completed_at,
-            },
-            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
-        )
-        + b"\n"
-    )
     run_log = (
         f"Biomodals GROMACS job\nrun_name: {run_name}\nstatus: succeeded\n"
     ).encode()
@@ -543,6 +538,24 @@ async def write_gromacs_archive(
                     role=role,
                 )
             )
+        topology_name = f"outputs/production_{run_name}.tpr"
+        software_version = _tpr_software_version(_read_prefix(archive, topology_name))
+        provenance_bytes = (
+            orjson.dumps(
+                {
+                    "archive_schema_version": _ARCHIVE_SCHEMA_VERSION,
+                    "job_id": job_id,
+                    "tool": "gromacs",
+                    "modal_app_name": modal_app_name,
+                    "modal_app_version": modal_app_version,
+                    "software_version": software_version,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                },
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            )
+            + b"\n"
+        )
         for name, role, content in (
             ("metadata/parameters.json", "normalized_parameters", parameters_bytes),
             ("metadata/provenance.json", "provenance", provenance_bytes),

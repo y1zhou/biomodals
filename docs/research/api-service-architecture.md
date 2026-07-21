@@ -471,6 +471,7 @@ The application factory reads these settings:
 | `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
 | `BIOMODALS_MODAL_ENVIRONMENT` | `production` | Modal Environment default; configurable in Admin unless a process override is set |
 | `BIOMODALS_GROMACS_APP` | `Gromacs` | Deployed GROMACS Modal App name |
+| `BIOMODALS_GROMACS_APP_VERSION` | `1` | Exact GROMACS Modal deployment version used by new Jobs |
 | `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Workload-wide active Job limit default |
 | `BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT` | `10` | Global active Job limit default |
 | `BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT` | `2` | Active Job limit assigned to new Users by default |

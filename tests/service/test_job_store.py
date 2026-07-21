@@ -99,6 +99,7 @@ def admit(
         workload=workload,
         modal_environment=DatabaseOverridableSetting("production", False),
         modal_app_name=DatabaseOverridableSetting("Gromacs", False),
+        modal_app_version=DatabaseOverridableSetting(1, False),
         workload_active_job_limit=DatabaseOverridableSetting(
             workload_limit,
             False,
@@ -200,6 +201,7 @@ def test_job_captures_modal_configuration_at_admission(tmp_path: Path) -> None:
             workload="gromacs",
             modal_environment=DatabaseOverridableSetting("department", False),
             modal_app_name=DatabaseOverridableSetting("GromacsDeployed", False),
+            modal_app_version=DatabaseOverridableSetting(17, False),
             workload_active_job_limit=DatabaseOverridableSetting(2, False),
             global_active_job_limit=DatabaseOverridableSetting(10, False),
         ),
@@ -208,6 +210,7 @@ def test_job_captures_modal_configuration_at_admission(tmp_path: Path) -> None:
 
     assert job.modal_environment == "department"
     assert job.modal_app_name == "GromacsDeployed"
+    assert job.modal_app_version == 17
 
 
 def test_job_queries_never_cross_owner_boundaries(tmp_path: Path) -> None:

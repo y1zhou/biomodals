@@ -167,7 +167,12 @@ class ModalGromacsAdapter:
         self._function_resolver = function_resolver or modal.Function.from_name
         self._call_resolver = call_resolver
 
-    async def preflight(self, app_name: str, environment_name: str) -> None:
+    async def preflight(
+        self,
+        app_name: str,
+        environment_name: str,
+        app_version: int,
+    ) -> None:
         """Hydrate required deployed resources without invoking compute."""
         volume = modal.Volume.from_name(
             self.output_volume_name,
@@ -179,6 +184,7 @@ class ModalGromacsAdapter:
                 app_name,
                 function_name,
                 environment_name=environment_name,
+                version=app_version,
             )
             await function.hydrate.aio()
 
@@ -196,6 +202,7 @@ class ModalGromacsAdapter:
             modal_configuration.app_name,
             function_name,
             environment_name=modal_configuration.environment,
+            version=modal_configuration.app_version,
         )
         try:
             call = await function.spawn.aio(
@@ -257,6 +264,7 @@ class ModalGromacsAdapter:
             job.modal_app_name,
             function_name,
             environment_name=job.modal_environment,
+            version=job.modal_app_version,
         )
         try:
             call = await function.spawn.aio(**kwargs)
@@ -523,6 +531,7 @@ class ModalGromacsAdapter:
                 run_name=job.run_name,
                 parameters_json=job.parameters_json,
                 modal_app_name=job.modal_app_name,
+                modal_app_version=job.modal_app_version,
                 job_id=str(job.job_id),
                 stages_json=orjson.dumps(stages).decode(),
                 started_at=job.created_at,

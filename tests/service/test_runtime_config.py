@@ -36,6 +36,7 @@ def test_database_overrides_file_and_updates_are_live(tmp_path: Path) -> None:
         config_file=(
             "BIOMODALS_MODAL_ENVIRONMENT=file-env\n"
             "BIOMODALS_GROMACS_APP=FileApp\n"
+            "BIOMODALS_GROMACS_APP_VERSION=3\n"
             "BIOMODALS_GROMACS_ACTIVE_LIMIT=3\n"
             "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=8\n"
         ),
@@ -43,6 +44,7 @@ def test_database_overrides_file_and_updates_are_live(tmp_path: Path) -> None:
 
     assert configuration.modal_environment().value == "file-env"
     assert configuration.workload("gromacs").modal_app_name.value == "FileApp"
+    assert configuration.workload("gromacs").modal_app_version.value == 3
 
     configuration.update_environment(
         modal_environment="database-env",
@@ -51,6 +53,7 @@ def test_database_overrides_file_and_updates_are_live(tmp_path: Path) -> None:
     configuration.set_workload(
         "gromacs",
         modal_app_name="DatabaseApp",
+        modal_app_version=7,
         active_job_limit=5,
     )
 
@@ -59,6 +62,7 @@ def test_database_overrides_file_and_updates_are_live(tmp_path: Path) -> None:
     assert configuration.global_active_job_limit().value == 12
     workload = configuration.workload("gromacs")
     assert workload.modal_app_name.value == "DatabaseApp"
+    assert workload.modal_app_version.value == 7
     assert workload.active_job_limit.value == 5
 
 
@@ -68,6 +72,7 @@ def test_reset_removes_only_one_database_override(tmp_path: Path) -> None:
         config_file=(
             "BIOMODALS_MODAL_ENVIRONMENT=file-env\n"
             "BIOMODALS_GROMACS_APP=FileApp\n"
+            "BIOMODALS_GROMACS_APP_VERSION=3\n"
             "BIOMODALS_GROMACS_ACTIVE_LIMIT=3\n"
             "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=8\n"
         ),
@@ -79,6 +84,7 @@ def test_reset_removes_only_one_database_override(tmp_path: Path) -> None:
     configuration.set_workload(
         "gromacs",
         modal_app_name="DatabaseApp",
+        modal_app_version=7,
         active_job_limit=5,
     )
 
@@ -93,6 +99,8 @@ def test_reset_removes_only_one_database_override(tmp_path: Path) -> None:
     workload = configuration.workload("gromacs")
     assert workload.modal_app_name.value == "DatabaseApp"
     assert workload.modal_app_name.source == "database"
+    assert workload.modal_app_version.value == 7
+    assert workload.modal_app_version.source == "database"
     assert workload.active_job_limit.value == 3
     assert workload.active_job_limit.source == "configuration_file"
 
@@ -121,6 +129,7 @@ def test_admission_resolves_database_settings_inside_store_transaction(
         config_file=(
             "BIOMODALS_MODAL_ENVIRONMENT=file-env\n"
             "BIOMODALS_GROMACS_APP=FileApp\n"
+            "BIOMODALS_GROMACS_APP_VERSION=3\n"
             "BIOMODALS_GROMACS_ACTIVE_LIMIT=3\n"
             "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=8\n"
         ),
@@ -151,6 +160,7 @@ def test_admission_resolves_database_settings_inside_store_transaction(
     configuration.set_workload(
         "gromacs",
         modal_app_name="DatabaseApp",
+        modal_app_version=7,
         active_job_limit=5,
     )
     job = configuration.store.admit_job(
@@ -165,3 +175,4 @@ def test_admission_resolves_database_settings_inside_store_transaction(
 
     assert job.modal_environment == "database-env"
     assert job.modal_app_name == "DatabaseApp"
+    assert job.modal_app_version == 7

@@ -53,18 +53,23 @@ class FakeGromacsAdapter:
 
     def __init__(self) -> None:
         self.submissions: list[tuple[bytes, str, GromacsJobOptions]] = []
-        self.submission_configurations: list[tuple[str, str]] = []
+        self.submission_configurations: list[tuple[str, str, int]] = []
         self.cancellations: list[str] = []
         self.recovery_attempts: list[UUID] = []
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
         self.failures_remaining = 0
         self.unknown_failures_remaining = 0
-        self.preflights: list[tuple[str, str]] = []
+        self.preflights: list[tuple[str, str, int]] = []
         self.preflight_failures_remaining = 0
 
-    async def preflight(self, app_name: str, environment_name: str) -> None:
-        self.preflights.append((app_name, environment_name))
+    async def preflight(
+        self,
+        app_name: str,
+        environment_name: str,
+        app_version: int,
+    ) -> None:
+        self.preflights.append((app_name, environment_name, app_version))
         if self.preflight_failures_remaining:
             self.preflight_failures_remaining -= 1
             raise RuntimeError("configured resource is unavailable")
@@ -81,6 +86,7 @@ class FakeGromacsAdapter:
         self.submission_configurations.append((
             modal_configuration.app_name,
             modal_configuration.environment,
+            modal_configuration.app_version,
         ))
         if self.unknown_failures_remaining:
             self.unknown_failures_remaining -= 1
@@ -469,7 +475,11 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     tool = client.patch(
         "/api/v1/admin/modal/tools/gromacs",
         headers=_unsafe_headers(csrf_token),
-        json={"modal_app_name": "GromacsA", "active_job_limit": 3},
+        json={
+            "modal_app_name": "GromacsA",
+            "modal_app_version": 17,
+            "active_job_limit": 3,
+        },
     )
     assert environment.json()["modal_environment"] == {
         "value": "department-a",
@@ -482,7 +492,7 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     assert first.status_code == 202
     first_job_id = UUID(first.json()["job_id"])
     store.set_job_state(first_job_id, JobState.RUNNING, now=1_800_000_001)
-    assert adapter.submission_configurations == [("GromacsA", "department-a")]
+    assert adapter.submission_configurations == [("GromacsA", "department-a", 17)]
 
     client.patch(
         "/api/v1/admin/modal/environment",
@@ -492,14 +502,14 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     client.patch(
         "/api/v1/admin/modal/tools/gromacs",
         headers=_unsafe_headers(csrf_token),
-        json={"modal_app_name": "GromacsB"},
+        json={"modal_app_name": "GromacsB", "modal_app_version": 23},
     )
     second = _submit(client, csrf_token, idempotency_key=str(uuid4()))
 
     assert second.status_code == 202
     assert adapter.submission_configurations == [
-        ("GromacsA", "department-a"),
-        ("GromacsB", "department-b"),
+        ("GromacsA", "department-a", 17),
+        ("GromacsB", "department-b", 23),
     ]
     first_job = store.get_job(
         UUID(client.get("/api/v1/auth/me").json()["user_id"]),
@@ -508,6 +518,7 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     assert first_job is not None
     assert first_job.modal_environment == "department-a"
     assert first_job.modal_app_name == "GromacsA"
+    assert first_job.modal_app_version == 17
     current = client.get("/api/v1/admin/modal").json()
     assert current["tools"][0]["active_jobs"] == 2
 
@@ -532,6 +543,11 @@ def test_modal_admin_updates_and_resets_each_field_independently(
     }
     assert tool["modal_app_name"] == {
         "value": "Gromacs",
+        "source": "default",
+        "editable": True,
+    }
+    assert tool["modal_app_version"] == {
+        "value": 1,
         "source": "default",
         "editable": True,
     }
@@ -645,19 +661,19 @@ def test_modal_preflight_runs_only_for_changed_provider_fields(
     rejected = client.patch(
         "/api/v1/admin/modal/tools/gromacs",
         headers=headers,
-        json={"modal_app_name": "UnavailableApp"},
+        json={"modal_app_name": "UnavailableApp", "modal_app_version": 17},
     )
     unchanged = client.get("/api/v1/admin/modal")
     accepted = client.patch(
         "/api/v1/admin/modal/tools/gromacs",
         headers=headers,
-        json={"modal_app_name": "AvailableApp"},
+        json={"modal_app_name": "AvailableApp", "modal_app_version": 23},
     )
 
     assert limit_only.status_code == 200
     assert adapter.preflights == [
-        ("UnavailableApp", "production"),
-        ("AvailableApp", "production"),
+        ("UnavailableApp", "production", 17),
+        ("AvailableApp", "production", 23),
     ]
     assert rejected.status_code == 400
     assert rejected.json()["code"] == "modal_preflight_failed"
@@ -832,11 +848,11 @@ def test_health_is_live_before_startup_and_ready_is_local_after_preflight(
             assert (await browser.get("/api/v1/health")).status_code == 200
             assert (await browser.get("/api/v1/ready")).status_code == 503
             async with client.app.router.lifespan_context(client.app):
-                assert adapter.preflights == [("Gromacs", "production")]
+                assert adapter.preflights == [("Gromacs", "production", 1)]
                 ready = await browser.get("/api/v1/ready")
                 assert ready.status_code == 200
                 assert ready.json() == {"status": "ok"}
-                assert adapter.preflights == [("Gromacs", "production")]
+                assert adapter.preflights == [("Gromacs", "production", 1)]
             assert (await browser.get("/api/v1/ready")).status_code == 503
 
     asyncio.run(scenario())

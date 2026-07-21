@@ -92,6 +92,7 @@ def _admission_configuration() -> JobAdmissionConfiguration:
         workload="gromacs",
         modal_environment=DatabaseOverridableSetting("department-dev", False),
         modal_app_name=DatabaseOverridableSetting("GromacsAPI", False),
+        modal_app_version=DatabaseOverridableSetting(17, False),
         workload_active_job_limit=DatabaseOverridableSetting(10, False),
         global_active_job_limit=DatabaseOverridableSetting(10, False),
     )
@@ -428,15 +429,16 @@ def test_submit_resolves_the_deployed_prepare_function_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     function = FakeFunction(FakeCall("fc-prepare"))
-    lookups: list[tuple[str, str, str | None]] = []
+    lookups: list[tuple[str, str, str | None, int | None]] = []
 
     def from_name(
         app_name: str,
         function_name: str,
         *,
         environment_name: str | None = None,
+        version: int | None = None,
     ):
-        lookups.append((app_name, function_name, environment_name))
+        lookups.append((app_name, function_name, environment_name, version))
         return function
 
     monkeypatch.setattr(modal.Function, "from_name", from_name)
@@ -460,12 +462,13 @@ def test_submit_resolves_the_deployed_prepare_function_directly(
             modal_configuration=ModalConfigurationSnapshot(
                 environment="department-dev",
                 app_name="GromacsAPI",
+                app_version=17,
             ),
         )
     )
 
     assert lookups == [
-        ("GromacsAPI", "prepare_tpr_cpu", "department-dev"),
+        ("GromacsAPI", "prepare_tpr_cpu", "department-dev", 17),
     ]
     assert submitted.modal_call_id == "fc-prepare"
     assert submitted.provider_operation == "prepare_tpr_cpu"
@@ -498,8 +501,13 @@ def test_preflight_hydrates_volume_and_every_required_function_without_spawning(
         function_name: str,
         *,
         environment_name: str,
+        version: int,
     ) -> modal.Function:
-        assert (app_name, environment_name) == ("CandidateApp", "candidate-env")
+        assert (app_name, environment_name, version) == (
+            "CandidateApp",
+            "candidate-env",
+            23,
+        )
         return cast(modal.Function, Hydratable("function", function_name))
 
     monkeypatch.setattr(
@@ -517,7 +525,7 @@ def test_preflight_hydrates_volume_and_every_required_function_without_spawning(
         function_resolver=resolve_function,
     )
 
-    asyncio.run(adapter.preflight("CandidateApp", "candidate-env"))
+    asyncio.run(adapter.preflight("CandidateApp", "candidate-env", 23))
 
     assert events == [
         ("volume", "Gromacs-outputs"),
@@ -551,6 +559,7 @@ def test_submit_spawns_detached_call_with_normalized_options(
             modal_configuration=ModalConfigurationSnapshot(
                 environment="department-dev",
                 app_name="GromacsAPI",
+                app_version=17,
             ),
         )
     )
@@ -586,6 +595,7 @@ def test_submit_marks_a_spawn_error_as_an_unknown_provider_outcome() -> None:
                 modal_configuration=ModalConfigurationSnapshot(
                     environment="department-dev",
                     app_name="GromacsAPI",
+                    app_version=17,
                 ),
             )
         )
@@ -593,7 +603,7 @@ def test_submit_marks_a_spawn_error_as_an_unknown_provider_outcome() -> None:
 
 def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
     store, job = _submitted_job(tmp_path)
-    lookups: list[tuple[str, str, str | None]] = []
+    lookups: list[tuple[str, str, str | None, int | None]] = []
     functions: list[FakeFunction] = []
 
     def from_name(
@@ -601,8 +611,9 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
         function_name: str,
         *,
         environment_name: str | None = None,
+        version: int | None = None,
     ):
-        lookups.append((app_name, function_name, environment_name))
+        lookups.append((app_name, function_name, environment_name, version))
         function = FakeFunction(FakeCall(f"fc-{len(functions) + 1}"))
         functions.append(function)
         return function
@@ -639,12 +650,13 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
             now=3 + index,
         )
 
-    assert [function_name for _, function_name, _ in lookups] == [
+    assert [function_name for _, function_name, _, _ in lookups] == [
         "collect_traj_stats",
         "collect_traj_stats",
         "production_run_gpu",
         "collect_traj_stats",
     ]
+    assert {version for _, _, _, version in lookups} == {17}
     assert functions[0].spawn_kwargs == {
         "traj_prefix": "nvt_",
         "run_name": RUN_NAME,
@@ -808,15 +820,16 @@ def test_reconciler_advances_completed_stage_to_one_direct_named_call(
     store, job = _submitted_job(tmp_path)
     prepare = FakeCall("fc-root", result="/volumes/Gromacs-outputs/api-run")
     analysis = FakeFunction(FakeCall("fc-analysis"))
-    lookups: list[tuple[str, str, str | None]] = []
+    lookups: list[tuple[str, str, str | None, int | None]] = []
 
     def from_name(
         app_name: str,
         function_name: str,
         *,
         environment_name: str | None = None,
+        version: int | None = None,
     ) -> FakeFunction:
-        lookups.append((app_name, function_name, environment_name))
+        lookups.append((app_name, function_name, environment_name, version))
         return analysis
 
     reconciler = GromacsReconciler(
@@ -831,7 +844,7 @@ def test_reconciler_advances_completed_stage_to_one_direct_named_call(
     assert advanced is not None
     assert advanced.modal_call_id == "fc-analysis"
     assert advanced.provider_operation == "collect_traj_stats:nvt_"
-    assert lookups == [("GromacsAPI", "collect_traj_stats", "department-dev")]
+    assert lookups == [("GromacsAPI", "collect_traj_stats", "department-dev", 17)]
     assert analysis.spawn_kwargs == {
         "traj_prefix": "nvt_",
         "run_name": RUN_NAME,

@@ -45,6 +45,7 @@ class WorkloadRuntimeConfiguration:
 
     workload: str
     modal_app_name: EffectiveSetting[str]
+    modal_app_version: EffectiveSetting[int]
     active_job_limit: EffectiveSetting[int]
 
 
@@ -69,6 +70,7 @@ class JobAdmissionConfiguration:
     workload: str
     modal_environment: DatabaseOverridableSetting[str]
     modal_app_name: DatabaseOverridableSetting[str]
+    modal_app_version: DatabaseOverridableSetting[int]
     workload_active_job_limit: DatabaseOverridableSetting[int]
     global_active_job_limit: DatabaseOverridableSetting[int]
 
@@ -79,6 +81,7 @@ class ModalConfigurationSnapshot:
 
     environment: str
     app_name: str
+    app_version: int
 
 
 class RuntimeConfiguration:
@@ -132,6 +135,13 @@ class RuntimeConfiguration:
                 database_value=(stored.modal_app_name if stored is not None else None),
                 default=self.settings.gromacs_app_name,
             ),
+            modal_app_version=self._workload_positive_integer_setting(
+                environment_name="BIOMODALS_GROMACS_APP_VERSION",
+                database_value=(
+                    stored.modal_app_version if stored is not None else None
+                ),
+                default=self.settings.gromacs_app_version,
+            ),
             active_job_limit=self._workload_integer_setting(
                 environment_name="BIOMODALS_GROMACS_ACTIVE_LIMIT",
                 database_value=(
@@ -155,6 +165,10 @@ class RuntimeConfiguration:
             modal_app_name=DatabaseOverridableSetting(
                 self.settings.gromacs_app_name,
                 not sources.has_process_override("BIOMODALS_GROMACS_APP"),
+            ),
+            modal_app_version=DatabaseOverridableSetting(
+                self.settings.gromacs_app_version,
+                not sources.has_process_override("BIOMODALS_GROMACS_APP_VERSION"),
             ),
             workload_active_job_limit=DatabaseOverridableSetting(
                 self.settings.gromacs_active_limit,
@@ -200,6 +214,7 @@ class RuntimeConfiguration:
         workload: str,
         *,
         modal_app_name: str | None | _Unchanged = _UNCHANGED,
+        modal_app_version: int | None | _Unchanged = _UNCHANGED,
         active_job_limit: int | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Atomically update supplied settings for one fixed workload."""
@@ -212,6 +227,13 @@ class RuntimeConfiguration:
                 None
                 if modal_app_name is None
                 else _nonempty(modal_app_name, "Modal app name")
+            )
+        if not isinstance(modal_app_version, _Unchanged):
+            self._ensure_editable("BIOMODALS_GROMACS_APP_VERSION")
+            updates["modal_app_version"] = (
+                None
+                if modal_app_version is None
+                else _positive(modal_app_version, "Modal App version")
             )
         if not isinstance(active_job_limit, _Unchanged):
             self._ensure_editable("BIOMODALS_GROMACS_ACTIVE_LIMIT")
@@ -270,6 +292,20 @@ class RuntimeConfiguration:
             _parse_nonnegative,
         )
 
+    def _workload_positive_integer_setting(
+        self,
+        *,
+        environment_name: str,
+        database_value: int | None,
+        default: int,
+    ) -> EffectiveSetting[int]:
+        return self._setting(
+            environment_name,
+            database_value,
+            default,
+            _parse_positive,
+        )
+
     def _setting[Value: (str, int)](
         self,
         environment_name: str,
@@ -320,7 +356,19 @@ def _nonnegative(value: int, label: str) -> int:
     return value
 
 
+def _positive(value: int, label: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be at least 1")
+    return value
+
+
 def _parse_nonnegative(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"{label} must be an integer")
     return _nonnegative(int(value), label)
+
+
+def _parse_positive(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{label} must be an integer")
+    return _positive(int(value), label)

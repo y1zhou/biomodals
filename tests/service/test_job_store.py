@@ -19,6 +19,8 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobNotCancellableError,
+    JobProviderCallRecord,
+    JobProviderCallState,
     JobState,
     JobStateResolutionError,
     JobStateUnknownReason,
@@ -95,6 +97,40 @@ def test_initialize_never_rewrites_an_existing_unsupported_database(
     assert path.read_bytes() == before
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_schema_10_migration_preserves_users_and_provider_work(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
+    store.mark_submitted(
+        job.job_id,
+        modal_call_id="fc-prepare",
+        provider_operation="prepare_tpr_cpu",
+        run_name=f"simulation-{job.job_id.hex}",
+        now=100,
+    )
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("DROP TABLE job_provider_calls")
+        conn.execute("PRAGMA user_version = 10")
+
+    store.initialize()
+
+    assert alice in {user.user_id for user in store.list_users()}
+    assert store.list_provider_calls(job.job_id) == [
+        JobProviderCallRecord(
+            job_id=job.job_id,
+            provider_operation="prepare_tpr_cpu",
+            modal_call_id="fc-prepare",
+            state=JobProviderCallState.RUNNING,
+            submission_token=None,
+            submission_lease_until=None,
+            started_at=100,
+            completed_at=None,
+        )
+    ]
+    store.check_ready()
 
 
 def admit(
@@ -354,7 +390,7 @@ def test_cancel_during_spawn_keeps_call_attached_for_reconciliation(
     assert attached.modal_call_id == "fc-live"
 
 
-def test_job_atomically_advances_one_active_provider_operation(
+def test_job_tracks_parallel_provider_operations(
     tmp_path: Path,
 ) -> None:
     store, alice, _bob = make_store(tmp_path)
@@ -366,40 +402,68 @@ def test_job_atomically_advances_one_active_provider_operation(
         run_name=f"simulation-{job.job_id.hex}",
         now=100,
     )
-    claimed = store.claim_provider_advance(
+    store.record_provider_call_outcome(
         job.job_id,
+        provider_operation="prepare_tpr_cpu",
         expected_modal_call_id="fc-prepare",
-        submission_token="next-stage",
+        outcome=JobProviderCallState.COMPLETED,
         now=101,
     )
-
-    advanced = store.replace_provider_call(
-        job.job_id,
-        expected_modal_call_id="fc-prepare",
-        modal_call_id="fc-production",
-        provider_operation="production_run_cpu",
-        submission_token="next-stage",
-        now=102,
+    operations = (
+        ("collect_traj_stats:nvt_", "fc-nvt"),
+        ("collect_traj_stats:npt_", "fc-npt"),
+        ("production_run_cpu", "fc-production"),
     )
+    for provider_operation, modal_call_id in operations:
+        claimed = store.claim_provider_operation(
+            job.job_id,
+            provider_operation=provider_operation,
+            submission_token=provider_operation,
+            now=102,
+        )
+        assert claimed is not None
+        store.attach_provider_call(
+            job.job_id,
+            provider_operation=provider_operation,
+            modal_call_id=modal_call_id,
+            submission_token=provider_operation,
+            now=102,
+        )
 
     assert attached.provider_operation == "prepare_tpr_cpu"
-    assert claimed is not None
-    assert claimed.stage_history[-1].completed_at == 101
-    assert advanced.modal_call_id == "fc-production"
-    assert advanced.provider_operation == "production_run_cpu"
-    assert advanced.submission_lease_until is None
+    assert [
+        call.provider_operation for call in store.list_provider_calls(job.job_id)
+    ] == [
+        "prepare_tpr_cpu",
+        "collect_traj_stats:npt_",
+        "collect_traj_stats:nvt_",
+        "production_run_cpu",
+    ]
+    running = store.get_job(alice, job.job_id)
+    assert running is not None
     assert [
         (stage.provider_operation, stage.started_at, stage.completed_at)
-        for stage in advanced.stage_history
+        for stage in running.stage_history
     ] == [
         ("prepare_tpr_cpu", 100, 101),
+        ("collect_traj_stats:nvt_", 102, None),
+        ("collect_traj_stats:npt_", 102, None),
         ("production_run_cpu", 102, None),
     ]
+
+    for provider_operation, modal_call_id in operations:
+        store.record_provider_call_outcome(
+            job.job_id,
+            provider_operation=provider_operation,
+            expected_modal_call_id=modal_call_id,
+            outcome=JobProviderCallState.COMPLETED,
+            now=103,
+        )
 
     finalizing = store.set_job_state(
         job.job_id,
         JobState.FINALIZING,
-        now=103,
+        now=104,
     )
 
     assert [
@@ -407,12 +471,14 @@ def test_job_atomically_advances_one_active_provider_operation(
         for stage in finalizing.stage_history
     ] == [
         ("prepare_tpr_cpu", 100, 101),
+        ("collect_traj_stats:nvt_", 102, 103),
+        ("collect_traj_stats:npt_", 102, 103),
         ("production_run_cpu", 102, 103),
-        ("result_packaging", 103, None),
+        ("result_packaging", 104, None),
     ]
 
 
-def test_provider_advance_lease_requires_explicit_release_before_retry(
+def test_provider_operation_lease_requires_explicit_release_before_retry(
     tmp_path: Path,
 ) -> None:
     store, alice, _bob = make_store(tmp_path)
@@ -425,16 +491,16 @@ def test_provider_advance_lease_requires_explicit_release_before_retry(
         now=100,
     )
 
-    claimed = store.claim_provider_advance(
+    claimed = store.claim_provider_operation(
         job.job_id,
-        expected_modal_call_id="fc-prepare",
+        provider_operation="collect_traj_stats:nvt_",
         submission_token="first",
         now=101,
         lease_seconds=20,
     )
-    expired = store.claim_provider_advance(
+    expired = store.claim_provider_operation(
         job.job_id,
-        expected_modal_call_id="fc-prepare",
+        provider_operation="collect_traj_stats:nvt_",
         submission_token="second",
         now=121,
         lease_seconds=20,
@@ -443,15 +509,15 @@ def test_provider_advance_lease_requires_explicit_release_before_retry(
     assert claimed is not None
     assert expired is None
 
-    store.release_provider_advance(
+    store.release_provider_operation(
         job.job_id,
-        expected_modal_call_id="fc-prepare",
+        provider_operation="collect_traj_stats:nvt_",
         submission_token="first",
         now=121,
     )
-    retried = store.claim_provider_advance(
+    retried = store.claim_provider_operation(
         job.job_id,
-        expected_modal_call_id="fc-prepare",
+        provider_operation="collect_traj_stats:nvt_",
         submission_token="second",
         now=121,
         lease_seconds=20,

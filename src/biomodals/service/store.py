@@ -2128,6 +2128,8 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             current_state = JobState(row["state"])
+            if current_state == JobState.STATE_UNKNOWN:
+                return _job_from_row(row)
             if current_state in {JobState.FAILED, JobState.CANCELLED}:
                 return _job_from_row(row)
             if current_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
@@ -2192,7 +2194,10 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            if JobState(row["state"]) in (JobState.SUCCEEDED, JobState.PARTIAL):
+            current_state = JobState(row["state"])
+            if current_state == JobState.STATE_UNKNOWN:
+                return _job_from_row(row)
+            if current_state in (JobState.SUCCEEDED, JobState.PARTIAL):
                 if result_cached and not bool(row["result_cached"]):
                     conn.execute(
                         "UPDATE jobs SET result_cached = 1 WHERE job_id = ?",

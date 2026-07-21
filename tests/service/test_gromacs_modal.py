@@ -603,6 +603,33 @@ def test_submit_marks_a_spawn_error_as_an_unknown_provider_outcome() -> None:
         )
 
 
+def test_submit_preserves_a_definite_modal_rejection() -> None:
+    adapter = ModalGromacsAdapter(
+        app_name="GromacsAPI",
+        environment_name="department-dev",
+        function_resolver=cast(
+            Any,
+            lambda *_args, **_kwargs: FailingFunction(
+                modal.exception.PermissionDeniedError("not allowed")
+            ),
+        ),
+    )
+
+    with pytest.raises(modal.exception.PermissionDeniedError):
+        asyncio.run(
+            adapter.submit(
+                b"PDB content",
+                GromacsJobOptions(),
+                run_name=RUN_NAME,
+                modal_configuration=ModalConfigurationSnapshot(
+                    environment="department-dev",
+                    app_name="GromacsAPI",
+                    app_version=17,
+                ),
+            )
+        )
+
+
 def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
     store, job = _submitted_job(tmp_path)
     lookups: list[tuple[str, str, str | None, int | None]] = []
@@ -1653,6 +1680,34 @@ def test_expired_provider_status_is_not_reported_as_confirmed_cancellation(
     assert unresolved.state_unknown_reason == "cancellation_outcome_unknown"
     assert unresolved.error_code is None
     assert f"api-results/{RUN_NAME}/result.zip" not in files
+
+
+def test_expired_cancellation_retries_transient_result_recovery(
+    tmp_path: Path,
+) -> None:
+    store, job = _submitted_job(
+        tmp_path,
+        cancel_requested=True,
+        provider_operation="collect_traj_stats:production_",
+    )
+    root = FakeCall(
+        "fc-root",
+        result=modal.exception.OutputExpiredError("expired"),
+    )
+    adapter = _adapter({"fc-root": root})
+
+    async def unavailable(_job: JobRecord) -> None:
+        raise modal.exception.ConnectionError("temporary")
+
+    cast(Any, adapter).recover_archive = unavailable
+    reconciler = GromacsReconciler(store, adapter, now=lambda: 10)
+
+    asyncio.run(reconciler.reconcile())
+
+    cancelling = store.get_job(job.owner_user_id, job.job_id)
+    assert cancelling is not None
+    assert cancelling.state == JobState.CANCEL_REQUESTED
+    assert cancelling.state_unknown_at is None
 
 
 def test_intermediate_cleanup_is_opt_in_and_preserves_final_archives(

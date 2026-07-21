@@ -71,12 +71,13 @@ _MODAL_PUBLICATION_ERRORS = _MODAL_SERVICE_ERRORS + (
     modal.exception.ExecutionError,
     modal.exception.VolumeUploadTimeoutError,
 )
-_PERMANENT_FINALIZATION_ERRORS = (
+_DEFINITE_SUBMISSION_ERRORS = (
     modal.exception.AuthError,
     modal.exception.InvalidError,
     modal.exception.NotFoundError,
     modal.exception.PermissionDeniedError,
 )
+_PERMANENT_FINALIZATION_ERRORS = _DEFINITE_SUBMISSION_ERRORS
 _TRANSIENT_FINALIZATION_ERRORS = (
     modal.exception.ConnectionError,
     modal.exception.ExecutionError,
@@ -214,6 +215,8 @@ class ModalGromacsAdapter:
                 run_pdbfixer=options.run_pdbfixer,
             )
             modal_call_id = call.object_id
+        except _DEFINITE_SUBMISSION_ERRORS:
+            raise
         except Exception as exc:
             raise SubmissionOutcomeUnknownError(
                 "Modal did not return a durable FunctionCall handle"
@@ -271,6 +274,8 @@ class ModalGromacsAdapter:
         try:
             call = await function.spawn.aio(**kwargs)
             modal_call_id = call.object_id
+        except _DEFINITE_SUBMISSION_ERRORS:
+            raise
         except Exception as exc:
             raise SubmissionOutcomeUnknownError(
                 "Modal did not return a durable FunctionCall handle"
@@ -871,6 +876,12 @@ class GromacsReconciler:
         if job.provider_operation == _FINAL_OPERATION:
             try:
                 archive = await self.adapter.recover_archive(job)
+            except _MODAL_SERVICE_ERRORS:
+                LOGGER.exception(
+                    "Modal is unavailable while recovering cancelling job %s",
+                    job.job_id,
+                )
+                return
             except Exception:
                 LOGGER.exception(
                     "Published Result is not yet recoverable for cancelling job %s",

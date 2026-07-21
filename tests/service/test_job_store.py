@@ -501,6 +501,29 @@ def test_state_unknown_consumes_capacity_until_admin_resolution(
             key="22222222-2222-4222-8222-222222222222",
             user_limit=1,
         )
+    assert (
+        store.block_job(
+            job.job_id,
+            category="modal_unavailable",
+            now=125,
+            next_retry_at=130,
+        ).state
+        == JobState.STATE_UNKNOWN
+    )
+    assert (
+        store.complete_job(
+            job.job_id,
+            state=JobState.SUCCEEDED,
+            result_volume_name="Gromacs-outputs",
+            result_volume_path="result.zip",
+            result_filename="result.zip",
+            result_size_bytes=1,
+            result_sha256="a" * 64,
+            result_archive_schema_version=1,
+            now=125,
+        ).state
+        == JobState.STATE_UNKNOWN
+    )
 
     resolved = store.resolve_state_unknown(job.job_id, now=130)
 

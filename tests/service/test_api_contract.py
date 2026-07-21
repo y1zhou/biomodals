@@ -648,6 +648,10 @@ def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> 
             "/api/v1/admin/users/{user_id}/password-link",
             "post",
         ): "user_inactive",
+        (
+            "/api/v1/admin/modal/state-unknown-jobs/{job_id}/mark-failed",
+            "post",
+        ): "job_state_changed",
     }
     for (path, method), expected_code in expected_conflicts.items():
         response = schema["paths"][path][method]["responses"]["409"]
@@ -1476,6 +1480,12 @@ def test_admin_can_resolve_state_unknown_after_manual_provider_review(
     assert job.error_message == (
         "An administrator could not confirm the remote compute state."
     )
+    repeated = client.post(
+        f"/api/v1/admin/modal/state-unknown-jobs/{job_id}/mark-failed",
+        headers=_unsafe_headers(csrf_token),
+    )
+    assert repeated.status_code == 409
+    assert repeated.json()["code"] == "job_state_changed"
 
 
 def test_cancel_after_failed_spawn_finishes_without_modal_access(

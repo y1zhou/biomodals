@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+
+import orjson
 
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
@@ -67,8 +68,8 @@ class _FakeGromacsAdapter:
     def _write_stats(self) -> None:
         self.stats_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.stats_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(
+        temporary.write_bytes(
+            orjson.dumps(
                 {
                     "password_link": self.password_link,
                     "preflight_versions": self.preflight_versions,
@@ -77,9 +78,8 @@ class _FakeGromacsAdapter:
                     "provider_calls": len(self.calls),
                     "cancel_calls": len(self.cancelled),
                 },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
+                option=orjson.OPT_SORT_KEYS,
+            )
         )
         temporary.replace(self.stats_path)
 

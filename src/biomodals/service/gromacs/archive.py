@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import csv
 import hashlib
-import io
 import stat
 import struct
 import zipfile
@@ -15,6 +13,7 @@ from pathlib import PurePosixPath
 from typing import BinaryIO, Protocol, TypeVar, cast
 
 import orjson
+import polars as pl
 
 from biomodals.service.artifacts import ArtifactSourceMissingError
 
@@ -184,25 +183,18 @@ def _validate_csv_member(
     header: tuple[str, str],
 ) -> None:
     try:
-        with (
-            archive.open(name) as member,
-            io.TextIOWrapper(member, encoding="utf-8", newline="") as text,
+        with archive.open(name) as member:
+            frame = pl.read_csv(
+                member,
+                schema_overrides={column: pl.Float64 for column in header},
+            )
+        if (
+            frame.columns != list(header)
+            or frame.height == 0
+            or any(frame.null_count().row(0))
         ):
-            rows = csv.reader(text)
-            if tuple(next(rows, ())) != header:
-                raise ValueError
-            row_count = 0
-            for row in rows:
-                if len(row) != 2:
-                    raise ValueError
-                float(row[0])
-                float(row[1])
-                row_count += 1
-            if row_count == 0:
-                raise ValueError
-    except (UnicodeDecodeError, csv.Error) as exc:
-        raise ValueError(f"GROMACS archive CSV is invalid: {name}") from exc
-    except ValueError as exc:
+            raise ValueError
+    except (pl.exceptions.PolarsError, ValueError) as exc:
         raise ValueError(f"GROMACS archive CSV has the wrong schema: {name}") from exc
 
 

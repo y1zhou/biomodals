@@ -23,6 +23,7 @@ from biomodals.service.artifacts import (
     ArtifactSourceMissingError,
 )
 from biomodals.service.gromacs.archive import (
+    GROMACS_ARCHIVE_SCHEMA_VERSION,
     BuiltGromacsArchive,
     validate_gromacs_archive,
     write_gromacs_archive,
@@ -54,7 +55,6 @@ _REQUIRED_FUNCTIONS = (
     "production_run_cpu",
     "production_run_gpu",
 )
-_ARCHIVE_SCHEMA_VERSION = 2
 _MODAL_SERVICE_ERRORS = (
     modal.exception.AuthError,
     modal.exception.ConnectionError,
@@ -419,6 +419,13 @@ class ModalGromacsAdapter:
         """Build and publish a ZIP from the established app's Volume files."""
         if job.run_name is None or not is_gromacs_run_name(job.run_name):
             raise ValueError("Job has no valid API run name")
+        if (
+            job.result_previous_state in {JobState.SUCCEEDED, JobState.PARTIAL}
+            and job.result_archive_schema_version != GROMACS_ARCHIVE_SCHEMA_VERSION
+        ):
+            raise GromacsResultInvalidError(
+                "Job uses an unsupported Result archive schema"
+            )
         archive_path = f"api-results/{job.run_name}/result.zip"
         marker_path = f"api-results/{job.run_name}/result.json"
         archive_file = tempfile.NamedTemporaryFile(
@@ -456,7 +463,7 @@ class ModalGromacsAdapter:
                             "Rebuilt Result does not match its published identity"
                         )
                 marker = orjson.dumps({
-                    "archive_schema_version": _ARCHIVE_SCHEMA_VERSION,
+                    "archive_schema_version": GROMACS_ARCHIVE_SCHEMA_VERSION,
                     "request_sha256": built.request_sha256,
                     "archive_sha256": built.sha256,
                     "size_bytes": built.size_bytes,
@@ -554,6 +561,8 @@ class ModalGromacsAdapter:
             or job.result_sha256 is None
         ):
             raise ValueError("Job lacks immutable Result identity")
+        if job.result_archive_schema_version != GROMACS_ARCHIVE_SCHEMA_VERSION:
+            raise ValueError("Job uses an unsupported Result archive schema")
         archive_file = tempfile.NamedTemporaryFile(
             dir=(self.artifact_cache.directory if self.artifact_cache else None),
             prefix=f".{job.job_id}.rebuild.",
@@ -612,7 +621,8 @@ class ModalGromacsAdapter:
         )
         if (
             not isinstance(marker, dict)
-            or marker.get("archive_schema_version") != _ARCHIVE_SCHEMA_VERSION
+            or marker.get("archive_schema_version")
+            != (job.result_archive_schema_version or GROMACS_ARCHIVE_SCHEMA_VERSION)
             or type(size_bytes) is not int
             or size_bytes < 1
             or not isinstance(archive_sha256, str)
@@ -1168,6 +1178,7 @@ class GromacsReconciler:
                 result_filename=archive.filename,
                 result_size_bytes=archive.size_bytes,
                 result_sha256=archive.sha256,
+                result_archive_schema_version=GROMACS_ARCHIVE_SCHEMA_VERSION,
                 warnings_json=archive.warnings_json,
                 result_cached=archive.cache_lease is not None,
                 now=self._now(),

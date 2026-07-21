@@ -957,6 +957,7 @@ def create_app(
         if existing is not None:
             try:
                 store.set_result_cached(job.job_id, cached=True)
+                cache.protect_prepared(str(job.job_id))
             finally:
                 existing.close()
             return
@@ -1017,6 +1018,7 @@ def create_app(
             ) from exc
         try:
             store.set_result_cached(job.job_id, cached=True)
+            cache.protect_prepared(str(job.job_id))
         finally:
             cached.close()
 

@@ -11,7 +11,7 @@ import struct
 import zipfile
 import zlib
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -21,6 +21,7 @@ import orjson
 import pytest
 
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
+from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
 from biomodals.service.gromacs.modal import (
     ArchiveNotReadyError,
     FinalArchive,
@@ -225,7 +226,7 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
         for name, content in members.items()
     ]
     manifest = orjson.dumps({
-        "archive_schema_version": 2,
+        "archive_schema_version": GROMACS_ARCHIVE_SCHEMA_VERSION,
         "run_name": RUN_NAME,
         "files": records,
     })
@@ -248,7 +249,7 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
 
 def _result_marker(archive_bytes: bytes, request_sha256: str) -> bytes:
     return orjson.dumps({
-        "archive_schema_version": 2,
+        "archive_schema_version": GROMACS_ARCHIVE_SCHEMA_VERSION,
         "request_sha256": request_sha256,
         "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
         "size_bytes": len(archive_bytes),
@@ -421,6 +422,7 @@ def _terminal_job(
         result_filename=f"{run_name}.zip",
         result_size_bytes=123,
         result_sha256=SHA256,
+        result_archive_schema_version=GROMACS_ARCHIVE_SCHEMA_VERSION,
         now=completed_at,
     )
 
@@ -1288,8 +1290,10 @@ def test_result_integrity_recovery_preserves_published_identity(
         result_filename=published.filename,
         result_size_bytes=published.size_bytes,
         result_sha256=published.sha256,
+        result_archive_schema_version=GROMACS_ARCHIVE_SCHEMA_VERSION,
         now=10,
     )
+    assert completed.result_archive_schema_version == GROMACS_ARCHIVE_SCHEMA_VERSION
     store.block_job(
         running.job_id,
         category="result_integrity",
@@ -1309,6 +1313,34 @@ def test_result_integrity_recovery_preserves_published_identity(
     assert recovered.result_sha256 == completed.result_sha256
     assert recovered.result_size_bytes == completed.result_size_bytes
     assert recovered.completed_at == 10
+
+
+def test_rebuild_rejects_an_unavailable_archive_builder(tmp_path: Path) -> None:
+    store, running = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    store.set_job_state(running.job_id, JobState.FINALIZING, now=10)
+    completed = store.complete_job(
+        running.job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{RUN_NAME}/result.zip",
+        result_filename=f"{RUN_NAME}.zip",
+        result_size_bytes=123,
+        result_sha256=SHA256,
+        result_archive_schema_version=GROMACS_ARCHIVE_SCHEMA_VERSION,
+        now=10,
+    )
+    unsupported = replace(completed, result_archive_schema_version=999)
+
+    async def rebuild() -> bytes:
+        return b"".join([
+            chunk async for chunk in _adapter({}).rebuild_artifact(unsupported)
+        ])
+
+    with pytest.raises(ValueError, match="unsupported Result archive schema"):
+        asyncio.run(rebuild())
 
 
 def test_expired_call_output_recovers_completed_archive_from_volume_marker(
@@ -1363,6 +1395,7 @@ def test_normal_cache_restore_requires_the_published_marker(
         result_filename=f"{RUN_NAME}.zip",
         result_size_bytes=len(archive_bytes),
         result_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        result_archive_schema_version=GROMACS_ARCHIVE_SCHEMA_VERSION,
         now=10,
     )
     _install_volume(

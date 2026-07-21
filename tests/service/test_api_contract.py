@@ -699,6 +699,7 @@ def test_storage_metrics_and_explicit_cleanup_report_actual_reclamation(
         result_filename="result.zip",
         result_size_bytes=len(content),
         result_sha256=hashlib.sha256(content).hexdigest(),
+        result_archive_schema_version=1,
         now=1_800_000_001,
     )
     cache: ArtifactCache = client.app.state.cache
@@ -1606,6 +1607,7 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
         result_filename="simulation.zip",
         result_size_bytes=len(content),
         result_sha256=hashlib.sha256(content).hexdigest(),
+        result_archive_schema_version=1,
         now=1_800_000_001,
     )
     bob = APIClient(alice.app)
@@ -1617,6 +1619,8 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
         f"/api/v1/jobs/{job_id}/prepare-download",
         headers=_unsafe_headers(alice_csrf),
     )
+    cache: ArtifactCache = alice.app.state.cache
+    cleanup_between_prepare_and_get = cache.clear()
     first = alice.get(f"/api/v1/jobs/{job_id}/download")
     second = alice.get(f"/api/v1/jobs/{job_id}/download")
     ranged = alice.get(
@@ -1633,6 +1637,7 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     assert unprepared.status_code == 409
     assert unprepared.json()["code"] == "result_not_prepared"
     assert prepared.status_code == 204
+    assert cleanup_between_prepare_and_get.entries == 0
     assert first.status_code == 200
     assert first.content == content
     assert first.headers["content-type"] == "application/zip"
@@ -1673,6 +1678,7 @@ def test_local_result_storage_failures_are_503_and_preserve_the_job(
         result_filename="simulation.zip",
         result_size_bytes=len(content),
         result_sha256=hashlib.sha256(content).hexdigest(),
+        result_archive_schema_version=1,
         now=1_800_000_001,
     )
     (tmp_path / "cache").rmdir()
@@ -1738,6 +1744,7 @@ def test_large_result_validation_keeps_core_requests_and_cache_hits_responsive(
         result_filename="cached.zip",
         result_size_bytes=len(cached_archive),
         result_sha256=hashlib.sha256(cached_archive).hexdigest(),
+        result_archive_schema_version=1,
         now=1_800_000_001,
     )
     assert (
@@ -1763,6 +1770,7 @@ def test_large_result_validation_keeps_core_requests_and_cache_hits_responsive(
         result_filename="simulation.zip",
         result_size_bytes=len(large_archive),
         result_sha256=hashlib.sha256(large_archive).hexdigest(),
+        result_archive_schema_version=1,
         now=1_800_000_001,
     )
     cancellable = _submit(

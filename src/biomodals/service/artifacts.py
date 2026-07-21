@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import stat
+import time
 from collections.abc import AsyncIterable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -103,6 +104,7 @@ class ArtifactCache:
         """Configure a cache directory without automatic size eviction."""
         self.directory = directory
         self._active: dict[str, int] = {}
+        self._prepared_until: dict[str, float] = {}
         self._verified: dict[str, tuple[int, str, int, int, int, int]] = {}
         self._fill_tasks: dict[str, asyncio.Task[None]] = {}
         self._state_lock = Lock()
@@ -222,6 +224,7 @@ class ArtifactCache:
                     sha256,
                 )
                 self._active[job_id] = self._active.get(job_id, 0) + 1
+                self._prepared_until.pop(job_id, None)
             return True, ArtifactLease(
                 descriptor,
                 path=path,
@@ -273,6 +276,7 @@ class ArtifactCache:
                     os.fstat(descriptor), size_bytes, sha256
                 )
                 self._active[job_id] = self._active.get(job_id, 0) + 1
+                self._prepared_until.pop(job_id, None)
             return ArtifactLease(
                 descriptor,
                 path=path,
@@ -491,6 +495,25 @@ class ArtifactCache:
             else:
                 self._active[job_id] = references - 1
 
+    def protect_prepared(self, job_id: str, *, seconds: int = 60) -> None:
+        """Reserve a prepared archive until its immediate download acquires it."""
+        self._path(job_id)
+        if type(seconds) is not int or seconds < 1:
+            raise ValueError("Prepared download protection must be positive")
+        with self._state_lock:
+            self._prepared_until[job_id] = time.monotonic() + seconds
+
+    def _prepared_locked(self) -> set[str]:
+        now = time.monotonic()
+        expired = [
+            job_id
+            for job_id, protected_until in self._prepared_until.items()
+            if protected_until <= now
+        ]
+        for job_id in expired:
+            self._prepared_until.pop(job_id, None)
+        return set(self._prepared_until)
+
     def _archives(self) -> list[tuple[Path, os.stat_result]]:
         archives: list[tuple[Path, os.stat_result]] = []
         with os.scandir(self.directory) as entries:
@@ -516,7 +539,9 @@ class ArtifactCache:
                 if stat.S_ISREG(file_stat.st_mode):
                     staging.append(file_stat)
         with self._state_lock:
-            protected = set(self._active) | set(self._fill_tasks)
+            protected = (
+                set(self._active) | set(self._fill_tasks) | self._prepared_locked()
+            )
         reclaimable = [
             file_stat for path, file_stat in archives if path.stem not in protected
         ]
@@ -542,7 +567,11 @@ class ArtifactCache:
         for path, file_stat in self._archives():
             job_id = path.stem
             with self._state_lock:
-                if self._active.get(job_id, 0) or job_id in self._fill_tasks:
+                if (
+                    self._active.get(job_id, 0)
+                    or job_id in self._fill_tasks
+                    or job_id in self._prepared_locked()
+                ):
                     continue
                 if self._unlink_if_same(path, file_stat):
                     self._verified.pop(job_id, None)

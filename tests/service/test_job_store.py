@@ -57,7 +57,7 @@ def test_readiness_never_recreates_or_accepts_an_empty_database(
         store.check_ready()
 
 
-@pytest.mark.parametrize("version", [0, 6])
+@pytest.mark.parametrize("version", [0, 8])
 def test_initialize_never_rewrites_an_existing_unsupported_database(
     tmp_path: Path,
     version: int,

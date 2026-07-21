@@ -347,6 +347,15 @@ When the final deployed Function completes, the backend persists
 publication retries and later reconstruction never substitute their current
 time. Together with fixed ZIP metadata and ordered members, unchanged remote
 outputs must therefore reproduce the same bytes, size, and SHA-256 digest.
+Every archive member uses ZIP's stored method so byte identity does not depend
+on the host zlib implementation.
+
+Each completed Job also persists the positive Result archive schema version
+used for its publication. Cache reconstruction dispatches only to a retained
+builder for that exact Tool/schema pair; it never rebuilds an older Result with
+the current writer by assumption. If that builder is unavailable, the Result
+moves to `blocked/result_integrity` and remains recoverable from its published
+Modal ZIP.
 
 The GROMACS Result ZIP has exactly three top-level entries or namespaces:
 `input.pdb`, `outputs/`, and `metadata/`. `outputs/` contains the files useful
@@ -465,6 +474,12 @@ refetches state when integrity recovery may have moved the Job to `blocked`.
 Aborting one browser request does not cancel or corrupt a cache fill shared with
 another waiter; a later preparation joins or safely retries that work. Both
 operations and their errors are part of OpenAPI.
+
+After preparation, the cache holds a short-lived one-download reservation.
+`Clear cache` treats that reservation like an active lease, so cleanup cannot
+remove the archive between the `204` response and the browser's immediate GET.
+The GET consumes the reservation when it acquires its streaming descriptor;
+an abandoned reservation expires automatically.
 
 The GET response uses a safe `Content-Disposition` filename derived only from
 the sanitized display name: `<display-name>-results.zip`, with

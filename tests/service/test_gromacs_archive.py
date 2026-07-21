@@ -126,6 +126,9 @@ def test_service_packages_established_remote_files_deterministically() -> None:
     assert first.sha256 == hashlib.sha256(first_bytes).hexdigest()
     assert validate_gromacs_archive(io.BytesIO(first_bytes), run_name=RUN_NAME)
     with zipfile.ZipFile(io.BytesIO(first_bytes)) as archive:
+        assert {info.compress_type for info in archive.infolist()} == {
+            zipfile.ZIP_STORED
+        }
         assert archive.read("input.pdb") == PDB
         assert f"outputs/{prefix}.xtc" not in archive.namelist()
         assert archive.read(f"outputs/{prefix}_nopbc.xtc") == XTC

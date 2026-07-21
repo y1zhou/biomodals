@@ -191,6 +191,35 @@ def test_explicit_cleanup_protects_an_active_download(tmp_path: Path) -> None:
     assert first.exists()
 
 
+def test_explicit_cleanup_protects_a_prepared_download_until_acquired(
+    tmp_path: Path,
+) -> None:
+    cache = ArtifactCache(tmp_path)
+    job_id = "11111111-1111-4111-8111-111111111111"
+    content = b"prepared"
+    lease = asyncio.run(
+        cache.store(
+            job_id,
+            size_bytes=len(content),
+            sha256=digest(content),
+            chunks=chunks(content),
+        )
+    )
+    lease.close()
+
+    cache.protect_prepared(job_id)
+    assert cache.clear().entries == 0
+
+    download = cache.acquire(
+        job_id,
+        size_bytes=len(content),
+        sha256=digest(content),
+    )
+    assert download is not None
+    download.close()
+    assert cache.clear().entries == 1
+
+
 def test_cancelled_waiter_does_not_cancel_shared_cache_fill(tmp_path: Path) -> None:
     async def scenario() -> None:
         cache = ArtifactCache(tmp_path)

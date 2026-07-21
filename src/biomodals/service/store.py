@@ -150,6 +150,7 @@ class JobRecord:
     result_filename: str | None
     result_size_bytes: int | None
     result_sha256: str | None
+    result_archive_schema_version: int | None
     warnings_json: str | None
     error_code: str | None
     error_message: str | None
@@ -420,6 +421,11 @@ class ServiceStore:
                         result_filename TEXT,
                         result_size_bytes INTEGER,
                         result_sha256 TEXT,
+                        result_archive_schema_version INTEGER
+                            CHECK (
+                                result_archive_schema_version IS NULL
+                                OR result_archive_schema_version >= 1
+                            ),
                         warnings_json TEXT,
                         error_code TEXT,
                         error_message TEXT,
@@ -461,11 +467,11 @@ class ServiceStore:
                             CHECK (active_job_limit IS NULL OR active_job_limit >= 0)
                     );
 
-                    PRAGMA user_version = 8;
+                    PRAGMA user_version = 9;
                     COMMIT;
                     """
                 )
-            elif version != 8:
+            elif version != 9:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
                     f"{version} at {self.path}; stop the service and initialize "
@@ -490,7 +496,7 @@ class ServiceStore:
                 timeout=5,
                 isolation_level=None,
             )
-            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 8:
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 9:
                 raise RuntimeError("SQLite schema is unavailable")
             conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         except sqlite3.Error as exc:
@@ -1917,6 +1923,7 @@ class ServiceStore:
         result_filename: str,
         result_size_bytes: int,
         result_sha256: str,
+        result_archive_schema_version: int,
         warnings_json: str = "[]",
         result_cached: bool = False,
         now: int,
@@ -1924,6 +1931,11 @@ class ServiceStore:
         """Record a verified immutable archive and its terminal job state."""
         if state not in (JobState.SUCCEEDED, JobState.PARTIAL):
             raise ValueError("Completed jobs must be succeeded or partial")
+        if (
+            type(result_archive_schema_version) is not int
+            or result_archive_schema_version < 1
+        ):
+            raise ValueError("Result archive schema version must be positive")
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1958,7 +1970,8 @@ class ServiceStore:
                 UPDATE jobs
                 SET state = ?, result_volume_name = ?, result_volume_path = ?,
                     result_filename = ?, result_size_bytes = ?,
-                    result_sha256 = ?, warnings_json = ?, error_code = NULL,
+                    result_sha256 = ?, result_archive_schema_version = ?,
+                    warnings_json = ?, error_code = NULL,
                     error_message = NULL, stage_history_json = ?, updated_at = ?,
                     completed_at = COALESCE(completed_at, ?), blocked_at = NULL,
                     next_retry_at = NULL,
@@ -1973,6 +1986,7 @@ class ServiceStore:
                     result_filename,
                     result_size_bytes,
                     result_sha256,
+                    result_archive_schema_version,
                     warnings_json,
                     history_json,
                     now,
@@ -2106,6 +2120,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         result_filename=row["result_filename"],
         result_size_bytes=row["result_size_bytes"],
         result_sha256=row["result_sha256"],
+        result_archive_schema_version=row["result_archive_schema_version"],
         warnings_json=row["warnings_json"],
         error_code=row["error_code"],
         error_message=row["error_message"],

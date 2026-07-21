@@ -58,7 +58,7 @@ class BuiltGromacsArchive:
     sha256: str
 
 
-_ARCHIVE_SCHEMA_VERSION = 2
+GROMACS_ARCHIVE_SCHEMA_VERSION = 3
 
 
 def _required_output_files(run_name: str) -> list[tuple[str, str]]:
@@ -357,11 +357,11 @@ def _member_digest(
     return size, digest.hexdigest()
 
 
-def _zip_info(name: str, *, stored: bool = False) -> zipfile.ZipInfo:
+def _zip_info(name: str) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(name, date_time=_ZIP_TIMESTAMP)
     info.create_system = 3
     info.external_attr = 0o100600 << 16
-    info.compress_type = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    info.compress_type = zipfile.ZIP_STORED
     return info
 
 
@@ -421,7 +421,7 @@ async def _write_remote_chunks(
     digest = hashlib.sha256()
     size_bytes = 0
     with archive.open(
-        _zip_info(name, stored=PurePosixPath(name).suffix in {".tpr", ".xtc"}),
+        _zip_info(name),
         mode="w",
         force_zip64=True,
     ) as destination:
@@ -543,7 +543,7 @@ async def write_gromacs_archive(
         provenance_bytes = (
             orjson.dumps(
                 {
-                    "archive_schema_version": _ARCHIVE_SCHEMA_VERSION,
+                    "archive_schema_version": GROMACS_ARCHIVE_SCHEMA_VERSION,
                     "job_id": job_id,
                     "tool": "gromacs",
                     "modal_app_name": modal_app_name,
@@ -577,7 +577,7 @@ async def write_gromacs_archive(
         manifest_bytes = (
             orjson.dumps(
                 {
-                    "archive_schema_version": _ARCHIVE_SCHEMA_VERSION,
+                    "archive_schema_version": GROMACS_ARCHIVE_SCHEMA_VERSION,
                     "run_name": run_name,
                     "files": records,
                 },
@@ -641,7 +641,7 @@ def _manifest_records(document: object) -> list[dict[str, object]]:
     if (
         not isinstance(document, dict)
         or set(document) != {"archive_schema_version", "run_name", "files"}
-        or document.get("archive_schema_version") != _ARCHIVE_SCHEMA_VERSION
+        or document.get("archive_schema_version") != GROMACS_ARCHIVE_SCHEMA_VERSION
     ):
         raise ValueError("GROMACS archive manifest is invalid")
     records = document.get("files")

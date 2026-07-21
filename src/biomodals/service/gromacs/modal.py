@@ -1043,6 +1043,7 @@ class GromacsReconciler:
     ) -> bool:
         """Request fail-fast cancellation and report whether every call stopped."""
         stopped = True
+        status_unknown = False
         for call in calls:
             if call.state != JobProviderCallState.RUNNING or call.modal_call_id is None:
                 continue
@@ -1065,18 +1066,23 @@ class GromacsReconciler:
             if outcome.kind == "running":
                 stopped = False
                 continue
-            terminal = (
-                JobProviderCallState.CANCELLED
-                if outcome.kind == "expired"
-                else JobProviderCallState(outcome.kind)
-            )
+            if outcome.kind == "expired":
+                status_unknown = True
+                continue
             self.store.record_provider_call_outcome(
                 job.job_id,
                 provider_operation=call.provider_operation,
                 expected_modal_call_id=call.modal_call_id,
-                outcome=terminal,
+                outcome=JobProviderCallState(outcome.kind),
                 now=self._now(),
             )
+        if status_unknown:
+            self.store.mark_state_unknown(
+                job.job_id,
+                reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
+                now=self._now(),
+            )
+            return False
         refreshed = self.store.list_provider_calls(job.job_id)
         return stopped and not any(
             call.state

@@ -368,7 +368,9 @@ The three branches after preparation run concurrently. Production analysis may
 start while NVT or NPT analysis is still running. Result preparation starts only
 after all three analysis stages complete. A definite branch failure stops new
 dependencies, requests cancellation of active siblings, and reaches `failed`
-only after every known remote call is inactive.
+only after every known remote call is inactive. If the service cannot confirm a
+sibling's state while stopping it, the Job becomes `state_unknown` and keeps its
+admission capacity until an Administrator resolves it.
 
 The Job page displays the last recorded update but never derives a stale,
 stalled, or failed state from elapsed time: a deployed Function can

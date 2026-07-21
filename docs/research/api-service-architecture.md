@@ -224,7 +224,9 @@ API does not duplicate or alter those details.
 A definite branch failure prevents further dependent submissions and requests
 cancellation of every still-running sibling. The Job remains active until those
 calls are confirmed inactive, then becomes `failed`; this avoids hiding paid
-remote work behind an early terminal state.
+remote work behind an early terminal state. If a sibling's status expires while
+the service is trying to stop it, the Job becomes `state_unknown` and continues
+to consume admission capacity until an Administrator resolves it.
 
 There is deliberately no deployed `run_gromacs_job` Function wrapping these
 calls. Such a wrapper adds a second Modal call layer, obscures which resource

@@ -1060,6 +1060,52 @@ def test_parallel_stage_failure_cancels_siblings_before_job_fails(
     assert ("cancel", "fc-production", False) in production.events
 
 
+def test_parallel_stage_failure_keeps_expired_sibling_state_unknown(
+    tmp_path: Path,
+) -> None:
+    class DisappearingCall(FakeCall):
+        async def _cancel(self, *, terminate_containers: bool):
+            await super()._cancel(terminate_containers=terminate_containers)
+            self.result = modal.exception.OutputExpiredError("expired")
+
+    class CancellableCall(FakeCall):
+        async def _cancel(self, *, terminate_containers: bool):
+            await super()._cancel(terminate_containers=terminate_containers)
+            self.result = modal.exception.InputCancellation("cancelled")
+
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="prepared")
+    nvt = FakeCall("fc-nvt", result=RuntimeError("analysis failed"))
+    npt = DisappearingCall("fc-npt")
+    production = CancellableCall("fc-production")
+    calls = {"fc-root": prepare}
+    functions = iter((FakeFunction(nvt), FakeFunction(npt), FakeFunction(production)))
+    reconciler = GromacsReconciler(
+        store,
+        _adapter(
+            calls,
+            function_resolver=lambda *_args, **_kwargs: next(functions),
+        ),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+    calls.update({call.object_id: call for call in (nvt, npt, production)})
+    asyncio.run(reconciler.reconcile())
+
+    unresolved = store.get_job(job.owner_user_id, job.job_id)
+    assert unresolved is not None
+    assert unresolved.state == JobState.STATE_UNKNOWN
+    assert unresolved.state_unknown_reason == "cancellation_outcome_unknown"
+    states = {
+        call.provider_operation: call.state
+        for call in store.list_provider_calls(job.job_id)
+    }
+    assert states["collect_traj_stats:nvt_"] == JobProviderCallState.FAILED
+    assert states["collect_traj_stats:npt_"] == JobProviderCallState.RUNNING
+    assert states["production_run_gpu"] == JobProviderCallState.CANCELLED
+
+
 def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
     tmp_path: Path,
 ) -> None:

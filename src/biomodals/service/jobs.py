@@ -16,6 +16,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.service.store import JobRecord, JobStageRecord, JobState
+from biomodals.service.workloads import WORKLOAD_DEFINITIONS, WorkloadDefinition
 
 LOGGER = logging.getLogger(__name__)
 JobErrorCode = Literal["compute_failed", "result_invalid"]
@@ -66,34 +67,18 @@ class JobStageView(BaseModel):
     outcome: JobStageOutcome | None = None
 
 
-_GROMACS_STAGES: dict[
-    str,
-    tuple[JobStageCode, DeployedFunctionName | None],
-] = {
-    "prepare_tpr_cpu": ("prepare_simulation", "prepare_tpr_cpu"),
-    "prepare_tpr_gpu": ("prepare_simulation", "prepare_tpr_gpu"),
-    "collect_traj_stats:nvt_": ("analyze_nvt", "collect_traj_stats"),
-    "collect_traj_stats:npt_": ("analyze_npt", "collect_traj_stats"),
-    "production_run_cpu": ("run_production", "production_run_cpu"),
-    "production_run_gpu": ("run_production", "production_run_gpu"),
-    "collect_traj_stats:production_": (
-        "analyze_production",
-        "collect_traj_stats",
-    ),
-    "result_packaging": ("prepare_result", None),
-}
-
-
 def _stage_view(
+    workload: str,
     provider_operation: str,
     event: JobStageRecord | None = None,
 ) -> JobStageView | None:
-    stage = _GROMACS_STAGES.get(provider_operation)
+    definition = WORKLOAD_DEFINITIONS.get(workload)
+    stage = definition.stage(provider_operation) if definition is not None else None
     if stage is None or event is None:
         return None
     return JobStageView(
-        code=stage[0],
-        function_name=stage[1],
+        code=cast(JobStageCode, stage.code),
+        function_name=cast(DeployedFunctionName | None, stage.function_name),
         started_at=datetime.fromtimestamp(event.started_at, UTC),
         ended_at=(
             datetime.fromtimestamp(event.completed_at, UTC)
@@ -108,7 +93,7 @@ def _job_stage(
     record: JobRecord,
     history: Sequence[JobStageRecord],
 ) -> JobStageView | None:
-    if record.workload != "gromacs":
+    if record.workload not in WORKLOAD_DEFINITIONS:
         return None
     if record.state in {
         JobState.FINALIZING,
@@ -131,19 +116,26 @@ def _job_stage(
         ),
         None,
     )
-    return _stage_view(provider_operation, event)
+    return _stage_view(record.workload, provider_operation, event)
 
 
 def _job_stage_history(
     record: JobRecord,
     history: Sequence[JobStageRecord],
 ) -> list[JobStageView]:
-    if record.workload != "gromacs":
+    if record.workload not in WORKLOAD_DEFINITIONS:
         return []
     return [
         stage
         for event in history
-        if (stage := _stage_view(event.provider_operation, event)) is not None
+        if (
+            stage := _stage_view(
+                record.workload,
+                event.provider_operation,
+                event,
+            )
+        )
+        is not None
     ]
 
 
@@ -246,7 +238,7 @@ PreflightWorkload = Callable[[str, str, int], Awaitable[None]]
 class WorkloadRegistration:
     """Explicit contribution made by one app or workflow service module."""
 
-    name: str
+    definition: WorkloadDefinition
     router: APIRouter
     lifecycle_locks: JobLifecycleLocks
     reconciler: Reconciler | None = None
@@ -255,6 +247,11 @@ class WorkloadRegistration:
     rebuild_artifact: ReadArtifact | None = None
     preflight: PreflightWorkload | None = None
     max_body_bytes: int = 1024 * 1024
+
+    @property
+    def name(self) -> str:
+        """Return the stable workload key used by routing and persistence."""
+        return self.definition.name
 
 
 async def reconciliation_loop(

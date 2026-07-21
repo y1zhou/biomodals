@@ -53,6 +53,7 @@ from biomodals.service.store import (
     ServiceStore,
     UserNotFoundError,
 )
+from biomodals.service.workloads import GROMACS_WORKLOAD
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -434,7 +435,7 @@ def create_registration(
     read_artifact = getattr(adapter, "read_artifact", None)
     rebuild_artifact = getattr(adapter, "rebuild_artifact", None)
     return WorkloadRegistration(
-        name="gromacs",
+        definition=GROMACS_WORKLOAD,
         router=create_router(
             adapter,
             lifecycle_locks=lifecycle_locks,

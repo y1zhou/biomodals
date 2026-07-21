@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from biomodals.service.config import ServiceSettings
+from biomodals.service.workloads import (
+    GROMACS_WORKLOAD,
+    WORKLOAD_DEFINITIONS,
+    WorkloadDefinition,
+)
 
 if TYPE_CHECKING:
     from biomodals.service.store import ServiceStore
@@ -84,6 +89,13 @@ class ModalConfigurationSnapshot:
     app_version: int
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkloadDefaults:
+    modal_app_name: str
+    modal_app_version: int
+    active_job_limit: int
+
+
 class RuntimeConfiguration:
     """Resolve process env over database over env file over defaults."""
 
@@ -94,6 +106,36 @@ class RuntimeConfiguration:
         """Bind live database overrides to immutable startup sources."""
         self.store = store
         self.settings = settings
+        self._workload_defaults = {
+            GROMACS_WORKLOAD.name: _WorkloadDefaults(
+                modal_app_name=settings.gromacs_app_name,
+                modal_app_version=settings.gromacs_app_version,
+                active_job_limit=settings.gromacs_active_limit,
+            )
+        }
+
+    def workload_definition(self, workload: str) -> WorkloadDefinition:
+        """Return the static descriptor for one registered workload."""
+        try:
+            return WORKLOAD_DEFINITIONS[workload]
+        except KeyError as exc:
+            raise ValueError(f"Unknown workload: {workload}") from exc
+
+    def workload_names(self) -> tuple[str, ...]:
+        """Return fixed workload names in their configured display order."""
+        return tuple(self._workload_defaults)
+
+    def _defaults(self, workload: str) -> _WorkloadDefaults:
+        self.workload_definition(workload)
+        return self._workload_defaults[workload]
+
+    def modal_app_name_fallback(self, workload: str) -> str:
+        """Return the startup fallback restored by a null Admin PATCH."""
+        return self._defaults(workload).modal_app_name
+
+    def modal_app_version_fallback(self, workload: str) -> int:
+        """Return the startup version restored by a null Admin PATCH."""
+        return self._defaults(workload).modal_app_version
 
     @property
     def modal_token_id(self) -> str:
@@ -125,36 +167,36 @@ class RuntimeConfiguration:
 
     def workload(self, workload: str) -> WorkloadRuntimeConfiguration:
         """Resolve settings for one fixed registered workload."""
-        if workload != "gromacs":
-            raise ValueError(f"Unknown workload: {workload}")
+        definition = self.workload_definition(workload)
+        defaults = self._defaults(workload)
         stored = self.store.get_workload_configuration(workload)
         return WorkloadRuntimeConfiguration(
             workload=workload,
             modal_app_name=self._workload_text_setting(
-                environment_name="BIOMODALS_GROMACS_APP",
+                environment_name=definition.modal_app_name_environment,
                 database_value=(stored.modal_app_name if stored is not None else None),
-                default=self.settings.gromacs_app_name,
+                default=defaults.modal_app_name,
             ),
             modal_app_version=self._workload_positive_integer_setting(
-                environment_name="BIOMODALS_GROMACS_APP_VERSION",
+                environment_name=definition.modal_app_version_environment,
                 database_value=(
                     stored.modal_app_version if stored is not None else None
                 ),
-                default=self.settings.gromacs_app_version,
+                default=defaults.modal_app_version,
             ),
             active_job_limit=self._workload_integer_setting(
-                environment_name="BIOMODALS_GROMACS_ACTIVE_LIMIT",
+                environment_name=definition.active_job_limit_environment,
                 database_value=(
                     stored.active_job_limit if stored is not None else None
                 ),
-                default=self.settings.gromacs_active_limit,
+                default=defaults.active_job_limit,
             ),
         )
 
     def admission_configuration(self, workload: str) -> JobAdmissionConfiguration:
         """Return static inputs; SQLite resolves mutable values atomically later."""
-        if workload != "gromacs":
-            raise ValueError(f"Unknown workload: {workload}")
+        definition = self.workload_definition(workload)
+        defaults = self._defaults(workload)
         sources = self.settings.sources
         return JobAdmissionConfiguration(
             workload=workload,
@@ -163,16 +205,20 @@ class RuntimeConfiguration:
                 not sources.has_process_override("BIOMODALS_MODAL_ENVIRONMENT"),
             ),
             modal_app_name=DatabaseOverridableSetting(
-                self.settings.gromacs_app_name,
-                not sources.has_process_override("BIOMODALS_GROMACS_APP"),
+                defaults.modal_app_name,
+                not sources.has_process_override(definition.modal_app_name_environment),
             ),
             modal_app_version=DatabaseOverridableSetting(
-                self.settings.gromacs_app_version,
-                not sources.has_process_override("BIOMODALS_GROMACS_APP_VERSION"),
+                defaults.modal_app_version,
+                not sources.has_process_override(
+                    definition.modal_app_version_environment
+                ),
             ),
             workload_active_job_limit=DatabaseOverridableSetting(
-                self.settings.gromacs_active_limit,
-                not sources.has_process_override("BIOMODALS_GROMACS_ACTIVE_LIMIT"),
+                defaults.active_job_limit,
+                not sources.has_process_override(
+                    definition.active_job_limit_environment
+                ),
             ),
             global_active_job_limit=DatabaseOverridableSetting(
                 self.settings.global_active_job_limit,
@@ -218,25 +264,24 @@ class RuntimeConfiguration:
         active_job_limit: int | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Atomically update supplied settings for one fixed workload."""
-        if workload != "gromacs":
-            raise ValueError(f"Unknown workload: {workload}")
+        definition = self.workload_definition(workload)
         updates: dict[str, str | int | None] = {}
         if not isinstance(modal_app_name, _Unchanged):
-            self._ensure_editable("BIOMODALS_GROMACS_APP")
+            self._ensure_editable(definition.modal_app_name_environment)
             updates["modal_app_name"] = (
                 None
                 if modal_app_name is None
                 else _nonempty(modal_app_name, "Modal app name")
             )
         if not isinstance(modal_app_version, _Unchanged):
-            self._ensure_editable("BIOMODALS_GROMACS_APP_VERSION")
+            self._ensure_editable(definition.modal_app_version_environment)
             updates["modal_app_version"] = (
                 None
                 if modal_app_version is None
                 else _positive(modal_app_version, "Modal App version")
             )
         if not isinstance(active_job_limit, _Unchanged):
-            self._ensure_editable("BIOMODALS_GROMACS_ACTIVE_LIMIT")
+            self._ensure_editable(definition.active_job_limit_environment)
             updates["active_job_limit"] = (
                 None
                 if active_job_limit is None

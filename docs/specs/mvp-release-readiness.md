@@ -317,6 +317,22 @@ job status." The frontend then retains the last known state, leaves manual
 Refresh available, and continues its normal polling cadence. Only the backend
 changes Job Status.
 
+### Workload and Catalog registration
+
+Each executable API workload has one fixed descriptor owning its stable key,
+User-facing Tool name, Runtime Setting environment-variable names, and mapping
+from provider operations to public timeline stages. Runtime configuration,
+Admin Tool rows, routing registration, and Job views consume that descriptor
+instead of carrying separate GROMACS name and stage tables. The descriptor does
+not make scientific orchestration generic: GROMACS keeps its own adapter,
+request schema, sequencing, archive builder, and tests.
+
+The frontend Catalog separately includes an AlphaFold 3 placeholder marked
+`WIP`. Its card is visibly muted, is not an interactive navigation target, and
+cannot submit a Job. The backend does not register an AlphaFold 3 workload,
+route, Modal App, configuration row, or speculative scientific contract until
+that workflow is designed and deployed.
+
 ### Durable Cancellation
 
 Accepting Cancellation persists `cancel_requested_at` and moves the Job to

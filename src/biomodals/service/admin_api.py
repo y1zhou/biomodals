@@ -190,6 +190,7 @@ class AdminModalToolView(BaseModel):
     """One fixed workload's deployment and admission state."""
 
     workload: str
+    display_name: str
     modal_app_name: TextSettingView
     modal_app_version: IntegerSettingView
     active_jobs: int
@@ -317,7 +318,6 @@ def _modal_view(
     configuration: RuntimeConfiguration,
     store: ServiceStore,
 ) -> AdminModalView:
-    workload = configuration.workload("gromacs")
     return AdminModalView(
         environment=AdminModalEnvironmentView(
             service_token_id=configuration.modal_token_id,
@@ -329,10 +329,16 @@ def _modal_view(
         tools=[
             AdminModalToolView(
                 workload=workload.workload,
+                display_name=configuration.workload_definition(
+                    workload.workload
+                ).display_name,
                 modal_app_name=_text_view(workload.modal_app_name),
                 modal_app_version=_integer_view(workload.modal_app_version),
                 active_jobs=store.count_active_jobs(workload.workload),
                 active_job_limit=_integer_view(workload.active_job_limit),
+            )
+            for workload in (
+                configuration.workload(name) for name in configuration.workload_names()
             )
         ],
         blocked_jobs=[
@@ -655,6 +661,7 @@ def create_admin_router() -> APIRouter:
         provider_fields = {"modal_app_name", "modal_app_version"}
         if submission.model_fields_set & provider_fields:
             effective = configuration.workload(workload)
+            definition = configuration.workload_definition(workload)
             if (
                 "modal_app_name" in submission.model_fields_set
                 and not effective.modal_app_name.editable
@@ -662,7 +669,8 @@ def create_admin_router() -> APIRouter:
                 raise CodedAPIError(
                     409,
                     "setting_overridden",
-                    "BIOMODALS_GROMACS_APP is controlled by an environment variable",
+                    f"{definition.modal_app_name_environment} is controlled by "
+                    "an environment variable",
                 )
             if (
                 "modal_app_version" in submission.model_fields_set
@@ -671,13 +679,13 @@ def create_admin_router() -> APIRouter:
                 raise CodedAPIError(
                     409,
                     "setting_overridden",
-                    "BIOMODALS_GROMACS_APP_VERSION is controlled by an "
-                    "environment variable",
+                    f"{definition.modal_app_version_environment} is controlled "
+                    "by an environment variable",
                 )
             candidate_app_name = effective.modal_app_name.value
             if "modal_app_name" in submission.model_fields_set:
                 candidate_app_name = (
-                    configuration.settings.gromacs_app_name
+                    configuration.modal_app_name_fallback(workload)
                     if submission.modal_app_name is None
                     else submission.modal_app_name.strip()
                 )
@@ -690,7 +698,7 @@ def create_admin_router() -> APIRouter:
             candidate_app_version = effective.modal_app_version.value
             if "modal_app_version" in submission.model_fields_set:
                 candidate_app_version = (
-                    configuration.settings.gromacs_app_version
+                    configuration.modal_app_version_fallback(workload)
                     if submission.modal_app_version is None
                     else submission.modal_app_version
                 )

@@ -473,6 +473,7 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     assert initial.json()["environment"]["service_token_id"] == "test-token-id"
     assert "test-token-secret" not in initial.text
     assert initial.json()["tools"][0]["workload"] == "gromacs"
+    assert initial.json()["tools"][0]["display_name"] == "GROMACS MD simulation"
 
     environment = client.patch(
         "/api/v1/admin/modal/environment",

@@ -690,8 +690,11 @@ continue to own permutations and edge cases.
 The backend merge gate installs the committed lockfile, runs the existing
 `prek` checks, and runs the full pytest suite. The frontend merge gate installs
 the committed lockfile, runs lint and unit tests, and produces the production
-build. The cross-repository gate runs the live OpenAPI `api:check` and the
-focused Playwright suite against the intended backend revision.
+build. The manually dispatched cross-repository gate requires full
+40-character candidate frontend and backend commit hashes, rejects mutable
+branches, tags, and abbreviated hashes, and records the checked-out pair in its
+workflow summary. It runs the live OpenAPI `api:check` and the focused
+Playwright suite against that immutable pair.
 
 The MVP does not add a version matrix, coverage threshold, or new mandatory
 backend type checker. CI never contacts Modal. The Administrator-run real-Modal

@@ -73,9 +73,6 @@ biomodals.example.com {
 	encode zstd gzip
 
 	@api path /api/* /docs* /openapi.json /redoc*
-	handle @api {
-		reverse_proxy 127.0.0.1:4100
-	}
 
 	header {
 		Content-Security-Policy "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
@@ -91,8 +88,11 @@ biomodals.example.com {
 	header @document Cache-Control "no-cache"
 
 	root * /srv/biomodals.example.com
-	try_files {path} /index.html
-	file_server
+	route {
+		reverse_proxy @api 127.0.0.1:4100
+		try_files {path} /index.html
+		file_server
+	}
 }
 ```
 
@@ -106,11 +106,15 @@ Before every deployment, record exactly two last-deployed commit hashes: one
 for this backend repository and one for the frontend repository. Verify both
 locally and generate a change-aware manual checklist from those baselines.
 When there is no prior deployment, treat the complete candidate as changed.
+Record the full 40-character candidate hashes as well. Run the frontend
+repository's manually dispatched `Cross-repository checks` workflow with those
+candidate hashes and retain its successful workflow URL; branches, tags, and
+abbreviated hashes are not acceptable release evidence.
 
 The checklist must order these actions:
 
-1. Run the automated backend, frontend, OpenAPI, and Playwright gates against
-   the intended pair of revisions.
+1. Run the automated backend and frontend merge gates, then the exact-SHA
+   OpenAPI and Playwright gate against the intended candidate pair.
 2. Review configuration-file ownership/mode and the effective public URL,
    cookie mode, state path, cache path, Modal Environment, App name, and limits.
 3. Deploy a changed GROMACS App before an API that calls its changed contract;

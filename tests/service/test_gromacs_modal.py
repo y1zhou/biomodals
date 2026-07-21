@@ -39,7 +39,13 @@ from biomodals.service.runtime_config import (
     JobAdmissionConfiguration,
     ModalConfigurationSnapshot,
 )
-from biomodals.service.store import JobRecord, JobState, ServiceStore, UserRecord
+from biomodals.service.store import (
+    JobProviderCallState,
+    JobRecord,
+    JobState,
+    ServiceStore,
+    UserRecord,
+)
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 SHA256 = "a" * 64
@@ -371,15 +377,69 @@ def _submitted_job(
         configuration=_admission_configuration(),
         now=2,
     )
-    job = store.mark_submitted(
-        admission.job.job_id,
-        modal_call_id="fc-root",
-        provider_operation=provider_operation,
-        run_name=RUN_NAME,
-        now=3,
-    )
+    if provider_operation == "prepare_tpr_gpu":
+        job = store.mark_submitted(
+            admission.job.job_id,
+            modal_call_id="fc-root",
+            provider_operation=provider_operation,
+            run_name=RUN_NAME,
+            now=3,
+        )
+        now = 3
+    else:
+        job = store.mark_submitted(
+            admission.job.job_id,
+            modal_call_id="fc-prepare",
+            provider_operation="prepare_tpr_gpu",
+            run_name=RUN_NAME,
+            now=3,
+        )
+        store.record_provider_call_outcome(
+            job.job_id,
+            provider_operation="prepare_tpr_gpu",
+            expected_modal_call_id="fc-prepare",
+            outcome=JobProviderCallState.COMPLETED,
+            now=4,
+        )
+        now = 5
+        operations = [
+            "collect_traj_stats:nvt_",
+            "collect_traj_stats:npt_",
+            "production_run_gpu",
+            "collect_traj_stats:production_",
+        ]
+        for operation in operations:
+            operation_now = 7 if operation == "collect_traj_stats:production_" else 5
+            token = f"setup-{operation}"
+            claimed = store.claim_provider_operation(
+                job.job_id,
+                provider_operation=operation,
+                submission_token=token,
+                now=operation_now,
+            )
+            assert claimed is not None
+            modal_call_id = (
+                "fc-root" if operation == provider_operation else f"fc-{operation}"
+            )
+            job = store.attach_provider_call(
+                job.job_id,
+                provider_operation=operation,
+                modal_call_id=modal_call_id,
+                submission_token=token,
+                now=operation_now,
+            )
+            if operation == provider_operation:
+                break
+            store.record_provider_call_outcome(
+                job.job_id,
+                provider_operation=operation,
+                expected_modal_call_id=modal_call_id,
+                outcome=JobProviderCallState.COMPLETED,
+                now=6,
+            )
+        now = 7
     if cancel_requested:
-        job = store.request_cancel(user.user_id, job.job_id, now=4)
+        job = store.request_cancel(user.user_id, job.job_id, now=now + 1)
     return store, job
 
 
@@ -630,8 +690,8 @@ def test_submit_preserves_a_definite_modal_rejection() -> None:
         )
 
 
-def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
-    store, job = _submitted_job(tmp_path)
+def test_submit_operation_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
+    _store, job = _submitted_job(tmp_path)
     lookups: list[tuple[str, str, str | None, int | None]] = []
     functions: list[FakeFunction] = []
 
@@ -659,25 +719,9 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
         "production_run_gpu",
         "collect_traj_stats:production_",
     )
-    for index, operation in enumerate(operations, start=1):
-        submission_token = f"stage-{index}"
-        claimed = store.claim_provider_advance(
-            job.job_id,
-            expected_modal_call_id=job.modal_call_id or "",
-            submission_token=submission_token,
-            now=3 + index,
-        )
-        assert claimed is not None
-        submitted = asyncio.run(adapter.advance(job))
+    for operation in operations:
+        submitted = asyncio.run(adapter.submit_operation(job, operation))
         assert submitted.provider_operation == operation
-        job = store.replace_provider_call(
-            job.job_id,
-            expected_modal_call_id=job.modal_call_id or "",
-            modal_call_id=f"fc-{index}",
-            provider_operation=operation,
-            submission_token=submission_token,
-            now=3 + index,
-        )
 
     assert [function_name for _, function_name, _, _ in lookups] == [
         "collect_traj_stats",
@@ -843,12 +887,16 @@ def test_published_archive_is_promoted_into_the_local_cache(
     assert cache.clear().entries == 1
 
 
-def test_reconciler_advances_completed_stage_to_one_direct_named_call(
+def test_reconciler_fans_out_after_preparation(
     tmp_path: Path,
 ) -> None:
     store, job = _submitted_job(tmp_path)
     prepare = FakeCall("fc-root", result="/volumes/Gromacs-outputs/api-run")
-    analysis = FakeFunction(FakeCall("fc-analysis"))
+    functions = [
+        FakeFunction(FakeCall("fc-nvt")),
+        FakeFunction(FakeCall("fc-npt")),
+        FakeFunction(FakeCall("fc-production")),
+    ]
     lookups: list[tuple[str, str, str | None, int | None]] = []
 
     def from_name(
@@ -859,7 +907,7 @@ def test_reconciler_advances_completed_stage_to_one_direct_named_call(
         version: int | None = None,
     ) -> FakeFunction:
         lookups.append((app_name, function_name, environment_name, version))
-        return analysis
+        return functions[len(lookups) - 1]
 
     reconciler = GromacsReconciler(
         store,
@@ -871,13 +919,145 @@ def test_reconciler_advances_completed_stage_to_one_direct_named_call(
 
     advanced = store.get_job(job.owner_user_id, job.job_id)
     assert advanced is not None
-    assert advanced.modal_call_id == "fc-analysis"
-    assert advanced.provider_operation == "collect_traj_stats:nvt_"
-    assert lookups == [("GromacsAPI", "collect_traj_stats", "department-dev", 17)]
-    assert analysis.spawn_kwargs == {
+    assert [
+        (call.provider_operation, call.modal_call_id)
+        for call in store.list_provider_calls(job.job_id)
+    ] == [
+        ("prepare_tpr_gpu", "fc-root"),
+        ("collect_traj_stats:npt_", "fc-npt"),
+        ("collect_traj_stats:nvt_", "fc-nvt"),
+        ("production_run_gpu", "fc-production"),
+    ]
+    assert [lookup[1] for lookup in lookups] == [
+        "collect_traj_stats",
+        "collect_traj_stats",
+        "production_run_gpu",
+    ]
+    assert functions[0].spawn_kwargs == {
         "traj_prefix": "nvt_",
         "run_name": RUN_NAME,
     }
+    assert functions[1].spawn_kwargs == {
+        "traj_prefix": "npt_",
+        "run_name": RUN_NAME,
+    }
+    assert functions[2].spawn_kwargs == {
+        "run_name": RUN_NAME,
+        "simulation_time_ns": 5,
+    }
+
+
+def test_reconciler_joins_parallel_analyses_before_finalizing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="prepared")
+    nvt = FakeCall("fc-nvt")
+    npt = FakeCall("fc-npt")
+    production = FakeCall("fc-production", result="produced")
+    production_analysis = FakeCall("fc-production-analysis")
+    calls = {"fc-root": prepare}
+    functions = iter((
+        FakeFunction(nvt),
+        FakeFunction(npt),
+        FakeFunction(production),
+        FakeFunction(production_analysis),
+    ))
+    adapter = _adapter(
+        calls,
+        function_resolver=lambda *_args, **_kwargs: next(functions),
+    )
+    reconciler = GromacsReconciler(store, adapter, now=lambda: 10)
+
+    asyncio.run(reconciler.reconcile())
+    calls.update({call.object_id: call for call in (nvt, npt, production)})
+    asyncio.run(reconciler.reconcile())
+    calls[production_analysis.object_id] = production_analysis
+
+    provider_calls = {
+        call.provider_operation: call for call in store.list_provider_calls(job.job_id)
+    }
+    assert provider_calls["collect_traj_stats:nvt_"].state == (
+        JobProviderCallState.RUNNING
+    )
+    assert provider_calls["collect_traj_stats:npt_"].state == (
+        JobProviderCallState.RUNNING
+    )
+    assert provider_calls["production_run_gpu"].state == (
+        JobProviderCallState.COMPLETED
+    )
+    assert provider_calls["collect_traj_stats:production_"].state == (
+        JobProviderCallState.RUNNING
+    )
+
+    nvt.result = "analyzed"
+    npt.result = "analyzed"
+    production_analysis.result = "analyzed"
+
+    async def publish(*_args, **_kwargs) -> FinalArchive:
+        return FinalArchive(
+            state=JobState.SUCCEEDED,
+            volume_name="Gromacs-outputs",
+            path=f"api-results/{RUN_NAME}/result.zip",
+            filename=f"{RUN_NAME}.zip",
+            size_bytes=123,
+            sha256=SHA256,
+            warnings_json="[]",
+        )
+
+    monkeypatch.setattr(adapter, "publish_archive", publish)
+    asyncio.run(reconciler.reconcile())
+
+    completed = store.get_job(job.owner_user_id, job.job_id)
+    assert completed is not None
+    assert completed.state == JobState.SUCCEEDED
+    assert all(
+        call.state == JobProviderCallState.COMPLETED
+        for call in store.list_provider_calls(job.job_id)
+    )
+
+
+def test_parallel_stage_failure_cancels_siblings_before_job_fails(
+    tmp_path: Path,
+) -> None:
+    class CancellableCall(FakeCall):
+        async def _cancel(self, *, terminate_containers: bool):
+            await super()._cancel(terminate_containers=terminate_containers)
+            self.result = modal.exception.InputCancellation("cancelled")
+
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="prepared")
+    nvt = FakeCall("fc-nvt", result=RuntimeError("analysis failed"))
+    npt = CancellableCall("fc-npt")
+    production = CancellableCall("fc-production")
+    calls = {"fc-root": prepare}
+    functions = iter((FakeFunction(nvt), FakeFunction(npt), FakeFunction(production)))
+    reconciler = GromacsReconciler(
+        store,
+        _adapter(
+            calls,
+            function_resolver=lambda *_args, **_kwargs: next(functions),
+        ),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+    calls.update({call.object_id: call for call in (nvt, npt, production)})
+    asyncio.run(reconciler.reconcile())
+
+    failed = store.get_job(job.owner_user_id, job.job_id)
+    assert failed is not None
+    assert failed.state == JobState.FAILED
+    states = {
+        call.provider_operation: call.state
+        for call in store.list_provider_calls(job.job_id)
+    }
+    assert states["collect_traj_stats:nvt_"] == JobProviderCallState.FAILED
+    assert states["collect_traj_stats:npt_"] == JobProviderCallState.CANCELLED
+    assert states["production_run_gpu"] == JobProviderCallState.CANCELLED
+    assert ("cancel", "fc-npt", False) in npt.events
+    assert ("cancel", "fc-production", False) in production.events
 
 
 def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
@@ -890,21 +1070,25 @@ def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
     async def scenario() -> None:
         spawn_started = asyncio.Event()
         release_spawn = asyncio.Event()
+        call_ids = iter(("fc-nvt", "fc-npt", "fc-production"))
 
         class BlockingFunction:
-            def __init__(self) -> None:
+            def __init__(self, call_id: str) -> None:
+                self.call_id = call_id
                 self.spawn = AsyncMethod(self._spawn)
 
             async def _spawn(self, **_kwargs):
                 spawn_started.set()
                 await release_spawn.wait()
-                return FakeCall("fc-successor")
+                return FakeCall(self.call_id)
 
         reconciler = GromacsReconciler(
             store,
             _adapter(
                 {"fc-root": prepare},
-                function_resolver=lambda *_args, **_kwargs: BlockingFunction(),
+                function_resolver=lambda *_args, **_kwargs: BlockingFunction(
+                    next(call_ids)
+                ),
             ),
             lifecycle_locks=locks,
             now=lambda: 10,
@@ -930,7 +1114,10 @@ def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
     cancelling = store.get_job(job.owner_user_id, job.job_id)
     assert cancelling is not None
     assert cancelling.state == JobState.CANCEL_REQUESTED
-    assert cancelling.modal_call_id == "fc-successor"
+    assert {call.modal_call_id for call in store.list_provider_calls(job.job_id)} == {
+        "fc-root",
+        "fc-nvt",
+    }
 
 
 def test_reconciliation_bounds_concurrent_provider_polls(tmp_path: Path) -> None:
@@ -1152,12 +1339,7 @@ def test_cancel_wins_after_final_stage_poll_before_state_transition(
     monkeypatch.setattr(adapter, "publish_archive", unexpected_publication)
     store.request_cancel(stale_running.owner_user_id, stale_running.job_id, now=9)
 
-    asyncio.run(
-        GromacsReconciler(store, adapter, now=lambda: 10)._apply(
-            stale_running,
-            PollOutcome("completed"),
-        )
-    )
+    asyncio.run(GromacsReconciler(store, adapter, now=lambda: 10).reconcile())
 
     cancelled = store.get_job(stale_running.owner_user_id, stale_running.job_id)
     assert cancelled is not None

@@ -916,13 +916,9 @@ def create_app(
             stage.code if stage is not None else "none",
             request_id_from(request),
         )
-        if (
-            job.modal_call_id is not None
-            and registration is not None
-            and registration.cancel is not None
-        ):
+        if registration is not None and registration.cancel is not None:
             try:
-                await registration.cancel(job)
+                await registration.cancel(store, job)
             except Exception:
                 LOGGER.exception(
                     "Could not yet cancel job %s request_id=%s",

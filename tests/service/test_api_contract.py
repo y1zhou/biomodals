@@ -29,7 +29,7 @@ from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
 )
-from biomodals.service.store import JobState, ServiceStore
+from biomodals.service.store import JobProviderCallState, JobState, ServiceStore
 
 ORIGIN = "https://biomodals.internal"
 PASSWORD = "correct horse battery staple"  # noqa: S105 - test credential
@@ -1223,6 +1223,7 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert first.json()["stage"]["code"] == "prepare_simulation"
     assert first.json()["stage"]["function_name"] == "prepare_tpr_cpu"
     assert first.json()["stage"]["started_at"]
+    assert first.json()["active_stages"] == [first.json()["stage"]]
     assert first.json()["stage_history"] == [first.json()["stage"]]
     assert conflict.status_code == 409
     assert conflict.json()["code"] == "idempotency_conflict"
@@ -1265,7 +1266,9 @@ def test_filename_derived_display_name_is_part_of_submission_identity(
     assert len(adapter.submissions) == 1
 
 
-def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> None:
+def test_job_stage_contract_supports_parallel_deployed_functions(
+    tmp_path: Path,
+) -> None:
     client, auth, store, _adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
     csrf_token = _login(client, "alice@example.com")
@@ -1275,37 +1278,57 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
         idempotency_key=str(uuid4()),
     )
     job_id = UUID(submitted.json()["job_id"])
-    transition_token = uuid4().hex
-
-    claimed = store.claim_provider_advance(
+    store.record_provider_call_outcome(
         job_id,
+        provider_operation="prepare_tpr_cpu",
         expected_modal_call_id="fc-1",
-        submission_token=transition_token,
+        outcome=JobProviderCallState.COMPLETED,
         now=1_800_000_001,
     )
-    assert claimed is not None
-    store.replace_provider_call(
-        job_id,
-        expected_modal_call_id="fc-1",
-        modal_call_id="fc-2",
-        provider_operation="collect_traj_stats:nvt_",
-        submission_token=transition_token,
-        now=1_800_000_001,
+    operations = (
+        ("collect_traj_stats:nvt_", "fc-nvt"),
+        ("collect_traj_stats:npt_", "fc-npt"),
+        ("production_run_cpu", "fc-production"),
     )
+    for provider_operation, modal_call_id in operations:
+        token = uuid4().hex
+        claimed = store.claim_provider_operation(
+            job_id,
+            provider_operation=provider_operation,
+            submission_token=token,
+            now=1_800_000_001,
+        )
+        assert claimed is not None
+        store.attach_provider_call(
+            job_id,
+            provider_operation=provider_operation,
+            modal_call_id=modal_call_id,
+            submission_token=token,
+            now=1_800_000_001,
+        )
     analyzing = client.get(f"/api/v1/jobs/{job_id}")
 
     assert analyzing.json()["stage"] == {
-        "code": "analyze_nvt",
-        "function_name": "collect_traj_stats",
+        "code": "run_production",
+        "function_name": "production_run_cpu",
         "started_at": "2027-01-15T08:00:01Z",
     }
-    preparation, nvt_analysis = analyzing.json()["stage_history"]
+    preparation, nvt_analysis, npt_analysis, production = analyzing.json()[
+        "stage_history"
+    ]
     assert preparation["code"] == "prepare_simulation"
     assert preparation["function_name"] == "prepare_tpr_cpu"
     assert preparation["started_at"]
     assert preparation["ended_at"] == "2027-01-15T08:00:01Z"
     assert preparation["outcome"] == "completed"
-    assert nvt_analysis == analyzing.json()["stage"]
+    assert [stage["code"] for stage in analyzing.json()["active_stages"]] == [
+        "analyze_nvt",
+        "analyze_npt",
+        "run_production",
+    ]
+    assert nvt_analysis == analyzing.json()["active_stages"][0]
+    assert npt_analysis == analyzing.json()["active_stages"][1]
+    assert production == analyzing.json()["active_stages"][2]
     assert "modal_call_id" not in analyzing.json()
     assert "provider_operation" not in analyzing.json()
 
@@ -1317,9 +1340,10 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     )
     unavailable = client.get(f"/api/v1/jobs/{job_id}")
 
+    assert unavailable.json()["active_stages"] == []
     assert unavailable.json()["stage"] == {
-        "code": "analyze_nvt",
-        "function_name": "collect_traj_stats",
+        "code": "run_production",
+        "function_name": "production_run_cpu",
         "started_at": "2027-01-15T08:00:01Z",
         "ended_at": "2027-01-15T08:00:02Z",
         "outcome": "failed",
@@ -1331,6 +1355,13 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
         idempotency_key=str(uuid4()),
     )
     packaging_job_id = UUID(submitted_packaging.json()["job_id"])
+    store.record_provider_call_outcome(
+        packaging_job_id,
+        provider_operation="prepare_tpr_cpu",
+        expected_modal_call_id="fc-2",
+        outcome=JobProviderCallState.COMPLETED,
+        now=1_800_000_003,
+    )
     store.set_job_state(
         packaging_job_id,
         JobState.FINALIZING,
@@ -1342,6 +1373,7 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
         "code": "prepare_result",
         "started_at": "2027-01-15T08:00:03Z",
     }
+    assert packaging.json()["active_stages"] == [packaging.json()["stage"]]
     assert packaging.json()["stage_history"][-2]["ended_at"] == ("2027-01-15T08:00:03Z")
     assert packaging.json()["stage_history"][-2]["outcome"] == "completed"
     assert packaging.json()["stage_history"][-1] == packaging.json()["stage"]
@@ -1372,6 +1404,9 @@ def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> No
     assert stage_schema["properties"]["started_at"]["format"] == "date-time"
     assert stage_schema["properties"]["ended_at"]["anyOf"][0]["format"] == ("date-time")
     assert schema["components"]["schemas"]["JobView"]["properties"]["stage_history"][
+        "items"
+    ]["$ref"].endswith("/JobStageView")
+    assert schema["components"]["schemas"]["JobView"]["properties"]["active_stages"][
         "items"
     ]["$ref"].endswith("/JobStageView")
 
@@ -1670,7 +1705,7 @@ def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:
 
 
 def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
-    client, auth, store, _adapter = _service(tmp_path)
+    client, auth, store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
     csrf_token = _login(client, "alice@example.com")
     submitted = _submit(
@@ -1679,6 +1714,33 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
         idempotency_key=str(uuid4()),
     )
     job_id = submitted.json()["job_id"]
+    parsed_job_id = UUID(job_id)
+    store.record_provider_call_outcome(
+        parsed_job_id,
+        provider_operation="prepare_tpr_cpu",
+        expected_modal_call_id="fc-1",
+        outcome=JobProviderCallState.COMPLETED,
+        now=1_799_999_999,
+    )
+    for provider_operation, modal_call_id in (
+        ("collect_traj_stats:nvt_", "fc-nvt"),
+        ("collect_traj_stats:npt_", "fc-npt"),
+        ("production_run_cpu", "fc-production"),
+    ):
+        token = uuid4().hex
+        store.claim_provider_operation(
+            parsed_job_id,
+            provider_operation=provider_operation,
+            submission_token=token,
+            now=1_799_999_999,
+        )
+        store.attach_provider_call(
+            parsed_job_id,
+            provider_operation=provider_operation,
+            modal_call_id=modal_call_id,
+            submission_token=token,
+            now=1_799_999_999,
+        )
 
     first = client.post(
         f"/api/v1/jobs/{job_id}/cancel",
@@ -1697,6 +1759,14 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     assert first.json()["state"] == "cancel_requested"
     assert replay.status_code == 202
     assert replay.json()["state"] == "cancel_requested"
+    assert adapter.cancellations == [
+        "fc-npt",
+        "fc-nvt",
+        "fc-production",
+        "fc-npt",
+        "fc-nvt",
+        "fc-production",
+    ]
     assert old_delete_route.status_code == 405
 
     store.set_job_state(UUID(job_id), JobState.CANCELLED, now=1_800_000_000)

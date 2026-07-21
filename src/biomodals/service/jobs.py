@@ -15,7 +15,7 @@ from weakref import WeakValueDictionary
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
-from biomodals.service.store import JobRecord, JobStageRecord, JobState
+from biomodals.service.store import JobRecord, JobStageRecord, JobState, ServiceStore
 from biomodals.service.workloads import WORKLOAD_DEFINITIONS, WorkloadDefinition
 
 LOGGER = logging.getLogger(__name__)
@@ -95,28 +95,34 @@ def _job_stage(
 ) -> JobStageView | None:
     if record.workload not in WORKLOAD_DEFINITIONS:
         return None
-    if record.state in {
-        JobState.FINALIZING,
-        JobState.BLOCKED,
-        JobState.SUCCEEDED,
-        JobState.PARTIAL,
-    } or (
-        record.state == JobState.FAILED
-        and record.error_code == "result_invalid"
-        and record.provider_operation in {None, "collect_traj_stats:production_"}
-    ):
-        provider_operation = "result_packaging"
+    active = [event for event in history if event.completed_at is None]
+    if active:
+        event = active[-1]
+    elif record.state == JobState.FAILED:
+        event = next(
+            (
+                candidate
+                for candidate in reversed(history)
+                if candidate.outcome == "failed"
+            ),
+            history[-1] if history else None,
+        )
+    elif record.state == JobState.CANCELLED:
+        event = next(
+            (
+                candidate
+                for candidate in reversed(history)
+                if candidate.outcome == "cancelled"
+            ),
+            history[-1] if history else None,
+        )
     else:
-        provider_operation = record.provider_operation or ""
-    event = next(
-        (
-            candidate
-            for candidate in reversed(history)
-            if candidate.provider_operation == provider_operation
-        ),
-        None,
+        event = history[-1] if history else None
+    return (
+        _stage_view(record.workload, event.provider_operation, event)
+        if event is not None
+        else None
     )
-    return _stage_view(record.workload, provider_operation, event)
 
 
 def _job_stage_history(
@@ -149,6 +155,7 @@ class JobView(BaseModel):
     display_name: str
     state: JobState
     stage: JobStageView | None = None
+    active_stages: list[JobStageView] = Field(default_factory=list)
     stage_history: list[JobStageView] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
@@ -173,12 +180,26 @@ class JobView(BaseModel):
         ):
             warnings.append("Cancellation is taking longer than expected.")
         stage_history = record.stage_history
+        active_stages = [
+            stage
+            for event in stage_history
+            if event.completed_at is None
+            and (
+                stage := _stage_view(
+                    record.workload,
+                    event.provider_operation,
+                    event,
+                )
+            )
+            is not None
+        ]
         return cls(
             job_id=str(record.job_id),
             workload=record.workload,
             display_name=record.display_name,
             state=record.state,
             stage=_job_stage(record, stage_history),
+            active_stages=active_stages,
             stage_history=_job_stage_history(record, stage_history),
             created_at=datetime.fromtimestamp(record.created_at, UTC),
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),
@@ -235,7 +256,7 @@ class Reconciler(Protocol):
         ...
 
 
-CancelJob = Callable[[JobRecord], Awaitable[None]]
+CancelJob = Callable[[ServiceStore, JobRecord], Awaitable[None]]
 ReadArtifact = Callable[[JobRecord], AsyncIterable[bytes]]
 PreflightWorkload = Callable[[str, str, int], Awaitable[None]]
 

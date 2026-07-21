@@ -48,6 +48,7 @@ from biomodals.service.runtime_config import (
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
+    JobProviderCallState,
     JobRecord,
     JobState,
     JobStateUnknownReason,
@@ -426,9 +427,17 @@ def create_registration(
 ) -> WorkloadRegistration:
     """Explicitly register GROMACS routes and lifecycle hooks."""
 
-    async def cancel(job: JobRecord) -> None:
-        if job.modal_call_id is not None:
-            await adapter.cancel(job.modal_call_id)
+    async def cancel(store: ServiceStore, job: JobRecord) -> None:
+        first_error: Exception | None = None
+        for call in store.list_provider_calls(job.job_id):
+            if call.state != JobProviderCallState.RUNNING or call.modal_call_id is None:
+                continue
+            try:
+                await adapter.cancel(call.modal_call_id)
+            except Exception as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
 
     lifecycle_locks = lifecycle_locks or getattr(
         reconciler,

@@ -1997,24 +1997,29 @@ class ServiceStore:
     ) -> JobRecord:
         """Attach a detached provider call to its leased graph operation."""
         with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE job_provider_calls
-                SET modal_call_id = ?, state = ?, submission_token = NULL,
-                    submission_lease_until = NULL, started_at = ?
-                WHERE job_id = ? AND provider_operation = ?
-                  AND state = ? AND submission_token = ?
-                """,
-                (
-                    modal_call_id,
-                    JobProviderCallState.RUNNING.value,
-                    now,
-                    str(job_id),
-                    provider_operation,
-                    JobProviderCallState.SUBMITTING.value,
-                    submission_token,
-                ),
-            )
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE job_provider_calls
+                    SET modal_call_id = ?, state = ?, submission_token = NULL,
+                        submission_lease_until = NULL, started_at = ?
+                    WHERE job_id = ? AND provider_operation = ?
+                      AND state = ? AND submission_token = ?
+                    """,
+                    (
+                        modal_call_id,
+                        JobProviderCallState.RUNNING.value,
+                        now,
+                        str(job_id),
+                        provider_operation,
+                        JobProviderCallState.SUBMITTING.value,
+                        submission_token,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise JobSubmissionConflictError(
+                    f"Provider call is already attached for job {job_id}"
+                ) from exc
             job = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
@@ -2554,8 +2559,29 @@ class ServiceStore:
                         (str(job_id),),
                     ).fetchone()
                 return _job_from_row(row)
-            history_json = _transition_stage_history_json(
+            history_json = _complete_open_stage_history_json(
                 str(row["stage_history_json"]),
+                now=now,
+                outcome=JobProviderCallState.COMPLETED.value,
+            )
+            conn.execute(
+                """
+                UPDATE job_provider_calls
+                SET state = ?, submission_token = NULL,
+                    submission_lease_until = NULL,
+                    completed_at = COALESCE(completed_at, ?)
+                WHERE job_id = ? AND state IN (?, ?)
+                """,
+                (
+                    JobProviderCallState.COMPLETED.value,
+                    now,
+                    str(job_id),
+                    JobProviderCallState.SUBMITTING.value,
+                    JobProviderCallState.RUNNING.value,
+                ),
+            )
+            history_json = _transition_stage_history_json(
+                history_json,
                 now=now,
                 start_operation="result_packaging",
             )

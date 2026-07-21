@@ -157,7 +157,7 @@ class CreatedAdminUserView(BaseModel):
 
 
 class UpdateAdminUserRequest(BaseModel):
-    """Editable User status and admission policy fields."""
+    """Editable User presentation, status, role, and admission fields."""
 
     display_name: str | None = Field(default=None, min_length=1, max_length=120)
     status: Literal["enabled", "disabled"] | None = None

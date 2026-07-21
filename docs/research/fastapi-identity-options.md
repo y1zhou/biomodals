@@ -201,7 +201,7 @@ digests, and private job metadata. The essential tables are:
 
 | Table | Important fields |
 | --- | --- |
-| `users` | immutable UUID, normalized unique email, display name, Argon2id hash, User Status, timestamps |
+| `users` | immutable UUID and normalized unique login email, Administrator-editable display name, Argon2id hash, User Status, timestamps |
 | `password_tokens` | SHA-256 token digest, user UUID, expiry |
 | `sessions` | SHA-256 session digest, user UUID, CSRF digest, created/last-seen/absolute-expiry timestamps |
 | `jobs` | owner UUID, public job UUID, workload, state and internal provider/artifact metadata |

@@ -368,9 +368,9 @@ instead of carrying separate GROMACS name and stage tables. The descriptor does
 not make scientific orchestration generic: GROMACS keeps its own adapter,
 request schema, sequencing, archive builder, and tests.
 
-The frontend Catalog separately includes an AlphaFold 3 placeholder marked
+The frontend Catalog separately includes an AlphaFold3 placeholder marked
 `WIP`. Its card is visibly muted, is not an interactive navigation target, and
-cannot submit a Job. The backend does not register an AlphaFold 3 workload,
+cannot submit a Job. The backend does not register an AlphaFold3 workload,
 route, Modal App, configuration row, or speculative scientific contract until
 that workflow is designed and deployed.
 
@@ -556,6 +556,12 @@ authenticate, consume Password Links, or create Submissions. Re-enabling
 returns a User with a password to enabled and one without a password to pending
 setup.
 
+The Admin Users table separates the editable display name from the immutable,
+normalized email used for login. `PATCH /api/v1/admin/users/{user_id}` accepts
+the optional trimmed display name with the same 120-character maximum as User
+creation; it never changes email or login identity. The OpenAPI contract and
+generated frontend client carry that field.
+
 Disabling a User does not cancel already admitted Jobs. They retain their owner
 and continue according to their existing lifecycle. They consume applicable
 Active Job Limits, including while `state_unknown`, until terminal or blocked.
@@ -634,8 +640,9 @@ which User a reset link belongs to.
 
 ### Administrator action confirmations
 
-Four disruptive actions require focused confirmation: Disable User, Remove
-Administrator role, issue a replacement Password Link, and Clear Result Cache.
+Five disruptive actions require focused confirmation: Disable User, Remove
+Administrator role, issue a replacement Password Link, Clear Result Cache, and
+mark a state-unknown Job failed.
 Each dialog identifies its exact User or cache scope, explains the consequence,
 and uses the destructive red confirmation style. A typed confirmation phrase is
 not required.

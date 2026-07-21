@@ -673,6 +673,20 @@ def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> 
         code_schema = schema["components"]["schemas"][model_name]["properties"]["code"]
         assert code_schema["const"] == expected_code
 
+    update_user = schema["paths"]["/api/v1/admin/users/{user_id}"]["patch"]
+    invalid_response = update_user["responses"]["400"]["content"]["application/json"][
+        "schema"
+    ]
+    invalid_model = invalid_response["$ref"].rsplit("/", maxsplit=1)[-1]
+    assert (
+        schema["components"]["schemas"][invalid_model]["properties"]["code"]["const"]
+        == "user_invalid"
+    )
+    display_name = schema["components"]["schemas"]["UpdateAdminUserRequest"][
+        "properties"
+    ]["display_name"]
+    assert display_name["anyOf"][0]["maxLength"] == 120
+
 
 def test_modal_preflight_runs_only_for_changed_provider_fields(
     tmp_path: Path,

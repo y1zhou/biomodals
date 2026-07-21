@@ -4,7 +4,7 @@ Status: accepted for the department development service
 
 Decision date: 2026-07-16
 
-Scope: HTTP ingress and job orchestration for GROMACS, AlphaFold 3, and future
+Scope: HTTP ingress and job orchestration for GROMACS, AlphaFold3, and future
 Biomodals apps and workflows
 
 ## Decision
@@ -122,7 +122,7 @@ The common routes are:
 - `POST /api/v1/jobs/{job_id}/cancel`
 - `GET /api/v1/jobs/{job_id}/download`
 
-GROMACS submission is `POST /api/v1/gromacs/jobs`; AlphaFold 3 will use its own
+GROMACS submission is `POST /api/v1/gromacs/jobs`; AlphaFold3 will use its own
 prefix.
 
 Split a workload into a separate API server only when it develops a genuinely

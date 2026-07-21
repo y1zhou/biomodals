@@ -166,9 +166,9 @@ detail page can show the current sequential step. SQLite also retains an
 ordered `stage_history` timing record: a stage starts when its direct call is
 durably attached and ends when the reconciler records its observed terminal
 outcome. Each entry has `started_at`, nullable `ended_at`, and a nullable outcome
-of `completed`, `failed`, or `cancelled`; active and blocked work has no end or
-outcome. Result packaging spans `finalizing` through archive publication. Modal
-call IDs, App and Environment names, Volume names and paths, dashboard links,
+of `completed`, `failed`, or `cancelled`; active, state-unknown, and blocked work
+has no end or outcome. Result packaging spans `finalizing` through archive
+publication. Modal call IDs, App and Environment names, Volume names and paths, dashboard links,
 tracebacks, and internal filesystem paths remain private.
 
 The stable public GROMACS stage mapping is:
@@ -223,6 +223,7 @@ queued -> running -> finalizing -> succeeded
                             |---> partial (downloadable, with warnings)
                             `---> failed
 queued/running -> cancel_requested -> cancelled
+queued/running/cancel_requested -> state_unknown -> failed (Admin resolution)
 ```
 
 Cancellation is idempotent while it is pending. The adapter asks Modal to
@@ -238,15 +239,29 @@ the completed Result wins. Terminal jobs are preserved and there is no
 job-delete endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
 
 The service does not infer successful Cancellation from a timeout. A pending
-Cancellation continues consuming Active Job Limits until the outcome is known.
-After 15 minutes the owner-facing view uses the persisted timestamp to warn
-that Cancellation is taking longer than expected while reconciliation
-continues.
+Cancellation continues consuming Active Job Limits while Modal still exposes a
+reconcilable call. After 15 minutes the owner-facing view uses the persisted
+timestamp to warn that Cancellation is taking longer than expected while
+reconciliation continues. If the call status expires before cancellation can
+be confirmed and no verified final Result can be recovered, the Job moves to
+`state_unknown`, not falsely to `cancelled`.
 
-If a submission may have reached Modal but no call ID was durably recorded,
-the control plane cannot prove inactivity or issue a targeted cancellation. A
-Cancellation request therefore remains pending through the submission lease
-and becomes `failed`, not falsely `cancelled`, when that lease expires.
+`state_unknown` is the durable safety state for remote execution that may still
+exist but can no longer be tracked automatically. It also applies when a
+`.spawn()` request may have reached Modal but no call ID was durably recorded.
+An explicit ambiguous SDK outcome enters it immediately; a process interruption
+enters it after the short submission lease expires. It consumes User, Tool, and
+Global Active Job Limits, is excluded from reconciliation, and is returned by
+idempotent replay without submitting again.
+
+The owner sees “Status unknown,” a generic explanation, and
+`state_unknown_at`, but no provider detail. The Admin Modal page lists the safe
+Job ID, workload, display name, run name, fixed reason, and timestamp needed for
+manual Modal review. After checking Modal and stopping remote work there when
+necessary, an Administrator may use the destructive `Mark failed` action. That
+action records a safe `compute_failed` terminal failure and releases admission
+capacity; it does not itself contact or cancel Modal. No automatic or owner
+transition leaves `state_unknown`.
 
 Initial submission uses a short SQLite lease and a stable run name made from a
 sanitized display-name slug plus the full Job UUID, for example
@@ -258,16 +273,17 @@ Legacy `api-<job UUID>` names remain valid for stored Result recovery.
 
 An idempotent replay cannot create a second call while the lease is active. If
 the process dies after claiming the Job but before storing a Modal call ID,
-reconciliation leaves the Job queued until the lease expires and then fails it
-with `compute_failed`. It does not automatically resubmit an operation whose
+reconciliation leaves the Job queued until the lease expires and then moves it
+to `state_unknown`. It does not automatically resubmit an operation whose
 provider outcome cannot be proven, because doing so could duplicate paid
-compute. The User must start a new Submission explicitly.
+compute. An Administrator must review the remote state before marking it failed.
 
 Every later stage transition takes the same kind of durable lease before
 calling `.spawn()`. A returned call ID atomically replaces the prior completed
 call and clears the lease. If the process dies or Modal's response is ambiguous
-before that replacement, reconciliation waits for expiry and fails the Job; it
-does not spawn the stage again. Each established stage writes resume-aware
+before that replacement, the Job enters `state_unknown` immediately for an
+explicit ambiguous response or at lease expiry after a process interruption;
+it does not spawn the stage again. Each established stage writes resume-aware
 output under the stable run name, but resume behavior is not treated as a
 provider idempotency guarantee. The required single API worker means routine
 reconciliation passes cannot race. Eliminating this untracked-call limitation

@@ -247,6 +247,46 @@ blocked counts grouped by safe Blocking Category and the oldest blocked age;
 it exposes no owner identity, Job identifier, Input, Result, raw provider
 detail, or storage path.
 
+### Unknown remote execution state
+
+The public Job Status vocabulary adds `state_unknown` for cases where remote
+work may exist but BioModals no longer has enough durable provider state to
+track it safely. This is distinct from `blocked`: a blocked Job has known
+scientific output and retries only recoverable finalization, while a
+state-unknown Job may still be consuming paid remote compute.
+
+A Job enters `state_unknown` when either:
+
+- a direct Modal `.spawn()` may have been accepted but its Function Call ID
+  could not be durably recorded; or
+- Cancellation cannot be confirmed because the known call status expired, and
+  a verified final Result cannot be recovered.
+
+An explicit ambiguous submission outcome enters the state immediately. If the
+API process stops after acquiring a submission lease, the restarted reconciler
+waits for that short lease to expire before entering the state. Neither path
+automatically submits another Function. The Job is excluded from automatic
+reconciliation but continues consuming User, Tool, and Global Active Job Limits
+until it is resolved.
+
+Owner-visible Job detail labels the state `Status unknown`, explains that an
+Administrator must review Modal, exposes `state_unknown_at`, and provides no
+Cancel, Download, or Start Again action. It does not automatically poll because
+only an Administrator mutation can resolve the state; focus, page reload, and
+manual Refresh still load the current record. The latest recorded Stage remains
+visible without a spinner or invented outcome.
+
+The Admin Modal page exposes a dedicated list containing only Job ID, workload,
+display name, safe run name, `state_unknown_at`, and one of the fixed reasons
+`submission_outcome_unknown` or `cancellation_outcome_unknown`. It does not
+expose owner identity, Input, Result, Function Call ID, raw provider exception,
+or storage path. The Administrator must inspect Modal and stop remote work there
+first when necessary. The only MVP resolution is a confirmed destructive
+`Mark failed` action. It records terminal `failed/compute_failed`, closes any
+still-open Stage as failed, preserves the unknown-state timestamp and reason for
+audit, and releases admission capacity. The action does not contact Modal and
+cannot be undone in the Admin panel.
+
 ### Modal configuration preflight
 
 Changing the effective Modal Environment must preflight the output Volume and
@@ -305,9 +345,10 @@ not public timeline rows. Each direct Function stage starts when its call is
 durably attached and ends when the backend records its observed terminal
 outcome. `prepare_result` spans local finalization through Result publication.
 Every started stage exposes `started_at`, nullable `ended_at`, and a nullable
-outcome of `completed`, `failed`, or `cancelled`; an active or blocked stage has
-no end or outcome. OpenAPI also exposes the stage code and safe Running Function
-name when applicable. It exposes no invented substage, timestamp, or outcome.
+outcome of `completed`, `failed`, or `cancelled`; an active, state-unknown, or
+blocked stage has no end or outcome. OpenAPI also exposes the stage code and safe
+Running Function name when applicable. It exposes no invented substage,
+timestamp, or outcome.
 
 The Job page displays the last recorded update but never derives a stale,
 stalled, or failed state from elapsed time: a deployed Function can
@@ -353,7 +394,9 @@ until its remote outcome is known. After 15 minutes, Job detail shows
 "Cancellation is taking longer than expected" using the persisted request
 timestamp; the warning does not change status or stop reconciliation. The
 Cancellation timestamp and coded `409 job_not_cancellable` response are part
-of OpenAPI.
+of OpenAPI. If Modal's call status expires before cancellation can be confirmed,
+the backend recovers a verified final Result when possible; otherwise it moves
+the Job to `state_unknown` for manual Administrator review.
 
 ### Immutable Result archive identity and layout
 
@@ -513,10 +556,11 @@ authenticate, consume Password Links, or create Submissions. Re-enabling
 returns a User with a password to enabled and one without a password to pending
 setup.
 
-Disabling a User does not cancel already admitted Jobs. They retain their
-owner, continue through reconciliation and finalization, and consume applicable
-Active Job Limits until terminal or blocked. Their Results are inaccessible
-while the User is disabled and become available again after re-enabling.
+Disabling a User does not cancel already admitted Jobs. They retain their owner
+and continue according to their existing lifecycle. They consume applicable
+Active Job Limits, including while `state_unknown`, until terminal or blocked.
+Their Results are inaccessible while the User is disabled and become available
+again after re-enabling.
 Administrator access does not grant access to those Jobs. The Disable
 confirmation states these consequences before committing the status change.
 
@@ -530,10 +574,10 @@ unsubmitted Job's provider lease and initiating paid work.
 ### Admin Active Job capacity display
 
 The Admin Modal Tool contract exposes `active_jobs`, not `running_jobs`. It
-counts the same `queued`, `running`, `finalizing`, and `cancel_requested` Job
-states consumed by Active Job Limits; `blocked` and terminal Jobs are excluded.
-The table heading is `Active jobs / active job limit`, so its numerator and
-denominator always describe the same admission-capacity rule.
+counts the same `queued`, `running`, `finalizing`, `cancel_requested`, and
+`state_unknown` Job states consumed by Active Job Limits; `blocked` and terminal
+Jobs are excluded. The table heading is `Active jobs / active job limit`, so its
+numerator and denominator always describe the same admission-capacity rule.
 
 Every User, Tool, and Global Active Job Limit accepts a non-negative integer,
 including zero. An Administrator may lower a limit below its current count;
@@ -648,8 +692,9 @@ OpenAPI must describe request and response bodies, Job states and conditional
 fields, per-operation frontend-handled error codes, authentication requirements,
 CSRF headers, relevant response headers, and binary and byte-range Result
 downloads. This includes the `blocked` Job contract and the Admin Modal
-preflight and Storage contracts. Protected operations declare the runtime
-session-cookie security scheme. The Password Link's
+preflight and Storage contracts, plus `state_unknown`, its safe timestamp and
+reason fields, and the Admin resolution operation. Protected operations declare
+the runtime session-cookie security scheme. The Password Link's
 `/set-password#token=...` SPA URL remains a tested cross-repository navigation
 contract rather than an OpenAPI operation.
 

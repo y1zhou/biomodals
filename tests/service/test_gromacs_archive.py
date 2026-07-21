@@ -177,6 +177,7 @@ def test_service_packages_established_remote_files_deterministically() -> None:
             "PNG is invalid",
         ),
         ("rmsd", b"time_ns,rmsd\n", "wrong schema"),
+        ("rmsd", b"time_ns,rmsd\n0.0,not-a-number\n", "wrong schema"),
     ],
 )
 def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(

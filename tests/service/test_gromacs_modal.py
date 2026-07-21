@@ -43,6 +43,7 @@ from biomodals.service.store import (
     JobProviderCallState,
     JobRecord,
     JobState,
+    JobSubmissionConflictError,
     ServiceStore,
     UserRecord,
 )
@@ -1060,6 +1061,47 @@ def test_parallel_stage_failure_cancels_siblings_before_job_fails(
     assert ("cancel", "fc-production", False) in production.events
 
 
+def test_definite_stage_rejection_cancels_started_siblings(
+    tmp_path: Path,
+) -> None:
+    class CancellableCall(FakeCall):
+        async def _cancel(self, *, terminate_containers: bool):
+            await super()._cancel(terminate_containers=terminate_containers)
+            self.result = modal.exception.InputCancellation("cancelled")
+
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="prepared")
+    nvt = CancellableCall("fc-nvt")
+    npt = CancellableCall("fc-npt")
+    rejected = FailingFunction(modal.exception.NotFoundError("deployment missing"))
+    calls = {"fc-root": prepare}
+    functions = iter((FakeFunction(nvt), FakeFunction(npt), rejected))
+    reconciler = GromacsReconciler(
+        store,
+        _adapter(
+            calls,
+            function_resolver=lambda *_args, **_kwargs: next(functions),
+        ),
+        now=lambda: 10,
+    )
+
+    asyncio.run(reconciler.reconcile())
+    calls.update({call.object_id: call for call in (nvt, npt)})
+    asyncio.run(reconciler.reconcile())
+
+    failed = store.get_job(job.owner_user_id, job.job_id)
+    assert failed is not None
+    assert failed.state == JobState.FAILED
+    states = {
+        call.provider_operation: call.state
+        for call in store.list_provider_calls(job.job_id)
+    }
+    assert states["collect_traj_stats:nvt_"] == JobProviderCallState.CANCELLED
+    assert states["collect_traj_stats:npt_"] == JobProviderCallState.CANCELLED
+    assert states["production_run_gpu"] == JobProviderCallState.FAILED
+    assert rejected.calls == 1
+
+
 def test_parallel_stage_failure_keeps_expired_sibling_state_unknown(
     tmp_path: Path,
 ) -> None:
@@ -1164,6 +1206,37 @@ def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
         "fc-root",
         "fc-nvt",
     }
+
+
+def test_stage_attach_conflict_marks_job_state_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(tmp_path)
+    prepare = FakeCall("fc-root", result="prepared")
+    duplicate = FakeCall("fc-duplicate")
+    adapter = _adapter(
+        {"fc-root": prepare, "fc-duplicate": duplicate},
+        function_resolver=lambda *_args, **_kwargs: FakeFunction(duplicate),
+    )
+
+    def reject_attach(*_args, **_kwargs):
+        raise JobSubmissionConflictError("provider operation changed concurrently")
+
+    monkeypatch.setattr(store, "attach_provider_call", reject_attach)
+    reconciler = GromacsReconciler(store, adapter, now=lambda: 10)
+
+    asyncio.run(reconciler.reconcile())
+
+    uncertain = store.get_job(job.owner_user_id, job.job_id)
+    assert uncertain is not None
+    assert uncertain.state == JobState.STATE_UNKNOWN
+    assert uncertain.state_unknown_reason == "cancellation_outcome_unknown"
+    provider_calls = store.list_provider_calls(job.job_id)
+    assert provider_calls[-1].provider_operation == "collect_traj_stats:nvt_"
+    assert provider_calls[-1].state == JobProviderCallState.STATE_UNKNOWN
+    assert provider_calls[-1].modal_call_id is None
+    assert ("cancel", "fc-duplicate", False) in duplicate.events
 
 
 def test_reconciliation_bounds_concurrent_provider_polls(tmp_path: Path) -> None:

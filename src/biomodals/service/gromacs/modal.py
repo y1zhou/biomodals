@@ -979,6 +979,19 @@ class GromacsReconciler:
                         now=self._now(),
                     )
                     return
+                except _DEFINITE_SUBMISSION_ERRORS:
+                    self.store.record_provider_submission_failure(
+                        job.job_id,
+                        provider_operation=operation,
+                        submission_token=submission_token,
+                        now=self._now(),
+                    )
+                    LOGGER.exception(
+                        "Modal rejected GROMACS stage %s for job %s",
+                        operation,
+                        job.job_id,
+                    )
+                    return
                 except _MODAL_SERVICE_ERRORS:
                     self.store.release_provider_operation(
                         job.job_id,
@@ -1016,15 +1029,20 @@ class GromacsReconciler:
                     )
                 except JobSubmissionConflictError:
                     LOGGER.warning(
-                        "Discarding duplicate GROMACS stage %s for job %s",
+                        "Could not attach spawned GROMACS stage %s for job %s",
                         submitted.modal_call_id,
                         job.job_id,
+                    )
+                    self.store.mark_state_unknown(
+                        job.job_id,
+                        reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
+                        now=self._now(),
                     )
                     try:
                         await self.adapter.cancel(submitted.modal_call_id)
                     except _MODAL_SERVICE_ERRORS:
                         LOGGER.exception(
-                            "Could not cancel duplicate GROMACS stage %s",
+                            "Could not cancel unattached GROMACS stage %s",
                             submitted.modal_call_id,
                         )
                     return

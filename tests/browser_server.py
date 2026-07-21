@@ -32,7 +32,8 @@ from biomodals.service.runtime_config import (
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 
 ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
-STAGE_SECONDS = 1.5
+STAGE_SECONDS = 1.0
+EQUILIBRATION_ANALYSIS_SECONDS = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +61,7 @@ class _FakeGromacsAdapter:
         self.submit_calls = 0
         self.preflight_versions: list[int] = []
         self.submit_versions: list[int] = []
-        self.calls: dict[str, float] = {}
+        self.calls: dict[str, tuple[float, str]] = {}
         self.cancelled: set[str] = set()
         self.archive = _result_archive()
         self._write_stats()
@@ -94,7 +95,7 @@ class _FakeGromacsAdapter:
 
     def _call(self, run_name: str, operation: str) -> _SubmittedCall:
         call_id = f"fake-{len(self.calls) + 1}"
-        self.calls[call_id] = time.monotonic()
+        self.calls[call_id] = (time.monotonic(), operation)
         self._write_stats()
         return _SubmittedCall(call_id, run_name, operation)
 
@@ -127,11 +128,16 @@ class _FakeGromacsAdapter:
         *,
         provider_operation: str | None = None,
     ) -> PollOutcome:
-        del provider_operation
         if modal_call_id in self.cancelled:
             return PollOutcome("cancelled")
-        started = self.calls[modal_call_id]
-        if time.monotonic() - started >= STAGE_SECONDS:
+        started, submitted_operation = self.calls[modal_call_id]
+        operation = provider_operation or submitted_operation
+        duration = (
+            EQUILIBRATION_ANALYSIS_SECONDS
+            if operation in {"collect_traj_stats:nvt_", "collect_traj_stats:npt_"}
+            else STAGE_SECONDS
+        )
+        if time.monotonic() - started >= duration:
             return PollOutcome("completed")
         return PollOutcome("running")
 

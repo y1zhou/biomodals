@@ -154,6 +154,7 @@ class JobView(BaseModel):
     updated_at: datetime
     completed_at: datetime | None = None
     cancel_requested_at: datetime | None = None
+    state_unknown_at: datetime | None = None
     blocked_at: datetime | None = None
     next_retry_at: datetime | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -189,6 +190,11 @@ class JobView(BaseModel):
             cancel_requested_at=(
                 datetime.fromtimestamp(record.cancel_requested_at, UTC)
                 if record.cancel_requested_at is not None
+                else None
+            ),
+            state_unknown_at=(
+                datetime.fromtimestamp(record.state_unknown_at, UTC)
+                if record.state_unknown_at is not None
                 else None
             ),
             blocked_at=(

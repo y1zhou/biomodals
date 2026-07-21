@@ -50,6 +50,7 @@ from biomodals.service.store import (
     JobLimitExceededError,
     JobRecord,
     JobState,
+    JobStateUnknownReason,
     ServiceStore,
     UserNotFoundError,
 )
@@ -342,17 +343,18 @@ def create_router(
                     run_name=run_name,
                     modal_configuration=claimed.modal_configuration,
                 )
-            except SubmissionOutcomeUnknownError as exc:
+            except SubmissionOutcomeUnknownError:
                 LOGGER.exception(
                     "Could not confirm GROMACS submission %s request_id=%s",
                     admission.job.job_id,
                     request_id_from(request),
                 )
-                raise CodedAPIError(
-                    503,
-                    "compute_unavailable",
-                    "GROMACS compute submission could not be confirmed",
-                ) from exc
+                uncertain = store.mark_state_unknown(
+                    admission.job.job_id,
+                    reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
+                    now=int(time.time()),
+                )
+                return JobView.from_record(uncertain)
             except Exception as exc:
                 LOGGER.exception(
                     "Could not submit GROMACS job %s request_id=%s",
@@ -380,7 +382,7 @@ def create_router(
                     run_name=submitted.run_name,
                     submission_token=submission_token,
                 )
-            except Exception as exc:
+            except Exception:
                 LOGGER.exception(
                     "Could not persist GROMACS submission %s request_id=%s",
                     admission.job.job_id,
@@ -395,11 +397,12 @@ def create_router(
                         submitted.modal_call_id,
                         request_id_from(request),
                     )
-                raise CodedAPIError(
-                    503,
-                    "compute_unavailable",
-                    "GROMACS compute submission could not be confirmed",
-                ) from exc
+                uncertain = store.mark_state_unknown(
+                    admission.job.job_id,
+                    reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
+                    now=int(time.time()),
+                )
+                return JobView.from_record(uncertain)
             stage = JobView.from_record(job).stage
             LOGGER.info(
                 "event=stage_attached job_id=%s workload=gromacs stage=%s "

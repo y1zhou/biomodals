@@ -474,6 +474,7 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     assert "test-token-secret" not in initial.text
     assert initial.json()["tools"][0]["workload"] == "gromacs"
     assert initial.json()["tools"][0]["display_name"] == "GROMACS MD simulation"
+    assert initial.json()["state_unknown_jobs"] == []
 
     environment = client.patch(
         "/api/v1/admin/modal/environment",
@@ -636,6 +637,7 @@ def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> 
         "/api/v1/admin/modal",
         "/api/v1/admin/modal/environment",
         "/api/v1/admin/modal/tools/{workload}",
+        "/api/v1/admin/modal/state-unknown-jobs/{job_id}/mark-failed",
     ):
         assert path in schema["paths"]
 
@@ -1419,18 +1421,61 @@ def test_unknown_spawn_outcome_is_not_retried(
     key = str(uuid4())
     adapter.unknown_failures_remaining = 1
 
-    failed = _submit(client, csrf_token, idempotency_key=key)
+    uncertain = _submit(client, csrf_token, idempotency_key=key)
     replayed = _submit(client, csrf_token, idempotency_key=key)
 
-    assert failed.status_code == 503
-    assert failed.json()["code"] == "compute_unavailable"
+    assert uncertain.status_code == 202
+    assert uncertain.json()["state"] == "state_unknown"
+    assert uncertain.json()["state_unknown_at"]
     assert replayed.status_code == 202
-    assert replayed.json()["state"] == "queued"
+    assert replayed.json() == uncertain.json()
     assert len(adapter.submissions) == 1
     owner_id = UUID(client.get("/api/v1/auth/me").json()["user_id"])
     job = store.get_job(owner_id, UUID(replayed.json()["job_id"]))
     assert job is not None
-    assert job.submission_lease_until is not None
+    assert job.state == JobState.STATE_UNKNOWN
+    assert job.submission_lease_until is None
+
+
+def test_admin_can_resolve_state_unknown_after_manual_provider_review(
+    tmp_path: Path,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "admin@example.com", is_admin=True)
+    csrf_token = _login(client, "admin@example.com")
+    adapter.unknown_failures_remaining = 1
+
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = submitted.json()["job_id"]
+    modal_view = client.get("/api/v1/admin/modal")
+
+    assert submitted.json()["state"] == "state_unknown"
+    assert modal_view.status_code == 200
+    assert modal_view.json()["state_unknown_jobs"] == [
+        {
+            "job_id": job_id,
+            "workload": "gromacs",
+            "display_name": "First simulation",
+            "run_name": f"first-simulation-{UUID(job_id).hex}",
+            "reason": "submission_outcome_unknown",
+            "state_unknown_at": submitted.json()["state_unknown_at"],
+        }
+    ]
+
+    resolved = client.post(
+        f"/api/v1/admin/modal/state-unknown-jobs/{job_id}/mark-failed",
+        headers=_unsafe_headers(csrf_token),
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["state_unknown_jobs"] == []
+    owner_id = UUID(client.get("/api/v1/auth/me").json()["user_id"])
+    job = store.get_job(owner_id, UUID(job_id))
+    assert job is not None
+    assert job.state == JobState.FAILED
+    assert job.error_message == (
+        "An administrator could not confirm the remote compute state."
+    )
 
 
 def test_cancel_after_failed_spawn_finishes_without_modal_access(

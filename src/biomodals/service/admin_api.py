@@ -27,6 +27,9 @@ from biomodals.service.runtime_config import (
     SettingSource,
 )
 from biomodals.service.store import (
+    JobNotFoundError,
+    JobStateResolutionError,
+    JobStateUnknownReason,
     LastActiveAdminError,
     ServiceStore,
     UserAlreadyExistsError,
@@ -92,6 +95,12 @@ class AdminSettingInvalidResponse(CodedErrorResponse):
     """Structurally valid Runtime Setting content failed validation."""
 
     code: Literal["modal_preflight_failed", "setting_invalid"]
+
+
+class AdminJobStateConflictResponse(CodedErrorResponse):
+    """A reviewed Job no longer has unknown remote state."""
+
+    code: Literal["job_state_changed"]
 
 
 class AdminUserView(BaseModel):
@@ -197,11 +206,23 @@ class AdminModalToolView(BaseModel):
     active_job_limit: IntegerSettingView
 
 
+class AdminStateUnknownJobView(BaseModel):
+    """Safe Job identity needed for manual Modal review."""
+
+    job_id: UUID
+    workload: str
+    display_name: str
+    run_name: str | None
+    reason: JobStateUnknownReason
+    state_unknown_at: datetime
+
+
 class AdminModalView(BaseModel):
     """Complete Modal Admin page document."""
 
     environment: AdminModalEnvironmentView
     tools: list[AdminModalToolView]
+    state_unknown_jobs: list[AdminStateUnknownJobView]
     blocked_jobs: list[AdminBlockedJobsView]
 
 
@@ -340,6 +361,18 @@ def _modal_view(
             for workload in (
                 configuration.workload(name) for name in configuration.workload_names()
             )
+        ],
+        state_unknown_jobs=[
+            AdminStateUnknownJobView(
+                job_id=job.job_id,
+                workload=job.workload,
+                display_name=job.display_name,
+                run_name=job.run_name,
+                reason=job.state_unknown_reason,
+                state_unknown_at=datetime.fromtimestamp(job.state_unknown_at, UTC),
+            )
+            for job in store.list_state_unknown_jobs()
+            if job.state_unknown_at is not None and job.state_unknown_reason is not None
         ],
         blocked_jobs=[
             AdminBlockedJobsView(
@@ -566,6 +599,38 @@ def create_admin_router() -> APIRouter:
             removed_entries=result.entries,
             removed_bytes=result.bytes,
         )
+
+    @router.post(
+        "/modal/state-unknown-jobs/{job_id}/mark-failed",
+        response_model=AdminModalView,
+        responses={
+            **mutation_responses,
+            404: {"model": ErrorResponse},
+            409: {"model": AdminJobStateConflictResponse},
+        },
+    )
+    async def mark_state_unknown_job_failed(
+        request: Request,
+        job_id: UUID,
+        _session: Annotated[AuthenticatedSession, Depends(require_unsafe_admin)],
+    ) -> AdminModalView:
+        store: ServiceStore = request.app.state.store
+        try:
+            store.resolve_state_unknown(job_id, now=int(time.time()))
+        except JobNotFoundError as exc:
+            raise HTTPException(404, "Job not found") from exc
+        except JobStateResolutionError as exc:
+            raise CodedAPIError(
+                409,
+                "job_state_changed",
+                "This Job no longer has unknown remote state",
+            ) from exc
+        LOGGER.info(
+            "event=state_unknown_resolved job_id=%s resolution=failed request_id=%s",
+            job_id,
+            request_id_from(request),
+        )
+        return _modal_view(request.app.state.configuration, store)
 
     @router.patch(
         "/modal/environment",

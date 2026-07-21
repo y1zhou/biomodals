@@ -20,6 +20,8 @@ from biomodals.service.store import (
     JobLimitExceededError,
     JobNotCancellableError,
     JobState,
+    JobStateResolutionError,
+    JobStateUnknownReason,
     ServiceStore,
     UserNotFoundError,
 )
@@ -73,7 +75,7 @@ def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
     assert locks.for_job(job_id) is not None
 
 
-@pytest.mark.parametrize("version", [0, 8])
+@pytest.mark.parametrize("version", [0, 9])
 def test_initialize_never_rewrites_an_existing_unsupported_database(
     tmp_path: Path,
     version: int,
@@ -457,3 +459,68 @@ def test_provider_advance_lease_requires_explicit_release_before_retry(
 
     assert retried is not None
     assert retried.submission_token == "second"
+
+
+def test_state_unknown_consumes_capacity_until_admin_resolution(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(
+        store,
+        alice,
+        key="11111111-1111-4111-8111-111111111111",
+        user_limit=1,
+    ).job
+    store.claim_submission(
+        job.job_id,
+        run_name=f"simulation-{job.job_id.hex}",
+        submission_token="uncertain-submission",
+        now=100,
+    )
+
+    uncertain = store.mark_state_unknown(
+        job.job_id,
+        reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
+        now=120,
+    )
+
+    assert uncertain.state == JobState.STATE_UNKNOWN
+    assert uncertain.state_unknown_at == 120
+    assert (
+        uncertain.state_unknown_reason
+        == JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
+    )
+    assert uncertain.submission_token is None
+    assert uncertain.submission_lease_until is None
+    assert store.count_active_jobs() == 1
+    assert store.list_reconcilable_jobs() == []
+    with pytest.raises(JobLimitExceededError, match="User"):
+        admit(
+            store,
+            alice,
+            key="22222222-2222-4222-8222-222222222222",
+            user_limit=1,
+        )
+
+    resolved = store.resolve_state_unknown(job.job_id, now=130)
+
+    assert resolved.state == JobState.FAILED
+    assert resolved.error_code == "compute_failed"
+    assert resolved.error_message == (
+        "An administrator could not confirm the remote compute state."
+    )
+    assert resolved.completed_at == 130
+    assert resolved.state_unknown_at == 120
+    assert (
+        resolved.state_unknown_reason
+        == JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
+    )
+    assert store.count_active_jobs() == 0
+
+
+def test_only_state_unknown_can_use_admin_resolution(tmp_path: Path) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
+
+    with pytest.raises(JobStateResolutionError, match="queued"):
+        store.resolve_state_unknown(job.job_id, now=120)

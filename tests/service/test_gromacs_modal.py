@@ -972,7 +972,7 @@ def test_reconciler_requires_a_positive_concurrency_bound(tmp_path: Path) -> Non
         GromacsReconciler(store, _adapter({}), max_concurrent_jobs=0)
 
 
-def test_reconciler_does_not_repeat_an_unknown_stage_submission(
+def test_reconciler_stops_after_an_unknown_stage_submission(
     tmp_path: Path,
 ) -> None:
     store, job = _submitted_job(tmp_path)
@@ -991,24 +991,15 @@ def test_reconciler_does_not_repeat_an_unknown_stage_submission(
     asyncio.run(reconciler.reconcile())
     uncertain = store.get_job(job.owner_user_id, job.job_id)
     assert uncertain is not None
-    assert uncertain.state == JobState.QUEUED
-    assert uncertain.submission_lease_until == 130
+    assert uncertain.state == JobState.STATE_UNKNOWN
+    assert uncertain.state_unknown_at == 10
+    assert uncertain.state_unknown_reason == "submission_outcome_unknown"
+    assert uncertain.submission_lease_until is None
     assert failing.calls == 1
 
     now = 129
     asyncio.run(reconciler.reconcile())
     assert failing.calls == 1
-
-    now = 130
-    asyncio.run(reconciler.reconcile())
-    failed = store.get_job(job.owner_user_id, job.job_id)
-    assert failed is not None
-    assert failed.state == JobState.FAILED
-    assert failed.error_code == "compute_failed"
-    assert failed.error_message == (
-        "GROMACS stage submission was interrupted before remote compute could be "
-        "tracked."
-    )
 
 
 def test_untracked_cancellation_is_not_declared_complete(
@@ -1056,10 +1047,10 @@ def test_untracked_cancellation_is_not_declared_complete(
 
     now = 123
     asyncio.run(reconciler.reconcile())
-    failed = store.get_job(user.user_id, admission.job.job_id)
-    assert failed is not None
-    assert failed.state == JobState.FAILED
-    assert failed.error_code == "compute_failed"
+    uncertain = store.get_job(user.user_id, admission.job.job_id)
+    assert uncertain is not None
+    assert uncertain.state == JobState.STATE_UNKNOWN
+    assert uncertain.state_unknown_reason == "submission_outcome_unknown"
 
 
 def test_completed_stage_does_not_advance_after_cancellation(tmp_path: Path) -> None:
@@ -1553,7 +1544,7 @@ def test_missing_recovery_marker_is_not_ready(
         asyncio.run(_adapter({}).recover_archive(job))
 
 
-def test_reconciler_fails_an_expired_untracked_submission(
+def test_reconciler_marks_an_expired_untracked_submission_state_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1597,13 +1588,11 @@ def test_reconciler_fails_an_expired_untracked_submission(
 
     now = 123
     asyncio.run(reconciler.reconcile())
-    failed = store.get_job(user.user_id, admission.job.job_id)
-    assert failed is not None
-    assert failed.state == JobState.FAILED
-    assert failed.error_code == "compute_failed"
-    assert failed.error_message == (
-        "GROMACS submission was interrupted before remote compute could be tracked."
-    )
+    uncertain = store.get_job(user.user_id, admission.job.job_id)
+    assert uncertain is not None
+    assert uncertain.state == JobState.STATE_UNKNOWN
+    assert uncertain.state_unknown_at == 123
+    assert uncertain.state_unknown_reason == "submission_outcome_unknown"
 
 
 def test_cancelled_is_terminal_only_after_call_graph_is_inactive(
@@ -1659,7 +1648,9 @@ def test_expired_provider_status_is_not_reported_as_confirmed_cancellation(
 
     unresolved = store.get_job(job.owner_user_id, job.job_id)
     assert unresolved is not None
-    assert unresolved.state == JobState.CANCEL_REQUESTED
+    assert unresolved.state == JobState.STATE_UNKNOWN
+    assert unresolved.state_unknown_at == 10
+    assert unresolved.state_unknown_reason == "cancellation_outcome_unknown"
     assert unresolved.error_code is None
     assert f"api-results/{RUN_NAME}/result.zip" not in files
 

@@ -39,6 +39,7 @@ from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import (
     JobRecord,
     JobState,
+    JobStateUnknownReason,
     JobSubmissionConflictError,
     ServiceStore,
 )
@@ -770,13 +771,9 @@ class GromacsReconciler:
         if job.modal_call_id is None:
             if job.submission_lease_until is not None:
                 if job.submission_lease_until <= now:
-                    self.store.fail_job(
+                    self.store.mark_state_unknown(
                         job.job_id,
-                        error_code="compute_failed",
-                        error_message=(
-                            "GROMACS submission was interrupted before remote "
-                            "compute could be tracked."
-                        ),
+                        reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
                         now=now,
                     )
                 return
@@ -790,13 +787,9 @@ class GromacsReconciler:
         if job.submission_lease_until is not None:
             now = self._now()
             if job.submission_lease_until <= now:
-                self.store.fail_job(
+                self.store.mark_state_unknown(
                     job.job_id,
-                    error_code="compute_failed",
-                    error_message=(
-                        "GROMACS stage submission was interrupted before remote "
-                        "compute could be tracked."
-                    ),
+                    reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
                     now=now,
                 )
             return
@@ -885,6 +878,12 @@ class GromacsReconciler:
                 )
             else:
                 self._complete(job, archive)
+                return
+        self.store.mark_state_unknown(
+            job.job_id,
+            reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
+            now=self._now(),
+        )
 
     async def _advance(self, job: JobRecord) -> None:
         """Attach exactly one next direct Modal stage to a durable Job."""
@@ -908,6 +907,11 @@ class GromacsReconciler:
         except SubmissionOutcomeUnknownError:
             LOGGER.exception(
                 "Could not confirm the next GROMACS stage for job %s", job.job_id
+            )
+            self.store.mark_state_unknown(
+                job.job_id,
+                reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
+                now=self._now(),
             )
             return
         except _MODAL_SERVICE_ERRORS:

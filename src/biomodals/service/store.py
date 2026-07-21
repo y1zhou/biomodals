@@ -64,6 +64,10 @@ class JobSubmissionConflictError(RuntimeError):
     """Raised when a stale submitter tries to attach a provider call."""
 
 
+class JobStateResolutionError(RuntimeError):
+    """Raised when an Administrator resolves a Job in another state."""
+
+
 class JobState(StrEnum):
     """Durable provider-neutral job states."""
 
@@ -71,6 +75,7 @@ class JobState(StrEnum):
     RUNNING = "running"
     FINALIZING = "finalizing"
     CANCEL_REQUESTED = "cancel_requested"
+    STATE_UNKNOWN = "state_unknown"
     BLOCKED = "blocked"
     SUCCEEDED = "succeeded"
     PARTIAL = "partial"
@@ -78,19 +83,27 @@ class JobState(StrEnum):
     CANCELLED = "cancelled"
 
 
-ACTIVE_JOB_STATES = (
+class JobStateUnknownReason(StrEnum):
+    """Safe reason that remote execution can no longer be confirmed."""
+
+    SUBMISSION_OUTCOME_UNKNOWN = "submission_outcome_unknown"
+    CANCELLATION_OUTCOME_UNKNOWN = "cancellation_outcome_unknown"
+
+
+PROVIDER_TRACKED_JOB_STATES = (
     JobState.QUEUED,
     JobState.RUNNING,
     JobState.FINALIZING,
     JobState.CANCEL_REQUESTED,
 )
+ACTIVE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.STATE_UNKNOWN)
 TERMINAL_JOB_STATES = (
     JobState.SUCCEEDED,
     JobState.PARTIAL,
     JobState.FAILED,
     JobState.CANCELLED,
 )
-RECONCILABLE_JOB_STATES = (*ACTIVE_JOB_STATES, JobState.BLOCKED)
+RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
 
 
@@ -175,6 +188,8 @@ class JobRecord:
     updated_at: int
     completed_at: int | None
     cancel_requested_at: int | None
+    state_unknown_at: int | None
+    state_unknown_reason: JobStateUnknownReason | None
     finalization_started_at: int | None
     finalization_retry_started_at: int | None
     finalization_retry_count: int
@@ -458,6 +473,13 @@ class ServiceStore:
                         updated_at INTEGER NOT NULL,
                         completed_at INTEGER,
                         cancel_requested_at INTEGER,
+                        state_unknown_at INTEGER,
+                        state_unknown_reason TEXT CHECK (
+                            state_unknown_reason IS NULL OR state_unknown_reason IN (
+                                'submission_outcome_unknown',
+                                'cancellation_outcome_unknown'
+                            )
+                        ),
                         finalization_started_at INTEGER,
                         finalization_retry_started_at INTEGER,
                         finalization_retry_count INTEGER NOT NULL DEFAULT 0,
@@ -492,11 +514,11 @@ class ServiceStore:
                             CHECK (active_job_limit IS NULL OR active_job_limit >= 0)
                     );
 
-                    PRAGMA user_version = 9;
+                    PRAGMA user_version = 10;
                     COMMIT;
                     """
                 )
-            elif version != 9:
+            elif version != 10:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
                     f"{version} at {self.path}; stop the service and initialize "
@@ -521,7 +543,7 @@ class ServiceStore:
                 timeout=5,
                 isolation_level=None,
             )
-            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 9:
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) != 10:
                 raise RuntimeError("SQLite schema is unavailable")
             conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         except sqlite3.Error as exc:
@@ -564,6 +586,19 @@ class ServiceStore:
             )
             for row in rows
         ]
+
+    def list_state_unknown_jobs(self) -> list[JobRecord]:
+        """List Jobs that require explicit Administrator review."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE state = ?
+                ORDER BY state_unknown_at, job_id
+                """,
+                (JobState.STATE_UNKNOWN.value,),
+            ).fetchall()
+        return [_job_from_row(row) for row in rows]
 
     def set_result_cached(self, job_id: UUID, *, cached: bool) -> None:
         """Persist whether the rebuildable local archive is currently present."""
@@ -1605,7 +1640,7 @@ class ServiceStore:
                     run_name,
                     updated_at,
                     str(job_id),
-                    *(state.value for state in ACTIVE_JOB_STATES),
+                    *(state.value for state in PROVIDER_TRACKED_JOB_STATES),
                     run_name,
                     submission_token,
                     submission_token,
@@ -1732,7 +1767,7 @@ class ServiceStore:
                     now,
                     str(job_id),
                     expected_modal_call_id,
-                    *(state.value for state in ACTIVE_JOB_STATES),
+                    *(state.value for state in PROVIDER_TRACKED_JOB_STATES),
                 ),
             )
             if cursor.rowcount != 1:
@@ -1811,7 +1846,7 @@ class ServiceStore:
                     str(job_id),
                     expected_modal_call_id,
                     submission_token,
-                    *(state.value for state in ACTIVE_JOB_STATES),
+                    *(state.value for state in PROVIDER_TRACKED_JOB_STATES),
                 ),
             )
             row = conn.execute(
@@ -1888,6 +1923,8 @@ class ServiceStore:
             raise ValueError("Use fail_job to record a safe failure")
         if state == JobState.BLOCKED:
             raise ValueError("Use block_job to record a recoverable failure")
+        if state == JobState.STATE_UNKNOWN:
+            raise ValueError("Use mark_state_unknown to record remote ambiguity")
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1895,10 +1932,13 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            if JobState(row["state"]) in TERMINAL_JOB_STATES:
+            current_state = JobState(row["state"])
+            if current_state in TERMINAL_JOB_STATES:
+                return _job_from_row(row)
+            if current_state == JobState.STATE_UNKNOWN:
                 return _job_from_row(row)
             if (
-                JobState(row["state"]) == JobState.CANCEL_REQUESTED
+                current_state == JobState.CANCEL_REQUESTED
                 and state not in TERMINAL_JOB_STATES
             ):
                 return _job_from_row(row)
@@ -1940,6 +1980,92 @@ class ServiceStore:
                 (str(job_id),),
             ).fetchone()
         return _job_from_row(row)
+
+    def mark_state_unknown(
+        self,
+        job_id: UUID,
+        *,
+        reason: JobStateUnknownReason,
+        now: int,
+    ) -> JobRecord:
+        """Stop automation when the existence of remote work is ambiguous."""
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            current_state = JobState(row["state"])
+            if current_state == JobState.STATE_UNKNOWN:
+                return _job_from_row(row)
+            if current_state not in PROVIDER_TRACKED_JOB_STATES:
+                return _job_from_row(row)
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state = ?, state_unknown_at = ?, state_unknown_reason = ?,
+                    submission_token = NULL, submission_lease_until = NULL,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    JobState.STATE_UNKNOWN.value,
+                    now,
+                    reason.value,
+                    now,
+                    str(job_id),
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return _job_from_row(updated)
+
+    def resolve_state_unknown(self, job_id: UUID, *, now: int) -> JobRecord:
+        """Mark one manually reviewed state-unknown Job as failed."""
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            current_state = JobState(row["state"])
+            if current_state != JobState.STATE_UNKNOWN:
+                raise JobStateResolutionError(
+                    f"Job is {current_state.value}, not state_unknown"
+                )
+            history_json = _transition_stage_history_json(
+                str(row["stage_history_json"]),
+                now=now,
+                complete_operation=row["provider_operation"],
+                complete_outcome="failed",
+            )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state = ?, error_code = ?, error_message = ?,
+                    stage_history_json = ?, updated_at = ?, completed_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    JobState.FAILED.value,
+                    "compute_failed",
+                    "An administrator could not confirm the remote compute state.",
+                    history_json,
+                    now,
+                    now,
+                    str(job_id),
+                    JobState.STATE_UNKNOWN.value,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return _job_from_row(updated)
 
     def schedule_finalization_retry(
         self,
@@ -2140,7 +2266,10 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            if JobState(row["state"]) in TERMINAL_JOB_STATES:
+            if JobState(row["state"]) in (
+                *TERMINAL_JOB_STATES,
+                JobState.STATE_UNKNOWN,
+            ):
                 return _job_from_row(row)
             history_json = _transition_stage_history_json(
                 str(row["stage_history_json"]),
@@ -2251,6 +2380,12 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         updated_at=int(row["updated_at"]),
         completed_at=row["completed_at"],
         cancel_requested_at=row["cancel_requested_at"],
+        state_unknown_at=row["state_unknown_at"],
+        state_unknown_reason=(
+            JobStateUnknownReason(row["state_unknown_reason"])
+            if row["state_unknown_reason"] is not None
+            else None
+        ),
         finalization_started_at=row["finalization_started_at"],
         finalization_retry_started_at=row["finalization_retry_started_at"],
         finalization_retry_count=int(row["finalization_retry_count"]),

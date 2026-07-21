@@ -676,6 +676,14 @@ def test_advance_resolves_each_deployed_stage_by_name(tmp_path: Path) -> None:
             "failed",
         ),
         (
+            [CallNode("fc-root", modal.call_graph.InputStatus.INIT_FAILURE)],
+            "failed",
+        ),
+        (
+            [CallNode("fc-root", modal.call_graph.InputStatus.TIMEOUT)],
+            "failed",
+        ),
+        (
             [CallNode("fc-root", modal.call_graph.InputStatus.SUCCESS)],
             "running",
         ),
@@ -1163,6 +1171,39 @@ def test_transient_finalization_blocks_after_retry_window(
     assert blocked.blocked_at == 1_810
     assert blocked.next_retry_at == 2_710
     assert store.count_active_jobs("gromacs") == 0
+
+
+def test_unexpected_finalization_error_preserves_completed_compute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job = _submitted_job(
+        tmp_path,
+        provider_operation="collect_traj_stats:production_",
+    )
+    adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
+
+    async def programming_error(*_args, **_kwargs):
+        raise RuntimeError("unexpected archive builder failure")
+
+    monkeypatch.setattr(adapter, "publish_archive", programming_error)
+    now = 10
+    reconciler = GromacsReconciler(store, adapter, now=lambda: now)
+    asyncio.run(reconciler.reconcile())
+
+    retrying = store.get_job(job.owner_user_id, job.job_id)
+    assert retrying is not None
+    assert retrying.state == JobState.FINALIZING
+    assert retrying.error_code is None
+    assert retrying.next_retry_at == 15
+
+    now = 1_810
+    asyncio.run(reconciler.reconcile())
+    blocked = store.get_job(job.owner_user_id, job.job_id)
+    assert blocked is not None
+    assert blocked.state == JobState.BLOCKED
+    assert blocked.blocking_category == "internal_service"
+    assert blocked.error_code is None
 
 
 def test_permanent_finalization_block_recovers_without_new_compute(

@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,S105,S106
 
+import sqlite3
 from pathlib import Path
 from uuid import UUID
 
@@ -54,6 +55,28 @@ def test_readiness_never_recreates_or_accepts_an_empty_database(
     path.touch()
     with pytest.raises(RuntimeError, match="schema is unavailable"):
         store.check_ready()
+
+
+@pytest.mark.parametrize("version", [0, 6])
+def test_initialize_never_rewrites_an_existing_unsupported_database(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE legacy_state (value TEXT)")
+        conn.execute(f"PRAGMA user_version = {version}")
+    before = path.read_bytes()
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"Unsupported pre-release service database version {version}",
+    ):
+        ServiceStore(path).initialize()
+
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
 
 def admit(

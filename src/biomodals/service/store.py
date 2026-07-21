@@ -341,16 +341,19 @@ class ServiceStore:
         if self.path.parent.is_symlink():
             raise RuntimeError("Service state directory must not be a symbolic link")
         self.path.parent.chmod(0o700)
+        created = False
+        try:
+            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+            created = True
         if self.path.is_symlink():
             raise RuntimeError("Service database must not be a symbolic link")
-        if not self.path.exists():
-            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(descriptor)
-        self.path.chmod(0o600)
         with self._connection() as conn:
-            conn.execute("PRAGMA journal_mode = WAL")
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version == 0:
+            if created:
                 conn.executescript(
                     """
                     BEGIN IMMEDIATE;
@@ -458,6 +461,8 @@ class ServiceStore:
                     f"{version} at {self.path}; stop the service and initialize "
                     "fresh state explicitly"
                 )
+            conn.execute("PRAGMA journal_mode = WAL")
+        self.path.chmod(0o600)
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
             if path.exists():
                 path.chmod(0o600)

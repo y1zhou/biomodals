@@ -134,9 +134,20 @@ class SubmissionOutcomeUnknownError(RuntimeError):
 class SubmittedCall(Protocol):
     """Detached provider call returned after submission."""
 
-    modal_call_id: str
-    run_name: str
-    provider_operation: str
+    @property
+    def modal_call_id(self) -> str:
+        """Return the durable provider call identifier."""
+        ...
+
+    @property
+    def run_name(self) -> str:
+        """Return the stable scientific run name."""
+        ...
+
+    @property
+    def provider_operation(self) -> str:
+        """Return the directly submitted provider operation."""
+        ...
 
 
 class GromacsAdapter(Protocol):
@@ -178,28 +189,32 @@ async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
     return bytes(content)
 
 
+def _filename_display_identity(filename: str | None) -> str:
+    """Return the stable filename-derived portion of a generated display name."""
+    safe_filename = (filename or "gromacs").replace("\\", "/")
+    stem = PurePosixPath(safe_filename).stem.strip() or "gromacs"
+    return re.sub(r"\s+", " ", stem)[:100]
+
+
 def _display_name(filename: str | None, supplied: str | None) -> str:
     if supplied is not None:
         return supplied
-    safe_filename = (filename or "gromacs").replace("\\", "/")
-    stem = PurePosixPath(safe_filename).stem.strip() or "gromacs"
-    stem = re.sub(r"\s+", " ", stem)[:100]
-    return f"{stem} · {datetime.now(UTC):%Y-%m-%d}"
+    return f"{_filename_display_identity(filename)} · {datetime.now(UTC):%Y-%m-%d}"
 
 
 def _request_identity(
     pdb_content: bytes,
     *,
-    supplied_display_name: str | None,
+    display_identity: str,
     options: GromacsJobOptions,
 ) -> tuple[str, str]:
     encoded = orjson.dumps(options.model_dump(), option=orjson.OPT_SORT_KEYS)
-    display_identity = orjson.dumps({"display_name": supplied_display_name})
+    encoded_display_identity = orjson.dumps({"display_name": display_identity})
     digest = hashlib.sha256()
     digest.update(len(pdb_content).to_bytes(8, "big"))
     digest.update(pdb_content)
     digest.update(encoded)
-    digest.update(display_identity)
+    digest.update(encoded_display_identity)
     return digest.hexdigest(), encoded.decode()
 
 
@@ -250,7 +265,9 @@ def create_router(
         normalized_name = _display_name(pdb.filename, normalized_supplied_name)
         request_hash, parameters_json = _request_identity(
             pdb_content,
-            supplied_display_name=normalized_supplied_name,
+            display_identity=(
+                normalized_supplied_name or _filename_display_identity(pdb.filename)
+            ),
             options=options,
         )
         store: ServiceStore = request.app.state.store

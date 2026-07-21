@@ -207,20 +207,23 @@ def _submit(
     *,
     idempotency_key: str | None = None,
     simulation_time_ns: int = 3,
-    display_name: str = "First simulation",
+    display_name: str | None = "First simulation",
+    filename: str = "protein.pdb",
 ):
     headers = _unsafe_headers(csrf_token)
     if idempotency_key is not None:
         headers["Idempotency-Key"] = idempotency_key
+    data = {
+        "simulation_time_ns": str(simulation_time_ns),
+        "cpu_only": "true",
+    }
+    if display_name is not None:
+        data["display_name"] = display_name
     return client.post(
         "/api/v1/gromacs/jobs",
         headers=headers,
-        files={"pdb": ("protein.pdb", VALID_PDB, "chemical/x-pdb")},
-        data={
-            "display_name": display_name,
-            "simulation_time_ns": str(simulation_time_ns),
-            "cpu_only": "true",
-        },
+        files={"pdb": (filename, VALID_PDB, "chemical/x-pdb")},
+        data=data,
     )
 
 
@@ -839,6 +842,53 @@ def test_health_is_live_before_startup_and_ready_is_local_after_preflight(
     asyncio.run(scenario())
 
 
+def test_cache_metadata_is_reconciled_before_job_reconciliation_starts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ServiceStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    settings = ServiceSettings.from_environment({
+        "MODAL_TOKEN_ID": "test-token-id",
+        "MODAL_TOKEN_SECRET": "test-token-secret",
+    })
+    configuration = RuntimeConfiguration(store, settings)
+    adapter = FakeGromacsAdapter()
+
+    class RecordingReconciler:
+        started = False
+
+        async def reconcile(self) -> None:
+            self.started = True
+
+    reconciler = RecordingReconciler()
+    registration = create_registration(adapter, reconciler=reconciler)
+    cache = ArtifactCache(tmp_path / "cache")
+
+    async def cached_job_ids() -> set[str]:
+        await asyncio.sleep(0)
+        assert not reconciler.started
+        return set()
+
+    monkeypatch.setattr(cache, "cached_job_ids_async", cached_job_ids)
+    app = create_app(
+        store=store,
+        auth=AuthService(store, frontend_url=ORIGIN),
+        configuration=configuration,
+        workloads=[registration],
+        allowed_origin=ORIGIN,
+        secure_cookies=True,
+        cache=cache,
+    )
+
+    async def scenario() -> None:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0)
+            assert reconciler.started
+
+    asyncio.run(scenario())
+
+
 def test_password_setup_exposes_coded_errors_and_cookie_contract(
     tmp_path: Path,
 ) -> None:
@@ -1122,6 +1172,36 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert pdb_content == VALID_PDB
     assert run_name == f"first-simulation-{UUID(first.json()['job_id']).hex}"
     assert options == GromacsJobOptions(simulation_time_ns=3, cpu_only=True)
+
+
+def test_filename_derived_display_name_is_part_of_submission_identity(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    key = str(uuid4())
+
+    first = _submit(
+        client,
+        csrf_token,
+        idempotency_key=key,
+        display_name=None,
+        filename="kinase.pdb",
+    )
+    conflict = _submit(
+        client,
+        csrf_token,
+        idempotency_key=key,
+        display_name=None,
+        filename="receptor.pdb",
+    )
+
+    assert first.status_code == 202
+    assert first.json()["display_name"].startswith("kinase ")
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "idempotency_conflict"
+    assert len(adapter.submissions) == 1
 
 
 def test_job_stage_tracks_the_sequential_deployed_function(tmp_path: Path) -> None:

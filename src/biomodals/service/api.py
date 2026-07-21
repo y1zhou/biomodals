@@ -529,6 +529,8 @@ def create_app(
                 effective.modal_app_name.value,
                 configuration.modal_environment().value,
             )
+        if cache is not None:
+            store.reconcile_result_cache(await cache.cached_job_ids_async())
         if any(workload.reconciler is not None for workload in workloads):
             task = asyncio.create_task(
                 reconciliation_loop(
@@ -538,8 +540,6 @@ def create_app(
                 ),
                 name="biomodals-job-reconciler",
             )
-        if cache is not None:
-            store.reconcile_result_cache(await cache.cached_job_ids_async())
         _app.state.reconciler_task = task
         _app.state.ready = True
         LOGGER.info("event=readiness_changed ready=true")

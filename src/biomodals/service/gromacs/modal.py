@@ -130,6 +130,10 @@ class ResultIdentityMismatchError(RuntimeError):
     """Raised when reconstruction cannot reproduce a published Result."""
 
 
+class GromacsResultInvalidError(RuntimeError):
+    """Raised when established GROMACS outputs violate the Result contract."""
+
+
 def _call_nodes(
     roots: Iterable[modal.call_graph.InputInfo],
 ) -> list[modal.call_graph.InputInfo]:
@@ -299,7 +303,13 @@ class ModalGromacsAdapter:
             ):
                 return PollOutcome("cancelled")
             if any(
-                node.status == modal.call_graph.InputStatus.FAILURE for node in nodes
+                node.status
+                in {
+                    modal.call_graph.InputStatus.FAILURE,
+                    modal.call_graph.InputStatus.INIT_FAILURE,
+                    modal.call_graph.InputStatus.TIMEOUT,
+                }
+                for node in nodes
             ):
                 return PollOutcome("failed")
             # A SUCCESS graph can become visible just before get() can return
@@ -507,22 +517,25 @@ class ModalGromacsAdapter:
                 time.gmtime(completed_at),
             )
             stages[-1]["outcome"] = "completed"
-        return await write_gromacs_archive(
-            handle,
-            run_name=job.run_name,
-            parameters_json=job.parameters_json,
-            modal_app_name=job.modal_app_name,
-            job_id=str(job.job_id),
-            stages_json=orjson.dumps(stages).decode(),
-            started_at=job.created_at,
-            completed_at=completed_at,
-            read_file=read_file,
-            run_bounded=(
-                self.artifact_cache.run_bounded
-                if self.artifact_cache is not None
-                else None
-            ),
-        )
+        try:
+            return await write_gromacs_archive(
+                handle,
+                run_name=job.run_name,
+                parameters_json=job.parameters_json,
+                modal_app_name=job.modal_app_name,
+                job_id=str(job.job_id),
+                stages_json=orjson.dumps(stages).decode(),
+                started_at=job.created_at,
+                completed_at=completed_at,
+                read_file=read_file,
+                run_bounded=(
+                    self.artifact_cache.run_bounded
+                    if self.artifact_cache is not None
+                    else None
+                ),
+            )
+        except ValueError as exc:
+            raise GromacsResultInvalidError(str(exc)) from exc
 
     async def rebuild_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
         """Rebuild exact recorded bytes from raw outputs without compute."""
@@ -1064,6 +1077,10 @@ class GromacsReconciler:
             LOGGER.exception("GROMACS job %s is missing required output", job.job_id)
             self._mark_invalid_result(job, now=now)
             return
+        except GromacsResultInvalidError:
+            LOGGER.exception("GROMACS job %s returned invalid output", job.job_id)
+            self._mark_invalid_result(job, now=now)
+            return
         except (OSError, ArtifactIntegrityError):
             LOGGER.exception(
                 "Local Result staging is unavailable for job %s",
@@ -1072,8 +1089,8 @@ class GromacsReconciler:
             self._retry_finalization(job, now=now, category="local_storage")
             return
         except Exception:
-            LOGGER.exception("GROMACS job %s returned an invalid archive", job.job_id)
-            self._mark_invalid_result(job, now=now)
+            LOGGER.exception("GROMACS finalization failed for job %s", job.job_id)
+            self._retry_finalization(job, now=now, category="internal_service")
             return
         self._complete(job, archive)
 

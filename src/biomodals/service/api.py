@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -38,12 +38,14 @@ from biomodals.service.auth import (
 )
 from biomodals.service.config import ServiceSettings
 from biomodals.service.jobs import (
+    JobPageView,
     JobView,
     WorkloadRegistration,
     reconciliation_loop,
 )
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
+    JobCursorError,
     JobNotCancellableError,
     JobNotFoundError,
     JobRecord,
@@ -823,17 +825,29 @@ def create_app(
 
     @app.get(
         "/api/v1/jobs",
-        response_model=list[JobView],
-        response_model_exclude_none=True,
-        responses={status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse}},
+        response_model=JobPageView,
+        responses={
+            status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse},
+            status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+        },
     )
     async def list_jobs(
         session: Annotated[AuthenticatedSession, Depends(require_session)],
-    ) -> list[JobView]:
-        return [
-            JobView.from_record(job)
-            for job in store.list_jobs(session.principal.user_id)
-        ]
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor: UUID | None = None,
+    ) -> JobPageView:
+        try:
+            page = store.list_jobs_page(
+                session.principal.user_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        except JobCursorError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return JobPageView(
+            jobs=[JobView.from_record(job) for job in page.jobs],
+            next_cursor=page.next_cursor,
+        )
 
     @app.get(
         "/api/v1/jobs/{job_id}",

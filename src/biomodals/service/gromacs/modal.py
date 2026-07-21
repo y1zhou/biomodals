@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -724,6 +725,7 @@ class GromacsReconciler:
         lifecycle_locks: JobLifecycleLocks | None = None,
         now: Callable[[], int] | None = None,
         intermediate_retention_days: int | None = None,
+        max_concurrent_jobs: int = 4,
     ) -> None:
         """Bind durable state to the provider adapter."""
         self.store = store
@@ -732,6 +734,9 @@ class GromacsReconciler:
         self._now = now or (lambda: int(time.time()))
         if intermediate_retention_days is not None and intermediate_retention_days < 1:
             raise ValueError("intermediate_retention_days must be positive")
+        if type(max_concurrent_jobs) is not int or max_concurrent_jobs < 1:
+            raise ValueError("max_concurrent_jobs must be positive")
+        self.max_concurrent_jobs = max_concurrent_jobs
         self.intermediate_retention_seconds = (
             intermediate_retention_days * 24 * 60 * 60
             if intermediate_retention_days is not None
@@ -740,118 +745,133 @@ class GromacsReconciler:
 
     async def reconcile(self) -> None:
         """Poll every active GROMACS call once."""
-        for job in self.store.list_reconcilable_jobs("gromacs"):
-            now = self._now()
-            if job.state in {JobState.FINALIZING, JobState.BLOCKED}:
-                if job.next_retry_at is None or job.next_retry_at <= now:
-                    await self._finalize(job)
-                continue
-            if job.modal_call_id is None:
-                if job.submission_lease_until is not None:
-                    if job.submission_lease_until <= now:
-                        self.store.fail_job(
-                            job.job_id,
-                            error_code="compute_failed",
-                            error_message=(
-                                "GROMACS submission was interrupted before remote "
-                                "compute could be tracked."
-                            ),
-                            now=now,
-                        )
-                    continue
-                if job.state == JobState.CANCEL_REQUESTED:
-                    self.store.set_job_state(
+        jobs = iter(self.store.list_reconcilable_jobs("gromacs"))
+
+        async def worker() -> None:
+            for job in jobs:
+                try:
+                    await self._reconcile_job(job)
+                except Exception:
+                    LOGGER.exception(
+                        "Could not reconcile GROMACS job %s",
                         job.job_id,
-                        JobState.CANCELLED,
-                        now=now,
                     )
-                continue
+
+        await asyncio.gather(*(worker() for _ in range(self.max_concurrent_jobs)))
+        await self._cleanup_intermediates()
+
+    async def _reconcile_job(self, job: JobRecord) -> None:
+        """Reconcile one durable Job without affecting independent Jobs."""
+        now = self._now()
+        if job.state in {JobState.FINALIZING, JobState.BLOCKED}:
+            if job.next_retry_at is None or job.next_retry_at <= now:
+                await self._finalize(job)
+            return
+        if job.modal_call_id is None:
             if job.submission_lease_until is not None:
-                now = self._now()
                 if job.submission_lease_until <= now:
                     self.store.fail_job(
                         job.job_id,
                         error_code="compute_failed",
                         error_message=(
-                            "GROMACS stage submission was interrupted before remote "
+                            "GROMACS submission was interrupted before remote "
                             "compute could be tracked."
                         ),
                         now=now,
                     )
-                continue
-            try:
-                if job.state == JobState.CANCEL_REQUESTED:
-                    try:
-                        await self.adapter.cancel(job.modal_call_id)
-                    except modal.exception.NotFoundError:
-                        outcome = PollOutcome("expired")
-                    else:
-                        outcome = await self.adapter.poll(
-                            job.modal_call_id,
-                            provider_operation=job.provider_operation,
-                        )
+                return
+            if job.state == JobState.CANCEL_REQUESTED:
+                self.store.set_job_state(
+                    job.job_id,
+                    JobState.CANCELLED,
+                    now=now,
+                )
+            return
+        if job.submission_lease_until is not None:
+            now = self._now()
+            if job.submission_lease_until <= now:
+                self.store.fail_job(
+                    job.job_id,
+                    error_code="compute_failed",
+                    error_message=(
+                        "GROMACS stage submission was interrupted before remote "
+                        "compute could be tracked."
+                    ),
+                    now=now,
+                )
+            return
+        try:
+            if job.state == JobState.CANCEL_REQUESTED:
+                try:
+                    await self.adapter.cancel(job.modal_call_id)
+                except modal.exception.NotFoundError:
+                    outcome = PollOutcome("expired")
                 else:
                     outcome = await self.adapter.poll(
                         job.modal_call_id,
                         provider_operation=job.provider_operation,
                     )
-            except _MODAL_SERVICE_ERRORS:
-                LOGGER.exception(
-                    "Modal is unavailable while reconciling job %s", job.job_id
+            else:
+                outcome = await self.adapter.poll(
+                    job.modal_call_id,
+                    provider_operation=job.provider_operation,
                 )
-                continue
-            if outcome.kind == "expired":
-                if job.state == JobState.CANCEL_REQUESTED:
-                    await self._resolve_expired_cancellation(job)
-                    continue
-                if job.provider_operation not in {None, _FINAL_OPERATION}:
-                    self.store.fail_job(
-                        job.job_id,
-                        error_code="compute_failed",
-                        error_message=(
-                            "GROMACS stage status expired before the simulation "
-                            "could continue."
-                        ),
-                        now=self._now(),
-                    )
-                    continue
-                finalizing = self.store.set_job_state(
+        except _MODAL_SERVICE_ERRORS:
+            LOGGER.exception(
+                "Modal is unavailable while reconciling job %s", job.job_id
+            )
+            return
+        if outcome.kind == "expired":
+            if job.state == JobState.CANCEL_REQUESTED:
+                await self._resolve_expired_cancellation(job)
+                return
+            if job.provider_operation not in {None, _FINAL_OPERATION}:
+                self.store.fail_job(
                     job.job_id,
-                    JobState.FINALIZING,
+                    error_code="compute_failed",
+                    error_message=(
+                        "GROMACS stage status expired before the simulation "
+                        "could continue."
+                    ),
                     now=self._now(),
                 )
-                try:
-                    archive = await self.adapter.recover_archive(finalizing)
-                except Exception:
-                    # A valid marker is the durable success boundary. If it is
-                    # absent or invalid, rebuild from the authoritative raw
-                    # Volume outputs without replaying scientific compute.
-                    await self._finalize(finalizing)
-                else:
-                    self._complete(finalizing, archive)
-                continue
-            if outcome.kind == "completed" and job.state == JobState.CANCEL_REQUESTED:
-                now = self._now()
-                completed = self.store.mark_provider_operation_completed(
+                return
+            finalizing = self.store.set_job_state(
+                job.job_id,
+                JobState.FINALIZING,
+                now=self._now(),
+            )
+            try:
+                archive = await self.adapter.recover_archive(finalizing)
+            except Exception:
+                # A valid marker is the durable success boundary. If it is
+                # absent or invalid, rebuild from the authoritative raw Volume
+                # outputs without replaying scientific compute.
+                await self._finalize(finalizing)
+            else:
+                self._complete(finalizing, archive)
+            return
+        if outcome.kind == "completed" and job.state == JobState.CANCEL_REQUESTED:
+            now = self._now()
+            completed = self.store.mark_provider_operation_completed(
+                job.job_id,
+                expected_modal_call_id=job.modal_call_id or "",
+                now=now,
+            )
+            if completed is not None:
+                self.store.set_job_state(
                     job.job_id,
-                    expected_modal_call_id=job.modal_call_id or "",
+                    JobState.CANCELLED,
                     now=now,
                 )
-                if completed is not None:
-                    self.store.set_job_state(
-                        job.job_id,
-                        JobState.CANCELLED,
-                        now=now,
-                    )
-                continue
-            if outcome.kind == "completed" and job.provider_operation not in {
-                None,
-                _FINAL_OPERATION,
-            }:
-                await self._advance(job)
-                continue
-            await self._apply(job, outcome)
-        await self._cleanup_intermediates()
+            return
+        if outcome.kind == "completed" and job.provider_operation not in {
+            None,
+            _FINAL_OPERATION,
+        }:
+            await self._advance(job)
+            return
+        await self._apply(job, outcome)
 
     async def _resolve_expired_cancellation(self, job: JobRecord) -> None:
         """Resolve lost provider status without claiming cancellation succeeded."""

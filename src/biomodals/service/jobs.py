@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
 from uuid import UUID
+from weakref import WeakValueDictionary
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
@@ -46,7 +47,7 @@ class JobLifecycleLocks:
 
     def __init__(self) -> None:
         """Create an initially empty lifecycle-lock registry."""
-        self._locks: dict[UUID, asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
 
     def for_job(self, job_id: UUID) -> asyncio.Lock:
         """Return the event-loop lock shared by HTTP and reconciliation work."""
@@ -217,6 +218,15 @@ class JobView(BaseModel):
                 else None
             ),
         )
+
+
+class JobPageView(BaseModel):
+    """One bounded page of private Job history."""
+
+    model_config = ConfigDict(frozen=True)
+
+    jobs: list[JobView]
+    next_cursor: UUID | None = None
 
 
 class Reconciler(Protocol):

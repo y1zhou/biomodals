@@ -900,11 +900,76 @@ def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
         await cancellation
 
     asyncio.run(scenario())
-
     cancelling = store.get_job(job.owner_user_id, job.job_id)
     assert cancelling is not None
     assert cancelling.state == JobState.CANCEL_REQUESTED
     assert cancelling.modal_call_id == "fc-successor"
+
+
+def test_reconciliation_bounds_concurrent_provider_polls(tmp_path: Path) -> None:
+    store, first = _submitted_job(tmp_path)
+    jobs = [first]
+    for index in range(5):
+        admitted = store.admit_job(
+            owner_user_id=first.owner_user_id,
+            display_name=f"Simulation {index}",
+            idempotency_key=str(uuid4()),
+            request_hash=f"request-{index}",
+            parameters_json='{"simulation_time_ns":5}',
+            configuration=_admission_configuration(),
+            now=3 + index,
+        )
+        jobs.append(
+            store.mark_submitted(
+                admitted.job.job_id,
+                modal_call_id=f"fc-{index}",
+                provider_operation="prepare_tpr_gpu",
+                run_name=f"simulation-{index}-0123456789abcdef0123456789abcdef",
+                now=3 + index,
+            )
+        )
+
+    async def scenario() -> None:
+        active = 0
+        peak = 0
+        calls = 0
+        saturated = asyncio.Event()
+        release = asyncio.Event()
+        adapter = _adapter({})
+
+        async def poll(*_args, **_kwargs) -> PollOutcome:
+            nonlocal active, peak, calls
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+            if active == 4:
+                saturated.set()
+            await release.wait()
+            active -= 1
+            return PollOutcome("running")
+
+        cast(Any, adapter).poll = poll
+        reconciler = GromacsReconciler(
+            store,
+            adapter,
+            now=lambda: 20,
+            max_concurrent_jobs=4,
+        )
+        task = asyncio.create_task(reconciler.reconcile())
+        await asyncio.wait_for(saturated.wait(), timeout=1)
+        assert peak == 4
+        release.set()
+        await task
+        assert calls == len(jobs)
+
+    asyncio.run(scenario())
+
+
+def test_reconciler_requires_a_positive_concurrency_bound(tmp_path: Path) -> None:
+    store, _job = _submitted_job(tmp_path)
+
+    with pytest.raises(ValueError, match="max_concurrent_jobs must be positive"):
+        GromacsReconciler(store, _adapter({}), max_concurrent_jobs=0)
 
 
 def test_reconciler_does_not_repeat_an_unknown_stage_submission(

@@ -3,12 +3,14 @@
 # ruff: noqa: D101,D102,D103,S105,S106
 
 import sqlite3
+import weakref
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from biomodals.service.auth import AuthService
+from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
     JobAdmissionConfiguration,
@@ -55,6 +57,19 @@ def test_readiness_never_recreates_or_accepts_an_empty_database(
     path.touch()
     with pytest.raises(RuntimeError, match="schema is unavailable"):
         store.check_ready()
+
+
+def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
+    locks = JobLifecycleLocks()
+    job_id = UUID("11111111-1111-4111-8111-111111111111")
+    first = locks.for_job(job_id)
+    reference = weakref.ref(first)
+
+    assert locks.for_job(job_id) is first
+    del first
+
+    assert reference() is None
+    assert locks.for_job(job_id) is not None
 
 
 @pytest.mark.parametrize("version", [0, 8])

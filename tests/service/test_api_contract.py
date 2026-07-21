@@ -393,14 +393,24 @@ def test_admin_user_management_requires_admin_and_preserves_last_admin(
 
     users = client.get("/api/v1/admin/users")
     assert users.status_code == 200
-    assert {user["email"] for user in users.json()} == {
+    user_page = users.json()
+    assert {user["email"] for user in user_page["users"]} == {
         "alice@example.com",
         "new@example.com",
         "ordinary@example.com",
     }
     alice_id = next(
-        user["user_id"] for user in users.json() if user["email"] == "alice@example.com"
+        user["user_id"]
+        for user in user_page["users"]
+        if user["email"] == "alice@example.com"
     )
+    first_user_page = client.get("/api/v1/admin/users?limit=2").json()
+    second_user_page = client.get(
+        f"/api/v1/admin/users?limit=2&cursor={first_user_page['next_cursor']}"
+    ).json()
+    assert len(first_user_page["users"]) == 2
+    assert len(second_user_page["users"]) == 1
+    assert second_user_page["next_cursor"] is None
 
     last_admin = client.patch(
         f"/api/v1/admin/users/{alice_id}",
@@ -1012,7 +1022,7 @@ def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> No
         ("/api/v1/auth/set-password", "post"): {"400", "403", "422"},
         ("/api/v1/auth/me", "get"): {"401"},
         ("/api/v1/auth/logout", "post"): {"401", "403"},
-        ("/api/v1/jobs", "get"): {"401"},
+        ("/api/v1/jobs", "get"): {"400", "401"},
         ("/api/v1/jobs/{job_id}", "get"): {"401", "404", "422"},
         ("/api/v1/jobs/{job_id}/cancel", "post"): {
             "401",
@@ -1497,6 +1507,49 @@ def test_my_jobs_and_job_lookup_are_private_to_the_cookie_owner(
     )
     assert forbidden_cancel.status_code == 404
     assert adapter.cancellations == []
+
+
+def test_job_history_uses_an_owner_scoped_cursor(tmp_path: Path) -> None:
+    client, auth, store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    alice = store.get_user_by_email("alice@example.com")
+    assert alice is not None
+    store.update_user(alice.user_id, active_job_limit=10, now=1_800_000_000)
+    for index in range(3):
+        submitted = _submit(
+            client,
+            csrf_token,
+            idempotency_key=str(uuid4()),
+            display_name=f"Simulation {index}",
+        )
+        assert submitted.status_code == 202
+        store.fail_job(
+            UUID(submitted.json()["job_id"]),
+            error_code="compute_failed",
+            error_message="Completed test fixture",
+            now=1_800_000_001 + index,
+        )
+
+    first = client.get("/api/v1/jobs?limit=2")
+    first_body = first.json()
+    second = client.get(f"/api/v1/jobs?limit=2&cursor={first_body['next_cursor']}")
+    second_body = second.json()
+    unknown = client.get(f"/api/v1/jobs?cursor={uuid4()}")
+    schema = client.get("/openapi.json").json()
+
+    assert first.status_code == 200
+    assert len(first_body["jobs"]) == 2
+    assert first_body["next_cursor"] is not None
+    assert second.status_code == 200
+    assert len(second_body["jobs"]) == 1
+    assert second_body["next_cursor"] is None
+    assert len({job["job_id"] for job in first_body["jobs"] + second_body["jobs"]}) == 3
+    assert unknown.status_code == 400
+    response_schema = schema["paths"]["/api/v1/jobs"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+    assert response_schema["$ref"].endswith("/JobPageView")
 
 
 def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:

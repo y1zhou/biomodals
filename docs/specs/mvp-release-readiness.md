@@ -602,6 +602,21 @@ new password and Session. Login retains a dummy Argon2 verification for unknown
 Users. This small availability bound does not add account lockout, per-User
 throttling, or a wider authentication-hardening project to the functional MVP.
 
+### Bounded control-plane work
+
+Successful authentication updates a Session's persisted idle-activity time at
+most once every five minutes rather than writing SQLite on every authenticated
+request. Expiry continues using the last persisted activity; the coalescing
+window is intentionally negligible relative to the 30-day idle lifetime.
+
+One GROMACS reconciliation pass runs at most four independent Jobs concurrently.
+It creates only that fixed worker count, isolates an unexpected per-Job error so
+other Jobs still progress, and performs intermediate cleanup after the workers
+finish. Per-Job lifecycle locks remain shared across HTTP cancellation and
+reconciliation while in use, then leave the process registry automatically
+when no task retains them. Durable Job state remains the restart-safe source of
+truth.
+
 ### OpenAPI contract discipline
 
 The live FastAPI OpenAPI document is the executable backend-frontend API
@@ -692,12 +707,14 @@ The MVP does not duplicate this state in local or session storage. Search
 parameters control the existing client-side filtering and sorting only; they do
 not silently imply server-side query behavior.
 
-The MVP collection endpoints remain unpaginated: My Jobs returns every Job
-owned by the authenticated User newest-first, and Admin Users returns every
-User. The frontend performs its existing sorting and filtering over those
-collections. There is no hidden result cap, total-count protocol, or server
-filter contract. Pagination is reconsidered when measured User histories reach
-hundreds of Jobs or response size and latency become material.
+The My Jobs and Admin Users endpoints use stable owner-scoped cursor pages with
+a default of 50 and maximum of 100 records per response. Each response returns
+its collection plus a nullable continuation cursor, and a cursor cannot cross
+the authenticated owner boundary. The frontend follows those cursors to
+assemble the complete MVP collection, preserving existing client-side sorting
+and filtering without a hidden result cap while bounding each SQLite query and
+HTTP response. Server-side filter/sort protocols and total counts remain
+outside the MVP.
 
 ### Responsive layout boundary
 
@@ -756,8 +773,8 @@ focus to their initiating controls.
 ## Review outcome
 
 The product owner accepted the constraints above and authorized implementation
-without deployment. Concurrent Administrator conflict detection, collection
-pagination, cross-deployment capacity coordination, and broader security work
-remain deliberately deferred under their owning sections. Completion still
-requires all automated gates, independent backend and frontend reviews, and an
+without deployment. Concurrent Administrator conflict detection,
+cross-deployment capacity coordination, and broader security work remain
+deliberately deferred under their owning sections. Completion still requires
+all automated gates, independent backend and frontend reviews, and an
 Administrator-run human smoke test before any deployment.

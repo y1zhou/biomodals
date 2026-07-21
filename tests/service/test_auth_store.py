@@ -134,6 +134,23 @@ def test_sessions_have_idle_and_absolute_expiry(tmp_path: Path) -> None:
     assert auth.authenticate(absolute_session.session_token) is None
 
 
+def test_session_activity_is_persisted_at_a_bounded_frequency(tmp_path: Path) -> None:
+    clock = Clock()
+    auth, _store = make_auth(tmp_path, clock)
+    activated_user(auth)
+    issued = auth.login("alice@example.com", "correct horse battery staple")
+
+    clock.now += 60
+    first = auth.authenticate(issued.session_token)
+    assert first is not None
+    assert first.last_seen_at == 1_800_000_000
+
+    clock.now += 5 * 60
+    second = auth.authenticate(issued.session_token)
+    assert second is not None
+    assert second.last_seen_at == clock.now
+
+
 def test_reset_and_disable_revoke_all_sessions(tmp_path: Path) -> None:
     clock = Clock()
     auth, _store = make_auth(tmp_path, clock)

@@ -28,6 +28,10 @@ class UserNotFoundError(LookupError):
     """Raised when an administrator names an unknown user."""
 
 
+class UserCursorError(ValueError):
+    """Raised when an Administrator history cursor is unknown."""
+
+
 class FirstUserMustBeAdminError(ValueError):
     """Raised when bootstrap would leave the service without an administrator."""
 
@@ -46,6 +50,10 @@ class JobLimitExceededError(RuntimeError):
 
 class JobNotFoundError(LookupError):
     """Raised when an owner-scoped job lookup fails."""
+
+
+class JobCursorError(ValueError):
+    """Raised when a history cursor does not name one owner's Job."""
 
 
 class JobNotCancellableError(RuntimeError):
@@ -83,6 +91,7 @@ TERMINAL_JOB_STATES = (
     JobState.CANCELLED,
 )
 RECONCILABLE_JOB_STATES = (*ACTIVE_JOB_STATES, JobState.BLOCKED)
+_SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
 
 
 class UserStatus(StrEnum):
@@ -122,6 +131,14 @@ class StoredSession:
     created_at: int
     last_seen_at: int
     absolute_expires_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class UserPageRecord:
+    """One bounded Administrator User page and its continuation cursor."""
+
+    users: list[UserRecord]
+    next_cursor: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +218,14 @@ class JobAdmission:
 
     job: JobRecord
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class JobPageRecord:
+    """One bounded owner-scoped history page and its continuation cursor."""
+
+    jobs: list[JobRecord]
+    next_cursor: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,6 +676,49 @@ class ServiceStore:
             ).fetchall()
         return [_user_from_row(row) for row in rows]
 
+    def list_users_page(
+        self,
+        *,
+        limit: int,
+        cursor: UUID | None = None,
+    ) -> UserPageRecord:
+        """List a stable bounded User page after an optional cursor."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError("User page limit must be positive")
+        with self._connection() as conn:
+            parameters: tuple[object, ...] = ()
+            cursor_clause = ""
+            if cursor is not None:
+                anchor = conn.execute(
+                    "SELECT email, user_id FROM users WHERE user_id = ?",
+                    (str(cursor),),
+                ).fetchone()
+                if anchor is None:
+                    raise UserCursorError("User cursor is invalid")
+                cursor_clause = " WHERE email > ? OR (email = ? AND user_id > ?)"
+                parameters = (
+                    str(anchor["email"]),
+                    str(anchor["email"]),
+                    str(anchor["user_id"]),
+                )
+            rows = conn.execute(
+                f"""
+                SELECT * FROM users{cursor_clause}
+                ORDER BY email, user_id
+                LIMIT ?
+                """,  # noqa: S608 - cursor clause is fixed service text
+                (*parameters, limit + 1),
+            ).fetchall()
+        page_rows = rows[:limit]
+        return UserPageRecord(
+            users=[_user_from_row(row) for row in page_rows],
+            next_cursor=(
+                UUID(page_rows[-1]["user_id"])
+                if len(rows) > limit and page_rows
+                else None
+            ),
+        )
+
     def issue_password_token(
         self,
         user_id: UUID,
@@ -838,15 +906,18 @@ class ServiceStore:
                     (token_digest,),
                 )
                 return None
-            conn.execute(
-                "UPDATE sessions SET last_seen_at = ? WHERE token_digest = ?",
-                (now, token_digest),
-            )
+            last_seen_at = int(row["last_seen_at"])
+            if now - last_seen_at >= _SESSION_TOUCH_INTERVAL_SECONDS:
+                conn.execute(
+                    "UPDATE sessions SET last_seen_at = ? WHERE token_digest = ?",
+                    (now, token_digest),
+                )
+                last_seen_at = now
         return StoredSession(
             user=_user_from_row(row),
             csrf_digest=bytes(row["csrf_digest"]),
             created_at=int(row["session_created_at"]),
-            last_seen_at=now,
+            last_seen_at=last_seen_at,
             absolute_expires_at=int(row["absolute_expires_at"]),
         )
 
@@ -1279,6 +1350,57 @@ class ServiceStore:
                 (str(owner_user_id),),
             ).fetchall()
         return [_job_from_row(row) for row in rows]
+
+    def list_jobs_page(
+        self,
+        owner_user_id: UUID,
+        *,
+        limit: int,
+        cursor: UUID | None = None,
+    ) -> JobPageRecord:
+        """List a stable bounded page after an optional owner-scoped cursor."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError("Job page limit must be positive")
+        with self._connection() as conn:
+            parameters: tuple[object, ...] = (str(owner_user_id),)
+            cursor_clause = ""
+            if cursor is not None:
+                anchor = conn.execute(
+                    """
+                    SELECT created_at, job_id FROM jobs
+                    WHERE owner_user_id = ? AND job_id = ?
+                    """,
+                    (str(owner_user_id), str(cursor)),
+                ).fetchone()
+                if anchor is None:
+                    raise JobCursorError("Job history cursor is invalid")
+                cursor_clause = (
+                    " AND (created_at < ? OR (created_at = ? AND job_id < ?))"
+                )
+                parameters = (
+                    str(owner_user_id),
+                    int(anchor["created_at"]),
+                    int(anchor["created_at"]),
+                    str(anchor["job_id"]),
+                )
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE owner_user_id = ?{cursor_clause}
+                ORDER BY created_at DESC, job_id DESC
+                LIMIT ?
+                """,  # noqa: S608 - cursor clause is fixed service text
+                (*parameters, limit + 1),
+            ).fetchall()
+        page_rows = rows[:limit]
+        return JobPageRecord(
+            jobs=[_job_from_row(row) for row in page_rows],
+            next_cursor=(
+                UUID(page_rows[-1]["job_id"])
+                if len(rows) > limit and page_rows
+                else None
+            ),
+        )
 
     def count_active_jobs(self, workload: str | None = None) -> int:
         """Count Jobs that consume admission capacity."""

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.service.api import (
@@ -30,6 +30,7 @@ from biomodals.service.store import (
     LastActiveAdminError,
     ServiceStore,
     UserAlreadyExistsError,
+    UserCursorError,
     UserNotFoundError,
     UserRecord,
     UserStatus,
@@ -120,6 +121,13 @@ class AdminUserView(BaseModel):
             created_at=datetime.fromtimestamp(user.created_at, UTC),
             updated_at=datetime.fromtimestamp(user.updated_at, UTC),
         )
+
+
+class AdminUserPageView(BaseModel):
+    """One bounded page of Administrator-visible Users."""
+
+    users: list[AdminUserView]
+    next_cursor: UUID | None = None
 
 
 class CreateAdminUserRequest(BaseModel):
@@ -378,15 +386,24 @@ def create_admin_router() -> APIRouter:
 
     @router.get(
         "/users",
-        response_model=list[AdminUserView],
-        responses=read_responses,
+        response_model=AdminUserPageView,
+        responses={**read_responses, 400: {"model": ErrorResponse}},
     )
     async def list_users(
         request: Request,
         _session: Annotated[AuthenticatedSession, Depends(require_admin)],
-    ) -> list[AdminUserView]:
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor: UUID | None = None,
+    ) -> AdminUserPageView:
         store: ServiceStore = request.app.state.store
-        return [AdminUserView.from_record(user) for user in store.list_users()]
+        try:
+            page = store.list_users_page(limit=limit, cursor=cursor)
+        except UserCursorError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return AdminUserPageView(
+            users=[AdminUserView.from_record(user) for user in page.users],
+            next_cursor=page.next_cursor,
+        )
 
     @router.post(
         "/users",

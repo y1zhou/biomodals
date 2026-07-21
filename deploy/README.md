@@ -12,10 +12,26 @@ All three examples:
 - use `https://biomodals.example.com` as the browser origin;
 - keep durable SQLite state separate from the rebuildable Result cache; and
 - contain only boot-critical process settings, so the Modal Environment, App
-  name, and admission limits remain editable in the Admin interface.
+  name, exact App deployment version, and admission limits remain editable in
+  the Admin interface.
 
 Replace every Modal token placeholder before starting a service. The backend
 refuses to start when either credential is missing.
+
+A fresh database initially uses the built-in `Gromacs` App version `1`. Before
+allowing a real Submission, run the following command to identify the intended
+deployment, then save its positive version in Admin → Modal → Tools:
+
+```console
+modal app history Gromacs --env <environment> --json
+```
+
+The production examples deliberately do not set that
+value as a process environment variable, because doing so would make the Admin
+field read-only. Startup preflight must succeed against the initial fallback;
+if a deployment does not retain version `1`, supply the intended version from a
+private `BIOMODALS_API_CONF_ENV` file for first boot, then keep it as the
+database-overridable configured default.
 
 ## Native systemd
 

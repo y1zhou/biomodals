@@ -116,7 +116,9 @@ The checklist must order these actions:
 1. Run the automated backend and frontend merge gates, then the exact-SHA
    OpenAPI and Playwright gate against the intended candidate pair.
 2. Review configuration-file ownership/mode and the effective public URL,
-   cookie mode, state path, cache path, Modal Environment, App name, and limits.
+   cookie mode, state path, cache path, Modal Environment, App name, exact App
+   deployment version, and limits. Confirm the version against `modal app
+   history <app> --env <environment> --json` before any real Submission.
 3. Deploy a changed GROMACS App before an API that calls its changed contract;
    otherwise explicitly mark that paid deployment step irrelevant.
 4. Start or restart the candidate API and wait for readiness before exposing

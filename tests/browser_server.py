@@ -57,6 +57,8 @@ class _FakeGromacsAdapter:
         self.stats_path = stats_path
         self.password_link = ""
         self.submit_calls = 0
+        self.preflight_versions: list[int] = []
+        self.submit_versions: list[int] = []
         self.calls: dict[str, float] = {}
         self.cancelled: set[str] = set()
         self.archive = _result_archive()
@@ -69,7 +71,9 @@ class _FakeGromacsAdapter:
             json.dumps(
                 {
                     "password_link": self.password_link,
+                    "preflight_versions": self.preflight_versions,
                     "submit_calls": self.submit_calls,
+                    "submit_versions": self.submit_versions,
                     "provider_calls": len(self.calls),
                     "cancel_calls": len(self.cancelled),
                 },
@@ -79,8 +83,14 @@ class _FakeGromacsAdapter:
         )
         temporary.replace(self.stats_path)
 
-    async def preflight(self, _app_name: str, _environment_name: str) -> None:
-        return None
+    async def preflight(
+        self,
+        _app_name: str,
+        _environment_name: str,
+        app_version: int,
+    ) -> None:
+        self.preflight_versions.append(app_version)
+        self._write_stats()
 
     def _call(self, run_name: str, operation: str) -> _SubmittedCall:
         call_id = f"fake-{len(self.calls) + 1}"
@@ -96,8 +106,9 @@ class _FakeGromacsAdapter:
         run_name: str,
         modal_configuration: ModalConfigurationSnapshot,
     ) -> _SubmittedCall:
-        del modal_configuration
         self.submit_calls += 1
+        self.submit_versions.append(modal_configuration.app_version)
+        self._write_stats()
         operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
         return self._call(run_name, operation)
 
@@ -170,6 +181,7 @@ def _create_browser_app():
         "BIOMODALS_CACHE_DIR": str(root / "cache"),
         "BIOMODALS_PUBLIC_URL": ORIGIN,
         "BIOMODALS_SECURE_COOKIES": "false",
+        "BIOMODALS_GROMACS_APP_VERSION": "7",
         "BIOMODALS_RECONCILE_SECONDS": "0.1",
     })
     store = ServiceStore(settings.database_path)

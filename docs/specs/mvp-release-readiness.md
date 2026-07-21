@@ -108,11 +108,13 @@ SQLite state remains disposable during the current active-development phase,
 and destructive schema resets are allowed. Backup implementation and restore
 drills are therefore outside the current implementation cycle.
 
-The backend never deletes or rewrites an incompatible database automatically.
-It reports the unsupported schema and configured database location, then exits.
-An Administrator must stop the service and explicitly remove or relocate that
-exact database before restart initializes the new schema. The MVP does not keep
-the current partial development-only migration path.
+The backend never deletes or destructively rewrites an incompatible database
+automatically. Schema 10 has one narrow in-place migration to schema 11 that
+adds per-stage provider calls and preserves Users and existing service state.
+For any other unsupported schema, the backend reports the version and configured
+database location, then exits. An Administrator must stop the service and
+explicitly remove or relocate that exact database before restart initializes a
+new schema.
 
 Pre-release and production must not share service configuration or host-local
 mutable state. Every pre-release service definition explicitly selects
@@ -322,7 +324,8 @@ the complete pair coherently.
 
 This is a narrow App reliability correction that benefits both the Local
 Entrypoint and API callers. The API service must not generate scientific plots,
-change the deployed Function sequence, or introduce an API-only coordinator.
+change deployed Function implementations or scientific arguments, or introduce
+an API-only coordinator.
 
 ### GROMACS Job timeline
 
@@ -346,9 +349,26 @@ durably attached and ends when the backend records its observed terminal
 outcome. `prepare_result` spans local finalization through Result publication.
 Every started stage exposes `started_at`, nullable `ended_at`, and a nullable
 outcome of `completed`, `failed`, or `cancelled`; an active, state-unknown, or
-blocked stage has no end or outcome. OpenAPI also exposes the stage code and safe
-Running Function name when applicable. It exposes no invented substage,
-timestamp, or outcome.
+blocked stage has no end or outcome. OpenAPI exposes all current rows through
+`active_stages`; the singular `stage` remains a compatibility summary. The Job
+table may therefore show several Running rows with overlapping timestamps. It
+exposes no invented substage, timestamp, or outcome.
+
+The durable dependency graph is:
+
+```text
+prepare_simulation
+  |-> analyze_nvt --------------------------------|
+  |-> analyze_npt --------------------------------|
+  `-> run_production -> analyze_production -------|
+                                                   `-> prepare_result
+```
+
+The three branches after preparation run concurrently. Production analysis may
+start while NVT or NPT analysis is still running. Result preparation starts only
+after all three analysis stages complete. A definite branch failure stops new
+dependencies, requests cancellation of active siblings, and reaches `failed`
+only after every known remote call is inactive.
 
 The Job page displays the last recorded update but never derives a stale,
 stalled, or failed state from elapsed time: a deployed Function can
@@ -378,16 +398,18 @@ that workflow is designed and deployed.
 
 Accepting Cancellation persists `cancel_requested_at` and moves the Job to
 `cancel_requested` before contacting Modal. The reconciler must not start
-another stage after that transition. For a known direct call it requests
-termination with `terminate_containers=False`, retries transient provider
-failures, and resumes the same work after an API restart. This mode cancels the
-input without forcibly terminating workers that may contain unrelated inputs.
+another stage after that transition. For every known active direct call it
+requests termination with `terminate_containers=False`, retries transient
+provider failures, and resumes the same work after an API restart. This mode
+cancels inputs without forcibly terminating workers that may contain unrelated
+inputs.
 
-The Job becomes `cancelled` only after Modal confirms termination. If the
-currently running stage completed first, the backend records that completion
-but does not start its successor and then completes Cancellation. If a complete
-Result was already published, its prior `succeeded` or `partial` state wins the
-race. The backend never reports `cancelled` merely because a timeout elapsed.
+The Job becomes `cancelled` only after Modal confirms every active call is
+inactive. Calls that finish first retain their completed outcome, but the
+backend starts no successors and continues cancelling their siblings. If a
+complete Result was already published, its prior `succeeded` or `partial` state
+wins the race. The backend never reports `cancelled` merely because a timeout
+elapsed.
 
 `cancel_requested` continues consuming User, Tool, and Global Active Job Limits
 until its remote outcome is known. After 15 minutes, Job detail shows
@@ -679,12 +701,13 @@ request. Expiry continues using the last persisted activity; the coalescing
 window is intentionally negligible relative to the 30-day idle lifetime.
 
 One GROMACS reconciliation pass runs at most four independent Jobs concurrently.
-It creates only that fixed worker count, isolates an unexpected per-Job error so
-other Jobs still progress, and performs intermediate cleanup after the workers
-finish. Per-Job lifecycle locks remain shared across HTTP cancellation and
-reconciliation while in use, then leave the process registry automatically
-when no task retains them. Durable Job state remains the restart-safe source of
-truth.
+Within one Job it polls every active direct call and may submit the fixed
+parallel branches described above. It creates only the fixed Job worker count,
+isolates an unexpected per-Job error so other Jobs still progress, and performs
+intermediate cleanup after the workers finish. Per-Job lifecycle locks remain
+shared across HTTP cancellation and reconciliation while in use, then leave the
+process registry automatically when no task retains them. Durable Job and
+per-stage call state remain the restart-safe source of truth.
 
 ### OpenAPI contract discipline
 

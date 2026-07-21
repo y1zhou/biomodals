@@ -21,13 +21,15 @@ module contributes an `APIRouter` and a narrow Modal adapter to the control
 plane. The adapter resolves each deployed stage by its Function name with
 `modal.Function.from_name()`, submits it with `.spawn()`, and reconciles the
 detached `FunctionCall`. GROMACS has no API-only coordinator or packaging
-Function. The control plane mirrors the established `submit_gromacs_task`
-local entrypoint by calling the existing preparation, trajectory-analysis, and
-production Functions sequentially. After the last Function succeeds, the
-control plane packages the established Volume outputs itself. The GROMACS App
-and its command-line behavior remain unchanged. This keeps the HTTP contract
-and account data local while preserving independent compute images, scaling,
-and deployment lifecycles. [Modal: invoking deployed Functions](https://modal.com/docs/guide/trigger-deployed-functions)
+Function. The control plane calls the existing preparation,
+trajectory-analysis, and production Functions through a fixed durable
+dependency graph. After preparation, NVT analysis, NPT analysis, and production
+run concurrently; production analysis starts when production finishes; Result
+preparation waits for all three analyses. The control plane then packages the
+established Volume outputs itself. The GROMACS App and its command-line behavior
+remain unchanged. This keeps the HTTP contract and account data local while
+preserving independent compute images, scaling, and deployment lifecycles.
+[Modal: invoking deployed Functions](https://modal.com/docs/guide/trigger-deployed-functions)
 
 No Modal Web Function, webhook, `@modal.asgi_app`, or
 `@modal.fastapi_endpoint` is needed for this deployment. Those components are
@@ -46,10 +48,10 @@ one FastAPI process
   |-- shared auth, jobs, downloads, SQLite, reconciler
   |-- /api/v1/gromacs/*   -> GROMACS adapter
   |                            |-> prepare_tpr_{cpu,gpu}
-  |                            |-> collect_traj_stats(nvt_)
-  |                            |-> collect_traj_stats(npt_)
-  |                            |-> production_run_{cpu,gpu}
-  |                            |-> collect_traj_stats(production_)
+  |                            |     |-> collect_traj_stats(nvt_)
+  |                            |     |-> collect_traj_stats(npt_)
+  |                            |     `-> production_run_{cpu,gpu}
+  |                            |             `-> collect_traj_stats(production_)
   |                            `-> service-built result.zip
   `-- /api/v1/alphafold3/* -> future AF3 adapter -> deployed AF3 Modal App
                                       |
@@ -156,20 +158,26 @@ Every list, inspect, cancel, and download lookup is constrained by both
 `404` as a missing job, before the server resolves any Modal identifier.
 Account administration does not grant access to employee jobs.
 
-The submit route persists the job, spawns the first Modal stage, stores its
-Function name and call identifier internally, and returns `202`. When that call
-completes, the reconciler resolves the next deployed Function by name and
-atomically replaces the stored active operation and call identifier. Exactly
-one direct stage is the durable active operation at a time. `JobView` exposes a
-sanitized stage code and the associated deployed Function name so the Job
-detail page can show the current sequential step. SQLite also retains an
-ordered `stage_history` timing record: a stage starts when its direct call is
-durably attached and ends when the reconciler records its observed terminal
-outcome. Each entry has `started_at`, nullable `ended_at`, and a nullable outcome
-of `completed`, `failed`, or `cancelled`; active, state-unknown, and blocked work
-has no end or outcome. Result packaging spans `finalizing` through archive
-publication. Modal call IDs, App and Environment names, Volume names and paths, dashboard links,
-tracebacks, and internal filesystem paths remain private.
+The submit route persists the Job, spawns preparation, stores its Function name
+and call identifier internally, and returns `202`. SQLite keeps one durable
+provider-call row per directly submitted operation. When calls complete, the
+reconciler evaluates the fixed GROMACS dependencies and attaches every newly
+ready call. Several direct stages may therefore be active at once. Per-stage
+submission leases retain the existing restart and ambiguous-submission boundary
+without introducing a remote coordinator.
+
+`JobView.active_stages` exposes every active sanitized stage code and deployed
+Function name. The singular `stage` remains as a compatibility summary of the
+most recently started active stage, or the relevant terminal stage. SQLite also
+retains an ordered `stage_history` timing record: a stage starts when its direct
+call is durably attached and ends when the reconciler records its observed
+terminal outcome. Parallel entries may have overlapping timestamps and may
+finish in a different order from their table rows. Each entry has `started_at`,
+nullable `ended_at`, and a nullable outcome of `completed`, `failed`, or
+`cancelled`; active, state-unknown, and blocked work has no end or outcome.
+Result packaging spans `finalizing` through archive publication. Modal call IDs,
+App and Environment names, Volume names and paths, dashboard links, tracebacks,
+and internal filesystem paths remain private.
 
 The stable public GROMACS stage mapping is:
 
@@ -189,25 +197,34 @@ share a Function name but remain distinct stages because their prefixes and
 positions differ. Nested App implementation calls such as `postprocess_traj`
 also remain outside the public timeline.
 
-The GROMACS API sequence is:
+The GROMACS API dependency graph is:
 
 ```text
 prepare_tpr_cpu|gpu
-  -> collect_traj_stats(traj_prefix="nvt_")
-  -> collect_traj_stats(traj_prefix="npt_")
-  -> production_run_cpu|gpu
-  -> collect_traj_stats(
-       traj_prefix="production_",
-       save_processed_traj=true
-     )
-  -> service builds and publishes result.zip
+  |-> collect_traj_stats(traj_prefix="nvt_") -------------------|
+  |-> collect_traj_stats(traj_prefix="npt_") -------------------|
+  `-> production_run_cpu|gpu                                     |
+        `-> collect_traj_stats(                                  |
+              traj_prefix="production_",                         |
+              save_processed_traj=true                           |
+            ) ---------------------------------------------------|
+                                                                  `-> service builds
+                                                                      result.zip
 ```
 
-This is the same sequence and argument shape as the GROMACS App's established
-`submit_gromacs_task` local entrypoint, except that the API deliberately waits
-for each call before starting the next one. `collect_traj_stats` remains free to
-use its own established implementation details, including its internal call to
-`postprocess_traj`; the API does not duplicate or alter those details.
+The API calls the same established Functions with the same scientific
+arguments as `submit_gromacs_task`, but overlaps production with NVT/NPT
+analysis. The CLI keeps its existing, slightly more conservative ordering.
+Preparation commits the shared inputs before fan-out, each branch writes
+distinct prefixed files on the Modal Volume v2, and Result preparation is the
+join barrier. `collect_traj_stats` remains free to use its established
+implementation details, including its internal call to `postprocess_traj`; the
+API does not duplicate or alter those details.
+
+A definite branch failure prevents further dependent submissions and requests
+cancellation of every still-running sibling. The Job remains active until those
+calls are confirmed inactive, then becomes `failed`; this avoids hiding paid
+remote work behind an early terminal state.
 
 There is deliberately no deployed `run_gromacs_job` Function wrapping these
 calls. Such a wrapper adds a second Modal call layer, obscures which resource
@@ -227,14 +244,14 @@ queued/running/cancel_requested -> state_unknown -> failed (Admin resolution)
 ```
 
 Cancellation is idempotent while it is pending. The adapter asks Modal to
-cancel the currently recorded direct call and any visible active descendants
-with `terminate_containers=False`; the job becomes `cancelled` only after the
-call graph is inactive. This cancels inputs without forcibly terminating
+cancel every recorded active direct call and any visible active descendants
+with `terminate_containers=False`; the Job becomes `cancelled` only after all
+call graphs are inactive. This cancels inputs without forcibly terminating
 workers that may contain unrelated inputs. `cancel_requested_at` is persisted
 before the provider request, transient failures are retried, and restart
 resumes reconciliation. No successor stage may be spawned after the durable
-request. If the active stage completed first, it is recorded as complete and
-the Job is then cancelled; if a verified Result archive was already published,
+request. Calls that complete first are recorded as complete while their active
+siblings are cancelled; if a verified Result archive was already published,
 the completed Result wins. Terminal jobs are preserved and there is no
 job-delete endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
 
@@ -242,7 +259,7 @@ The service does not infer successful Cancellation from a timeout. A pending
 Cancellation continues consuming Active Job Limits while Modal still exposes a
 reconcilable call. After 15 minutes the owner-facing view uses the persisted
 timestamp to warn that Cancellation is taking longer than expected while
-reconciliation continues. If the call status expires before cancellation can
+reconciliation continues. If any call status expires before cancellation can
 be confirmed and no verified final Result can be recovered, the Job moves to
 `state_unknown`, not falsely to `cancelled`.
 
@@ -278,10 +295,11 @@ to `state_unknown`. It does not automatically resubmit an operation whose
 provider outcome cannot be proven, because doing so could duplicate paid
 compute. An Administrator must review the remote state before marking it failed.
 
-Every later stage transition takes the same kind of durable lease before
-calling `.spawn()`. A returned call ID atomically replaces the prior completed
-call and clears the lease. If the process dies or Modal's response is ambiguous
-before that replacement, the Job enters `state_unknown` immediately for an
+Every later stage submission takes the same kind of operation-scoped durable
+lease before calling `.spawn()`. A returned call ID atomically attaches to that
+operation and clears its lease without replacing sibling calls. If the process
+dies or Modal's response is ambiguous before that attachment, the Job enters
+`state_unknown` immediately for an
 explicit ambiguous response or at lease expiry after a process interruption;
 it does not spawn the stage again. Each established stage writes resume-aware
 output under the stable run name, but resume behavior is not treated as a
@@ -537,12 +555,14 @@ Production uses the same factory and worker count behind the internal HTTPS
 reverse proxy. See the root README for the complete local setup and account
 provisioning example.
 
-The SQLite schema has one supported pre-release version. Encountering another
-version is a startup error: the service reports the configured database
-location and exits, but never migrates, truncates, or deletes it automatically.
-During active development an Administrator may explicitly remove or relocate
-that exact database while the service is stopped, then restart to initialize a
-fresh schema. This reset policy ends at the first release.
+The SQLite schema has one current pre-release version. Schema 10 has one narrow
+automatic migration to schema 11: it adds per-stage provider-call records and
+preserves all Users, Sessions, settings, Jobs, and stage history. Encountering
+any other version is a startup error: the service reports the configured
+database location and never truncates or deletes it automatically. During
+active development an Administrator may explicitly remove or relocate an
+unsupported database while the service is stopped, then restart to initialize
+a fresh schema. This reset policy ends at the first release.
 
 Pre-release and production service definitions select distinct
 `BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` values. Pre-release sets

@@ -127,8 +127,10 @@ The checklist must order these actions:
    App, adapter, or effective Modal configuration changed, an Administrator
    must approve the cost and submit one smallest valid, unmistakably named
    real-Modal Job.
-6. Verify one invocation of each expected deployed Function, exact public stage
-   transitions, finalization, prepared download, and the Result ZIP allowlist.
+6. Verify one invocation of each expected deployed Function: preparation first;
+   NVT analysis, NPT analysis, and production overlapping; production analysis
+   after production; and Result preparation only after all analyses. Then verify
+   the public timestamps, prepared download, and Result ZIP allowlist.
 7. Stop on any unexpected invocation, stage, archive member, permission error,
    or configuration error. Capture the Job ID, request ID, safe stage, and
    timestamps before retrying; do not blindly resubmit paid work.
@@ -143,3 +145,8 @@ incompatible newer database. During the current disposable-state phase, stop
 the pre-release service and explicitly remove only the exact pre-release
 database named by its configuration when a schema reset is required. Never
 apply that reset instruction to production state or cache.
+
+The schema 10 to 11 upgrade is automatic and preserves Users and existing Job
+state. Do not delete that database for this upgrade. A rollback to a schema 10
+binary requires a separate compatible database because schema 10 rejects the
+newer schema.

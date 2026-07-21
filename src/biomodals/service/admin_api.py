@@ -159,6 +159,7 @@ class CreatedAdminUserView(BaseModel):
 class UpdateAdminUserRequest(BaseModel):
     """Editable User status and admission policy fields."""
 
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
     status: Literal["enabled", "disabled"] | None = None
     is_admin: bool | None = None
     active_job_limit: int | None = Field(default=None, ge=0)
@@ -491,6 +492,7 @@ def create_admin_router() -> APIRouter:
         response_model=AdminUserView,
         responses={
             **mutation_responses,
+            400: {"model": AdminUserInvalidResponse},
             404: {"model": ErrorResponse},
             409: {"model": LastActiveAdminResponse},
         },
@@ -505,6 +507,7 @@ def create_admin_router() -> APIRouter:
         try:
             user = store.update_user(
                 user_id,
+                display_name=submission.display_name,
                 active=(
                     submission.status == "enabled"
                     if submission.status is not None
@@ -514,6 +517,8 @@ def create_admin_router() -> APIRouter:
                 active_job_limit=submission.active_job_limit,
                 now=int(time.time()),
             )
+        except ValueError as exc:
+            raise CodedAPIError(400, "user_invalid", str(exc)) from exc
         except UserNotFoundError as exc:
             raise _not_found() from exc
         except LastActiveAdminError as exc:

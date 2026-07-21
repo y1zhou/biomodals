@@ -51,14 +51,20 @@ def test_user_admin_status_and_active_job_limit_are_configurable(
 
     updated = store.update_user(
         user.user_id,
+        display_name="  Alice Researcher  ",
         is_admin=True,
         active_job_limit=7,
         now=2,
     )
 
+    assert updated.display_name == "Alice Researcher"
     assert updated.is_admin is True
     assert updated.active_job_limit == 7
     assert store.list_users() == [administrator, updated]
+
+    with pytest.raises(ValueError, match="Display name is required"):
+        store.update_user(user.user_id, display_name="   ", now=3)
+    assert store.get_user(user.user_id) == updated
 
 
 def test_first_user_must_be_an_administrator(tmp_path: Path) -> None:

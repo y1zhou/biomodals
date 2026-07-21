@@ -989,12 +989,20 @@ class ServiceStore:
         self,
         user_id: UUID,
         *,
+        display_name: str | None = None,
         active: bool | None = None,
         is_admin: bool | None = None,
         active_job_limit: int | None = None,
         now: int,
     ) -> UserRecord:
         """Update one user atomically and never remove the final active admin."""
+        normalized_display_name = (
+            display_name.strip() if display_name is not None else None
+        )
+        if normalized_display_name is not None and not normalized_display_name:
+            raise ValueError("Display name is required")
+        if normalized_display_name is not None and len(normalized_display_name) > 120:
+            raise ValueError("Display name must not exceed 120 characters")
         if active_job_limit is not None and active_job_limit < 0:
             raise ValueError("active_job_limit must be non-negative")
         with self._transaction() as conn:
@@ -1035,13 +1043,20 @@ class ServiceStore:
                 if active_job_limit is None
                 else active_job_limit
             )
+            target_display_name = (
+                str(row["display_name"])
+                if normalized_display_name is None
+                else normalized_display_name
+            )
             conn.execute(
                 """
                 UPDATE users
-                SET status = ?, is_admin = ?, active_job_limit = ?, updated_at = ?
+                SET display_name = ?, status = ?, is_admin = ?,
+                    active_job_limit = ?, updated_at = ?
                 WHERE user_id = ?
                 """,
                 (
+                    target_display_name,
                     target_status.value,
                     int(target_admin),
                     target_limit,

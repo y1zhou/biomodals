@@ -423,11 +423,24 @@ def test_admin_user_management_requires_admin_and_preserves_last_admin(
     promoted = client.patch(
         f"/api/v1/admin/users/{new_user_id}",
         headers=_unsafe_headers(csrf_token),
-        json={"is_admin": True, "active_job_limit": 6},
+        json={
+            "display_name": "  New Researcher  ",
+            "is_admin": True,
+            "active_job_limit": 6,
+        },
     )
     assert promoted.status_code == 200
+    assert promoted.json()["display_name"] == "New Researcher"
     assert promoted.json()["is_admin"] is True
     assert promoted.json()["active_job_limit"] == 6
+
+    invalid_name = client.patch(
+        f"/api/v1/admin/users/{new_user_id}",
+        headers=_unsafe_headers(csrf_token),
+        json={"display_name": "   "},
+    )
+    assert invalid_name.status_code == 400
+    assert invalid_name.json()["code"] == "user_invalid"
 
     disabled = client.patch(
         f"/api/v1/admin/users/{new_user_id}",

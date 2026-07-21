@@ -112,22 +112,14 @@ class _FakeGromacsAdapter:
         operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
         return self._call(run_name, operation)
 
-    async def advance(self, job: JobRecord) -> _SubmittedCall:
-        operations = {
-            "prepare_tpr_cpu": "collect_traj_stats:nvt_",
-            "prepare_tpr_gpu": "collect_traj_stats:nvt_",
-            "collect_traj_stats:nvt_": "collect_traj_stats:npt_",
-            "collect_traj_stats:npt_": (
-                "production_run_cpu"
-                if GromacsJobOptions.model_validate_json(job.parameters_json).cpu_only
-                else "production_run_gpu"
-            ),
-            "production_run_cpu": "collect_traj_stats:production_",
-            "production_run_gpu": "collect_traj_stats:production_",
-        }
-        if job.run_name is None or job.provider_operation not in operations:
-            raise ValueError("Fake Job cannot advance")
-        return self._call(job.run_name, operations[job.provider_operation])
+    async def submit_operation(
+        self,
+        job: JobRecord,
+        provider_operation: str,
+    ) -> _SubmittedCall:
+        if job.run_name is None:
+            raise ValueError("Fake Job has no run name")
+        return self._call(job.run_name, provider_operation)
 
     async def poll(
         self,

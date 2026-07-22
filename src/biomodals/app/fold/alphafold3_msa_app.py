@@ -130,11 +130,10 @@ BENCHMARK_OUTPUT_VOLUME = modal.Volume.from_name(
 # production app. SeqKit is an additional preparation-only tool.
 runtime_image = (
     modal.Image
-    .debian_slim(python_version=CONF.python_version)
+    .micromamba(python_version=CONF.python_version)
     .apt_install(
         "git",
         "build-essential",
-        "curl",
         "zstd",
         "zlib1g-dev",
         "wget",
@@ -147,11 +146,11 @@ runtime_image = (
             "XLA_CLIENT_MEM_FRACTION": "0.95",
         }
     )
-    .run_commands("curl -L micro.mamba.pm/install.sh | bash")
     .micromamba_install(
         f"seqkit={SEQKIT_VERSION}",
         channels=["conda-forge", "bioconda"],
     )
+    .run_commands("seqkit version")
     .run_commands(
         " && ".join((
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",

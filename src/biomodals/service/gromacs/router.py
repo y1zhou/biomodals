@@ -38,6 +38,8 @@ from biomodals.service.gromacs.plan import prepare_operation
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     JobView,
+    PreflightWorkload,
+    ReadArtifact,
     Reconciler,
     WorkloadRegistration,
 )
@@ -343,6 +345,9 @@ def create_registration(
     *,
     reconciler: Reconciler | None = None,
     lifecycle_locks: JobLifecycleLocks | None = None,
+    read_artifact: ReadArtifact | None = None,
+    rebuild_artifact: ReadArtifact | None = None,
+    preflight: PreflightWorkload | None = None,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> WorkloadRegistration:
     """Explicitly register GROMACS routes and lifecycle hooks."""
@@ -359,13 +364,9 @@ def create_registration(
         if first_error is not None:
             raise first_error
 
-    lifecycle_locks = lifecycle_locks or getattr(
-        reconciler,
-        "lifecycle_locks",
-        JobLifecycleLocks(),
-    )
-    read_artifact = getattr(adapter, "read_artifact", None)
-    rebuild_artifact = getattr(adapter, "rebuild_artifact", None)
+    if reconciler is not None and lifecycle_locks is None:
+        raise ValueError("A reconciler must share the route lifecycle locks")
+    lifecycle_locks = lifecycle_locks or JobLifecycleLocks()
     return WorkloadRegistration(
         definition=GROMACS_WORKLOAD,
         router=create_router(
@@ -378,6 +379,6 @@ def create_registration(
         cancel=cancel,
         read_artifact=read_artifact,
         rebuild_artifact=rebuild_artifact,
-        preflight=getattr(adapter, "preflight", None),
+        preflight=preflight,
         max_body_bytes=max_pdb_bytes + MAX_MULTIPART_OVERHEAD_BYTES,
     )

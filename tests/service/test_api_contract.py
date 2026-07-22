@@ -23,7 +23,7 @@ from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.modal import GromacsReconciler
-from biomodals.service.jobs import WorkloadRegistration
+from biomodals.service.jobs import JobLifecycleLocks, WorkloadRegistration
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
@@ -176,6 +176,8 @@ def _service(
     adapter = FakeGromacsAdapter()
     registration = create_registration(
         adapter,
+        read_artifact=adapter.read_artifact,
+        preflight=adapter.preflight,
         max_pdb_bytes=max_pdb_bytes,
     )
     assert isinstance(registration, WorkloadRegistration)
@@ -921,7 +923,13 @@ def test_cache_metadata_is_reconciled_before_job_reconciliation_starts(
             self.started = True
 
     reconciler = RecordingReconciler()
-    registration = create_registration(adapter, reconciler=reconciler)
+    registration = create_registration(
+        adapter,
+        reconciler=reconciler,
+        lifecycle_locks=JobLifecycleLocks(),
+        read_artifact=adapter.read_artifact,
+        preflight=adapter.preflight,
+    )
     cache = ArtifactCache(tmp_path / "cache")
 
     async def cached_job_ids() -> set[str]:

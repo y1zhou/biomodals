@@ -1220,6 +1220,9 @@ def create_deployed_app() -> FastAPI:
             intermediate_retention_days=settings.intermediate_retention_days,
         ),
         lifecycle_locks=lifecycle_locks,
+        read_artifact=adapter.read_artifact,
+        rebuild_artifact=adapter.rebuild_artifact,
+        preflight=adapter.preflight,
     )
     return create_app(
         store=store,

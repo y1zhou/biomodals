@@ -105,10 +105,15 @@ src/biomodals/service/
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
   jobs.py            common job view and workload registration
+  submission.py      shared operation lease, spawn and attachment boundary
   artifacts.py       verified final-ZIP staging and cache
   gromacs/
     router.py        GROMACS request schema and submission route
-    modal.py         Modal invocation, polling, cancellation and artifacts
+    plan.py          pure operation graph and deployed-function arguments
+    provider.py      Modal lookup, submission, polling and cancellation
+    results.py       Result publication, recovery and cache access
+    coordinator.py   durable operation reconciliation and finalization
+    modal.py         stable facade that composes the focused boundaries
 ```
 
 New workloads export a router plus lifecycle hooks through an explicit

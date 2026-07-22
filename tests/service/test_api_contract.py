@@ -1399,14 +1399,11 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
 
     schema = client.get("/openapi.json").json()
     stage_schema = schema["components"]["schemas"]["JobStageView"]
-    assert stage_schema["properties"]["code"]["enum"] == [
-        "prepare_simulation",
-        "analyze_nvt",
-        "analyze_npt",
-        "run_production",
-        "analyze_production",
-        "prepare_result",
-    ]
+    assert stage_schema["properties"]["code"] == {
+        "title": "Code",
+        "type": "string",
+    }
+    assert stage_schema["properties"]["function_name"]["anyOf"][0] == {"type": "string"}
     assert stage_schema["properties"]["started_at"]["format"] == "date-time"
     assert stage_schema["properties"]["ended_at"]["anyOf"][0]["format"] == ("date-time")
     assert schema["components"]["schemas"]["JobView"]["properties"]["stage_history"][

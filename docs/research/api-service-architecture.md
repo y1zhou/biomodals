@@ -126,6 +126,11 @@ submission endpoints are clearer than a lowest-common-denominator
 `POST /jobs?kind=...`, because a PDB upload, AlphaFold input, and workflow DAG
 have different schemas.
 
+The common Job response keeps `stage.code` and `stage.function_name` as open
+strings. Each registered workload owns their allowed values in its static
+definition; the shared OpenAPI schema does not need a new release whenever a
+workflow adds a stage or calls a different deployed function.
+
 The common routes are:
 
 - `GET /api/v1/jobs`

@@ -25,6 +25,7 @@ from biomodals.service.gromacs import (
     create_registration,
 )
 from biomodals.service.gromacs.modal import FinalArchive, PollOutcome
+from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
@@ -194,7 +195,12 @@ def _create_browser_app():
     )
     adapter.password_link = link.url
     adapter._write_stats()
-    reconciler = GromacsReconciler(store, cast(Any, adapter))
+    lifecycle_locks = JobLifecycleLocks()
+    reconciler = GromacsReconciler(
+        store,
+        cast(Any, adapter),
+        lifecycle_locks=lifecycle_locks,
+    )
     cache = ArtifactCache(settings.cache_dir / "results")
     return create_app(
         store=store,
@@ -204,6 +210,7 @@ def _create_browser_app():
             create_registration(
                 cast(Any, adapter),
                 reconciler=reconciler,
+                lifecycle_locks=lifecycle_locks,
             )
         ],
         allowed_origin=ORIGIN,

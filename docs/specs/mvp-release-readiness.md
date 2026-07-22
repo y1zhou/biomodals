@@ -339,6 +339,11 @@ uses these stable stage codes, labels, and Running Function values in order:
 | `analyze_production` | Analyze production | `collect_traj_stats` |
 | `prepare_result` | Prepare result | none; local service work |
 
+These values are fixed by the GROMACS workload definition, not by the shared
+Job schema. OpenAPI exposes stage codes and Running Function names as strings
+so another workload can define its own timeline without changing the common
+Job contract.
+
 Preparation, minimization, NVT, and NPT execution occur inside the selected
 `prepare_tpr_*` Function and are not presented as separately observable
 stages. Likewise, nested implementation calls such as `postprocess_traj` are

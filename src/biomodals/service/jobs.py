@@ -20,22 +20,7 @@ from biomodals.service.workloads import WORKLOAD_DEFINITIONS, WorkloadDefinition
 
 LOGGER = logging.getLogger(__name__)
 JobErrorCode = Literal["compute_failed", "result_invalid"]
-JobStageCode = Literal[
-    "prepare_simulation",
-    "analyze_nvt",
-    "analyze_npt",
-    "run_production",
-    "analyze_production",
-    "prepare_result",
-]
 JobStageOutcome = Literal["completed", "failed", "cancelled"]
-DeployedFunctionName = Literal[
-    "prepare_tpr_cpu",
-    "prepare_tpr_gpu",
-    "collect_traj_stats",
-    "production_run_cpu",
-    "production_run_gpu",
-]
 
 
 class JobLifecycleLocks:
@@ -60,8 +45,8 @@ class JobStageView(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    code: JobStageCode
-    function_name: DeployedFunctionName | None = None
+    code: str
+    function_name: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
     outcome: JobStageOutcome | None = None
@@ -77,8 +62,8 @@ def _stage_view(
     if stage is None or event is None:
         return None
     return JobStageView(
-        code=cast(JobStageCode, stage.code),
-        function_name=cast(DeployedFunctionName | None, stage.function_name),
+        code=stage.code,
+        function_name=stage.function_name,
         started_at=datetime.fromtimestamp(event.started_at, UTC),
         ended_at=(
             datetime.fromtimestamp(event.completed_at, UTC)

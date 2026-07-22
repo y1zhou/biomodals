@@ -633,12 +633,12 @@ overwriting unrelated settings, but the contract adds no ETag, revision, or
 conflict dialog. Ordinary last-commit-wins behavior is acceptable for the
 private deployment's small Administrator population.
 
-The Admin Modal page refreshes this operational snapshot every 10 seconds while
-visible, pauses while the document is hidden, and refetches on focus and after
-a successful setting mutation. It also provides manual Refresh and a small
-last-updated indicator. A count refresh must not overwrite unsaved Environment
-or Tool form values. The existing combined Modal Admin endpoint remains
-sufficient; the MVP adds no push or streaming channel.
+The Admin Modal page refreshes this operational snapshot every 60 seconds while
+visible, backs off to every 5 minutes while the document is hidden, and
+refetches on focus and after a successful setting mutation. It also provides
+manual Refresh and a small last-updated indicator. A count refresh must not
+overwrite unsaved Environment or Tool form values. The existing combined Modal
+Admin endpoint remains sufficient; the MVP adds no push or streaming channel.
 
 ### Administrator Password Link handoff
 

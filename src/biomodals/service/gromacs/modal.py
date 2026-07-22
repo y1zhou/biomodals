@@ -37,8 +37,8 @@ from biomodals.service.gromacs.router import (
 from biomodals.service.jobs import JobLifecycleLocks, JobView
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import (
-    JobProviderCallRecord,
-    JobProviderCallState,
+    JobOperationRecord,
+    JobOperationState,
     JobRecord,
     JobState,
     JobStateUnknownReason,
@@ -96,7 +96,7 @@ class SubmittedModalCall:
 
     modal_call_id: str
     run_name: str
-    provider_operation: str
+    operation: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,13 +222,13 @@ class ModalGromacsAdapter:
         return SubmittedModalCall(
             modal_call_id=modal_call_id,
             run_name=run_name,
-            provider_operation=function_name,
+            operation=function_name,
         )
 
     async def submit_operation(
         self,
         job: JobRecord,
-        provider_operation: str,
+        operation: str,
     ) -> SubmittedModalCall:
         """Spawn one explicitly selected deployed stage in the Job graph."""
         if job.run_name is None:
@@ -237,21 +237,21 @@ class ModalGromacsAdapter:
         production_operation = (
             "production_run_cpu" if options.cpu_only else "production_run_gpu"
         )
-        if provider_operation not in {
+        if operation not in {
             _NVT_ANALYSIS,
             _NPT_ANALYSIS,
             production_operation,
             _PRODUCTION_ANALYSIS,
         }:
-            raise ValueError(f"Unsupported GROMACS operation: {provider_operation}")
+            raise ValueError(f"Unsupported GROMACS operation: {operation}")
 
-        function_name, _, traj_prefix = provider_operation.partition(":")
+        function_name, _, traj_prefix = operation.partition(":")
         if function_name.startswith("production_run_"):
             kwargs = {
                 "run_name": job.run_name,
                 "simulation_time_ns": options.simulation_time_ns,
             }
-        elif provider_operation == _PRODUCTION_ANALYSIS:
+        elif operation == _PRODUCTION_ANALYSIS:
             kwargs = {
                 "traj_prefix": traj_prefix,
                 "run_name": job.run_name,
@@ -281,14 +281,14 @@ class ModalGromacsAdapter:
         return SubmittedModalCall(
             modal_call_id=modal_call_id,
             run_name=job.run_name,
-            provider_operation=provider_operation,
+            operation=operation,
         )
 
     async def poll(
         self,
         modal_call_id: str,
         *,
-        provider_operation: str | None = None,
+        operation: str | None = None,
     ) -> PollOutcome:
         """Poll without blocking and distinguish a poll timeout from failure."""
         call = self._call_resolver(modal_call_id)
@@ -335,7 +335,7 @@ class ModalGromacsAdapter:
         if not isinstance(raw_result, str):
             LOGGER.error(
                 "GROMACS stage %s (%s) returned an invalid result",
-                provider_operation,
+                operation,
                 modal_call_id,
             )
             return PollOutcome("failed")
@@ -734,15 +734,15 @@ def _operation_dependencies(job: JobRecord) -> dict[str, tuple[str, ...]]:
 
 def _ready_operations(
     job: JobRecord,
-    calls: Iterable[JobProviderCallRecord],
+    calls: Iterable[JobOperationRecord],
 ) -> list[str]:
     dependencies = _operation_dependencies(job)
     call_list = list(calls)
-    known = {call.provider_operation for call in call_list}
+    known = {call.operation for call in call_list}
     completed = {
-        call.provider_operation
+        call.operation
         for call in call_list
-        if call.state == JobProviderCallState.COMPLETED
+        if call.state == JobOperationState.COMPLETED
     }
     return [
         operation
@@ -753,12 +753,10 @@ def _ready_operations(
 
 def _all_operations_completed(
     job: JobRecord,
-    calls: Iterable[JobProviderCallRecord],
+    calls: Iterable[JobOperationRecord],
 ) -> bool:
     completed = {
-        call.provider_operation
-        for call in calls
-        if call.state == JobProviderCallState.COMPLETED
+        call.operation for call in calls if call.state == JobOperationState.COMPLETED
     }
     return set(_operation_dependencies(job)).issubset(completed)
 
@@ -816,15 +814,7 @@ class GromacsReconciler:
             if job.next_retry_at is None or job.next_retry_at <= now:
                 await self._finalize(job)
             return
-        if job.submission_lease_until is not None:
-            if job.submission_lease_until <= now:
-                self.store.mark_state_unknown(
-                    job.job_id,
-                    reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
-                    now=now,
-                )
-            return
-        calls = self.store.list_provider_calls(job.job_id)
+        calls = self.store.list_operations(job.job_id)
         if not calls:
             if job.state == JobState.CANCEL_REQUESTED:
                 self.store.set_job_state(
@@ -834,7 +824,7 @@ class GromacsReconciler:
                 )
             return
         submitting = [
-            call for call in calls if call.state == JobProviderCallState.SUBMITTING
+            call for call in calls if call.state == JobOperationState.SUBMITTING
         ]
         if submitting:
             if any(
@@ -857,14 +847,14 @@ class GromacsReconciler:
         current = self.store.get_job(job.owner_user_id, job.job_id)
         if current is None:  # pragma: no cover - reconciler loaded this row
             return
-        calls = self.store.list_provider_calls(job.job_id)
+        calls = self.store.list_operations(job.job_id)
         if current.state == JobState.CANCEL_REQUESTED:
             await self._reconcile_cancellation(current, calls)
             return
-        if any(call.state == JobProviderCallState.FAILED for call in calls):
+        if any(call.state == JobOperationState.FAILED for call in calls):
             await self._settle_failed_job(current, calls)
             return
-        if any(call.state == JobProviderCallState.CANCELLED for call in calls):
+        if any(call.state == JobOperationState.CANCELLED for call in calls):
             await self._settle_cancelled_job(current, calls)
             return
         if _all_operations_completed(current, calls):
@@ -875,22 +865,22 @@ class GromacsReconciler:
     async def _poll_running_calls(
         self,
         job: JobRecord,
-        calls: Iterable[JobProviderCallRecord],
+        calls: Iterable[JobOperationRecord],
     ) -> None:
         """Poll every directly running branch once and persist observations."""
         saw_running = False
         for call in calls:
-            if call.state != JobProviderCallState.RUNNING or call.modal_call_id is None:
+            if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
                 continue
             try:
                 outcome = await self.adapter.poll(
                     call.modal_call_id,
-                    provider_operation=call.provider_operation,
+                    operation=call.operation,
                 )
             except _MODAL_SERVICE_ERRORS:
                 LOGGER.exception(
                     "Modal is unavailable while polling stage %s for job %s",
-                    call.provider_operation,
+                    call.operation,
                     job.job_id,
                 )
                 continue
@@ -899,23 +889,20 @@ class GromacsReconciler:
                 continue
             if outcome.kind == "expired":
                 terminal = (
-                    JobProviderCallState.COMPLETED
-                    if call.provider_operation == _FINAL_OPERATION
-                    else JobProviderCallState.FAILED
+                    JobOperationState.COMPLETED
+                    if call.operation == _FINAL_OPERATION
+                    else JobOperationState.FAILED
                 )
             else:
-                terminal = JobProviderCallState(outcome.kind)
-            self.store.record_provider_call_outcome(
+                terminal = JobOperationState(outcome.kind)
+            self.store.record_operation_outcome(
                 job.job_id,
-                provider_operation=call.provider_operation,
+                operation=call.operation,
                 expected_modal_call_id=call.modal_call_id,
                 outcome=terminal,
                 now=self._now(),
             )
-            if (
-                outcome.kind == "expired"
-                and call.provider_operation == _FINAL_OPERATION
-            ):
+            if outcome.kind == "expired" and call.operation == _FINAL_OPERATION:
                 try:
                     archive = await self.adapter.recover_archive(job)
                 except Exception:
@@ -937,7 +924,7 @@ class GromacsReconciler:
             return
         ready = _ready_operations(
             current,
-            self.store.list_provider_calls(job.job_id),
+            self.store.list_operations(job.job_id),
         )
         for operation in ready:
             async with self.lifecycle_locks.for_job(job.job_id):
@@ -949,13 +936,13 @@ class GromacsReconciler:
                     return
                 if operation not in _ready_operations(
                     current,
-                    self.store.list_provider_calls(job.job_id),
+                    self.store.list_operations(job.job_id),
                 ):
                     continue
                 submission_token = uuid4().hex
-                claimed = self.store.claim_provider_operation(
+                claimed = self.store.claim_modal_operation(
                     job.job_id,
-                    provider_operation=operation,
+                    operation=operation,
                     submission_token=submission_token,
                     now=self._now(),
                 )
@@ -976,9 +963,9 @@ class GromacsReconciler:
                     )
                     return
                 except _DEFINITE_SUBMISSION_ERRORS:
-                    self.store.record_provider_submission_failure(
+                    self.store.record_operation_submission_failure(
                         job.job_id,
-                        provider_operation=operation,
+                        operation=operation,
                         submission_token=submission_token,
                         now=self._now(),
                     )
@@ -989,9 +976,9 @@ class GromacsReconciler:
                     )
                     return
                 except _MODAL_SERVICE_ERRORS:
-                    self.store.release_provider_operation(
+                    self.store.release_operation(
                         job.job_id,
-                        provider_operation=operation,
+                        operation=operation,
                         submission_token=submission_token,
                         now=self._now(),
                     )
@@ -1002,9 +989,9 @@ class GromacsReconciler:
                     )
                     return
                 except Exception:
-                    self.store.record_provider_submission_failure(
+                    self.store.record_operation_submission_failure(
                         job.job_id,
-                        provider_operation=operation,
+                        operation=operation,
                         submission_token=submission_token,
                         now=self._now(),
                     )
@@ -1016,9 +1003,9 @@ class GromacsReconciler:
                     return
 
                 try:
-                    advanced = self.store.attach_provider_call(
+                    advanced = self.store.attach_modal_call(
                         job.job_id,
-                        provider_operation=operation,
+                        operation=operation,
                         modal_call_id=submitted.modal_call_id,
                         submission_token=submission_token,
                         now=self._now(),
@@ -1053,19 +1040,19 @@ class GromacsReconciler:
     async def _stop_active_calls(
         self,
         job: JobRecord,
-        calls: Iterable[JobProviderCallRecord],
+        calls: Iterable[JobOperationRecord],
     ) -> bool:
         """Request fail-fast cancellation and report whether every call stopped."""
         stopped = True
         status_unknown = False
         for call in calls:
-            if call.state != JobProviderCallState.RUNNING or call.modal_call_id is None:
+            if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
                 continue
             try:
                 await self.adapter.cancel(call.modal_call_id)
                 outcome = await self.adapter.poll(
                     call.modal_call_id,
-                    provider_operation=call.provider_operation,
+                    operation=call.operation,
                 )
             except modal.exception.NotFoundError:
                 outcome = PollOutcome("expired")
@@ -1073,7 +1060,7 @@ class GromacsReconciler:
                 stopped = False
                 LOGGER.exception(
                     "Modal is unavailable while stopping stage %s for job %s",
-                    call.provider_operation,
+                    call.operation,
                     job.job_id,
                 )
                 continue
@@ -1083,11 +1070,11 @@ class GromacsReconciler:
             if outcome.kind == "expired":
                 status_unknown = True
                 continue
-            self.store.record_provider_call_outcome(
+            self.store.record_operation_outcome(
                 job.job_id,
-                provider_operation=call.provider_operation,
+                operation=call.operation,
                 expected_modal_call_id=call.modal_call_id,
-                outcome=JobProviderCallState(outcome.kind),
+                outcome=JobOperationState(outcome.kind),
                 now=self._now(),
             )
         if status_unknown:
@@ -1097,17 +1084,16 @@ class GromacsReconciler:
                 now=self._now(),
             )
             return False
-        refreshed = self.store.list_provider_calls(job.job_id)
+        refreshed = self.store.list_operations(job.job_id)
         return stopped and not any(
-            call.state
-            in {JobProviderCallState.SUBMITTING, JobProviderCallState.RUNNING}
+            call.state in {JobOperationState.SUBMITTING, JobOperationState.RUNNING}
             for call in refreshed
         )
 
     async def _settle_failed_job(
         self,
         job: JobRecord,
-        calls: Iterable[JobProviderCallRecord],
+        calls: Iterable[JobOperationRecord],
     ) -> None:
         if not await self._stop_active_calls(job, calls):
             return
@@ -1137,7 +1123,7 @@ class GromacsReconciler:
     async def _settle_cancelled_job(
         self,
         job: JobRecord,
-        calls: Iterable[JobProviderCallRecord],
+        calls: Iterable[JobOperationRecord],
     ) -> None:
         if not await self._stop_active_calls(job, calls):
             return
@@ -1148,25 +1134,25 @@ class GromacsReconciler:
     async def _reconcile_cancellation(
         self,
         job: JobRecord,
-        calls: Iterable[JobProviderCallRecord],
+        calls: Iterable[JobOperationRecord],
     ) -> None:
         """Cancel every active branch without claiming an unknown outcome."""
-        expired: list[JobProviderCallRecord] = []
+        expired: list[JobOperationRecord] = []
         for call in calls:
-            if call.state != JobProviderCallState.RUNNING or call.modal_call_id is None:
+            if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
                 continue
             try:
                 await self.adapter.cancel(call.modal_call_id)
                 outcome = await self.adapter.poll(
                     call.modal_call_id,
-                    provider_operation=call.provider_operation,
+                    operation=call.operation,
                 )
             except modal.exception.NotFoundError:
                 outcome = PollOutcome("expired")
             except _MODAL_SERVICE_ERRORS:
                 LOGGER.exception(
                     "Modal is unavailable while cancelling stage %s for job %s",
-                    call.provider_operation,
+                    call.operation,
                     job.job_id,
                 )
                 continue
@@ -1175,26 +1161,26 @@ class GromacsReconciler:
             if outcome.kind == "expired":
                 expired.append(call)
                 continue
-            self.store.record_provider_call_outcome(
+            self.store.record_operation_outcome(
                 job.job_id,
-                provider_operation=call.provider_operation,
+                operation=call.operation,
                 expected_modal_call_id=call.modal_call_id,
-                outcome=JobProviderCallState(outcome.kind),
+                outcome=JobOperationState(outcome.kind),
                 now=self._now(),
             )
 
-        refreshed = self.store.list_provider_calls(job.job_id)
+        refreshed = self.store.list_operations(job.job_id)
         if expired:
             if (
                 len(expired) == 1
-                and expired[0].provider_operation == _FINAL_OPERATION
+                and expired[0].operation == _FINAL_OPERATION
                 and not any(
                     call.state
                     in {
-                        JobProviderCallState.SUBMITTING,
-                        JobProviderCallState.RUNNING,
+                        JobOperationState.SUBMITTING,
+                        JobOperationState.RUNNING,
                     }
-                    and call.provider_operation != _FINAL_OPERATION
+                    and call.operation != _FINAL_OPERATION
                     for call in refreshed
                 )
             ):
@@ -1212,11 +1198,11 @@ class GromacsReconciler:
                         job.job_id,
                     )
                 else:
-                    self.store.record_provider_call_outcome(
+                    self.store.record_operation_outcome(
                         job.job_id,
-                        provider_operation=expired[0].provider_operation,
+                        operation=expired[0].operation,
                         expected_modal_call_id=expired[0].modal_call_id or "",
-                        outcome=JobProviderCallState.COMPLETED,
+                        outcome=JobOperationState.COMPLETED,
                         now=self._now(),
                     )
                     self._complete(job, archive)
@@ -1228,8 +1214,7 @@ class GromacsReconciler:
             )
             return
         if any(
-            call.state
-            in {JobProviderCallState.SUBMITTING, JobProviderCallState.RUNNING}
+            call.state in {JobOperationState.SUBMITTING, JobOperationState.RUNNING}
             for call in refreshed
         ):
             return
@@ -1244,7 +1229,7 @@ class GromacsReconciler:
                 JobState.RUNNING,
             }:
                 return
-            calls = self.store.list_provider_calls(job.job_id)
+            calls = self.store.list_operations(job.job_id)
             if not _all_operations_completed(current, calls):
                 return
             finalizing = self.store.set_job_state(

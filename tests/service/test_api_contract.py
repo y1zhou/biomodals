@@ -29,7 +29,7 @@ from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
 )
-from biomodals.service.store import JobProviderCallState, JobState, ServiceStore
+from biomodals.service.store import JobOperationState, JobState, ServiceStore
 
 ORIGIN = "https://biomodals.internal"
 PASSWORD = "correct horse battery staple"  # noqa: S105 - test credential
@@ -45,7 +45,7 @@ VALID_PDB = (
 class SubmittedCall:
     modal_call_id: str
     run_name: str
-    provider_operation: str
+    operation: str
 
 
 class FakeGromacsAdapter:
@@ -97,9 +97,7 @@ class FakeGromacsAdapter:
         return SubmittedCall(
             modal_call_id=f"fc-{len(self.submissions)}",
             run_name=run_name,
-            provider_operation=(
-                "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
-            ),
+            operation=("prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"),
         )
 
     async def cancel(self, modal_call_id: str) -> None:
@@ -1278,11 +1276,11 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         idempotency_key=str(uuid4()),
     )
     job_id = UUID(submitted.json()["job_id"])
-    store.record_provider_call_outcome(
+    store.record_operation_outcome(
         job_id,
-        provider_operation="prepare_tpr_cpu",
+        operation="prepare_tpr_cpu",
         expected_modal_call_id="fc-1",
-        outcome=JobProviderCallState.COMPLETED,
+        outcome=JobOperationState.COMPLETED,
         now=1_800_000_001,
     )
     operations = (
@@ -1290,18 +1288,18 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         ("collect_traj_stats:npt_", "fc-npt"),
         ("production_run_cpu", "fc-production"),
     )
-    for provider_operation, modal_call_id in operations:
+    for operation, modal_call_id in operations:
         token = uuid4().hex
-        claimed = store.claim_provider_operation(
+        claimed = store.claim_modal_operation(
             job_id,
-            provider_operation=provider_operation,
+            operation=operation,
             submission_token=token,
             now=1_800_000_001,
         )
         assert claimed is not None
-        store.attach_provider_call(
+        store.attach_modal_call(
             job_id,
-            provider_operation=provider_operation,
+            operation=operation,
             modal_call_id=modal_call_id,
             submission_token=token,
             now=1_800_000_001,
@@ -1330,7 +1328,7 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
     assert npt_analysis == analyzing.json()["active_stages"][1]
     assert production == analyzing.json()["active_stages"][2]
     assert "modal_call_id" not in analyzing.json()
-    assert "provider_operation" not in analyzing.json()
+    assert "operation" not in analyzing.json()
 
     store.fail_job(
         job_id,
@@ -1355,11 +1353,11 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         idempotency_key=str(uuid4()),
     )
     packaging_job_id = UUID(submitted_packaging.json()["job_id"])
-    store.record_provider_call_outcome(
+    store.record_operation_outcome(
         packaging_job_id,
-        provider_operation="prepare_tpr_cpu",
+        operation="prepare_tpr_cpu",
         expected_modal_call_id="fc-2",
-        outcome=JobProviderCallState.COMPLETED,
+        outcome=JobOperationState.COMPLETED,
         now=1_800_000_003,
     )
     store.set_job_state(
@@ -1500,7 +1498,7 @@ def test_unknown_spawn_outcome_is_not_retried(
     job = store.get_job(owner_id, UUID(replayed.json()["job_id"]))
     assert job is not None
     assert job.state == JobState.STATE_UNKNOWN
-    assert job.submission_lease_until is None
+    assert job.operations[0].submission_lease_until is None
 
 
 def test_admin_can_resolve_state_unknown_after_manual_provider_review(
@@ -1715,28 +1713,28 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     )
     job_id = submitted.json()["job_id"]
     parsed_job_id = UUID(job_id)
-    store.record_provider_call_outcome(
+    store.record_operation_outcome(
         parsed_job_id,
-        provider_operation="prepare_tpr_cpu",
+        operation="prepare_tpr_cpu",
         expected_modal_call_id="fc-1",
-        outcome=JobProviderCallState.COMPLETED,
+        outcome=JobOperationState.COMPLETED,
         now=1_799_999_999,
     )
-    for provider_operation, modal_call_id in (
+    for operation, modal_call_id in (
         ("collect_traj_stats:nvt_", "fc-nvt"),
         ("collect_traj_stats:npt_", "fc-npt"),
         ("production_run_cpu", "fc-production"),
     ):
         token = uuid4().hex
-        store.claim_provider_operation(
+        store.claim_modal_operation(
             parsed_job_id,
-            provider_operation=provider_operation,
+            operation=operation,
             submission_token=token,
             now=1_799_999_999,
         )
-        store.attach_provider_call(
+        store.attach_modal_call(
             parsed_job_id,
-            provider_operation=provider_operation,
+            operation=operation,
             modal_call_id=modal_call_id,
             submission_token=token,
             now=1_799_999_999,
@@ -1760,11 +1758,11 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     assert replay.status_code == 202
     assert replay.json()["state"] == "cancel_requested"
     assert adapter.cancellations == [
-        "fc-npt",
         "fc-nvt",
+        "fc-npt",
         "fc-production",
-        "fc-npt",
         "fc-nvt",
+        "fc-npt",
         "fc-production",
     ]
     assert old_delete_route.status_code == 405

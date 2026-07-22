@@ -158,21 +158,22 @@ Every list, inspect, cancel, and download lookup is constrained by both
 `404` as a missing job, before the server resolves any Modal identifier.
 Account administration does not grant access to employee jobs.
 
-The submit route persists the Job, spawns preparation, stores its Function name
-and call identifier internally, and returns `202`. SQLite keeps one durable
-provider-call row per directly submitted operation. When calls complete, the
-reconciler evaluates the fixed GROMACS dependencies and attaches every newly
-ready call. Several direct stages may therefore be active at once. Per-stage
-submission leases retain the existing restart and ambiguous-submission boundary
-without introducing a remote coordinator.
+The submit route persists the Job, leases preparation, spawns it, attaches its
+Modal call identifier to the leased operation, and returns `202`. SQLite keeps
+one ordered `job_operations` row per remote or local operation. Modal rows own
+their call identifier and submission lease; local Result packaging uses the
+same lifecycle without pretending to be a provider call. When calls complete,
+the reconciler evaluates the fixed GROMACS dependencies and attaches every
+newly ready call. Several direct stages may therefore be active at once.
 
 `JobView.active_stages` exposes every active sanitized stage code and deployed
 Function name. The singular `stage` remains as a compatibility summary of the
-most recently started active stage, or the relevant terminal stage. SQLite also
-retains an ordered `stage_history` timing record: a stage starts when its direct
-call is durably attached and ends when the reconciler records its observed
-terminal outcome. Parallel entries may have overlapping timestamps and may
-finish in a different order from their table rows. Each entry has `started_at`,
+most recently started active stage, or the relevant terminal stage. The API
+projects ordered `stage_history` entries from the operation ledger: a stage
+starts when its direct call is durably attached and ends when the reconciler
+records its observed terminal outcome. Parallel entries may have overlapping
+timestamps and may finish in a different order from their table rows. Each
+entry has `started_at`,
 nullable `ended_at`, and a nullable outcome of `completed`, `failed`, or
 `cancelled`; active, state-unknown, and blocked work has no end or outcome.
 Result packaging spans `finalizing` through archive publication. Modal call IDs,
@@ -282,13 +283,12 @@ action records a safe `compute_failed` terminal failure and releases admission
 capacity; it does not itself contact or cancel Modal. No automatic or owner
 transition leaves `state_unknown`.
 
-Initial submission uses a short SQLite lease and a stable run name made from a
+Initial submission uses an operation-scoped SQLite lease and a stable run name made from a
 sanitized display-name slug plus the full Job UUID, for example
 `kinase-trial-<job UUID without hyphens>`. The deployed GROMACS App uses that
 single value for both its Volume directory and scientific filenames, so the
 UUID suffix prevents repeated display names from silently reusing another
 Job's checkpoints. The API does not change the established App interface.
-Legacy `api-<job UUID>` names remain valid for stored Result recovery.
 
 An idempotent replay cannot create a second call while the lease is active. If
 the process dies after claiming the Job but before storing a Modal call ID,
@@ -557,14 +557,12 @@ Production uses the same factory and worker count behind the internal HTTPS
 reverse proxy. See the root README for the complete local setup and account
 provisioning example.
 
-The SQLite schema has one current pre-release version. Schema 10 has one narrow
-automatic migration to schema 11: it adds per-stage provider-call records and
-preserves all Users, Sessions, settings, Jobs, and stage history. Encountering
-any other version is a startup error: the service reports the configured
-database location and never truncates or deletes it automatically. During
-active development an Administrator may explicitly remove or relocate an
-unsupported database while the service is stopped, then restart to initialize
-a fresh schema. This reset policy ends at the first release.
+The SQLite schema has one current pre-release version. Encountering any other
+version is a startup error: the service reports the configured database
+location and never truncates, rewrites, or deletes it automatically. During
+active development an Administrator may explicitly migrate selected records or
+remove the unsupported database while the service is stopped, then restart to
+initialize a fresh schema. This reset policy ends at the first release.
 
 Pre-release and production service definitions select distinct
 `BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` values. Pre-release sets

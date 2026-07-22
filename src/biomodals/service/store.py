@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -90,8 +89,8 @@ class JobStateUnknownReason(StrEnum):
     CANCELLATION_OUTCOME_UNKNOWN = "cancellation_outcome_unknown"
 
 
-class JobProviderCallState(StrEnum):
-    """Durable state of one directly submitted provider operation."""
+class JobOperationState(StrEnum):
+    """Durable state of one operation used to advance a Job."""
 
     SUBMITTING = "submitting"
     RUNNING = "running"
@@ -99,6 +98,13 @@ class JobProviderCallState(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     STATE_UNKNOWN = "state_unknown"
+
+
+class JobOperationExecutor(StrEnum):
+    """Execution boundary responsible for one durable Job operation."""
+
+    MODAL = "modal"
+    LOCAL = "local"
 
 
 PROVIDER_TRACKED_JOB_STATES = (
@@ -116,11 +122,13 @@ TERMINAL_JOB_STATES = (
 )
 RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 11
-_JOB_PROVIDER_CALLS_TABLE_SQL = """
-CREATE TABLE job_provider_calls (
+_SERVICE_SCHEMA_VERSION = 1
+_JOB_OPERATIONS_TABLE_SQL = """
+CREATE TABLE job_operations (
     job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-    provider_operation TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    executor TEXT NOT NULL CHECK (executor IN ('modal', 'local')),
     modal_call_id TEXT UNIQUE,
     state TEXT NOT NULL CHECK (
         state IN (
@@ -132,11 +140,12 @@ CREATE TABLE job_provider_calls (
     submission_lease_until INTEGER,
     started_at INTEGER,
     completed_at INTEGER,
-    PRIMARY KEY (job_id, provider_operation)
+    PRIMARY KEY (job_id, operation),
+    UNIQUE (job_id, ordinal)
 )
 """
-_JOB_PROVIDER_CALLS_ACTIVE_INDEX_SQL = """
-CREATE INDEX job_provider_calls_active ON job_provider_calls(job_id, state)
+_JOB_OPERATIONS_ACTIVE_INDEX_SQL = """
+CREATE INDEX job_operations_active ON job_operations(job_id, state)
 """
 
 
@@ -202,12 +211,8 @@ class JobRecord:
     modal_environment: str
     modal_app_name: str
     modal_app_version: int
-    modal_call_id: str | None
-    provider_operation: str | None
     run_name: str | None
-    stage_history_json: str
-    submission_token: str | None
-    submission_lease_until: int | None
+    operations: tuple[JobOperationRecord, ...]
     result_volume_name: str | None
     result_volume_path: str | None
     result_filename: str | None
@@ -247,8 +252,26 @@ class JobRecord:
 
     @property
     def stage_history(self) -> list[JobStageRecord]:
-        """Decode the ordered stage transitions retained for this job."""
-        return _stage_history_from_json(self.stage_history_json)
+        """Project durable operations into the public timeline shape."""
+        history: list[JobStageRecord] = []
+        terminal_states = {
+            JobOperationState.COMPLETED,
+            JobOperationState.FAILED,
+            JobOperationState.CANCELLED,
+        }
+        for operation in self.operations:
+            if operation.started_at is None:
+                continue
+            terminal = operation.state in terminal_states
+            history.append(
+                JobStageRecord(
+                    operation=operation.operation,
+                    started_at=operation.started_at,
+                    completed_at=operation.completed_at if terminal else None,
+                    outcome=operation.state.value if terminal else None,
+                )
+            )
+        return history
 
     @property
     def modal_configuration(self) -> ModalConfigurationSnapshot:
@@ -280,20 +303,22 @@ class JobPageRecord:
 class JobStageRecord:
     """One durable workload operation and its observed timing."""
 
-    provider_operation: str
+    operation: str
     started_at: int
     completed_at: int | None
     outcome: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class JobProviderCallRecord:
-    """One durable direct provider call used to advance a Job graph."""
+class JobOperationRecord:
+    """One durable remote or local operation in a Job graph."""
 
     job_id: UUID
-    provider_operation: str
+    operation: str
+    ordinal: int
+    executor: JobOperationExecutor
     modal_call_id: str | None
-    state: JobProviderCallState
+    state: JobOperationState
     submission_token: str | None
     submission_lease_until: int | None
     started_at: int | None
@@ -325,121 +350,6 @@ class BlockedJobSummary:
     category: str
     count: int
     oldest_blocked_at: int
-
-
-def _stage_history_from_json(value: str) -> list[JobStageRecord]:
-    document = orjson.loads(value)
-    if not isinstance(document, list):
-        raise ValueError("stage_history_json must contain a JSON list")
-    history: list[JobStageRecord] = []
-    for item in document:
-        if not isinstance(item, dict) or set(item) != {
-            "provider_operation",
-            "started_at",
-            "completed_at",
-            "outcome",
-        }:
-            raise ValueError("stage_history_json contains an invalid stage")
-        provider_operation = item["provider_operation"]
-        started_at = item["started_at"]
-        completed_at = item["completed_at"]
-        outcome = item["outcome"]
-        if (
-            not isinstance(provider_operation, str)
-            or not provider_operation
-            or not isinstance(started_at, int)
-            or isinstance(started_at, bool)
-            or (
-                completed_at is not None
-                and (
-                    not isinstance(completed_at, int)
-                    or isinstance(completed_at, bool)
-                    or completed_at < started_at
-                )
-            )
-            or outcome not in {None, "completed", "failed", "cancelled"}
-            or (completed_at is None) != (outcome is None)
-        ):
-            raise ValueError("stage_history_json contains an invalid stage")
-        history.append(
-            JobStageRecord(
-                provider_operation=provider_operation,
-                started_at=started_at,
-                completed_at=completed_at,
-                outcome=outcome,
-            )
-        )
-    return history
-
-
-def _transition_stage_history_json(
-    value: str,
-    *,
-    now: int,
-    complete_operation: str | None = None,
-    complete_outcome: str = "completed",
-    start_operation: str | None = None,
-) -> str:
-    history = _stage_history_from_json(value)
-    if complete_operation is not None:
-        for index in range(len(history) - 1, -1, -1):
-            stage = history[index]
-            if (
-                stage.provider_operation == complete_operation
-                and stage.completed_at is None
-            ):
-                history[index] = JobStageRecord(
-                    provider_operation=stage.provider_operation,
-                    started_at=stage.started_at,
-                    completed_at=max(now, stage.started_at),
-                    outcome=complete_outcome,
-                )
-                break
-    if start_operation is not None and not (
-        history
-        and history[-1].provider_operation == start_operation
-        and history[-1].completed_at is None
-    ):
-        history.append(
-            JobStageRecord(
-                provider_operation=start_operation,
-                started_at=now,
-                completed_at=None,
-                outcome=None,
-            )
-        )
-    return orjson.dumps([
-        {
-            "provider_operation": stage.provider_operation,
-            "started_at": stage.started_at,
-            "completed_at": stage.completed_at,
-            "outcome": stage.outcome,
-        }
-        for stage in history
-    ]).decode()
-
-
-def _complete_open_stage_history_json(
-    value: str,
-    *,
-    now: int,
-    outcome: str,
-) -> str:
-    """Close every concurrently active stage with one terminal outcome."""
-    history = _stage_history_from_json(value)
-    return orjson.dumps([
-        {
-            "provider_operation": stage.provider_operation,
-            "started_at": stage.started_at,
-            "completed_at": (
-                max(now, stage.started_at)
-                if stage.completed_at is None
-                else stage.completed_at
-            ),
-            "outcome": outcome if stage.outcome is None else stage.outcome,
-        }
-        for stage in history
-    ]).decode()
 
 
 class ServiceStore:
@@ -520,12 +430,7 @@ class ServiceStore:
                         modal_app_name TEXT NOT NULL,
                         modal_app_version INTEGER NOT NULL
                             CHECK (modal_app_version >= 1),
-                        modal_call_id TEXT,
-                        provider_operation TEXT,
                         run_name TEXT,
-                        stage_history_json TEXT NOT NULL DEFAULT '[]',
-                        submission_token TEXT,
-                        submission_lease_until INTEGER,
                         result_volume_name TEXT,
                         result_volume_path TEXT,
                         result_filename TEXT,
@@ -567,8 +472,8 @@ class ServiceStore:
                     CREATE INDEX jobs_active
                         ON jobs(state, owner_user_id, workload);
 
-                    {_JOB_PROVIDER_CALLS_TABLE_SQL};
-                    {_JOB_PROVIDER_CALLS_ACTIVE_INDEX_SQL};
+                    {_JOB_OPERATIONS_TABLE_SQL};
+                    {_JOB_OPERATIONS_ACTIVE_INDEX_SQL};
 
                     CREATE TABLE service_settings (
                         key TEXT PRIMARY KEY,
@@ -674,7 +579,7 @@ class ServiceStore:
                 """,
                 (JobState.STATE_UNKNOWN.value,),
             ).fetchall()
-        return [_job_from_row(row) for row in rows]
+            return _jobs_from_rows(conn, rows)
 
     def set_result_cached(self, job_id: UUID, *, cached: bool) -> None:
         """Persist whether the rebuildable local archive is currently present."""
@@ -1317,7 +1222,10 @@ class ServiceStore:
             if user["status"] != UserStatus.ENABLED.value:
                 raise UserNotFoundError(f"Enabled User not found: {owner_user_id}")
             if existing is not None:
-                return JobAdmission(job=_job_from_row(existing), created=False)
+                return JobAdmission(
+                    job=_job_from_row_with_operations(conn, existing),
+                    created=False,
+                )
             user_active_job_limit = int(user["active_job_limit"])
 
             service_rows = conn.execute(
@@ -1417,20 +1325,9 @@ class ServiceStore:
                     job_id, owner_user_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json, state,
                     modal_environment, modal_app_name, modal_app_version,
-                    modal_call_id,
-                    provider_operation, run_name, submission_token,
-                    submission_lease_until, result_volume_name,
-                    result_volume_path, result_filename, result_size_bytes,
-                    result_sha256, warnings_json, error_code, error_message,
-                    created_at, updated_at, completed_at, cancel_requested_at,
-                    finalization_started_at, finalization_retry_started_at,
-                    finalization_retry_count, blocked_at, next_retry_at, blocking_category,
-                    result_previous_state, result_cached,
-                    intermediates_cleaned_at
+                    created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?,
-                    ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1453,7 +1350,8 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return JobAdmission(job=_job_from_row(row), created=True)
+            job = _job_from_row_with_operations(conn, row)
+        return JobAdmission(job=job, created=True)
 
     def get_job(self, owner_user_id: UUID, job_id: UUID) -> JobRecord | None:
         """Load a job only when it belongs to the requesting owner."""
@@ -1464,7 +1362,7 @@ class ServiceStore:
                 """,
                 (str(job_id), str(owner_user_id)),
             ).fetchone()
-        return _job_from_row(row) if row is not None else None
+            return _job_from_row_with_operations(conn, row) if row is not None else None
 
     def list_jobs(self, owner_user_id: UUID) -> list[JobRecord]:
         """List only one owner's jobs, newest first."""
@@ -1476,7 +1374,7 @@ class ServiceStore:
                 """,
                 (str(owner_user_id),),
             ).fetchall()
-        return [_job_from_row(row) for row in rows]
+            return _jobs_from_rows(conn, rows)
 
     def list_jobs_page(
         self,
@@ -1519,15 +1417,15 @@ class ServiceStore:
                 """,  # noqa: S608 - cursor clause is fixed service text
                 (*parameters, limit + 1),
             ).fetchall()
-        page_rows = rows[:limit]
-        return JobPageRecord(
-            jobs=[_job_from_row(row) for row in page_rows],
-            next_cursor=(
-                UUID(page_rows[-1]["job_id"])
-                if len(rows) > limit and page_rows
-                else None
-            ),
-        )
+            page_rows = rows[:limit]
+            return JobPageRecord(
+                jobs=_jobs_from_rows(conn, page_rows),
+                next_cursor=(
+                    UUID(page_rows[-1]["job_id"])
+                    if len(rows) > limit and page_rows
+                    else None
+                ),
+            )
 
     def count_active_jobs(self, workload: str | None = None) -> int:
         """Count Jobs that consume admission capacity."""
@@ -1569,7 +1467,7 @@ class ServiceStore:
                 """,  # noqa: S608 - placeholders are generated, not user input
                 parameters,
             ).fetchall()
-        return [_job_from_row(row) for row in rows]
+            return _jobs_from_rows(conn, rows)
 
     def list_intermediate_cleanup_candidates(
         self,
@@ -1596,7 +1494,7 @@ class ServiceStore:
                     completed_before,
                 ),
             ).fetchall()
-        return [_job_from_row(row) for row in rows]
+            return _jobs_from_rows(conn, rows)
 
     def mark_intermediates_cleaned(self, job_id: UUID, *, now: int) -> JobRecord:
         """Record successful removal without changing final artifact state."""
@@ -1621,231 +1519,66 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-        return _job_from_row(row)
+            return _job_from_row_with_operations(conn, row)
 
-    def claim_submission(
-        self,
-        job_id: UUID,
-        *,
-        run_name: str,
-        submission_token: str,
-        now: int,
-        lease_seconds: int = 120,
-    ) -> JobRecord | None:
-        """Lease one queued provider submission to a single request handler."""
-        if lease_seconds < 1:
-            raise ValueError("lease_seconds must be positive")
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE jobs
-                SET run_name = ?, submission_token = ?,
-                    submission_lease_until = ?, updated_at = ?
-                WHERE job_id = ?
-                  AND state = ?
-                  AND modal_call_id IS NULL
-                  AND (run_name IS NULL OR run_name = ?)
-                  AND submission_token IS NULL
-                  AND submission_lease_until IS NULL
-                """,
-                (
-                    run_name,
-                    submission_token,
-                    now + lease_seconds,
-                    now,
-                    str(job_id),
-                    JobState.QUEUED.value,
-                    run_name,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-        return _job_from_row(row)
-
-    def release_submission(
-        self,
-        job_id: UUID,
-        *,
-        submission_token: str,
-        now: int,
-    ) -> JobRecord:
-        """Release a failed submission attempt without losing the queued job."""
-        with self._transaction() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET submission_token = NULL, submission_lease_until = NULL,
-                    updated_at = ?
-                WHERE job_id = ? AND submission_token = ?
-                  AND modal_call_id IS NULL
-                """,
-                (now, str(job_id), submission_token),
-            )
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-        return _job_from_row(row)
-
-    def mark_submitted(
-        self,
-        job_id: UUID,
-        *,
-        modal_call_id: str,
-        provider_operation: str,
-        run_name: str,
-        submission_token: str | None = None,
-        now: int | None = None,
-    ) -> JobRecord:
-        """Attach provider identifiers after a successful asynchronous spawn."""
-        provider_operation = provider_operation.strip()
-        if not provider_operation:
-            raise ValueError("Provider operation must not be empty")
-        updated_at = int(time.time()) if now is None else now
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE jobs
-                SET modal_call_id = ?, provider_operation = ?, run_name = ?,
-                    submission_token = NULL, submission_lease_until = NULL,
-                    updated_at = ?
-                WHERE job_id = ?
-                  AND state IN (?, ?, ?, ?)
-                  AND modal_call_id IS NULL
-                  AND (run_name IS NULL OR run_name = ?)
-                  AND (? IS NULL OR submission_token = ?)
-                """,
-                (
-                    modal_call_id,
-                    provider_operation,
-                    run_name,
-                    updated_at,
-                    str(job_id),
-                    *(state.value for state in PROVIDER_TRACKED_JOB_STATES),
-                    run_name,
-                    submission_token,
-                    submission_token,
-                ),
-            )
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            if cursor.rowcount != 1 and (
-                row["modal_call_id"] != modal_call_id
-                or row["provider_operation"] != provider_operation
-                or row["run_name"] != run_name
-            ):
-                raise JobSubmissionConflictError(
-                    f"Submission lease is no longer valid for job {job_id}"
-                )
-            if cursor.rowcount == 1:
-                conn.execute(
-                    """
-                    INSERT INTO job_provider_calls (
-                        job_id, provider_operation, modal_call_id, state,
-                        submission_token, submission_lease_until,
-                        started_at, completed_at
-                    ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
-                    """,
-                    (
-                        str(job_id),
-                        provider_operation,
-                        modal_call_id,
-                        JobProviderCallState.RUNNING.value,
-                        updated_at,
-                    ),
-                )
-                history_json = _transition_stage_history_json(
-                    str(row["stage_history_json"]),
-                    now=updated_at,
-                    start_operation=provider_operation,
-                )
-                conn.execute(
-                    "UPDATE jobs SET stage_history_json = ? WHERE job_id = ?",
-                    (history_json, str(job_id)),
-                )
-                row = conn.execute(
-                    "SELECT * FROM jobs WHERE job_id = ?",
-                    (str(job_id),),
-                ).fetchone()
-            else:
-                provider_call = conn.execute(
-                    """
-                    SELECT * FROM job_provider_calls
-                    WHERE job_id = ? AND provider_operation = ?
-                    """,
-                    (str(job_id), provider_operation),
-                ).fetchone()
-                if (
-                    provider_call is None
-                    or provider_call["modal_call_id"] != modal_call_id
-                ):
-                    raise JobSubmissionConflictError(
-                        f"Provider call is not attached to job {job_id}"
-                    )
-        return _job_from_row(row)
-
-    def list_provider_calls(self, job_id: UUID) -> list[JobProviderCallRecord]:
-        """List every direct provider operation attached to one Job."""
+    def list_operations(self, job_id: UUID) -> list[JobOperationRecord]:
+        """List every durable remote or local operation for one Job."""
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT * FROM job_provider_calls
+                SELECT * FROM job_operations
                 WHERE job_id = ?
-                ORDER BY COALESCE(started_at, 9223372036854775807),
-                         provider_operation
+                ORDER BY ordinal
                 """,
                 (str(job_id),),
             ).fetchall()
-        return [_provider_call_from_row(row) for row in rows]
+            return [_operation_from_row(row) for row in rows]
 
-    def claim_provider_operation(
+    def claim_modal_operation(
         self,
         job_id: UUID,
         *,
-        provider_operation: str,
+        operation: str,
         submission_token: str,
         now: int,
+        run_name: str | None = None,
         lease_seconds: int = 120,
-    ) -> JobProviderCallRecord | None:
-        """Lease one not-yet-started operation in a durable Job graph."""
-        provider_operation = provider_operation.strip()
-        if not provider_operation:
-            raise ValueError("Provider operation must not be empty")
+    ) -> JobOperationRecord | None:
+        """Lease one not-yet-started Modal operation exactly once."""
+        operation = operation.strip()
+        if not operation:
+            raise ValueError("Job operation must not be empty")
         if not submission_token:
             raise ValueError("Submission token must not be empty")
+        if run_name is not None and not run_name.strip():
+            raise ValueError("Run name must not be empty")
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
         with self._transaction() as conn:
             job = conn.execute(
-                "SELECT state FROM jobs WHERE job_id = ?",
+                "SELECT state, run_name FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
             if job is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if JobState(job["state"]) not in {JobState.QUEUED, JobState.RUNNING}:
                 return None
+            if run_name is not None and job["run_name"] not in {None, run_name}:
+                return None
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO job_provider_calls (
-                    job_id, provider_operation, modal_call_id, state,
+                INSERT OR IGNORE INTO job_operations (
+                    job_id, operation, ordinal, executor, modal_call_id, state,
                     submission_token, submission_lease_until,
                     started_at, completed_at
-                ) VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL)
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL)
                 """,
                 (
                     str(job_id),
-                    provider_operation,
-                    JobProviderCallState.SUBMITTING.value,
+                    operation,
+                    _next_operation_ordinal(conn, job_id),
+                    JobOperationExecutor.MODAL.value,
+                    JobOperationState.SUBMITTING.value,
                     submission_token,
                     now + lease_seconds,
                 ),
@@ -1853,38 +1586,42 @@ class ServiceStore:
             if cursor.rowcount != 1:
                 return None
             conn.execute(
-                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
-                (now, str(job_id)),
+                """
+                UPDATE jobs
+                SET run_name = COALESCE(run_name, ?), updated_at = ?
+                WHERE job_id = ?
+                """,
+                (run_name, now, str(job_id)),
             )
             row = conn.execute(
                 """
-                SELECT * FROM job_provider_calls
-                WHERE job_id = ? AND provider_operation = ?
+                SELECT * FROM job_operations
+                WHERE job_id = ? AND operation = ?
                 """,
-                (str(job_id), provider_operation),
+                (str(job_id), operation),
             ).fetchone()
-        return _provider_call_from_row(row)
+            return _operation_from_row(row)
 
-    def release_provider_operation(
+    def release_operation(
         self,
         job_id: UUID,
         *,
-        provider_operation: str,
+        operation: str,
         submission_token: str,
         now: int,
     ) -> JobRecord:
-        """Release a stage claim known not to have started remote work."""
+        """Release a claim known not to have started remote work."""
         with self._transaction() as conn:
             cursor = conn.execute(
                 """
-                DELETE FROM job_provider_calls
-                WHERE job_id = ? AND provider_operation = ?
+                DELETE FROM job_operations
+                WHERE job_id = ? AND operation = ?
                   AND state = ? AND submission_token = ?
                 """,
                 (
                     str(job_id),
-                    provider_operation,
-                    JobProviderCallState.SUBMITTING.value,
+                    operation,
+                    JobOperationState.SUBMITTING.value,
                     submission_token,
                 ),
             )
@@ -1899,41 +1636,41 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-        return _job_from_row(row)
+            return _job_from_row_with_operations(conn, row)
 
-    def attach_provider_call(
+    def attach_modal_call(
         self,
         job_id: UUID,
         *,
-        provider_operation: str,
+        operation: str,
         modal_call_id: str,
         submission_token: str,
         now: int,
     ) -> JobRecord:
-        """Attach a detached provider call to its leased graph operation."""
+        """Attach a detached Modal call to its leased Job operation."""
         with self._transaction() as conn:
             try:
                 cursor = conn.execute(
                     """
-                    UPDATE job_provider_calls
+                    UPDATE job_operations
                     SET modal_call_id = ?, state = ?, submission_token = NULL,
                         submission_lease_until = NULL, started_at = ?
-                    WHERE job_id = ? AND provider_operation = ?
+                    WHERE job_id = ? AND operation = ?
                       AND state = ? AND submission_token = ?
                     """,
                     (
                         modal_call_id,
-                        JobProviderCallState.RUNNING.value,
+                        JobOperationState.RUNNING.value,
                         now,
                         str(job_id),
-                        provider_operation,
-                        JobProviderCallState.SUBMITTING.value,
+                        operation,
+                        JobOperationState.SUBMITTING.value,
                         submission_token,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise JobSubmissionConflictError(
-                    f"Provider call is already attached for job {job_id}"
+                    f"Modal call is already attached for job {job_id}"
                 ) from exc
             job = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1943,49 +1680,41 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if cursor.rowcount != 1:
                 raise JobSubmissionConflictError(
-                    f"Provider operation changed concurrently for job {job_id}"
+                    f"Job operation changed concurrently for job {job_id}"
                 )
-            history_json = _transition_stage_history_json(
-                str(job["stage_history_json"]),
-                now=now,
-                start_operation=provider_operation,
-            )
             conn.execute(
-                """
-                UPDATE jobs SET stage_history_json = ?, updated_at = ?
-                WHERE job_id = ?
-                """,
-                (history_json, now, str(job_id)),
+                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
+                (now, str(job_id)),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
-    def record_provider_call_outcome(
+    def record_operation_outcome(
         self,
         job_id: UUID,
         *,
-        provider_operation: str,
+        operation: str,
         expected_modal_call_id: str,
-        outcome: JobProviderCallState,
+        outcome: JobOperationState,
         now: int,
     ) -> JobRecord | None:
-        """Record one observed terminal provider outcome exactly once."""
+        """Record one observed terminal operation outcome exactly once."""
         if outcome not in {
-            JobProviderCallState.COMPLETED,
-            JobProviderCallState.FAILED,
-            JobProviderCallState.CANCELLED,
+            JobOperationState.COMPLETED,
+            JobOperationState.FAILED,
+            JobOperationState.CANCELLED,
         }:
-            raise ValueError("Provider call outcome must be terminal")
+            raise ValueError("Job operation outcome must be terminal")
         with self._transaction() as conn:
             call = conn.execute(
                 """
-                SELECT * FROM job_provider_calls
-                WHERE job_id = ? AND provider_operation = ?
+                SELECT * FROM job_operations
+                WHERE job_id = ? AND operation = ?
                 """,
-                (str(job_id), provider_operation),
+                (str(job_id), operation),
             ).fetchone()
             job = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1996,51 +1725,42 @@ class ServiceStore:
             if call is None or call["modal_call_id"] != expected_modal_call_id:
                 return None
             if call["state"] == outcome.value:
-                return _job_from_row(job)
-            if call["state"] != JobProviderCallState.RUNNING.value:
+                return _job_from_row_with_operations(conn, job)
+            if call["state"] != JobOperationState.RUNNING.value:
                 return None
             cursor = conn.execute(
                 """
-                UPDATE job_provider_calls
+                UPDATE job_operations
                 SET state = ?, completed_at = ?
-                WHERE job_id = ? AND provider_operation = ?
+                WHERE job_id = ? AND operation = ?
                   AND modal_call_id = ? AND state = ?
                 """,
                 (
                     outcome.value,
                     now,
                     str(job_id),
-                    provider_operation,
+                    operation,
                     expected_modal_call_id,
-                    JobProviderCallState.RUNNING.value,
+                    JobOperationState.RUNNING.value,
                 ),
             )
             if cursor.rowcount != 1:
                 return None
-            history_json = _transition_stage_history_json(
-                str(job["stage_history_json"]),
-                now=now,
-                complete_operation=provider_operation,
-                complete_outcome=outcome.value,
-            )
             conn.execute(
-                """
-                UPDATE jobs SET stage_history_json = ?, updated_at = ?
-                WHERE job_id = ?
-                """,
-                (history_json, now, str(job_id)),
+                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
+                (now, str(job_id)),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
-    def record_provider_submission_failure(
+    def record_operation_submission_failure(
         self,
         job_id: UUID,
         *,
-        provider_operation: str,
+        operation: str,
         submission_token: str,
         now: int,
     ) -> JobRecord | None:
@@ -2048,19 +1768,19 @@ class ServiceStore:
         with self._transaction() as conn:
             cursor = conn.execute(
                 """
-                UPDATE job_provider_calls
+                UPDATE job_operations
                 SET state = ?, submission_token = NULL,
                     submission_lease_until = NULL, started_at = ?, completed_at = ?
-                WHERE job_id = ? AND provider_operation = ?
+                WHERE job_id = ? AND operation = ?
                   AND state = ? AND submission_token = ?
                 """,
                 (
-                    JobProviderCallState.FAILED.value,
+                    JobOperationState.FAILED.value,
                     now,
                     now,
                     str(job_id),
-                    provider_operation,
-                    JobProviderCallState.SUBMITTING.value,
+                    operation,
+                    JobOperationState.SUBMITTING.value,
                     submission_token,
                 ),
             )
@@ -2072,29 +1792,15 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if cursor.rowcount != 1:
                 return None
-            history_json = _transition_stage_history_json(
-                str(job["stage_history_json"]),
-                now=now,
-                start_operation=provider_operation,
-            )
-            history_json = _transition_stage_history_json(
-                history_json,
-                now=now,
-                complete_operation=provider_operation,
-                complete_outcome=JobProviderCallState.FAILED.value,
-            )
             conn.execute(
-                """
-                UPDATE jobs SET stage_history_json = ?, updated_at = ?
-                WHERE job_id = ?
-                """,
-                (history_json, now, str(job_id)),
+                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
+                (now, str(job_id)),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
     def request_cancel(
         self,
@@ -2115,7 +1821,7 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             state = JobState(row["state"])
             if state == JobState.CANCEL_REQUESTED:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if state not in (JobState.QUEUED, JobState.RUNNING):
                 raise JobNotCancellableError(f"Job is already {state.value}")
             conn.execute(
@@ -2130,7 +1836,7 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
     def set_job_state(
         self,
@@ -2157,55 +1863,59 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             current_state = JobState(row["state"])
             if current_state in TERMINAL_JOB_STATES:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if (
                 current_state == JobState.CANCEL_REQUESTED
                 and state not in TERMINAL_JOB_STATES
             ):
-                return _job_from_row(row)
-            history_json = str(row["stage_history_json"])
+                return _job_from_row_with_operations(conn, row)
             finalization_started_at = row["finalization_started_at"]
             if state == JobState.FINALIZING:
-                history_json = _transition_stage_history_json(
-                    history_json,
-                    now=now,
-                    start_operation="result_packaging",
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO job_operations (
+                        job_id, operation, ordinal, executor, modal_call_id, state,
+                        submission_token, submission_lease_until,
+                        started_at, completed_at
+                    ) VALUES (?, 'result_packaging', ?, ?, NULL, ?, NULL, NULL, ?, NULL)
+                    """,
+                    (
+                        str(job_id),
+                        _next_operation_ordinal(conn, job_id),
+                        JobOperationExecutor.LOCAL.value,
+                        JobOperationState.RUNNING.value,
+                        now,
+                    ),
                 )
                 finalization_started_at = finalization_started_at or now
             elif state == JobState.CANCELLED:
-                history_json = _complete_open_stage_history_json(
-                    history_json,
-                    now=now,
-                    outcome=JobProviderCallState.CANCELLED.value,
-                )
                 conn.execute(
                     """
-                    UPDATE job_provider_calls
+                    UPDATE job_operations
                     SET state = ?, submission_token = NULL,
                         submission_lease_until = NULL,
                         completed_at = COALESCE(completed_at, ?)
                     WHERE job_id = ? AND state IN (?, ?)
                     """,
                     (
-                        JobProviderCallState.CANCELLED.value,
+                        JobOperationState.CANCELLED.value,
                         now,
                         str(job_id),
-                        JobProviderCallState.SUBMITTING.value,
-                        JobProviderCallState.RUNNING.value,
+                        JobOperationState.SUBMITTING.value,
+                        JobOperationState.RUNNING.value,
                     ),
                 )
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, stage_history_json = ?, updated_at = ?,
-                    completed_at = ?, finalization_started_at = ?
+                SET state = ?, updated_at = ?, completed_at = ?,
+                    finalization_started_at = ?
                 WHERE job_id = ?
                 """,
                 (
                     state.value,
-                    history_json,
                     now,
                     now if state in TERMINAL_JOB_STATES else None,
                     finalization_started_at,
@@ -2216,7 +1926,7 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(row)
+            return _job_from_row_with_operations(conn, row)
 
     def mark_state_unknown(
         self,
@@ -2235,14 +1945,13 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             current_state = JobState(row["state"])
             if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if current_state not in PROVIDER_TRACKED_JOB_STATES:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             conn.execute(
                 """
                 UPDATE jobs
                 SET state = ?, state_unknown_at = ?, state_unknown_reason = ?,
-                    submission_token = NULL, submission_lease_until = NULL,
                     updated_at = ?
                 WHERE job_id = ?
                 """,
@@ -2256,22 +1965,22 @@ class ServiceStore:
             )
             conn.execute(
                 """
-                UPDATE job_provider_calls
+                UPDATE job_operations
                 SET state = ?, submission_token = NULL,
                     submission_lease_until = NULL
                 WHERE job_id = ? AND state = ?
                 """,
                 (
-                    JobProviderCallState.STATE_UNKNOWN.value,
+                    JobOperationState.STATE_UNKNOWN.value,
                     str(job_id),
-                    JobProviderCallState.SUBMITTING.value,
+                    JobOperationState.SUBMITTING.value,
                 ),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
     def resolve_state_unknown(self, job_id: UUID, *, now: int) -> JobRecord:
         """Mark one manually reviewed state-unknown Job as failed."""
@@ -2287,40 +1996,34 @@ class ServiceStore:
                 raise JobStateResolutionError(
                     f"Job is {current_state.value}, not state_unknown"
                 )
-            history_json = _complete_open_stage_history_json(
-                str(row["stage_history_json"]),
-                now=now,
-                outcome=JobProviderCallState.FAILED.value,
-            )
             conn.execute(
                 """
-                UPDATE job_provider_calls
+                UPDATE job_operations
                 SET state = ?, submission_token = NULL,
                     submission_lease_until = NULL,
                     completed_at = COALESCE(completed_at, ?)
                 WHERE job_id = ? AND state IN (?, ?, ?)
                 """,
                 (
-                    JobProviderCallState.FAILED.value,
+                    JobOperationState.FAILED.value,
                     now,
                     str(job_id),
-                    JobProviderCallState.SUBMITTING.value,
-                    JobProviderCallState.RUNNING.value,
-                    JobProviderCallState.STATE_UNKNOWN.value,
+                    JobOperationState.SUBMITTING.value,
+                    JobOperationState.RUNNING.value,
+                    JobOperationState.STATE_UNKNOWN.value,
                 ),
             )
             conn.execute(
                 """
                 UPDATE jobs
                 SET state = ?, error_code = ?, error_message = ?,
-                    stage_history_json = ?, updated_at = ?, completed_at = ?
+                    updated_at = ?, completed_at = ?
                 WHERE job_id = ? AND state = ?
                 """,
                 (
                     JobState.FAILED.value,
                     "compute_failed",
                     "An administrator could not confirm the remote compute state.",
-                    history_json,
                     now,
                     now,
                     str(job_id),
@@ -2331,7 +2034,7 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
     def schedule_finalization_retry(
         self,
@@ -2372,7 +2075,7 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-        return _job_from_row(row)
+            return _job_from_row_with_operations(conn, row)
 
     def block_job(
         self,
@@ -2395,9 +2098,9 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             current_state = JobState(row["state"])
             if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if current_state in {JobState.FAILED, JobState.CANCELLED}:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if current_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
                 if previous_state != current_state:
                     raise ValueError(
@@ -2428,7 +2131,7 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-        return _job_from_row(row)
+            return _job_from_row_with_operations(conn, row)
 
     def complete_job(
         self,
@@ -2462,7 +2165,7 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             current_state = JobState(row["state"])
             if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row(row)
+                return _job_from_row_with_operations(conn, row)
             if current_state in (JobState.SUCCEEDED, JobState.PARTIAL):
                 if result_cached and not bool(row["result_cached"]):
                     conn.execute(
@@ -2473,37 +2176,47 @@ class ServiceStore:
                         "SELECT * FROM jobs WHERE job_id = ?",
                         (str(job_id),),
                     ).fetchone()
-                return _job_from_row(row)
-            history_json = _complete_open_stage_history_json(
-                str(row["stage_history_json"]),
-                now=now,
-                outcome=JobProviderCallState.COMPLETED.value,
-            )
+                return _job_from_row_with_operations(conn, row)
             conn.execute(
                 """
-                UPDATE job_provider_calls
+                UPDATE job_operations
                 SET state = ?, submission_token = NULL,
                     submission_lease_until = NULL,
+                    started_at = COALESCE(started_at, ?),
                     completed_at = COALESCE(completed_at, ?)
                 WHERE job_id = ? AND state IN (?, ?)
                 """,
                 (
-                    JobProviderCallState.COMPLETED.value,
+                    JobOperationState.COMPLETED.value,
+                    now,
                     now,
                     str(job_id),
-                    JobProviderCallState.SUBMITTING.value,
-                    JobProviderCallState.RUNNING.value,
+                    JobOperationState.SUBMITTING.value,
+                    JobOperationState.RUNNING.value,
                 ),
             )
-            history_json = _transition_stage_history_json(
-                history_json,
-                now=now,
-                start_operation="result_packaging",
-            )
-            history_json = _transition_stage_history_json(
-                history_json,
-                now=now,
-                complete_operation="result_packaging",
+            conn.execute(
+                """
+                INSERT INTO job_operations (
+                    job_id, operation, ordinal, executor, modal_call_id, state,
+                    submission_token, submission_lease_until,
+                    started_at, completed_at
+                ) VALUES (?, 'result_packaging', ?, ?, NULL, ?, NULL, NULL, ?, ?)
+                ON CONFLICT(job_id, operation) DO UPDATE SET
+                    state = excluded.state,
+                    submission_token = NULL,
+                    submission_lease_until = NULL,
+                    started_at = COALESCE(job_operations.started_at, excluded.started_at),
+                    completed_at = excluded.completed_at
+                """,
+                (
+                    str(job_id),
+                    _next_operation_ordinal(conn, job_id),
+                    JobOperationExecutor.LOCAL.value,
+                    JobOperationState.COMPLETED.value,
+                    row["finalization_started_at"] or now,
+                    now,
+                ),
             )
             conn.execute(
                 """
@@ -2512,7 +2225,7 @@ class ServiceStore:
                     result_filename = ?, result_size_bytes = ?,
                     result_sha256 = ?, result_archive_schema_version = ?,
                     warnings_json = ?, error_code = NULL,
-                    error_message = NULL, stage_history_json = ?, updated_at = ?,
+                    error_message = NULL, updated_at = ?,
                     completed_at = COALESCE(completed_at, ?), blocked_at = NULL,
                     next_retry_at = NULL,
                     blocking_category = NULL, result_previous_state = NULL,
@@ -2528,7 +2241,6 @@ class ServiceStore:
                     result_sha256,
                     result_archive_schema_version,
                     warnings_json,
-                    history_json,
                     now,
                     now,
                     int(result_cached),
@@ -2539,7 +2251,7 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
     def fail_job(
         self,
@@ -2561,42 +2273,35 @@ class ServiceStore:
                 *TERMINAL_JOB_STATES,
                 JobState.STATE_UNKNOWN,
             ):
-                return _job_from_row(row)
-            history_json = _complete_open_stage_history_json(
-                str(row["stage_history_json"]),
-                now=now,
-                outcome=JobProviderCallState.FAILED.value,
-            )
+                return _job_from_row_with_operations(conn, row)
             conn.execute(
                 """
-                UPDATE job_provider_calls
+                UPDATE job_operations
                 SET state = ?, submission_token = NULL,
                     submission_lease_until = NULL,
                     completed_at = COALESCE(completed_at, ?)
                 WHERE job_id = ? AND state IN (?, ?, ?)
                 """,
                 (
-                    JobProviderCallState.FAILED.value,
+                    JobOperationState.FAILED.value,
                     now,
                     str(job_id),
-                    JobProviderCallState.SUBMITTING.value,
-                    JobProviderCallState.RUNNING.value,
-                    JobProviderCallState.STATE_UNKNOWN.value,
+                    JobOperationState.SUBMITTING.value,
+                    JobOperationState.RUNNING.value,
+                    JobOperationState.STATE_UNKNOWN.value,
                 ),
             )
             conn.execute(
                 """
                 UPDATE jobs
                 SET state = ?, error_code = ?, error_message = ?,
-                    submission_token = NULL, submission_lease_until = NULL,
-                    stage_history_json = ?, updated_at = ?, completed_at = ?
+                    updated_at = ?, completed_at = ?
                 WHERE job_id = ?
                 """,
                 (
                     JobState.FAILED.value,
                     error_code,
                     error_message,
-                    history_json,
                     now,
                     now,
                     str(job_id),
@@ -2606,7 +2311,7 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-        return _job_from_row(updated)
+            return _job_from_row_with_operations(conn, updated)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -2646,12 +2351,14 @@ def _user_from_row(row: sqlite3.Row) -> UserRecord:
     )
 
 
-def _provider_call_from_row(row: sqlite3.Row) -> JobProviderCallRecord:
-    return JobProviderCallRecord(
+def _operation_from_row(row: sqlite3.Row) -> JobOperationRecord:
+    return JobOperationRecord(
         job_id=UUID(row["job_id"]),
-        provider_operation=str(row["provider_operation"]),
+        operation=str(row["operation"]),
+        ordinal=int(row["ordinal"]),
+        executor=JobOperationExecutor(row["executor"]),
         modal_call_id=row["modal_call_id"],
-        state=JobProviderCallState(row["state"]),
+        state=JobOperationState(row["state"]),
         submission_token=row["submission_token"],
         submission_lease_until=row["submission_lease_until"],
         started_at=row["started_at"],
@@ -2659,7 +2366,49 @@ def _provider_call_from_row(row: sqlite3.Row) -> JobProviderCallRecord:
     )
 
 
-def _job_from_row(row: sqlite3.Row) -> JobRecord:
+def _next_operation_ordinal(conn: sqlite3.Connection, job_id: UUID) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM job_operations WHERE job_id = ?",
+        (str(job_id),),
+    ).fetchone()
+    return int(row[0])
+
+
+def _jobs_from_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> list[JobRecord]:
+    if not rows:
+        return []
+    job_ids = [str(row["job_id"]) for row in rows]
+    placeholders = ", ".join("?" for _ in job_ids)
+    operation_rows = conn.execute(
+        f"""
+        SELECT * FROM job_operations
+        WHERE job_id IN ({placeholders})
+        ORDER BY job_id, ordinal
+        """,  # noqa: S608 - placeholders are generated, not user input
+        job_ids,
+    ).fetchall()
+    operations: dict[str, list[JobOperationRecord]] = {job_id: [] for job_id in job_ids}
+    for operation_row in operation_rows:
+        operations[str(operation_row["job_id"])].append(
+            _operation_from_row(operation_row)
+        )
+    return [_job_from_row(row, tuple(operations[str(row["job_id"])])) for row in rows]
+
+
+def _job_from_row_with_operations(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> JobRecord:
+    return _jobs_from_rows(conn, [row])[0]
+
+
+def _job_from_row(
+    row: sqlite3.Row,
+    operations: tuple[JobOperationRecord, ...],
+) -> JobRecord:
     return JobRecord(
         job_id=UUID(row["job_id"]),
         owner_user_id=UUID(row["owner_user_id"]),
@@ -2672,12 +2421,8 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         modal_environment=str(row["modal_environment"]),
         modal_app_name=str(row["modal_app_name"]),
         modal_app_version=int(row["modal_app_version"]),
-        modal_call_id=row["modal_call_id"],
-        provider_operation=row["provider_operation"],
         run_name=row["run_name"],
-        stage_history_json=str(row["stage_history_json"]),
-        submission_token=row["submission_token"],
-        submission_lease_until=row["submission_lease_until"],
+        operations=operations,
         result_volume_name=row["result_volume_name"],
         result_volume_path=row["result_volume_path"],
         result_filename=row["result_filename"],

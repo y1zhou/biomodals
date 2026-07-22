@@ -40,7 +40,7 @@ from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
 )
 from biomodals.service.store import (
-    JobProviderCallState,
+    JobOperationState,
     JobRecord,
     JobState,
     JobSubmissionConflictError,
@@ -347,11 +347,38 @@ def _adapter(
     )
 
 
+def _attach_modal_operation(
+    store: ServiceStore,
+    job_id: UUID,
+    *,
+    operation: str,
+    modal_call_id: str,
+    now: int,
+    run_name: str | None = None,
+) -> JobRecord:
+    token = f"setup-{operation}"
+    claimed = store.claim_modal_operation(
+        job_id,
+        operation=operation,
+        submission_token=token,
+        run_name=run_name,
+        now=now,
+    )
+    assert claimed is not None
+    return store.attach_modal_call(
+        job_id,
+        operation=operation,
+        modal_call_id=modal_call_id,
+        submission_token=token,
+        now=now,
+    )
+
+
 def _submitted_job(
     tmp_path: Path,
     *,
     cancel_requested: bool = False,
-    provider_operation: str = "prepare_tpr_gpu",
+    operation: str = "prepare_tpr_gpu",
 ) -> tuple[ServiceStore, JobRecord]:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
@@ -376,28 +403,31 @@ def _submitted_job(
         configuration=_admission_configuration(),
         now=2,
     )
-    if provider_operation == "prepare_tpr_gpu":
-        job = store.mark_submitted(
+    if operation == "prepare_tpr_gpu":
+        job = _attach_modal_operation(
+            store,
             admission.job.job_id,
             modal_call_id="fc-root",
-            provider_operation=provider_operation,
+            operation=operation,
             run_name=RUN_NAME,
             now=3,
         )
         now = 3
     else:
-        job = store.mark_submitted(
+        target_operation = operation
+        job = _attach_modal_operation(
+            store,
             admission.job.job_id,
             modal_call_id="fc-prepare",
-            provider_operation="prepare_tpr_gpu",
+            operation="prepare_tpr_gpu",
             run_name=RUN_NAME,
             now=3,
         )
-        store.record_provider_call_outcome(
+        store.record_operation_outcome(
             job.job_id,
-            provider_operation="prepare_tpr_gpu",
+            operation="prepare_tpr_gpu",
             expected_modal_call_id="fc-prepare",
-            outcome=JobProviderCallState.COMPLETED,
+            outcome=JobOperationState.COMPLETED,
             now=4,
         )
         now = 5
@@ -407,33 +437,25 @@ def _submitted_job(
             "production_run_gpu",
             "collect_traj_stats:production_",
         ]
-        for operation in operations:
-            operation_now = 7 if operation == "collect_traj_stats:production_" else 5
-            token = f"setup-{operation}"
-            claimed = store.claim_provider_operation(
-                job.job_id,
-                provider_operation=operation,
-                submission_token=token,
-                now=operation_now,
-            )
-            assert claimed is not None
+        for candidate in operations:
+            operation_now = 7 if candidate == "collect_traj_stats:production_" else 5
             modal_call_id = (
-                "fc-root" if operation == provider_operation else f"fc-{operation}"
+                "fc-root" if candidate == target_operation else f"fc-{candidate}"
             )
-            job = store.attach_provider_call(
+            job = _attach_modal_operation(
+                store,
                 job.job_id,
-                provider_operation=operation,
+                operation=candidate,
                 modal_call_id=modal_call_id,
-                submission_token=token,
                 now=operation_now,
             )
-            if operation == provider_operation:
+            if candidate == target_operation:
                 break
-            store.record_provider_call_outcome(
+            store.record_operation_outcome(
                 job.job_id,
-                provider_operation=operation,
+                operation=candidate,
                 expected_modal_call_id=modal_call_id,
-                outcome=JobProviderCallState.COMPLETED,
+                outcome=JobOperationState.COMPLETED,
                 now=6,
             )
         now = 7
@@ -459,10 +481,11 @@ def _terminal_job(
         configuration=_admission_configuration(),
         now=completed_at - 2,
     )
-    job = store.mark_submitted(
+    job = _attach_modal_operation(
+        store,
         admission.job.job_id,
         modal_call_id=f"fc-{run_name}",
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
         run_name=run_name,
         now=completed_at - 1,
     )
@@ -529,7 +552,7 @@ def test_submit_resolves_the_deployed_prepare_function_directly(
         ("GromacsAPI", "prepare_tpr_cpu", "department-dev", 17),
     ]
     assert submitted.modal_call_id == "fc-prepare"
-    assert submitted.provider_operation == "prepare_tpr_cpu"
+    assert submitted.operation == "prepare_tpr_cpu"
     assert function.spawn_kwargs == {
         "pdb_content": b"PDB content",
         "run_name": RUN_NAME,
@@ -706,7 +729,7 @@ def test_submit_operation_resolves_each_deployed_stage_by_name(tmp_path: Path) -
     )
     for operation in operations:
         submitted = asyncio.run(adapter.submit_operation(job, operation))
-        assert submitted.provider_operation == operation
+        assert submitted.operation == operation
 
     assert [function_name for _, function_name, _, _ in lookups] == [
         "collect_traj_stats",
@@ -825,7 +848,7 @@ def test_service_packages_and_publishes_established_app_outputs(
 ) -> None:
     _store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     files = _established_output_files()
     _install_volume(monkeypatch, files)
@@ -850,7 +873,7 @@ def test_published_archive_is_promoted_into_the_local_cache(
 ) -> None:
     _store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     files = _established_output_files()
     _install_volume(monkeypatch, files)
@@ -903,12 +926,12 @@ def test_reconciler_fans_out_after_preparation(
     advanced = store.get_job(job.owner_user_id, job.job_id)
     assert advanced is not None
     assert [
-        (call.provider_operation, call.modal_call_id)
-        for call in store.list_provider_calls(job.job_id)
+        (call.operation, call.modal_call_id)
+        for call in store.list_operations(job.job_id)
     ] == [
         ("prepare_tpr_gpu", "fc-root"),
-        ("collect_traj_stats:npt_", "fc-npt"),
         ("collect_traj_stats:nvt_", "fc-nvt"),
+        ("collect_traj_stats:npt_", "fc-npt"),
         ("production_run_gpu", "fc-production"),
     ]
     assert [lookup[1] for lookup in lookups] == [
@@ -959,19 +982,17 @@ def test_reconciler_joins_parallel_analyses_before_finalizing(
     calls[production_analysis.object_id] = production_analysis
 
     provider_calls = {
-        call.provider_operation: call for call in store.list_provider_calls(job.job_id)
+        call.operation: call for call in store.list_operations(job.job_id)
     }
     assert provider_calls["collect_traj_stats:nvt_"].state == (
-        JobProviderCallState.RUNNING
+        JobOperationState.RUNNING
     )
     assert provider_calls["collect_traj_stats:npt_"].state == (
-        JobProviderCallState.RUNNING
+        JobOperationState.RUNNING
     )
-    assert provider_calls["production_run_gpu"].state == (
-        JobProviderCallState.COMPLETED
-    )
+    assert provider_calls["production_run_gpu"].state == (JobOperationState.COMPLETED)
     assert provider_calls["collect_traj_stats:production_"].state == (
-        JobProviderCallState.RUNNING
+        JobOperationState.RUNNING
     )
 
     nvt.result = "analyzed"
@@ -996,8 +1017,8 @@ def test_reconciler_joins_parallel_analyses_before_finalizing(
     assert completed is not None
     assert completed.state == JobState.SUCCEEDED
     assert all(
-        call.state == JobProviderCallState.COMPLETED
-        for call in store.list_provider_calls(job.job_id)
+        call.state == JobOperationState.COMPLETED
+        for call in store.list_operations(job.job_id)
     )
 
 
@@ -1032,13 +1053,10 @@ def test_parallel_stage_failure_cancels_siblings_before_job_fails(
     failed = store.get_job(job.owner_user_id, job.job_id)
     assert failed is not None
     assert failed.state == JobState.FAILED
-    states = {
-        call.provider_operation: call.state
-        for call in store.list_provider_calls(job.job_id)
-    }
-    assert states["collect_traj_stats:nvt_"] == JobProviderCallState.FAILED
-    assert states["collect_traj_stats:npt_"] == JobProviderCallState.CANCELLED
-    assert states["production_run_gpu"] == JobProviderCallState.CANCELLED
+    states = {call.operation: call.state for call in store.list_operations(job.job_id)}
+    assert states["collect_traj_stats:nvt_"] == JobOperationState.FAILED
+    assert states["collect_traj_stats:npt_"] == JobOperationState.CANCELLED
+    assert states["production_run_gpu"] == JobOperationState.CANCELLED
     assert ("cancel", "fc-npt", False) in npt.events
     assert ("cancel", "fc-production", False) in production.events
 
@@ -1074,13 +1092,10 @@ def test_definite_stage_rejection_cancels_started_siblings(
     failed = store.get_job(job.owner_user_id, job.job_id)
     assert failed is not None
     assert failed.state == JobState.FAILED
-    states = {
-        call.provider_operation: call.state
-        for call in store.list_provider_calls(job.job_id)
-    }
-    assert states["collect_traj_stats:nvt_"] == JobProviderCallState.CANCELLED
-    assert states["collect_traj_stats:npt_"] == JobProviderCallState.CANCELLED
-    assert states["production_run_gpu"] == JobProviderCallState.FAILED
+    states = {call.operation: call.state for call in store.list_operations(job.job_id)}
+    assert states["collect_traj_stats:nvt_"] == JobOperationState.CANCELLED
+    assert states["collect_traj_stats:npt_"] == JobOperationState.CANCELLED
+    assert states["production_run_gpu"] == JobOperationState.FAILED
     assert rejected.calls == 1
 
 
@@ -1121,13 +1136,10 @@ def test_parallel_stage_failure_keeps_expired_sibling_state_unknown(
     assert unresolved is not None
     assert unresolved.state == JobState.STATE_UNKNOWN
     assert unresolved.state_unknown_reason == "cancellation_outcome_unknown"
-    states = {
-        call.provider_operation: call.state
-        for call in store.list_provider_calls(job.job_id)
-    }
-    assert states["collect_traj_stats:nvt_"] == JobProviderCallState.FAILED
-    assert states["collect_traj_stats:npt_"] == JobProviderCallState.RUNNING
-    assert states["production_run_gpu"] == JobProviderCallState.CANCELLED
+    states = {call.operation: call.state for call in store.list_operations(job.job_id)}
+    assert states["collect_traj_stats:nvt_"] == JobOperationState.FAILED
+    assert states["collect_traj_stats:npt_"] == JobOperationState.RUNNING
+    assert states["production_run_gpu"] == JobOperationState.CANCELLED
 
 
 def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
@@ -1184,7 +1196,7 @@ def test_durable_cancellation_cannot_race_a_successor_stage_spawn(
     cancelling = store.get_job(job.owner_user_id, job.job_id)
     assert cancelling is not None
     assert cancelling.state == JobState.CANCEL_REQUESTED
-    assert {call.modal_call_id for call in store.list_provider_calls(job.job_id)} == {
+    assert {call.modal_call_id for call in store.list_operations(job.job_id)} == {
         "fc-root",
         "fc-nvt",
     }
@@ -1205,7 +1217,7 @@ def test_stage_attach_conflict_marks_job_state_unknown(
     def reject_attach(*_args, **_kwargs):
         raise JobSubmissionConflictError("provider operation changed concurrently")
 
-    monkeypatch.setattr(store, "attach_provider_call", reject_attach)
+    monkeypatch.setattr(store, "attach_modal_call", reject_attach)
     reconciler = GromacsReconciler(store, adapter, now=lambda: 10)
 
     asyncio.run(reconciler.reconcile())
@@ -1214,9 +1226,9 @@ def test_stage_attach_conflict_marks_job_state_unknown(
     assert uncertain is not None
     assert uncertain.state == JobState.STATE_UNKNOWN
     assert uncertain.state_unknown_reason == "submission_outcome_unknown"
-    provider_calls = store.list_provider_calls(job.job_id)
-    assert provider_calls[-1].provider_operation == "collect_traj_stats:nvt_"
-    assert provider_calls[-1].state == JobProviderCallState.STATE_UNKNOWN
+    provider_calls = store.list_operations(job.job_id)
+    assert provider_calls[-1].operation == "collect_traj_stats:nvt_"
+    assert provider_calls[-1].state == JobOperationState.STATE_UNKNOWN
     assert provider_calls[-1].modal_call_id is None
     assert ("cancel", "fc-duplicate", False) in duplicate.events
 
@@ -1235,10 +1247,11 @@ def test_reconciliation_bounds_concurrent_provider_polls(tmp_path: Path) -> None
             now=3 + index,
         )
         jobs.append(
-            store.mark_submitted(
+            _attach_modal_operation(
+                store,
                 admitted.job.job_id,
                 modal_call_id=f"fc-{index}",
-                provider_operation="prepare_tpr_gpu",
+                operation="prepare_tpr_gpu",
                 run_name=f"simulation-{index}-0123456789abcdef0123456789abcdef",
                 now=3 + index,
             )
@@ -1309,7 +1322,8 @@ def test_reconciler_stops_after_an_unknown_stage_submission(
     assert uncertain.state == JobState.STATE_UNKNOWN
     assert uncertain.state_unknown_at == 10
     assert uncertain.state_unknown_reason == "submission_outcome_unknown"
-    assert uncertain.submission_lease_until is None
+    assert uncertain.operations[-1].submission_lease_until is None
+    assert uncertain.operations[-1].state == JobOperationState.STATE_UNKNOWN
     assert failing.calls == 1
 
     now = 129
@@ -1344,8 +1358,9 @@ def test_untracked_cancellation_is_not_declared_complete(
         configuration=_admission_configuration(),
         now=2,
     )
-    store.claim_submission(
+    store.claim_modal_operation(
         admission.job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=RUN_NAME,
         submission_token="lost-submitter",
         now=3,
@@ -1391,7 +1406,7 @@ def test_completed_stage_does_not_advance_after_cancellation(tmp_path: Path) -> 
     cancelled = store.get_job(job.owner_user_id, job.job_id)
     assert cancelled is not None
     assert cancelled.state == JobState.CANCELLED
-    assert cancelled.modal_call_id == "fc-root"
+    assert cancelled.operations[0].modal_call_id == "fc-root"
     assert cancelled.stage_history[-1].completed_at == 10
 
 
@@ -1402,7 +1417,7 @@ def test_cancel_wins_before_result_publication(
     store, job = _submitted_job(
         tmp_path,
         cancel_requested=True,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     files = _established_output_files()
     _install_volume(monkeypatch, files)
@@ -1430,7 +1445,7 @@ def test_cancel_wins_after_final_stage_poll_before_state_transition(
 ) -> None:
     store, stale_running = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     adapter = _adapter({"fc-root": FakeCall("fc-root", result="completed")})
 
@@ -1464,7 +1479,7 @@ def test_transient_archive_publication_error_remains_finalizing(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
 
@@ -1499,7 +1514,7 @@ def test_local_staging_failure_retries_and_blocks_without_losing_compute(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
 
@@ -1531,7 +1546,7 @@ def test_transient_finalization_blocks_after_retry_window(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
 
@@ -1560,7 +1575,7 @@ def test_unexpected_finalization_error_preserves_completed_compute(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     adapter = _adapter({"fc-root": FakeCall("fc-root", result=str(tmp_path))})
 
@@ -1593,7 +1608,7 @@ def test_permanent_finalization_block_recovers_without_new_compute(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     root = FakeCall("fc-root", result=str(tmp_path))
     adapter = _adapter({"fc-root": root})
@@ -1641,7 +1656,7 @@ def test_result_integrity_recovery_preserves_published_identity(
 ) -> None:
     store, running = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     files = _established_output_files()
     _install_volume(monkeypatch, files)
@@ -1684,7 +1699,7 @@ def test_result_integrity_recovery_preserves_published_identity(
 def test_rebuild_rejects_an_unavailable_archive_builder(tmp_path: Path) -> None:
     store, running = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     store.set_job_state(running.job_id, JobState.FINALIZING, now=10)
     completed = store.complete_job(
@@ -1715,7 +1730,7 @@ def test_expired_call_output_recovers_completed_archive_from_volume_marker(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     root = FakeCall(
         "fc-root",
@@ -1750,7 +1765,7 @@ def test_normal_cache_restore_requires_the_published_marker(
 ) -> None:
     store, running = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     archive_bytes, _request_sha256 = _valid_archive_bytes()
     completed = store.complete_job(
@@ -1783,7 +1798,7 @@ def test_expired_call_rejects_marker_when_archive_bytes_are_corrupt(
 ) -> None:
     store, job = _submitted_job(
         tmp_path,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     root = FakeCall(
         "fc-root",
@@ -1881,8 +1896,9 @@ def test_reconciler_marks_an_expired_untracked_submission_state_unknown(
         configuration=_admission_configuration(),
         now=2,
     )
-    store.claim_submission(
+    store.claim_modal_operation(
         admission.job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=RUN_NAME,
         submission_token="lost-submitter",
         now=3,
@@ -1971,7 +1987,7 @@ def test_expired_cancellation_retries_transient_result_recovery(
     store, job = _submitted_job(
         tmp_path,
         cancel_requested=True,
-        provider_operation="collect_traj_stats:production_",
+        operation="collect_traj_stats:production_",
     )
     root = FakeCall(
         "fc-root",

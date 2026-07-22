@@ -108,13 +108,11 @@ SQLite state remains disposable during the current active-development phase,
 and destructive schema resets are allowed. Backup implementation and restore
 drills are therefore outside the current implementation cycle.
 
-The backend never deletes or destructively rewrites an incompatible database
-automatically. Schema 10 has one narrow in-place migration to schema 11 that
-adds per-stage provider calls and preserves Users and existing service state.
-For any other unsupported schema, the backend reports the version and configured
-database location, then exits. An Administrator must stop the service and
-explicitly remove or relocate that exact database before restart initializes a
-new schema.
+The backend never deletes, migrates, or destructively rewrites an incompatible
+database automatically. It reports the version and configured database
+location, then exits. During active development an Administrator must stop the
+service and explicitly migrate selected records or remove that exact database
+before restart initializes the current schema.
 
 Pre-release and production must not share service configuration or host-local
 mutable state. Every pre-release service definition explicitly selects
@@ -384,7 +382,7 @@ changes Job Status.
 
 Each executable API workload has one fixed descriptor owning its stable key,
 User-facing Tool name, Runtime Setting environment-variable names, and mapping
-from provider operations to public timeline stages. Runtime configuration,
+from durable operations to public timeline stages. Runtime configuration,
 Admin Tool rows, routing registration, and Job views consume that descriptor
 instead of carrying separate GROMACS name and stage tables. The descriptor does
 not make scientific orchestration generic: GROMACS keeps its own adapter,

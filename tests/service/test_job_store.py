@@ -19,7 +19,8 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobNotCancellableError,
-    JobProviderCallState,
+    JobOperationExecutor,
+    JobOperationState,
     JobState,
     JobStateResolutionError,
     JobStateUnknownReason,
@@ -63,6 +64,36 @@ def test_readiness_never_recreates_or_accepts_an_empty_database(
         store.check_ready()
 
 
+def test_job_operations_are_the_only_durable_stage_ledger(tmp_path: Path) -> None:
+    store, _alice, _bob = make_store(tmp_path)
+
+    with sqlite3.connect(store.path) as conn:
+        job_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)")}
+        operation_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(job_operations)")
+        }
+
+    assert {
+        "modal_call_id",
+        "operation",
+        "stage_history_json",
+        "submission_token",
+        "submission_lease_until",
+    }.isdisjoint(job_columns)
+    assert {
+        "job_id",
+        "operation",
+        "ordinal",
+        "executor",
+        "modal_call_id",
+        "state",
+        "submission_token",
+        "submission_lease_until",
+        "started_at",
+        "completed_at",
+    } == operation_columns
+
+
 def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
     locks = JobLifecycleLocks()
     job_id = UUID("11111111-1111-4111-8111-111111111111")
@@ -76,7 +107,7 @@ def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
     assert locks.for_job(job_id) is not None
 
 
-@pytest.mark.parametrize("version", [0, 9, 10])
+@pytest.mark.parametrize("version", [0, 9, 10, 11])
 def test_initialize_never_rewrites_an_existing_unsupported_database(
     tmp_path: Path,
     version: int,
@@ -136,6 +167,33 @@ def admit(
     )
 
 
+def attach_operation(
+    store: ServiceStore,
+    job_id: UUID,
+    *,
+    operation: str,
+    modal_call_id: str,
+    run_name: str | None = None,
+    now: int = 100,
+):
+    token = f"claim-{operation}"
+    claimed = store.claim_modal_operation(
+        job_id,
+        operation=operation,
+        submission_token=token,
+        run_name=run_name,
+        now=now,
+    )
+    assert claimed is not None
+    return store.attach_modal_call(
+        job_id,
+        operation=operation,
+        modal_call_id=modal_call_id,
+        submission_token=token,
+        now=now,
+    )
+
+
 def test_idempotency_is_scoped_to_owner_and_payload(tmp_path: Path) -> None:
     store, alice, bob = make_store(tmp_path)
 
@@ -168,7 +226,7 @@ def test_disabled_user_cannot_replay_a_queued_admission(tmp_path: Path) -> None:
     preserved = store.get_job(bob, first.job.job_id)
     assert preserved is not None
     assert preserved.state == JobState.QUEUED
-    assert preserved.submission_token is None
+    assert preserved.operations == ()
 
 
 def test_user_active_limit_is_transactional_across_workloads(tmp_path: Path) -> None:
@@ -260,10 +318,11 @@ def test_job_queries_never_cross_owner_boundaries(tmp_path: Path) -> None:
 def test_cancellation_is_preserved_as_a_state_transition(tmp_path: Path) -> None:
     store, alice, _bob = make_store(tmp_path)
     job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
-    store.mark_submitted(
+    attach_operation(
+        store,
         job.job_id,
         modal_call_id="fc-123",
-        provider_operation="prepare_tpr_gpu",
+        operation="prepare_tpr_gpu",
         run_name="api-123",
     )
 
@@ -284,22 +343,25 @@ def test_submission_lease_requires_explicit_release_before_retry(
     job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
     run_name = f"api-{job.job_id.hex}"
 
-    claimed = store.claim_submission(
+    claimed = store.claim_modal_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=run_name,
         submission_token="first",
         now=100,
         lease_seconds=20,
     )
-    concurrent = store.claim_submission(
+    concurrent = store.claim_modal_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=run_name,
         submission_token="second",
         now=110,
         lease_seconds=20,
     )
-    expired = store.claim_submission(
+    expired = store.claim_modal_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=run_name,
         submission_token="retry",
         now=120,
@@ -307,17 +369,21 @@ def test_submission_lease_requires_explicit_release_before_retry(
     )
 
     assert claimed is not None
-    assert claimed.run_name == run_name
+    current = store.get_job(alice, job.job_id)
+    assert current is not None
+    assert current.run_name == run_name
     assert concurrent is None
     assert expired is None
 
-    store.release_submission(
+    store.release_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         submission_token="first",
         now=120,
     )
-    retry = store.claim_submission(
+    retry = store.claim_modal_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=run_name,
         submission_token="retry",
         now=120,
@@ -334,44 +400,45 @@ def test_cancel_during_spawn_keeps_call_attached_for_reconciliation(
     store, alice, _bob = make_store(tmp_path)
     job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
     run_name = f"api-{job.job_id.hex}"
-    store.claim_submission(
+    store.claim_modal_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=run_name,
         submission_token="submitter",
         now=100,
     )
 
     store.request_cancel(alice, job.job_id, now=101)
-    attached = store.mark_submitted(
+    attached = store.attach_modal_call(
         job.job_id,
         modal_call_id="fc-live",
-        provider_operation="prepare_tpr_gpu",
-        run_name=run_name,
+        operation="prepare_tpr_gpu",
         submission_token="submitter",
         now=102,
     )
 
     assert attached.state == JobState.CANCEL_REQUESTED
-    assert attached.modal_call_id == "fc-live"
+    assert attached.operations[0].modal_call_id == "fc-live"
 
 
-def test_job_tracks_parallel_provider_operations(
+def test_job_tracks_parallel_operations(
     tmp_path: Path,
 ) -> None:
     store, alice, _bob = make_store(tmp_path)
     job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
-    attached = store.mark_submitted(
+    attached = attach_operation(
+        store,
         job.job_id,
         modal_call_id="fc-prepare",
-        provider_operation="prepare_tpr_cpu",
+        operation="prepare_tpr_cpu",
         run_name=f"simulation-{job.job_id.hex}",
         now=100,
     )
-    store.record_provider_call_outcome(
+    store.record_operation_outcome(
         job.job_id,
-        provider_operation="prepare_tpr_cpu",
+        operation="prepare_tpr_cpu",
         expected_modal_call_id="fc-prepare",
-        outcome=JobProviderCallState.COMPLETED,
+        outcome=JobOperationState.COMPLETED,
         now=101,
     )
     operations = (
@@ -379,35 +446,33 @@ def test_job_tracks_parallel_provider_operations(
         ("collect_traj_stats:npt_", "fc-npt"),
         ("production_run_cpu", "fc-production"),
     )
-    for provider_operation, modal_call_id in operations:
-        claimed = store.claim_provider_operation(
+    for operation, modal_call_id in operations:
+        claimed = store.claim_modal_operation(
             job.job_id,
-            provider_operation=provider_operation,
-            submission_token=provider_operation,
+            operation=operation,
+            submission_token=operation,
             now=102,
         )
         assert claimed is not None
-        store.attach_provider_call(
+        store.attach_modal_call(
             job.job_id,
-            provider_operation=provider_operation,
+            operation=operation,
             modal_call_id=modal_call_id,
-            submission_token=provider_operation,
+            submission_token=operation,
             now=102,
         )
 
-    assert attached.provider_operation == "prepare_tpr_cpu"
-    assert [
-        call.provider_operation for call in store.list_provider_calls(job.job_id)
-    ] == [
+    assert attached.operations[0].operation == "prepare_tpr_cpu"
+    assert [call.operation for call in store.list_operations(job.job_id)] == [
         "prepare_tpr_cpu",
-        "collect_traj_stats:npt_",
         "collect_traj_stats:nvt_",
+        "collect_traj_stats:npt_",
         "production_run_cpu",
     ]
     running = store.get_job(alice, job.job_id)
     assert running is not None
     assert [
-        (stage.provider_operation, stage.started_at, stage.completed_at)
+        (stage.operation, stage.started_at, stage.completed_at)
         for stage in running.stage_history
     ] == [
         ("prepare_tpr_cpu", 100, 101),
@@ -416,12 +481,12 @@ def test_job_tracks_parallel_provider_operations(
         ("production_run_cpu", 102, None),
     ]
 
-    for provider_operation, modal_call_id in operations:
-        store.record_provider_call_outcome(
+    for operation, modal_call_id in operations:
+        store.record_operation_outcome(
             job.job_id,
-            provider_operation=provider_operation,
+            operation=operation,
             expected_modal_call_id=modal_call_id,
-            outcome=JobProviderCallState.COMPLETED,
+            outcome=JobOperationState.COMPLETED,
             now=103,
         )
 
@@ -432,7 +497,7 @@ def test_job_tracks_parallel_provider_operations(
     )
 
     assert [
-        (stage.provider_operation, stage.started_at, stage.completed_at)
+        (stage.operation, stage.started_at, stage.completed_at)
         for stage in finalizing.stage_history
     ] == [
         ("prepare_tpr_cpu", 100, 101),
@@ -441,31 +506,51 @@ def test_job_tracks_parallel_provider_operations(
         ("production_run_cpu", 102, 103),
         ("result_packaging", 104, None),
     ]
+    assert finalizing.operations[-1].executor == JobOperationExecutor.LOCAL
+
+    completed = store.complete_job(
+        job.job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path="api-results/result.zip",
+        result_filename="result.zip",
+        result_size_bytes=1,
+        result_sha256="a" * 64,
+        result_archive_schema_version=1,
+        now=105,
+    )
+
+    assert all(
+        operation.state == JobOperationState.COMPLETED
+        for operation in completed.operations
+    )
+    assert completed.stage_history[-1].completed_at == 105
 
 
-def test_provider_operation_lease_requires_explicit_release_before_retry(
+def test_operation_lease_requires_explicit_release_before_retry(
     tmp_path: Path,
 ) -> None:
     store, alice, _bob = make_store(tmp_path)
     job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
-    store.mark_submitted(
+    attach_operation(
+        store,
         job.job_id,
         modal_call_id="fc-prepare",
-        provider_operation="prepare_tpr_cpu",
+        operation="prepare_tpr_cpu",
         run_name=f"simulation-{job.job_id.hex}",
         now=100,
     )
 
-    claimed = store.claim_provider_operation(
+    claimed = store.claim_modal_operation(
         job.job_id,
-        provider_operation="collect_traj_stats:nvt_",
+        operation="collect_traj_stats:nvt_",
         submission_token="first",
         now=101,
         lease_seconds=20,
     )
-    expired = store.claim_provider_operation(
+    expired = store.claim_modal_operation(
         job.job_id,
-        provider_operation="collect_traj_stats:nvt_",
+        operation="collect_traj_stats:nvt_",
         submission_token="second",
         now=121,
         lease_seconds=20,
@@ -474,15 +559,15 @@ def test_provider_operation_lease_requires_explicit_release_before_retry(
     assert claimed is not None
     assert expired is None
 
-    store.release_provider_operation(
+    store.release_operation(
         job.job_id,
-        provider_operation="collect_traj_stats:nvt_",
+        operation="collect_traj_stats:nvt_",
         submission_token="first",
         now=121,
     )
-    retried = store.claim_provider_operation(
+    retried = store.claim_modal_operation(
         job.job_id,
-        provider_operation="collect_traj_stats:nvt_",
+        operation="collect_traj_stats:nvt_",
         submission_token="second",
         now=121,
         lease_seconds=20,
@@ -502,8 +587,9 @@ def test_state_unknown_consumes_capacity_until_admin_resolution(
         key="11111111-1111-4111-8111-111111111111",
         user_limit=1,
     ).job
-    store.claim_submission(
+    store.claim_modal_operation(
         job.job_id,
+        operation="prepare_tpr_gpu",
         run_name=f"simulation-{job.job_id.hex}",
         submission_token="uncertain-submission",
         now=100,
@@ -521,8 +607,9 @@ def test_state_unknown_consumes_capacity_until_admin_resolution(
         uncertain.state_unknown_reason
         == JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
     )
-    assert uncertain.submission_token is None
-    assert uncertain.submission_lease_until is None
+    assert uncertain.operations[0].submission_token is None
+    assert uncertain.operations[0].submission_lease_until is None
+    assert uncertain.operations[0].state == JobOperationState.STATE_UNKNOWN
     assert store.count_active_jobs() == 1
     assert store.list_reconcilable_jobs() == []
     with pytest.raises(JobLimitExceededError, match="User"):

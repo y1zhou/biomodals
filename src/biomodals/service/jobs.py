@@ -69,11 +69,11 @@ class JobStageView(BaseModel):
 
 def _stage_view(
     workload: str,
-    provider_operation: str,
+    operation: str,
     event: JobStageRecord | None = None,
 ) -> JobStageView | None:
     definition = WORKLOAD_DEFINITIONS.get(workload)
-    stage = definition.stage(provider_operation) if definition is not None else None
+    stage = definition.stage(operation) if definition is not None else None
     if stage is None or event is None:
         return None
     return JobStageView(
@@ -119,7 +119,7 @@ def _job_stage(
     else:
         event = history[-1] if history else None
     return (
-        _stage_view(record.workload, event.provider_operation, event)
+        _stage_view(record.workload, event.operation, event)
         if event is not None
         else None
     )
@@ -137,7 +137,7 @@ def _job_stage_history(
         if (
             stage := _stage_view(
                 record.workload,
-                event.provider_operation,
+                event.operation,
                 event,
             )
         )
@@ -187,7 +187,7 @@ class JobView(BaseModel):
             and (
                 stage := _stage_view(
                     record.workload,
-                    event.provider_operation,
+                    event.operation,
                     event,
                 )
             )

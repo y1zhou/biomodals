@@ -48,7 +48,7 @@ from biomodals.service.runtime_config import (
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
-    JobProviderCallState,
+    JobOperationState,
     JobRecord,
     JobState,
     JobStateUnknownReason,
@@ -145,7 +145,7 @@ class SubmittedCall(Protocol):
         ...
 
     @property
-    def provider_operation(self) -> str:
+    def operation(self) -> str:
         """Return the directly submitted provider operation."""
         ...
 
@@ -307,10 +307,7 @@ def create_router(
             request_id_from(request),
         )
 
-        if (
-            admission.job.modal_call_id is not None
-            or admission.job.state != JobState.QUEUED
-        ):
+        if admission.job.operations or admission.job.state != JobState.QUEUED:
             return JobView.from_record(admission.job)
 
         async with lifecycle_locks.for_job(admission.job.job_id):
@@ -319,8 +316,10 @@ def create_router(
                 admission.job.job_id,
             )
             submission_token = uuid4().hex
-            claimed = store.claim_submission(
+            operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
+            claimed = store.claim_modal_operation(
                 admission.job.job_id,
+                operation=operation,
                 run_name=run_name,
                 submission_token=submission_token,
                 now=now,
@@ -339,7 +338,7 @@ def create_router(
                     pdb_content,
                     options,
                     run_name=run_name,
-                    modal_configuration=claimed.modal_configuration,
+                    modal_configuration=admission.job.modal_configuration,
                 )
             except SubmissionOutcomeUnknownError:
                 LOGGER.exception(
@@ -359,8 +358,9 @@ def create_router(
                     admission.job.job_id,
                     request_id_from(request),
                 )
-                store.release_submission(
+                store.release_operation(
                     admission.job.job_id,
+                    operation=operation,
                     submission_token=submission_token,
                     now=int(time.time()),
                 )
@@ -373,12 +373,14 @@ def create_router(
             try:
                 if submitted.run_name != run_name:
                     raise RuntimeError("Compute returned the wrong GROMACS run name")
-                job = store.mark_submitted(
+                if submitted.operation != operation:
+                    raise RuntimeError("Compute returned the wrong GROMACS operation")
+                job = store.attach_modal_call(
                     admission.job.job_id,
                     modal_call_id=submitted.modal_call_id,
-                    provider_operation=submitted.provider_operation,
-                    run_name=submitted.run_name,
+                    operation=submitted.operation,
                     submission_token=submission_token,
+                    now=int(time.time()),
                 )
             except Exception:
                 LOGGER.exception(
@@ -407,7 +409,7 @@ def create_router(
                 "function=%s request_id=%s",
                 job.job_id,
                 stage.code if stage is not None else "none",
-                submitted.provider_operation.partition(":")[0],
+                submitted.operation.partition(":")[0],
                 request_id_from(request),
             )
         return JobView.from_record(job)
@@ -426,8 +428,8 @@ def create_registration(
 
     async def cancel(store: ServiceStore, job: JobRecord) -> None:
         first_error: Exception | None = None
-        for call in store.list_provider_calls(job.job_id):
-            if call.state != JobProviderCallState.RUNNING or call.modal_call_id is None:
+        for call in store.list_operations(job.job_id):
+            if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
                 continue
             try:
                 await adapter.cancel(call.modal_call_id)

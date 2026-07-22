@@ -9,7 +9,7 @@ from dataclasses import dataclass
 class WorkloadStageDefinition:
     """Map one provider operation to its stable public timeline fields."""
 
-    provider_operation: str
+    operation: str
     code: str
     function_name: str | None
 
@@ -25,14 +25,10 @@ class WorkloadDefinition:
     active_job_limit_environment: str
     stages: tuple[WorkloadStageDefinition, ...]
 
-    def stage(self, provider_operation: str) -> WorkloadStageDefinition | None:
+    def stage(self, operation: str) -> WorkloadStageDefinition | None:
         """Return the public stage owned by a provider operation."""
         return next(
-            (
-                stage
-                for stage in self.stages
-                if stage.provider_operation == provider_operation
-            ),
+            (stage for stage in self.stages if stage.operation == operation),
             None,
         )
 

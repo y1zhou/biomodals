@@ -31,7 +31,6 @@ from biomodals.service.gromacs.archive import (
 )
 from biomodals.service.gromacs.router import (
     GromacsJobOptions,
-    SubmissionOutcomeUnknownError,
     is_gromacs_run_name,
 )
 from biomodals.service.jobs import JobLifecycleLocks, JobView
@@ -45,6 +44,7 @@ from biomodals.service.store import (
     JobSubmissionConflictError,
     ServiceStore,
 )
+from biomodals.service.submission import SubmissionOutcomeUnknownError
 
 LOGGER = logging.getLogger(__name__)
 _SHA256 = re.compile(r"[0-9a-f]{64}")

@@ -386,7 +386,9 @@ from durable operations to public timeline stages. Runtime configuration,
 Admin Tool rows, routing registration, and Job views consume that descriptor
 instead of carrying separate GROMACS name and stage tables. The descriptor does
 not make scientific orchestration generic: GROMACS keeps its own adapter,
-request schema, sequencing, archive builder, and tests.
+request schema, sequencing, archive builder, and tests. All executable workload
+routes do share the operation-scoped Modal submission state machine so
+idempotency and ambiguous paid-call outcomes cannot drift between Tools.
 
 The frontend Catalog separately includes an AlphaFold3 placeholder marked
 `WIP`. Its card is visibly muted, is not an interactive navigation target, and

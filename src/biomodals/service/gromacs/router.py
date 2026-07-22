@@ -19,7 +19,6 @@ from fastapi import (
     File,
     Form,
     Header,
-    HTTPException,
     Request,
     UploadFile,
 )
@@ -50,10 +49,12 @@ from biomodals.service.store import (
     JobLimitExceededError,
     JobOperationState,
     JobRecord,
-    JobState,
-    JobStateUnknownReason,
     ServiceStore,
     UserNotFoundError,
+)
+from biomodals.service.submission import (
+    ModalJobSubmitter,
+    SubmittedModalOperation,
 )
 from biomodals.service.workloads import GROMACS_WORKLOAD
 
@@ -127,29 +128,6 @@ class SubmissionForbiddenResponse(CodedErrorResponse):
     code: Literal["account_disabled", "csrf_invalid", "origin_not_allowed"]
 
 
-class SubmissionOutcomeUnknownError(RuntimeError):
-    """Raised when a remote call may exist but no durable handle was returned."""
-
-
-class SubmittedCall(Protocol):
-    """Detached provider call returned after submission."""
-
-    @property
-    def modal_call_id(self) -> str:
-        """Return the durable provider call identifier."""
-        ...
-
-    @property
-    def run_name(self) -> str:
-        """Return the stable scientific run name."""
-        ...
-
-    @property
-    def operation(self) -> str:
-        """Return the directly submitted provider operation."""
-        ...
-
-
 class GromacsAdapter(Protocol):
     """Narrow Modal boundary used by this workload router."""
 
@@ -160,7 +138,7 @@ class GromacsAdapter(Protocol):
         *,
         run_name: str,
         modal_configuration: ModalConfigurationSnapshot,
-    ) -> SubmittedCall:
+    ) -> SubmittedModalOperation:
         """Spawn one detached scientific job."""
         ...
 
@@ -307,109 +285,51 @@ def create_router(
             request_id_from(request),
         )
 
-        if admission.job.operations or admission.job.state != JobState.QUEUED:
-            return JobView.from_record(admission.job)
+        run_name = admission.job.run_name or gromacs_run_name(
+            admission.job.display_name,
+            admission.job.job_id,
+        )
+        operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
+        submitter = ModalJobSubmitter(store, lifecycle_locks)
 
-        async with lifecycle_locks.for_job(admission.job.job_id):
-            run_name = admission.job.run_name or gromacs_run_name(
-                admission.job.display_name,
-                admission.job.job_id,
+        async def spawn(claimed_job: JobRecord) -> SubmittedModalOperation:
+            return await adapter.submit(
+                pdb_content,
+                options,
+                run_name=run_name,
+                modal_configuration=claimed_job.modal_configuration,
             )
-            submission_token = uuid4().hex
-            operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
-            claimed = store.claim_modal_operation(
-                admission.job.job_id,
+
+        try:
+            result = await submitter.submit(
+                admission.job,
                 operation=operation,
                 run_name=run_name,
-                submission_token=submission_token,
-                now=now,
+                submission_token=uuid4().hex,
+                spawn=spawn,
+                cancel=adapter.cancel,
             )
-            if claimed is None:
-                current = store.get_job(
-                    session.principal.user_id,
-                    admission.job.job_id,
-                )
-                if current is None:  # pragma: no cover - admission owns the row
-                    raise HTTPException(404, "Job not found")
-                return JobView.from_record(current)
+        except Exception as exc:
+            LOGGER.exception(
+                "Could not submit GROMACS job %s request_id=%s",
+                admission.job.job_id,
+                request_id_from(request),
+            )
+            raise CodedAPIError(
+                503,
+                "compute_unavailable",
+                "GROMACS compute is temporarily unavailable",
+            ) from exc
 
-            try:
-                submitted = await adapter.submit(
-                    pdb_content,
-                    options,
-                    run_name=run_name,
-                    modal_configuration=admission.job.modal_configuration,
-                )
-            except SubmissionOutcomeUnknownError:
-                LOGGER.exception(
-                    "Could not confirm GROMACS submission %s request_id=%s",
-                    admission.job.job_id,
-                    request_id_from(request),
-                )
-                uncertain = store.mark_state_unknown(
-                    admission.job.job_id,
-                    reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
-                    now=int(time.time()),
-                )
-                return JobView.from_record(uncertain)
-            except Exception as exc:
-                LOGGER.exception(
-                    "Could not submit GROMACS job %s request_id=%s",
-                    admission.job.job_id,
-                    request_id_from(request),
-                )
-                store.release_operation(
-                    admission.job.job_id,
-                    operation=operation,
-                    submission_token=submission_token,
-                    now=int(time.time()),
-                )
-                raise CodedAPIError(
-                    503,
-                    "compute_unavailable",
-                    "GROMACS compute is temporarily unavailable",
-                ) from exc
-
-            try:
-                if submitted.run_name != run_name:
-                    raise RuntimeError("Compute returned the wrong GROMACS run name")
-                if submitted.operation != operation:
-                    raise RuntimeError("Compute returned the wrong GROMACS operation")
-                job = store.attach_modal_call(
-                    admission.job.job_id,
-                    modal_call_id=submitted.modal_call_id,
-                    operation=submitted.operation,
-                    submission_token=submission_token,
-                    now=int(time.time()),
-                )
-            except Exception:
-                LOGGER.exception(
-                    "Could not persist GROMACS submission %s request_id=%s",
-                    admission.job.job_id,
-                    request_id_from(request),
-                )
-                try:
-                    await adapter.cancel(submitted.modal_call_id)
-                except Exception:
-                    LOGGER.exception(
-                        "Could not cancel untracked GROMACS submission %s "
-                        "request_id=%s",
-                        submitted.modal_call_id,
-                        request_id_from(request),
-                    )
-                uncertain = store.mark_state_unknown(
-                    admission.job.job_id,
-                    reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
-                    now=int(time.time()),
-                )
-                return JobView.from_record(uncertain)
+        job = result.job
+        if result.attached:
             stage = JobView.from_record(job).stage
             LOGGER.info(
                 "event=stage_attached job_id=%s workload=gromacs stage=%s "
                 "function=%s request_id=%s",
                 job.job_id,
                 stage.code if stage is not None else "none",
-                submitted.operation.partition(":")[0],
+                operation.partition(":")[0],
                 request_id_from(request),
             )
         return JobView.from_record(job)

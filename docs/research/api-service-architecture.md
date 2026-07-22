@@ -310,6 +310,13 @@ reconciliation passes cannot race. Eliminating this untracked-call limitation
 requires provider-side idempotent submission or an external durable worker
 before enabling multiple API processes.
 
+Initial workload routes use the shared `ModalJobSubmitter` state machine for
+the claim, detached spawn, call attachment, definite-rejection release,
+unattached-call cancellation, and `state_unknown` transitions. A new workload
+supplies its validated request, initial operation name, spawn callback, and
+cancel callback; it must not reproduce these cost-sensitive transitions in its
+route handler.
+
 The supported `FunctionCall` API does not expose a backend log stream. Live
 stdout streaming is therefore deferred. A small service-generated `run.log`
 records the completed job identity and status instead of integrating Modal's

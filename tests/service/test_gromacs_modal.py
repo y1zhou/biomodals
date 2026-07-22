@@ -29,10 +29,7 @@ from biomodals.service.gromacs.modal import (
     ModalGromacsAdapter,
     PollOutcome,
 )
-from biomodals.service.gromacs.router import (
-    GromacsJobOptions,
-    SubmissionOutcomeUnknownError,
-)
+from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
@@ -47,6 +44,7 @@ from biomodals.service.store import (
     ServiceStore,
     UserRecord,
 )
+from biomodals.service.submission import SubmissionOutcomeUnknownError
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 SHA256 = "a" * 64

@@ -23,13 +23,13 @@ from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.modal import GromacsReconciler
-from biomodals.service.gromacs.router import SubmissionOutcomeUnknownError
 from biomodals.service.jobs import WorkloadRegistration
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
 )
 from biomodals.service.store import JobOperationState, JobState, ServiceStore
+from biomodals.service.submission import SubmissionOutcomeUnknownError
 
 ORIGIN = "https://biomodals.internal"
 PASSWORD = "correct horse battery staple"  # noqa: S105 - test credential

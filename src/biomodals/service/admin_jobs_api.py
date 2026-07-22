@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
+from starlette.types import Receive, Scope, Send
 
 from biomodals.service.admin_api import AdminForbiddenResponse, require_admin
 from biomodals.service.auth import AuthenticatedSession
@@ -40,6 +41,17 @@ _LOGGABLE_STATES = {
 class _AsyncClosable(Protocol):
     async def aclose(self) -> None:
         """Release resources owned by an asynchronous iterator."""
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close a resource-owning body iterator after completion or disconnect."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if isinstance(self.body_iterator, _AsyncClosable):
+                await self.body_iterator.aclose()
 
 
 class AdminJobLogTargetView(BaseModel):
@@ -241,7 +253,7 @@ def create_admin_jobs_router() -> APIRouter:
             stage,
             request_id_from(request),
         )
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             _redact_provider_call_id(stream, selected.modal_call_id),
             media_type="text/plain",
             headers={

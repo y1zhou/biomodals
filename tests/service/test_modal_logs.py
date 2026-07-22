@@ -5,12 +5,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, MutableMapping
 from typing import Any, cast
 
 import pytest
+from starlette.requests import ClientDisconnect
 
-from biomodals.service.admin_jobs_api import _redact_provider_call_id
+from biomodals.service.admin_jobs_api import (
+    _ClosingStreamingResponse,
+    _redact_provider_call_id,
+)
 from biomodals.service.modal_logs import ModalCLILogStreamer
 
 
@@ -116,6 +120,39 @@ def test_log_redaction_closes_source_when_consumer_disconnects() -> None:
 
         assert await anext(redacted)
         await redacted.aclose()
+
+        assert source_closed
+
+    asyncio.run(scenario())
+
+
+def test_streaming_response_closes_body_after_client_disconnect() -> None:
+    async def scenario() -> None:
+        source_closed = False
+
+        async def source() -> AsyncGenerator[bytes, None]:
+            nonlocal source_closed
+            try:
+                yield b"one log chunk\n"
+                await asyncio.Event().wait()
+            finally:
+                source_closed = True
+
+        response = _ClosingStreamingResponse(source(), media_type="text/plain")
+
+        async def receive() -> dict[str, str]:
+            return {"type": "http.disconnect"}
+
+        async def send(message: MutableMapping[str, Any]) -> None:
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        with pytest.raises(ClientDisconnect):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
 
         assert source_closed
 

@@ -375,6 +375,34 @@ only after every known remote call is inactive. If the service cannot confirm a
 sibling's state while stopping it, the Job becomes `state_unknown` and keeps its
 admission capacity until an Administrator resolves it.
 
+### Administrator Job logs
+
+An enabled Administrator viewing an Active Job has a collapsed `Logs` panel at
+the bottom of Job detail. Opening it loads the currently loggable remote stages.
+When several stages are active concurrently, the panel lists each safe Stage
+code and Running Function and lets the Administrator select one. Ordinary Users
+never see the panel or its endpoints.
+
+The target response contains Job ID, Stage code, Running Function, operation
+state, and start time. It never contains a Modal Function Call ID. The selected
+Stage code is resolved again against current durable state before streaming, so
+a stale or completed selection returns typed
+`409 job_log_target_unavailable` instead of opening an earlier call. Running and
+`state_unknown` Modal operations with known call IDs are eligible; local Result
+preparation and terminal or unsubmitted operations are not.
+
+The GROMACS registration opens the stream with Modal's supported
+`modal app logs --follow --function-call` CLI command, using the App and Environment
+snapshot stored on that Job. The backend terminates the CLI process when the
+browser collapses the panel, changes Stage, navigates away, or otherwise closes
+the HTTP response. The frontend keeps at most the latest 500,000 characters and
+marks when earlier output was omitted. It refreshes the target choices every ten
+seconds only while expanded.
+
+Provider logs are fallible Administrator diagnostics. They do not determine or
+advance Job Status, Stage History, Progress, Cancellation, or Result validity,
+and an empty or interrupted stream does not imply that remote work stopped.
+
 The Job page displays the last recorded update but never derives a stale,
 stalled, or failed state from elapsed time: a deployed Function can
 legitimately run for hours without changing `updated_at`, and the API has no
@@ -730,8 +758,9 @@ fields, per-operation frontend-handled error codes, authentication requirements,
 CSRF headers, relevant response headers, and binary and byte-range Result
 downloads. This includes the `blocked` Job contract and the Admin Modal
 preflight and Storage contracts, plus `state_unknown`, its safe timestamp and
-reason fields, and the Admin resolution operation. Protected operations declare
-the runtime session-cookie security scheme. The Password Link's
+reason fields, the Admin resolution operation, and the admin-only log-target and
+plain-text stream operations. Protected operations declare the runtime
+session-cookie security scheme. The Password Link's
 `/set-password#token=...` SPA URL remains a tested cross-repository navigation
 contract rather than an OpenAPI operation.
 

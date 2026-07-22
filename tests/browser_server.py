@@ -41,7 +41,7 @@ EQUILIBRATION_ANALYSIS_SECONDS = 4.0
 class _SubmittedCall:
     modal_call_id: str
     run_name: str
-    provider_operation: str
+    operation: str
 
 
 def _result_archive() -> bytes:
@@ -117,25 +117,26 @@ class _FakeGromacsAdapter:
     async def submit_operation(
         self,
         job: JobRecord,
-        provider_operation: str,
+        operation: str,
     ) -> _SubmittedCall:
         if job.run_name is None:
             raise ValueError("Fake Job has no run name")
-        return self._call(job.run_name, provider_operation)
+        return self._call(job.run_name, operation)
 
     async def poll(
         self,
         modal_call_id: str,
         *,
-        provider_operation: str | None = None,
+        operation: str | None = None,
     ) -> PollOutcome:
         if modal_call_id in self.cancelled:
             return PollOutcome("cancelled")
         started, submitted_operation = self.calls[modal_call_id]
-        operation = provider_operation or submitted_operation
+        effective_operation = operation or submitted_operation
         duration = (
             EQUILIBRATION_ANALYSIS_SECONDS
-            if operation in {"collect_traj_stats:nvt_", "collect_traj_stats:npt_"}
+            if effective_operation
+            in {"collect_traj_stats:nvt_", "collect_traj_stats:npt_"}
             else STAGE_SECONDS
         )
         if time.monotonic() - started >= duration:
@@ -169,6 +170,16 @@ class _FakeGromacsAdapter:
 
     async def rebuild_artifact(self, _job: JobRecord):
         yield self.archive
+
+    async def open_operation_logs(
+        self,
+        _job: JobRecord,
+        _modal_call_id: str,
+    ):
+        async def chunks():
+            yield b"Browser test remote log\n"
+
+        return chunks()
 
 
 def _create_browser_app():
@@ -211,6 +222,10 @@ def _create_browser_app():
                 cast(Any, adapter),
                 reconciler=reconciler,
                 lifecycle_locks=lifecycle_locks,
+                open_operation_logs=adapter.open_operation_logs,
+                preflight=adapter.preflight,
+                read_artifact=adapter.read_artifact,
+                rebuild_artifact=adapter.rebuild_artifact,
             )
         ],
         allowed_origin=ORIGIN,

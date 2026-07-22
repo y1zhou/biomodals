@@ -105,12 +105,15 @@ src/biomodals/service/
   operations_api.py  liveness and readiness routes
   auth_api.py        browser authentication contract and routes
   jobs_api.py        provider-neutral Job and Result routes
+  admin_api.py       User, Modal and storage administration routes
+  admin_jobs_api.py  admin-only active-stage log diagnostics
   config.py          host configuration
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
   jobs.py            common job view and workload registration
   submission.py      shared operation lease, spawn and attachment boundary
   artifacts.py       verified final-ZIP staging and cache
+  modal_logs.py      call-filtered Modal CLI log streams
   gromacs/
     router.py        GROMACS request schema and submission route
     plan.py          pure operation graph and deployed-function arguments
@@ -187,10 +190,12 @@ Modal App do not coordinate admission. Pre-release examples set User, Tool,
 and Global defaults to one; provider-level limits or shared coordination remain
 outside this architecture.
 
-Every list, inspect, cancel, and download lookup is constrained by both
-`owner_user_id` and `job_id`. Looking up another user's job returns the same
-`404` as a missing job, before the server resolves any Modal identifier.
-Account administration does not grant access to employee jobs.
+Every owner-facing list, inspect, cancel, and download lookup is constrained by
+both `owner_user_id` and `job_id`. Looking up another user's job returns the
+same `404` as a missing job, before the server resolves any Modal identifier.
+The narrow Administrator diagnostics exception can list safe active-stage
+selectors and stream their provider logs for any Job, but it cannot inspect
+Input, download Result, cancel work, or retrieve a provider call identifier.
 
 The submit route persists the Job, leases preparation, spawns it, attaches its
 Modal call identifier to the leased operation, and returns `202`. SQLite keeps
@@ -212,7 +217,9 @@ nullable `ended_at`, and a nullable outcome of `completed`, `failed`, or
 `cancelled`; active, state-unknown, and blocked work has no end or outcome.
 Result packaging spans `finalizing` through archive publication. Modal call IDs,
 App and Environment names, Volume names and paths, dashboard links, tracebacks,
-and internal filesystem paths remain private.
+and internal filesystem paths remain private in owner-facing contracts. The
+Administrator log endpoints use the persisted call ID internally but expose
+only safe stage codes and deployed Function names as selectors.
 
 The stable public GROMACS stage mapping is:
 
@@ -351,10 +358,20 @@ supplies its validated request, initial operation name, spawn callback, and
 cancel callback; it must not reproduce these cost-sensitive transitions in its
 route handler.
 
-The supported `FunctionCall` API does not expose a backend log stream. Live
-stdout streaming is therefore deferred. A small service-generated `run.log`
-records the completed job identity and status instead of integrating Modal's
-CLI log command into the service.
+Modal's supported CLI can follow App logs filtered by one Function Call ID.
+Each workload may therefore register an optional operation-log opener. For
+GROMACS, the admin-only Job diagnostics routes map a selected active stage back
+to its durable operation, then run `modal app logs --follow --function-call`
+against the Job's captured App and Environment. The Function Call ID never
+crosses the HTTP boundary. Collapsing the browser panel or leaving the page
+aborts the response and terminates its CLI subprocess.
+
+The target list includes running calls and calls in `state_unknown` whose IDs
+are still known, because their logs may help an Administrator resolve remote
+ambiguity. It excludes local Result preparation, unsubmitted operations, and
+terminal calls. Logs are diagnostic provider output, not Job state, Progress,
+Stage History, or an audit record; their presence, absence, or final line never
+advances the durable Job lifecycle.
 
 ## Artifact and storage contract
 
@@ -626,4 +643,5 @@ an intentionally authorized pre-release service may still target the Modal
 | Modal Dict as the job database | Rejected. Job history and ownership must outlive short Modal call/Dict retention. |
 | Modal Dict as an atomic final-archive publication registry | Rejected. The single control-plane reconciler publishes deterministic archives directly, so another registry adds no useful authority. |
 | PostgreSQL and multiple API workers | Deferred. It adds operations without benefit at the current scale; it becomes necessary before horizontal API scaling. |
-| SSE/WebSockets or Modal log streaming | Deferred. Polling coarse SQLite state is enough for v1, and the public Modal call API has no supported log stream. |
+| Owner-visible provider log streaming | Rejected for the MVP. Raw logs are operational diagnostics, not safe Job status. |
+| Admin-only per-call Modal CLI stream | **Selected.** The supported CLI filters by Function Call ID while the HTTP contract exposes only safe stage selectors. |

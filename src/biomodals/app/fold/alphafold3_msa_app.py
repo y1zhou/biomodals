@@ -57,6 +57,14 @@ SEQKIT_VERSION = "2.13.0"
 DEFAULT_SEQKIT_THREADS = 8
 MAX_SEQKIT_THREADS = 32
 MAX_PROFILE_IMBALANCE = 0.05
+PROFILE_VALIDATION_RELPATHS = (
+    "validation/source-stats.tsv",
+    "validation/shard-stats.tsv",
+    "validation/shard-summary.parquet",
+    "validation/source-sum.tsv",
+    "validation/shard-sum.tsv",
+    "validation/seqkit-sum.json",
+)
 HMMER_VERSION = "3.4"
 JACKHMMER_PATCH_SHA256 = (
     "df9e3ae35ad1659921d96ebfca67a9616a7a467ddde2be18a56f9bd3edb38c41"
@@ -513,9 +521,9 @@ def _validate_published_profile(
     manifest_path = profile_root / "manifest.json"
     _require_regular_file(manifest_path)
     manifest = _load_json_object(manifest_path)
-    source, shards = _validate_profile_manifest(manifest)
+    source, shards, validation_artifacts = _validate_profile_manifest(manifest)
 
-    records = [source, *shards]
+    records = [source, *shards, *validation_artifacts]
     for record in records:
         relative = str(record["path"])
         artifact_path = (profile_root / relative).resolve()
@@ -531,7 +539,7 @@ def _validate_published_profile(
 
 def _validate_profile_manifest(
     manifest: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate profile metadata without requiring a mounted filesystem."""
     if manifest.get("schema_version") != PROFILE_SCHEMA_VERSION:
         raise ValueError("Unexpected profile manifest schema version")
@@ -546,6 +554,7 @@ def _validate_profile_manifest(
 
     source = manifest.get("source")
     shards = manifest.get("shards")
+    recipe = manifest.get("recipe")
     validation = manifest.get("validation")
     if not isinstance(source, dict):
         raise ValueError("Profile manifest source must be an object")
@@ -553,12 +562,31 @@ def _validate_profile_manifest(
         raise ValueError("Profile manifest source path is invalid")
     if not isinstance(shards, list) or len(shards) != SHARD_COUNT:
         raise ValueError(f"Profile manifest must declare {SHARD_COUNT} shards")
+    if not isinstance(recipe, dict):
+        raise ValueError("Profile manifest recipe must be an object")
+    if recipe.get("version") != 1:
+        raise ValueError("Unexpected profile recipe version")
+    if recipe.get("seqkit_version") != SEQKIT_VERSION:
+        raise ValueError("Unexpected profile SeqKit version")
+    try:
+        _validate_seqkit_threads(recipe.get("seqkit_threads"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid profile SeqKit thread count") from exc
+    if recipe.get("random_seed") != SHARD_RANDOM_SEED:
+        raise ValueError("Unexpected profile shuffle seed")
+    if recipe.get("shuffle") != ["--two-pass", "--update-faidx"]:
+        raise ValueError("Unexpected profile shuffle recipe")
+    if recipe.get("split") != ["--by-part", SHARD_COUNT]:
+        raise ValueError("Unexpected profile split recipe")
     if not isinstance(validation, dict) or validation.get("passed") is not True:
         raise ValueError("Profile manifest does not declare passed validation")
+    validation_artifacts = validation.get("artifacts")
+    if not isinstance(validation_artifacts, list):
+        raise ValueError("Profile manifest validation artifacts must be a list")
 
     expected_paths = [f"shards/{name}" for name in _shard_names()]
     actual_paths: list[str] = []
-    records = [source, *shards]
+    records = [source, *shards, *validation_artifacts]
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("Profile artifact record must be an object")
@@ -579,7 +607,10 @@ def _validate_profile_manifest(
             actual_paths.append(relative)
     if actual_paths != expected_paths:
         raise ValueError("Profile manifest shard order or names are invalid")
-    return source, shards
+    actual_validation_paths = [str(record["path"]) for record in validation_artifacts]
+    if actual_validation_paths != list(PROFILE_VALIDATION_RELPATHS):
+        raise ValueError("Profile manifest validation artifact paths are invalid")
+    return source, shards, validation_artifacts
 
 
 def _build_prepare_plan(seqkit_threads: int) -> dict[str, object]:
@@ -628,6 +659,8 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
 
     SHARDED_MSA_DB_VOLUME.reload()
     BENCHMARK_OUTPUT_VOLUME.reload()
+    _ensure_campaign_plan_mounted()
+    BENCHMARK_OUTPUT_VOLUME.commit()
     if (profile_root / "manifest.json").is_file():
         manifest = _validate_published_profile(profile_root, verify_digests=True)
         result = {
@@ -763,10 +796,24 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
         shard_stats_path,
         shard_summary_path,
     )
+    seqkit_sum_report_path = validation_dir / "seqkit-sum.json"
+    _write_json_atomic(
+        seqkit_sum_report_path,
+        {
+            "source": source_sum,
+            "aggregate_shards": shard_sum,
+            "match": True,
+            "seqkit_version": SEQKIT_VERSION,
+        },
+    )
 
     source_record = _artifact_record(copied_source, staging_root)
     shard_records = [
         _artifact_record(shard_path, staging_root) for shard_path in shard_paths
+    ]
+    validation_records = [
+        _artifact_record(staging_root / relative_path, staging_root)
+        for relative_path in PROFILE_VALIDATION_RELPATHS
     ]
     manifest: dict[str, object] = {
         "schema_version": PROFILE_SCHEMA_VERSION,
@@ -796,19 +843,46 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
             "sum_len": statistics["sum_len"],
             "maximum_residue_imbalance": statistics["maximum_residue_imbalance"],
             "maximum_allowed_residue_imbalance": MAX_PROFILE_IMBALANCE,
+            "artifacts": validation_records,
         },
     }
 
+    _write_json_atomic(staging_root / "manifest.json", manifest)
     SHARDED_MSA_DB_VOLUME.commit()
+    _validate_published_profile(staging_root, verify_digests=False)
+
+    publication_status = "published"
     profile_root.parent.mkdir(parents=True, exist_ok=True)
-    staging_root.replace(profile_root)
-    SHARDED_MSA_DB_VOLUME.commit()
-    _write_json_atomic(profile_root / "manifest.json", manifest)
+    if profile_root.exists():
+        try:
+            existing_manifest = _validate_published_profile(
+                profile_root,
+                verify_digests=False,
+            )
+        except (FileNotFoundError, ValueError):
+            orphan_root = sharded_root / ".orphaned"
+            orphan_root.mkdir(parents=True, exist_ok=True)
+            profile_root.replace(orphan_root / f"{PROFILE_ID}-{uuid.uuid4().hex}")
+        else:
+            if _profile_scientific_identity(existing_manifest) != (
+                _profile_scientific_identity(manifest)
+            ):
+                raise RuntimeError(
+                    "A different valid profile was published concurrently"
+                )
+            duplicate_root = sharded_root / ".orphaned"
+            duplicate_root.mkdir(parents=True, exist_ok=True)
+            staging_root.replace(
+                duplicate_root / f"{PROFILE_ID}-duplicate-{generation_id}"
+            )
+            publication_status = "reused-concurrent"
+    if publication_status == "published":
+        staging_root.replace(profile_root)
     SHARDED_MSA_DB_VOLUME.commit()
     _validate_published_profile(profile_root, verify_digests=False)
 
     result = {
-        "status": "published",
+        "status": publication_status,
         "profile_path": str(profile_root),
         "manifest_sha256": _sha256_file(profile_root / "manifest.json"),
         "source_size_bytes": source_size,
@@ -939,7 +1013,7 @@ def _profile_artifact_map(
     manifest: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     """Index validated profile artifact records by relative path."""
-    source, shards = _validate_profile_manifest(manifest)
+    source, shards, _ = _validate_profile_manifest(manifest)
     return {str(record["path"]): record for record in [source, *shards]}
 
 
@@ -1033,17 +1107,21 @@ def _scan_one_file(path: Path, relative_path: str) -> dict[str, str | int | floa
     expected_bytes = path.stat().st_size
     byte_count = 0
     buffer = bytearray(SCAN_BUFFER_SIZE)
+    started_at = _utc_now()
     started = perf_counter()
     with path.open("rb", buffering=0) as handle:
         while read_size := handle.readinto(buffer):
             byte_count += read_size
     elapsed = perf_counter() - started
+    finished_at = _utc_now()
     if byte_count != expected_bytes:
         raise OSError(
             f"Short scan for {relative_path}: read {byte_count}, expected {expected_bytes}"
         )
     return {
         "path": relative_path,
+        "started_at": started_at,
+        "finished_at": finished_at,
         "bytes": byte_count,
         "wall_seconds": elapsed,
         "throughput_bytes_per_second": byte_count / elapsed if elapsed else 0.0,
@@ -1117,7 +1195,7 @@ def _run_scan_partition(case_id: str, partition_index: int) -> dict[str, object]
     case = _scan_case(case_id)
     relative_paths = _scan_partition_paths(case, partition_index)
     profile_root = Path(APP_INFO.sharded_db_dir) / APP_INFO.profile_relpath
-    output_root = Path(APP_INFO.output_dir) / _scan_partition_relpath(
+    final_output_root = Path(APP_INFO.output_dir) / _scan_partition_relpath(
         case_id, partition_index
     )
     SHARDED_MSA_DB_VOLUME.reload()
@@ -1132,14 +1210,19 @@ def _run_scan_partition(case_id: str, partition_index: int) -> dict[str, object]
         partition_index,
     )
     try:
-        _validate_done_marker(output_root, expected_identity=identity)
+        _validate_done_marker(final_output_root, expected_identity=identity)
     except (FileNotFoundError, ValueError):
         pass
     else:
-        metrics = _load_json_object(output_root / "metrics.json")
+        metrics = _load_json_object(final_output_root / "metrics.json")
         return metrics | {"status": "reused"}
 
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = (
+        final_output_root.parent
+        / ".staging"
+        / f"partition-{partition_index:02d}-{uuid.uuid4().hex}"
+    )
+    output_root.mkdir(parents=True)
     log_path = output_root / "run.log"
     _append_log(
         log_path,
@@ -1197,6 +1280,27 @@ def _run_scan_partition(case_id: str, partition_index: int) -> dict[str, object]
         ],
     }
     _write_json_atomic(output_root / "done.json", marker)
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    if final_output_root.exists():
+        try:
+            _validate_done_marker(final_output_root, expected_identity=identity)
+        except (FileNotFoundError, ValueError):
+            orphan_root = final_output_root.parent / ".orphaned"
+            orphan_root.mkdir(parents=True, exist_ok=True)
+            final_output_root.replace(
+                orphan_root / f"partition-{partition_index:02d}-{uuid.uuid4().hex}"
+            )
+        else:
+            duplicate_root = final_output_root.parent / ".orphaned"
+            duplicate_root.mkdir(parents=True, exist_ok=True)
+            output_root.replace(
+                duplicate_root
+                / f"partition-{partition_index:02d}-duplicate-{uuid.uuid4().hex}"
+            )
+            BENCHMARK_OUTPUT_VOLUME.commit()
+            existing = _load_json_object(final_output_root / "metrics.json")
+            return existing | {"status": "reused-concurrent"}
+    output_root.replace(final_output_root)
     BENCHMARK_OUTPUT_VOLUME.commit()
     return metrics
 
@@ -1296,9 +1400,8 @@ def _client_done_marker_valid(
     marker_relative_path: str,
     *,
     expected_identity: str,
-    verify_digests: bool = True,
 ) -> bool:
-    """Validate a marker, optionally trusting its published artifact digests."""
+    """Validate a completion marker and every artifact through client reads."""
     try:
         marker = _read_volume_json(volume, marker_relative_path)
         if marker.get("schema_version") != DONE_SCHEMA_VERSION:
@@ -1311,12 +1414,6 @@ def _client_done_marker_valid(
         if not isinstance(artifacts, list) or not artifacts:
             return False
         marker_parent = PurePosixPath(marker_relative_path).parent
-        listed_sizes: dict[str, int] = {}
-        if not verify_digests:
-            listed_sizes = {
-                PurePosixPath(entry.path).as_posix().lstrip("/"): entry.size
-                for entry in volume.listdir(str(marker_parent), recursive=True)
-            }
         for record in artifacts:
             if not isinstance(record, dict):
                 return False
@@ -1333,18 +1430,11 @@ def _client_done_marker_valid(
             if not isinstance(digest, str) or len(digest) != 64:
                 return False
             artifact_path = (marker_parent / path).as_posix().lstrip("/")
-            if verify_digests:
-                artifact = _read_volume_bytes(volume, artifact_path)
-                if len(artifact) != size_bytes:
-                    return False
-                if _sha256_bytes(artifact) != digest:
-                    return False
-            else:
-                listed_size = listed_sizes.get(artifact_path)
-                if listed_size is None:
-                    listed_size = listed_sizes.get(path.as_posix())
-                if listed_size != size_bytes:
-                    return False
+            artifact = _read_volume_bytes(volume, artifact_path)
+            if len(artifact) != size_bytes:
+                return False
+            if _sha256_bytes(artifact) != digest:
+                return False
     except (FileNotFoundError, ValueError, orjson.JSONDecodeError):
         return False
     return True
@@ -1391,6 +1481,40 @@ def _scan_results_parquet(results: list[dict[str, Any]]) -> bytes:
     return buffer.getvalue()
 
 
+def _scan_case_pass_summaries(
+    results: list[dict[str, Any]],
+) -> list[dict[str, object]]:
+    """Aggregate concurrent partition throughput for each scan pass."""
+    summaries: list[dict[str, object]] = []
+    for pass_name in SCAN_PASS_NAMES:
+        partition_passes: list[dict[str, Any]] = []
+        for result in results:
+            passes = result.get("passes")
+            if not isinstance(passes, list):
+                raise ValueError("Scan result has no pass list")
+            matches = [
+                item
+                for item in passes
+                if isinstance(item, dict) and item.get("pass") == pass_name
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"Scan result has invalid {pass_name} evidence")
+            partition_passes.append(matches[0])
+        byte_count = sum(int(item["bytes"]) for item in partition_passes)
+        critical_wall_seconds = max(
+            float(item["wall_seconds"]) for item in partition_passes
+        )
+        summaries.append({
+            "pass": pass_name,
+            "bytes": byte_count,
+            "critical_wall_seconds": critical_wall_seconds,
+            "aggregate_throughput_bytes_per_second": (
+                byte_count / critical_wall_seconds if critical_wall_seconds else 0.0
+            ),
+        })
+    return summaries
+
+
 def _scan_operation_identity(manifest_sha256: str) -> str:
     """Hash the immutable campaign scan plan."""
     return _sha256_bytes(
@@ -1404,6 +1528,7 @@ def _scan_operation_identity(manifest_sha256: str) -> str:
 
 def _submit_scan_matrix() -> dict[str, object]:
     """Submit missing scan partitions case by case and publish their index."""
+    _ensure_campaign_plan_client()
     profile_manifest_relpath = f"{APP_INFO.profile_relpath}/manifest.json"
     manifest_bytes = _read_volume_bytes(
         SHARDED_MSA_DB_VOLUME,
@@ -1437,6 +1562,14 @@ def _submit_scan_matrix() -> dict[str, object]:
         for partition_index in range(case.containers)
     )
     if operation_complete and partitions_complete:
+        _publish_campaign_progress(
+            stage="storage scan",
+            status="scan complete; search benchmarks pending",
+            details=[
+                f"The complete V0-V8 scan index is available under `{storage_root}/`.",
+                "No search benchmark result is included yet.",
+            ],
+        )
         return {
             "status": "reused",
             "operation": "scan",
@@ -1522,6 +1655,9 @@ def _submit_scan_matrix() -> dict[str, object]:
             "case": case.as_dict(),
             "profile_manifest_sha256": manifest_sha256,
             "partition_identities": expected_identities,
+            "pass_summaries": _scan_case_pass_summaries(
+                list(results_by_partition.values())
+            ),
             "remote_call_wall_seconds": remote_call_wall_seconds,
             "submitted_partitions": missing_partitions,
             "completed_at": _utc_now(),
@@ -1558,6 +1694,14 @@ def _submit_scan_matrix() -> dict[str, object]:
         BENCHMARK_OUTPUT_VOLUME,
         operation_marker_path,
         _json_bytes(operation_marker),
+    )
+    _publish_campaign_progress(
+        stage="storage scan",
+        status="scan complete; search benchmarks pending",
+        details=[
+            f"Completed all {len(SCAN_CASES)} V0-V8 scan cases.",
+            f"Submitted {submitted_inputs} remote partition inputs.",
+        ],
     )
     return {
         "status": "published",
@@ -1714,21 +1858,52 @@ def _scientific_search_config(case: SearchCase) -> dict[str, object]:
     }
 
 
-def _search_identity(manifest_sha256: str, case: SearchCase) -> str:
-    """Hash database and result-affecting settings, excluding execution knobs."""
+def _profile_scientific_identity(manifest: dict[str, Any]) -> str:
+    """Hash profile content and recipe while excluding operational thread count."""
+    source, shards, _ = _validate_profile_manifest(manifest)
+    recipe = manifest.get("recipe")
+    if not isinstance(recipe, dict):
+        raise ValueError("Profile manifest recipe must be an object")
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": manifest["schema_version"],
+            "profile_id": manifest["profile_id"],
+            "database_id": manifest["database_id"],
+            "source": source,
+            "shards": shards,
+            "shard_count": manifest["shard_count"],
+            "z_value": manifest["z_value"],
+            "recipe": {
+                "version": recipe.get("version"),
+                "seqkit_version": recipe.get("seqkit_version"),
+                "random_seed": recipe.get("random_seed"),
+                "shuffle": recipe.get("shuffle"),
+                "split": recipe.get("split"),
+            },
+        })
+    )
+
+
+def _search_identity(
+    profile_scientific_identity: str,
+    query: SearchQuery,
+    case: SearchCase,
+) -> str:
+    """Hash query, database, and result-affecting settings only."""
     return _sha256_bytes(
         _json_bytes({
             "schema_version": 1,
             "database_id": DATABASE_ID,
             "profile_id": PROFILE_ID,
-            "profile_manifest_sha256": manifest_sha256,
+            "profile_scientific_identity": profile_scientific_identity,
+            "query": query.as_dict(),
             "scientific_config": _scientific_search_config(case),
         })
     )
 
 
 def _search_sample_identity(
-    manifest_sha256: str,
+    profile_scientific_identity: str,
     query: SearchQuery,
     case: SearchCase,
     sample_id: str,
@@ -1740,7 +1915,11 @@ def _search_sample_identity(
             "schema_version": 1,
             "campaign_id": CAMPAIGN_ID,
             "query": query.as_dict(),
-            "search_identity": _search_identity(manifest_sha256, case),
+            "search_identity": _search_identity(
+                profile_scientific_identity,
+                query,
+                case,
+            ),
             "sample_id": validated_sample_id,
             "operational_config": {
                 "case_id": case.case_id,
@@ -1820,6 +1999,43 @@ def _build_search_plan(mode: str) -> dict[str, object]:
             },
         }
     raise ValueError("search mode must be 'smoke' or 'matrix'")
+
+
+def _campaign_plan_bytes() -> bytes:
+    """Serialize the immutable plan shared by every campaign operation."""
+    return _json_bytes({
+        "schema_version": 1,
+        "campaign_id": CAMPAIGN_ID,
+        "profile_id": PROFILE_ID,
+        "prepare": _build_prepare_plan(DEFAULT_SEQKIT_THREADS),
+        "storage_scan": _build_scan_plan(),
+        "search_smoke": _build_search_plan("smoke"),
+        "search_matrix": _build_search_plan("matrix"),
+    })
+
+
+def _ensure_campaign_plan_mounted() -> None:
+    """Create or validate the immutable campaign plan through its mount."""
+    plan_path = Path(APP_INFO.output_dir) / "benchmarks" / CAMPAIGN_ID / "plan.json"
+    expected = _campaign_plan_bytes()
+    if plan_path.is_file():
+        if plan_path.read_bytes() != expected:
+            raise ValueError("Existing campaign plan differs from this app")
+        return
+    _write_bytes_exclusive(plan_path, expected)
+
+
+def _ensure_campaign_plan_client() -> None:
+    """Create or validate the immutable campaign plan through the client."""
+    relative_path = f"benchmarks/{CAMPAIGN_ID}/plan.json"
+    expected = _campaign_plan_bytes()
+    try:
+        existing = _read_volume_bytes(BENCHMARK_OUTPUT_VOLUME, relative_path)
+    except FileNotFoundError:
+        _upload_volume_bytes(BENCHMARK_OUTPUT_VOLUME, relative_path, expected)
+    else:
+        if existing != expected:
+            raise ValueError("Existing campaign plan differs from this app")
 
 
 def _parse_a3m_records(a3m: str) -> list[tuple[str, str]]:
@@ -2319,12 +2535,13 @@ def _run_search_sample(
     profile_root = Path(APP_INFO.sharded_db_dir) / APP_INFO.profile_relpath
     SHARDED_MSA_DB_VOLUME.reload()
     BENCHMARK_OUTPUT_VOLUME.reload()
-    _validate_published_profile(profile_root, verify_digests=False)
+    manifest = _validate_published_profile(profile_root, verify_digests=False)
     manifest_path = profile_root / "manifest.json"
     manifest_sha256 = _sha256_file(manifest_path)
-    search_identity = _search_identity(manifest_sha256, case)
+    profile_scientific_identity = _profile_scientific_identity(manifest)
+    search_identity = _search_identity(profile_scientific_identity, query, case)
     sample_identity = _search_sample_identity(
-        manifest_sha256,
+        profile_scientific_identity,
         query,
         case,
         validated_sample_id,
@@ -2339,20 +2556,20 @@ def _run_search_sample(
         search_identity,
         validated_sample_id,
     )
-    output_root = Path(APP_INFO.output_dir) / sample_relpath
+    final_output_root = Path(APP_INFO.output_dir) / sample_relpath
     try:
-        _validate_done_marker(output_root, expected_identity=sample_identity)
+        _validate_done_marker(final_output_root, expected_identity=sample_identity)
     except (FileNotFoundError, ValueError):
         pass
     else:
-        metrics = _load_json_object(output_root / "metrics.json")
+        metrics = _load_json_object(final_output_root / "metrics.json")
         return metrics | {"status": "reused"}
 
-    if output_root.exists():
-        orphan_root = output_root.parent / ".orphaned"
-        orphan_root.mkdir(parents=True, exist_ok=True)
-        output_root.replace(orphan_root / f"{validated_sample_id}-{uuid.uuid4().hex}")
-        BENCHMARK_OUTPUT_VOLUME.commit()
+    output_root = (
+        final_output_root.parent
+        / ".staging"
+        / f"{validated_sample_id}-{uuid.uuid4().hex}"
+    )
     output_root.mkdir(parents=True)
     log_path = output_root / "run.log"
     trace_path = output_root / "trace.jsonl"
@@ -2391,15 +2608,18 @@ def _run_search_sample(
             sample_started,
         )
         _mark_resource_phase(phase_state, "publish", sample_started)
-        merged_a3m_path = output_root / "merged.a3m"
+        merged_a3m_path = output_root / "result.a3m"
         _write_bytes_exclusive(merged_a3m_path, merged_a3m.encode())
         raw_tblout_paths: list[Path] = []
         for source, tblout in raw_tblouts:
-            tblout_path = output_root / "raw-tblout" / f"{source}.tblout"
+            if source == "monolith":
+                tblout_path = output_root / "result.tblout"
+            else:
+                tblout_path = output_root / "shards" / f"{source}.tblout"
             _write_bytes_exclusive(tblout_path, tblout.encode())
             raw_tblout_paths.append(tblout_path)
         hit_rows = _normalized_hit_rows(merged_a3m, raw_tblouts)
-        normalized_hits_path = output_root / "normalized-hits.parquet"
+        normalized_hits_path = output_root / "hits.parquet"
         _write_bytes_exclusive(
             normalized_hits_path,
             _normalized_hits_parquet(hit_rows),
@@ -2429,9 +2649,16 @@ def _run_search_sample(
     _mark_resource_phase(phase_state, "complete", sample_started)
     trace_stop.set()
     trace_thread.join()
+    resource_summary = _summarize_resource_trace(trace_path)
+    core_artifacts = [
+        _artifact_record(merged_a3m_path, output_root),
+        _artifact_record(normalized_hits_path, output_root),
+        _artifact_record(trace_path, output_root),
+        _artifact_record(log_path, output_root),
+        *(_artifact_record(path, output_root) for path in raw_tblout_paths),
+    ]
     BENCHMARK_OUTPUT_VOLUME.commit()
     sample_wall_seconds = perf_counter() - sample_started
-    resource_summary = _summarize_resource_trace(trace_path)
     cost_estimate = _estimate_compute_cost(resource_summary, sample_wall_seconds)
     unique_hit_count = len({str(row["target_id"]) for row in hit_rows})
     cross_shard_duplicate_count = len({
@@ -2445,6 +2672,7 @@ def _run_search_sample(
         "database_id": DATABASE_ID,
         "profile_id": PROFILE_ID,
         "profile_manifest_sha256": manifest_sha256,
+        "profile_scientific_identity": profile_scientific_identity,
         "query": query.as_dict(),
         "case": case.as_dict(),
         "scientific_config": _scientific_search_config(case),
@@ -2455,6 +2683,7 @@ def _run_search_sample(
         "search_wall_seconds": timings["search_wall_seconds"],
         "merge_wall_seconds": timings["merge_wall_seconds"],
         "sample_wall_seconds": sample_wall_seconds,
+        "sample_wall_endpoint": "durable-core-evidence-commit",
         "shard_timings": timings["shards"],
         "hit_rows": len(hit_rows),
         "unique_hits": unique_hit_count,
@@ -2467,14 +2696,7 @@ def _run_search_sample(
     metrics_path = output_root / "metrics.json"
     _write_json_atomic(metrics_path, metrics)
     BENCHMARK_OUTPUT_VOLUME.commit()
-    artifacts = [
-        _artifact_record(merged_a3m_path, output_root),
-        _artifact_record(normalized_hits_path, output_root),
-        _artifact_record(metrics_path, output_root),
-        _artifact_record(trace_path, output_root),
-        _artifact_record(log_path, output_root),
-        *(_artifact_record(path, output_root) for path in raw_tblout_paths),
-    ]
+    artifacts = [*core_artifacts, _artifact_record(metrics_path, output_root)]
     _write_json_atomic(
         output_root / "done.json",
         {
@@ -2485,6 +2707,29 @@ def _run_search_sample(
             "artifacts": artifacts,
         },
     )
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    if final_output_root.exists():
+        try:
+            _validate_done_marker(
+                final_output_root,
+                expected_identity=sample_identity,
+            )
+        except (FileNotFoundError, ValueError):
+            orphan_root = final_output_root.parent / ".orphaned"
+            orphan_root.mkdir(parents=True, exist_ok=True)
+            final_output_root.replace(
+                orphan_root / f"{validated_sample_id}-{uuid.uuid4().hex}"
+            )
+        else:
+            duplicate_root = final_output_root.parent / ".orphaned"
+            duplicate_root.mkdir(parents=True, exist_ok=True)
+            output_root.replace(
+                duplicate_root / f"{validated_sample_id}-duplicate-{uuid.uuid4().hex}"
+            )
+            BENCHMARK_OUTPUT_VOLUME.commit()
+            existing = _load_json_object(final_output_root / "metrics.json")
+            return existing | {"status": "reused-concurrent"}
+    output_root.replace(final_output_root)
     BENCHMARK_OUTPUT_VOLUME.commit()
     return metrics
 
@@ -2583,12 +2828,12 @@ def _compare_normalized_hits(
     candidate_positions = {
         target_id: position for position, target_id in enumerate(candidate_ids, start=1)
     }
+    difference_positions = [
+        *(oracle_positions[target_id] for target_id in oracle_only),
+        *(candidate_positions[target_id] for target_id in candidate_only),
+    ]
     differences_are_below_top_100 = all(
-        position > 100
-        for position in [
-            *(oracle_positions[target_id] for target_id in oracle_only),
-            *(candidate_positions[target_id] for target_id in candidate_only),
-        ]
+        position > 100 for position in difference_positions
     )
     duplicate_targets = sorted({
         str(row["target_id"])
@@ -2600,10 +2845,21 @@ def _compare_normalized_hits(
         len(oracle_rows) == JACKHMMER_MAX_SEQUENCES - 1
         and len(candidate_rows) == JACKHMMER_MAX_SEQUENCES - 1
     )
+    candidate_duplicate_hit_rows = len(candidate_rows) - len(candidate_unique)
+    oracle_tail_start = len(oracle_ids) - candidate_duplicate_hit_rows + 1
+    oracle_only_is_displaced_tail = (
+        not candidate_only
+        and len(oracle_only) <= candidate_duplicate_hit_rows <= SHARD_COUNT
+        and all(
+            oracle_positions[target_id] >= oracle_tail_start
+            for target_id in oracle_only
+        )
+    )
     differences_characterized = not has_set_differences or (
         differences_are_below_top_100
         and bool(duplicate_targets)
         and both_results_reached_hit_row_limit
+        and oracle_only_is_displaced_tail
     )
     passed = (
         top_hits_exact
@@ -2631,6 +2887,9 @@ def _compare_normalized_hits(
         "candidate_only_ids": candidate_only,
         "differences_are_below_top_100": differences_are_below_top_100,
         "both_results_reached_hit_row_limit": both_results_reached_hit_row_limit,
+        "candidate_duplicate_hit_rows": candidate_duplicate_hit_rows,
+        "oracle_tail_start": oracle_tail_start,
+        "oracle_only_is_displaced_tail": oracle_only_is_displaced_tail,
         "candidate_cross_shard_duplicate_targets": duplicate_targets,
         "differences_characterized_as_duplicate_tail": differences_characterized,
     }
@@ -2642,7 +2901,7 @@ def _read_normalized_hits(sample_relpath: str) -> list[dict[str, object]]:
 
     data = _read_volume_bytes(
         BENCHMARK_OUTPUT_VOLUME,
-        f"{sample_relpath}/normalized-hits.parquet",
+        f"{sample_relpath}/hits.parquet",
     )
     return pl.read_parquet(io.BytesIO(data)).to_dicts()
 
@@ -2762,6 +3021,7 @@ def _smoke_operation_identity(
 
 def _submit_search_smoke() -> dict[str, object]:
     """Run only missing smoke samples, then publish the scientific gate."""
+    _ensure_campaign_plan_client()
     manifest_relpath = f"{APP_INFO.profile_relpath}/manifest.json"
     manifest_bytes = _read_volume_bytes(SHARDED_MSA_DB_VOLUME, manifest_relpath)
     manifest = orjson.loads(manifest_bytes)
@@ -2769,14 +3029,20 @@ def _submit_search_smoke() -> dict[str, object]:
         raise ValueError("Profile manifest must be a JSON object")
     _validate_profile_manifest(manifest)
     manifest_sha256 = _sha256_bytes(manifest_bytes)
+    profile_scientific_identity = _profile_scientific_identity(manifest)
     cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
     sample_ids = {case.case_id: f"smoke-{case.case_id.lower()}" for case in cases}
     search_identities = {
-        case.case_id: _search_identity(manifest_sha256, case) for case in cases
+        case.case_id: _search_identity(
+            profile_scientific_identity,
+            SCREENING_QUERY,
+            case,
+        )
+        for case in cases
     }
     sample_identities = {
         case.case_id: _search_sample_identity(
-            manifest_sha256,
+            profile_scientific_identity,
             SCREENING_QUERY,
             case,
             sample_ids[case.case_id],
@@ -2802,7 +3068,6 @@ def _submit_search_smoke() -> dict[str, object]:
             BENCHMARK_OUTPUT_VOLUME,
             f"{sample_relpaths[case.case_id]}/done.json",
             expected_identity=sample_identities[case.case_id],
-            verify_digests=False,
         )
         for case in cases
     )
@@ -2814,6 +3079,19 @@ def _submit_search_smoke() -> dict[str, object]:
         summary = _read_volume_json(
             BENCHMARK_OUTPUT_VOLUME,
             f"{operation_root}/summary.json",
+        )
+        gate_status = (
+            "smoke gate passed; measured matrix pending"
+            if summary.get("scientific_gate_passed") is True
+            else "blocked by smoke scientific gate"
+        )
+        _publish_campaign_progress(
+            stage="search smoke",
+            status=gate_status,
+            details=[
+                "B0, B1, and S3 smoke evidence is available under "
+                f"`{operation_root}/`.",
+            ],
         )
         return summary | {
             "status": "reused",
@@ -2828,7 +3106,6 @@ def _submit_search_smoke() -> dict[str, object]:
             BENCHMARK_OUTPUT_VOLUME,
             marker_path,
             expected_identity=sample_identities[case.case_id],
-            verify_digests=False,
         )
         if reused:
             result = _read_volume_json(
@@ -2914,6 +3191,18 @@ def _submit_search_smoke() -> dict[str, object]:
             ],
         }),
     )
+    _publish_campaign_progress(
+        stage="search smoke",
+        status=(
+            "smoke gate passed; measured matrix pending"
+            if scientific_gate_passed
+            else "blocked by smoke scientific gate"
+        ),
+        details=[
+            f"Scientific gate: {'PASS' if scientific_gate_passed else 'FAIL'}.",
+            f"Submitted {submitted_inputs} remote search inputs.",
+        ],
+    )
     return summary
 
 
@@ -2953,15 +3242,15 @@ def _matrix_sample_id(kind: str, case_id: str, block_index: int) -> str:
 
 
 def _matrix_sample_spec(
-    manifest_sha256: str,
+    profile_scientific_identity: str,
     query: SearchQuery,
     case: SearchCase,
     sample_id: str,
 ) -> dict[str, str]:
     """Build all immutable identifiers and paths for one matrix sample."""
-    search_identity = _search_identity(manifest_sha256, case)
+    search_identity = _search_identity(profile_scientific_identity, query, case)
     sample_identity = _search_sample_identity(
-        manifest_sha256,
+        profile_scientific_identity,
         query,
         case,
         sample_id,
@@ -2978,7 +3267,7 @@ def _matrix_sample_spec(
 
 
 def _run_or_reuse_matrix_sample(
-    manifest_sha256: str,
+    profile_scientific_identity: str,
     query: SearchQuery,
     case: SearchCase,
     sample_id: str,
@@ -2987,13 +3276,17 @@ def _run_or_reuse_matrix_sample(
     block_index: int,
 ) -> tuple[dict[str, Any], bool]:
     """Check durable evidence before submitting exactly one remote sample."""
-    spec = _matrix_sample_spec(manifest_sha256, query, case, sample_id)
+    spec = _matrix_sample_spec(
+        profile_scientific_identity,
+        query,
+        case,
+        sample_id,
+    )
     marker_path = f"{spec['sample_relpath']}/done.json"
     reused = _client_done_marker_valid(
         BENCHMARK_OUTPUT_VOLUME,
         marker_path,
         expected_identity=spec["sample_identity"],
-        verify_digests=False,
     )
     if reused:
         result = _read_volume_json(
@@ -3023,12 +3316,15 @@ def _run_or_reuse_matrix_sample(
     )
 
 
-def _require_passing_smoke_gate(manifest_sha256: str) -> None:
+def _require_passing_smoke_gate(
+    manifest_sha256: str,
+    profile_scientific_identity: str,
+) -> None:
     """Block matrix submission unless the exact current smoke gate passed."""
     cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
     sample_identities = {
         case.case_id: _search_sample_identity(
-            manifest_sha256,
+            profile_scientific_identity,
             SCREENING_QUERY,
             case,
             f"smoke-{case.case_id.lower()}",
@@ -3047,7 +3343,11 @@ def _require_passing_smoke_gate(manifest_sha256: str) -> None:
     ):
         raise RuntimeError("The current profile does not have a complete smoke gate")
     for case in cases:
-        search_identity = _search_identity(manifest_sha256, case)
+        search_identity = _search_identity(
+            profile_scientific_identity,
+            SCREENING_QUERY,
+            case,
+        )
         sample_relpath = _search_sample_relpath(
             SCREENING_QUERY,
             search_identity,
@@ -3057,7 +3357,6 @@ def _require_passing_smoke_gate(manifest_sha256: str) -> None:
             BENCHMARK_OUTPUT_VOLUME,
             f"{sample_relpath}/done.json",
             expected_identity=sample_identities[case.case_id],
-            verify_digests=False,
         ):
             raise RuntimeError(f"Smoke sample {case.case_id} is incomplete")
     summary = _read_volume_json(
@@ -3352,27 +3651,244 @@ def _matrix_sample_records(results: list[dict[str, Any]]) -> list[dict[str, obje
     ]
 
 
-def _matrix_summary_markdown(summary: dict[str, object]) -> str:
-    """Render the durable one-shot matrix outcome."""
+def _matrix_summary_markdown(
+    summary: dict[str, object],
+    rankings: dict[str, object],
+) -> str:
+    """Render the matrix outcome, gates, variability, and candidate ranks."""
     selected = summary.get("selected_case_ids")
-    selected_text = (
-        ", ".join(str(case_id) for case_id in selected)
-        if isinstance(selected, list)
-        else "none"
+    if not isinstance(selected, list):
+        raise ValueError("Matrix summary has invalid selected cases")
+    selected_ids = {str(case_id) for case_id in selected}
+    selected_text = ", ".join(sorted(selected_ids)) or "none"
+    candidate_rows = rankings.get("candidate_rankings")
+    statistics = rankings.get("case_statistics")
+    if not isinstance(candidate_rows, list) or not isinstance(statistics, dict):
+        raise ValueError("Matrix rankings are missing candidate statistics")
+    typed_candidates: list[dict[str, object]] = []
+    for candidate in candidate_rows:
+        if not isinstance(candidate, dict):
+            raise ValueError("Candidate ranking row must be an object")
+        typed_candidates.append({str(key): value for key, value in candidate.items()})
+    typed_statistics: dict[str, dict[str, object]] = {}
+    for case_id, case_statistics in statistics.items():
+        if not isinstance(case_statistics, dict):
+            raise ValueError(f"Invalid matrix statistics for {case_id}")
+        typed_statistics[str(case_id)] = {
+            str(key): value for key, value in case_statistics.items()
+        }
+
+    ordered_candidates = sorted(
+        typed_candidates,
+        key=lambda row: (
+            not bool(row["scientific_valid"]),
+            _ranking_float(row, "median_search_wall_seconds"),
+            _ranking_float(row, "median_estimated_compute_cost_usd"),
+            str(row["case_id"]),
+        ),
     )
-    return "\n".join([
+    campaign_complete = not str(summary["status"]).startswith("blocked_")
+    lines = [
         f"# {CAMPAIGN_ID} measured matrix",
         "",
         f"Status: **{summary['status']}**",
+        f"Campaign complete: **{'YES' if campaign_complete else 'NO'}**",
         f"Screening samples: {summary['screening_samples']}",
         f"Stress samples: {summary['stress_samples']}",
         f"Submitted remote samples: {summary['remote_function_inputs_submitted']}",
-        f"Promoted sharded cases: {selected_text or 'none'}",
+        f"Promoted sharded cases: {selected_text}",
         "",
         "B1 is the scientific and performance oracle. B0 remains descriptive.",
         "No additional diagnostic samples are submitted automatically.",
         "",
+        "## Screening candidate ranking",
+        "",
+        "| Rank | Case | Scientific | Stable | Search median (s) | "
+        "Search min-max (s) | Search MAD (s) | vs B1 | Sample median (s) | "
+        "Cost median (USD) | 20% gate | Selected |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | "
+        "---: | --- | --- |",
+    ]
+    for rank, candidate in enumerate(ordered_candidates, start=1):
+        case_id = str(candidate["case_id"])
+        minimum = _case_statistic_float(
+            typed_statistics, case_id, "search_wall_seconds", "minimum"
+        )
+        maximum = _case_statistic_float(
+            typed_statistics, case_id, "search_wall_seconds", "maximum"
+        )
+        mad = _case_statistic_float(
+            typed_statistics,
+            case_id,
+            "search_wall_seconds",
+            "median_absolute_deviation",
+        )
+        lines.append(
+            f"| {rank} | {case_id} | "
+            f"{'PASS' if candidate['scientific_valid'] is True else 'FAIL'} | "
+            f"{'PASS' if candidate['stable_within_10_percent'] is True else 'FAIL'} | "
+            f"{_ranking_float(candidate, 'median_search_wall_seconds'):.3f} | "
+            f"{minimum:.3f}-{maximum:.3f} | {mad:.3f} | "
+            f"{_ranking_float(candidate, 'search_improvement_vs_B1'):.1%} | "
+            f"{_ranking_float(candidate, 'median_sample_wall_seconds'):.3f} | "
+            f"{_ranking_float(candidate, 'median_estimated_compute_cost_usd'):.6f} | "
+            f"{'PASS' if candidate['meaningful_20_percent_success'] is True else 'FAIL'} | "
+            f"{'yes' if case_id in selected_ids else 'no'} |"
+        )
+
+    b1_search = _case_statistic_float(
+        typed_statistics, "B1", "search_wall_seconds", "median"
+    )
+    b1_sample = _case_statistic_float(
+        typed_statistics, "B1", "sample_wall_seconds", "median"
+    )
+    b1_remote = _case_statistic_float(
+        typed_statistics, "B1", "remote_call_wall_seconds", "median"
+    )
+    lines.extend([
+        "",
+        "## Oracle timing",
+        "",
+        f"B1 median Search Wall Time: {b1_search:.3f} s",
+        f"B1 median Sample Wall Time: {b1_sample:.3f} s",
+        f"B1 median Remote Call Wall Time: {b1_remote:.3f} s",
+        "",
+        "The ranking uses median Search Wall Time. Variation is the three-sample "
+        "range divided by the median; MAD is reported instead of p95.",
+        "",
     ])
+    return "\n".join(lines)
+
+
+def _campaign_results_parquet(
+    matrix_results: list[dict[str, Any]] | None = None,
+) -> bytes:
+    """Combine available scan and search sample indexes at campaign root."""
+    import polars as pl
+
+    tables: list[pl.DataFrame] = []
+    operation_paths = (
+        (
+            "storage-scan",
+            f"benchmarks/{CAMPAIGN_ID}/storage-scans/results.parquet",
+        ),
+        ("smoke", f"benchmarks/{CAMPAIGN_ID}/search/smoke/results.parquet"),
+    )
+    for campaign_stage, relative_path in operation_paths:
+        try:
+            data = _read_volume_bytes(BENCHMARK_OUTPUT_VOLUME, relative_path)
+        except FileNotFoundError:
+            continue
+        tables.append(
+            pl.read_parquet(io.BytesIO(data)).with_columns(
+                pl.lit(campaign_stage).alias("campaign_stage")
+            )
+        )
+
+    if matrix_results is None:
+        matrix_paths = (
+            f"benchmarks/{CAMPAIGN_ID}/search/matrix/all-results.parquet",
+            f"benchmarks/{CAMPAIGN_ID}/search/matrix/screening-results.parquet",
+        )
+        for relative_path in matrix_paths:
+            try:
+                data = _read_volume_bytes(BENCHMARK_OUTPUT_VOLUME, relative_path)
+            except FileNotFoundError:
+                continue
+            tables.append(
+                pl.read_parquet(io.BytesIO(data)).with_columns(
+                    pl.lit("matrix").alias("campaign_stage")
+                )
+            )
+            break
+    else:
+        tables.append(
+            pl.read_parquet(
+                io.BytesIO(_search_results_parquet(matrix_results))
+            ).with_columns(pl.lit("matrix").alias("campaign_stage"))
+        )
+
+    if not tables:
+        raise ValueError("No completed scan or search samples are available")
+    combined = pl.concat(tables, how="diagonal_relaxed")
+    sort_columns = [
+        column
+        for column in (
+            "campaign_stage",
+            "sample_kind",
+            "query_id",
+            "case_id",
+            "block_index",
+            "partition_index",
+            "pass",
+        )
+        if column in combined.columns
+    ]
+    buffer = io.BytesIO()
+    combined.sort(sort_columns).write_parquet(buffer)
+    return buffer.getvalue()
+
+
+def _publish_campaign_progress(
+    *,
+    stage: str,
+    status: str,
+    details: list[str],
+) -> None:
+    """Publish a clearly incomplete campaign snapshot after an operation."""
+    campaign_root = f"benchmarks/{CAMPAIGN_ID}"
+    try:
+        matrix_summary = _read_volume_json(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{campaign_root}/search/matrix/summary.json",
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        if matrix_summary.get("campaign_id") == CAMPAIGN_ID:
+            return
+    results = _campaign_results_parquet()
+    summary = "\n".join([
+        f"# {CAMPAIGN_ID}",
+        "",
+        f"Current stage: **{stage}**",
+        f"Status: **{status}**",
+        "Campaign complete: **NO**",
+        "",
+        *details,
+        "",
+        "This is a progress snapshot, not a final sharding recommendation.",
+        "",
+    ]).encode()
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{campaign_root}/results.parquet",
+        results,
+    )
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{campaign_root}/summary.md",
+        summary,
+    )
+
+
+def _publish_campaign_matrix_snapshot(
+    summary: dict[str, object],
+    rankings: dict[str, object],
+    matrix_results: list[dict[str, Any]] | None = None,
+) -> None:
+    """Publish the campaign-wide sample index and measured matrix report."""
+    campaign_root = f"benchmarks/{CAMPAIGN_ID}"
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{campaign_root}/results.parquet",
+        _campaign_results_parquet(matrix_results),
+    )
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{campaign_root}/summary.md",
+        _matrix_summary_markdown(summary, rankings).encode(),
+    )
 
 
 def _publish_matrix_artifacts(
@@ -3440,7 +3956,6 @@ def _completed_matrix_is_valid(
             BENCHMARK_OUTPUT_VOLUME,
             f"{result_path}/done.json",
             expected_identity=sample_identity,
-            verify_digests=False,
         ):
             return None
     return summary
@@ -3448,6 +3963,7 @@ def _completed_matrix_is_valid(
 
 def _submit_search_matrix() -> dict[str, object]:
     """Run the fixed screening matrix and conditionally run its stress matrix."""
+    _ensure_campaign_plan_client()
     _validate_screening_block_orders()
     manifest_relpath = f"{APP_INFO.profile_relpath}/manifest.json"
     manifest_bytes = _read_volume_bytes(SHARDED_MSA_DB_VOLUME, manifest_relpath)
@@ -3456,11 +3972,20 @@ def _submit_search_matrix() -> dict[str, object]:
         raise ValueError("Profile manifest must be a JSON object")
     _validate_profile_manifest(manifest)
     manifest_sha256 = _sha256_bytes(manifest_bytes)
-    _require_passing_smoke_gate(manifest_sha256)
+    profile_scientific_identity = _profile_scientific_identity(manifest)
+    _require_passing_smoke_gate(
+        manifest_sha256,
+        profile_scientific_identity,
+    )
     operation_root = f"benchmarks/{CAMPAIGN_ID}/search/matrix"
     operation_identity = _matrix_operation_identity(manifest_sha256)
     completed = _completed_matrix_is_valid(operation_root, operation_identity)
     if completed is not None:
+        completed_rankings = _read_volume_json(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{operation_root}/rankings.json",
+        )
+        _publish_campaign_matrix_snapshot(completed, completed_rankings)
         return completed | {
             "status": "reused",
             "remote_function_inputs_submitted": 0,
@@ -3471,7 +3996,7 @@ def _submit_search_matrix() -> dict[str, object]:
     for block_index, order in enumerate(SCREENING_BLOCK_ORDERS, start=1):
         for case_id in order:
             result, submitted = _run_or_reuse_matrix_sample(
-                manifest_sha256,
+                profile_scientific_identity,
                 SCREENING_QUERY,
                 _search_case(case_id),
                 _matrix_sample_id("screen", case_id, block_index),
@@ -3527,9 +4052,10 @@ def _submit_search_matrix() -> dict[str, object]:
         }
         blocked_artifacts = screening_artifacts | {
             "summary.json": _json_bytes(summary),
-            "summary.md": _matrix_summary_markdown(summary).encode(),
+            "summary.md": _matrix_summary_markdown(summary, rankings).encode(),
         }
         _publish_matrix_artifacts(operation_root, blocked_artifacts)
+        _publish_campaign_matrix_snapshot(summary, rankings, screening_results)
         return summary
 
     selected = rankings.get("selected_case_ids")
@@ -3554,13 +4080,14 @@ def _submit_search_matrix() -> dict[str, object]:
         }
         final_artifacts = screening_artifacts | {
             "summary.json": _json_bytes(summary),
-            "summary.md": _matrix_summary_markdown(summary).encode(),
+            "summary.md": _matrix_summary_markdown(summary, rankings).encode(),
         }
         _finalize_matrix_operation(
             operation_root,
             operation_identity,
             final_artifacts,
         )
+        _publish_campaign_matrix_snapshot(summary, rankings, screening_results)
         return summary
 
     selected_pair = (str(selected[0]), str(selected[1]))
@@ -3571,7 +4098,7 @@ def _submit_search_matrix() -> dict[str, object]:
     ):
         for case_id in order:
             result, submitted = _run_or_reuse_matrix_sample(
-                manifest_sha256,
+                profile_scientific_identity,
                 STRESS_QUERY,
                 _search_case(case_id),
                 _matrix_sample_id("stress", case_id, block_index),
@@ -3602,6 +4129,7 @@ def _submit_search_matrix() -> dict[str, object]:
         "stress_samples": len(stress_results),
         "selected_case_ids": list(selected_pair),
         "stress_scientific_gate_passed": stress_gate_passed,
+        "stress_statistics": stress_statistics,
         "samples": _matrix_sample_records(all_results),
         "remote_function_inputs_submitted": submitted_inputs,
         "completed_at": _utc_now(),
@@ -3613,13 +4141,14 @@ def _submit_search_matrix() -> dict[str, object]:
         "stress-statistics.json": _json_bytes(stress_statistics),
         "all-results.parquet": _search_results_parquet(all_results),
         "summary.json": _json_bytes(summary),
-        "summary.md": _matrix_summary_markdown(summary).encode(),
+        "summary.md": _matrix_summary_markdown(summary, rankings).encode(),
     }
     _finalize_matrix_operation(
         operation_root,
         operation_identity,
         final_artifacts,
     )
+    _publish_campaign_matrix_snapshot(summary, rankings, all_results)
     return summary
 
 

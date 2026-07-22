@@ -100,7 +100,11 @@ The current layout is:
 
 ```text
 src/biomodals/service/
-  api.py             unified app factory, auth and common routes
+  api.py             app assembly, lifecycle and production wiring
+  http_contract.py   shared errors, auth dependencies and middleware
+  operations_api.py  liveness and readiness routes
+  auth_api.py        browser authentication contract and routes
+  jobs_api.py        provider-neutral Job and Result routes
   config.py          host configuration
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
@@ -127,7 +131,14 @@ The common routes are:
 - `GET /api/v1/jobs`
 - `GET /api/v1/jobs/{job_id}`
 - `POST /api/v1/jobs/{job_id}/cancel`
+- `POST /api/v1/jobs/{job_id}/prepare-download`
 - `GET /api/v1/jobs/{job_id}/download`
+
+The app factory composes these route modules and registered workloads. Route
+modules depend on the small shared HTTP contract rather than importing the app
+factory, so a future API area can reuse authentication and error behavior
+without creating circular imports or adding more unrelated responsibilities to
+`api.py`.
 
 GROMACS submission is `POST /api/v1/gromacs/jobs`; AlphaFold3 will use its own
 prefix.

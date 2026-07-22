@@ -11,7 +11,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from biomodals.service.api import (
+from biomodals.service.auth import AuthenticatedSession, AuthService
+from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
@@ -19,7 +20,6 @@ from biomodals.service.api import (
     require_session,
     require_unsafe_session,
 )
-from biomodals.service.auth import AuthenticatedSession, AuthService
 from biomodals.service.runtime_config import (
     EffectiveSetting,
     RuntimeConfiguration,

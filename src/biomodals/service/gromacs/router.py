@@ -25,7 +25,9 @@ from fastapi import (
 from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.helper.pdb import validate_pdb_content
-from biomodals.service.api import (
+from biomodals.service.auth import AuthenticatedSession
+from biomodals.service.gromacs.plan import prepare_operation
+from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
@@ -33,8 +35,6 @@ from biomodals.service.api import (
     request_id_from,
     require_unsafe_session,
 )
-from biomodals.service.auth import AuthenticatedSession
-from biomodals.service.gromacs.plan import prepare_operation
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     JobView,

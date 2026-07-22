@@ -31,7 +31,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from threading import Event, Thread
+from statistics import median
+from threading import Event, Lock, Thread
 from time import perf_counter
 from typing import Any
 
@@ -68,6 +69,10 @@ JACKHMMER_FILTER_F1 = 5e-4
 JACKHMMER_FILTER_F2 = 5e-5
 JACKHMMER_FILTER_F3 = 5e-7
 RESOURCE_TRACE_INTERVAL_SECONDS = 1.0
+MODAL_CPU_USD_PER_CORE_SECOND = 0.0000131
+MODAL_MEMORY_USD_PER_GIB_SECOND = 0.00000222
+MODAL_PRICING_OBSERVED_DATE = "2026-07-22"
+MODAL_PRICING_URL = "https://modal.com/pricing"
 JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
@@ -171,6 +176,10 @@ runtime_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+_CONTAINER_INSTANCE_ID = uuid.uuid4().hex
+_CONTAINER_SAMPLE_COUNT = 0
+_CONTAINER_SAMPLE_LOCK = Lock()
 
 
 def _utc_now() -> str:
@@ -1089,6 +1098,20 @@ def _container_metadata() -> dict[str, object]:
     }
 
 
+def _container_sample_metadata() -> dict[str, object]:
+    """Record whether this interpreter already ran a benchmark sample."""
+    global _CONTAINER_SAMPLE_COUNT  # noqa: PLW0603
+
+    with _CONTAINER_SAMPLE_LOCK:
+        _CONTAINER_SAMPLE_COUNT += 1
+        sample_ordinal = _CONTAINER_SAMPLE_COUNT
+    return _container_metadata() | {
+        "container_instance_id": _CONTAINER_INSTANCE_ID,
+        "container_sample_ordinal": sample_ordinal,
+        "container_reused_for_sample": sample_ordinal > 1,
+    }
+
+
 def _run_scan_partition(case_id: str, partition_index: int) -> dict[str, object]:
     """Execute one two-pass Volume scan assignment."""
     case = _scan_case(case_id)
@@ -1273,8 +1296,9 @@ def _client_done_marker_valid(
     marker_relative_path: str,
     *,
     expected_identity: str,
+    verify_digests: bool = True,
 ) -> bool:
-    """Validate a completion marker through metadata-only client reads."""
+    """Validate a marker, optionally trusting its published artifact digests."""
     try:
         marker = _read_volume_json(volume, marker_relative_path)
         if marker.get("schema_version") != DONE_SCHEMA_VERSION:
@@ -1287,6 +1311,12 @@ def _client_done_marker_valid(
         if not isinstance(artifacts, list) or not artifacts:
             return False
         marker_parent = PurePosixPath(marker_relative_path).parent
+        listed_sizes: dict[str, int] = {}
+        if not verify_digests:
+            listed_sizes = {
+                PurePosixPath(entry.path).as_posix().lstrip("/"): entry.size
+                for entry in volume.listdir(str(marker_parent), recursive=True)
+            }
         for record in artifacts:
             if not isinstance(record, dict):
                 return False
@@ -1296,11 +1326,25 @@ def _client_done_marker_valid(
             path = PurePosixPath(relative)
             if path.is_absolute() or ".." in path.parts:
                 return False
-            artifact = _read_volume_bytes(volume, str(marker_parent / path))
-            if len(artifact) != record.get("size_bytes"):
+            size_bytes = record.get("size_bytes")
+            digest = record.get("sha256")
+            if isinstance(size_bytes, bool) or not isinstance(size_bytes, int):
                 return False
-            if _sha256_bytes(artifact) != record.get("sha256"):
+            if not isinstance(digest, str) or len(digest) != 64:
                 return False
+            artifact_path = (marker_parent / path).as_posix().lstrip("/")
+            if verify_digests:
+                artifact = _read_volume_bytes(volume, artifact_path)
+                if len(artifact) != size_bytes:
+                    return False
+                if _sha256_bytes(artifact) != digest:
+                    return False
+            else:
+                listed_size = listed_sizes.get(artifact_path)
+                if listed_size is None:
+                    listed_size = listed_sizes.get(path.as_posix())
+                if listed_size != size_bytes:
+                    return False
     except (FileNotFoundError, ValueError, orjson.JSONDecodeError):
         return False
     return True
@@ -1532,7 +1576,25 @@ PEMBROLIZUMAB_VH_SEQUENCE = (
 PEMBROLIZUMAB_VH_SHA256 = (
     "5d92fab232244fa55131fc3b8d31b34990aa778623cdd906d58cf920dbdaf28f"
 )
+ECOLI_K12_GROEL_SEQUENCE = (
+    "MAAKDVKFGNDARVKMLRGVNVLADAVKVTLGPKGRNVVLDKSFGAPTITKDGVSVAREIELEDKFENMG"
+    "AQMVKEVASKANDAAGDGTTTATVLAQAIITEGLKAVAAGMNPMDLKRGIDKAVTAAVEELKALSVPCSD"
+    "SKAIAQVGTISANSDETVGKLIAEAMDKVGKEGVITVEDGTGLQDELDVVEGMQFDRGYLSPYFINKPET"
+    "GAVELESPFILLADKKISNIREMLPVLEAVAKAGKPLLIIAEDVEGEALATLVVNTMRGIVKVAAVKAPG"
+    "FGDRRKAMLQDIATLTGGTVISEEIGMELEKATLEDLGQAKRVVINKDTTTIIDGVGEEAAIQGRVAQIR"
+    "QQIEEATSDYDREKLQERVAKLAGGVAVIKVGAATEVEMKEKKARVEDALHATRAAVEEGVVAGGGVALI"
+    "RVASKLADLRGQNEDQNVGIKVALRAMEAPLRQIVLNCGEEPSVVANTVKGGDGNYGYNAATEEYGNMID"
+    "MGILDPTKVTRSALQYAASVAGLMITTECMVTDLPKNDAADLGAAGGMGGMGGMGGMM"
+)
+ECOLI_K12_GROEL_SHA256 = (
+    "40544c6fee0f15b6fe78d6ab7e5e27d8080224fe28dc0d6ca6f2e9a790dd24d4"
+)
 SMOKE_CASE_IDS = ("B0", "B1", "S3")
+SCREENING_BLOCK_ORDERS = (
+    ("B1", "S3", "S0", "B0", "S5", "S2", "S4", "S1"),
+    ("S3", "S0", "B1", "S5", "S2", "B0", "S4", "S1"),
+    ("S1", "S4", "B0", "S2", "S5", "B1", "S3", "S0"),
+)
 
 
 @dataclass(frozen=True)
@@ -1583,6 +1645,12 @@ SCREENING_QUERY = SearchQuery(
     sequence=PEMBROLIZUMAB_VH_SEQUENCE,
     sequence_sha256=PEMBROLIZUMAB_VH_SHA256,
 )
+STRESS_QUERY = SearchQuery(
+    query_id="ecoli-k12-groel",
+    role="stress",
+    sequence=ECOLI_K12_GROEL_SEQUENCE,
+    sequence_sha256=ECOLI_K12_GROEL_SHA256,
+)
 SEARCH_CASES = (
     SearchCase("B0", "monolith", 8, 1, None),
     SearchCase("B1", "monolith", 8, 1, SMALL_BFD_Z),
@@ -1606,12 +1674,15 @@ def _search_case(case_id: str) -> SearchCase:
 
 def _search_query(query_id: str) -> SearchQuery:
     """Resolve one fixed query and validate its embedded digest."""
-    if query_id != SCREENING_QUERY.query_id:
-        raise ValueError(f"Unknown search query: {query_id!r}")
-    measured_sha256 = _sha256_bytes(SCREENING_QUERY.sequence.encode())
-    if measured_sha256 != SCREENING_QUERY.sequence_sha256:
-        raise RuntimeError("Embedded screening query SHA-256 is invalid")
-    return SCREENING_QUERY
+    queries = (SCREENING_QUERY, STRESS_QUERY)
+    for query in queries:
+        if query.query_id == query_id:
+            measured_sha256 = _sha256_bytes(query.sequence.encode())
+            if measured_sha256 != query.sequence_sha256:
+                raise RuntimeError(f"Embedded {query.query_id} SHA-256 is invalid")
+            return query
+    choices = ", ".join(query.query_id for query in queries)
+    raise ValueError(f"Unknown search query {query_id!r}; expected one of {choices}")
 
 
 def _validate_sample_id(sample_id: str) -> str:
@@ -1699,20 +1770,11 @@ def _search_sample_relpath(
 
 def _build_search_plan(mode: str) -> dict[str, object]:
     """Build a side-effect-free fixed search plan."""
-    if mode != "smoke":
-        raise ValueError("search mode must be 'smoke'")
-    cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
-    return {
+    common: dict[str, object] = {
         "campaign_id": CAMPAIGN_ID,
         "operation": "search",
         "mode": mode,
-        "query": SCREENING_QUERY.as_dict(),
-        "cases": [case.as_dict() for case in cases],
-        "remote_function_inputs": len(cases),
         "execution": "sequential",
-        "counted_as_benchmark_samples": False,
-        "oracle_case": "B1",
-        "scientific_gate_case": "S3",
         "resources_per_container": {
             "cpu": [0.125, 32.125],
             "memory_mib": [1024, 131_072],
@@ -1720,6 +1782,44 @@ def _build_search_plan(mode: str) -> dict[str, object]:
         },
         "cache_policy": "validate-done-marker-before-remote-call",
     }
+    if mode == "smoke":
+        cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
+        return common | {
+            "query": SCREENING_QUERY.as_dict(),
+            "cases": [case.as_dict() for case in cases],
+            "remote_function_inputs": len(cases),
+            "counted_as_benchmark_samples": False,
+            "oracle_case": "B1",
+            "scientific_gate_case": "S3",
+        }
+    if mode == "matrix":
+        return common | {
+            "screening_query": SCREENING_QUERY.as_dict(),
+            "stress_query": STRESS_QUERY.as_dict(),
+            "screening_block_orders": [list(order) for order in SCREENING_BLOCK_ORDERS],
+            "screening_samples": 24,
+            "conditional_stress_samples": 12,
+            "maximum_remote_function_inputs": 36,
+            "stress_cases": "B0, B1, and two promoted sharded layouts",
+            "prerequisite": "completed passing smoke gate",
+            "scientific_gate": {
+                "oracle_case": "B1",
+                "top_unique_hits_exact": 100,
+                "minimum_full_unique_hit_jaccard": 0.99,
+            },
+            "performance_gate": {
+                "minimum_search_wall_improvement_vs_B1": 0.20,
+                "cost_candidate_maximum_slowdown_vs_fastest": 0.15,
+                "maximum_three_sample_variation": 0.10,
+            },
+            "pricing": {
+                "cpu_usd_per_core_second": MODAL_CPU_USD_PER_CORE_SECOND,
+                "memory_usd_per_gib_second": MODAL_MEMORY_USD_PER_GIB_SECOND,
+                "observed_date": MODAL_PRICING_OBSERVED_DATE,
+                "source": MODAL_PRICING_URL,
+            },
+        }
+    raise ValueError("search mode must be 'smoke' or 'matrix'")
 
 
 def _parse_a3m_records(a3m: str) -> list[tuple[str, str]]:
@@ -1874,52 +1974,107 @@ def _read_optional_integer(path: Path) -> int | None:
         return None
 
 
-def _cgroup_cpu_usage_usec() -> int | None:
-    """Read cumulative cgroup CPU use across Python and Jackhmmer children."""
-    cpu_stat = Path("/sys/fs/cgroup/cpu.stat")
+def _cgroup_cpu_stats() -> dict[str, int | None]:
+    """Read cumulative cgroup CPU use and throttling counters."""
+    stats: dict[str, int | None] = {
+        "usage_usec": None,
+        "nr_periods": None,
+        "nr_throttled": None,
+        "throttled_usec": None,
+    }
     try:
-        for line in cpu_stat.read_text(encoding="utf-8").splitlines():
+        lines = Path("/sys/fs/cgroup/cpu.stat").read_text(encoding="utf-8")
+        for line in lines.splitlines():
             key, _, value = line.partition(" ")
-            if key == "usage_usec":
-                return int(value)
+            if key in stats:
+                stats[key] = int(value)
     except (FileNotFoundError, PermissionError, ValueError):
         pass
-    usage_ns = _read_optional_integer(Path("/sys/fs/cgroup/cpuacct/cpuacct.usage"))
-    return None if usage_ns is None else usage_ns // 1_000
+    if stats["usage_usec"] is None:
+        usage_ns = _read_optional_integer(Path("/sys/fs/cgroup/cpuacct/cpuacct.usage"))
+        stats["usage_usec"] = None if usage_ns is None else usage_ns // 1_000
+    return stats
 
 
-def _resource_snapshot(started: float) -> dict[str, object]:
+def _mark_resource_phase(
+    phase_state: dict[str, Any],
+    phase: str,
+    started: float,
+) -> None:
+    """Record an exact phase boundary for the next trace observation."""
+    phase_state["current"] = phase
+    events = phase_state.setdefault("events", [])
+    if not isinstance(events, list):
+        raise TypeError("Resource phase events must be a list")
+    events.append({
+        "phase": phase,
+        "observed_at": _utc_now(),
+        "elapsed_seconds": perf_counter() - started,
+    })
+
+
+def _resource_snapshot(
+    started: float,
+    phase_state: dict[str, Any],
+    context: dict[str, object],
+) -> dict[str, object]:
     """Capture one portable one-second resource observation."""
+    import resource
+
     load_average: list[float] | None = None
     if hasattr(os, "getloadavg"):
         load_average = list(os.getloadavg())
-    return {
+    affinity: list[int] | None = None
+    if hasattr(os, "sched_getaffinity"):
+        affinity = sorted(os.sched_getaffinity(0))
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_stats = _cgroup_cpu_stats()
+    events = phase_state.get("events")
+    if not isinstance(events, list):
+        events = []
+    return context | {
         "observed_at": _utc_now(),
         "elapsed_seconds": perf_counter() - started,
-        "cpu_usage_usec": _cgroup_cpu_usage_usec(),
+        "phase": phase_state.get("current"),
+        "phase_events": list(events),
+        "cpu_usage_usec": cpu_stats["usage_usec"],
+        "cpu_nr_periods": cpu_stats["nr_periods"],
+        "cpu_nr_throttled": cpu_stats["nr_throttled"],
+        "cpu_throttled_usec": cpu_stats["throttled_usec"],
         "memory_current_bytes": _read_optional_integer(
             Path("/sys/fs/cgroup/memory.current")
         ),
         "memory_peak_bytes": _read_optional_integer(Path("/sys/fs/cgroup/memory.peak")),
         "load_average": load_average,
+        "cpu_affinity": affinity,
+        "children_user_seconds": children.ru_utime,
+        "children_system_seconds": children.ru_stime,
     }
 
 
-def _trace_resources(trace_path: Path, stop: Event, started: float) -> None:
+def _trace_resources(
+    trace_path: Path,
+    stop: Event,
+    started: float,
+    phase_state: dict[str, Any],
+    context: dict[str, object],
+) -> None:
     """Persist cgroup measurements once a second until the sample finishes."""
     with trace_path.open("xb") as handle:
         while True:
-            handle.write(orjson.dumps(_resource_snapshot(started)) + b"\n")
+            snapshot = _resource_snapshot(started, phase_state, context)
+            handle.write(orjson.dumps(snapshot) + b"\n")
             handle.flush()
             if stop.wait(RESOURCE_TRACE_INTERVAL_SECONDS):
-                handle.write(orjson.dumps(_resource_snapshot(started)) + b"\n")
+                snapshot = _resource_snapshot(started, phase_state, context)
+                handle.write(orjson.dumps(snapshot) + b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
                 return
 
 
 def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]:
-    """Reduce the raw trace to actual CPU and memory usage signals."""
+    """Reduce the raw trace to actual CPU, throttling, and memory signals."""
     snapshots = [
         orjson.loads(line)
         for line in trace_path.read_bytes().splitlines()
@@ -1928,16 +2083,29 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
     if not snapshots:
         raise ValueError("Resource trace is empty")
     cpu_rates: list[float] = []
+    memory_gib_seconds = 0.0
+    has_memory_integral = False
     for previous, current in zip(snapshots, snapshots[1:], strict=False):
+        elapsed = float(current["elapsed_seconds"]) - float(previous["elapsed_seconds"])
         previous_cpu = previous.get("cpu_usage_usec")
         current_cpu = current.get("cpu_usage_usec")
-        elapsed = float(current["elapsed_seconds"]) - float(previous["elapsed_seconds"])
         if (
             isinstance(previous_cpu, int)
             and isinstance(current_cpu, int)
             and elapsed > 0
         ):
             cpu_rates.append((current_cpu - previous_cpu) / 1_000_000 / elapsed)
+        previous_memory = previous.get("memory_current_bytes")
+        current_memory = current.get("memory_current_bytes")
+        if (
+            isinstance(previous_memory, int)
+            and isinstance(current_memory, int)
+            and elapsed > 0
+        ):
+            mean_memory_bytes = (previous_memory + current_memory) / 2
+            memory_gib_seconds += mean_memory_bytes / (1024**3) * elapsed
+            has_memory_integral = True
+
     first_cpu = snapshots[0].get("cpu_usage_usec")
     last_cpu = snapshots[-1].get("cpu_usage_usec")
     cpu_core_seconds: float | None = None
@@ -1955,13 +2123,75 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
         for value in (snapshot.get("memory_peak_bytes"),)
         if isinstance(value, int)
     ]
+    first_throttled = snapshots[0].get("cpu_throttled_usec")
+    last_throttled = snapshots[-1].get("cpu_throttled_usec")
+    throttled_seconds: float | None = None
+    if isinstance(first_throttled, int) and isinstance(last_throttled, int):
+        throttled_seconds = (last_throttled - first_throttled) / 1_000_000
+    first_nr_throttled = snapshots[0].get("cpu_nr_throttled")
+    last_nr_throttled = snapshots[-1].get("cpu_nr_throttled")
+    throttled_periods: int | None = None
+    if isinstance(first_nr_throttled, int) and isinstance(last_nr_throttled, int):
+        throttled_periods = last_nr_throttled - first_nr_throttled
+    first_child_user = snapshots[0].get("children_user_seconds")
+    last_child_user = snapshots[-1].get("children_user_seconds")
+    first_child_system = snapshots[0].get("children_system_seconds")
+    last_child_system = snapshots[-1].get("children_system_seconds")
+    child_cpu_values = (
+        first_child_user,
+        last_child_user,
+        first_child_system,
+        last_child_system,
+    )
+    child_cpu_seconds: float | None = None
+    if all(isinstance(value, int | float) for value in child_cpu_values):
+        child_cpu_seconds = (
+            float(last_child_user)
+            - float(first_child_user)
+            + float(last_child_system)
+            - float(first_child_system)
+        )
     return {
         "observations": len(snapshots),
         "elapsed_seconds": float(snapshots[-1]["elapsed_seconds"]),
         "cpu_core_seconds": cpu_core_seconds,
+        "child_process_cpu_seconds": child_cpu_seconds,
         "peak_interval_cpu_cores": max(cpu_rates) if cpu_rates else None,
+        "cpu_throttled_periods": throttled_periods,
+        "cpu_throttled_seconds": throttled_seconds,
+        "memory_gib_seconds": memory_gib_seconds if has_memory_integral else None,
         "peak_memory_current_bytes": max(memory_values) if memory_values else None,
         "cgroup_memory_peak_bytes": max(peak_values) if peak_values else None,
+    }
+
+
+def _estimate_compute_cost(
+    resource_summary: dict[str, int | float | None],
+    sample_wall_seconds: float,
+) -> dict[str, float | str]:
+    """Estimate billed CPU and memory using Modal's published Function rates."""
+    cpu_core_seconds = resource_summary.get("cpu_core_seconds")
+    memory_gib_seconds = resource_summary.get("memory_gib_seconds")
+    observed_cpu = (
+        float(cpu_core_seconds) if isinstance(cpu_core_seconds, int | float) else 0.0
+    )
+    observed_memory = (
+        float(memory_gib_seconds)
+        if isinstance(memory_gib_seconds, int | float)
+        else 0.0
+    )
+    billed_cpu = max(0.125 * sample_wall_seconds, observed_cpu)
+    billed_memory = max(1.0 * sample_wall_seconds, observed_memory)
+    cpu_cost = billed_cpu * MODAL_CPU_USD_PER_CORE_SECOND
+    memory_cost = billed_memory * MODAL_MEMORY_USD_PER_GIB_SECOND
+    return {
+        "estimated_billed_cpu_core_seconds": billed_cpu,
+        "estimated_billed_memory_gib_seconds": billed_memory,
+        "estimated_cpu_cost_usd": cpu_cost,
+        "estimated_memory_cost_usd": memory_cost,
+        "estimated_compute_cost_usd": cpu_cost + memory_cost,
+        "pricing_observed_date": MODAL_PRICING_OBSERVED_DATE,
+        "pricing_source": MODAL_PRICING_URL,
     }
 
 
@@ -1969,6 +2199,8 @@ def _execute_jackhmmer_search(
     profile_root: Path,
     query: SearchQuery,
     case: SearchCase,
+    phase_state: dict[str, Any],
+    sample_started: float,
 ) -> tuple[str, list[tuple[str, str]], dict[str, object]]:
     """Run the pinned wrapper while retaining raw tblout and phase timings."""
     from importlib import import_module
@@ -1993,6 +2225,7 @@ def _execute_jackhmmer_search(
         filter_f3=JACKHMMER_FILTER_F3,
         max_threads=case.active_shards,
     )
+    _mark_resource_phase(phase_state, "query", sample_started)
     search_started = perf_counter()
     if case.layout == "monolith":
         shard_started = perf_counter()
@@ -2052,6 +2285,7 @@ def _execute_jackhmmer_search(
         if result.tblout is None:
             raise ValueError(f"Shard {timing['source']} did not contain tblout")
         raw_tblouts.append((str(timing["source"]), result.tblout))
+    _mark_resource_phase(phase_state, "merge", sample_started)
     merge_started = perf_counter()
     merged = jackhmmer._merge_jackhmmer_results(  # noqa: SLF001
         results,
@@ -2078,6 +2312,7 @@ def _run_search_sample(
     expected_sample_identity: str,
 ) -> dict[str, object]:
     """Run one immutable sample and publish its completion marker last."""
+    sample_started = perf_counter()
     query = _search_query(query_id)
     case = _search_case(case_id)
     validated_sample_id = _validate_sample_id(sample_id)
@@ -2120,8 +2355,10 @@ def _run_search_sample(
         BENCHMARK_OUTPUT_VOLUME.commit()
     output_root.mkdir(parents=True)
     log_path = output_root / "run.log"
-    trace_path = output_root / "resource-trace.jsonl"
-    sample_started = perf_counter()
+    trace_path = output_root / "trace.jsonl"
+    container = _container_sample_metadata()
+    phase_state: dict[str, Any] = {"current": None, "events": []}
+    _mark_resource_phase(phase_state, "warmup", sample_started)
     _append_log(
         log_path,
         f"Starting {query.query_id} {case.case_id} sample {validated_sample_id}",
@@ -2129,7 +2366,19 @@ def _run_search_sample(
     trace_stop = Event()
     trace_thread = Thread(
         target=_trace_resources,
-        args=(trace_path, trace_stop, sample_started),
+        args=(
+            trace_path,
+            trace_stop,
+            sample_started,
+            phase_state,
+            {
+                "query_id": query.query_id,
+                "case_id": case.case_id,
+                "jackhmmer_n_cpu": case.jackhmmer_n_cpu,
+                "active_shards": case.active_shards,
+                "container_instance_id": container["container_instance_id"],
+            },
+        ),
         daemon=True,
     )
     trace_thread.start()
@@ -2138,7 +2387,10 @@ def _run_search_sample(
             profile_root,
             query,
             case,
+            phase_state,
+            sample_started,
         )
+        _mark_resource_phase(phase_state, "publish", sample_started)
         merged_a3m_path = output_root / "merged.a3m"
         _write_bytes_exclusive(merged_a3m_path, merged_a3m.encode())
         raw_tblout_paths: list[Path] = []
@@ -2174,10 +2426,13 @@ def _run_search_sample(
         )
         BENCHMARK_OUTPUT_VOLUME.commit()
         raise
+    _mark_resource_phase(phase_state, "complete", sample_started)
     trace_stop.set()
     trace_thread.join()
+    BENCHMARK_OUTPUT_VOLUME.commit()
     sample_wall_seconds = perf_counter() - sample_started
     resource_summary = _summarize_resource_trace(trace_path)
+    cost_estimate = _estimate_compute_cost(resource_summary, sample_wall_seconds)
     unique_hit_count = len({str(row["target_id"]) for row in hit_rows})
     cross_shard_duplicate_count = len({
         str(row["target_id"])
@@ -2206,7 +2461,8 @@ def _run_search_sample(
         "duplicate_hit_rows": len(hit_rows) - unique_hit_count,
         "cross_shard_duplicate_targets": cross_shard_duplicate_count,
         "resource_summary": resource_summary,
-        "container": _container_metadata(),
+        "cost_estimate": cost_estimate,
+        "container": container,
     }
     metrics_path = output_root / "metrics.json"
     _write_json_atomic(metrics_path, metrics)
@@ -2340,8 +2596,14 @@ def _compare_normalized_hits(
         if row.get("cross_shard_duplicate") is True
     })
     has_set_differences = bool(oracle_only or candidate_only)
+    both_results_reached_hit_row_limit = (
+        len(oracle_rows) == JACKHMMER_MAX_SEQUENCES - 1
+        and len(candidate_rows) == JACKHMMER_MAX_SEQUENCES - 1
+    )
     differences_characterized = not has_set_differences or (
-        differences_are_below_top_100 and bool(duplicate_targets)
+        differences_are_below_top_100
+        and bool(duplicate_targets)
+        and both_results_reached_hit_row_limit
     )
     passed = (
         top_hits_exact
@@ -2368,6 +2630,7 @@ def _compare_normalized_hits(
         "oracle_only_ids": oracle_only,
         "candidate_only_ids": candidate_only,
         "differences_are_below_top_100": differences_are_below_top_100,
+        "both_results_reached_hit_row_limit": both_results_reached_hit_row_limit,
         "candidate_cross_shard_duplicate_targets": duplicate_targets,
         "differences_characterized_as_duplicate_tail": differences_characterized,
     }
@@ -2393,6 +2656,7 @@ def _search_results_parquet(results: list[dict[str, Any]]) -> bytes:
         case = result.get("case")
         query = result.get("query")
         resource = result.get("resource_summary")
+        cost = result.get("cost_estimate")
         container = result.get("container")
         if not isinstance(case, dict):
             raise ValueError("Search result is missing case metadata")
@@ -2400,11 +2664,14 @@ def _search_results_parquet(results: list[dict[str, Any]]) -> bytes:
             raise ValueError("Search result is missing query metadata")
         if not isinstance(resource, dict):
             raise ValueError("Search result is missing resource metadata")
+        if not isinstance(cost, dict):
+            raise ValueError("Search result is missing cost metadata")
         if not isinstance(container, dict):
             raise ValueError("Search result is missing nested metadata")
         rows.append({
             "campaign_id": CAMPAIGN_ID,
             "sample_kind": result["sample_kind"],
+            "block_index": result.get("block_index"),
             "query_id": query["query_id"],
             "query_length": query["length"],
             "case_id": case["case_id"],
@@ -2425,8 +2692,14 @@ def _search_results_parquet(results: list[dict[str, Any]]) -> bytes:
             "cross_shard_duplicate_targets": result["cross_shard_duplicate_targets"],
             "cpu_core_seconds": resource.get("cpu_core_seconds"),
             "peak_interval_cpu_cores": resource.get("peak_interval_cpu_cores"),
+            "cpu_throttled_periods": resource.get("cpu_throttled_periods"),
+            "cpu_throttled_seconds": resource.get("cpu_throttled_seconds"),
             "peak_memory_current_bytes": resource.get("peak_memory_current_bytes"),
+            "estimated_compute_cost_usd": cost.get("estimated_compute_cost_usd"),
             "container_hostname": container.get("hostname"),
+            "container_instance_id": container.get("container_instance_id"),
+            "container_sample_ordinal": container.get("container_sample_ordinal"),
+            "container_reused_for_sample": container.get("container_reused_for_sample"),
             "result_path": result["result_path"],
             "reused": result["reused"],
         })
@@ -2529,6 +2802,7 @@ def _submit_search_smoke() -> dict[str, object]:
             BENCHMARK_OUTPUT_VOLUME,
             f"{sample_relpaths[case.case_id]}/done.json",
             expected_identity=sample_identities[case.case_id],
+            verify_digests=False,
         )
         for case in cases
     )
@@ -2554,15 +2828,17 @@ def _submit_search_smoke() -> dict[str, object]:
             BENCHMARK_OUTPUT_VOLUME,
             marker_path,
             expected_identity=sample_identities[case.case_id],
+            verify_digests=False,
         )
-        remote_started = perf_counter()
         if reused:
             result = _read_volume_json(
                 BENCHMARK_OUTPUT_VOLUME,
                 f"{sample_relpaths[case.case_id]}/metrics.json",
             )
+            remote_call_wall_seconds = 0.0
         else:
             submitted_inputs += 1
+            remote_started = perf_counter()
             result = benchmark_small_bfd_search.remote(
                 query_id=SCREENING_QUERY.query_id,
                 case_id=case.case_id,
@@ -2570,11 +2846,12 @@ def _submit_search_smoke() -> dict[str, object]:
                 expected_search_identity=search_identities[case.case_id],
                 expected_sample_identity=sample_identities[case.case_id],
             )
+            remote_call_wall_seconds = perf_counter() - remote_started
         results.append(
             result
             | {
                 "sample_kind": "smoke",
-                "remote_call_wall_seconds": perf_counter() - remote_started,
+                "remote_call_wall_seconds": remote_call_wall_seconds,
                 "reused": reused,
             }
         )
@@ -2640,6 +2917,712 @@ def _submit_search_smoke() -> dict[str, object]:
     return summary
 
 
+def _validate_screening_block_orders() -> None:
+    """Require three distinct permutations of every fixed search case."""
+    expected = {case.case_id for case in SEARCH_CASES}
+    if len(SCREENING_BLOCK_ORDERS) != 3:
+        raise ValueError("The screening matrix must contain three blocks")
+    if len(set(SCREENING_BLOCK_ORDERS)) != len(SCREENING_BLOCK_ORDERS):
+        raise ValueError("Screening block orders must be distinct")
+    for order in SCREENING_BLOCK_ORDERS:
+        if len(order) != len(expected) or set(order) != expected:
+            raise ValueError("Each screening block must contain every case once")
+
+
+def _matrix_operation_identity(manifest_sha256: str) -> str:
+    """Hash the fixed one-shot matrix plan and profile identity."""
+    _validate_screening_block_orders()
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "campaign_id": CAMPAIGN_ID,
+            "profile_manifest_sha256": manifest_sha256,
+            "plan": _build_search_plan("matrix"),
+        })
+    )
+
+
+def _matrix_sample_id(kind: str, case_id: str, block_index: int) -> str:
+    """Return one deterministic screening or stress sample ID."""
+    if kind not in {"screen", "stress"}:
+        raise ValueError("Matrix sample kind must be 'screen' or 'stress'")
+    _search_case(case_id)
+    if block_index not in {1, 2, 3}:
+        raise ValueError("Matrix block index must be 1, 2, or 3")
+    return f"{kind}-{case_id.lower()}-block-{block_index:02d}"
+
+
+def _matrix_sample_spec(
+    manifest_sha256: str,
+    query: SearchQuery,
+    case: SearchCase,
+    sample_id: str,
+) -> dict[str, str]:
+    """Build all immutable identifiers and paths for one matrix sample."""
+    search_identity = _search_identity(manifest_sha256, case)
+    sample_identity = _search_sample_identity(
+        manifest_sha256,
+        query,
+        case,
+        sample_id,
+    )
+    return {
+        "search_identity": search_identity,
+        "sample_identity": sample_identity,
+        "sample_relpath": _search_sample_relpath(
+            query,
+            search_identity,
+            sample_id,
+        ),
+    }
+
+
+def _run_or_reuse_matrix_sample(
+    manifest_sha256: str,
+    query: SearchQuery,
+    case: SearchCase,
+    sample_id: str,
+    *,
+    sample_kind: str,
+    block_index: int,
+) -> tuple[dict[str, Any], bool]:
+    """Check durable evidence before submitting exactly one remote sample."""
+    spec = _matrix_sample_spec(manifest_sha256, query, case, sample_id)
+    marker_path = f"{spec['sample_relpath']}/done.json"
+    reused = _client_done_marker_valid(
+        BENCHMARK_OUTPUT_VOLUME,
+        marker_path,
+        expected_identity=spec["sample_identity"],
+        verify_digests=False,
+    )
+    if reused:
+        result = _read_volume_json(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{spec['sample_relpath']}/metrics.json",
+        )
+        remote_call_wall_seconds = 0.0
+    else:
+        remote_started = perf_counter()
+        result = benchmark_small_bfd_search.remote(
+            query_id=query.query_id,
+            case_id=case.case_id,
+            sample_id=sample_id,
+            expected_search_identity=spec["search_identity"],
+            expected_sample_identity=spec["sample_identity"],
+        )
+        remote_call_wall_seconds = perf_counter() - remote_started
+    return (
+        result
+        | {
+            "sample_kind": sample_kind,
+            "block_index": block_index,
+            "remote_call_wall_seconds": remote_call_wall_seconds,
+            "reused": reused,
+        },
+        not reused,
+    )
+
+
+def _require_passing_smoke_gate(manifest_sha256: str) -> None:
+    """Block matrix submission unless the exact current smoke gate passed."""
+    cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
+    sample_identities = {
+        case.case_id: _search_sample_identity(
+            manifest_sha256,
+            SCREENING_QUERY,
+            case,
+            f"smoke-{case.case_id.lower()}",
+        )
+        for case in cases
+    }
+    operation_identity = _smoke_operation_identity(
+        manifest_sha256,
+        sample_identities,
+    )
+    smoke_root = f"benchmarks/{CAMPAIGN_ID}/search/smoke"
+    if not _client_done_marker_valid(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{smoke_root}/done.json",
+        expected_identity=operation_identity,
+    ):
+        raise RuntimeError("The current profile does not have a complete smoke gate")
+    for case in cases:
+        search_identity = _search_identity(manifest_sha256, case)
+        sample_relpath = _search_sample_relpath(
+            SCREENING_QUERY,
+            search_identity,
+            f"smoke-{case.case_id.lower()}",
+        )
+        if not _client_done_marker_valid(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{sample_relpath}/done.json",
+            expected_identity=sample_identities[case.case_id],
+            verify_digests=False,
+        ):
+            raise RuntimeError(f"Smoke sample {case.case_id} is incomplete")
+    summary = _read_volume_json(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{smoke_root}/summary.json",
+    )
+    if summary.get("scientific_gate_passed") is not True:
+        raise RuntimeError("The current profile's smoke scientific gate did not pass")
+
+
+def _metric_float(result: dict[str, Any], key: str) -> float:
+    """Read one finite, nonnegative numeric sample metric."""
+    value = result.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"Search result has invalid numeric metric {key!r}")
+    numeric = float(value)
+    if numeric < 0 or numeric == float("inf") or numeric != numeric:
+        raise ValueError(f"Search result has non-finite metric {key!r}")
+    return numeric
+
+
+def _sample_cost(result: dict[str, Any]) -> float:
+    """Read the pinned compute-cost estimate from one sample."""
+    estimate = result.get("cost_estimate")
+    if not isinstance(estimate, dict):
+        raise ValueError("Search result is missing its cost estimate")
+    value = estimate.get("estimated_compute_cost_usd")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("Search result has an invalid compute-cost estimate")
+    return float(value)
+
+
+def _median_summary(values: list[float]) -> dict[str, float]:
+    """Report median, range, MAD, and three-sample variation."""
+    if not values:
+        raise ValueError("Cannot summarize an empty metric sample")
+    center = median(values)
+    absolute_deviations = [abs(value - center) for value in values]
+    variation = (max(values) - min(values)) / center if center else 0.0
+    return {
+        "median": center,
+        "minimum": min(values),
+        "maximum": max(values),
+        "range": max(values) - min(values),
+        "median_absolute_deviation": median(absolute_deviations),
+        "relative_range": variation,
+    }
+
+
+def _case_performance_statistics(
+    results: list[dict[str, Any]],
+) -> dict[str, dict[str, object]]:
+    """Aggregate three measured samples for every represented case."""
+    case_ids = sorted({str(result["case"]["case_id"]) for result in results})
+    statistics: dict[str, dict[str, object]] = {}
+    for case_id in case_ids:
+        case_results = [
+            result for result in results if result["case"]["case_id"] == case_id
+        ]
+        if len(case_results) != 3:
+            raise ValueError(
+                f"Expected three samples for {case_id}, got {len(case_results)}"
+            )
+        statistics[case_id] = {
+            "search_wall_seconds": _median_summary([
+                _metric_float(result, "search_wall_seconds") for result in case_results
+            ]),
+            "sample_wall_seconds": _median_summary([
+                _metric_float(result, "sample_wall_seconds") for result in case_results
+            ]),
+            "remote_call_wall_seconds": _median_summary([
+                _metric_float(result, "remote_call_wall_seconds")
+                for result in case_results
+            ]),
+            "estimated_compute_cost_usd": _median_summary([
+                _sample_cost(result) for result in case_results
+            ]),
+            "new_container_samples": sum(
+                result["container"].get("container_reused_for_sample") is False
+                for result in case_results
+            ),
+            "reused_container_samples": sum(
+                result["container"].get("container_reused_for_sample") is True
+                for result in case_results
+            ),
+        }
+    return statistics
+
+
+def _case_statistic_float(
+    statistics: dict[str, dict[str, object]],
+    case_id: str,
+    metric: str,
+    statistic: str,
+) -> float:
+    """Read one checked numeric value from nested case statistics."""
+    summary = statistics[case_id].get(metric)
+    if not isinstance(summary, dict):
+        raise ValueError(f"Missing {metric} statistics for {case_id}")
+    value = summary.get(statistic)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"Invalid {metric}.{statistic} for {case_id}")
+    return float(value)
+
+
+def _ranking_float(row: dict[str, object], key: str) -> float:
+    """Read one checked numeric candidate-ranking value."""
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"Invalid candidate ranking value: {key}")
+    return float(value)
+
+
+def _matrix_comparisons(
+    results: list[dict[str, Any]],
+    candidate_case_ids: tuple[str, ...],
+) -> dict[str, dict[str, object]]:
+    """Compare every candidate and B0 with the same-block B1 oracle."""
+    indexed = {
+        (int(result["block_index"]), str(result["case"]["case_id"])): result
+        for result in results
+    }
+    hit_tables = {
+        key: _read_normalized_hits(str(result["result_path"]))
+        for key, result in indexed.items()
+    }
+    comparisons: dict[str, dict[str, object]] = {}
+    for block_index in (1, 2, 3):
+        oracle = hit_tables[(block_index, "B1")]
+        for case_id in ("B0", *candidate_case_ids):
+            comparison_id = f"block-{block_index:02d}-{case_id}-vs-B1"
+            comparisons[comparison_id] = _compare_normalized_hits(
+                oracle,
+                hit_tables[(block_index, case_id)],
+            ) | {
+                "block_index": block_index,
+                "oracle_case": "B1",
+                "candidate_case": case_id,
+                "is_gate": case_id != "B0",
+            }
+    return comparisons
+
+
+def _rank_screening_cases(
+    results: list[dict[str, Any]],
+    comparisons: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Apply scientific, stability, speed, overhead, and cost promotion rules."""
+    statistics = _case_performance_statistics(results)
+    b1_search = _case_statistic_float(statistics, "B1", "search_wall_seconds", "median")
+    b1_sample = _case_statistic_float(statistics, "B1", "sample_wall_seconds", "median")
+    candidate_rows: list[dict[str, object]] = []
+    for case in SEARCH_CASES:
+        if not case.case_id.startswith("S"):
+            continue
+        scientific_valid = all(
+            comparisons[f"block-{block_index:02d}-{case.case_id}-vs-B1"]["passed"]
+            is True
+            for block_index in (1, 2, 3)
+        )
+        search_median = _case_statistic_float(
+            statistics, case.case_id, "search_wall_seconds", "median"
+        )
+        sample_median = _case_statistic_float(
+            statistics, case.case_id, "sample_wall_seconds", "median"
+        )
+        cost_median = _case_statistic_float(
+            statistics, case.case_id, "estimated_compute_cost_usd", "median"
+        )
+        search_improvement = 1.0 - search_median / b1_search
+        sample_improvement = 1.0 - sample_median / b1_sample
+        stable = (
+            _case_statistic_float(
+                statistics,
+                case.case_id,
+                "search_wall_seconds",
+                "relative_range",
+            )
+            <= 0.10
+        )
+        operational_overhead_preserves_improvement = sample_improvement > 0
+        meaningful = (
+            scientific_valid
+            and stable
+            and search_improvement >= 0.20
+            and operational_overhead_preserves_improvement
+        )
+        candidate_rows.append({
+            "case_id": case.case_id,
+            "scientific_valid": scientific_valid,
+            "stable_within_10_percent": stable,
+            "search_improvement_vs_B1": search_improvement,
+            "sample_improvement_vs_B1": sample_improvement,
+            "operational_overhead_preserves_improvement": (
+                operational_overhead_preserves_improvement
+            ),
+            "meaningful_20_percent_success": meaningful,
+            "median_search_wall_seconds": search_median,
+            "median_sample_wall_seconds": sample_median,
+            "median_estimated_compute_cost_usd": cost_median,
+        })
+
+    invalid_cases = [
+        str(row["case_id"])
+        for row in candidate_rows
+        if row["scientific_valid"] is False
+    ]
+    unstable_cases = [
+        str(row["case_id"])
+        for row in candidate_rows
+        if row["scientific_valid"] is True and row["stable_within_10_percent"] is False
+    ]
+    meaningful = [
+        row for row in candidate_rows if row["meaningful_20_percent_success"] is True
+    ]
+    status = "promoted"
+    selected: list[str] = []
+    if invalid_cases:
+        status = "blocked_scientific_review"
+    elif unstable_cases:
+        status = "blocked_high_variation"
+    elif len(meaningful) < 2:
+        status = "complete_insufficient_meaningful_layouts"
+    else:
+        fastest = min(
+            meaningful,
+            key=lambda row: (
+                _ranking_float(row, "median_search_wall_seconds"),
+                _ranking_float(row, "median_estimated_compute_cost_usd"),
+                str(row["case_id"]),
+            ),
+        )
+        cost_pool = [
+            row
+            for row in meaningful
+            if row["case_id"] != fastest["case_id"]
+            and _ranking_float(row, "median_search_wall_seconds")
+            <= _ranking_float(fastest, "median_search_wall_seconds") * 1.15
+        ]
+        if not cost_pool:
+            status = "complete_no_distinct_cost_candidate_within_15_percent"
+        else:
+            lowest_cost = min(
+                cost_pool,
+                key=lambda row: (
+                    _ranking_float(row, "median_estimated_compute_cost_usd"),
+                    _ranking_float(row, "median_search_wall_seconds"),
+                    str(row["case_id"]),
+                ),
+            )
+            selected = [str(fastest["case_id"]), str(lowest_cost["case_id"])]
+    return {
+        "status": status,
+        "selected_case_ids": selected,
+        "invalid_scientific_case_ids": invalid_cases,
+        "unstable_case_ids": unstable_cases,
+        "candidate_rankings": candidate_rows,
+        "case_statistics": statistics,
+        "rules": _build_search_plan("matrix")["performance_gate"],
+    }
+
+
+def _stress_block_orders(
+    selected_case_ids: tuple[str, str],
+) -> tuple[tuple[str, ...], ...]:
+    """Return three distinct deterministic stress permutations."""
+    first, second = selected_case_ids
+    if first == second or not all(
+        case_id.startswith("S") for case_id in (first, second)
+    ):
+        raise ValueError("Stress promotion requires two distinct sharded cases")
+    _search_case(first)
+    _search_case(second)
+    return (
+        ("B0", "B1", first, second),
+        (second, "B0", first, "B1"),
+        ("B1", first, "B0", second),
+    )
+
+
+def _matrix_sample_records(results: list[dict[str, Any]]) -> list[dict[str, object]]:
+    """Build marker-validation references for every measured sample."""
+    return [
+        {
+            "query_id": result["query"]["query_id"],
+            "case_id": result["case"]["case_id"],
+            "sample_id": result["sample_id"],
+            "sample_identity": result["sample_identity"],
+            "result_path": result["result_path"],
+        }
+        for result in results
+    ]
+
+
+def _matrix_summary_markdown(summary: dict[str, object]) -> str:
+    """Render the durable one-shot matrix outcome."""
+    selected = summary.get("selected_case_ids")
+    selected_text = (
+        ", ".join(str(case_id) for case_id in selected)
+        if isinstance(selected, list)
+        else "none"
+    )
+    return "\n".join([
+        f"# {CAMPAIGN_ID} measured matrix",
+        "",
+        f"Status: **{summary['status']}**",
+        f"Screening samples: {summary['screening_samples']}",
+        f"Stress samples: {summary['stress_samples']}",
+        f"Submitted remote samples: {summary['remote_function_inputs_submitted']}",
+        f"Promoted sharded cases: {selected_text or 'none'}",
+        "",
+        "B1 is the scientific and performance oracle. B0 remains descriptive.",
+        "No additional diagnostic samples are submitted automatically.",
+        "",
+    ])
+
+
+def _publish_matrix_artifacts(
+    operation_root: str,
+    artifacts: dict[str, bytes],
+) -> None:
+    """Upload a complete set of small matrix index artifacts."""
+    for relative_path, data in artifacts.items():
+        _upload_volume_bytes(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{operation_root}/{relative_path}",
+            data,
+        )
+
+
+def _finalize_matrix_operation(
+    operation_root: str,
+    operation_identity: str,
+    artifacts: dict[str, bytes],
+) -> None:
+    """Publish all matrix indexes, then its completion marker last."""
+    _publish_matrix_artifacts(operation_root, artifacts)
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{operation_root}/done.json",
+        _json_bytes({
+            "schema_version": DONE_SCHEMA_VERSION,
+            "status": "complete",
+            "identity": operation_identity,
+            "completed_at": _utc_now(),
+            "artifacts": [
+                _volume_artifact_record(relative_path, data)
+                for relative_path, data in artifacts.items()
+            ],
+        }),
+    )
+
+
+def _completed_matrix_is_valid(
+    operation_root: str,
+    operation_identity: str,
+) -> dict[str, Any] | None:
+    """Validate a complete matrix index and each referenced sample marker."""
+    if not _client_done_marker_valid(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{operation_root}/done.json",
+        expected_identity=operation_identity,
+    ):
+        return None
+    summary = _read_volume_json(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{operation_root}/summary.json",
+    )
+    samples = summary.get("samples")
+    if not isinstance(samples, list):
+        return None
+    for sample in samples:
+        if not isinstance(sample, dict):
+            return None
+        result_path = sample.get("result_path")
+        sample_identity = sample.get("sample_identity")
+        if not isinstance(result_path, str) or not isinstance(sample_identity, str):
+            return None
+        if not _client_done_marker_valid(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{result_path}/done.json",
+            expected_identity=sample_identity,
+            verify_digests=False,
+        ):
+            return None
+    return summary
+
+
+def _submit_search_matrix() -> dict[str, object]:
+    """Run the fixed screening matrix and conditionally run its stress matrix."""
+    _validate_screening_block_orders()
+    manifest_relpath = f"{APP_INFO.profile_relpath}/manifest.json"
+    manifest_bytes = _read_volume_bytes(SHARDED_MSA_DB_VOLUME, manifest_relpath)
+    manifest = orjson.loads(manifest_bytes)
+    if not isinstance(manifest, dict):
+        raise ValueError("Profile manifest must be a JSON object")
+    _validate_profile_manifest(manifest)
+    manifest_sha256 = _sha256_bytes(manifest_bytes)
+    _require_passing_smoke_gate(manifest_sha256)
+    operation_root = f"benchmarks/{CAMPAIGN_ID}/search/matrix"
+    operation_identity = _matrix_operation_identity(manifest_sha256)
+    completed = _completed_matrix_is_valid(operation_root, operation_identity)
+    if completed is not None:
+        return completed | {
+            "status": "reused",
+            "remote_function_inputs_submitted": 0,
+        }
+
+    screening_results: list[dict[str, Any]] = []
+    submitted_inputs = 0
+    for block_index, order in enumerate(SCREENING_BLOCK_ORDERS, start=1):
+        for case_id in order:
+            result, submitted = _run_or_reuse_matrix_sample(
+                manifest_sha256,
+                SCREENING_QUERY,
+                _search_case(case_id),
+                _matrix_sample_id("screen", case_id, block_index),
+                sample_kind="screening",
+                block_index=block_index,
+            )
+            screening_results.append(result)
+            submitted_inputs += submitted
+
+    sharded_case_ids = tuple(
+        case.case_id for case in SEARCH_CASES if case.case_id.startswith("S")
+    )
+    screening_comparisons = _matrix_comparisons(
+        screening_results,
+        sharded_case_ids,
+    )
+    rankings = _rank_screening_cases(screening_results, screening_comparisons)
+    screening_summary = {
+        "schema_version": 1,
+        "campaign_id": CAMPAIGN_ID,
+        "operation_identity": operation_identity,
+        "status": rankings["status"],
+        "sample_count": len(screening_results),
+        "remote_function_inputs_submitted": submitted_inputs,
+        "samples": _matrix_sample_records(screening_results),
+        "completed_at": _utc_now(),
+    }
+    screening_artifacts = {
+        "screening-results.parquet": _search_results_parquet(screening_results),
+        "screening-comparisons.json": _json_bytes(screening_comparisons),
+        "rankings.json": _json_bytes(rankings),
+        "screening-summary.json": _json_bytes(screening_summary),
+    }
+    _publish_matrix_artifacts(operation_root, screening_artifacts)
+
+    ranking_status = str(rankings["status"])
+    if ranking_status.startswith("blocked_"):
+        summary: dict[str, object] = {
+            "schema_version": 1,
+            "status": ranking_status,
+            "campaign_id": CAMPAIGN_ID,
+            "operation": "search",
+            "mode": "matrix",
+            "operation_identity": operation_identity,
+            "profile_manifest_sha256": manifest_sha256,
+            "screening_samples": len(screening_results),
+            "stress_samples": 0,
+            "selected_case_ids": [],
+            "samples": _matrix_sample_records(screening_results),
+            "remote_function_inputs_submitted": submitted_inputs,
+            "completed_at": _utc_now(),
+            "requires_human_review": True,
+        }
+        blocked_artifacts = screening_artifacts | {
+            "summary.json": _json_bytes(summary),
+            "summary.md": _matrix_summary_markdown(summary).encode(),
+        }
+        _publish_matrix_artifacts(operation_root, blocked_artifacts)
+        return summary
+
+    selected = rankings.get("selected_case_ids")
+    if not isinstance(selected, list):
+        raise ValueError("Screening rankings have invalid selected cases")
+    if len(selected) != 2:
+        summary = {
+            "schema_version": 1,
+            "status": ranking_status,
+            "campaign_id": CAMPAIGN_ID,
+            "operation": "search",
+            "mode": "matrix",
+            "operation_identity": operation_identity,
+            "profile_manifest_sha256": manifest_sha256,
+            "screening_samples": len(screening_results),
+            "stress_samples": 0,
+            "selected_case_ids": selected,
+            "samples": _matrix_sample_records(screening_results),
+            "remote_function_inputs_submitted": submitted_inputs,
+            "completed_at": _utc_now(),
+            "requires_human_review": False,
+        }
+        final_artifacts = screening_artifacts | {
+            "summary.json": _json_bytes(summary),
+            "summary.md": _matrix_summary_markdown(summary).encode(),
+        }
+        _finalize_matrix_operation(
+            operation_root,
+            operation_identity,
+            final_artifacts,
+        )
+        return summary
+
+    selected_pair = (str(selected[0]), str(selected[1]))
+    stress_results: list[dict[str, Any]] = []
+    for block_index, order in enumerate(
+        _stress_block_orders(selected_pair),
+        start=1,
+    ):
+        for case_id in order:
+            result, submitted = _run_or_reuse_matrix_sample(
+                manifest_sha256,
+                STRESS_QUERY,
+                _search_case(case_id),
+                _matrix_sample_id("stress", case_id, block_index),
+                sample_kind="stress",
+                block_index=block_index,
+            )
+            stress_results.append(result)
+            submitted_inputs += submitted
+
+    stress_comparisons = _matrix_comparisons(stress_results, selected_pair)
+    stress_gate_passed = all(
+        comparison["passed"] is True
+        for comparison in stress_comparisons.values()
+        if comparison["is_gate"] is True
+    )
+    stress_statistics = _case_performance_statistics(stress_results)
+    final_status = "complete" if stress_gate_passed else "complete_stress_gate_failed"
+    all_results = [*screening_results, *stress_results]
+    summary = {
+        "schema_version": 1,
+        "status": final_status,
+        "campaign_id": CAMPAIGN_ID,
+        "operation": "search",
+        "mode": "matrix",
+        "operation_identity": operation_identity,
+        "profile_manifest_sha256": manifest_sha256,
+        "screening_samples": len(screening_results),
+        "stress_samples": len(stress_results),
+        "selected_case_ids": list(selected_pair),
+        "stress_scientific_gate_passed": stress_gate_passed,
+        "samples": _matrix_sample_records(all_results),
+        "remote_function_inputs_submitted": submitted_inputs,
+        "completed_at": _utc_now(),
+        "requires_human_review": not stress_gate_passed,
+    }
+    final_artifacts = screening_artifacts | {
+        "stress-results.parquet": _search_results_parquet(stress_results),
+        "stress-comparisons.json": _json_bytes(stress_comparisons),
+        "stress-statistics.json": _json_bytes(stress_statistics),
+        "all-results.parquet": _search_results_parquet(all_results),
+        "summary.json": _json_bytes(summary),
+        "summary.md": _matrix_summary_markdown(summary).encode(),
+    }
+    _finalize_matrix_operation(
+        operation_root,
+        operation_identity,
+        final_artifacts,
+    )
+    return summary
+
+
 @app.local_entrypoint()
 def submit_alphafold3_msa_task(
     operation: str = "prepare",
@@ -2654,7 +3637,7 @@ def submit_alphafold3_msa_task(
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
         seqkit_threads: SeqKit thread count for profile preparation, default 8.
-        search_mode: Fixed search workload. Currently ``smoke``.
+        search_mode: Fixed search workload: ``smoke`` or ``matrix``.
     """
     if operation == "prepare":
         plan = _build_prepare_plan(seqkit_threads)
@@ -2675,6 +3658,10 @@ def submit_alphafold3_msa_task(
         print("🧬 Submitting the sequential Volume scan matrix...")
         result = _submit_scan_matrix()
     else:
-        print("🧬 Submitting the sequential small-BFD search smoke...")
-        result = _submit_search_smoke()
+        if search_mode == "smoke":
+            print("🧬 Submitting the sequential small-BFD search smoke...")
+            result = _submit_search_smoke()
+        else:
+            print("🧬 Submitting the one-shot measured small-BFD matrix...")
+            result = _submit_search_matrix()
     print(_json_bytes(result).decode(), end="")

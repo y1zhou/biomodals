@@ -25,11 +25,13 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from threading import Event, Thread
 from time import perf_counter
 from typing import Any
 
@@ -54,6 +56,18 @@ SEQKIT_VERSION = "2.13.0"
 DEFAULT_SEQKIT_THREADS = 8
 MAX_SEQKIT_THREADS = 32
 MAX_PROFILE_IMBALANCE = 0.05
+HMMER_VERSION = "3.4"
+JACKHMMER_PATCH_SHA256 = (
+    "df9e3ae35ad1659921d96ebfca67a9616a7a467ddde2be18a56f9bd3edb38c41"
+)
+JACKHMMER_BINARY_PATH = "/hmmer/bin/jackhmmer"
+JACKHMMER_N_ITER = 1
+JACKHMMER_E_VALUE = 1e-4
+JACKHMMER_MAX_SEQUENCES = 5_000
+JACKHMMER_FILTER_F1 = 5e-4
+JACKHMMER_FILTER_F2 = 5e-5
+JACKHMMER_FILTER_F3 = 5e-7
+RESOURCE_TRACE_INTERVAL_SECONDS = 1.0
 JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
@@ -1511,26 +1525,1145 @@ def _submit_scan_matrix() -> dict[str, object]:
     }
 
 
+PEMBROLIZUMAB_VH_SEQUENCE = (
+    "QVQLVQSGVEVKKPGASVKVSCKASGYTFTNYYMYWVRQAPGQGLEWMGGINPSNGGTNFNEKFKNRV"
+    "TLTTDSSTTTAYMELKSLQFDDTAVYYCARRDYRFDMGFDYWGQGTTVTVSS"
+)
+PEMBROLIZUMAB_VH_SHA256 = (
+    "5d92fab232244fa55131fc3b8d31b34990aa778623cdd906d58cf920dbdaf28f"
+)
+SMOKE_CASE_IDS = ("B0", "B1", "S3")
+
+
+@dataclass(frozen=True)
+class SearchQuery:
+    """One immutable benchmark query sequence."""
+
+    query_id: str
+    role: str
+    sequence: str
+    sequence_sha256: str
+
+    def as_dict(self) -> dict[str, str | int]:
+        """Return query provenance without duplicating the full sequence."""
+        return {
+            "query_id": self.query_id,
+            "role": self.role,
+            "length": len(self.sequence),
+            "sequence_sha256": self.sequence_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class SearchCase:
+    """One scientific layout and operational Jackhmmer topology."""
+
+    case_id: str
+    layout: str
+    jackhmmer_n_cpu: int
+    active_shards: int
+    z_value: int | None
+
+    def as_dict(self) -> dict[str, str | int | None]:
+        """Return a primitive plan representation."""
+        return {
+            "case_id": self.case_id,
+            "layout": self.layout,
+            "jackhmmer_n_cpu": self.jackhmmer_n_cpu,
+            "active_shards": self.active_shards,
+            "aggregate_cpu_slots": self.jackhmmer_n_cpu * self.active_shards,
+            "z_value": self.z_value,
+            "dom_z_value": self.z_value,
+        }
+
+
+SCREENING_QUERY = SearchQuery(
+    query_id="pembrolizumab-vh",
+    role="screening",
+    sequence=PEMBROLIZUMAB_VH_SEQUENCE,
+    sequence_sha256=PEMBROLIZUMAB_VH_SHA256,
+)
+SEARCH_CASES = (
+    SearchCase("B0", "monolith", 8, 1, None),
+    SearchCase("B1", "monolith", 8, 1, SMALL_BFD_Z),
+    SearchCase("S0", "shards", 8, 1, SMALL_BFD_Z),
+    SearchCase("S1", "shards", 2, 4, SMALL_BFD_Z),
+    SearchCase("S2", "shards", 2, 8, SMALL_BFD_Z),
+    SearchCase("S3", "shards", 2, 16, SMALL_BFD_Z),
+    SearchCase("S4", "shards", 4, 8, SMALL_BFD_Z),
+    SearchCase("S5", "shards", 8, 4, SMALL_BFD_Z),
+)
+
+
+def _search_case(case_id: str) -> SearchCase:
+    """Resolve one fixed benchmark search case."""
+    for case in SEARCH_CASES:
+        if case.case_id == case_id:
+            return case
+    choices = ", ".join(case.case_id for case in SEARCH_CASES)
+    raise ValueError(f"Unknown search case {case_id!r}; expected one of {choices}")
+
+
+def _search_query(query_id: str) -> SearchQuery:
+    """Resolve one fixed query and validate its embedded digest."""
+    if query_id != SCREENING_QUERY.query_id:
+        raise ValueError(f"Unknown search query: {query_id!r}")
+    measured_sha256 = _sha256_bytes(SCREENING_QUERY.sequence.encode())
+    if measured_sha256 != SCREENING_QUERY.sequence_sha256:
+        raise RuntimeError("Embedded screening query SHA-256 is invalid")
+    return SCREENING_QUERY
+
+
+def _validate_sample_id(sample_id: str) -> str:
+    """Reject sample identifiers that cannot be safe path components."""
+    if not isinstance(sample_id, str) or not 1 <= len(sample_id) <= 64:
+        raise ValueError("sample_id must contain between 1 and 64 characters")
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+    if sample_id[0] == "-" or any(character not in allowed for character in sample_id):
+        raise ValueError("sample_id must use lowercase letters, digits, and hyphens")
+    return sample_id
+
+
+def _scientific_search_config(case: SearchCase) -> dict[str, object]:
+    """Return only result-affecting Jackhmmer configuration."""
+    return {
+        "alphafold_commit": CONF.repo_commit_hash,
+        "hmmer_version": HMMER_VERSION,
+        "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+        "database_layout": case.layout,
+        "n_iter": JACKHMMER_N_ITER,
+        "e_value": JACKHMMER_E_VALUE,
+        "z_value": case.z_value,
+        "dom_z_value": case.z_value,
+        "max_sequences": JACKHMMER_MAX_SEQUENCES,
+        "filter_f1": JACKHMMER_FILTER_F1,
+        "filter_f2": JACKHMMER_FILTER_F2,
+        "filter_f3": JACKHMMER_FILTER_F3,
+        "seq_limit_patch": True,
+    }
+
+
+def _search_identity(manifest_sha256: str, case: SearchCase) -> str:
+    """Hash database and result-affecting settings, excluding execution knobs."""
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "database_id": DATABASE_ID,
+            "profile_id": PROFILE_ID,
+            "profile_manifest_sha256": manifest_sha256,
+            "scientific_config": _scientific_search_config(case),
+        })
+    )
+
+
+def _search_sample_identity(
+    manifest_sha256: str,
+    query: SearchQuery,
+    case: SearchCase,
+    sample_id: str,
+) -> str:
+    """Hash both scientific inputs and operational sample settings."""
+    validated_sample_id = _validate_sample_id(sample_id)
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "campaign_id": CAMPAIGN_ID,
+            "query": query.as_dict(),
+            "search_identity": _search_identity(manifest_sha256, case),
+            "sample_id": validated_sample_id,
+            "operational_config": {
+                "case_id": case.case_id,
+                "jackhmmer_n_cpu": case.jackhmmer_n_cpu,
+                "active_shards": case.active_shards,
+                "resource_trace_interval_seconds": RESOURCE_TRACE_INTERVAL_SECONDS,
+            },
+        })
+    )
+
+
+def _search_sample_relpath(
+    query: SearchQuery,
+    search_identity: str,
+    sample_id: str,
+) -> str:
+    """Return the common sequence-addressed raw-MSA sample path."""
+    validated_sample_id = _validate_sample_id(sample_id)
+    if len(search_identity) != 64:
+        raise ValueError("search_identity must be a SHA-256 digest")
+    sequence_sha256 = query.sequence_sha256
+    return (
+        f"{sequence_sha256[:2]}/{sequence_sha256}/raw-msa/{DATABASE_ID}/"
+        f"{search_identity}/samples/{validated_sample_id}"
+    )
+
+
+def _build_search_plan(mode: str) -> dict[str, object]:
+    """Build a side-effect-free fixed search plan."""
+    if mode != "smoke":
+        raise ValueError("search mode must be 'smoke'")
+    cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
+    return {
+        "campaign_id": CAMPAIGN_ID,
+        "operation": "search",
+        "mode": mode,
+        "query": SCREENING_QUERY.as_dict(),
+        "cases": [case.as_dict() for case in cases],
+        "remote_function_inputs": len(cases),
+        "execution": "sequential",
+        "counted_as_benchmark_samples": False,
+        "oracle_case": "B1",
+        "scientific_gate_case": "S3",
+        "resources_per_container": {
+            "cpu": [0.125, 32.125],
+            "memory_mib": [1024, 131_072],
+            "timeout_seconds": CONF.timeout,
+        },
+        "cache_policy": "validate-done-marker-before-remote-call",
+    }
+
+
+def _parse_a3m_records(a3m: str) -> list[tuple[str, str]]:
+    """Parse the small, truncated merged A3M without importing AlphaFold."""
+    records: list[tuple[str, str]] = []
+    description: str | None = None
+    sequence_parts: list[str] = []
+    for raw_line in a3m.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if description is not None:
+                if not sequence_parts:
+                    raise ValueError(f"A3M record {description!r} has no sequence")
+                records.append(("".join(sequence_parts), description))
+            description = line[1:]
+            if not description:
+                raise ValueError("A3M record has an empty description")
+            sequence_parts = []
+        else:
+            if description is None:
+                raise ValueError("A3M sequence appears before its description")
+            sequence_parts.append(line)
+    if description is not None:
+        if not sequence_parts:
+            raise ValueError(f"A3M record {description!r} has no sequence")
+        records.append(("".join(sequence_parts), description))
+    if not records:
+        raise ValueError("Merged A3M is empty")
+    return records
+
+
+def _normalize_a3m_sequence(sequence: str) -> str:
+    """Remove A3M insertions and dot gaps for exact aligned-hit comparison."""
+    return "".join(
+        character
+        for character in sequence
+        if not character.islower() and character != "."
+    )
+
+
+def _tblout_index(
+    raw_tblouts: list[tuple[str, str]],
+) -> tuple[dict[str, dict[str, object]], dict[str, list[dict[str, object]]]]:
+    """Parse raw tblouts using the same target-name key as AlphaFold."""
+    latest_by_target: dict[str, dict[str, object]] = {}
+    occurrences: dict[str, list[dict[str, object]]] = {}
+    for source, tblout in raw_tblouts:
+        for line_number, line in enumerate(tblout.splitlines(), start=1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 6:
+                raise ValueError(
+                    f"Invalid tblout line {line_number} from {source}: {line!r}"
+                )
+            entry: dict[str, object] = {
+                "target_id": fields[0],
+                "e_value_text": fields[4],
+                "bit_score_text": fields[5],
+                "e_value": float(fields[4]),
+                "bit_score": float(fields[5]),
+                "source": source,
+                "line": line,
+            }
+            target_id = fields[0]
+            occurrences.setdefault(target_id, []).append(entry)
+            # This deliberately mirrors AlphaFold's last-tblout-line-wins map.
+            latest_by_target[target_id] = entry
+    return latest_by_target, occurrences
+
+
+def _normalized_hit_rows(
+    merged_a3m: str,
+    raw_tblouts: list[tuple[str, str]],
+) -> list[dict[str, object]]:
+    """Create one normalized evidence row per non-query merged A3M record."""
+    records = _parse_a3m_records(merged_a3m)
+    latest_by_target, occurrences = _tblout_index(raw_tblouts)
+    rows: list[dict[str, object]] = []
+    for ordinal, (sequence, description) in enumerate(records[1:], start=1):
+        target_id = description.partition(" ")[0].partition("/")[0]
+        entry = latest_by_target.get(target_id)
+        if entry is None:
+            raise ValueError(f"Merged A3M target has no tblout row: {target_id}")
+        target_occurrences = occurrences[target_id]
+        occurrence_sources = [str(item["source"]) for item in target_occurrences]
+        normalized_sequence = _normalize_a3m_sequence(sequence)
+        rows.append({
+            "ordinal": ordinal,
+            "target_id": target_id,
+            "description": description,
+            "aligned_sequence": sequence,
+            "normalized_sequence": normalized_sequence,
+            "normalized_sequence_sha256": _sha256_bytes(normalized_sequence.encode()),
+            "e_value": entry["e_value"],
+            "e_value_text": entry["e_value_text"],
+            "bit_score": entry["bit_score"],
+            "bit_score_text": entry["bit_score_text"],
+            "tblout_source": entry["source"],
+            "tblout_line": entry["line"],
+            "raw_occurrence_count": len(target_occurrences),
+            "raw_occurrence_sources": ",".join(occurrence_sources),
+            "cross_shard_duplicate": len(set(occurrence_sources)) > 1,
+        })
+    return rows
+
+
+def _normalized_hits_parquet(rows: list[dict[str, object]]) -> bytes:
+    """Serialize normalized hit evidence with a stable schema."""
+    import polars as pl
+
+    schema = {
+        "ordinal": pl.Int64,
+        "target_id": pl.String,
+        "description": pl.String,
+        "aligned_sequence": pl.String,
+        "normalized_sequence": pl.String,
+        "normalized_sequence_sha256": pl.String,
+        "e_value": pl.Float64,
+        "e_value_text": pl.String,
+        "bit_score": pl.Float64,
+        "bit_score_text": pl.String,
+        "tblout_source": pl.String,
+        "tblout_line": pl.String,
+        "raw_occurrence_count": pl.Int64,
+        "raw_occurrence_sources": pl.String,
+        "cross_shard_duplicate": pl.Boolean,
+    }
+    table = pl.DataFrame(rows, schema=schema) if rows else pl.DataFrame(schema=schema)
+    buffer = io.BytesIO()
+    table.write_parquet(buffer)
+    return buffer.getvalue()
+
+
+def _write_bytes_exclusive(path: Path, data: bytes) -> None:
+    """Write one evidence artifact without replacing an existing sample."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _read_optional_integer(path: Path) -> int | None:
+    """Read a Linux counter if exposed by the current cgroup."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        return None if value == "max" else int(value)
+    except (FileNotFoundError, PermissionError, ValueError):
+        return None
+
+
+def _cgroup_cpu_usage_usec() -> int | None:
+    """Read cumulative cgroup CPU use across Python and Jackhmmer children."""
+    cpu_stat = Path("/sys/fs/cgroup/cpu.stat")
+    try:
+        for line in cpu_stat.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if key == "usage_usec":
+                return int(value)
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    usage_ns = _read_optional_integer(Path("/sys/fs/cgroup/cpuacct/cpuacct.usage"))
+    return None if usage_ns is None else usage_ns // 1_000
+
+
+def _resource_snapshot(started: float) -> dict[str, object]:
+    """Capture one portable one-second resource observation."""
+    load_average: list[float] | None = None
+    if hasattr(os, "getloadavg"):
+        load_average = list(os.getloadavg())
+    return {
+        "observed_at": _utc_now(),
+        "elapsed_seconds": perf_counter() - started,
+        "cpu_usage_usec": _cgroup_cpu_usage_usec(),
+        "memory_current_bytes": _read_optional_integer(
+            Path("/sys/fs/cgroup/memory.current")
+        ),
+        "memory_peak_bytes": _read_optional_integer(Path("/sys/fs/cgroup/memory.peak")),
+        "load_average": load_average,
+    }
+
+
+def _trace_resources(trace_path: Path, stop: Event, started: float) -> None:
+    """Persist cgroup measurements once a second until the sample finishes."""
+    with trace_path.open("xb") as handle:
+        while True:
+            handle.write(orjson.dumps(_resource_snapshot(started)) + b"\n")
+            handle.flush()
+            if stop.wait(RESOURCE_TRACE_INTERVAL_SECONDS):
+                handle.write(orjson.dumps(_resource_snapshot(started)) + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                return
+
+
+def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]:
+    """Reduce the raw trace to actual CPU and memory usage signals."""
+    snapshots = [
+        orjson.loads(line)
+        for line in trace_path.read_bytes().splitlines()
+        if line.strip()
+    ]
+    if not snapshots:
+        raise ValueError("Resource trace is empty")
+    cpu_rates: list[float] = []
+    for previous, current in zip(snapshots, snapshots[1:], strict=False):
+        previous_cpu = previous.get("cpu_usage_usec")
+        current_cpu = current.get("cpu_usage_usec")
+        elapsed = float(current["elapsed_seconds"]) - float(previous["elapsed_seconds"])
+        if (
+            isinstance(previous_cpu, int)
+            and isinstance(current_cpu, int)
+            and elapsed > 0
+        ):
+            cpu_rates.append((current_cpu - previous_cpu) / 1_000_000 / elapsed)
+    first_cpu = snapshots[0].get("cpu_usage_usec")
+    last_cpu = snapshots[-1].get("cpu_usage_usec")
+    cpu_core_seconds: float | None = None
+    if isinstance(first_cpu, int) and isinstance(last_cpu, int):
+        cpu_core_seconds = (last_cpu - first_cpu) / 1_000_000
+    memory_values = [
+        value
+        for snapshot in snapshots
+        for value in (snapshot.get("memory_current_bytes"),)
+        if isinstance(value, int)
+    ]
+    peak_values = [
+        value
+        for snapshot in snapshots
+        for value in (snapshot.get("memory_peak_bytes"),)
+        if isinstance(value, int)
+    ]
+    return {
+        "observations": len(snapshots),
+        "elapsed_seconds": float(snapshots[-1]["elapsed_seconds"]),
+        "cpu_core_seconds": cpu_core_seconds,
+        "peak_interval_cpu_cores": max(cpu_rates) if cpu_rates else None,
+        "peak_memory_current_bytes": max(memory_values) if memory_values else None,
+        "cgroup_memory_peak_bytes": max(peak_values) if peak_values else None,
+    }
+
+
+def _execute_jackhmmer_search(
+    profile_root: Path,
+    query: SearchQuery,
+    case: SearchCase,
+) -> tuple[str, list[tuple[str, str]], dict[str, object]]:
+    """Run the pinned wrapper while retaining raw tblout and phase timings."""
+    from importlib import import_module
+
+    jackhmmer = import_module("alphafold3.data.tools.jackhmmer")
+
+    if case.layout == "monolith":
+        database_path = str(profile_root / "source" / SOURCE_DB_FILENAME)
+    else:
+        database_path = f"{profile_root / 'shards' / SOURCE_DB_FILENAME}@{SHARD_COUNT}"
+    tool = jackhmmer.Jackhmmer(
+        binary_path=JACKHMMER_BINARY_PATH,
+        database_path=database_path,
+        n_cpu=case.jackhmmer_n_cpu,
+        n_iter=JACKHMMER_N_ITER,
+        e_value=JACKHMMER_E_VALUE,
+        z_value=case.z_value,
+        dom_z_value=case.z_value,
+        max_sequences=JACKHMMER_MAX_SEQUENCES,
+        filter_f1=JACKHMMER_FILTER_F1,
+        filter_f2=JACKHMMER_FILTER_F2,
+        filter_f3=JACKHMMER_FILTER_F3,
+        max_threads=case.active_shards,
+    )
+    search_started = perf_counter()
+    if case.layout == "monolith":
+        shard_started = perf_counter()
+        result = tool._query_db_shard(  # noqa: SLF001
+            target_sequence=query.sequence,
+            db_shard_path=database_path,
+            get_tblout=True,
+        )
+        shard_finished = perf_counter()
+        if result.tblout is None:
+            raise ValueError("Monolith Jackhmmer result did not contain tblout")
+        search_wall_seconds = perf_counter() - search_started
+        return (
+            result.a3m,
+            [("monolith", result.tblout)],
+            {
+                "search_wall_seconds": search_wall_seconds,
+                "merge_wall_seconds": 0.0,
+                "shards": [
+                    {
+                        "source": "monolith",
+                        "started_seconds": shard_started - search_started,
+                        "finished_seconds": shard_finished - search_started,
+                        "wall_seconds": shard_finished - shard_started,
+                    }
+                ],
+            },
+        )
+
+    shard_paths = tuple(profile_root / "shards" / name for name in _shard_names())
+    global_temp_dir = tempfile.mkdtemp(prefix="af3-msa-search-")
+
+    def query_shard(shard_path: Path) -> tuple[Any, dict[str, object]]:
+        shard_started = perf_counter()
+        result = tool._query_db_shard(  # noqa: SLF001
+            target_sequence=query.sequence,
+            db_shard_path=str(shard_path),
+            get_tblout=True,
+            global_temp_dir=global_temp_dir,
+        )
+        shard_finished = perf_counter()
+        return result, {
+            "source": shard_path.name,
+            "started_seconds": shard_started - search_started,
+            "finished_seconds": shard_finished - search_started,
+            "wall_seconds": shard_finished - shard_started,
+        }
+
+    try:
+        with ThreadPoolExecutor(max_workers=case.active_shards) as executor:
+            outputs = tuple(executor.map(query_shard, shard_paths))
+    finally:
+        shutil.rmtree(global_temp_dir, ignore_errors=True)
+    results = [result for result, unused_timing in outputs]
+    raw_tblouts: list[tuple[str, str]] = []
+    for result, timing in outputs:
+        if result.tblout is None:
+            raise ValueError(f"Shard {timing['source']} did not contain tblout")
+        raw_tblouts.append((str(timing["source"]), result.tblout))
+    merge_started = perf_counter()
+    merged = jackhmmer._merge_jackhmmer_results(  # noqa: SLF001
+        results,
+        JACKHMMER_MAX_SEQUENCES,
+    )
+    merge_wall_seconds = perf_counter() - merge_started
+    search_wall_seconds = perf_counter() - search_started
+    return (
+        merged.a3m,
+        raw_tblouts,
+        {
+            "search_wall_seconds": search_wall_seconds,
+            "merge_wall_seconds": merge_wall_seconds,
+            "shards": [timing for unused_result, timing in outputs],
+        },
+    )
+
+
+def _run_search_sample(
+    query_id: str,
+    case_id: str,
+    sample_id: str,
+    expected_search_identity: str,
+    expected_sample_identity: str,
+) -> dict[str, object]:
+    """Run one immutable sample and publish its completion marker last."""
+    query = _search_query(query_id)
+    case = _search_case(case_id)
+    validated_sample_id = _validate_sample_id(sample_id)
+    profile_root = Path(APP_INFO.sharded_db_dir) / APP_INFO.profile_relpath
+    SHARDED_MSA_DB_VOLUME.reload()
+    BENCHMARK_OUTPUT_VOLUME.reload()
+    _validate_published_profile(profile_root, verify_digests=False)
+    manifest_path = profile_root / "manifest.json"
+    manifest_sha256 = _sha256_file(manifest_path)
+    search_identity = _search_identity(manifest_sha256, case)
+    sample_identity = _search_sample_identity(
+        manifest_sha256,
+        query,
+        case,
+        validated_sample_id,
+    )
+    if search_identity != expected_search_identity:
+        raise ValueError("Client and worker search identities differ")
+    if sample_identity != expected_sample_identity:
+        raise ValueError("Client and worker sample identities differ")
+
+    sample_relpath = _search_sample_relpath(
+        query,
+        search_identity,
+        validated_sample_id,
+    )
+    output_root = Path(APP_INFO.output_dir) / sample_relpath
+    try:
+        _validate_done_marker(output_root, expected_identity=sample_identity)
+    except (FileNotFoundError, ValueError):
+        pass
+    else:
+        metrics = _load_json_object(output_root / "metrics.json")
+        return metrics | {"status": "reused"}
+
+    if output_root.exists():
+        orphan_root = output_root.parent / ".orphaned"
+        orphan_root.mkdir(parents=True, exist_ok=True)
+        output_root.replace(orphan_root / f"{validated_sample_id}-{uuid.uuid4().hex}")
+        BENCHMARK_OUTPUT_VOLUME.commit()
+    output_root.mkdir(parents=True)
+    log_path = output_root / "run.log"
+    trace_path = output_root / "resource-trace.jsonl"
+    sample_started = perf_counter()
+    _append_log(
+        log_path,
+        f"Starting {query.query_id} {case.case_id} sample {validated_sample_id}",
+    )
+    trace_stop = Event()
+    trace_thread = Thread(
+        target=_trace_resources,
+        args=(trace_path, trace_stop, sample_started),
+        daemon=True,
+    )
+    trace_thread.start()
+    try:
+        merged_a3m, raw_tblouts, timings = _execute_jackhmmer_search(
+            profile_root,
+            query,
+            case,
+        )
+        merged_a3m_path = output_root / "merged.a3m"
+        _write_bytes_exclusive(merged_a3m_path, merged_a3m.encode())
+        raw_tblout_paths: list[Path] = []
+        for source, tblout in raw_tblouts:
+            tblout_path = output_root / "raw-tblout" / f"{source}.tblout"
+            _write_bytes_exclusive(tblout_path, tblout.encode())
+            raw_tblout_paths.append(tblout_path)
+        hit_rows = _normalized_hit_rows(merged_a3m, raw_tblouts)
+        normalized_hits_path = output_root / "normalized-hits.parquet"
+        _write_bytes_exclusive(
+            normalized_hits_path,
+            _normalized_hits_parquet(hit_rows),
+        )
+        _append_log(
+            log_path,
+            f"Completed search with {len(hit_rows)} merged hit rows",
+        )
+    except Exception as exc:
+        trace_stop.set()
+        trace_thread.join()
+        _append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
+        _write_json_atomic(
+            output_root / "failure.json",
+            {
+                "failed_at": _utc_now(),
+                "query": query.as_dict(),
+                "case": case.as_dict(),
+                "sample_id": validated_sample_id,
+                "sample_identity": sample_identity,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        raise
+    trace_stop.set()
+    trace_thread.join()
+    sample_wall_seconds = perf_counter() - sample_started
+    resource_summary = _summarize_resource_trace(trace_path)
+    unique_hit_count = len({str(row["target_id"]) for row in hit_rows})
+    cross_shard_duplicate_count = len({
+        str(row["target_id"])
+        for row in hit_rows
+        if row["cross_shard_duplicate"] is True
+    })
+    metrics: dict[str, object] = {
+        "status": "published",
+        "campaign_id": CAMPAIGN_ID,
+        "database_id": DATABASE_ID,
+        "profile_id": PROFILE_ID,
+        "profile_manifest_sha256": manifest_sha256,
+        "query": query.as_dict(),
+        "case": case.as_dict(),
+        "scientific_config": _scientific_search_config(case),
+        "search_identity": search_identity,
+        "sample_id": validated_sample_id,
+        "sample_identity": sample_identity,
+        "result_path": sample_relpath,
+        "search_wall_seconds": timings["search_wall_seconds"],
+        "merge_wall_seconds": timings["merge_wall_seconds"],
+        "sample_wall_seconds": sample_wall_seconds,
+        "shard_timings": timings["shards"],
+        "hit_rows": len(hit_rows),
+        "unique_hits": unique_hit_count,
+        "duplicate_hit_rows": len(hit_rows) - unique_hit_count,
+        "cross_shard_duplicate_targets": cross_shard_duplicate_count,
+        "resource_summary": resource_summary,
+        "container": _container_metadata(),
+    }
+    metrics_path = output_root / "metrics.json"
+    _write_json_atomic(metrics_path, metrics)
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    artifacts = [
+        _artifact_record(merged_a3m_path, output_root),
+        _artifact_record(normalized_hits_path, output_root),
+        _artifact_record(metrics_path, output_root),
+        _artifact_record(trace_path, output_root),
+        _artifact_record(log_path, output_root),
+        *(_artifact_record(path, output_root) for path in raw_tblout_paths),
+    ]
+    _write_json_atomic(
+        output_root / "done.json",
+        {
+            "schema_version": DONE_SCHEMA_VERSION,
+            "status": "complete",
+            "identity": sample_identity,
+            "completed_at": _utc_now(),
+            "artifacts": artifacts,
+        },
+    )
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    return metrics
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 131_072),
+    timeout=CONF.timeout,
+    max_containers=1,
+    volumes={
+        APP_INFO.sharded_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
+            read_only=True
+        ),
+        APP_INFO.output_dir: BENCHMARK_OUTPUT_VOLUME,
+    },
+)
+def benchmark_small_bfd_search(
+    query_id: str,
+    case_id: str,
+    sample_id: str,
+    expected_search_identity: str,
+    expected_sample_identity: str,
+) -> dict[str, object]:
+    """Run one cache-aware small-BFD Jackhmmer benchmark sample."""
+    return _run_search_sample(
+        query_id,
+        case_id,
+        sample_id,
+        expected_search_identity,
+        expected_sample_identity,
+    )
+
+
+def _unique_hit_rows(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Keep the first merged occurrence of each AlphaFold target name."""
+    unique_rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for row in rows:
+        target_id = str(row["target_id"])
+        if target_id not in seen:
+            seen.add(target_id)
+            unique_rows.append(row)
+    return unique_rows
+
+
+def _compare_normalized_hits(
+    oracle_rows: list[dict[str, object]],
+    candidate_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    """Apply the fixed smoke scientific-equivalence gate."""
+    oracle_unique = _unique_hit_rows(oracle_rows)
+    candidate_unique = _unique_hit_rows(candidate_rows)
+    oracle_ids = [str(row["target_id"]) for row in oracle_unique]
+    candidate_ids = [str(row["target_id"]) for row in candidate_unique]
+    top_width = min(100, max(len(oracle_ids), len(candidate_ids)))
+    top_oracle = oracle_ids[:top_width]
+    top_candidate = candidate_ids[:top_width]
+    top_hits_exact = top_oracle == top_candidate
+
+    oracle_by_id = {str(row["target_id"]): row for row in oracle_unique}
+    candidate_by_id = {str(row["target_id"]): row for row in candidate_unique}
+    shared_ids = set(oracle_by_id) & set(candidate_by_id)
+    score_mismatches = sorted(
+        target_id
+        for target_id in shared_ids
+        if (
+            oracle_by_id[target_id]["e_value_text"],
+            oracle_by_id[target_id]["bit_score_text"],
+        )
+        != (
+            candidate_by_id[target_id]["e_value_text"],
+            candidate_by_id[target_id]["bit_score_text"],
+        )
+    )
+    sequence_mismatches = sorted(
+        target_id
+        for target_id in shared_ids
+        if oracle_by_id[target_id]["normalized_sequence_sha256"]
+        != candidate_by_id[target_id]["normalized_sequence_sha256"]
+    )
+    oracle_set = set(oracle_ids)
+    candidate_set = set(candidate_ids)
+    union = oracle_set | candidate_set
+    overlap = len(oracle_set & candidate_set) / len(union) if union else 1.0
+    oracle_only = [
+        target_id for target_id in oracle_ids if target_id not in candidate_set
+    ]
+    candidate_only = [
+        target_id for target_id in candidate_ids if target_id not in oracle_set
+    ]
+    oracle_positions = {
+        target_id: position for position, target_id in enumerate(oracle_ids, start=1)
+    }
+    candidate_positions = {
+        target_id: position for position, target_id in enumerate(candidate_ids, start=1)
+    }
+    differences_are_below_top_100 = all(
+        position > 100
+        for position in [
+            *(oracle_positions[target_id] for target_id in oracle_only),
+            *(candidate_positions[target_id] for target_id in candidate_only),
+        ]
+    )
+    duplicate_targets = sorted({
+        str(row["target_id"])
+        for row in candidate_rows
+        if row.get("cross_shard_duplicate") is True
+    })
+    has_set_differences = bool(oracle_only or candidate_only)
+    differences_characterized = not has_set_differences or (
+        differences_are_below_top_100 and bool(duplicate_targets)
+    )
+    passed = (
+        top_hits_exact
+        and not score_mismatches
+        and not sequence_mismatches
+        and overlap >= 0.99
+        and differences_characterized
+    )
+    return {
+        "passed": passed,
+        "top_comparison_width": top_width,
+        "top_hits_exact": top_hits_exact,
+        "oracle_top_ids": top_oracle,
+        "candidate_top_ids": top_candidate,
+        "oracle_unique_hits": len(oracle_ids),
+        "candidate_unique_hits": len(candidate_ids),
+        "shared_unique_hits": len(shared_ids),
+        "full_unique_hit_jaccard": overlap,
+        "required_full_unique_hit_jaccard": 0.99,
+        "score_mismatch_count": len(score_mismatches),
+        "score_mismatch_ids": score_mismatches,
+        "sequence_mismatch_count": len(sequence_mismatches),
+        "sequence_mismatch_ids": sequence_mismatches,
+        "oracle_only_ids": oracle_only,
+        "candidate_only_ids": candidate_only,
+        "differences_are_below_top_100": differences_are_below_top_100,
+        "candidate_cross_shard_duplicate_targets": duplicate_targets,
+        "differences_characterized_as_duplicate_tail": differences_characterized,
+    }
+
+
+def _read_normalized_hits(sample_relpath: str) -> list[dict[str, object]]:
+    """Read one sample's normalized hit table through the Volume client."""
+    import polars as pl
+
+    data = _read_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{sample_relpath}/normalized-hits.parquet",
+    )
+    return pl.read_parquet(io.BytesIO(data)).to_dicts()
+
+
+def _search_results_parquet(results: list[dict[str, Any]]) -> bytes:
+    """Serialize one flat timing and resource row per search sample."""
+    import polars as pl
+
+    rows: list[dict[str, object]] = []
+    for result in results:
+        case = result.get("case")
+        query = result.get("query")
+        resource = result.get("resource_summary")
+        container = result.get("container")
+        if not isinstance(case, dict):
+            raise ValueError("Search result is missing case metadata")
+        if not isinstance(query, dict):
+            raise ValueError("Search result is missing query metadata")
+        if not isinstance(resource, dict):
+            raise ValueError("Search result is missing resource metadata")
+        if not isinstance(container, dict):
+            raise ValueError("Search result is missing nested metadata")
+        rows.append({
+            "campaign_id": CAMPAIGN_ID,
+            "sample_kind": result["sample_kind"],
+            "query_id": query["query_id"],
+            "query_length": query["length"],
+            "case_id": case["case_id"],
+            "layout": case["layout"],
+            "jackhmmer_n_cpu": case["jackhmmer_n_cpu"],
+            "active_shards": case["active_shards"],
+            "aggregate_cpu_slots": case["aggregate_cpu_slots"],
+            "search_identity": result["search_identity"],
+            "sample_id": result["sample_id"],
+            "sample_identity": result["sample_identity"],
+            "search_wall_seconds": result["search_wall_seconds"],
+            "merge_wall_seconds": result["merge_wall_seconds"],
+            "sample_wall_seconds": result["sample_wall_seconds"],
+            "remote_call_wall_seconds": result["remote_call_wall_seconds"],
+            "hit_rows": result["hit_rows"],
+            "unique_hits": result["unique_hits"],
+            "duplicate_hit_rows": result["duplicate_hit_rows"],
+            "cross_shard_duplicate_targets": result["cross_shard_duplicate_targets"],
+            "cpu_core_seconds": resource.get("cpu_core_seconds"),
+            "peak_interval_cpu_cores": resource.get("peak_interval_cpu_cores"),
+            "peak_memory_current_bytes": resource.get("peak_memory_current_bytes"),
+            "container_hostname": container.get("hostname"),
+            "result_path": result["result_path"],
+            "reused": result["reused"],
+        })
+    buffer = io.BytesIO()
+    pl.DataFrame(rows).sort(["query_id", "case_id", "sample_id"]).write_parquet(buffer)
+    return buffer.getvalue()
+
+
+def _smoke_summary_markdown(
+    results: list[dict[str, Any]],
+    comparisons: dict[str, dict[str, object]],
+) -> str:
+    """Render a compact durable smoke-test report."""
+    gate_passed = comparisons["S3_vs_B1"]["passed"] is True
+    jaccard = comparisons["S3_vs_B1"]["full_unique_hit_jaccard"]
+    if not isinstance(jaccard, int | float):
+        raise ValueError("Smoke comparison has an invalid Jaccard value")
+    lines = [
+        f"# {CAMPAIGN_ID} search smoke",
+        "",
+        f"Scientific gate: **{'PASS' if gate_passed else 'FAIL'}**",
+        "",
+        "| Case | Search wall (s) | Sample wall (s) | Unique hits | Reused |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ]
+    for result in sorted(results, key=lambda item: str(item["case"]["case_id"])):
+        case = result["case"]
+        lines.append(
+            f"| {case['case_id']} | {float(result['search_wall_seconds']):.3f} | "
+            f"{float(result['sample_wall_seconds']):.3f} | "
+            f"{int(result['unique_hits'])} | {bool(result['reused'])} |"
+        )
+    lines.extend([
+        "",
+        "B1 is the explicit-Z oracle. B0 is descriptive only; S3 is the "
+        "required sharded scientific gate.",
+        "",
+        f"S3/B1 top hits exact: {comparisons['S3_vs_B1']['top_hits_exact']}",
+        f"S3/B1 full unique-hit Jaccard: {float(jaccard):.6f}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _smoke_operation_identity(
+    manifest_sha256: str,
+    sample_identities: dict[str, str],
+) -> str:
+    """Hash the complete smoke operation and its immutable sample identities."""
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "campaign_id": CAMPAIGN_ID,
+            "profile_manifest_sha256": manifest_sha256,
+            "plan": _build_search_plan("smoke"),
+            "sample_identities": sample_identities,
+        })
+    )
+
+
+def _submit_search_smoke() -> dict[str, object]:
+    """Run only missing smoke samples, then publish the scientific gate."""
+    manifest_relpath = f"{APP_INFO.profile_relpath}/manifest.json"
+    manifest_bytes = _read_volume_bytes(SHARDED_MSA_DB_VOLUME, manifest_relpath)
+    manifest = orjson.loads(manifest_bytes)
+    if not isinstance(manifest, dict):
+        raise ValueError("Profile manifest must be a JSON object")
+    _validate_profile_manifest(manifest)
+    manifest_sha256 = _sha256_bytes(manifest_bytes)
+    cases = [_search_case(case_id) for case_id in SMOKE_CASE_IDS]
+    sample_ids = {case.case_id: f"smoke-{case.case_id.lower()}" for case in cases}
+    search_identities = {
+        case.case_id: _search_identity(manifest_sha256, case) for case in cases
+    }
+    sample_identities = {
+        case.case_id: _search_sample_identity(
+            manifest_sha256,
+            SCREENING_QUERY,
+            case,
+            sample_ids[case.case_id],
+        )
+        for case in cases
+    }
+    sample_relpaths = {
+        case.case_id: _search_sample_relpath(
+            SCREENING_QUERY,
+            search_identities[case.case_id],
+            sample_ids[case.case_id],
+        )
+        for case in cases
+    }
+    operation_root = f"benchmarks/{CAMPAIGN_ID}/search/smoke"
+    operation_identity = _smoke_operation_identity(
+        manifest_sha256,
+        sample_identities,
+    )
+    operation_marker_path = f"{operation_root}/done.json"
+    samples_complete = all(
+        _client_done_marker_valid(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{sample_relpaths[case.case_id]}/done.json",
+            expected_identity=sample_identities[case.case_id],
+        )
+        for case in cases
+    )
+    if samples_complete and _client_done_marker_valid(
+        BENCHMARK_OUTPUT_VOLUME,
+        operation_marker_path,
+        expected_identity=operation_identity,
+    ):
+        summary = _read_volume_json(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{operation_root}/summary.json",
+        )
+        return summary | {
+            "status": "reused",
+            "remote_function_inputs_submitted": 0,
+        }
+
+    results: list[dict[str, Any]] = []
+    submitted_inputs = 0
+    for case in cases:
+        marker_path = f"{sample_relpaths[case.case_id]}/done.json"
+        reused = _client_done_marker_valid(
+            BENCHMARK_OUTPUT_VOLUME,
+            marker_path,
+            expected_identity=sample_identities[case.case_id],
+        )
+        remote_started = perf_counter()
+        if reused:
+            result = _read_volume_json(
+                BENCHMARK_OUTPUT_VOLUME,
+                f"{sample_relpaths[case.case_id]}/metrics.json",
+            )
+        else:
+            submitted_inputs += 1
+            result = benchmark_small_bfd_search.remote(
+                query_id=SCREENING_QUERY.query_id,
+                case_id=case.case_id,
+                sample_id=sample_ids[case.case_id],
+                expected_search_identity=search_identities[case.case_id],
+                expected_sample_identity=sample_identities[case.case_id],
+            )
+        results.append(
+            result
+            | {
+                "sample_kind": "smoke",
+                "remote_call_wall_seconds": perf_counter() - remote_started,
+                "reused": reused,
+            }
+        )
+
+    hits_by_case = {
+        case.case_id: _read_normalized_hits(sample_relpaths[case.case_id])
+        for case in cases
+    }
+    comparisons = {
+        "B0_vs_B1": _compare_normalized_hits(hits_by_case["B1"], hits_by_case["B0"])
+        | {"oracle_case": "B1", "candidate_case": "B0", "is_gate": False},
+        "S3_vs_B1": _compare_normalized_hits(hits_by_case["B1"], hits_by_case["S3"])
+        | {"oracle_case": "B1", "candidate_case": "S3", "is_gate": True},
+    }
+    scientific_gate_passed = comparisons["S3_vs_B1"]["passed"] is True
+    results_bytes = _search_results_parquet(results)
+    comparisons_bytes = _json_bytes(comparisons)
+    summary_markdown = _smoke_summary_markdown(results, comparisons).encode()
+    summary = {
+        "schema_version": 1,
+        "status": "complete",
+        "campaign_id": CAMPAIGN_ID,
+        "operation": "search",
+        "mode": "smoke",
+        "operation_identity": operation_identity,
+        "profile_manifest_sha256": manifest_sha256,
+        "scientific_gate_passed": scientific_gate_passed,
+        "oracle_case": "B1",
+        "gate_case": "S3",
+        "sample_paths": sample_relpaths,
+        "remote_function_inputs_submitted": submitted_inputs,
+        "completed_at": _utc_now(),
+        "results_path": f"{operation_root}/results.parquet",
+        "comparisons_path": f"{operation_root}/comparisons.json",
+    }
+    summary_bytes = _json_bytes(summary)
+    operation_artifacts = {
+        "results.parquet": results_bytes,
+        "comparisons.json": comparisons_bytes,
+        "summary.md": summary_markdown,
+        "summary.json": summary_bytes,
+    }
+    for relative_path, data in operation_artifacts.items():
+        _upload_volume_bytes(
+            BENCHMARK_OUTPUT_VOLUME,
+            f"{operation_root}/{relative_path}",
+            data,
+        )
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        operation_marker_path,
+        _json_bytes({
+            "schema_version": DONE_SCHEMA_VERSION,
+            "status": "complete",
+            "identity": operation_identity,
+            "completed_at": _utc_now(),
+            "artifacts": [
+                _volume_artifact_record(relative_path, data)
+                for relative_path, data in operation_artifacts.items()
+            ],
+        }),
+    )
+    return summary
+
+
 @app.local_entrypoint()
 def submit_alphafold3_msa_task(
     operation: str = "prepare",
     submit: bool = False,
     seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+    search_mode: str = "smoke",
 ) -> None:
     """Plan or submit one isolated AlphaFold 3 MSA benchmark operation.
 
     Args:
-        operation: Operation to plan or run: ``prepare`` or ``scan``.
+        operation: Operation to plan or run: ``prepare``, ``scan``, or ``search``.
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
         seqkit_threads: SeqKit thread count for profile preparation, default 8.
+        search_mode: Fixed search workload. Currently ``smoke``.
     """
     if operation == "prepare":
         plan = _build_prepare_plan(seqkit_threads)
     elif operation == "scan":
         plan = _build_scan_plan()
+    elif operation == "search":
+        plan = _build_search_plan(search_mode)
     else:
-        raise ValueError("operation must be 'prepare' or 'scan'")
+        raise ValueError("operation must be 'prepare', 'scan', or 'search'")
     print(_json_bytes(plan).decode(), end="")
     if not submit:
         print("🧬 Plan only; no Modal function was submitted.")
@@ -1538,7 +2671,10 @@ def submit_alphafold3_msa_task(
     if operation == "prepare":
         print("🧬 Submitting one small-BFD profile preparation function...")
         result = prepare_small_bfd_profile.remote(seqkit_threads=seqkit_threads)
-    else:
+    elif operation == "scan":
         print("🧬 Submitting the sequential Volume scan matrix...")
         result = _submit_scan_matrix()
+    else:
+        print("🧬 Submitting the sequential small-BFD search smoke...")
+        result = _submit_search_smoke()
     print(_json_bytes(result).decode(), end="")

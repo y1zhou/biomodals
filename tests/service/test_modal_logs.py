@@ -16,7 +16,7 @@ from biomodals.service.admin_jobs_api import (
     _ClosingStreamingResponse,
     _redact_provider_call_id,
 )
-from biomodals.service.modal_logs import ModalCLILogStreamer
+from biomodals.service.modal_logs import ModalCLILogSource
 
 
 class FakeProcess:
@@ -55,7 +55,7 @@ def test_modal_cli_stream_filters_one_call_and_stops_on_disconnect() -> None:
             options = kwargs
             return process
 
-        streamer = ModalCLILogStreamer(process_factory=create_process)
+        streamer = ModalCLILogSource(process_factory=create_process)
         opened = await streamer.open(
             app_name="GromacsApp",
             environment_name="production",
@@ -92,7 +92,7 @@ def test_modal_cli_stream_filters_one_call_and_stops_on_disconnect() -> None:
 
 def test_modal_cli_stream_rejects_non_function_call_ids() -> None:
     async def scenario() -> None:
-        streamer = ModalCLILogStreamer()
+        streamer = ModalCLILogSource()
         with pytest.raises(ValueError, match="must start with fc-"):
             await streamer.open(
                 app_name="GromacsApp",
@@ -117,7 +117,7 @@ def test_modal_cli_fetches_complete_historical_call_range() -> None:
             process._finished.set()
             return process
 
-        streamer = ModalCLILogStreamer(process_factory=create_process)
+        streamer = ModalCLILogSource(process_factory=create_process)
         stream = await streamer.open(
             app_name="GromacsApp",
             environment_name="production",
@@ -144,6 +144,33 @@ def test_modal_cli_fetches_complete_historical_call_range() -> None:
             "--env",
             "production",
         )
+
+    asyncio.run(scenario())
+
+
+def test_modal_cli_reports_nonzero_process_exit() -> None:
+    async def scenario() -> None:
+        process = FakeProcess()
+
+        async def create_process(*_args: str, **_kwargs: Any) -> Any:
+            process.stdout.feed_data(b"Modal could not read this Function Call\n")
+            process.stdout.feed_eof()
+            process.returncode = 1
+            process._finished.set()
+            return process
+
+        streamer = ModalCLILogSource(process_factory=create_process)
+        opened = await streamer.open(
+            app_name="GromacsApp",
+            environment_name="production",
+            function_call_id="fc-example",
+            follow=True,
+        )
+        stream = cast(AsyncGenerator[bytes, None], opened)
+
+        assert await anext(stream) == b"Modal could not read this Function Call\n"
+        with pytest.raises(OSError, match="exited with status 1"):
+            await anext(stream)
 
     asyncio.run(scenario())
 

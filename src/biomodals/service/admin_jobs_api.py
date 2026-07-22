@@ -1,4 +1,4 @@
-"""Administrator-only inspection of active Job operation logs."""
+"""Administrator-only inspection of retained Job operation logs."""
 
 from __future__ import annotations
 
@@ -21,10 +21,13 @@ from biomodals.service.http_contract import (
     ErrorResponse,
     request_id_from,
 )
-from biomodals.service.jobs import WorkloadRegistration
+from biomodals.service.jobs import (
+    OperationLogMode,
+    WorkloadRegistration,
+    operation_log_mode,
+)
 from biomodals.service.store import (
     JobOperationRecord,
-    JobOperationState,
     JobRecord,
     ServiceStore,
 )
@@ -37,15 +40,6 @@ AdminJobLogTargetState = Literal[
     "failed",
     "cancelled",
 ]
-AdminJobLogMode = Literal["live", "historical"]
-_LOGGABLE_STATES = {
-    JobOperationState.RUNNING,
-    JobOperationState.STATE_UNKNOWN,
-    JobOperationState.COMPLETED,
-    JobOperationState.FAILED,
-    JobOperationState.CANCELLED,
-}
-_LIVE_LOG_STATES = {JobOperationState.RUNNING, JobOperationState.STATE_UNKNOWN}
 
 
 @runtime_checkable
@@ -73,7 +67,7 @@ class AdminJobLogTargetView(BaseModel):
     stage_code: str
     function_name: str
     state: AdminJobLogTargetState
-    mode: AdminJobLogMode
+    mode: OperationLogMode
     started_at: datetime
     ended_at: datetime | None
 
@@ -112,14 +106,12 @@ def _log_targets(
     targets: list[tuple[AdminJobLogTargetView, JobOperationRecord]] = []
     for operation in job.operations:
         stage = registration.definition.stage(operation.operation)
+        mode = operation_log_mode(operation.state)
         if (
-            operation.state not in _LOGGABLE_STATES
+            mode is None
             or not operation.modal_call_id
             or operation.started_at is None
-            or (
-                operation.state not in _LIVE_LOG_STATES
-                and operation.completed_at is None
-            )
+            or (mode == "historical" and operation.completed_at is None)
             or stage is None
             or stage.function_name is None
         ):
@@ -129,7 +121,7 @@ def _log_targets(
                 stage_code=stage.code,
                 function_name=stage.function_name,
                 state=cast(AdminJobLogTargetState, operation.state.value),
-                mode=("live" if operation.state in _LIVE_LOG_STATES else "historical"),
+                mode=mode,
                 started_at=datetime.fromtimestamp(operation.started_at, UTC),
                 ended_at=(
                     datetime.fromtimestamp(operation.completed_at, UTC)
@@ -248,7 +240,7 @@ def create_admin_jobs_router() -> APIRouter:
         )
         selected = next(
             (
-                operation
+                (target, operation)
                 for target, operation in _log_targets(job, registration)
                 if target.stage_code == stage
             ),
@@ -258,18 +250,22 @@ def create_admin_jobs_router() -> APIRouter:
             registration is None
             or registration.open_operation_logs is None
             or selected is None
-            or selected.modal_call_id is None
         ):
             raise CodedAPIError(
                 409,
                 "job_log_target_unavailable",
                 "Logs are not available for the selected Job stage",
             )
-        try:
-            stream = await registration.open_operation_logs(
-                job,
-                selected,
+        selected_target, selected_operation = selected
+        modal_call_id = selected_operation.modal_call_id
+        if modal_call_id is None:  # pragma: no cover - filtered by _log_targets
+            raise CodedAPIError(
+                409,
+                "job_log_target_unavailable",
+                "Logs are not available for the selected Job stage",
             )
+        try:
+            stream = await registration.open_operation_logs(job, selected_operation)
         except OSError as exc:
             LOGGER.exception(
                 "Could not start Job log stream job_id=%s stage=%s request_id=%s",
@@ -286,18 +282,16 @@ def create_admin_jobs_router() -> APIRouter:
             "event=job_log_stream_started job_id=%s stage=%s mode=%s request_id=%s",
             job.job_id,
             stage,
-            "live" if selected.state in _LIVE_LOG_STATES else "historical",
+            selected_target.mode,
             request_id_from(request),
         )
         return _ClosingStreamingResponse(
-            _redact_provider_call_id(stream, selected.modal_call_id),
+            _redact_provider_call_id(stream, modal_call_id),
             media_type="text/plain",
             headers={
                 "Cache-Control": "no-store, no-transform",
                 "X-Accel-Buffering": "no",
-                "X-BioModals-Log-Mode": (
-                    "live" if selected.state in _LIVE_LOG_STATES else "historical"
-                ),
+                "X-BioModals-Log-Mode": selected_target.mode,
             },
         )
 

@@ -22,9 +22,10 @@ from biomodals.service.gromacs.results import (
     ResultIdentityMismatchError,
 )
 from biomodals.service.gromacs.router import GromacsJobOptions
-from biomodals.service.modal_logs import ModalCLILogStreamer
+from biomodals.service.jobs import operation_log_mode
+from biomodals.service.modal_logs import ModalCLILogSource
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
-from biomodals.service.store import JobOperationRecord, JobOperationState, JobRecord
+from biomodals.service.store import JobOperationRecord, JobRecord
 
 
 class ModalGromacsAdapter:
@@ -37,7 +38,7 @@ class ModalGromacsAdapter:
         artifact_cache: ArtifactCache | None = None,
         call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
         function_resolver: Callable[..., modal.Function] | None = None,
-        log_streamer: ModalCLILogStreamer | None = None,
+        log_source: ModalCLILogSource | None = None,
     ) -> None:
         """Compose focused Modal compute and Result boundaries."""
         self.provider = ModalGromacsProvider(
@@ -49,7 +50,7 @@ class ModalGromacsAdapter:
             output_volume_name=output_volume_name,
             artifact_cache=artifact_cache,
         )
-        self.logs = log_streamer or ModalCLILogStreamer()
+        self.logs = log_source or ModalCLILogSource()
 
     async def preflight(
         self,
@@ -105,10 +106,10 @@ class ModalGromacsAdapter:
         """Open live or historical logs for one attached Modal operation."""
         if operation.modal_call_id is None or operation.started_at is None:
             raise ValueError("GROMACS operation has no attached Modal call")
-        live = operation.state in {
-            JobOperationState.RUNNING,
-            JobOperationState.STATE_UNKNOWN,
-        }
+        mode = operation_log_mode(operation.state)
+        if mode is None:
+            raise ValueError("GROMACS operation does not retain inspectable logs")
+        live = mode == "live"
         started_at = datetime.fromtimestamp(operation.started_at, UTC)
         ended_at = (
             datetime.fromtimestamp(operation.completed_at, UTC)

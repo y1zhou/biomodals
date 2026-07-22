@@ -1,4 +1,4 @@
-"""Modal CLI-backed live log streaming for attached function calls."""
+"""Modal CLI-backed log access for attached Function Calls."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _PROCESS_STOP_TIMEOUT_SECONDS = 5
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 
-class ModalCLILogStreamer:
+class ModalCLILogSource:
     """Open one supported ``modal app logs`` stream filtered by call ID."""
 
     def __init__(
@@ -99,6 +99,7 @@ async def _read_process(
         return_code = await process.wait()
         if return_code != 0:
             LOGGER.warning("Modal log process exited with status %s", return_code)
+            raise OSError(f"Modal log process exited with status {return_code}")
     finally:
         await _stop_process(process)
 

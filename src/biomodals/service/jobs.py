@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.service.store import (
     JobOperationRecord,
+    JobOperationState,
     JobRecord,
     JobStageRecord,
     JobState,
@@ -27,6 +28,20 @@ from biomodals.service.workloads import WORKLOAD_DEFINITIONS, WorkloadDefinition
 LOGGER = logging.getLogger(__name__)
 JobErrorCode = Literal["compute_failed", "result_invalid"]
 JobStageOutcome = Literal["completed", "failed", "cancelled"]
+OperationLogMode = Literal["live", "historical"]
+
+
+def operation_log_mode(state: JobOperationState) -> OperationLogMode | None:
+    """Classify operation states that retain inspectable provider logs."""
+    if state in {JobOperationState.RUNNING, JobOperationState.STATE_UNKNOWN}:
+        return "live"
+    if state in {
+        JobOperationState.COMPLETED,
+        JobOperationState.FAILED,
+        JobOperationState.CANCELLED,
+    }:
+        return "historical"
+    return None
 
 
 class JobLifecycleLocks:

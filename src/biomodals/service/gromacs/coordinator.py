@@ -43,10 +43,9 @@ from biomodals.service.store import (
     JobRecord,
     JobState,
     JobStateUnknownReason,
-    JobSubmissionConflictError,
     ServiceStore,
 )
-from biomodals.service.submission import SubmissionOutcomeUnknownError
+from biomodals.service.submission import ModalJobSubmitter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -127,6 +126,11 @@ class GromacsReconciler:
         self.adapter = adapter
         self.lifecycle_locks = lifecycle_locks or JobLifecycleLocks()
         self._now = now or (lambda: int(time.time()))
+        self.submitter = ModalJobSubmitter(
+            store,
+            self.lifecycle_locks,
+            now=self._now,
+        )
         if intermediate_retention_days is not None and intermediate_retention_days < 1:
             raise ValueError("intermediate_retention_days must be positive")
         if type(max_concurrent_jobs) is not int or max_concurrent_jobs < 1:
@@ -270,117 +274,90 @@ class GromacsReconciler:
         current = self.store.get_job(job.owner_user_id, job.job_id)
         if current is None:
             return
+        if current.run_name is None:  # pragma: no cover - initial claim sets it
+            raise RuntimeError(f"GROMACS Job has no run name: {job.job_id}")
         ready = _ready_operations(
             current,
             self.store.list_operations(job.job_id),
         )
+
+        def is_retryable(error: Exception) -> bool:
+            return isinstance(error, MODAL_SERVICE_ERRORS) and not isinstance(
+                error,
+                DEFINITE_SUBMISSION_ERRORS,
+            )
+
         for operation in ready:
-            async with self.lifecycle_locks.for_job(job.job_id):
-                current = self.store.get_job(job.owner_user_id, job.job_id)
-                if current is None or current.state not in {
+            submission_token = uuid4().hex
+
+            def can_submit(
+                candidate: JobRecord,
+                selected_operation: str = operation,
+            ) -> bool:
+                return candidate.state in {
                     JobState.QUEUED,
                     JobState.RUNNING,
-                }:
-                    return
-                if operation not in _ready_operations(
-                    current,
+                } and selected_operation in _ready_operations(
+                    candidate,
                     self.store.list_operations(job.job_id),
-                ):
-                    continue
-                submission_token = uuid4().hex
-                claimed = self.store.claim_modal_operation(
-                    job.job_id,
-                    operation=operation,
-                    submission_token=submission_token,
-                    now=self._now(),
                 )
-                if claimed is None:
-                    continue
-                try:
-                    submitted = await self.adapter.submit_operation(current, operation)
-                except SubmissionOutcomeUnknownError:
-                    LOGGER.exception(
-                        "Could not confirm GROMACS stage %s for job %s",
-                        operation,
-                        job.job_id,
-                    )
-                    self.store.mark_state_unknown(
-                        job.job_id,
-                        reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
-                        now=self._now(),
-                    )
-                    return
-                except DEFINITE_SUBMISSION_ERRORS:
-                    self.store.record_operation_submission_failure(
-                        job.job_id,
-                        operation=operation,
-                        submission_token=submission_token,
-                        now=self._now(),
-                    )
-                    LOGGER.exception(
-                        "Modal rejected GROMACS stage %s for job %s",
-                        operation,
-                        job.job_id,
-                    )
-                    return
-                except MODAL_SERVICE_ERRORS:
-                    self.store.release_operation(
-                        job.job_id,
-                        operation=operation,
-                        submission_token=submission_token,
-                        now=self._now(),
-                    )
-                    LOGGER.exception(
-                        "Modal is unavailable while submitting stage %s for job %s",
-                        operation,
-                        job.job_id,
-                    )
-                    return
-                except Exception:
-                    self.store.record_operation_submission_failure(
-                        job.job_id,
-                        operation=operation,
-                        submission_token=submission_token,
-                        now=self._now(),
-                    )
-                    LOGGER.exception(
-                        "Could not submit GROMACS stage %s for job %s",
-                        operation,
-                        job.job_id,
-                    )
-                    return
 
-                try:
-                    advanced = self.store.attach_modal_call(
-                        job.job_id,
-                        operation=operation,
-                        modal_call_id=submitted.modal_call_id,
-                        submission_token=submission_token,
-                        now=self._now(),
-                    )
-                except JobSubmissionConflictError:
-                    LOGGER.warning(
-                        "Could not attach spawned GROMACS stage %s for job %s",
-                        submitted.modal_call_id,
-                        job.job_id,
-                    )
-                    self.store.mark_state_unknown(
-                        job.job_id,
-                        reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
-                        now=self._now(),
-                    )
-                    try:
-                        await self.adapter.cancel(submitted.modal_call_id)
-                    except MODAL_SERVICE_ERRORS:
-                        LOGGER.exception(
-                            "Could not cancel unattached GROMACS stage %s",
-                            submitted.modal_call_id,
-                        )
-                    return
+            async def spawn(
+                claimed: JobRecord,
+                selected_operation: str = operation,
+            ) -> SubmittedModalCall:
+                return await self.adapter.submit_operation(
+                    claimed,
+                    selected_operation,
+                )
+
+            try:
+                result = await self.submitter.submit(
+                    current,
+                    operation=operation,
+                    run_name=current.run_name,
+                    submission_token=submission_token,
+                    spawn=spawn,
+                    cancel=self.adapter.cancel,
+                    can_submit=can_submit,
+                    is_retryable_spawn_error=is_retryable,
+                )
+            except DEFINITE_SUBMISSION_ERRORS:
+                LOGGER.exception(
+                    "Modal rejected GROMACS stage %s for job %s",
+                    operation,
+                    job.job_id,
+                )
+                return
+            except MODAL_SERVICE_ERRORS:
+                LOGGER.exception(
+                    "Modal is unavailable while submitting stage %s for job %s",
+                    operation,
+                    job.job_id,
+                )
+                return
+            except Exception:
+                LOGGER.exception(
+                    "Could not submit GROMACS stage %s for job %s",
+                    operation,
+                    job.job_id,
+                )
+                return
+
+            if result.job.state == JobState.STATE_UNKNOWN:
+                LOGGER.error(
+                    "Could not confirm GROMACS stage %s for job %s",
+                    operation,
+                    job.job_id,
+                )
+                return
+            if result.job.state not in {JobState.QUEUED, JobState.RUNNING}:
+                return
+            if result.attached:
                 LOGGER.info(
                     "event=stage_attached job_id=%s workload=gromacs "
                     "operation=%s function=%s",
-                    advanced.job_id,
+                    result.job.job_id,
                     operation,
                     operation.partition(":")[0],
                 )

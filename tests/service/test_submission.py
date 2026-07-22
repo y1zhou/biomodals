@@ -105,6 +105,83 @@ def test_replay_attaches_only_one_paid_modal_call(tmp_path: Path) -> None:
     assert replay.job.operations[0].modal_call_id == "fc-1"
 
 
+def test_submitter_attaches_a_successor_operation(tmp_path: Path) -> None:
+    store, job = admitted_job(tmp_path)
+    submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)
+
+    async def scenario():
+        await submitter.submit(
+            job,
+            operation="prepare",
+            run_name="simulation-1",
+            submission_token="prepare-token",
+            spawn=lambda _job: asyncio.sleep(
+                0,
+                result=Submitted("fc-prepare", "simulation-1", "prepare"),
+            ),
+            cancel=lambda _call_id: asyncio.sleep(0),
+        )
+        completed = store.record_operation_outcome(
+            job.job_id,
+            operation="prepare",
+            expected_modal_call_id="fc-prepare",
+            outcome=JobOperationState.COMPLETED,
+            now=11,
+        )
+        assert completed is not None
+        return await submitter.submit(
+            completed,
+            operation="analyze",
+            run_name="simulation-1",
+            submission_token="analyze-token",
+            spawn=lambda _job: asyncio.sleep(
+                0,
+                result=Submitted("fc-analyze", "simulation-1", "analyze"),
+            ),
+            cancel=lambda _call_id: asyncio.sleep(0),
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result.attached is True
+    assert [operation.operation for operation in result.job.operations] == [
+        "prepare",
+        "analyze",
+    ]
+    assert result.job.operations[-1].modal_call_id == "fc-analyze"
+
+
+def test_submitter_reloads_eligibility_before_claiming(tmp_path: Path) -> None:
+    store, job = admitted_job(tmp_path)
+    submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)
+    spawned = 0
+    store.request_cancel(job.owner_user_id, job.job_id, now=9)
+
+    async def spawn(_job):
+        nonlocal spawned
+        spawned += 1
+        return Submitted("fc-prepare", "simulation-1", "prepare")
+
+    result = asyncio.run(
+        submitter.submit(
+            job,
+            operation="prepare",
+            run_name="simulation-1",
+            submission_token="prepare-token",
+            spawn=spawn,
+            cancel=lambda _call_id: asyncio.sleep(0),
+            can_submit=lambda current: (
+                current.state in {JobState.QUEUED, JobState.RUNNING}
+            ),
+        )
+    )
+
+    assert result.attached is False
+    assert result.job.state == JobState.CANCEL_REQUESTED
+    assert spawned == 0
+    assert store.list_operations(job.job_id) == []
+
+
 def test_definite_rejection_releases_the_operation_for_retry(tmp_path: Path) -> None:
     store, job = admitted_job(tmp_path)
     submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)
@@ -125,6 +202,31 @@ def test_definite_rejection_releases_the_operation_for_retry(tmp_path: Path) -> 
         )
 
     assert store.list_operations(job.job_id) == []
+
+
+def test_terminal_rejection_records_failed_operation(tmp_path: Path) -> None:
+    store, job = admitted_job(tmp_path)
+    submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)
+
+    async def reject(_job):
+        raise RuntimeError("terminal rejection")
+
+    with pytest.raises(RuntimeError, match="terminal rejection"):
+        asyncio.run(
+            submitter.submit(
+                job,
+                operation="prepare",
+                run_name="simulation-1",
+                submission_token="first",
+                spawn=reject,
+                cancel=lambda _call_id: asyncio.sleep(0),
+                is_retryable_spawn_error=lambda _error: False,
+            )
+        )
+
+    operation = store.list_operations(job.job_id)[0]
+    assert operation.operation == "prepare"
+    assert operation.state == JobOperationState.FAILED
 
 
 def test_unknown_spawn_outcome_stops_automatic_retries(tmp_path: Path) -> None:

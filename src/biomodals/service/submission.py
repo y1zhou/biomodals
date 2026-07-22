@@ -11,7 +11,6 @@ from typing import Protocol
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.store import (
     JobRecord,
-    JobState,
     JobStateUnknownReason,
     ServiceStore,
 )
@@ -52,6 +51,8 @@ class SubmissionResult:
 
 SpawnModalOperation = Callable[[JobRecord], Awaitable[SubmittedModalOperation]]
 CancelModalCall = Callable[[str], Awaitable[None]]
+CanSubmitOperation = Callable[[JobRecord], bool]
+IsRetryableSpawnError = Callable[[Exception], bool]
 
 
 class ModalJobSubmitter:
@@ -78,12 +79,14 @@ class ModalJobSubmitter:
         submission_token: str,
         spawn: SpawnModalOperation,
         cancel: CancelModalCall,
+        can_submit: CanSubmitOperation | None = None,
+        is_retryable_spawn_error: IsRetryableSpawnError | None = None,
     ) -> SubmissionResult:
         """Claim, spawn, and attach one Modal operation without duplicate work."""
-        if job.operations or job.state != JobState.QUEUED:
-            return SubmissionResult(job=job, attached=False)
-
         async with self.lifecycle_locks.for_job(job.job_id):
+            current = self._reload(job)
+            if can_submit is not None and not can_submit(current):
+                return SubmissionResult(job=current, attached=False)
             claimed = self.store.claim_modal_operation(
                 job.job_id,
                 operation=operation,
@@ -106,13 +109,21 @@ class ModalJobSubmitter:
                     ),
                     attached=False,
                 )
-            except Exception:
-                self.store.release_operation(
-                    job.job_id,
-                    operation=operation,
-                    submission_token=submission_token,
-                    now=self._now(),
-                )
+            except Exception as error:
+                if is_retryable_spawn_error is None or is_retryable_spawn_error(error):
+                    self.store.release_operation(
+                        job.job_id,
+                        operation=operation,
+                        submission_token=submission_token,
+                        now=self._now(),
+                    )
+                else:
+                    self.store.record_operation_submission_failure(
+                        job.job_id,
+                        operation=operation,
+                        submission_token=submission_token,
+                        now=self._now(),
+                    )
                 raise
 
             try:

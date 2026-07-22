@@ -2024,7 +2024,10 @@ def _submit_scan_matrix() -> dict[str, object]:
             "campaign_id": CAMPAIGN_ID,
             "case": case.as_dict(),
             "profile_manifest_sha256": manifest_sha256,
-            "partition_identities": expected_identities,
+            "partition_identities": {
+                str(partition_index): identity
+                for partition_index, identity in expected_identities.items()
+            },
             "pass_summaries": _scan_case_pass_summaries(
                 list(results_by_partition.values())
             ),

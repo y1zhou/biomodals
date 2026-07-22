@@ -44,7 +44,7 @@ import orjson
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
 
-CAMPAIGN_ID = "small-bfd-phase1-v1"
+CAMPAIGN_ID = "small-bfd-phase1-v2"
 PROFILE_ID = "small-bfd-64-v1"
 PROFILE_SCHEMA_VERSION = 1
 SOURCE_DB_FILENAME = "bfd-first_non_consensus_sequences.fasta"

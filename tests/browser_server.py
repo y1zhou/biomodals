@@ -191,7 +191,9 @@ class _FakeGromacsAdapter:
 
         async def chunks():
             await asyncio.sleep(0.25)
-            yield b"2026-07-22 14:05:33+08:00 Browser test remote log\n"
+            yield (
+                b"2026-07-22 14:05:33+08:00 \x1b[31mBrowser test remote log\x1b[0m\n"
+            )
             yield (b"2026-07-22 14:05:34+08:00 " + b"A" * 4_096 + b"\n")
             if operation.state in {
                 JobOperationState.RUNNING,

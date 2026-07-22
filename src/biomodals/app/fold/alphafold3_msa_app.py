@@ -12,8 +12,9 @@ Commands are plan-only unless ``--submit`` is explicitly supplied.
 The first operation copies small BFD from the read-only production database
 Volume, creates 64 deterministic SeqKit shards in
 ``AlphaFold3-msa-db-sharded``, validates them, and publishes ``manifest.json``
-last. Benchmark evidence is written to
-``AlphaFold3-MSA-Benchmark-outputs``.
+last. Duplicate full headers omitted by SeqKit's two-pass FASTA index are
+recovered from its logged byte offsets before splitting. Benchmark evidence is
+written to ``AlphaFold3-MSA-Benchmark-outputs``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -34,7 +36,7 @@ from pathlib import Path, PurePosixPath
 from statistics import median
 from threading import Event, Lock, Thread
 from time import perf_counter
-from typing import Any
+from typing import Any, BinaryIO
 
 import modal
 import orjson
@@ -53,10 +55,15 @@ DATABASE_ID = "small-bfd"
 SHARD_COUNT = 64
 SHARD_RANDOM_SEED = 23
 SMALL_BFD_Z = 65_984_053
+EXPECTED_RECOVERED_RECORDS = 55_187
+EXPECTED_RECOVERED_RESIDUES = 24_934_582
 SEQKIT_VERSION = "2.13.0"
 DEFAULT_SEQKIT_THREADS = 8
 MAX_SEQKIT_THREADS = 32
 MAX_PROFILE_IMBALANCE = 0.05
+PROFILE_RECIPE_VERSION = 2
+RECOVERED_HEADER_NAMESPACE = "__AF3_RECOVERED_"
+MAX_FASTA_HEADER_BYTES = 1024 * 1024
 PROFILE_VALIDATION_RELPATHS = (
     "validation/source-stats.tsv",
     "validation/shard-stats.tsv",
@@ -64,6 +71,8 @@ PROFILE_VALIDATION_RELPATHS = (
     "validation/source-sum.tsv",
     "validation/shard-sum.tsv",
     "validation/seqkit-sum.json",
+    "validation/shuffle-stderr.log",
+    "validation/duplicate-recovery.jsonl",
 )
 HMMER_VERSION = "3.4"
 JACKHMMER_PATCH_SHA256 = (
@@ -82,6 +91,11 @@ MODAL_MEMORY_USD_PER_GIB_SECOND = 0.00000222
 MODAL_PRICING_OBSERVED_DATE = "2026-07-22"
 MODAL_PRICING_URL = "https://modal.com/pricing"
 JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
+JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
+_FAI_DUPLICATE_WARNING = re.compile(
+    rb'^\[fai warning\] ignoring duplicate sequence "(?P<name>.*)" '
+    rb"at byte offset (?P<offset>[0-9]+)\r?\n?$"
+)
 
 
 CONF = AppConfig(
@@ -106,6 +120,14 @@ class AppInfo:
     output_dir: str = f"/mnt/{OUTPUT_VOLUME_NAME}"
     profile_relpath: str = f"profiles/{PROFILE_ID}"
     preparation_relpath: str = f"benchmarks/{CAMPAIGN_ID}/preparation"
+
+
+@dataclass(frozen=True)
+class FaiDuplicateWarning:
+    """One record omitted by SeqKit's full-header FASTA index."""
+
+    sequence_name: bytes
+    sequence_offset: int
 
 
 APP_INFO = AppInfo()
@@ -220,6 +242,17 @@ def _shard_names() -> tuple[str, ...]:
     return tuple(_shard_filename(index) for index in range(SHARD_COUNT))
 
 
+def _duplicate_recovery_recipe() -> dict[str, object]:
+    """Return the scientific recipe for restoring FAI-omitted records."""
+    return {
+        "warning_source": "seqkit-fai-sequence-byte-offset",
+        "expected_records": EXPECTED_RECOVERED_RECORDS,
+        "temporary_header_identity": "unique-uuid",
+        "append_after_shuffle": True,
+        "strip_after_split": True,
+    }
+
+
 def _json_bytes(value: object) -> bytes:
     """Serialize a JSON value deterministically."""
     return orjson.dumps(value, option=JSON_OPTIONS)
@@ -255,13 +288,27 @@ def _require_regular_file(path: Path) -> None:
         raise ValueError(f"Expected nonempty file: {path}")
 
 
-def _sha256_file(path: Path, *, chunk_size: int = 16 * 1024 * 1024) -> str:
-    """Compute a streaming SHA-256 digest for a regular file."""
+def _sha256_file(
+    path: Path,
+    *,
+    chunk_size: int = 16 * 1024 * 1024,
+    forbidden_bytes: bytes | None = None,
+) -> str:
+    """Compute a digest and optionally reject a byte marker while streaming."""
     _require_regular_file(path)
+    if forbidden_bytes == b"":
+        raise ValueError("forbidden_bytes must be nonempty")
     digest = hashlib.sha256()
+    overlap = b""
     with path.open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
+            if forbidden_bytes is not None:
+                searchable = overlap + chunk
+                if forbidden_bytes in searchable:
+                    raise ValueError(f"Forbidden byte marker remains in {path}")
+                overlap_size = len(forbidden_bytes) - 1
+                overlap = searchable[-overlap_size:] if overlap_size else b""
     return digest.hexdigest()
 
 
@@ -286,6 +333,207 @@ def _append_log(path: Path, message: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"{_utc_now()} {message}\n")
+
+
+def _append_diagnostic_file(source_path: Path, log_path: Path) -> None:
+    """Copy one command's raw diagnostics into the durable operation log."""
+    _require_regular_file(source_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with source_path.open("rb") as source, log_path.open("ab") as log:
+        shutil.copyfileobj(source, log, length=1024 * 1024)
+
+
+def _parse_fai_duplicate_warnings(
+    diagnostics_path: Path,
+) -> tuple[FaiDuplicateWarning, ...]:
+    """Parse SeqKit FAI duplicate warnings as ordered sequence offsets."""
+    _require_regular_file(diagnostics_path)
+    warnings: list[FaiDuplicateWarning] = []
+    with diagnostics_path.open("rb") as diagnostics:
+        for line_number, line in enumerate(diagnostics, start=1):
+            if b"[fai warning]" not in line:
+                continue
+            match = _FAI_DUPLICATE_WARNING.fullmatch(line)
+            if match is None:
+                raise ValueError(
+                    f"Malformed SeqKit FAI warning at {diagnostics_path}:{line_number}"
+                )
+            sequence_name = match.group("name")
+            sequence_offset = int(match.group("offset"))
+            if not sequence_name:
+                raise ValueError(
+                    f"Empty sequence name in FAI warning at line {line_number}"
+                )
+            if sequence_offset <= 0:
+                raise ValueError(
+                    f"Invalid FAI sequence offset at line {line_number}: "
+                    f"{sequence_offset}"
+                )
+            if warnings and sequence_offset <= warnings[-1].sequence_offset:
+                raise ValueError(
+                    "SeqKit FAI warning offsets must be strictly increasing"
+                )
+            warnings.append(FaiDuplicateWarning(sequence_name, sequence_offset))
+    return tuple(warnings)
+
+
+def _read_fasta_header_before_sequence_offset(
+    source: BinaryIO,
+    sequence_offset: int,
+) -> bytes:
+    """Read the exact FASTA header preceding an FAI sequence-start offset."""
+    file_size = os.fstat(source.fileno()).st_size
+    if not 1 < sequence_offset <= file_size:
+        raise ValueError(
+            f"FAI sequence offset {sequence_offset} is outside the source file"
+        )
+    source.seek(sequence_offset - 1)
+    if source.read(1) != b"\n":
+        raise ValueError(
+            f"FAI sequence offset {sequence_offset} does not follow a header line"
+        )
+
+    cursor = sequence_offset - 1
+    header_chunks: list[bytes] = []
+    scanned_bytes = 0
+    header_line: bytes | None = None
+    while cursor > 0 and scanned_bytes < MAX_FASTA_HEADER_BYTES:
+        read_size = min(4096, cursor, MAX_FASTA_HEADER_BYTES - scanned_bytes)
+        chunk_start = cursor - read_size
+        source.seek(chunk_start)
+        chunk = source.read(read_size)
+        previous_newline = chunk.rfind(b"\n")
+        if previous_newline >= 0:
+            header_chunks.append(chunk[previous_newline + 1 :])
+            header_line = b"".join(reversed(header_chunks))
+            break
+        header_chunks.append(chunk)
+        scanned_bytes += read_size
+        cursor = chunk_start
+    if header_line is None and cursor == 0:
+        header_line = b"".join(reversed(header_chunks))
+    if header_line is None:
+        raise ValueError(
+            f"FASTA header before offset {sequence_offset} exceeds "
+            f"{MAX_FASTA_HEADER_BYTES} bytes"
+        )
+    if header_line.endswith(b"\r"):
+        header_line = header_line[:-1]
+    if not header_line.startswith(b">") or len(header_line) == 1:
+        raise ValueError(
+            f"FAI sequence offset {sequence_offset} has no valid preceding header"
+        )
+    return header_line[1:]
+
+
+def _recovery_header_pattern(temporary_namespace: str) -> str:
+    """Return the anchored SeqKit regex for one generation's UUID prefixes."""
+    expected = rf"{RECOVERED_HEADER_NAMESPACE}[0-9a-f]{{32}}_"
+    if re.fullmatch(expected, temporary_namespace) is None:
+        raise ValueError("Invalid temporary recovery namespace")
+    return rf"^{temporary_namespace}[0-9a-f]{{32}}__"
+
+
+def _append_recovered_fasta_records(
+    source_path: Path,
+    shuffled_path: Path,
+    warnings: tuple[FaiDuplicateWarning, ...],
+    report_path: Path,
+    *,
+    temporary_namespace: str,
+) -> dict[str, int]:
+    """Recover FAI-omitted records and append UUID-prefixed FASTA entries."""
+    _require_regular_file(source_path)
+    _require_regular_file(shuffled_path)
+    _recovery_header_pattern(temporary_namespace)
+    if not warnings:
+        raise ValueError("SeqKit emitted no duplicate-record byte offsets")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    recovered_residues = 0
+    temporary_uuids: set[str] = set()
+    previous_offset = 0
+    namespace_bytes = temporary_namespace.encode("ascii")
+    with (
+        source_path.open("rb") as source,
+        shuffled_path.open("r+b") as shuffled,
+        report_path.open("xb") as report,
+    ):
+        shuffled.seek(0, os.SEEK_END)
+        shuffled_size = shuffled.tell()
+        if shuffled_size > 0:
+            shuffled.seek(-1, os.SEEK_END)
+            if shuffled.read(1) != b"\n":
+                shuffled.write(b"\n")
+        shuffled.seek(0, os.SEEK_END)
+
+        for warning in warnings:
+            if warning.sequence_offset <= previous_offset:
+                raise ValueError(
+                    "SeqKit FAI warning offsets must be strictly increasing"
+                )
+            previous_offset = warning.sequence_offset
+            original_header = _read_fasta_header_before_sequence_offset(
+                source,
+                warning.sequence_offset,
+            )
+            normalized_header = re.sub(rb"\t+", b" ", original_header)
+            if normalized_header != warning.sequence_name:
+                raise ValueError(
+                    "FAI warning name does not match source header at byte offset "
+                    f"{warning.sequence_offset}"
+                )
+
+            record_uuid = uuid.uuid4().hex
+            if not re.fullmatch(r"[0-9a-f]{32}", record_uuid):
+                raise RuntimeError(
+                    "UUID generator returned an invalid hexadecimal UUID"
+                )
+            if record_uuid in temporary_uuids:
+                raise RuntimeError("UUID generator returned a duplicate recovery UUID")
+            temporary_uuids.add(record_uuid)
+            temporary_prefix = namespace_bytes + record_uuid.encode("ascii") + b"__"
+            shuffled.write(b">" + temporary_prefix + original_header + b"\n")
+
+            sequence_digest = hashlib.sha256()
+            sequence_length = 0
+            sequence_ends_with_newline = True
+            source.seek(warning.sequence_offset)
+            while line := source.readline():
+                if line.startswith(b">"):
+                    break
+                shuffled.write(line)
+                sequence_bases = line.rstrip(b"\r\n")
+                sequence_digest.update(sequence_bases)
+                sequence_length += len(sequence_bases)
+                sequence_ends_with_newline = line.endswith(b"\n")
+            if not sequence_ends_with_newline:
+                shuffled.write(b"\n")
+            recovered_residues += sequence_length
+            report.write(
+                orjson.dumps(
+                    {
+                        "byte_offset": warning.sequence_offset,
+                        "header_sha256": hashlib.sha256(original_header).hexdigest(),
+                        "sequence_length": sequence_length,
+                        "sequence_sha256": sequence_digest.hexdigest(),
+                        "temporary_uuid": record_uuid,
+                    },
+                    option=JSONL_OPTIONS,
+                )
+            )
+
+        shuffled.flush()
+        os.fsync(shuffled.fileno())
+        report.flush()
+        os.fsync(report.fileno())
+
+    return {
+        "recovered_records": len(warnings),
+        "recovered_residues": recovered_residues,
+        "first_byte_offset": warnings[0].sequence_offset,
+        "last_byte_offset": warnings[-1].sequence_offset,
+    }
 
 
 def _require_executable(name: str) -> str:
@@ -314,12 +562,17 @@ def _run_to_file(argv: list[str], output_path: Path, log_path: Path) -> None:
 def _run_shuffle_split(
     source_path: Path,
     raw_shard_dir: Path,
+    shard_dir: Path,
+    validation_dir: Path,
     log_path: Path,
     *,
     seqkit_threads: int,
-) -> None:
-    """Stream deterministic SeqKit shuffle output directly into split2."""
+) -> dict[str, int | str]:
+    """Shuffle, recover FAI-omitted records, split, and restore headers."""
     seqkit = _require_executable("seqkit")
+    shuffled_path = raw_shard_dir.parent / ".shuffled.fasta"
+    shuffle_diagnostics_path = validation_dir / "shuffle-stderr.log"
+    recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
     shuffle_argv = [
         seqkit,
         "shuffle",
@@ -331,6 +584,51 @@ def _run_shuffle_split(
         str(SHARD_RANDOM_SEED),
         str(source_path),
     ]
+    _append_log(log_path, f"Running command: {shlex.join(shuffle_argv)}")
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    with (
+        shuffled_path.open("xb") as shuffled,
+        shuffle_diagnostics_path.open("xb") as diagnostics,
+    ):
+        shuffle_process = subprocess.run(  # noqa: S603
+            shuffle_argv,
+            check=False,
+            stdout=shuffled,
+            stderr=diagnostics,
+        )
+    _append_diagnostic_file(shuffle_diagnostics_path, log_path)
+    if shuffle_process.returncode != 0:
+        raise subprocess.CalledProcessError(shuffle_process.returncode, shuffle_argv)
+
+    warnings = _parse_fai_duplicate_warnings(shuffle_diagnostics_path)
+    if len(warnings) != EXPECTED_RECOVERED_RECORDS:
+        raise ValueError(
+            "Unexpected number of SeqKit FAI duplicate warnings: "
+            f"{len(warnings)} != {EXPECTED_RECOVERED_RECORDS}"
+        )
+    temporary_namespace = f"{RECOVERED_HEADER_NAMESPACE}{uuid.uuid4().hex}_"
+    recovery_metrics = _append_recovered_fasta_records(
+        source_path,
+        shuffled_path,
+        warnings,
+        recovery_report_path,
+        temporary_namespace=temporary_namespace,
+    )
+    if recovery_metrics["recovered_residues"] != EXPECTED_RECOVERED_RESIDUES:
+        raise ValueError(
+            "Recovered duplicate residue count does not match the failed-run "
+            f"deficit: {recovery_metrics['recovered_residues']} != "
+            f"{EXPECTED_RECOVERED_RESIDUES}"
+        )
+    _append_log(
+        log_path,
+        "Recovered "
+        f"{recovery_metrics['recovered_records']} FAI-omitted records "
+        f"({recovery_metrics['recovered_residues']} residues) from byte offsets "
+        f"{recovery_metrics['first_byte_offset']} through "
+        f"{recovery_metrics['last_byte_offset']}",
+    )
+
     split_argv = [
         seqkit,
         "split2",
@@ -343,34 +641,57 @@ def _run_shuffle_split(
         "--force",
         "--out-prefix",
         "part_",
-        "-",
+        str(shuffled_path),
     ]
-    _append_log(log_path, f"Running command: {shlex.join(shuffle_argv)}")
-    _append_log(log_path, f"Piping into: {shlex.join(split_argv)}")
+    _append_log(log_path, f"Running command: {shlex.join(split_argv)}")
     raw_shard_dir.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log:
-        shuffle_process = subprocess.Popen(  # noqa: S603
-            shuffle_argv,
-            stdout=subprocess.PIPE,
+        split_process = subprocess.run(  # noqa: S603
+            split_argv,
+            check=False,
+            stdout=subprocess.DEVNULL,
             stderr=log,
         )
-        if shuffle_process.stdout is None:
-            shuffle_process.kill()
-            raise RuntimeError("SeqKit shuffle did not expose stdout")
-        try:
-            split_process = subprocess.run(  # noqa: S603
-                split_argv,
-                check=False,
-                stdin=shuffle_process.stdout,
-                stderr=log,
-            )
-        finally:
-            shuffle_process.stdout.close()
-        shuffle_returncode = shuffle_process.wait()
-    if shuffle_returncode != 0:
-        raise subprocess.CalledProcessError(shuffle_returncode, shuffle_argv)
     if split_process.returncode != 0:
         raise subprocess.CalledProcessError(split_process.returncode, split_argv)
+
+    raw_shards = sorted(
+        path
+        for path in raw_shard_dir.iterdir()
+        if path.is_file() and not path.is_symlink()
+    )
+    if len(raw_shards) != SHARD_COUNT:
+        raise ValueError(f"Expected {SHARD_COUNT} raw shards, found {len(raw_shards)}")
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    recovery_pattern = _recovery_header_pattern(temporary_namespace)
+    for index, raw_shard in enumerate(raw_shards):
+        if raw_shard.stat().st_size <= 0:
+            raise ValueError(f"SeqKit produced empty shard: {raw_shard}")
+        _run_to_file(
+            [
+                seqkit,
+                "replace",
+                "-j",
+                str(seqkit_threads),
+                "--pattern",
+                recovery_pattern,
+                "--replacement",
+                "",
+                str(raw_shard),
+            ],
+            shard_dir / _shard_filename(index),
+            log_path,
+        )
+
+    for raw_shard in raw_shards:
+        raw_shard.unlink()
+    raw_shard_dir.rmdir()
+    shuffled_path.unlink()
+    Path(f"{source_path}.seqkit.fai").unlink(missing_ok=True)
+    return recovery_metrics | {
+        "temporary_namespace": temporary_namespace,
+        "temporary_header_pattern": recovery_pattern,
+    }
 
 
 def _run_aggregate_seqkit_sum(
@@ -497,7 +818,12 @@ def _validate_profile_statistics(
     }
 
 
-def _artifact_record(path: Path, profile_root: Path) -> dict[str, str | int]:
+def _artifact_record(
+    path: Path,
+    profile_root: Path,
+    *,
+    forbidden_bytes: bytes | None = None,
+) -> dict[str, str | int]:
     """Build one manifest artifact record below the profile root."""
     _require_regular_file(path)
     resolved_root = profile_root.resolve()
@@ -507,7 +833,7 @@ def _artifact_record(path: Path, profile_root: Path) -> dict[str, str | int]:
     return {
         "path": resolved_path.relative_to(resolved_root).as_posix(),
         "size_bytes": path.stat().st_size,
-        "sha256": _sha256_file(path),
+        "sha256": _sha256_file(path, forbidden_bytes=forbidden_bytes),
     }
 
 
@@ -563,7 +889,7 @@ def _validate_profile_manifest(
         raise ValueError(f"Profile manifest must declare {SHARD_COUNT} shards")
     if not isinstance(recipe, dict):
         raise ValueError("Profile manifest recipe must be an object")
-    if recipe.get("version") != 1:
+    if recipe.get("version") != PROFILE_RECIPE_VERSION:
         raise ValueError("Unexpected profile recipe version")
     if recipe.get("seqkit_version") != SEQKIT_VERSION:
         raise ValueError("Unexpected profile SeqKit version")
@@ -575,10 +901,18 @@ def _validate_profile_manifest(
         raise ValueError("Unexpected profile shuffle seed")
     if recipe.get("shuffle") != ["--two-pass", "--update-faidx"]:
         raise ValueError("Unexpected profile shuffle recipe")
+    if recipe.get("duplicate_recovery") != _duplicate_recovery_recipe():
+        raise ValueError("Unexpected profile duplicate-recovery recipe")
     if recipe.get("split") != ["--by-part", SHARD_COUNT]:
         raise ValueError("Unexpected profile split recipe")
     if not isinstance(validation, dict) or validation.get("passed") is not True:
         raise ValueError("Profile manifest does not declare passed validation")
+    if validation.get("recovered_records") != EXPECTED_RECOVERED_RECORDS:
+        raise ValueError("Unexpected recovered duplicate-record count")
+    if validation.get("recovered_residues") != EXPECTED_RECOVERED_RESIDUES:
+        raise ValueError("Unexpected recovered duplicate-residue count")
+    if validation.get("temporary_recovery_prefix_absent") is not True:
+        raise ValueError("Profile may retain temporary recovery prefixes")
     validation_artifacts = validation.get("artifacts")
     if not isinstance(validation_artifacts, list):
         raise ValueError("Profile manifest validation artifacts must be a list")
@@ -638,6 +972,7 @@ def _build_prepare_plan(seqkit_threads: int) -> dict[str, object]:
             "threads": threads,
             "random_seed": SHARD_RANDOM_SEED,
             "shards": SHARD_COUNT,
+            "duplicate_recovery": _duplicate_recovery_recipe(),
         },
         "existing_profile_policy": "validate-and-reuse",
     }
@@ -716,25 +1051,44 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
         )
     _append_log(log_path, f"Using {version_output}")
 
-    _run_shuffle_split(
+    recovery_metrics = _run_shuffle_split(
         copied_source,
         raw_shard_dir,
+        shard_dir,
+        validation_dir,
         log_path,
         seqkit_threads=threads,
     )
-    raw_shards = sorted(
-        path
-        for path in raw_shard_dir.iterdir()
-        if path.is_file() and not path.is_symlink()
+    shuffle_log_path = validation_dir / "shuffle-stderr.log"
+    recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
+    evidence_shuffle_path = evidence_root / f"{generation_id}-shuffle-stderr.log"
+    evidence_recovery_path = evidence_root / f"{generation_id}-duplicate-recovery.jsonl"
+    shuffle_log_sha256, shuffle_log_size = _copy_file_with_sha256(
+        shuffle_log_path,
+        evidence_shuffle_path,
     )
-    if len(raw_shards) != SHARD_COUNT:
-        raise ValueError(f"Expected {SHARD_COUNT} raw shards, found {len(raw_shards)}")
-    for index, raw_shard in enumerate(raw_shards):
-        if raw_shard.stat().st_size <= 0:
-            raise ValueError(f"SeqKit produced empty shard: {raw_shard}")
-        raw_shard.replace(shard_dir / _shard_filename(index))
-    raw_shard_dir.rmdir()
-    Path(f"{copied_source}.seqkit.fai").unlink(missing_ok=True)
+    recovery_report_sha256, recovery_report_size = _copy_file_with_sha256(
+        recovery_report_path,
+        evidence_recovery_path,
+    )
+    _write_json_atomic(
+        evidence_root / "recovery.json",
+        recovery_metrics
+        | {
+            "generation_id": generation_id,
+            "shuffle_diagnostics": {
+                "path": evidence_shuffle_path.name,
+                "sha256": shuffle_log_sha256,
+                "size_bytes": shuffle_log_size,
+            },
+            "recovery_report": {
+                "path": evidence_recovery_path.name,
+                "sha256": recovery_report_sha256,
+                "size_bytes": recovery_report_size,
+            },
+        },
+    )
+    BENCHMARK_OUTPUT_VOLUME.commit()
     shard_paths = tuple(shard_dir / name for name in _shard_names())
 
     source_stats_path = validation_dir / "source-stats.tsv"
@@ -807,8 +1161,17 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
     )
 
     source_record = _artifact_record(copied_source, staging_root)
+    temporary_namespace = recovery_metrics.get("temporary_namespace")
+    if not isinstance(temporary_namespace, str):
+        raise RuntimeError("Duplicate recovery did not return its temporary namespace")
+    forbidden_recovery_header = b">" + temporary_namespace.encode("ascii")
     shard_records = [
-        _artifact_record(shard_path, staging_root) for shard_path in shard_paths
+        _artifact_record(
+            shard_path,
+            staging_root,
+            forbidden_bytes=forbidden_recovery_header,
+        )
+        for shard_path in shard_paths
     ]
     validation_records = [
         _artifact_record(staging_root / relative_path, staging_root)
@@ -827,11 +1190,12 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
         "shards": shard_records,
         "z_value": SMALL_BFD_Z,
         "recipe": {
-            "version": 1,
+            "version": PROFILE_RECIPE_VERSION,
             "seqkit_version": SEQKIT_VERSION,
             "seqkit_threads": threads,
             "random_seed": SHARD_RANDOM_SEED,
             "shuffle": ["--two-pass", "--update-faidx"],
+            "duplicate_recovery": _duplicate_recovery_recipe(),
             "split": ["--by-part", SHARD_COUNT],
         },
         "validation": {
@@ -842,6 +1206,11 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
             "sum_len": statistics["sum_len"],
             "maximum_residue_imbalance": statistics["maximum_residue_imbalance"],
             "maximum_allowed_residue_imbalance": MAX_PROFILE_IMBALANCE,
+            "recovered_records": recovery_metrics["recovered_records"],
+            "recovered_residues": recovery_metrics["recovered_residues"],
+            "first_recovered_byte_offset": recovery_metrics["first_byte_offset"],
+            "last_recovered_byte_offset": recovery_metrics["last_byte_offset"],
+            "temporary_recovery_prefix_absent": True,
             "artifacts": validation_records,
         },
     }
@@ -889,6 +1258,8 @@ def _prepare_profile(seqkit_threads: int) -> dict[str, object]:
         "num_seqs": statistics["num_seqs"],
         "sum_len": statistics["sum_len"],
         "maximum_residue_imbalance": statistics["maximum_residue_imbalance"],
+        "recovered_records": recovery_metrics["recovered_records"],
+        "recovered_residues": recovery_metrics["recovered_residues"],
     }
     _append_log(log_path, f"Published profile {PROFILE_ID}")
     _write_json_atomic(evidence_root / "metrics.json", result)
@@ -1877,6 +2248,7 @@ def _profile_scientific_identity(manifest: dict[str, Any]) -> str:
                 "seqkit_version": recipe.get("seqkit_version"),
                 "random_seed": recipe.get("random_seed"),
                 "shuffle": recipe.get("shuffle"),
+                "duplicate_recovery": recipe.get("duplicate_recovery"),
                 "split": recipe.get("split"),
             },
         })

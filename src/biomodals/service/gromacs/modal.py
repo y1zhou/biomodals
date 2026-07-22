@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 
 import modal
 
@@ -21,6 +21,7 @@ from biomodals.service.gromacs.results import (
     ResultIdentityMismatchError,
 )
 from biomodals.service.gromacs.router import GromacsJobOptions
+from biomodals.service.modal_logs import ModalCLILogStreamer
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import JobRecord
 
@@ -35,6 +36,7 @@ class ModalGromacsAdapter:
         artifact_cache: ArtifactCache | None = None,
         call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
         function_resolver: Callable[..., modal.Function] | None = None,
+        log_streamer: ModalCLILogStreamer | None = None,
     ) -> None:
         """Compose focused Modal compute and Result boundaries."""
         self.provider = ModalGromacsProvider(
@@ -46,6 +48,7 @@ class ModalGromacsAdapter:
             output_volume_name=output_volume_name,
             artifact_cache=artifact_cache,
         )
+        self.logs = log_streamer or ModalCLILogStreamer()
 
     async def preflight(
         self,
@@ -92,6 +95,18 @@ class ModalGromacsAdapter:
     async def cancel(self, modal_call_id: str) -> None:
         """Cancel one Modal call graph."""
         await self.provider.cancel(modal_call_id)
+
+    async def open_operation_logs(
+        self,
+        job: JobRecord,
+        modal_call_id: str,
+    ) -> AsyncIterable[bytes]:
+        """Follow one attached call through Modal's supported logs CLI."""
+        return await self.logs.open(
+            app_name=job.modal_app_name,
+            environment_name=job.modal_environment,
+            function_call_id=modal_call_id,
+        )
 
     async def read_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
         """Read the authoritative published Result."""

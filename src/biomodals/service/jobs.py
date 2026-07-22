@@ -243,6 +243,7 @@ class Reconciler(Protocol):
 
 CancelJob = Callable[[ServiceStore, JobRecord], Awaitable[None]]
 ReadArtifact = Callable[[JobRecord], AsyncIterable[bytes]]
+OpenOperationLogs = Callable[[JobRecord, str], Awaitable[AsyncIterable[bytes]]]
 PreflightWorkload = Callable[[str, str, int], Awaitable[None]]
 
 
@@ -257,6 +258,7 @@ class WorkloadRegistration:
     cancel: CancelJob | None = None
     read_artifact: ReadArtifact | None = None
     rebuild_artifact: ReadArtifact | None = None
+    open_operation_logs: OpenOperationLogs | None = None
     preflight: PreflightWorkload | None = None
     max_body_bytes: int = 1024 * 1024
 

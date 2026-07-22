@@ -63,6 +63,7 @@ class FakeGromacsAdapter:
         self.unknown_failures_remaining = 0
         self.preflights: list[tuple[str, str, int]] = []
         self.preflight_failures_remaining = 0
+        self.log_requests: list[tuple[UUID, str]] = []
 
     async def preflight(
         self,
@@ -111,6 +112,15 @@ class FakeGromacsAdapter:
     async def read_artifact(self, _job):
         self.downloads += 1
         yield self.artifact_content
+
+    async def open_operation_logs(self, job, modal_call_id: str):
+        self.log_requests.append((job.job_id, modal_call_id))
+
+        async def chunks():
+            yield b"Preparing simulation\n"
+            yield b"Simulation is running\n"
+
+        return chunks()
 
 
 class APIClient:
@@ -178,6 +188,7 @@ def _service(
     registration = create_registration(
         adapter,
         read_artifact=adapter.read_artifact,
+        open_operation_logs=adapter.open_operation_logs,
         preflight=adapter.preflight,
         max_pdb_bytes=max_pdb_bytes,
     )
@@ -691,6 +702,106 @@ def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> 
         "properties"
     ]["display_name"]
     assert display_name["anyOf"][0]["maxLength"] == 120
+
+
+def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "admin@example.com", is_admin=True)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(
+        client,
+        csrf_token,
+        idempotency_key=str(uuid4()),
+    )
+    job_id = UUID(submitted.json()["job_id"])
+
+    assert client.get(f"/api/v1/admin/jobs/{job_id}/log-targets").status_code == 403
+
+    client.cookies.clear()
+    _login(client, "admin@example.com")
+    targets = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
+
+    assert targets.status_code == 200
+    assert targets.json() == {
+        "job_id": str(job_id),
+        "targets": [
+            {
+                "stage_code": "prepare_simulation",
+                "function_name": "prepare_tpr_cpu",
+                "state": "running",
+                "started_at": targets.json()["targets"][0]["started_at"],
+            }
+        ],
+    }
+    assert "fc-1" not in targets.text
+
+    streamed = client.get(f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation")
+
+    assert streamed.status_code == 200
+    assert streamed.headers["content-type"].startswith("text/plain")
+    assert streamed.text == "Preparing simulation\nSimulation is running\n"
+    assert adapter.log_requests == [(job_id, "fc-1")]
+
+    store.record_operation_outcome(
+        job_id,
+        operation="prepare_tpr_cpu",
+        expected_modal_call_id="fc-1",
+        outcome=JobOperationState.COMPLETED,
+        now=1_800_000_001,
+    )
+    for operation, modal_call_id in (
+        ("collect_traj_stats:nvt_", "fc-nvt"),
+        ("collect_traj_stats:npt_", "fc-npt"),
+        ("production_run_cpu", "fc-production"),
+    ):
+        token = uuid4().hex
+        assert (
+            store.claim_modal_operation(
+                job_id,
+                operation=operation,
+                submission_token=token,
+                now=1_800_000_001,
+            )
+            is not None
+        )
+        store.attach_modal_call(
+            job_id,
+            operation=operation,
+            modal_call_id=modal_call_id,
+            submission_token=token,
+            now=1_800_000_001,
+        )
+
+    parallel = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
+
+    assert [target["stage_code"] for target in parallel.json()["targets"]] == [
+        "analyze_nvt",
+        "analyze_npt",
+        "run_production",
+    ]
+    stale = client.get(f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation")
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "job_log_target_unavailable"
+
+
+def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    schema = client.get("/openapi.json").json()
+    targets_path = "/api/v1/admin/jobs/{job_id}/log-targets"
+    stream_path = "/api/v1/admin/jobs/{job_id}/logs"
+
+    assert targets_path in schema["paths"]
+    assert stream_path in schema["paths"]
+    target_response = schema["paths"][targets_path]["get"]["responses"]["200"]
+    assert target_response["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/AdminJobLogTargetsView"
+    )
+    stream_response = schema["paths"][stream_path]["get"]["responses"]["200"]
+    assert stream_response["content"]["text/plain"]["schema"] == {"type": "string"}
+    assert stream_response["description"] == "Live logs for the selected active stage"
+    assert schema["paths"][stream_path]["get"]["security"] == [{"SessionCookie": []}]
 
 
 def test_modal_preflight_runs_only_for_changed_provider_fields(

@@ -147,8 +147,10 @@ def create_app(
         app.include_router(workload.router)
 
     from biomodals.service.admin_api import create_admin_router
+    from biomodals.service.admin_jobs_api import create_admin_jobs_router
 
     app.include_router(create_admin_router())
+    app.include_router(create_admin_jobs_router())
     document_contract_headers(app, session_cookie_name=session_cookie_name)
     return app
 
@@ -185,6 +187,7 @@ def create_deployed_app() -> FastAPI:
         lifecycle_locks=lifecycle_locks,
         read_artifact=adapter.read_artifact,
         rebuild_artifact=adapter.rebuild_artifact,
+        open_operation_logs=adapter.open_operation_logs,
         preflight=adapter.preflight,
     )
     return create_app(

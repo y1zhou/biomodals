@@ -1365,6 +1365,15 @@ class ServiceStore:
             ).fetchone()
             return _job_from_row_with_operations(conn, row) if row is not None else None
 
+    def get_job_by_id(self, job_id: UUID) -> JobRecord | None:
+        """Load one Job for an internal or already-authorized operation."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            return _job_from_row_with_operations(conn, row) if row is not None else None
+
     def list_jobs(self, owner_user_id: UUID) -> list[JobRecord]:
         """List only one owner's jobs, newest first."""
         with self._connection() as conn:

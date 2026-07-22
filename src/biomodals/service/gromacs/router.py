@@ -38,6 +38,7 @@ from biomodals.service.http_contract import (
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     JobView,
+    OpenOperationLogs,
     PreflightWorkload,
     ReadArtifact,
     Reconciler,
@@ -347,6 +348,7 @@ def create_registration(
     lifecycle_locks: JobLifecycleLocks | None = None,
     read_artifact: ReadArtifact | None = None,
     rebuild_artifact: ReadArtifact | None = None,
+    open_operation_logs: OpenOperationLogs | None = None,
     preflight: PreflightWorkload | None = None,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> WorkloadRegistration:
@@ -379,6 +381,7 @@ def create_registration(
         cancel=cancel,
         read_artifact=read_artifact,
         rebuild_artifact=rebuild_artifact,
+        open_operation_logs=open_operation_logs,
         preflight=preflight,
         max_body_bytes=max_pdb_bytes + MAX_MULTIPART_OVERHEAD_BYTES,
     )

@@ -30,6 +30,150 @@ _Avoid_: final node, last node
 A deployed Modal app that owns tool runtime, images, volumes, and exported app functions.
 _Avoid_: workflow node, app node
 
+**MSA Benchmark App**:
+An experimental, self-contained Biomodals app that produces comparable AlphaFold3 MSA-search measurements while remaining outside production prediction and workflow behavior. It may copy proven environment and image setup, but owns separate Modal resources and never imports the production AlphaFold3 app module. Profile preparation, storage scanning, and search benchmarking are separately invoked operations; later operations require a valid Published Database Profile. Local commands are plan-only by default and require an explicit `--submit` flag before making remote calls. The initial implementation is limited to small-BFD profile preparation, Volume scans, smoke validation, and the Phase 1 search matrix; four-database/per-sequence fanout is designed only after Phase 1 measurements select candidate layouts.
+_Avoid_: temporary AlphaFold3 app, production AlphaFold3 app
+
+**Benchmark Database Profile**:
+A manifest-identified set of scientifically equivalent physical layouts of one genetic reference database used for controlled MSA-search comparisons.
+_Avoid_: shard directory, test database, database copy
+
+**Published Database Profile**:
+A Benchmark Database Profile whose source identity, shard equivalence, and balance have passed validation and whose readiness manifest has been published.
+_Avoid_: complete directory, prepared database
+
+**Profile Preparation**:
+The explicit pre-measurement operation that creates, validates, and publishes a Benchmark Database Profile.
+_Avoid_: benchmark setup, lazy shard creation
+
+**Shard Build Recipe**:
+A versioned deterministic transformation from a reference-database monolith into the shard layout of a Benchmark Database Profile.
+_Avoid_: ad hoc split, shard command
+
+**Benchmark Run**:
+A controlled MSA-search execution that reads a published Benchmark Database Profile without modifying it and produces performance and scientific evidence.
+_Avoid_: profile preparation, production prediction
+
+**Storage Scan**:
+A Benchmark Run that reads one complete physical database layout without performing sequence search, establishing the storage-delivery envelope.
+_Avoid_: MSA search, cold-cache benchmark
+
+**Storage Reader Topology**:
+The allocation of concurrent database read streams across benchmark containers during a Storage Scan.
+_Avoid_: shard count, HMMER CPU layout
+
+**Isolated Database Search**:
+A Benchmark Run that queries exactly one genetic database through the pinned AlphaFold MSA implementation, excluding other databases, templates, and inference.
+_Avoid_: full data pipeline, prediction benchmark
+
+**Instrumented Search Adapter**:
+A benchmark-only wrapper around the pinned AlphaFold database search that retains raw evidence and timings without changing search or merge behavior.
+_Avoid_: AlphaFold fork, alternative search implementation
+
+**Validated Search Result**:
+A database-search result whose completion marker proves its scientific identity and the integrity of its declared artifacts.
+_Avoid_: existing A3M file, benchmark cache hit
+
+**Operational Search Baseline**:
+An Isolated Database Search using the current unsharded AlphaFold search configuration, used to quantify change from existing behavior.
+_Avoid_: scientific oracle, full production latency
+
+**Monolithic Search Oracle**:
+An unsharded Isolated Database Search with full-database statistical scaling fixed explicitly, used to evaluate sharded scientific evidence.
+_Avoid_: operational baseline, byte-identical output oracle
+
+**HMMER CPU Layout**:
+The combination of tool threads per shard process and simultaneously active shard processes within an Isolated Database Search.
+_Avoid_: Modal CPU allocation, total database shard count
+
+**Screening Query**:
+The pinned representative protein sequence evaluated across every initial Isolated Database Search configuration.
+_Avoid_: example input, stress query
+
+**Stress Query**:
+The pinned protein sequence with high expected search and merge demand used to validate promoted search configurations.
+_Avoid_: screening query, arbitrary long sequence
+
+**Benchmark Block**:
+One sequential pass through a defined set of search configurations in a controlled order, providing one measured sample per configuration.
+_Avoid_: concurrent batch, benchmark case
+
+**Promoted Search Layout**:
+A sharded HMMER CPU Layout that passes screening gates and advances to stress-query or integrated-pipeline evaluation.
+_Avoid_: fastest observation, presumed production default
+
+**Scientific Promotion Gate**:
+The evidence requirements an Isolated Database Search must satisfy against the Monolithic Search Oracle before its performance can justify further evaluation.
+_Avoid_: byte-identity requirement, final-model score check
+
+**Performance Promotion Gate**:
+The latency and cost requirements a scientifically valid search layout must satisfy before advancing beyond isolated-database evaluation.
+_Avoid_: fastest sample, scientific gate
+
+**Benchmark Evidence Set**:
+The durable raw search outputs, measurements, provenance, and completion state produced by one defined benchmark execution. At the campaign root, `plan.json` fixes the work, `results.parquet` indexes one row per sample, and `summary.md` reports comparisons and gates; large/raw artifacts remain in their sample directories and are referenced rather than copied.
+_Avoid_: MSA cache, database profile, downloaded summary
+
+**Resource Trace**:
+A durable time series of container resource use and active search work aligned to the phase boundaries of a Benchmark Run.
+_Avoid_: transient platform log, aggregate runtime only
+
+**Benchmark Campaign**:
+A finite, reproducible collection of Benchmark Runs performed to select an MSA Sharding Strategy. Non-sequence evidence such as storage scans and campaign summaries lives under `/benchmarks/{campaign_id}/`; it is never assigned a synthetic sequence hash. The immutable initial campaign ID is `small-bfd-phase1-v1`; changing its plan requires a new ID. This campaign permits one smoke invocation and, after it passes, one measured matrix invocation containing the agreed three blocks. Completion markers make accidental reruns submit no work.
+_Avoid_: benchmark service, production workload
+
+**MSA Sharding Strategy**:
+A scientifically valid database layout and search-resource configuration selected for possible incorporation into the production AlphaFold3 app. Benchmarking may rank candidates but never migrates one automatically; production promotion is a separate, explicitly approved implementation step.
+_Avoid_: fastest sample, benchmark harness
+
+**MSA Search Subject**:
+A unique biological sequence that requires database-generated MSA evidence and may be referenced by one or more input chains.
+_Avoid_: chain identifier, duplicate homomer chain
+
+**Raw Database MSA**:
+A validated per-database MSA result produced for one MSA Search Subject before AlphaFold combines database results.
+_Avoid_: combined unpaired MSA, paired MSA, benchmark summary
+
+**Search Identity**:
+A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
+_Avoid_: sequence hash, benchmark sample ID, resource configuration
+
+**Canonical Search Result**:
+The production-cache artifact published at a Search Identity root only after its search strategy has passed the scientific and performance gates. Benchmark runs never publish this artifact; they write only Benchmark Samples beneath `samples/`.
+_Avoid_: arbitrary benchmark result, fastest unvalidated sample
+
+**Benchmark Sample**:
+One measured execution of a search case within a Benchmark Campaign, identified by a human-readable sample ID such as `screen-S3-block-01`. Multiple Benchmark Samples may share one Search Identity while measuring different operational layouts or repetitions. Query-derived evidence always lives beneath `/{sequence_hash_prefix}/{sequence_hash}/raw-msa/`.
+_Avoid_: scientific cache identity, unique biological sequence
+
+**Sequence Hash Prefix**:
+The first two hexadecimal characters of the full sequence hash, used only to fan out directories. It is not a sequence identifier by itself.
+_Avoid_: sequence hash, search identity
+
+**Duplicate-Tail Difference**:
+A sharded-search discrepancy attributable only to cross-shard duplicate hits and their effect at the truncated end of an MSA result.
+_Avoid_: unexplained hit difference, scientific equivalence
+
+**Benchmark CPU Floor**:
+The minimum Modal CPU reserved throughout a Benchmark Run, balancing guaranteed compute availability against cost during low-utilization phases.
+_Avoid_: HMMER CPU layout, CPU limit
+
+**Search Wall Time**:
+Elapsed time from starting the pinned database query through completion of its merged A3M result.
+_Avoid_: sample wall time, remote call wall time
+
+**Sample Wall Time**:
+Elapsed time from benchmark-function entry through durable publication of that sample's evidence.
+_Avoid_: search wall time, remote call wall time
+
+**Remote Call Wall Time**:
+Elapsed time from submitting a benchmark function call through observing its completion, including platform scheduling and container startup.
+_Avoid_: search wall time, sample wall time
+
+**Volume-Resident Reference Data**:
+Genetic reference-database payloads that remain on persistent Modal Volumes throughout preparation and measurement rather than being fully staged on container-local storage.
+_Avoid_: local database staging, SSD-cached database
+
 **App Function**:
 A callable Modal remote function exposed by a Biomodals app or another Modal app and invoked by a workflow node.
 _Avoid_: workflow node

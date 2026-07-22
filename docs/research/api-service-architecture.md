@@ -131,6 +131,19 @@ strings. Each registered workload owns their allowed values in its static
 definition; the shared OpenAPI schema does not need a new release whenever a
 workflow adds a stage or calls a different deployed function.
 
+`ServiceStore` deliberately remains the sole SQLite transaction owner for the
+MVP. Admission, User limits, operation attachment, cancellation, and Result
+publication cross several tables and must commit atomically. Splitting them
+into nominal repositories would either hide that boundary or add a forwarding
+facade; revisit the module boundary when a second persistence implementation or
+an explicit transaction coordinator exists.
+
+`ModalGromacsAdapter` is the narrow composition facade over the focused compute
+provider and Result publisher. Routes and reconciliation depend on that one
+testable workload seam, while Modal lookup and archive behavior remain in their
+own modules. It is not a shared workflow base class, and future workloads need
+not reproduce its shape.
+
 The common routes are:
 
 - `GET /api/v1/jobs`

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import os
@@ -32,6 +33,7 @@ from biomodals.service.runtime_config import (
 )
 from biomodals.service.store import (
     JobOperationRecord,
+    JobOperationState,
     JobRecord,
     JobState,
     ServiceStore,
@@ -67,6 +69,7 @@ class _FakeGromacsAdapter:
         self.submit_calls = 0
         self.preflight_versions: list[int] = []
         self.submit_versions: list[int] = []
+        self.log_fetches = 0
         self.calls: dict[str, tuple[float, str]] = {}
         self.cancelled: set[str] = set()
         self.archive = _result_archive()
@@ -84,6 +87,7 @@ class _FakeGromacsAdapter:
                     "submit_versions": self.submit_versions,
                     "provider_calls": len(self.calls),
                     "cancel_calls": len(self.cancelled),
+                    "log_fetches": self.log_fetches,
                 },
                 option=orjson.OPT_SORT_KEYS,
             )
@@ -179,10 +183,18 @@ class _FakeGromacsAdapter:
     async def open_operation_logs(
         self,
         _job: JobRecord,
-        _operation: JobOperationRecord,
+        operation: JobOperationRecord,
     ):
+        self.log_fetches += 1
+        self._write_stats()
+
         async def chunks():
-            yield b"Browser test remote log\n"
+            yield b"2026-07-22 14:05:33+08:00 Browser test remote log\n"
+            if operation.state in {
+                JobOperationState.RUNNING,
+                JobOperationState.STATE_UNKNOWN,
+            }:
+                await asyncio.Event().wait()
 
         return chunks()
 

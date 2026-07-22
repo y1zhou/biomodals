@@ -164,7 +164,19 @@ async def _redact_provider_call_id(
                     output.extend(replacement)
                     pending = pending[index + len(secret) :]
                     continue
-                safe_length = max(0, len(pending) - len(secret) + 1)
+                held_length = next(
+                    (
+                        length
+                        for length in range(
+                            min(len(pending), len(secret) - 1),
+                            0,
+                            -1,
+                        )
+                        if pending.endswith(secret[:length])
+                    ),
+                    0,
+                )
+                safe_length = len(pending) - held_length
                 output.extend(pending[:safe_length])
                 pending = pending[safe_length:]
                 break

@@ -165,7 +165,7 @@ def test_log_redaction_closes_source_when_consumer_disconnects() -> None:
             _redact_provider_call_id(source(), "fc-secret"),
         )
 
-        assert await anext(redacted)
+        assert await anext(redacted) == b"visible output before a long-running call\n"
         await redacted.aclose()
 
         assert source_closed

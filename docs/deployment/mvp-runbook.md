@@ -145,8 +145,3 @@ incompatible newer database. During the current disposable-state phase, stop
 the pre-release service and explicitly remove only the exact pre-release
 database named by its configuration when a schema reset is required. Never
 apply that reset instruction to production state or cache.
-
-The schema 10 to 11 upgrade is automatic and preserves Users and existing Job
-state. Do not delete that database for this upgrade. A rollback to a schema 10
-binary requires a separate compatible database because schema 10 rejects the
-newer schema.

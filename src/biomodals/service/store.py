@@ -1764,19 +1764,18 @@ class ServiceStore:
         submission_token: str,
         now: int,
     ) -> JobRecord | None:
-        """Persist a definite stage-submission failure for fail-fast cleanup."""
+        """Persist a rejected submission without inventing a started stage."""
         with self._transaction() as conn:
             cursor = conn.execute(
                 """
                 UPDATE job_operations
                 SET state = ?, submission_token = NULL,
-                    submission_lease_until = NULL, started_at = ?, completed_at = ?
+                    submission_lease_until = NULL, completed_at = ?
                 WHERE job_id = ? AND operation = ?
                   AND state = ? AND submission_token = ?
                 """,
                 (
                     JobOperationState.FAILED.value,
-                    now,
                     now,
                     str(job_id),
                     operation,

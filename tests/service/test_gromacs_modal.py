@@ -1094,6 +1094,15 @@ def test_definite_stage_rejection_cancels_started_siblings(
     assert states["collect_traj_stats:nvt_"] == JobOperationState.CANCELLED
     assert states["collect_traj_stats:npt_"] == JobOperationState.CANCELLED
     assert states["production_run_gpu"] == JobOperationState.FAILED
+    rejected_operation = next(
+        operation
+        for operation in failed.operations
+        if operation.operation == "production_run_gpu"
+    )
+    assert rejected_operation.started_at is None
+    assert all(
+        stage.operation != "production_run_gpu" for stage in failed.stage_history
+    )
     assert rejected.calls == 1
 
 

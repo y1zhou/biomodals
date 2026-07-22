@@ -98,7 +98,7 @@ def _download_filename(display_name: str) -> str:
     )
     slug = _DOWNLOAD_NAME_SEPARATOR.sub("-", ascii_name).strip("-")
     slug = slug[:120].rstrip("-")
-    return f"{slug or 'job'}-results.zip"
+    return f"{slug or 'gromacs'}-results.zip"
 
 
 def _cached_archive_response(

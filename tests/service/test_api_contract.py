@@ -24,6 +24,7 @@ from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.modal import GromacsReconciler
 from biomodals.service.jobs import JobLifecycleLocks, WorkloadRegistration
+from biomodals.service.jobs_api import _download_filename
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
@@ -245,6 +246,10 @@ def _response_codes(schema: dict, path: str, status_code: int) -> list[str]:
         "code"
     ]
     return code["enum"] if "enum" in code else [code["const"]]
+
+
+def test_result_filename_falls_back_without_exposing_job_identity() -> None:
+    assert _download_filename("日本語") == "gromacs-results.zip"
 
 
 def test_login_requires_the_frontend_origin_and_sets_hardened_cookies(

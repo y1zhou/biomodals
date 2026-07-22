@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any, cast
@@ -23,7 +24,11 @@ from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.modal import GromacsReconciler
-from biomodals.service.jobs import JobLifecycleLocks, WorkloadRegistration
+from biomodals.service.jobs import (
+    JobLifecycleLocks,
+    OperationLogRequest,
+    WorkloadRegistration,
+)
 from biomodals.service.jobs_api import _download_filename
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
@@ -63,7 +68,16 @@ class FakeGromacsAdapter:
         self.unknown_failures_remaining = 0
         self.preflights: list[tuple[str, str, int]] = []
         self.preflight_failures_remaining = 0
-        self.log_requests: list[tuple[UUID, str | None, str]] = []
+        self.log_requests: list[
+            tuple[
+                UUID,
+                str | None,
+                str,
+                str,
+                datetime | None,
+                datetime | None,
+            ]
+        ] = []
 
     async def preflight(
         self,
@@ -113,11 +127,19 @@ class FakeGromacsAdapter:
         self.downloads += 1
         yield self.artifact_content
 
-    async def open_operation_logs(self, job, operation):
+    async def open_operation_logs(
+        self,
+        job,
+        operation,
+        selection: OperationLogRequest,
+    ):
         self.log_requests.append((
             job.job_id,
             operation.modal_call_id,
             operation.state.value,
+            selection.mode,
+            selection.since,
+            selection.until,
         ))
 
         async def chunks():
@@ -754,7 +776,7 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
         "Simulation is running\n"
     )
     assert "fc-1" not in streamed.text
-    assert adapter.log_requests == [(job_id, "fc-1", "running")]
+    assert adapter.log_requests == [(job_id, "fc-1", "running", "live", None, None)]
 
     store.record_operation_outcome(
         job_id,
@@ -839,7 +861,59 @@ def test_admin_can_fetch_completed_stage_logs_without_following(tmp_path: Path) 
     ]
     assert targets.json()["targets"][0]["ended_at"] is not None
     assert streamed.status_code == 200
-    assert adapter.log_requests == [(job_id, "fc-1", "completed")]
+    assert adapter.log_requests == [
+        (job_id, "fc-1", "completed", "historical", None, None)
+    ]
+
+
+def test_admin_can_page_active_stage_logs_by_bounded_time_window(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "admin@example.com", is_admin=True)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    client.cookies.clear()
+    _login(client, "admin@example.com")
+    targets = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets").json()
+    started_at = datetime.fromisoformat(targets["targets"][0]["started_at"])
+    since = started_at - timedelta(seconds=1)
+    until = started_at + timedelta(seconds=1)
+
+    streamed = client.get(
+        f"/api/v1/admin/jobs/{job_id}/logs",
+        params={
+            "stage": "prepare_simulation",
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+        },
+    )
+    incomplete = client.get(
+        f"/api/v1/admin/jobs/{job_id}/logs",
+        params={"stage": "prepare_simulation", "since": since.isoformat()},
+    )
+    oversized = client.get(
+        f"/api/v1/admin/jobs/{job_id}/logs",
+        params={
+            "stage": "prepare_simulation",
+            "since": since.isoformat(),
+            "until": (since + timedelta(minutes=16)).isoformat(),
+        },
+    )
+
+    assert streamed.status_code == 200
+    assert streamed.headers["x-biomodals-log-mode"] == "historical"
+    assert streamed.headers["x-biomodals-log-since"] == since.isoformat()
+    assert streamed.headers["x-biomodals-log-until"] == until.isoformat()
+    assert adapter.log_requests == [
+        (job_id, "fc-1", "running", "historical", since, until)
+    ]
+    assert incomplete.status_code == 400
+    assert incomplete.json()["code"] == "job_log_window_invalid"
+    assert oversized.status_code == 400
+    assert oversized.json()["code"] == "job_log_window_invalid"
 
 
 def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
@@ -859,6 +933,17 @@ def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
     assert stream_response["content"]["text/plain"]["schema"] == {"type": "string"}
     assert stream_response["description"] == "Logs for the selected remote stage"
     assert schema["paths"][stream_path]["get"]["security"] == [{"SessionCookie": []}]
+    stream_parameters = {
+        parameter["name"]: parameter
+        for parameter in schema["paths"][stream_path]["get"]["parameters"]
+        if parameter["in"] == "query"
+    }
+    assert set(stream_parameters) == {"stage", "since", "until"}
+    assert stream_parameters["since"]["schema"]["anyOf"][0]["format"] == "date-time"
+    invalid_window = schema["paths"][stream_path]["get"]["responses"]["400"]
+    assert invalid_window["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/AdminJobLogWindowInvalidResponse"
+    )
     targets_schema = schema["components"]["schemas"]["AdminJobLogTargetsView"]
     assert set(targets_schema["required"]) == {"job_id", "targets"}
     target_schema = schema["components"]["schemas"]["AdminJobLogTargetView"]

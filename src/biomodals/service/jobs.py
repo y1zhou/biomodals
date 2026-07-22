@@ -31,6 +31,31 @@ JobStageOutcome = Literal["completed", "failed", "cancelled"]
 OperationLogMode = Literal["live", "historical"]
 
 
+@dataclass(frozen=True, slots=True)
+class OperationLogRequest:
+    """Provider-independent selection of live or time-bounded operation logs."""
+
+    mode: OperationLogMode
+    since: datetime | None = None
+    until: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Reject combinations that no provider adapter can interpret safely."""
+        if self.mode == "live" and (self.since is not None or self.until is not None):
+            raise ValueError("Live operation logs cannot use a time range")
+        if (self.since is None) != (self.until is None):
+            raise ValueError("Operation log ranges require both since and until")
+        if self.since is not None and self.until is not None:
+            if self.mode != "historical":
+                raise ValueError("Time-bounded operation logs must be historical")
+            if (
+                self.since.tzinfo is None
+                or self.until.tzinfo is None
+                or self.since >= self.until
+            ):
+                raise ValueError("Operation log ranges require valid aware timestamps")
+
+
 def operation_log_mode(state: JobOperationState) -> OperationLogMode | None:
     """Classify operation states that retain inspectable provider logs."""
     if state in {JobOperationState.RUNNING, JobOperationState.STATE_UNKNOWN}:
@@ -265,7 +290,7 @@ class Reconciler(Protocol):
 CancelJob = Callable[[ServiceStore, JobRecord], Awaitable[None]]
 ReadArtifact = Callable[[JobRecord], AsyncIterable[bytes]]
 OpenOperationLogs = Callable[
-    [JobRecord, JobOperationRecord],
+    [JobRecord, JobOperationRecord, OperationLogRequest],
     Awaitable[AsyncIterable[bytes]],
 ]
 PreflightWorkload = Callable[[str, str, int], Awaitable[None]]

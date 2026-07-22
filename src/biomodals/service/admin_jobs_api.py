@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterable, AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, Protocol, cast, runtime_checkable
 from uuid import UUID
 
@@ -23,6 +23,7 @@ from biomodals.service.http_contract import (
 )
 from biomodals.service.jobs import (
     OperationLogMode,
+    OperationLogRequest,
     WorkloadRegistration,
     operation_log_mode,
 )
@@ -33,6 +34,7 @@ from biomodals.service.store import (
 )
 
 LOGGER = logging.getLogger(__name__)
+_MAX_LOG_WINDOW = timedelta(minutes=15)
 AdminJobLogTargetState = Literal[
     "running",
     "state_unknown",
@@ -93,6 +95,12 @@ class AdminJobLogsUnavailableResponse(CodedErrorResponse):
     code: Literal["job_logs_unavailable"]
 
 
+class AdminJobLogWindowInvalidResponse(CodedErrorResponse):
+    """The requested historical window is incomplete or too large."""
+
+    code: Literal["job_log_window_invalid"]
+
+
 def _not_found() -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
 
@@ -132,6 +140,53 @@ def _log_targets(
             operation,
         ))
     return targets
+
+
+def _operation_log_request(
+    target: AdminJobLogTargetView,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    now: datetime,
+) -> OperationLogRequest | None:
+    """Validate and clamp an optional historical window to durable Stage bounds."""
+    if since is None and until is None:
+        return OperationLogRequest(mode=target.mode)
+    if since is None or until is None:
+        raise CodedAPIError(
+            400,
+            "job_log_window_invalid",
+            "Historical Job log windows require both since and until",
+        )
+    if since.tzinfo is None or until.tzinfo is None or since >= until:
+        raise CodedAPIError(
+            400,
+            "job_log_window_invalid",
+            "Historical Job log windows require valid timezone-aware timestamps",
+        )
+    if until - since > _MAX_LOG_WINDOW:
+        raise CodedAPIError(
+            400,
+            "job_log_window_invalid",
+            "Historical Job log windows cannot exceed 15 minutes",
+        )
+    lower_bound = target.started_at - timedelta(seconds=1)
+    upper_bound = (target.ended_at or now) + timedelta(seconds=1)
+    bounded_since = max(since, lower_bound)
+    bounded_until = min(until, upper_bound)
+    if bounded_since >= bounded_until:
+        return None
+    return OperationLogRequest(
+        mode="historical",
+        since=bounded_since,
+        until=bounded_until,
+    )
+
+
+async def _empty_log_stream() -> AsyncIterator[bytes]:
+    """Represent a valid requested window outside the operation's lifetime."""
+    if False:  # pragma: no cover - makes this an async iterator without output
+        yield b""
 
 
 async def _redact_provider_call_id(
@@ -222,6 +277,7 @@ def create_admin_jobs_router() -> APIRouter:
             },
             **read_responses,
             409: {"model": AdminJobLogTargetUnavailableResponse},
+            400: {"model": AdminJobLogWindowInvalidResponse},
             503: {"model": AdminJobLogsUnavailableResponse},
         },
     )
@@ -230,6 +286,8 @@ def create_admin_jobs_router() -> APIRouter:
         job_id: UUID,
         _session: Annotated[AuthenticatedSession, Depends(require_admin)],
         stage: Annotated[str, Query(min_length=1, max_length=120)],
+        since: Annotated[datetime | None, Query()] = None,
+        until: Annotated[datetime | None, Query()] = None,
     ) -> StreamingResponse:
         store: ServiceStore = request.app.state.store
         job = store.get_job_by_id(job_id)
@@ -264,8 +322,22 @@ def create_admin_jobs_router() -> APIRouter:
                 "job_log_target_unavailable",
                 "Logs are not available for the selected Job stage",
             )
+        selection = _operation_log_request(
+            selected_target,
+            since=since,
+            until=until,
+            now=datetime.now(UTC),
+        )
         try:
-            stream = await registration.open_operation_logs(job, selected_operation)
+            stream = (
+                _empty_log_stream()
+                if selection is None
+                else await registration.open_operation_logs(
+                    job,
+                    selected_operation,
+                    selection,
+                )
+            )
         except OSError as exc:
             LOGGER.exception(
                 "Could not start Job log stream job_id=%s stage=%s request_id=%s",
@@ -282,17 +354,25 @@ def create_admin_jobs_router() -> APIRouter:
             "event=job_log_stream_started job_id=%s stage=%s mode=%s request_id=%s",
             job.job_id,
             stage,
-            selected_target.mode,
+            selection.mode if selection is not None else "historical",
             request_id_from(request),
         )
+        response_mode: OperationLogMode = (
+            selection.mode if selection is not None else "historical"
+        )
+        response_headers = {
+            "Cache-Control": "no-store, no-transform",
+            "X-Accel-Buffering": "no",
+            "X-BioModals-Log-Mode": response_mode,
+        }
+        if selection is not None and selection.since is not None:
+            response_headers["X-BioModals-Log-Since"] = selection.since.isoformat()
+        if selection is not None and selection.until is not None:
+            response_headers["X-BioModals-Log-Until"] = selection.until.isoformat()
         return _ClosingStreamingResponse(
             _redact_provider_call_id(stream, modal_call_id),
             media_type="text/plain",
-            headers={
-                "Cache-Control": "no-store, no-transform",
-                "X-Accel-Buffering": "no",
-                "X-BioModals-Log-Mode": selected_target.mode,
-            },
+            headers=response_headers,
         )
 
     return router

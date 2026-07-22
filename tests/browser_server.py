@@ -184,6 +184,7 @@ class _FakeGromacsAdapter:
         self,
         _job: JobRecord,
         operation: JobOperationRecord,
+        _selection,
     ):
         self.log_fetches += 1
         self._write_stats()

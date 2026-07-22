@@ -22,7 +22,7 @@ from biomodals.service.gromacs.results import (
     ResultIdentityMismatchError,
 )
 from biomodals.service.gromacs.router import GromacsJobOptions
-from biomodals.service.jobs import operation_log_mode
+from biomodals.service.jobs import OperationLogRequest, operation_log_mode
 from biomodals.service.modal_logs import ModalCLILogSource
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import JobOperationRecord, JobRecord
@@ -102,6 +102,7 @@ class ModalGromacsAdapter:
         self,
         job: JobRecord,
         operation: JobOperationRecord,
+        selection: OperationLogRequest,
     ) -> AsyncIterable[bytes]:
         """Open live or historical logs for one attached Modal operation."""
         if operation.modal_call_id is None or operation.started_at is None:
@@ -109,7 +110,9 @@ class ModalGromacsAdapter:
         mode = operation_log_mode(operation.state)
         if mode is None:
             raise ValueError("GROMACS operation does not retain inspectable logs")
-        live = mode == "live"
+        if selection.mode == "live" and mode != "live":
+            raise ValueError("A terminal GROMACS operation cannot open live logs")
+        live = selection.mode == "live"
         started_at = datetime.fromtimestamp(operation.started_at, UTC)
         ended_at = (
             datetime.fromtimestamp(operation.completed_at, UTC)
@@ -121,8 +124,14 @@ class ModalGromacsAdapter:
             environment_name=job.modal_environment,
             function_call_id=operation.modal_call_id,
             follow=live,
-            since=(started_at - timedelta(seconds=1) if not live else None),
-            until=(ended_at + timedelta(seconds=1) if ended_at is not None else None),
+            since=(
+                selection.since
+                or (started_at - timedelta(seconds=1) if not live else None)
+            ),
+            until=(
+                selection.until
+                or (ended_at + timedelta(seconds=1) if ended_at is not None else None)
+            ),
         )
 
     async def read_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:

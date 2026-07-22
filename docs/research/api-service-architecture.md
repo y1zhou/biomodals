@@ -368,6 +368,14 @@ cancelled operations omit follow mode and use the operation's recorded time
 range with `--since` and `--until`. Both forms use the Job's captured App and
 Environment.
 
+The same endpoint accepts paired, timezone-aware `since` and `until` query
+parameters for lazy history. The service rejects windows longer than 15
+minutes, clamps valid windows to the operation's recorded lifetime, and opens
+them in historical mode even while the operation is active. This keeps the
+provider-independent workload hook reusable: it receives an explicit live or
+historical selection rather than HTTP query details. Omitting both parameters
+preserves complete terminal fetches and active follow streams.
+
 A nonzero Modal CLI exit fails the response body instead of turning CLI error
 text into an apparently successful fetch. The browser therefore presents the
 diagnostic failure state.

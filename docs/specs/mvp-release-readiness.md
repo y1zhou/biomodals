@@ -397,17 +397,27 @@ logs use the same call filter and timestamps without follow mode, bounded by the
 operation's recorded start and end times. Both use the App and Environment
 snapshot stored on that Job. The backend terminates a live CLI process when the
 browser collapses the row, opens another row, navigates away, or otherwise
-closes the HTTP response. TanStack Query caches a terminal Stage's first
-successful fetch for the current browser page, so collapsing and reopening it
-does not require target metadata or contact Modal again; refreshing the page
-permits a fresh fetch. Target metadata refreshes every ten seconds only while
-the selected target is live.
+closes the HTTP response. Paired `since` and `until` parameters request one
+historical window, including for an active Stage. Windows are timezone-aware,
+limited to 15 minutes, and clamped to the durable operation lifetime. Omitting
+the parameters keeps the complete terminal fetch and active follow behavior.
+
+The browser initially requests the newest 10-minute terminal window and loads
+older windows when the Administrator scrolls to the top. Each successful
+window remains in TanStack Query for the current page, so collapsing and
+reopening a terminal row refreshes only the small target selector and does not
+contact Modal for the same log windows again. Refreshing the browser page
+permits a fresh fetch. Target metadata refreshes every ten seconds while the
+selected target is live.
 
 The log viewport has a fixed maximum height. Provider timestamps, when present,
-are separated from monospace messages. Copy and Download controls operate on
-the retained text; downloads use
-`<current-timestamp>_<tool>_<stage>.log`. The frontend keeps at most the latest
-500,000 characters and marks when earlier output was omitted. Empty and failed
+are separated from monospace messages. ANSI SGR colors and decorations become
+structured React spans; no provider text is inserted as HTML. Copy and Download
+retain the raw text and use `<current-timestamp>_<tool>_<stage>.log`. While
+older windows remain unloaded, both controls say that they operate on loaded
+logs only. Active streams keep a 500,000-character tail until the Administrator
+loads earlier history; at that point the viewer pins the live tail and fetches
+older 10-minute windows without dropping subsequent output. Empty and failed
 fetches display diagnostic guidance instead of silently presenting a blank row.
 
 The selected Function Call ID is an internal filter, not browser data. The

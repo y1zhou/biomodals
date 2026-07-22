@@ -101,6 +101,11 @@ class ModalJobSubmitter:
             try:
                 submitted = await spawn(claimed_job)
             except SubmissionOutcomeUnknownError:
+                LOGGER.exception(
+                    "Modal submission outcome is unknown for operation %s on Job %s",
+                    operation,
+                    job.job_id,
+                )
                 return SubmissionResult(
                     job=self.store.mark_state_unknown(
                         job.job_id,

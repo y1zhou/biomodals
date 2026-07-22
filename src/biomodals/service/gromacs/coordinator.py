@@ -345,11 +345,6 @@ class GromacsReconciler:
                 return
 
             if result.job.state == JobState.STATE_UNKNOWN:
-                LOGGER.error(
-                    "Could not confirm GROMACS stage %s for job %s",
-                    operation,
-                    job.job_id,
-                )
                 return
             if result.job.state not in {JobState.QUEUED, JobState.RUNNING}:
                 return

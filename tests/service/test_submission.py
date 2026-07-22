@@ -229,7 +229,10 @@ def test_terminal_rejection_records_failed_operation(tmp_path: Path) -> None:
     assert operation.state == JobOperationState.FAILED
 
 
-def test_unknown_spawn_outcome_stops_automatic_retries(tmp_path: Path) -> None:
+def test_unknown_spawn_outcome_stops_automatic_retries(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     store, job = admitted_job(tmp_path)
     submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)
 
@@ -250,6 +253,12 @@ def test_unknown_spawn_outcome_stops_automatic_retries(tmp_path: Path) -> None:
     assert result.attached is False
     assert result.job.state == JobState.STATE_UNKNOWN
     assert result.job.operations[0].state == JobOperationState.STATE_UNKNOWN
+    diagnostic = next(
+        record
+        for record in caplog.records
+        if record.message.startswith("Modal submission outcome is unknown")
+    )
+    assert diagnostic.exc_info is not None
 
 
 def test_unattachable_call_is_cancelled_and_marked_unknown(tmp_path: Path) -> None:

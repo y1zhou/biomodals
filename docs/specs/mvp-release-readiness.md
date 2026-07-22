@@ -397,10 +397,11 @@ logs use the same call filter and timestamps without follow mode, bounded by the
 operation's recorded start and end times. Both use the App and Environment
 snapshot stored on that Job. The backend terminates a live CLI process when the
 browser collapses the row, opens another row, navigates away, or otherwise
-closes the HTTP response. A terminal Stage's first successful fetch is cached
-for the lifetime of that Job-detail page, so collapsing and reopening it does
-not contact Modal again; refreshing the page permits a fresh fetch. Target
-metadata refreshes every ten seconds only while the selected target is live.
+closes the HTTP response. TanStack Query caches a terminal Stage's first
+successful fetch for the current browser page, so collapsing and reopening it
+does not require target metadata or contact Modal again; refreshing the page
+permits a fresh fetch. Target metadata refreshes every ten seconds only while
+the selected target is live.
 
 The log viewport has a fixed maximum height. Provider timestamps, when present,
 are separated from monospace messages. Copy and Download controls operate on

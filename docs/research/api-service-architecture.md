@@ -106,14 +106,14 @@ src/biomodals/service/
   auth_api.py        browser authentication contract and routes
   jobs_api.py        provider-neutral Job and Result routes
   admin_api.py       User, Modal and storage administration routes
-  admin_jobs_api.py  admin-only active-stage log diagnostics
+  admin_jobs_api.py  admin-only Stage log diagnostics
   config.py          host configuration
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
   jobs.py            common job view and workload registration
   submission.py      shared operation lease, spawn and attachment boundary
   artifacts.py       verified final-ZIP staging and cache
-  modal_logs.py      call-filtered Modal CLI log streams
+  modal_logs.py      call-filtered Modal CLI log access
   gromacs/
     router.py        GROMACS request schema and submission route
     plan.py          pure operation graph and deployed-function arguments
@@ -366,6 +366,10 @@ operation. Running and `state_unknown` operations use
 cancelled operations omit follow mode and use the operation's recorded time
 range with `--since` and `--until`. Both forms use the Job's captured App and
 Environment.
+
+A nonzero Modal CLI exit fails the response body instead of turning CLI error
+text into an apparently successful fetch. The browser therefore presents the
+diagnostic failure state.
 
 The Function Call ID never appears in the selector contract, request URL, or
 response bytes: the HTTP boundary also redacts an exact ID emitted by provider

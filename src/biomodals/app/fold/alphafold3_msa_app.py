@@ -2009,13 +2009,16 @@ def _submit_scan_matrix() -> dict[str, object]:
             all_results.append(result)
 
         if len(missing_partitions) == case.containers and case.containers > 1:
-            hostnames = {
-                str(result["container"]["hostname"])
+            task_ids = {
+                result["container"].get("modal_task_id")
                 for result in results_by_partition.values()
             }
-            if len(hostnames) != case.containers:
+            if (
+                not all(isinstance(task_id, str) and task_id for task_id in task_ids)
+                or len(task_ids) != case.containers
+            ):
                 raise RuntimeError(
-                    f"{case.case_id} used {len(hostnames)} containers, "
+                    f"{case.case_id} used {len(task_ids)} Modal task IDs, "
                     f"expected {case.containers}"
                 )
 

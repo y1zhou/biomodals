@@ -10,6 +10,24 @@ from types import SimpleNamespace
 from biomodals.app.bioinfo import gromacs_app
 
 
+def test_analysis_csv_preserves_the_established_checkpoint_format(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "rmsf.csv"
+
+    gromacs_app.write_analysis_csv(
+        output,
+        {
+            "residue_index": [1.0, 2.0],
+            "rmsf": [0.123456, 2.0],
+        },
+    )
+
+    assert output.read_text(encoding="utf-8") == (
+        "residue_index,rmsf\n1.00000,0.12346\n2.00000,2.00000\n"
+    )
+
+
 def test_analysis_pair_invalidates_each_stale_member_independently(
     tmp_path: Path,
 ) -> None:

@@ -223,6 +223,13 @@ def file1_needs_update(file1: Path, file2: Path) -> bool:
     return file1.stat().st_mtime < file2.stat().st_mtime
 
 
+def write_analysis_csv(path: Path, columns: dict[str, object]) -> None:
+    """Write one stable five-decimal analysis checkpoint with Polars."""
+    import polars as pl
+
+    pl.DataFrame(columns).write_csv(path, float_precision=5)
+
+
 def remove_stale_analysis_outputs(
     csv_path: Path,
     figure_path: Path,
@@ -734,13 +741,9 @@ def collect_traj_stats(
     if not rmsd_csv_path.exists() or (make_figures and not rmsd_fig_path.exists()):
         rmsd = struc.rmsd(trajectory[0], trajectory)
         if not rmsd_csv_path.exists():
-            np.savetxt(
+            write_analysis_csv(
                 rmsd_csv_path,
-                np.column_stack((time, rmsd)),
-                fmt="%.5f",
-                delimiter=",",
-                header="time_ns,rmsd",
-                comments="",
+                {"time_ns": time, "rmsd": rmsd},
             )
 
         if not rmsd_fig_path.exists() and make_figures:
@@ -767,13 +770,9 @@ def collect_traj_stats(
     if not rg_csv_path.exists() or (make_figures and not rg_fig_path.exists()):
         rg = struc.gyration_radius(trajectory)
         if not rg_csv_path.exists():
-            np.savetxt(
+            write_analysis_csv(
                 rg_csv_path,
-                np.column_stack((time, rg)),
-                fmt="%.5f",
-                delimiter=",",
-                header="time_ns,rg",
-                comments="",
+                {"time_ns": time, "rg": rg},
             )
         if not rg_fig_path.exists() and make_figures:
             figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
@@ -803,13 +802,12 @@ def collect_traj_stats(
         res_count = struc.get_residue_count(trajectory)
         res_idx = np.arange(1, res_count + 1)
         if not rmsf_csv_path.exists():
-            np.savetxt(
+            write_analysis_csv(
                 rmsf_csv_path,
-                np.column_stack((res_idx, rmsf)),
-                fmt="%.5f",
-                delimiter=",",
-                header="residue_index,rmsf",
-                comments="",
+                {
+                    "residue_index": res_idx.astype(float),
+                    "rmsf": rmsf,
+                },
             )
         if not rmsf_fig_path.exists() and make_figures:
             # Sidechain atoms fluctuate too much, so we only consider CA atoms

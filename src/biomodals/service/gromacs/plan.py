@@ -28,21 +28,52 @@ class ModalInvocation:
     kwargs: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class PlannedOperation:
+    """One operation's identity, dependency, and invocation metadata."""
+
+    operation: str
+    dependencies: tuple[str, ...]
+    function_name: str
+    traj_prefix: str | None = None
+    include_simulation_time: bool = False
+    save_processed_traj: bool = False
+
+
+def _operation_plan(*, cpu_only: bool) -> tuple[PlannedOperation, ...]:
+    """Build the selected fixed plan from one CPU/GPU decision."""
+    prepare = "prepare_tpr_cpu" if cpu_only else "prepare_tpr_gpu"
+    production = "production_run_cpu" if cpu_only else "production_run_gpu"
+    return (
+        PlannedOperation(prepare, (), prepare),
+        PlannedOperation(NVT_ANALYSIS, (prepare,), "collect_traj_stats", "nvt_"),
+        PlannedOperation(NPT_ANALYSIS, (prepare,), "collect_traj_stats", "npt_"),
+        PlannedOperation(
+            production,
+            (prepare,),
+            production,
+            include_simulation_time=True,
+        ),
+        PlannedOperation(
+            PRODUCTION_ANALYSIS,
+            (production,),
+            "collect_traj_stats",
+            "production_",
+            save_processed_traj=True,
+        ),
+    )
+
+
 def prepare_operation(*, cpu_only: bool) -> str:
     """Select the established preparation function for one request."""
-    return "prepare_tpr_cpu" if cpu_only else "prepare_tpr_gpu"
+    return _operation_plan(cpu_only=cpu_only)[0].operation
 
 
 def operation_dependencies(*, cpu_only: bool) -> dict[str, tuple[str, ...]]:
     """Return the fixed GROMACS graph in stable display/submission order."""
-    prepare = prepare_operation(cpu_only=cpu_only)
-    production = "production_run_cpu" if cpu_only else "production_run_gpu"
     return {
-        prepare: (),
-        NVT_ANALYSIS: (prepare,),
-        NPT_ANALYSIS: (prepare,),
-        production: (prepare,),
-        PRODUCTION_ANALYSIS: (production,),
+        operation.operation: operation.dependencies
+        for operation in _operation_plan(cpu_only=cpu_only)
     }
 
 
@@ -89,31 +120,22 @@ def modal_invocation(
     simulation_time_ns: int,
 ) -> ModalInvocation:
     """Build established Modal function arguments for one successor operation."""
-    production_operation = "production_run_cpu" if cpu_only else "production_run_gpu"
-    if operation not in {
-        NVT_ANALYSIS,
-        NPT_ANALYSIS,
-        production_operation,
-        PRODUCTION_ANALYSIS,
-    }:
+    planned = next(
+        (
+            candidate
+            for candidate in _operation_plan(cpu_only=cpu_only)[1:]
+            if candidate.operation == operation
+        ),
+        None,
+    )
+    if planned is None:
         raise ValueError(f"Unsupported GROMACS operation: {operation}")
 
-    function_name, _, traj_prefix = operation.partition(":")
-    kwargs: dict[str, object]
-    if function_name.startswith("production_run_"):
-        kwargs = {
-            "run_name": run_name,
-            "simulation_time_ns": simulation_time_ns,
-        }
-    elif operation == PRODUCTION_ANALYSIS:
-        kwargs = {
-            "traj_prefix": traj_prefix,
-            "run_name": run_name,
-            "save_processed_traj": True,
-        }
-    else:
-        kwargs = {
-            "traj_prefix": traj_prefix,
-            "run_name": run_name,
-        }
-    return ModalInvocation(function_name=function_name, kwargs=kwargs)
+    kwargs: dict[str, object] = {"run_name": run_name}
+    if planned.traj_prefix is not None:
+        kwargs["traj_prefix"] = planned.traj_prefix
+    if planned.include_simulation_time:
+        kwargs["simulation_time_ns"] = simulation_time_ns
+    if planned.save_processed_traj:
+        kwargs["save_processed_traj"] = True
+    return ModalInvocation(function_name=planned.function_name, kwargs=kwargs)

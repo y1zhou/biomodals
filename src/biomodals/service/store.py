@@ -123,6 +123,7 @@ TERMINAL_JOB_STATES = (
 RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
 _SERVICE_SCHEMA_VERSION = 1
+_RESULT_PACKAGING_OPERATION = "result_packaging"
 _JOB_OPERATIONS_TABLE_SQL = """
 CREATE TABLE job_operations (
     job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -1878,10 +1879,11 @@ class ServiceStore:
                         job_id, operation, ordinal, executor, modal_call_id, state,
                         submission_token, submission_lease_until,
                         started_at, completed_at
-                    ) VALUES (?, 'result_packaging', ?, ?, NULL, ?, NULL, NULL, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, ?, NULL)
                     """,
                     (
                         str(job_id),
+                        _RESULT_PACKAGING_OPERATION,
                         _next_operation_ordinal(conn, job_id),
                         JobOperationExecutor.LOCAL.value,
                         JobOperationState.RUNNING.value,
@@ -2200,7 +2202,7 @@ class ServiceStore:
                     job_id, operation, ordinal, executor, modal_call_id, state,
                     submission_token, submission_lease_until,
                     started_at, completed_at
-                ) VALUES (?, 'result_packaging', ?, ?, NULL, ?, NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?)
                 ON CONFLICT(job_id, operation) DO UPDATE SET
                     state = excluded.state,
                     submission_token = NULL,
@@ -2210,6 +2212,7 @@ class ServiceStore:
                 """,
                 (
                     str(job_id),
+                    _RESULT_PACKAGING_OPERATION,
                     _next_operation_ordinal(conn, job_id),
                     JobOperationExecutor.LOCAL.value,
                     JobOperationState.COMPLETED.value,

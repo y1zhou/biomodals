@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 _WRITE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+_PREPARED_ARTIFACT_SECONDS = 60
 _T = TypeVar("_T")
 
 
@@ -329,15 +330,21 @@ class ArtifactCache:
                         completed,
                     )
                 )
-        await asyncio.shield(task)
-        lease = await self.acquire_async(
-            job_id,
-            size_bytes=size_bytes,
-            sha256=sha256,
-        )
-        if lease is None:  # pragma: no cover - protected fill invariant
-            raise ArtifactIntegrityError("Published cache entry disappeared")
-        return lease
+            # Every waiter protects the publication until it has either
+            # acquired its own descriptor lease or stopped waiting.
+            self._active[job_id] = self._active.get(job_id, 0) + 1
+        try:
+            await asyncio.shield(task)
+            lease = await self.acquire_async(
+                job_id,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            )
+            if lease is None:  # pragma: no cover - protected fill invariant
+                raise ArtifactIntegrityError("Published cache entry disappeared")
+            return lease
+        finally:
+            self._release(job_id)
 
     async def _fill(
         self,
@@ -495,7 +502,12 @@ class ArtifactCache:
             else:
                 self._active[job_id] = references - 1
 
-    def protect_prepared(self, job_id: str, *, seconds: int = 60) -> None:
+    def protect_prepared(
+        self,
+        job_id: str,
+        *,
+        seconds: int = _PREPARED_ARTIFACT_SECONDS,
+    ) -> None:
         """Reserve a prepared archive until its immediate download acquires it."""
         self._path(job_id)
         if type(seconds) is not int or seconds < 1:

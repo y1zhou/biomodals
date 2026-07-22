@@ -43,6 +43,28 @@ from biomodals.service.store import (
 LOGGER = logging.getLogger(__name__)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _DOWNLOAD_NAME_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_DOWNLOAD_RESPONSE_HEADERS: dict[str, dict[str, object]] = {
+    "Accept-Ranges": {
+        "description": "Supported range unit for resumable downloads.",
+        "schema": {"type": "string", "enum": ["bytes"]},
+    },
+    "Cache-Control": {
+        "description": "Prevents shared or browser caching of private Results.",
+        "schema": {"type": "string"},
+    },
+    "Content-Disposition": {
+        "description": "Browser attachment using the server-provided result filename.",
+        "schema": {"type": "string"},
+    },
+    "Content-Length": {
+        "description": "Number of archive bytes in this response.",
+        "schema": {"type": "integer", "minimum": 0},
+    },
+    "ETag": {
+        "description": "Immutable archive identity derived from its SHA-256 digest.",
+        "schema": {"type": "string"},
+    },
+}
 
 
 class JobNotCancellableResponse(CodedErrorResponse):
@@ -435,15 +457,7 @@ def create_jobs_router(
         responses={
             status.HTTP_200_OK: {
                 "description": "Complete ZIP result archive.",
-                "headers": {
-                    "Content-Disposition": {
-                        "description": (
-                            "Browser attachment using the server-provided result "
-                            "filename."
-                        ),
-                        "schema": {"type": "string"},
-                    }
-                },
+                "headers": _DOWNLOAD_RESPONSE_HEADERS,
                 "content": {
                     "application/zip": {
                         "schema": {"type": "string", "format": "binary"}
@@ -453,13 +467,7 @@ def create_jobs_router(
             status.HTTP_206_PARTIAL_CONTENT: {
                 "description": "Requested byte range of the ZIP result archive.",
                 "headers": {
-                    "Content-Disposition": {
-                        "description": (
-                            "Browser attachment using the server-provided result "
-                            "filename."
-                        ),
-                        "schema": {"type": "string"},
-                    },
+                    **_DOWNLOAD_RESPONSE_HEADERS,
                     "Content-Range": {
                         "description": "Byte range returned from the complete archive.",
                         "schema": {"type": "string"},

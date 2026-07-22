@@ -28,6 +28,7 @@ SESSION_IDLE_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
 SESSION_ABSOLUTE_LIFETIME_SECONDS = 90 * 24 * 60 * 60
 MIN_PASSWORD_CHARACTERS = 15
 MAX_PASSWORD_CHARACTERS = 128
+MAX_DISPLAY_NAME_CHARACTERS = 120
 PASSWORD_WORKER_COUNT = 2
 PASSWORD_QUEUE_COUNT = 8
 
@@ -208,6 +209,10 @@ class AuthService:
         normalized_name = display_name.strip()
         if not normalized_name:
             raise ValueError("Display name is required")
+        if len(normalized_name) > MAX_DISPLAY_NAME_CHARACTERS:
+            raise ValueError(
+                f"Display name must be at most {MAX_DISPLAY_NAME_CHARACTERS} characters"
+            )
         token = _new_token()
         now = self._now()
         expires_at = now + PASSWORD_TOKEN_LIFETIME_SECONDS

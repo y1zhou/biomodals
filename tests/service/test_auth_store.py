@@ -77,6 +77,16 @@ def test_setup_link_is_one_time_and_passwords_use_argon2id(tmp_path: Path) -> No
         auth.set_password(token, "another correct horse staple")
 
 
+def test_create_user_rejects_an_oversized_display_name(tmp_path: Path) -> None:
+    auth, _store = make_auth(tmp_path, Clock())
+
+    with pytest.raises(ValueError, match="at most 120 characters"):
+        auth.create_user(
+            "alice@example.com",
+            display_name="a" * 121,
+        )
+
+
 def test_password_policy_prefers_long_passphrases(tmp_path: Path) -> None:
     auth, _store = make_auth(tmp_path, Clock())
     token = reset_token(

@@ -79,6 +79,29 @@ def test_first_cli_user_requires_admin_flag(monkeypatch, tmp_path) -> None:
     assert store.list_users() == []
 
 
+def test_cli_rejects_an_oversized_display_name(monkeypatch, tmp_path) -> None:
+    """The offline CLI applies the same identity limit as the HTTP API."""
+    store = _configure(monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "api",
+            "admin",
+            "create-user",
+            "admin@example.com",
+            "--display-name",
+            "a" * 121,
+            "--admin",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "at most 120 characters" in result.output
+    store.initialize()
+    assert store.list_users() == []
+
+
 def test_reset_password_replaces_prior_link(monkeypatch, tmp_path) -> None:
     """Reset replaces the setup token and prints only the new link."""
     store = _configure(monkeypatch, tmp_path)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
@@ -11,7 +13,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from biomodals.service.auth import AuthenticatedSession, AuthService
+from biomodals.service.auth import (
+    MAX_DISPLAY_NAME_CHARACTERS,
+    AuthenticatedSession,
+    AuthService,
+)
 from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
@@ -143,7 +149,10 @@ class CreateAdminUserRequest(BaseModel):
     """Administrator-provisioned User fields."""
 
     email: str = Field(min_length=3, max_length=320)
-    display_name: str = Field(min_length=1, max_length=120)
+    display_name: str = Field(
+        min_length=1,
+        max_length=MAX_DISPLAY_NAME_CHARACTERS,
+    )
     is_admin: bool = False
     active_job_limit: int | None = Field(default=None, ge=0)
 
@@ -159,7 +168,11 @@ class CreatedAdminUserView(BaseModel):
 class UpdateAdminUserRequest(BaseModel):
     """Editable User presentation, status, role, and admission fields."""
 
-    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    display_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_DISPLAY_NAME_CHARACTERS,
+    )
     status: Literal["enabled", "disabled"] | None = None
     is_admin: bool | None = None
     active_job_limit: int | None = Field(default=None, ge=0)
@@ -415,6 +428,13 @@ async def _storage_view(request: Request) -> AdminStorageView:
 def create_admin_router() -> APIRouter:
     """Create the administrator-only API router."""
     router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+    runtime_configuration_lock = asyncio.Lock()
+
+    async def serialize_runtime_configuration_mutation() -> AsyncIterator[None]:
+        """Keep provider preflight and its corresponding commit indivisible."""
+        async with runtime_configuration_lock:
+            yield
+
     read_responses: dict[int | str, dict[str, Any]] = {
         401: {"model": ErrorResponse},
         403: {"model": AdminForbiddenResponse},
@@ -640,6 +660,7 @@ def create_admin_router() -> APIRouter:
     @router.patch(
         "/modal/environment",
         response_model=AdminModalEnvironmentView,
+        dependencies=[Depends(serialize_runtime_configuration_mutation)],
         responses={
             **mutation_responses,
             400: {"model": AdminSettingInvalidResponse},
@@ -711,6 +732,7 @@ def create_admin_router() -> APIRouter:
     @router.patch(
         "/modal/tools/{workload}",
         response_model=AdminModalToolView,
+        dependencies=[Depends(serialize_runtime_configuration_mutation)],
         responses={
             **mutation_responses,
             400: {"model": AdminSettingInvalidResponse},

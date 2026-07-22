@@ -68,6 +68,8 @@ class FakeGromacsAdapter:
         self.unknown_failures_remaining = 0
         self.preflights: list[tuple[str, str, int]] = []
         self.preflight_failures_remaining = 0
+        self.preflight_started: asyncio.Event | None = None
+        self.preflight_release: asyncio.Event | None = None
         self.log_requests: list[
             tuple[
                 UUID,
@@ -86,6 +88,10 @@ class FakeGromacsAdapter:
         app_version: int,
     ) -> None:
         self.preflights.append((app_name, environment_name, app_version))
+        if self.preflight_started is not None:
+            self.preflight_started.set()
+        if self.preflight_release is not None:
+            await self.preflight_release.wait()
         if self.preflight_failures_remaining:
             self.preflight_failures_remaining -= 1
             raise RuntimeError("configured resource is unavailable")
@@ -932,6 +938,17 @@ def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
     stream_response = schema["paths"][stream_path]["get"]["responses"]["200"]
     assert stream_response["content"]["text/plain"]["schema"] == {"type": "string"}
     assert stream_response["description"] == "Logs for the selected remote stage"
+    assert {
+        "Cache-Control",
+        "X-Accel-Buffering",
+        "X-BioModals-Log-Mode",
+        "X-BioModals-Log-Since",
+        "X-BioModals-Log-Until",
+    } <= set(stream_response["headers"])
+    assert stream_response["headers"]["X-BioModals-Log-Mode"]["schema"] == {
+        "type": "string",
+        "enum": ["live", "historical"],
+    }
     assert schema["paths"][stream_path]["get"]["security"] == [{"SessionCookie": []}]
     stream_parameters = {
         parameter["name"]: parameter
@@ -1001,6 +1018,62 @@ def test_modal_preflight_runs_only_for_changed_provider_fields(
     assert unchanged.json()["tools"][0]["modal_app_name"]["value"] == "Gromacs"
     assert accepted.status_code == 200
     assert accepted.json()["modal_app_name"]["value"] == "AvailableApp"
+
+
+def test_concurrent_modal_updates_preflight_the_committed_identity(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com", is_admin=True)
+    csrf_token = _login(client, "alice@example.com")
+
+    async def scenario() -> None:
+        adapter.preflight_started = asyncio.Event()
+        adapter.preflight_release = asyncio.Event()
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=ORIGIN,
+            cookies=client.cookies,
+        ) as browser:
+            environment_update = asyncio.create_task(
+                browser.patch(
+                    "/api/v1/admin/modal/environment",
+                    headers=_unsafe_headers(csrf_token),
+                    json={"modal_environment": "department-a"},
+                )
+            )
+            await asyncio.wait_for(adapter.preflight_started.wait(), timeout=5)
+            tool_update = asyncio.create_task(
+                browser.patch(
+                    "/api/v1/admin/modal/tools/gromacs",
+                    headers=_unsafe_headers(csrf_token),
+                    json={
+                        "modal_app_name": "PinnedApp",
+                        "modal_app_version": 7,
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+            assert adapter.preflights == [("Gromacs", "department-a", 1)]
+            adapter.preflight_release.set()
+            environment, tool = await asyncio.gather(
+                environment_update,
+                tool_update,
+            )
+            current = (await browser.get("/api/v1/admin/modal")).json()
+
+        assert environment.status_code == 200
+        assert tool.status_code == 200
+        assert adapter.preflights == [
+            ("Gromacs", "department-a", 1),
+            ("PinnedApp", "department-a", 7),
+        ]
+        assert current["environment"]["modal_environment"]["value"] == ("department-a")
+        assert current["tools"][0]["modal_app_name"]["value"] == "PinnedApp"
+        assert current["tools"][0]["modal_app_version"]["value"] == 7
+
+    asyncio.run(scenario())
 
 
 def test_storage_metrics_and_explicit_cleanup_report_actual_reclamation(
@@ -1325,10 +1398,41 @@ def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
     binary_zip = {"application/zip": {"schema": {"type": "string", "format": "binary"}}}
 
     assert responses["200"]["content"] == binary_zip
-    assert "Content-Disposition" in responses["200"]["headers"]
+    common_headers = {
+        "Accept-Ranges",
+        "Cache-Control",
+        "Content-Disposition",
+        "Content-Length",
+        "ETag",
+    }
+    assert common_headers <= set(responses["200"]["headers"])
     assert responses["206"]["content"] == binary_zip
-    assert "Content-Disposition" in responses["206"]["headers"]
+    assert common_headers <= set(responses["206"]["headers"])
     assert "Content-Range" in responses["206"]["headers"]
+
+
+def test_openapi_describes_conditional_job_fields(tmp_path: Path) -> None:
+    client, _auth, _store, _adapter = _service(tmp_path)
+
+    properties = client.get("/openapi.json").json()["components"]["schemas"]["JobView"][
+        "properties"
+    ]
+
+    for field in (
+        "stage",
+        "active_stages",
+        "stage_history",
+        "completed_at",
+        "cancel_requested_at",
+        "state_unknown_at",
+        "blocked_at",
+        "next_retry_at",
+        "warnings",
+        "error_code",
+        "error_message",
+        "download_url",
+    ):
+        assert properties[field]["description"]
 
 
 def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> None:
@@ -1677,6 +1781,7 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
     schema = client.get("/openapi.json").json()
     stage_schema = schema["components"]["schemas"]["JobStageView"]
     assert stage_schema["properties"]["code"] == {
+        "description": "Stable workload stage code.",
         "title": "Code",
         "type": "string",
     }

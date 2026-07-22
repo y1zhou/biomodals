@@ -299,6 +299,10 @@ for process/file-controlled settings. Validation never invokes a paid
 Function, and failure leaves the previous effective setting intact with a
 stable configuration error.
 
+Within one API process, provider-identity mutations serialize their effective
+setting read, preflight, and database commit. A concurrent Environment and Tool
+edit therefore cannot commit a combined identity that was never preflighted.
+
 Job admission snapshots the Modal Environment, App name, and exact deployment
 version in one transaction. Every direct deployed-Function lookup for that Job
 passes the snapshot as Modal's `version` argument, so an App redeployment cannot

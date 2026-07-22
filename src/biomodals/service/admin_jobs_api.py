@@ -42,6 +42,28 @@ AdminJobLogTargetState = Literal[
     "failed",
     "cancelled",
 ]
+_LOG_STREAM_RESPONSE_HEADERS: dict[str, dict[str, object]] = {
+    "Cache-Control": {
+        "description": "Disables storage and response transformation for logs.",
+        "schema": {"type": "string"},
+    },
+    "X-Accel-Buffering": {
+        "description": "Requests that compatible reverse proxies stream immediately.",
+        "schema": {"type": "string", "enum": ["no"]},
+    },
+    "X-BioModals-Log-Mode": {
+        "description": "Whether the response is a live stream or historical window.",
+        "schema": {"type": "string", "enum": ["live", "historical"]},
+    },
+    "X-BioModals-Log-Since": {
+        "description": "Inclusive beginning of a selected historical window.",
+        "schema": {"type": "string", "format": "date-time"},
+    },
+    "X-BioModals-Log-Until": {
+        "description": "Exclusive end of a selected historical window.",
+        "schema": {"type": "string", "format": "date-time"},
+    },
+}
 
 
 @runtime_checkable
@@ -273,6 +295,7 @@ def create_admin_jobs_router() -> APIRouter:
         responses={
             200: {
                 "description": "Logs for the selected remote stage",
+                "headers": _LOG_STREAM_RESPONSE_HEADERS,
                 "content": {"text/plain": {"schema": {"type": "string"}}},
             },
             **read_responses,

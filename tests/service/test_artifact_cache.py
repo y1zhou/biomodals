@@ -220,6 +220,50 @@ def test_explicit_cleanup_protects_a_prepared_download_until_acquired(
     assert cache.clear().entries == 1
 
 
+def test_cleanup_cannot_remove_completed_fill_before_first_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        cache = ArtifactCache(tmp_path)
+        job_id = "11111111-1111-4111-8111-111111111111"
+        content = b"published"
+        second_acquire_started = asyncio.Event()
+        release_second_acquire = asyncio.Event()
+        original_acquire = cache.acquire_async
+        acquire_calls = 0
+
+        async def delayed_acquire(*args, **kwargs):
+            nonlocal acquire_calls
+            acquire_calls += 1
+            if acquire_calls == 2:
+                second_acquire_started.set()
+                await release_second_acquire.wait()
+            return await original_acquire(*args, **kwargs)
+
+        monkeypatch.setattr(cache, "acquire_async", delayed_acquire)
+        stored = asyncio.create_task(
+            cache.store(
+                job_id,
+                size_bytes=len(content),
+                sha256=digest(content),
+                chunks=chunks(content),
+            )
+        )
+        await second_acquire_started.wait()
+
+        assert (await cache.clear_async()).entries == 0
+
+        release_second_acquire.set()
+        lease = await stored
+        assert lease.read(len(content)) == content
+        lease.close()
+        assert (await cache.clear_async()).entries == 1
+        await cache.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_waiter_does_not_cancel_shared_cache_fill(tmp_path: Path) -> None:
     async def scenario() -> None:
         cache = ArtifactCache(tmp_path)

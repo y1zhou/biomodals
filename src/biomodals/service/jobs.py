@@ -91,11 +91,20 @@ class JobStageView(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    code: str
-    function_name: str | None = None
-    started_at: datetime
-    ended_at: datetime | None = None
-    outcome: JobStageOutcome | None = None
+    code: str = Field(description="Stable workload stage code.")
+    function_name: str | None = Field(
+        default=None,
+        description="Deployed provider function for this stage, when applicable.",
+    )
+    started_at: datetime = Field(description="Time this stage began.")
+    ended_at: datetime | None = Field(
+        default=None,
+        description="Time this stage ended; absent while the stage is active.",
+    )
+    outcome: JobStageOutcome | None = Field(
+        default=None,
+        description="Terminal stage outcome; absent while the stage is active.",
+    )
 
 
 def _stage_view(
@@ -185,20 +194,62 @@ class JobView(BaseModel):
     workload: str
     display_name: str
     state: JobState
-    stage: JobStageView | None = None
-    active_stages: list[JobStageView] = Field(default_factory=list)
-    stage_history: list[JobStageView] = Field(default_factory=list)
+    stage: JobStageView | None = Field(
+        default=None,
+        description=(
+            "Representative active or most recently relevant execution stage; "
+            "absent before execution starts or for an unknown workload."
+        ),
+    )
+    active_stages: list[JobStageView] = Field(
+        default_factory=list,
+        description="All execution stages that are currently active.",
+    )
+    stage_history: list[JobStageView] = Field(
+        default_factory=list,
+        description="Recorded execution stages in lifecycle order.",
+    )
     created_at: datetime
     updated_at: datetime
-    completed_at: datetime | None = None
-    cancel_requested_at: datetime | None = None
-    state_unknown_at: datetime | None = None
-    blocked_at: datetime | None = None
-    next_retry_at: datetime | None = None
-    warnings: list[str] = Field(default_factory=list)
-    error_code: JobErrorCode | None = None
-    error_message: str | None = None
-    download_url: str | None = None
+    completed_at: datetime | None = Field(
+        default=None,
+        description="Terminal completion time; absent for non-terminal Jobs.",
+    )
+    cancel_requested_at: datetime | None = Field(
+        default=None,
+        description="Time cancellation was requested, when applicable.",
+    )
+    state_unknown_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Time remote execution state first became unknown; retained after "
+            "administrator resolution."
+        ),
+    )
+    blocked_at: datetime | None = Field(
+        default=None,
+        description="Time recoverable finalization first became blocked.",
+    )
+    next_retry_at: datetime | None = Field(
+        default=None,
+        description="Scheduled time for the next recoverable finalization retry.",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Safe owner-visible lifecycle warnings.",
+    )
+    error_code: JobErrorCode | None = Field(
+        default=None,
+        description="Stable failure code; present only for failed Jobs.",
+    )
+    error_message: str | None = Field(
+        default=None,
+        description="Safe failure explanation; present only for failed Jobs.",
+    )
+    download_url: str | None = Field(
+        default=None,
+        description="Result download path for succeeded or partial Jobs only.",
+    )
 
     @classmethod
     def from_record(cls, record: JobRecord) -> JobView:

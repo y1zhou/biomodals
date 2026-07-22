@@ -34,6 +34,7 @@ from biomodals.service.api import (
     require_unsafe_session,
 )
 from biomodals.service.auth import AuthenticatedSession
+from biomodals.service.gromacs.plan import prepare_operation
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     JobView,
@@ -289,7 +290,7 @@ def create_router(
             admission.job.display_name,
             admission.job.job_id,
         )
-        operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
+        operation = prepare_operation(cpu_only=options.cpu_only)
         submitter = ModalJobSubmitter(store, lifecycle_locks)
 
         async def spawn(claimed_job: JobRecord) -> SubmittedModalOperation:

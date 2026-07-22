@@ -29,6 +29,14 @@ from biomodals.service.gromacs.archive import (
     validate_gromacs_archive,
     write_gromacs_archive,
 )
+from biomodals.service.gromacs.plan import (
+    FINAL_OPERATION,
+    REQUIRED_FUNCTIONS,
+    all_operations_completed,
+    modal_invocation,
+    prepare_operation,
+    ready_operations,
+)
 from biomodals.service.gromacs.router import (
     GromacsJobOptions,
     is_gromacs_run_name,
@@ -48,17 +56,6 @@ from biomodals.service.submission import SubmissionOutcomeUnknownError
 
 LOGGER = logging.getLogger(__name__)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_NVT_ANALYSIS = "collect_traj_stats:nvt_"
-_NPT_ANALYSIS = "collect_traj_stats:npt_"
-_PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
-_FINAL_OPERATION = _PRODUCTION_ANALYSIS
-_REQUIRED_FUNCTIONS = (
-    "prepare_tpr_cpu",
-    "prepare_tpr_gpu",
-    "collect_traj_stats",
-    "production_run_cpu",
-    "production_run_gpu",
-)
 _MODAL_SERVICE_ERRORS = (
     modal.exception.AuthError,
     modal.exception.ConnectionError,
@@ -180,7 +177,7 @@ class ModalGromacsAdapter:
             environment_name=environment_name,
         )
         await volume.hydrate.aio()
-        for function_name in _REQUIRED_FUNCTIONS:
+        for function_name in REQUIRED_FUNCTIONS:
             function = self._function_resolver(
                 app_name,
                 function_name,
@@ -198,7 +195,7 @@ class ModalGromacsAdapter:
         modal_configuration: ModalConfigurationSnapshot,
     ) -> SubmittedModalCall:
         """Spawn the first deployed compute stage without a remote coordinator."""
-        function_name = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
+        function_name = prepare_operation(cpu_only=options.cpu_only)
         function = self._function_resolver(
             modal_configuration.app_name,
             function_name,
@@ -234,43 +231,21 @@ class ModalGromacsAdapter:
         if job.run_name is None:
             raise ValueError("GROMACS Job has no run name")
         options = GromacsJobOptions.model_validate_json(job.parameters_json)
-        production_operation = (
-            "production_run_cpu" if options.cpu_only else "production_run_gpu"
+        invocation = modal_invocation(
+            operation,
+            cpu_only=options.cpu_only,
+            run_name=job.run_name,
+            simulation_time_ns=options.simulation_time_ns,
         )
-        if operation not in {
-            _NVT_ANALYSIS,
-            _NPT_ANALYSIS,
-            production_operation,
-            _PRODUCTION_ANALYSIS,
-        }:
-            raise ValueError(f"Unsupported GROMACS operation: {operation}")
-
-        function_name, _, traj_prefix = operation.partition(":")
-        if function_name.startswith("production_run_"):
-            kwargs = {
-                "run_name": job.run_name,
-                "simulation_time_ns": options.simulation_time_ns,
-            }
-        elif operation == _PRODUCTION_ANALYSIS:
-            kwargs = {
-                "traj_prefix": traj_prefix,
-                "run_name": job.run_name,
-                "save_processed_traj": True,
-            }
-        else:
-            kwargs = {
-                "traj_prefix": traj_prefix,
-                "run_name": job.run_name,
-            }
 
         function = self._function_resolver(
             job.modal_app_name,
-            function_name,
+            invocation.function_name,
             environment_name=job.modal_environment,
             version=job.modal_app_version,
         )
         try:
-            call = await function.spawn.aio(**kwargs)
+            call = await function.spawn.aio(**invocation.kwargs)
             modal_call_id = call.object_id
         except _DEFINITE_SUBMISSION_ERRORS:
             raise
@@ -718,47 +693,20 @@ class ModalGromacsAdapter:
         )
 
 
-def _operation_dependencies(job: JobRecord) -> dict[str, tuple[str, ...]]:
-    """Return the fixed GROMACS graph for one CPU or GPU submission."""
-    options = GromacsJobOptions.model_validate_json(job.parameters_json)
-    prepare = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
-    production = "production_run_cpu" if options.cpu_only else "production_run_gpu"
-    return {
-        prepare: (),
-        _NVT_ANALYSIS: (prepare,),
-        _NPT_ANALYSIS: (prepare,),
-        production: (prepare,),
-        _PRODUCTION_ANALYSIS: (production,),
-    }
-
-
 def _ready_operations(
     job: JobRecord,
     calls: Iterable[JobOperationRecord],
 ) -> list[str]:
-    dependencies = _operation_dependencies(job)
-    call_list = list(calls)
-    known = {call.operation for call in call_list}
-    completed = {
-        call.operation
-        for call in call_list
-        if call.state == JobOperationState.COMPLETED
-    }
-    return [
-        operation
-        for operation, requirements in tuple(dependencies.items())[1:]
-        if operation not in known and all(item in completed for item in requirements)
-    ]
+    options = GromacsJobOptions.model_validate_json(job.parameters_json)
+    return ready_operations(cpu_only=options.cpu_only, operations=calls)
 
 
 def _all_operations_completed(
     job: JobRecord,
     calls: Iterable[JobOperationRecord],
 ) -> bool:
-    completed = {
-        call.operation for call in calls if call.state == JobOperationState.COMPLETED
-    }
-    return set(_operation_dependencies(job)).issubset(completed)
+    options = GromacsJobOptions.model_validate_json(job.parameters_json)
+    return all_operations_completed(cpu_only=options.cpu_only, operations=calls)
 
 
 class GromacsReconciler:
@@ -890,7 +838,7 @@ class GromacsReconciler:
             if outcome.kind == "expired":
                 terminal = (
                     JobOperationState.COMPLETED
-                    if call.operation == _FINAL_OPERATION
+                    if call.operation == FINAL_OPERATION
                     else JobOperationState.FAILED
                 )
             else:
@@ -902,7 +850,7 @@ class GromacsReconciler:
                 outcome=terminal,
                 now=self._now(),
             )
-            if outcome.kind == "expired" and call.operation == _FINAL_OPERATION:
+            if outcome.kind == "expired" and call.operation == FINAL_OPERATION:
                 try:
                     archive = await self.adapter.recover_archive(job)
                 except Exception:
@@ -1173,14 +1121,14 @@ class GromacsReconciler:
         if expired:
             if (
                 len(expired) == 1
-                and expired[0].operation == _FINAL_OPERATION
+                and expired[0].operation == FINAL_OPERATION
                 and not any(
                     call.state
                     in {
                         JobOperationState.SUBMITTING,
                         JobOperationState.RUNNING,
                     }
-                    and call.operation != _FINAL_OPERATION
+                    and call.operation != FINAL_OPERATION
                     for call in refreshed
                 )
             ):

@@ -193,9 +193,10 @@ outside this architecture.
 Every owner-facing list, inspect, cancel, and download lookup is constrained by
 both `owner_user_id` and `job_id`. Looking up another user's job returns the
 same `404` as a missing job, before the server resolves any Modal identifier.
-The narrow Administrator diagnostics exception can list safe active-stage
-selectors and stream their provider logs for any Job, but it cannot inspect
-Input, download Result, cancel work, or retrieve a provider call identifier.
+The narrow Administrator diagnostics exception can list safe started remote
+Stage selectors and access their live or historical provider logs for any Job,
+but it cannot inspect Input, download Result, cancel work, or retrieve a
+provider call identifier.
 
 The submit route persists the Job, leases preparation, spawns it, attaches its
 Modal call identifier to the leased operation, and returns `202`. SQLite keeps

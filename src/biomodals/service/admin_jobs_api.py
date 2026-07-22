@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -34,6 +34,12 @@ _LOGGABLE_STATES = {
     JobOperationState.RUNNING,
     JobOperationState.STATE_UNKNOWN,
 }
+
+
+@runtime_checkable
+class _AsyncClosable(Protocol):
+    async def aclose(self) -> None:
+        """Release resources owned by an asynchronous iterator."""
 
 
 class AdminJobLogTargetView(BaseModel):
@@ -111,24 +117,29 @@ async def _redact_provider_call_id(
         raise ValueError("Provider call ID must not be empty")
     replacement = b"[function-call-id-redacted]"
     pending = b""
-    async for chunk in stream:
-        pending += chunk
-        output = bytearray()
-        while True:
-            index = pending.find(secret)
-            if index >= 0:
-                output.extend(pending[:index])
-                output.extend(replacement)
-                pending = pending[index + len(secret) :]
-                continue
-            safe_length = max(0, len(pending) - len(secret) + 1)
-            output.extend(pending[:safe_length])
-            pending = pending[safe_length:]
-            break
-        if output:
-            yield bytes(output)
-    if pending:
-        yield pending.replace(secret, replacement)
+    iterator = aiter(stream)
+    try:
+        async for chunk in iterator:
+            pending += chunk
+            output = bytearray()
+            while True:
+                index = pending.find(secret)
+                if index >= 0:
+                    output.extend(pending[:index])
+                    output.extend(replacement)
+                    pending = pending[index + len(secret) :]
+                    continue
+                safe_length = max(0, len(pending) - len(secret) + 1)
+                output.extend(pending[:safe_length])
+                pending = pending[safe_length:]
+                break
+            if output:
+                yield bytes(output)
+        if pending:
+            yield pending.replace(secret, replacement)
+    finally:
+        if isinstance(iterator, _AsyncClosable):
+            await iterator.aclose()
 
 
 def create_admin_jobs_router() -> APIRouter:

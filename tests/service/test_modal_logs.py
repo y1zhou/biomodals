@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+from biomodals.service.admin_jobs_api import _redact_provider_call_id
 from biomodals.service.modal_logs import ModalCLILogStreamer
 
 
@@ -92,5 +93,30 @@ def test_modal_cli_stream_rejects_non_function_call_ids() -> None:
                 environment_name="production",
                 function_call_id="not-a-call",
             )
+
+    asyncio.run(scenario())
+
+
+def test_log_redaction_closes_source_when_consumer_disconnects() -> None:
+    async def scenario() -> None:
+        source_closed = False
+
+        async def source() -> AsyncGenerator[bytes, None]:
+            nonlocal source_closed
+            try:
+                yield b"visible output before a long-running call\n"
+                await asyncio.Event().wait()
+            finally:
+                source_closed = True
+
+        redacted = cast(
+            AsyncGenerator[bytes, None],
+            _redact_provider_call_id(source(), "fc-secret"),
+        )
+
+        assert await anext(redacted)
+        await redacted.aclose()
+
+        assert source_closed
 
     asyncio.run(scenario())

@@ -157,16 +157,12 @@ class ModalGromacsAdapter:
     def __init__(
         self,
         *,
-        app_name: str,
-        environment_name: str,
         output_volume_name: str = "Gromacs-outputs",
         artifact_cache: ArtifactCache | None = None,
         call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
         function_resolver: Callable[..., modal.Function] | None = None,
     ) -> None:
-        """Bind one deployed App in an explicit Modal Environment."""
-        self.environment_name = environment_name
-        self.app_name = app_name
+        """Configure Modal resolution, output storage, and local caching."""
         self.output_volume_name = output_volume_name
         self.artifact_cache = artifact_cache
         self._function_resolver = function_resolver or modal.Function.from_name

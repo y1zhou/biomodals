@@ -1206,11 +1206,8 @@ def create_deployed_app() -> FastAPI:
     store.initialize()
     configuration = RuntimeConfiguration(store, settings)
     auth = AuthService(store, frontend_url=settings.public_url)
-    gromacs_configuration = configuration.workload("gromacs")
     cache = ArtifactCache(settings.cache_dir / "results")
     adapter = ModalGromacsAdapter(
-        app_name=gromacs_configuration.modal_app_name.value,
-        environment_name=configuration.modal_environment().value,
         artifact_cache=cache,
     )
     lifecycle_locks = JobLifecycleLocks()

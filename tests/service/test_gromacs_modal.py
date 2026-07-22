@@ -341,8 +341,6 @@ def _adapter(
     function_resolver=None,
 ) -> ModalGromacsAdapter:
     return ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
         output_volume_name=output_volume_name,
         call_resolver=cast(Any, calls.__getitem__),
         function_resolver=function_resolver,
@@ -506,10 +504,7 @@ def test_submit_resolves_the_deployed_prepare_function_directly(
 
     monkeypatch.setattr(modal.Function, "from_name", from_name)
 
-    adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
-    )
+    adapter = ModalGromacsAdapter()
 
     assert lookups == []
 
@@ -583,8 +578,6 @@ def test_preflight_hydrates_volume_and_every_required_function_without_spawning(
         ),
     )
     adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
         function_resolver=resolve_function,
     )
 
@@ -605,10 +598,7 @@ def test_submit_spawns_detached_call_with_normalized_options(
 ) -> None:
     function = FakeFunction(FakeCall("fc-detached"))
     monkeypatch.setattr(modal.Function, "from_name", lambda *_args, **_kwargs: function)
-    adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
-    )
+    adapter = ModalGromacsAdapter()
 
     submitted = asyncio.run(
         adapter.submit(
@@ -639,8 +629,6 @@ def test_submit_spawns_detached_call_with_normalized_options(
 
 def test_submit_marks_a_spawn_error_as_an_unknown_provider_outcome() -> None:
     adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
         function_resolver=cast(
             Any,
             lambda *_args, **_kwargs: FailingFunction(
@@ -666,8 +654,6 @@ def test_submit_marks_a_spawn_error_as_an_unknown_provider_outcome() -> None:
 
 def test_submit_preserves_a_definite_modal_rejection() -> None:
     adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
         function_resolver=cast(
             Any,
             lambda *_args, **_kwargs: FailingFunction(
@@ -709,8 +695,6 @@ def test_submit_operation_resolves_each_deployed_stage_by_name(tmp_path: Path) -
         return function
 
     adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
         function_resolver=from_name,
     )
 
@@ -872,8 +856,6 @@ def test_published_archive_is_promoted_into_the_local_cache(
     _install_volume(monkeypatch, files)
     cache = ArtifactCache(tmp_path / "cache")
     adapter = ModalGromacsAdapter(
-        app_name="GromacsAPI",
-        environment_name="department-dev",
         artifact_cache=cache,
         call_resolver=cast(Any, {}.__getitem__),
     )

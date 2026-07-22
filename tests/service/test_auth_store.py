@@ -111,7 +111,8 @@ def test_login_uses_generic_failures_and_stores_only_token_digests(
     assert session is not None
     assert session.principal.email == "alice@example.com"
     assert auth.verify_csrf(session, issued.csrf_token)
-    database_bytes = store.database_bytes_for_test()
+    paths = (store.path, Path(f"{store.path}-wal"), Path(f"{store.path}-shm"))
+    database_bytes = b"".join(path.read_bytes() for path in paths if path.exists())
     assert issued.session_token.encode() not in database_bytes
     assert issued.csrf_token.encode() not in database_bytes
 

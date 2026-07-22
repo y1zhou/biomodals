@@ -19,7 +19,6 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobNotCancellableError,
-    JobProviderCallRecord,
     JobProviderCallState,
     JobState,
     JobStateResolutionError,
@@ -77,7 +76,7 @@ def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
     assert locks.for_job(job_id) is not None
 
 
-@pytest.mark.parametrize("version", [0, 9])
+@pytest.mark.parametrize("version", [0, 9, 10])
 def test_initialize_never_rewrites_an_existing_unsupported_database(
     tmp_path: Path,
     version: int,
@@ -97,40 +96,6 @@ def test_initialize_never_rewrites_an_existing_unsupported_database(
     assert path.read_bytes() == before
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
-
-
-def test_schema_10_migration_preserves_users_and_provider_work(
-    tmp_path: Path,
-) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    job = admit(store, alice, key="11111111-1111-4111-8111-111111111111").job
-    store.mark_submitted(
-        job.job_id,
-        modal_call_id="fc-prepare",
-        provider_operation="prepare_tpr_cpu",
-        run_name=f"simulation-{job.job_id.hex}",
-        now=100,
-    )
-    with sqlite3.connect(store.path) as conn:
-        conn.execute("DROP TABLE job_provider_calls")
-        conn.execute("PRAGMA user_version = 10")
-
-    store.initialize()
-
-    assert alice in {user.user_id for user in store.list_users()}
-    assert store.list_provider_calls(job.job_id) == [
-        JobProviderCallRecord(
-            job_id=job.job_id,
-            provider_operation="prepare_tpr_cpu",
-            modal_call_id="fc-prepare",
-            state=JobProviderCallState.RUNNING,
-            submission_token=None,
-            submission_lease_until=None,
-            started_at=100,
-            completed_at=None,
-        )
-    ]
-    store.check_ready()
 
 
 def admit(

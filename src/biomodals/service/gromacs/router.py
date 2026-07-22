@@ -63,7 +63,6 @@ MAX_SIMULATION_TIME_NS = 200
 LOGGER = logging.getLogger(__name__)
 _RUN_NAME_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _RUN_NAME_SUFFIX = re.compile(r"[0-9a-f]{32}")
-_LEGACY_RUN_NAME = re.compile(r"api-[0-9a-f]{32}")
 _MAX_RUN_NAME_SLUG_LENGTH = 64
 
 
@@ -83,8 +82,6 @@ def gromacs_run_name(display_name: str, job_id: UUID) -> str:
 
 def is_gromacs_run_name(value: str) -> bool:
     """Return whether a service-generated GROMACS run name is path-safe."""
-    if _LEGACY_RUN_NAME.fullmatch(value):
-        return True
     slug, separator, suffix = value.rpartition("-")
     return bool(
         separator

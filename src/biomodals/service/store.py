@@ -442,85 +442,6 @@ def _complete_open_stage_history_json(
     ]).decode()
 
 
-def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
-    """Add durable per-stage calls while preserving every existing account."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute(_JOB_PROVIDER_CALLS_TABLE_SQL)
-        conn.execute(_JOB_PROVIDER_CALLS_ACTIVE_INDEX_SQL)
-        rows = conn.execute("SELECT * FROM jobs").fetchall()
-        for row in rows:
-            history = _stage_history_from_json(str(row["stage_history_json"]))
-            migrated_operations: set[str] = set()
-            for stage in history:
-                if stage.provider_operation == "result_packaging":
-                    continue
-                modal_call_id = (
-                    row["modal_call_id"]
-                    if row["provider_operation"] == stage.provider_operation
-                    else None
-                )
-                if stage.outcome is not None:
-                    state = JobProviderCallState(stage.outcome)
-                elif JobState(row["state"]) == JobState.STATE_UNKNOWN:
-                    state = JobProviderCallState.STATE_UNKNOWN
-                elif modal_call_id is not None:
-                    state = JobProviderCallState.RUNNING
-                else:
-                    state = JobProviderCallState.STATE_UNKNOWN
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO job_provider_calls (
-                        job_id, provider_operation, modal_call_id, state,
-                        submission_token, submission_lease_until,
-                        started_at, completed_at
-                    ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)
-                    """,
-                    (
-                        row["job_id"],
-                        stage.provider_operation,
-                        modal_call_id,
-                        state.value,
-                        stage.started_at,
-                        stage.completed_at,
-                    ),
-                )
-                migrated_operations.add(stage.provider_operation)
-
-            current_operation = row["provider_operation"]
-            if (
-                current_operation is not None
-                and row["modal_call_id"] is not None
-                and current_operation not in migrated_operations
-            ):
-                state = (
-                    JobProviderCallState.STATE_UNKNOWN
-                    if JobState(row["state"]) == JobState.STATE_UNKNOWN
-                    else JobProviderCallState.RUNNING
-                )
-                conn.execute(
-                    """
-                    INSERT INTO job_provider_calls (
-                        job_id, provider_operation, modal_call_id, state,
-                        submission_token, submission_lease_until,
-                        started_at, completed_at
-                    ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)
-                    """,
-                    (
-                        row["job_id"],
-                        current_operation,
-                        row["modal_call_id"],
-                        state.value,
-                        int(row["updated_at"]),
-                    ),
-                )
-        conn.execute(f"PRAGMA user_version = {_SERVICE_SCHEMA_VERSION}")
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-
-
 class ServiceStore:
     """Small synchronous repository backed by one local SQLite database."""
 
@@ -670,8 +591,6 @@ class ServiceStore:
                     COMMIT;
                     """
                 )
-            elif version == 10:
-                _migrate_v10_to_v11(conn)
             elif version != _SERVICE_SCHEMA_VERSION:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
@@ -1629,10 +1548,6 @@ class ServiceStore:
                     (*states, workload),
                 ).fetchone()
             return int(row[0])
-
-    def count_running_jobs(self, workload: str | None = None) -> int:
-        """Backward-compatible alias for the admission-capacity count."""
-        return self.count_active_jobs(workload)
 
     def list_reconcilable_jobs(
         self,
@@ -2692,11 +2607,6 @@ class ServiceStore:
                 (str(job_id),),
             ).fetchone()
         return _job_from_row(updated)
-
-    def database_bytes_for_test(self) -> bytes:
-        """Return database files for tests that assert secrets are not persisted."""
-        paths = (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm"))
-        return b"".join(path.read_bytes() for path in paths if path.exists())
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

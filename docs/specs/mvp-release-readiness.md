@@ -377,27 +377,37 @@ admission capacity until an Administrator resolves it.
 
 ### Administrator Job logs
 
-An enabled Administrator viewing an Active Job has a collapsed `Logs` panel at
-the bottom of Job detail. Opening it loads the currently loggable remote stages.
-When several stages are active concurrently, the panel lists each safe Stage
-code and Running Function and lets the Administrator select one. Ordinary Users
-never see the panel or its endpoints.
+An enabled Administrator can expand any started remote Stage directly inside
+the Execution stages table. Every row is collapsed by default and only one row
+is expanded at a time. Ordinary Users see the same stage table without log-row
+interactivity and cannot use the diagnostic endpoints.
 
 The target response contains Job ID, Stage code, Running Function, operation
-state, and start time. It never contains a Modal Function Call ID. The selected
-Stage code is resolved again against current durable state before streaming, so
-a stale or completed selection returns typed
-`409 job_log_target_unavailable` instead of opening an earlier call. Running and
-`state_unknown` Modal operations with known call IDs are eligible; local Result
-preparation and terminal or unsubmitted operations are not.
+state, live-or-historical mode, start time, and nullable end time. It never
+contains a Modal Function Call ID. The selected Stage code is resolved again
+against current durable state before opening logs. Running and `state_unknown`
+Modal operations use live mode; completed, failed, and cancelled Modal
+operations with retained call IDs and completion times use historical mode.
+Local Result preparation and unsubmitted operations are excluded. An ineligible
+selection returns typed `409 job_log_target_unavailable`.
 
-The GROMACS registration opens the stream with Modal's supported
-`modal app logs --follow --function-call` CLI command, using the App and Environment
-snapshot stored on that Job. The backend terminates the CLI process when the
-browser collapses the panel, changes Stage, navigates away, or otherwise closes
-the HTTP response. The frontend keeps at most the latest 500,000 characters and
-marks when earlier output was omitted. It refreshes the target choices every ten
-seconds only while expanded.
+The GROMACS registration opens live logs with Modal's supported
+`modal app logs --follow --function-call --timestamps` CLI command. Historical
+logs use the same call filter and timestamps without follow mode, bounded by the
+operation's recorded start and end times. Both use the App and Environment
+snapshot stored on that Job. The backend terminates a live CLI process when the
+browser collapses the row, opens another row, navigates away, or otherwise
+closes the HTTP response. A terminal Stage's first successful fetch is cached
+for the lifetime of that Job-detail page, so collapsing and reopening it does
+not contact Modal again; refreshing the page permits a fresh fetch. Target
+metadata refreshes every ten seconds only while the selected target is live.
+
+The log viewport has a fixed maximum height. Provider timestamps, when present,
+are separated from monospace messages. Copy and Download controls operate on
+the retained text; downloads use
+`<current-timestamp>_<tool>_<stage>.log`. The frontend keeps at most the latest
+500,000 characters and marks when earlier output was omitted. Empty and failed
+fetches display diagnostic guidance instead of silently presenting a blank row.
 
 The selected Function Call ID is an internal filter, not browser data. The
 backend redacts that exact identifier from provider output even when it is split

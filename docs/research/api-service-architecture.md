@@ -358,27 +358,31 @@ supplies its validated request, initial operation name, spawn callback, and
 cancel callback; it must not reproduce these cost-sensitive transitions in its
 route handler.
 
-Modal's supported CLI can follow App logs filtered by one Function Call ID.
-Each workload may therefore register an optional operation-log opener. For
-GROMACS, the admin-only Job diagnostics routes map a selected active stage back
-to its durable operation, then run `modal app logs --follow --function-call`
-against the Job's captured App and Environment. The Function Call ID never
-appears in the selector contract, request URL, or response bytes: the HTTP
-boundary also redacts an exact ID emitted by provider output, including when it
-straddles stream chunks. Modal deployment versions select Function versions
-inside the named deployed App, while the call filter identifies the exact
-invocation, so the logs command does not take a separate version selector. If
-an operator deletes and recreates that App under the same name while a Job is
-active, its diagnostic stream may be unavailable even though lifecycle polling
-by durable call ID can continue. Collapsing the browser panel or leaving the
-page aborts the response and terminates its CLI subprocess.
+Modal's supported CLI can filter App logs by one Function Call ID. Each workload
+may therefore register an optional operation-log opener. For GROMACS, the
+admin-only Job diagnostics routes map a selected Stage back to its durable
+operation. Running and `state_unknown` operations use
+`modal app logs --follow --function-call --timestamps`; completed, failed, and
+cancelled operations omit follow mode and use the operation's recorded time
+range with `--since` and `--until`. Both forms use the Job's captured App and
+Environment.
 
-The target list includes running calls and calls in `state_unknown` whose IDs
-are still known, because their logs may help an Administrator resolve remote
-ambiguity. It excludes local Result preparation, unsubmitted operations, and
-terminal calls. Logs are diagnostic provider output, not Job state, Progress,
-Stage History, or an audit record; their presence, absence, or final line never
-advances the durable Job lifecycle.
+The Function Call ID never appears in the selector contract, request URL, or
+response bytes: the HTTP boundary also redacts an exact ID emitted by provider
+output, including when it straddles stream chunks. Modal deployment versions
+select Function versions inside the named deployed App, while the call filter
+identifies the exact invocation, so the logs command does not take a separate
+version selector. If an operator deletes and recreates that App under the same
+name, diagnostic logs may be unavailable even though lifecycle polling by
+durable call ID can continue. Closing a live browser response terminates its CLI
+subprocess.
+
+The target list assigns live mode to running and `state_unknown` calls whose IDs
+are known. It assigns historical mode to completed, failed, and cancelled calls
+that also have recorded completion times. It excludes local Result preparation
+and unsubmitted operations. Logs are diagnostic provider output, not Job state,
+Progress, Stage History, or an audit record; their presence, absence, or final
+line never advances the durable Job lifecycle.
 
 ## Artifact and storage contract
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterable, AsyncIterator, Callable
+from datetime import UTC, datetime, timedelta
 
 import modal
 
@@ -23,7 +24,7 @@ from biomodals.service.gromacs.results import (
 from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.modal_logs import ModalCLILogStreamer
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
-from biomodals.service.store import JobRecord
+from biomodals.service.store import JobOperationRecord, JobOperationState, JobRecord
 
 
 class ModalGromacsAdapter:
@@ -99,13 +100,28 @@ class ModalGromacsAdapter:
     async def open_operation_logs(
         self,
         job: JobRecord,
-        modal_call_id: str,
+        operation: JobOperationRecord,
     ) -> AsyncIterable[bytes]:
-        """Follow one attached call through Modal's supported logs CLI."""
+        """Open live or historical logs for one attached Modal operation."""
+        if operation.modal_call_id is None or operation.started_at is None:
+            raise ValueError("GROMACS operation has no attached Modal call")
+        live = operation.state in {
+            JobOperationState.RUNNING,
+            JobOperationState.STATE_UNKNOWN,
+        }
+        started_at = datetime.fromtimestamp(operation.started_at, UTC)
+        ended_at = (
+            datetime.fromtimestamp(operation.completed_at, UTC)
+            if operation.completed_at is not None
+            else None
+        )
         return await self.logs.open(
             app_name=job.modal_app_name,
             environment_name=job.modal_environment,
-            function_call_id=modal_call_id,
+            function_call_id=operation.modal_call_id,
+            follow=live,
+            since=(started_at - timedelta(seconds=1) if not live else None),
+            until=(ended_at + timedelta(seconds=1) if ended_at is not None else None),
         )
 
     async def read_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:

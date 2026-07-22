@@ -30,7 +30,12 @@ from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
 )
-from biomodals.service.store import JobRecord, JobState, ServiceStore
+from biomodals.service.store import (
+    JobOperationRecord,
+    JobRecord,
+    JobState,
+    ServiceStore,
+)
 
 ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
 STAGE_SECONDS = 1.0
@@ -174,7 +179,7 @@ class _FakeGromacsAdapter:
     async def open_operation_logs(
         self,
         _job: JobRecord,
-        _modal_call_id: str,
+        _operation: JobOperationRecord,
     ):
         async def chunks():
             yield b"Browser test remote log\n"

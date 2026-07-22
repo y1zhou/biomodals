@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
+from datetime import datetime
 
 LOGGER = logging.getLogger(__name__)
 _READ_CHUNK_BYTES = 64 * 1024
@@ -31,27 +32,50 @@ class ModalCLILogStreamer:
         app_name: str,
         environment_name: str,
         function_call_id: str,
+        follow: bool,
+        since: datetime | None = None,
+        until: datetime | None = None,
     ) -> AsyncIterable[bytes]:
-        """Start following one FunctionCall without exposing its ID over HTTP."""
+        """Open live or complete time-bounded logs for one FunctionCall."""
         if not app_name.strip() or not environment_name.strip():
             raise ValueError("Modal App and Environment names must not be empty")
         if not function_call_id.startswith("fc-"):
             raise ValueError("Modal FunctionCall ID must start with fc-")
+        if follow and (since is not None or until is not None):
+            raise ValueError("Live Modal logs cannot use a time range")
+        if not follow and (
+            since is None
+            or until is None
+            or since.tzinfo is None
+            or until.tzinfo is None
+            or since >= until
+        ):
+            raise ValueError("Historical Modal logs require a valid aware time range")
         environment = dict(os.environ)
         environment["NO_COLOR"] = "1"
-        process = await self._process_factory(
+        command = [
             sys.executable,
             "-m",
             "modal",
             "app",
             "logs",
             app_name,
-            "--follow",
+        ]
+        if follow:
+            command.append("--follow")
+        else:
+            if since is None or until is None:  # pragma: no cover - validated above
+                raise ValueError("Historical Modal logs require a time range")
+            command.extend(("--since", since.isoformat(), "--until", until.isoformat()))
+        command.extend((
             "--function-call",
             function_call_id,
             "--timestamps",
             "--env",
             environment_name,
+        ))
+        process = await self._process_factory(
+            *command,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,

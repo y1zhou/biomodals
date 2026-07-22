@@ -63,7 +63,7 @@ class FakeGromacsAdapter:
         self.unknown_failures_remaining = 0
         self.preflights: list[tuple[str, str, int]] = []
         self.preflight_failures_remaining = 0
-        self.log_requests: list[tuple[UUID, str]] = []
+        self.log_requests: list[tuple[UUID, str | None, str]] = []
 
     async def preflight(
         self,
@@ -113,8 +113,12 @@ class FakeGromacsAdapter:
         self.downloads += 1
         yield self.artifact_content
 
-    async def open_operation_logs(self, job, modal_call_id: str):
-        self.log_requests.append((job.job_id, modal_call_id))
+    async def open_operation_logs(self, job, operation):
+        self.log_requests.append((
+            job.job_id,
+            operation.modal_call_id,
+            operation.state.value,
+        ))
 
         async def chunks():
             yield b"Preparing simulation (call fc"
@@ -730,7 +734,9 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
                 "stage_code": "prepare_simulation",
                 "function_name": "prepare_tpr_cpu",
                 "state": "running",
+                "mode": "live",
                 "started_at": targets.json()["targets"][0]["started_at"],
+                "ended_at": None,
             }
         ],
     }
@@ -742,12 +748,13 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
     assert streamed.headers["content-type"].startswith("text/plain")
     assert streamed.headers["cache-control"] == "no-store, no-transform"
     assert streamed.headers["x-accel-buffering"] == "no"
+    assert streamed.headers["x-biomodals-log-mode"] == "live"
     assert streamed.text == (
         "Preparing simulation (call [function-call-id-redacted])\n"
         "Simulation is running\n"
     )
     assert "fc-1" not in streamed.text
-    assert adapter.log_requests == [(job_id, "fc-1")]
+    assert adapter.log_requests == [(job_id, "fc-1", "running")]
 
     store.record_operation_outcome(
         job_id,
@@ -782,13 +789,57 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
     parallel = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
 
     assert [target["stage_code"] for target in parallel.json()["targets"]] == [
+        "prepare_simulation",
         "analyze_nvt",
         "analyze_npt",
         "run_production",
     ]
-    stale = client.get(f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation")
-    assert stale.status_code == 409
-    assert stale.json()["code"] == "job_log_target_unavailable"
+    historical = client.get(
+        f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation"
+    )
+    unavailable = client.get(
+        f"/api/v1/admin/jobs/{job_id}/logs?stage=analyze_production"
+    )
+    assert historical.status_code == 200
+    assert historical.headers["x-biomodals-log-mode"] == "historical"
+    assert unavailable.status_code == 409
+    assert unavailable.json()["code"] == "job_log_target_unavailable"
+
+
+def test_admin_can_fetch_completed_stage_logs_without_following(tmp_path: Path) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "admin@example.com", is_admin=True)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    store.record_operation_outcome(
+        job_id,
+        operation="prepare_tpr_cpu",
+        expected_modal_call_id="fc-1",
+        outcome=JobOperationState.COMPLETED,
+        now=1_800_000_001,
+    )
+    client.cookies.clear()
+    _login(client, "admin@example.com")
+
+    targets = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
+    streamed = client.get(f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation")
+
+    assert targets.status_code == 200
+    assert targets.json()["targets"] == [
+        {
+            "stage_code": "prepare_simulation",
+            "function_name": "prepare_tpr_cpu",
+            "state": "completed",
+            "mode": "historical",
+            "started_at": targets.json()["targets"][0]["started_at"],
+            "ended_at": targets.json()["targets"][0]["ended_at"],
+        }
+    ]
+    assert targets.json()["targets"][0]["ended_at"] is not None
+    assert streamed.status_code == 200
+    assert adapter.log_requests == [(job_id, "fc-1", "completed")]
 
 
 def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
@@ -806,10 +857,27 @@ def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
     )
     stream_response = schema["paths"][stream_path]["get"]["responses"]["200"]
     assert stream_response["content"]["text/plain"]["schema"] == {"type": "string"}
-    assert stream_response["description"] == "Live logs for the selected active stage"
+    assert stream_response["description"] == "Logs for the selected remote stage"
     assert schema["paths"][stream_path]["get"]["security"] == [{"SessionCookie": []}]
     targets_schema = schema["components"]["schemas"]["AdminJobLogTargetsView"]
     assert set(targets_schema["required"]) == {"job_id", "targets"}
+    target_schema = schema["components"]["schemas"]["AdminJobLogTargetView"]
+    assert set(target_schema["required"]) == {
+        "ended_at",
+        "function_name",
+        "mode",
+        "stage_code",
+        "started_at",
+        "state",
+    }
+    assert target_schema["properties"]["mode"]["enum"] == ["live", "historical"]
+    assert target_schema["properties"]["state"]["enum"] == [
+        "running",
+        "state_unknown",
+        "completed",
+        "failed",
+        "cancelled",
+    ]
 
 
 def test_modal_preflight_runs_only_for_changed_provider_fields(

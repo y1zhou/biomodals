@@ -15,7 +15,13 @@ from weakref import WeakValueDictionary
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
-from biomodals.service.store import JobRecord, JobStageRecord, JobState, ServiceStore
+from biomodals.service.store import (
+    JobOperationRecord,
+    JobRecord,
+    JobStageRecord,
+    JobState,
+    ServiceStore,
+)
 from biomodals.service.workloads import WORKLOAD_DEFINITIONS, WorkloadDefinition
 
 LOGGER = logging.getLogger(__name__)
@@ -243,7 +249,10 @@ class Reconciler(Protocol):
 
 CancelJob = Callable[[ServiceStore, JobRecord], Awaitable[None]]
 ReadArtifact = Callable[[JobRecord], AsyncIterable[bytes]]
-OpenOperationLogs = Callable[[JobRecord, str], Awaitable[AsyncIterable[bytes]]]
+OpenOperationLogs = Callable[
+    [JobRecord, JobOperationRecord],
+    Awaitable[AsyncIterable[bytes]],
+]
 PreflightWorkload = Callable[[str, str, int], Awaitable[None]]
 
 

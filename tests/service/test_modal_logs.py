@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, MutableMapping
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -59,6 +60,7 @@ def test_modal_cli_stream_filters_one_call_and_stops_on_disconnect() -> None:
             app_name="GromacsApp",
             environment_name="production",
             function_call_id="fc-example",
+            follow=True,
         )
         stream = cast(AsyncGenerator[bytes, None], opened)
         process.stdout.feed_data(b"remote output\n")
@@ -96,7 +98,52 @@ def test_modal_cli_stream_rejects_non_function_call_ids() -> None:
                 app_name="GromacsApp",
                 environment_name="production",
                 function_call_id="not-a-call",
+                follow=True,
             )
+
+    asyncio.run(scenario())
+
+
+def test_modal_cli_fetches_complete_historical_call_range() -> None:
+    async def scenario() -> None:
+        process = FakeProcess()
+        command: tuple[str, ...] = ()
+
+        async def create_process(*args: str, **_kwargs: Any) -> Any:
+            nonlocal command
+            command = args
+            process.stdout.feed_eof()
+            process.returncode = 0
+            process._finished.set()
+            return process
+
+        streamer = ModalCLILogStreamer(process_factory=create_process)
+        stream = await streamer.open(
+            app_name="GromacsApp",
+            environment_name="production",
+            function_call_id="fc-example",
+            follow=False,
+            since=datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC),
+            until=datetime(2026, 7, 22, 1, 4, 5, tzinfo=UTC),
+        )
+
+        assert [chunk async for chunk in stream] == []
+        assert command[1:] == (
+            "-m",
+            "modal",
+            "app",
+            "logs",
+            "GromacsApp",
+            "--since",
+            "2026-07-22T01:02:03+00:00",
+            "--until",
+            "2026-07-22T01:04:05+00:00",
+            "--function-call",
+            "fc-example",
+            "--timestamps",
+            "--env",
+            "production",
+        )
 
     asyncio.run(scenario())
 

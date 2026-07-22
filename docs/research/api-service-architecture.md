@@ -363,8 +363,15 @@ Each workload may therefore register an optional operation-log opener. For
 GROMACS, the admin-only Job diagnostics routes map a selected active stage back
 to its durable operation, then run `modal app logs --follow --function-call`
 against the Job's captured App and Environment. The Function Call ID never
-crosses the HTTP boundary. Collapsing the browser panel or leaving the page
-aborts the response and terminates its CLI subprocess.
+appears in the selector contract, request URL, or response bytes: the HTTP
+boundary also redacts an exact ID emitted by provider output, including when it
+straddles stream chunks. Modal deployment versions select Function versions
+inside the named deployed App, while the call filter identifies the exact
+invocation, so the logs command does not take a separate version selector. If
+an operator deletes and recreates that App under the same name while a Job is
+active, its diagnostic stream may be unavailable even though lifecycle polling
+by durable call ID can continue. Collapsing the browser panel or leaving the
+page aborts the response and terminates its CLI subprocess.
 
 The target list includes running calls and calls in `state_unknown` whose IDs
 are still known, because their logs may help an Administrator resolve remote

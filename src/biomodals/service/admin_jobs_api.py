@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterable, AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from biomodals.service.admin_api import AdminForbiddenResponse, require_admin
 from biomodals.service.auth import AuthenticatedSession
@@ -52,7 +53,7 @@ class AdminJobLogTargetsView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     job_id: UUID
-    targets: list[AdminJobLogTargetView] = Field(default_factory=list)
+    targets: list[AdminJobLogTargetView]
 
 
 class AdminJobLogTargetUnavailableResponse(CodedErrorResponse):
@@ -82,7 +83,7 @@ def _log_targets(
         stage = registration.definition.stage(operation.operation)
         if (
             operation.state not in _LOGGABLE_STATES
-            or operation.modal_call_id is None
+            or not operation.modal_call_id
             or operation.started_at is None
             or stage is None
             or stage.function_name is None
@@ -98,6 +99,36 @@ def _log_targets(
             operation,
         ))
     return targets
+
+
+async def _redact_provider_call_id(
+    stream: AsyncIterable[bytes],
+    provider_call_id: str,
+) -> AsyncIterator[bytes]:
+    """Remove the selected provider identifier, including across chunk edges."""
+    secret = provider_call_id.encode()
+    if not secret:  # pragma: no cover - empty IDs are excluded from targets
+        raise ValueError("Provider call ID must not be empty")
+    replacement = b"[function-call-id-redacted]"
+    pending = b""
+    async for chunk in stream:
+        pending += chunk
+        output = bytearray()
+        while True:
+            index = pending.find(secret)
+            if index >= 0:
+                output.extend(pending[:index])
+                output.extend(replacement)
+                pending = pending[index + len(secret) :]
+                continue
+            safe_length = max(0, len(pending) - len(secret) + 1)
+            output.extend(pending[:safe_length])
+            pending = pending[safe_length:]
+            break
+        if output:
+            yield bytes(output)
+    if pending:
+        yield pending.replace(secret, replacement)
 
 
 def create_admin_jobs_router() -> APIRouter:
@@ -200,10 +231,10 @@ def create_admin_jobs_router() -> APIRouter:
             request_id_from(request),
         )
         return StreamingResponse(
-            stream,
+            _redact_provider_call_id(stream, selected.modal_call_id),
             media_type="text/plain",
             headers={
-                "Cache-Control": "no-store",
+                "Cache-Control": "no-store, no-transform",
                 "X-Accel-Buffering": "no",
             },
         )

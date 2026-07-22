@@ -399,6 +399,14 @@ the HTTP response. The frontend keeps at most the latest 500,000 characters and
 marks when earlier output was omitted. It refreshes the target choices every ten
 seconds only while expanded.
 
+The selected Function Call ID is an internal filter, not browser data. The
+backend redacts that exact identifier from provider output even when it is split
+across stream chunks. Modal deployment versions select Function versions within
+the named deployed App; filtering on the durable call ID selects the originating
+invocation without a separate logs-version argument. Deleting and recreating an
+App under the same name can make an in-flight Job's diagnostic logs unavailable,
+but cannot redefine the Job lifecycle or justify resubmission.
+
 Provider logs are fallible Administrator diagnostics. They do not determine or
 advance Job Status, Stage History, Progress, Cancellation, or Result validity,
 and an empty or interrupted stream does not imply that remote work stopped.

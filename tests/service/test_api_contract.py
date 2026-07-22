@@ -117,8 +117,8 @@ class FakeGromacsAdapter:
         self.log_requests.append((job.job_id, modal_call_id))
 
         async def chunks():
-            yield b"Preparing simulation\n"
-            yield b"Simulation is running\n"
+            yield b"Preparing simulation (call fc"
+            yield b"-1)\nSimulation is running\n"
 
         return chunks()
 
@@ -740,7 +740,13 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
 
     assert streamed.status_code == 200
     assert streamed.headers["content-type"].startswith("text/plain")
-    assert streamed.text == "Preparing simulation\nSimulation is running\n"
+    assert streamed.headers["cache-control"] == "no-store, no-transform"
+    assert streamed.headers["x-accel-buffering"] == "no"
+    assert streamed.text == (
+        "Preparing simulation (call [function-call-id-redacted])\n"
+        "Simulation is running\n"
+    )
+    assert "fc-1" not in streamed.text
     assert adapter.log_requests == [(job_id, "fc-1")]
 
     store.record_operation_outcome(
@@ -802,6 +808,8 @@ def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
     assert stream_response["content"]["text/plain"]["schema"] == {"type": "string"}
     assert stream_response["description"] == "Live logs for the selected active stage"
     assert schema["paths"][stream_path]["get"]["security"] == [{"SessionCookie": []}]
+    targets_schema = schema["components"]["schemas"]["AdminJobLogTargetsView"]
+    assert set(targets_schema["required"]) == {"job_id", "targets"}
 
 
 def test_modal_preflight_runs_only_for_changed_provider_fields(

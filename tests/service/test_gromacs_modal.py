@@ -1231,7 +1231,7 @@ def test_stage_attach_conflict_marks_job_state_unknown(
     uncertain = store.get_job(job.owner_user_id, job.job_id)
     assert uncertain is not None
     assert uncertain.state == JobState.STATE_UNKNOWN
-    assert uncertain.state_unknown_reason == "cancellation_outcome_unknown"
+    assert uncertain.state_unknown_reason == "submission_outcome_unknown"
     provider_calls = store.list_provider_calls(job.job_id)
     assert provider_calls[-1].provider_operation == "collect_traj_stats:nvt_"
     assert provider_calls[-1].state == JobProviderCallState.STATE_UNKNOWN

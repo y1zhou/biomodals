@@ -1035,7 +1035,7 @@ class GromacsReconciler:
                     )
                     self.store.mark_state_unknown(
                         job.job_id,
-                        reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
+                        reason=JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN,
                         now=self._now(),
                     )
                     try:

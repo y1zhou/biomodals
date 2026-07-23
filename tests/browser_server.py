@@ -66,6 +66,7 @@ class _FakeGromacsAdapter:
     def __init__(self, stats_path: Path) -> None:
         self.stats_path = stats_path
         self.password_link = ""
+        self.secondary_password_link = ""
         self.submit_calls = 0
         self.preflight_versions: list[int] = []
         self.submit_versions: list[int] = []
@@ -82,6 +83,7 @@ class _FakeGromacsAdapter:
             orjson.dumps(
                 {
                     "password_link": self.password_link,
+                    "secondary_password_link": self.secondary_password_link,
                     "preflight_versions": self.preflight_versions,
                     "submit_calls": self.submit_calls,
                     "submit_versions": self.submit_versions,
@@ -227,6 +229,11 @@ def _create_browser_app():
         is_admin=True,
     )
     adapter.password_link = link.url
+    secondary_link = auth.create_user(
+        "browser-user@example.com",
+        display_name="Browser Regular User",
+    )
+    adapter.secondary_password_link = secondary_link.url
     adapter._write_stats()
     lifecycle_locks = JobLifecycleLocks()
     reconciler = GromacsReconciler(

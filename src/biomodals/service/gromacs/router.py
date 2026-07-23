@@ -156,17 +156,15 @@ def _request_identity(
     options: GromacsJobOptions,
 ) -> tuple[str, str, str]:
     parameters_json = options.model_dump_json()
-    encoded = parameters_json.encode()
+    artifact_digest = artifact_request_sha256(pdb_content, parameters_json)
     encoded_display_identity = orjson.dumps({"display_name": display_identity})
     digest = hashlib.sha256()
-    digest.update(len(pdb_content).to_bytes(8, "big"))
-    digest.update(pdb_content)
-    digest.update(encoded)
+    digest.update(bytes.fromhex(artifact_digest))
     digest.update(encoded_display_identity)
     return (
         digest.hexdigest(),
         parameters_json,
-        artifact_request_sha256(pdb_content, parameters_json),
+        artifact_digest,
     )
 
 
@@ -296,6 +294,7 @@ def create_router(
                 spawn=spawn,
                 cancel=adapter.cancel,
                 operation_preclaimed=admission.created,
+                require_enabled_owner=True,
             )
         except Exception as exc:
             LOGGER.exception(

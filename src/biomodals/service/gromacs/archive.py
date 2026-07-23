@@ -203,10 +203,12 @@ def _validate_csv_member(
         ):
             raise ValueError
         axis = frame.get_column(header[0])
+        values = frame.get_column(header[1])
         if (
             cast("float", axis.min()) < (1 if header[0] == "residue_index" else 0)
             or axis.diff().drop_nulls().le(0).any()
             or (header[0] == "residue_index" and axis.ne(axis.floor()).any())
+            or values.lt(0).any()
         ):
             raise ValueError
     except (pl.exceptions.PolarsError, ValueError) as exc:

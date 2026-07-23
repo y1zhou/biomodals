@@ -559,8 +559,9 @@ checks for PDB, MDP, XTC, TPR, CSV, PNG, and JSON members so a checksummed but
 obviously truncated archive cannot become a successful Result.
 Publication and recovery must also reproduce the artifact-request digest
 persisted at admission from the exact PDB bytes and normalized parameters.
-Remote input or parameter drift therefore cannot publish under the admitted
-Job identity.
+The Volume input and archived parameter document therefore remain bound to the
+admitted Job identity, and provider invocations are constructed from those same
+persisted parameters.
 Allowlisted GROMACS logs and `.mdp` files are diagnostic and included only when
 present. Their absence does not invalidate an otherwise complete Result. The
 manifest enumerates the exact optional members included.

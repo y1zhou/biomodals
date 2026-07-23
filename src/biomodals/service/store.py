@@ -1638,6 +1638,7 @@ class ServiceStore:
         now: int,
         run_name: str | None = None,
         lease_seconds: int = 120,
+        require_enabled_owner: bool = False,
     ) -> JobOperationRecord | None:
         """Lease one not-yet-started Modal operation exactly once."""
         operation = operation.strip()
@@ -1651,12 +1652,22 @@ class ServiceStore:
             raise ValueError("lease_seconds must be positive")
         with self._transaction() as conn:
             job = conn.execute(
-                "SELECT state, run_name FROM jobs WHERE job_id = ?",
+                """
+                SELECT jobs.state, jobs.run_name, users.status AS owner_status
+                FROM jobs
+                JOIN users ON users.user_id = jobs.owner_user_id
+                WHERE jobs.job_id = ?
+                """,
                 (str(job_id),),
             ).fetchone()
             if job is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if JobState(job["state"]) not in {JobState.QUEUED, JobState.RUNNING}:
+                return None
+            if (
+                require_enabled_owner
+                and job["owner_status"] != UserStatus.ENABLED.value
+            ):
                 return None
             if run_name is not None and job["run_name"] not in {None, run_name}:
                 return None

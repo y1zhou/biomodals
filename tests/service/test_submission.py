@@ -151,6 +151,43 @@ def test_submitter_attaches_a_successor_operation(tmp_path: Path) -> None:
     assert result.job.operations[-1].modal_call_id == "fc-analyze"
 
 
+def test_missing_preclaimed_operation_is_an_invariant_error(tmp_path: Path) -> None:
+    store, job = admitted_job(tmp_path)
+    claimed = store.claim_modal_operation(
+        job.job_id,
+        operation="prepare",
+        run_name="simulation-1",
+        submission_token="discarded-token",
+        now=9,
+    )
+    assert claimed is not None
+    store.release_operation(
+        job.job_id,
+        operation="prepare",
+        submission_token="discarded-token",
+        now=9,
+    )
+    refreshed = store.get_job(job.owner_user_id, job.job_id)
+    assert refreshed is not None
+    submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)
+
+    with pytest.raises(RuntimeError, match="Preclaimed Modal operation is missing"):
+        asyncio.run(
+            submitter.submit(
+                refreshed,
+                operation="prepare",
+                run_name="simulation-1",
+                submission_token="initial-token",
+                spawn=lambda _job: asyncio.sleep(
+                    0,
+                    result=Submitted("fc-prepare", "simulation-1", "prepare"),
+                ),
+                cancel=lambda _call_id: asyncio.sleep(0),
+                operation_preclaimed=True,
+            )
+        )
+
+
 def test_submitter_reloads_eligibility_before_claiming(tmp_path: Path) -> None:
     store, job = admitted_job(tmp_path)
     submitter = ModalJobSubmitter(store, JobLifecycleLocks(), now=lambda: 10)

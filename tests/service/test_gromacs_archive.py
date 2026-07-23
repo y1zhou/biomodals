@@ -200,6 +200,9 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         ("rmsd", b"time_ns,rmsd\n0.0,0.1\n0.0,0.2\n"),
         ("rg", b"time_ns,rg\n1.0,1.2\n0.5,1.3\n"),
         ("rmsf", b"residue_index,rmsf\n1.5,0.2\n"),
+        ("rmsd", b"time_ns,rmsd\n0.0,-0.1\n"),
+        ("rg", b"time_ns,rg\n0.0,-1.2\n"),
+        ("rmsf", b"residue_index,rmsf\n1,-0.2\n"),
     ],
 )
 def test_archive_validator_rejects_invalid_analysis_axes_and_values(

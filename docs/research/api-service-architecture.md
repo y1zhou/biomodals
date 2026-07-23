@@ -419,9 +419,10 @@ deterministic local ZIP, validates it, then uploads `result.zip` followed by a
 small completion marker under `api-results/<run_name>/`. The marker records the
 artifact-request identity, byte size, and SHA-256 digest. Publication and
 recovery compare that identity with the digest persisted at Job admission, so
-altered remote input or parameters cannot be accepted as the admitted Result.
-The archive and marker are the durable success boundary; the control plane does
-not mark a job complete until the ZIP contract validates.
+the Volume input and archived normalized parameters remain bound to the
+admitted request. Provider invocations are constructed from those same
+persisted parameters. The archive and marker are the durable success boundary;
+the control plane does not mark a job complete until the ZIP contract validates.
 
 When the final deployed Function completes, the control plane atomically stores
 `finalization_started_at` as it enters `finalizing`. Archive provenance uses

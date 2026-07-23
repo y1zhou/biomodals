@@ -440,6 +440,37 @@ def test_submission_lease_requires_explicit_release_before_retry(
     assert retry.submission_token == "retry"
 
 
+def test_disabled_owner_cannot_reclaim_a_released_initial_operation(
+    tmp_path: Path,
+) -> None:
+    store, _alice, bob = make_store(tmp_path)
+    job = admit(
+        store,
+        bob,
+        key="11111111-1111-4111-8111-111111111111",
+    ).job
+    store.update_user(bob, active=False, now=101)
+
+    replay_claim = store.claim_modal_operation(
+        job.job_id,
+        operation="prepare_tpr_gpu",
+        run_name=f"simulation-{job.job_id.hex}",
+        submission_token="replay",
+        now=102,
+        require_enabled_owner=True,
+    )
+    lifecycle_claim = store.claim_modal_operation(
+        job.job_id,
+        operation="prepare_tpr_gpu",
+        run_name=f"simulation-{job.job_id.hex}",
+        submission_token="reconciler",
+        now=103,
+    )
+
+    assert replay_claim is None
+    assert lifecycle_claim is not None
+
+
 def test_cancel_during_spawn_keeps_call_attached_for_reconciliation(
     tmp_path: Path,
 ) -> None:

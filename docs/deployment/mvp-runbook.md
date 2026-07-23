@@ -51,12 +51,19 @@ a fixed working directory, private umask, restart-on-failure, and journald
 output. Review and install only one alternative. A pre-release service must use
 its own copied configuration, host paths, public URL, and port.
 
-Before directing a browser to the production API, verify it on port `4100`.
-Use port `4144` for the development or pre-release service:
+Before directing a browser to the production API, verify its production unit
+on port `4100`:
 
 ```console
 curl --fail http://127.0.0.1:4100/api/v1/health
 curl --fail http://127.0.0.1:4100/api/v1/ready
+```
+
+Verify a development or pre-release unit on its separate port `4144`:
+
+```console
+curl --fail http://127.0.0.1:4144/api/v1/health
+curl --fail http://127.0.0.1:4144/api/v1/ready
 ```
 
 Liveness only proves that the event loop responds. Readiness additionally

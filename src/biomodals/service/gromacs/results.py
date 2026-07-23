@@ -269,7 +269,7 @@ class ModalGromacsResults:
             remote_mtimes[path] = entry.mtime
 
         stages = [
-            stage.model_dump(mode="json")
+            orjson.loads(stage.model_dump_json())
             for stage in job_stage_history(job, job.stage_history)
         ]
         if stages and stages[-1]["code"] == "prepare_result":

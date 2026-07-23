@@ -85,6 +85,7 @@ class ModalJobSubmitter:
         can_submit: CanSubmitOperation | None = None,
         is_retryable_spawn_error: IsRetryableSpawnError | None = None,
         operation_preclaimed: bool = False,
+        require_enabled_owner: bool = False,
     ) -> SubmissionResult:
         """Claim, spawn, and attach one Modal operation without duplicate work."""
         async with self.lifecycle_locks.for_job(job.job_id):
@@ -105,6 +106,7 @@ class ModalJobSubmitter:
                     run_name=run_name,
                     submission_token=submission_token,
                     now=self._now(),
+                    require_enabled_owner=require_enabled_owner,
                 )
             if claimed is None:
                 return SubmissionResult(job=self._reload(job), attached=False)
@@ -191,7 +193,7 @@ class ModalJobSubmitter:
             return None
         if job.run_name != run_name:
             raise RuntimeError("Preclaimed Modal operation has the wrong run name")
-        return next(
+        claimed = next(
             (
                 candidate
                 for candidate in job.operations
@@ -201,6 +203,9 @@ class ModalJobSubmitter:
             ),
             None,
         )
+        if claimed is None:
+            raise RuntimeError("Preclaimed Modal operation is missing")
+        return claimed
 
     def _reload(self, job: JobRecord) -> JobRecord:
         current = self.store.get_job(job.owner_user_id, job.job_id)

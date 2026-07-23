@@ -734,9 +734,18 @@ def test_openapi_includes_admin_contract_and_admin_principal(tmp_path: Path) -> 
         "properties"
     ]["display_name"]
     assert display_name["anyOf"][0]["maxLength"] == 120
+    owner_log_setting = schema["components"]["schemas"]["UpdateAdminModalToolRequest"][
+        "properties"
+    ]["job_logs_visible_to_owner"]
+    assert owner_log_setting["anyOf"] == [
+        {"type": "boolean"},
+        {"type": "null"},
+    ]
 
 
-def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> None:
+def test_job_owner_and_admin_can_select_and_stream_owner_visible_logs(
+    tmp_path: Path,
+) -> None:
     client, auth, store, adapter = _service(tmp_path)
     _activate(auth, "admin@example.com", is_admin=True)
     _activate(auth, "alice@example.com")
@@ -748,11 +757,12 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
     )
     job_id = UUID(submitted.json()["job_id"])
 
-    assert client.get(f"/api/v1/admin/jobs/{job_id}/log-targets").status_code == 403
+    owner_targets = client.get(f"/api/v1/jobs/{job_id}/log-targets")
+    assert owner_targets.status_code == 200
 
     client.cookies.clear()
     _login(client, "admin@example.com")
-    targets = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
+    targets = client.get(f"/api/v1/jobs/{job_id}/log-targets")
 
     assert targets.status_code == 200
     assert targets.json() == {
@@ -770,7 +780,7 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
     }
     assert "fc-1" not in targets.text
 
-    streamed = client.get(f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation")
+    streamed = client.get(f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation")
 
     assert streamed.status_code == 200
     assert streamed.headers["content-type"].startswith("text/plain")
@@ -814,7 +824,7 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
             now=1_800_000_001,
         )
 
-    parallel = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
+    parallel = client.get(f"/api/v1/jobs/{job_id}/log-targets")
 
     assert [target["stage_code"] for target in parallel.json()["targets"]] == [
         "prepare_simulation",
@@ -822,16 +832,84 @@ def test_admin_can_select_and_stream_active_job_stage_logs(tmp_path: Path) -> No
         "analyze_npt",
         "run_production",
     ]
-    historical = client.get(
-        f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation"
-    )
-    unavailable = client.get(
-        f"/api/v1/admin/jobs/{job_id}/logs?stage=analyze_production"
-    )
+    historical = client.get(f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation")
+    unavailable = client.get(f"/api/v1/jobs/{job_id}/logs?stage=analyze_production")
     assert historical.status_code == 200
     assert historical.headers["x-biomodals-log-mode"] == "historical"
     assert unavailable.status_code == 409
     assert unavailable.json()["code"] == "job_log_target_unavailable"
+
+
+def test_admin_can_restrict_tool_logs_without_blocking_admin_access(
+    tmp_path: Path,
+) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "admin@example.com", is_admin=True)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    assert submitted.json()["can_view_logs"] is True
+    assert client.get(f"/api/v1/jobs/{job_id}/log-targets").status_code == 200
+
+    client.cookies.clear()
+    admin_csrf = _login(client, "admin@example.com")
+    initial = client.get("/api/v1/admin/modal").json()["tools"][0]
+    assert initial["job_logs_visible_to_owner"] == {
+        "value": True,
+        "source": "default",
+        "editable": True,
+    }
+    restricted = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=_unsafe_headers(admin_csrf),
+        json={"job_logs_visible_to_owner": False},
+    )
+    assert restricted.status_code == 200
+    assert restricted.json()["job_logs_visible_to_owner"] == {
+        "value": False,
+        "source": "database",
+        "editable": True,
+    }
+    assert client.get(f"/api/v1/jobs/{job_id}/log-targets").status_code == 200
+
+    client.cookies.clear()
+    _login(client, "alice@example.com")
+    assert client.get(f"/api/v1/jobs/{job_id}").json()["can_view_logs"] is False
+    forbidden = client.get(f"/api/v1/jobs/{job_id}/log-targets")
+    assert forbidden.status_code == 403
+    assert forbidden.json()["code"] == "job_logs_forbidden"
+
+    client.cookies.clear()
+    admin_csrf = _login(client, "admin@example.com")
+    restored = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=_unsafe_headers(admin_csrf),
+        json={"job_logs_visible_to_owner": None},
+    )
+    assert restored.json()["job_logs_visible_to_owner"] == {
+        "value": True,
+        "source": "default",
+        "editable": True,
+    }
+
+
+def test_unrelated_user_cannot_discover_owner_visible_job_logs(tmp_path: Path) -> None:
+    client, auth, _store, _adapter = _service(tmp_path)
+    _activate(auth, "admin@example.com", is_admin=True)
+    _activate(auth, "alice@example.com")
+    _activate(auth, "bob@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+
+    client.cookies.clear()
+    _login(client, "bob@example.com")
+    targets = client.get(f"/api/v1/jobs/{job_id}/log-targets")
+    streamed = client.get(f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation")
+
+    assert targets.status_code == 404
+    assert streamed.status_code == 404
 
 
 def test_admin_can_fetch_completed_stage_logs_without_following(tmp_path: Path) -> None:
@@ -851,8 +929,8 @@ def test_admin_can_fetch_completed_stage_logs_without_following(tmp_path: Path) 
     client.cookies.clear()
     _login(client, "admin@example.com")
 
-    targets = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets")
-    streamed = client.get(f"/api/v1/admin/jobs/{job_id}/logs?stage=prepare_simulation")
+    targets = client.get(f"/api/v1/jobs/{job_id}/log-targets")
+    streamed = client.get(f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation")
 
     assert targets.status_code == 200
     assert targets.json()["targets"] == [
@@ -883,13 +961,13 @@ def test_admin_can_page_active_stage_logs_by_bounded_time_window(
     job_id = UUID(submitted.json()["job_id"])
     client.cookies.clear()
     _login(client, "admin@example.com")
-    targets = client.get(f"/api/v1/admin/jobs/{job_id}/log-targets").json()
+    targets = client.get(f"/api/v1/jobs/{job_id}/log-targets").json()
     started_at = datetime.fromisoformat(targets["targets"][0]["started_at"])
     since = started_at - timedelta(seconds=1)
     until = started_at + timedelta(seconds=1)
 
     streamed = client.get(
-        f"/api/v1/admin/jobs/{job_id}/logs",
+        f"/api/v1/jobs/{job_id}/logs",
         params={
             "stage": "prepare_simulation",
             "since": since.isoformat(),
@@ -897,11 +975,11 @@ def test_admin_can_page_active_stage_logs_by_bounded_time_window(
         },
     )
     incomplete = client.get(
-        f"/api/v1/admin/jobs/{job_id}/logs",
+        f"/api/v1/jobs/{job_id}/logs",
         params={"stage": "prepare_simulation", "since": since.isoformat()},
     )
     oversized = client.get(
-        f"/api/v1/admin/jobs/{job_id}/logs",
+        f"/api/v1/jobs/{job_id}/logs",
         params={
             "stage": "prepare_simulation",
             "since": since.isoformat(),
@@ -922,18 +1000,18 @@ def test_admin_can_page_active_stage_logs_by_bounded_time_window(
     assert oversized.json()["code"] == "job_log_window_invalid"
 
 
-def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
+def test_openapi_documents_authorized_job_log_contract(tmp_path: Path) -> None:
     client, _auth, _store, _adapter = _service(tmp_path)
 
     schema = client.get("/openapi.json").json()
-    targets_path = "/api/v1/admin/jobs/{job_id}/log-targets"
-    stream_path = "/api/v1/admin/jobs/{job_id}/logs"
+    targets_path = "/api/v1/jobs/{job_id}/log-targets"
+    stream_path = "/api/v1/jobs/{job_id}/logs"
 
     assert targets_path in schema["paths"]
     assert stream_path in schema["paths"]
     target_response = schema["paths"][targets_path]["get"]["responses"]["200"]
     assert target_response["content"]["application/json"]["schema"]["$ref"].endswith(
-        "/AdminJobLogTargetsView"
+        "/JobLogTargetsView"
     )
     stream_response = schema["paths"][stream_path]["get"]["responses"]["200"]
     assert stream_response["content"]["text/plain"]["schema"] == {"type": "string"}
@@ -959,11 +1037,19 @@ def test_openapi_documents_admin_job_log_contract(tmp_path: Path) -> None:
     assert stream_parameters["since"]["schema"]["anyOf"][0]["format"] == "date-time"
     invalid_window = schema["paths"][stream_path]["get"]["responses"]["400"]
     assert invalid_window["content"]["application/json"]["schema"]["$ref"].endswith(
-        "/AdminJobLogWindowInvalidResponse"
+        "/JobLogWindowInvalidResponse"
     )
-    targets_schema = schema["components"]["schemas"]["AdminJobLogTargetsView"]
+    forbidden = schema["paths"][stream_path]["get"]["responses"]["403"]
+    forbidden_model = forbidden["content"]["application/json"]["schema"]["$ref"].rsplit(
+        "/", 1
+    )[-1]
+    assert (
+        schema["components"]["schemas"][forbidden_model]["properties"]["code"]["const"]
+        == "job_logs_forbidden"
+    )
+    targets_schema = schema["components"]["schemas"]["JobLogTargetsView"]
     assert set(targets_schema["required"]) == {"job_id", "targets"}
-    target_schema = schema["components"]["schemas"]["AdminJobLogTargetView"]
+    target_schema = schema["components"]["schemas"]["JobLogTargetView"]
     assert set(target_schema["required"]) == {
         "ended_at",
         "function_name",
@@ -995,6 +1081,11 @@ def test_modal_preflight_runs_only_for_changed_provider_fields(
         headers=headers,
         json={"active_job_limit": 0},
     )
+    policy_only = client.patch(
+        "/api/v1/admin/modal/tools/gromacs",
+        headers=headers,
+        json={"job_logs_visible_to_owner": False},
+    )
     adapter.preflight_failures_remaining = 1
     rejected = client.patch(
         "/api/v1/admin/modal/tools/gromacs",
@@ -1009,6 +1100,7 @@ def test_modal_preflight_runs_only_for_changed_provider_fields(
     )
 
     assert limit_only.status_code == 200
+    assert policy_only.status_code == 200
     assert adapter.preflights == [
         ("UnavailableApp", "production", 17),
         ("AvailableApp", "production", 23),
@@ -1419,6 +1511,7 @@ def test_openapi_describes_conditional_job_fields(tmp_path: Path) -> None:
     ]
 
     for field in (
+        "can_view_logs",
         "stage",
         "active_stages",
         "stage_history",
@@ -1445,6 +1538,21 @@ def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> No
         ("/api/v1/auth/logout", "post"): {"401", "403"},
         ("/api/v1/jobs", "get"): {"400", "401"},
         ("/api/v1/jobs/{job_id}", "get"): {"401", "404", "422"},
+        ("/api/v1/jobs/{job_id}/log-targets", "get"): {
+            "401",
+            "403",
+            "404",
+            "422",
+        },
+        ("/api/v1/jobs/{job_id}/logs", "get"): {
+            "400",
+            "401",
+            "403",
+            "404",
+            "409",
+            "422",
+            "503",
+        },
         ("/api/v1/jobs/{job_id}/cancel", "post"): {
             "401",
             "403",

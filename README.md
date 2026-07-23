@@ -112,10 +112,11 @@ configuration as the server. Related commands include `reset-password`,
 active administrator cannot be disabled or demoted, and the first User must be
 created with `--admin`.
 
-Administrators can manage Users and non-secret live Modal configuration in the
-web interface. Runtime setting precedence is process environment, database
-Admin value, configured `.env` file, then built-in default. Process-controlled
-fields are read-only in the Admin interface.
+Administrators can manage Users, per-Tool Job Log visibility, and non-secret
+live Modal configuration in the web interface. Runtime setting precedence is
+process environment, database Admin value, configured `.env` file, then
+built-in default. Process-controlled fields are read-only in the Admin
+interface.
 
 ### Production deployment
 

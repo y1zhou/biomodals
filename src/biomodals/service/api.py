@@ -140,6 +140,7 @@ def create_app(
         create_jobs_router(
             store=store,
             workloads=registrations,
+            configuration=configuration,
             cache=cache,
         )
     )
@@ -147,10 +148,10 @@ def create_app(
         app.include_router(workload.router)
 
     from biomodals.service.admin_api import create_admin_router
-    from biomodals.service.admin_jobs_api import create_admin_jobs_router
+    from biomodals.service.job_logs_api import create_job_logs_router
 
     app.include_router(create_admin_router())
-    app.include_router(create_admin_jobs_router())
+    app.include_router(create_job_logs_router())
     document_contract_headers(app, session_cookie_name=session_cookie_name)
     return app
 

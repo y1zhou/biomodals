@@ -24,6 +24,7 @@ class WorkloadDefinition:
     modal_app_version_environment: str
     active_job_limit_environment: str
     stages: tuple[WorkloadStageDefinition, ...]
+    job_logs_visible_to_owner_default: bool = False
 
     def stage(self, operation: str) -> WorkloadStageDefinition | None:
         """Return the public stage owned by a provider operation."""
@@ -77,6 +78,7 @@ GROMACS_WORKLOAD = WorkloadDefinition(
         ),
         WorkloadStageDefinition("result_packaging", "prepare_result", None),
     ),
+    job_logs_visible_to_owner_default=True,
 )
 
 WORKLOAD_DEFINITIONS = {GROMACS_WORKLOAD.name: GROMACS_WORKLOAD}

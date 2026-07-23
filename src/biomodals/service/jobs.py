@@ -193,6 +193,12 @@ class JobView(BaseModel):
     job_id: str
     workload: str
     display_name: str
+    can_view_logs: bool = Field(
+        description=(
+            "Whether the authenticated caller may inspect retained provider logs "
+            "for started remote stages of this Job."
+        ),
+    )
     state: JobState
     stage: JobStageView | None = Field(
         default=None,
@@ -252,7 +258,12 @@ class JobView(BaseModel):
     )
 
     @classmethod
-    def from_record(cls, record: JobRecord) -> JobView:
+    def from_record(
+        cls,
+        record: JobRecord,
+        *,
+        can_view_logs: bool = False,
+    ) -> JobView:
         """Build a safe public view without exposing Modal identifiers or paths."""
         warnings = record.warnings
         if (
@@ -279,6 +290,7 @@ class JobView(BaseModel):
             job_id=str(record.job_id),
             workload=record.workload,
             display_name=record.display_name,
+            can_view_logs=can_view_logs,
             state=record.state,
             stage=_job_stage(record, stage_history),
             active_stages=active_stages,

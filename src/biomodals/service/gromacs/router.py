@@ -204,6 +204,7 @@ def create_router(
     adapter: GromacsAdapter,
     *,
     lifecycle_locks: JobLifecycleLocks,
+    job_logs_supported: bool,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
     """Create the GROMACS router around an injectable compute adapter."""
@@ -336,7 +337,16 @@ def create_router(
                 operation.partition(":")[0],
                 request_id_from(request),
             )
-        return JobView.from_record(job)
+        return JobView.from_record(
+            job,
+            can_view_logs=(
+                job_logs_supported
+                and (
+                    session.principal.is_admin
+                    or configuration.workload("gromacs").job_logs_visible_to_owner.value
+                )
+            ),
+        )
 
     return router
 
@@ -374,6 +384,7 @@ def create_registration(
         router=create_router(
             adapter,
             lifecycle_locks=lifecycle_locks,
+            job_logs_supported=open_operation_logs is not None,
             max_pdb_bytes=max_pdb_bytes,
         ),
         lifecycle_locks=lifecycle_locks,

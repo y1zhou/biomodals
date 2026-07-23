@@ -1,4 +1,4 @@
-"""Administrator-only inspection of retained Job operation logs."""
+"""Authorized inspection of retained Job operation logs."""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.types import Receive, Scope, Send
 
-from biomodals.service.admin_api import AdminForbiddenResponse, require_admin
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
     request_id_from,
+    require_session,
 )
 from biomodals.service.jobs import (
     OperationLogMode,
@@ -35,7 +35,7 @@ from biomodals.service.store import (
 
 LOGGER = logging.getLogger(__name__)
 _MAX_LOG_WINDOW = timedelta(minutes=15)
-AdminJobLogTargetState = Literal[
+JobLogTargetState = Literal[
     "running",
     "state_unknown",
     "completed",
@@ -83,41 +83,47 @@ class _ClosingStreamingResponse(StreamingResponse):
                 await self.body_iterator.aclose()
 
 
-class AdminJobLogTargetView(BaseModel):
-    """One provider operation whose logs an Administrator may inspect."""
+class JobLogTargetView(BaseModel):
+    """One provider operation whose logs the caller may inspect."""
 
     model_config = ConfigDict(frozen=True)
 
     stage_code: str
     function_name: str
-    state: AdminJobLogTargetState
+    state: JobLogTargetState
     mode: OperationLogMode
     started_at: datetime
     ended_at: datetime | None
 
 
-class AdminJobLogTargetsView(BaseModel):
+class JobLogTargetsView(BaseModel):
     """Safe selectors for a Job's currently inspectable provider calls."""
 
     model_config = ConfigDict(frozen=True)
 
     job_id: UUID
-    targets: list[AdminJobLogTargetView]
+    targets: list[JobLogTargetView]
 
 
-class AdminJobLogTargetUnavailableResponse(CodedErrorResponse):
+class JobLogTargetUnavailableResponse(CodedErrorResponse):
     """The selected stage does not identify a retained provider call."""
 
     code: Literal["job_log_target_unavailable"]
 
 
-class AdminJobLogsUnavailableResponse(CodedErrorResponse):
+class JobLogsUnavailableResponse(CodedErrorResponse):
     """The workload cannot start a provider log stream."""
 
     code: Literal["job_logs_unavailable"]
 
 
-class AdminJobLogWindowInvalidResponse(CodedErrorResponse):
+class JobLogsForbiddenResponse(CodedErrorResponse):
+    """The authenticated Job owner may not inspect this Tool's logs."""
+
+    code: Literal["job_logs_forbidden"]
+
+
+class JobLogWindowInvalidResponse(CodedErrorResponse):
     """The requested historical window is incomplete or too large."""
 
     code: Literal["job_log_window_invalid"]
@@ -130,10 +136,10 @@ def _not_found() -> HTTPException:
 def _log_targets(
     job: JobRecord,
     registration: WorkloadRegistration | None,
-) -> list[tuple[AdminJobLogTargetView, JobOperationRecord]]:
+) -> list[tuple[JobLogTargetView, JobOperationRecord]]:
     if registration is None or registration.open_operation_logs is None:
         return []
-    targets: list[tuple[AdminJobLogTargetView, JobOperationRecord]] = []
+    targets: list[tuple[JobLogTargetView, JobOperationRecord]] = []
     for operation in job.operations:
         stage = registration.definition.stage(operation.operation)
         mode = operation_log_mode(operation.state)
@@ -147,10 +153,10 @@ def _log_targets(
         ):
             continue
         targets.append((
-            AdminJobLogTargetView(
+            JobLogTargetView(
                 stage_code=stage.code,
                 function_name=stage.function_name,
-                state=cast(AdminJobLogTargetState, operation.state.value),
+                state=cast(JobLogTargetState, operation.state.value),
                 mode=mode,
                 started_at=datetime.fromtimestamp(operation.started_at, UTC),
                 ended_at=(
@@ -165,7 +171,7 @@ def _log_targets(
 
 
 def _operation_log_request(
-    target: AdminJobLogTargetView,
+    target: JobLogTargetView,
     *,
     since: datetime | None,
     until: datetime | None,
@@ -258,33 +264,59 @@ async def _redact_provider_call_id(
             await iterator.aclose()
 
 
-def create_admin_jobs_router() -> APIRouter:
-    """Create Administrator-only Job diagnostics routes."""
-    router = APIRouter(prefix="/api/v1/admin/jobs", tags=["admin"])
+def create_job_logs_router() -> APIRouter:
+    """Create owner- and Administrator-authorized Job log routes."""
+    router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
     read_responses: dict[int | str, dict[str, Any]] = {
         401: {"model": ErrorResponse},
-        403: {"model": AdminForbiddenResponse},
+        403: {"model": JobLogsForbiddenResponse},
         404: {"model": ErrorResponse},
     }
 
-    @router.get(
-        "/{job_id}/log-targets",
-        response_model=AdminJobLogTargetsView,
-        responses=read_responses,
-    )
-    async def job_log_targets(
+    def authorized_job(
         request: Request,
         job_id: UUID,
-        _session: Annotated[AuthenticatedSession, Depends(require_admin)],
-    ) -> AdminJobLogTargetsView:
+        session: AuthenticatedSession,
+    ) -> JobRecord:
         store: ServiceStore = request.app.state.store
-        job = store.get_job_by_id(job_id)
+        job = (
+            store.get_job_by_id(job_id)
+            if session.principal.is_admin
+            else store.get_job(session.principal.user_id, job_id)
+        )
         if job is None:
             raise _not_found()
         registration: WorkloadRegistration | None = request.app.state.workloads.get(
             job.workload
         )
-        return AdminJobLogTargetsView(
+        if not session.principal.is_admin and (
+            registration is None
+            or not request.app.state.configuration.workload(
+                job.workload
+            ).job_logs_visible_to_owner.value
+        ):
+            raise CodedAPIError(
+                403,
+                "job_logs_forbidden",
+                "Job logs are available only to administrators for this Tool",
+            )
+        return job
+
+    @router.get(
+        "/{job_id}/log-targets",
+        response_model=JobLogTargetsView,
+        responses=read_responses,
+    )
+    async def job_log_targets(
+        request: Request,
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> JobLogTargetsView:
+        job = authorized_job(request, job_id, session)
+        registration: WorkloadRegistration | None = request.app.state.workloads.get(
+            job.workload
+        )
+        return JobLogTargetsView(
             job_id=job.job_id,
             targets=[target for target, _operation in _log_targets(job, registration)],
         )
@@ -299,23 +331,20 @@ def create_admin_jobs_router() -> APIRouter:
                 "content": {"text/plain": {"schema": {"type": "string"}}},
             },
             **read_responses,
-            409: {"model": AdminJobLogTargetUnavailableResponse},
-            400: {"model": AdminJobLogWindowInvalidResponse},
-            503: {"model": AdminJobLogsUnavailableResponse},
+            409: {"model": JobLogTargetUnavailableResponse},
+            400: {"model": JobLogWindowInvalidResponse},
+            503: {"model": JobLogsUnavailableResponse},
         },
     )
     async def stream_job_logs(
         request: Request,
         job_id: UUID,
-        _session: Annotated[AuthenticatedSession, Depends(require_admin)],
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
         stage: Annotated[str, Query(min_length=1, max_length=120)],
         since: Annotated[datetime | None, Query()] = None,
         until: Annotated[datetime | None, Query()] = None,
     ) -> StreamingResponse:
-        store: ServiceStore = request.app.state.store
-        job = store.get_job_by_id(job_id)
-        if job is None:
-            raise _not_found()
+        job = authorized_job(request, job_id, session)
         registration: WorkloadRegistration | None = request.app.state.workloads.get(
             job.workload
         )

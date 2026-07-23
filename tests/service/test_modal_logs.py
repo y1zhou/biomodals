@@ -12,7 +12,7 @@ from typing import Any, cast
 import pytest
 from starlette.requests import ClientDisconnect
 
-from biomodals.service.admin_jobs_api import (
+from biomodals.service.job_logs_api import (
     _ClosingStreamingResponse,
     _redact_provider_call_id,
 )

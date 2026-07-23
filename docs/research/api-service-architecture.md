@@ -106,7 +106,7 @@ src/biomodals/service/
   auth_api.py        browser authentication contract and routes
   jobs_api.py        provider-neutral Job and Result routes
   admin_api.py       User, Modal and storage administration routes
-  admin_jobs_api.py  admin-only Stage log diagnostics
+  job_logs_api.py    authorized Stage log diagnostics
   config.py          host configuration
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
@@ -360,9 +360,12 @@ cancel callback; it must not reproduce these cost-sensitive transitions in its
 route handler.
 
 Modal's supported CLI can filter App logs by one Function Call ID. Each workload
-may therefore register an optional operation-log opener. For GROMACS, the
-admin-only Job diagnostics routes map a selected Stage back to its durable
-operation. Running and `state_unknown` operations use
+may therefore register an optional operation-log opener and an
+Administrator-overridable default for Job-owner visibility. GROMACS opts owners
+in by default; future workloads remain Administrator-only until reviewed. The
+shared Job log routes enforce ownership and the live Tool policy before mapping
+a selected Stage back to its durable operation. Running and `state_unknown`
+operations use
 `modal app logs --follow --function-call --timestamps`; completed, failed, and
 cancelled operations omit follow mode and use the operation's recorded time
 range with `--since` and `--until`. Both forms use the Job's captured App and

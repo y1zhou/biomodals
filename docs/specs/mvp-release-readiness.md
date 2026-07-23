@@ -379,12 +379,24 @@ only after every known remote call is inactive. If the service cannot confirm a
 sibling's state while stopping it, the Job becomes `state_unknown` and keeps its
 admission capacity until an Administrator resolves it.
 
-### Administrator Job logs
+### Tool-configured Job logs
 
-An enabled Administrator can expand any started remote Stage directly inside
-the Execution stages table. Every row is collapsed by default and only one row
-is expanded at a time. Ordinary Users see the same stage table without log-row
-interactivity and cannot use the diagnostic endpoints.
+Each executable Tool declares whether its Job Logs are safe for authenticated
+Job owners by default. GROMACS defaults to owner-visible logs. New Tools default
+to Administrator-only logs until their provider output has been reviewed. The
+per-Tool `job_logs_visible_to_owner` Runtime Setting may override that default
+in SQLite without changing existing Job state. Administrators always retain
+access. The setting is evaluated for each new log request; it is not captured
+in the Job's Modal Configuration Snapshot.
+
+An authorized viewer can expand any started remote Stage directly inside the
+Execution stages table. Every row is collapsed by default and only one row is
+expanded at a time. The Job response's backend-computed `can_view_logs` field
+controls row interactivity. A non-Administrator can access logs only for a Job
+they own and only while that Tool permits owner access. An unrelated User gets
+the ordinary Job-not-found response, while an owner disallowed by Tool policy
+gets typed `403 job_logs_forbidden` from the log routes. Frontend state never
+grants access by itself.
 
 The target response contains Job ID, Stage code, Running Function, operation
 state, live-or-historical mode, start time, and nullable end time. It never
@@ -407,7 +419,7 @@ limited to 15 minutes, and clamped to the durable operation lifetime. Omitting
 the parameters keeps the complete terminal fetch and active follow behavior.
 
 The browser initially requests the newest 10-minute terminal window and loads
-older windows when the Administrator scrolls to the top. Each successful
+older windows when the viewer scrolls to the top. Each successful
 window remains in TanStack Query for the current page, so collapsing and
 reopening a terminal row refreshes only the small target selector and does not
 contact Modal for the same log windows again. Refreshing the browser page
@@ -419,7 +431,7 @@ are separated from monospace messages. ANSI SGR colors and decorations become
 structured React spans; no provider text is inserted as HTML. Copy and Download
 retain the raw text and use `<current-timestamp>_<tool>_<stage>.log`. While
 older windows remain unloaded, both controls say that they operate on loaded
-logs only. Active streams keep a 500,000-character tail until the Administrator
+logs only. Active streams keep a 500,000-character tail until the viewer
 loads earlier history; at that point the viewer pins the live tail and fetches
 older 10-minute windows without dropping subsequent output. Empty and failed
 fetches display diagnostic guidance instead of silently presenting a blank row.
@@ -432,7 +444,7 @@ invocation without a separate logs-version argument. Deleting and recreating an
 App under the same name can make an in-flight Job's diagnostic logs unavailable,
 but cannot redefine the Job lifecycle or justify resubmission.
 
-Provider logs are fallible Administrator diagnostics. They do not determine or
+Provider logs are fallible diagnostics. They do not determine or
 advance Job Status, Stage History, Progress, Cancellation, or Result validity,
 and an empty or interrupted stream does not imply that remote work stopped.
 
@@ -448,7 +460,9 @@ changes Job Status.
 
 Each executable API workload has one fixed descriptor owning its stable key,
 User-facing Tool name, Runtime Setting environment-variable names, and mapping
-from durable operations to public timeline stages. Runtime configuration,
+from durable operations to public timeline stages. The descriptor also owns the
+safe default for Job-owner log visibility; missing or future descriptors default
+to Administrator-only access. Runtime configuration,
 Admin Tool rows, routing registration, and Job views consume that descriptor
 instead of carrying separate GROMACS name and stage tables. The descriptor does
 not make scientific orchestration generic: GROMACS keeps its own adapter,
@@ -791,8 +805,9 @@ fields, per-operation frontend-handled error codes, authentication requirements,
 CSRF headers, relevant response headers, and binary and byte-range Result
 downloads. This includes the `blocked` Job contract and the Admin Modal
 preflight and Storage contracts, plus `state_unknown`, its safe timestamp and
-reason fields, the Admin resolution operation, and the admin-only log-target and
-plain-text stream operations. Protected operations declare the runtime
+reason fields, the Admin resolution operation, and the owner-and-Administrator-
+authorized log-target and plain-text stream operations. Protected operations
+declare the runtime
 session-cookie security scheme. The Password Link's
 `/set-password#token=...` SPA URL remains a tested cross-repository navigation
 contract rather than an OpenAPI operation.

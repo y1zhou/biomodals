@@ -31,6 +31,7 @@ from biomodals.service.http_contract import (
     require_unsafe_session,
 )
 from biomodals.service.jobs import JobPageView, JobView, WorkloadRegistration
+from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobCursorError,
     JobNotCancellableError,
@@ -203,10 +204,23 @@ def create_jobs_router(
     *,
     store: ServiceStore,
     workloads: Mapping[str, WorkloadRegistration],
+    configuration: RuntimeConfiguration,
     cache: ArtifactCache | None,
 ) -> APIRouter:
     """Create shared Job routes over registered workload capabilities."""
     router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
+
+    def job_view(job: JobRecord, session: AuthenticatedSession) -> JobView:
+        registration = workloads.get(job.workload)
+        can_view_logs = bool(
+            registration is not None
+            and registration.open_operation_logs is not None
+            and (
+                session.principal.is_admin
+                or configuration.workload(job.workload).job_logs_visible_to_owner.value
+            )
+        )
+        return JobView.from_record(job, can_view_logs=can_view_logs)
 
     @router.get(
         "",
@@ -230,7 +244,7 @@ def create_jobs_router(
         except JobCursorError as exc:
             raise HTTPException(400, str(exc)) from exc
         return JobPageView(
-            jobs=[JobView.from_record(job) for job in page.jobs],
+            jobs=[job_view(job, session) for job in page.jobs],
             next_cursor=page.next_cursor,
         )
 
@@ -250,7 +264,7 @@ def create_jobs_router(
         job = store.get_job(session.principal.user_id, job_id)
         if job is None:
             raise _not_found()
-        return JobView.from_record(job)
+        return job_view(job, session)
 
     @router.post(
         "/{job_id}/cancel",
@@ -313,7 +327,7 @@ def create_jobs_router(
                     job.job_id,
                     request_id_from(request),
                 )
-        return JobView.from_record(job)
+        return job_view(job, session)
 
     async def prepare_cached_artifact(job: JobRecord, *, request_id: str) -> None:
         if (

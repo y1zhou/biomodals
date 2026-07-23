@@ -36,7 +36,7 @@ _UNCHANGED = _Unchanged()
 
 
 @dataclass(frozen=True, slots=True)
-class EffectiveSetting[Value: (str, int)]:
+class EffectiveSetting[Value: (str, int, bool)]:
     """One effective value plus enough provenance for an honest Admin UI."""
 
     value: Value
@@ -52,6 +52,7 @@ class WorkloadRuntimeConfiguration:
     modal_app_name: EffectiveSetting[str]
     modal_app_version: EffectiveSetting[int]
     active_job_limit: EffectiveSetting[int]
+    job_logs_visible_to_owner: EffectiveSetting[bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +95,7 @@ class _WorkloadDefaults:
     modal_app_name: str
     modal_app_version: int
     active_job_limit: int
+    job_logs_visible_to_owner: bool
 
 
 class RuntimeConfiguration:
@@ -111,6 +113,9 @@ class RuntimeConfiguration:
                 modal_app_name=settings.gromacs_app_name,
                 modal_app_version=settings.gromacs_app_version,
                 active_job_limit=settings.gromacs_active_limit,
+                job_logs_visible_to_owner=(
+                    GROMACS_WORKLOAD.job_logs_visible_to_owner_default
+                ),
             )
         }
 
@@ -191,6 +196,12 @@ class RuntimeConfiguration:
                 ),
                 default=defaults.active_job_limit,
             ),
+            job_logs_visible_to_owner=self._workload_boolean_setting(
+                database_value=(
+                    stored.job_logs_visible_to_owner if stored is not None else None
+                ),
+                default=defaults.job_logs_visible_to_owner,
+            ),
         )
 
     def admission_configuration(self, workload: str) -> JobAdmissionConfiguration:
@@ -262,10 +273,11 @@ class RuntimeConfiguration:
         modal_app_name: str | None | _Unchanged = _UNCHANGED,
         modal_app_version: int | None | _Unchanged = _UNCHANGED,
         active_job_limit: int | None | _Unchanged = _UNCHANGED,
+        job_logs_visible_to_owner: bool | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Atomically update supplied settings for one fixed workload."""
         definition = self.workload_definition(workload)
-        updates: dict[str, str | int | None] = {}
+        updates: dict[str, str | int | bool | None] = {}
         if not isinstance(modal_app_name, _Unchanged):
             self._ensure_editable(definition.modal_app_name_environment)
             updates["modal_app_name"] = (
@@ -287,6 +299,8 @@ class RuntimeConfiguration:
                 if active_job_limit is None
                 else _nonnegative(active_job_limit, "Tool active job limit")
             )
+        if not isinstance(job_logs_visible_to_owner, _Unchanged):
+            updates["job_logs_visible_to_owner"] = job_logs_visible_to_owner
         self.store.set_workload_configuration(workload, updates)
 
     def _text_setting(
@@ -350,6 +364,17 @@ class RuntimeConfiguration:
             default,
             _parse_positive,
         )
+
+    def _workload_boolean_setting(
+        self,
+        *,
+        database_value: bool | None,
+        default: bool,
+    ) -> EffectiveSetting[bool]:
+        """Resolve a database-editable boolean over its Tool-owned default."""
+        if database_value is not None:
+            return EffectiveSetting(database_value, "database", True)
+        return EffectiveSetting(default, "default", True)
 
     def _setting[Value: (str, int)](
         self,

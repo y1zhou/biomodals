@@ -122,7 +122,7 @@ TERMINAL_JOB_STATES = (
 )
 RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 1
+_SERVICE_SCHEMA_VERSION = 2
 _RESULT_PACKAGING_OPERATION = "result_packaging"
 _JOB_OPERATIONS_TABLE_SQL = """
 CREATE TABLE job_operations (
@@ -334,6 +334,7 @@ class WorkloadConfigurationRecord:
     modal_app_name: str | None
     modal_app_version: int | None
     active_job_limit: int | None
+    job_logs_visible_to_owner: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,9 +489,14 @@ class ServiceStore:
                             CHECK (
                                 modal_app_version IS NULL
                                 OR modal_app_version >= 1
-                            ),
+                        ),
                         active_job_limit INTEGER
-                            CHECK (active_job_limit IS NULL OR active_job_limit >= 0)
+                            CHECK (active_job_limit IS NULL OR active_job_limit >= 0),
+                        job_logs_visible_to_owner INTEGER
+                            CHECK (
+                                job_logs_visible_to_owner IS NULL
+                                OR job_logs_visible_to_owner IN (0, 1)
+                            )
                     );
 
                     PRAGMA user_version = {_SERVICE_SCHEMA_VERSION};
@@ -1104,12 +1110,17 @@ class ServiceStore:
             modal_app_name=row["modal_app_name"],
             modal_app_version=row["modal_app_version"],
             active_job_limit=row["active_job_limit"],
+            job_logs_visible_to_owner=(
+                bool(row["job_logs_visible_to_owner"])
+                if row["job_logs_visible_to_owner"] is not None
+                else None
+            ),
         )
 
     def set_workload_configuration(
         self,
         workload: str,
-        settings: dict[str, str | int | None],
+        settings: dict[str, str | int | bool | None],
     ) -> None:
         """Create, update, or remove supplied workload overrides atomically."""
         if not workload:
@@ -1118,12 +1129,14 @@ class ServiceStore:
             "modal_app_name",
             "modal_app_version",
             "active_job_limit",
+            "job_logs_visible_to_owner",
         }
         if unknown:
             raise ValueError(f"Unknown workload settings: {', '.join(sorted(unknown))}")
         modal_app_name = settings.get("modal_app_name")
         modal_app_version = settings.get("modal_app_version")
         active_job_limit = settings.get("active_job_limit")
+        job_logs_visible_to_owner = settings.get("job_logs_visible_to_owner")
         if modal_app_name is not None and (
             not isinstance(modal_app_name, str) or not modal_app_name
         ):
@@ -1136,6 +1149,11 @@ class ServiceStore:
             type(active_job_limit) is not int or active_job_limit < 0
         ):
             raise ValueError("active_job_limit must be non-negative")
+        if (
+            job_logs_visible_to_owner is not None
+            and type(job_logs_visible_to_owner) is not bool
+        ):
+            raise ValueError("job_logs_visible_to_owner must be boolean")
         if not settings:
             return
         with self._transaction() as conn:
@@ -1158,10 +1176,18 @@ class ServiceStore:
                 if row is not None and "active_job_limit" not in settings
                 else active_job_limit
             )
+            next_job_logs_visible_to_owner = (
+                bool(row["job_logs_visible_to_owner"])
+                if row is not None
+                and "job_logs_visible_to_owner" not in settings
+                and row["job_logs_visible_to_owner"] is not None
+                else job_logs_visible_to_owner
+            )
             if (
                 next_modal_app_name is None
                 and next_modal_app_version is None
                 and next_active_job_limit is None
+                and next_job_logs_visible_to_owner is None
             ):
                 conn.execute(
                     "DELETE FROM workload_settings WHERE workload = ?",
@@ -1172,18 +1198,21 @@ class ServiceStore:
                     """
                     INSERT INTO workload_settings (
                         workload, modal_app_name, modal_app_version,
-                        active_job_limit
-                    ) VALUES (?, ?, ?, ?)
+                        active_job_limit, job_logs_visible_to_owner
+                    ) VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(workload) DO UPDATE SET
                         modal_app_name = excluded.modal_app_name,
                         modal_app_version = excluded.modal_app_version,
-                        active_job_limit = excluded.active_job_limit
+                        active_job_limit = excluded.active_job_limit,
+                        job_logs_visible_to_owner =
+                            excluded.job_logs_visible_to_owner
                     """,
                     (
                         workload,
                         next_modal_app_name,
                         next_modal_app_version,
                         next_active_job_limit,
+                        next_job_logs_visible_to_owner,
                     ),
                 )
 

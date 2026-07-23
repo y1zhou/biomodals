@@ -201,6 +201,14 @@ class IntegerSettingView(BaseModel):
     editable: bool
 
 
+class BooleanSettingView(BaseModel):
+    """One effective boolean setting and its controlling source."""
+
+    value: bool
+    source: SettingSource
+    editable: bool
+
+
 class AdminModalEnvironmentView(BaseModel):
     """Service-user identity and cross-Tool Modal settings."""
 
@@ -218,6 +226,7 @@ class AdminModalToolView(BaseModel):
     modal_app_version: IntegerSettingView
     active_jobs: int
     active_job_limit: IntegerSettingView
+    job_logs_visible_to_owner: BooleanSettingView
 
 
 class AdminStateUnknownJobView(BaseModel):
@@ -309,6 +318,14 @@ class UpdateAdminModalToolRequest(BaseModel):
         ge=0,
         description="Omit to keep unchanged; null restores the configured default.",
     )
+    job_logs_visible_to_owner: bool | None = Field(
+        default=None,
+        description=(
+            "Whether authenticated Job owners may inspect provider logs. "
+            "Administrators always retain access. Omit to keep unchanged; "
+            "null restores the Tool default."
+        ),
+    )
 
 
 async def require_admin(
@@ -349,6 +366,14 @@ def _integer_view(setting: EffectiveSetting[int]) -> IntegerSettingView:
     )
 
 
+def _boolean_view(setting: EffectiveSetting[bool]) -> BooleanSettingView:
+    return BooleanSettingView(
+        value=setting.value,
+        source=setting.source,
+        editable=setting.editable,
+    )
+
+
 def _modal_view(
     configuration: RuntimeConfiguration,
     store: ServiceStore,
@@ -371,6 +396,9 @@ def _modal_view(
                 modal_app_version=_integer_view(workload.modal_app_version),
                 active_jobs=store.count_active_jobs(workload.workload),
                 active_job_limit=_integer_view(workload.active_job_limit),
+                job_logs_visible_to_owner=_boolean_view(
+                    workload.job_logs_visible_to_owner
+                ),
             )
             for workload in (
                 configuration.workload(name) for name in configuration.workload_names()

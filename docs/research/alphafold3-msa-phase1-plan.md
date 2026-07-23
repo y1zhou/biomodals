@@ -1,8 +1,10 @@
 # AlphaFold 3 small-BFD sharding benchmark plan
 
-Status: agreed implementation plan; no Modal jobs submitted
+Status: executed with an approved focused-sweep scope; production promotion pending
 Plan date: 2026-07-22
-Campaign: `small-bfd-phase1-v1`
+Results date: 2026-07-23
+Original campaign: `small-bfd-phase1-v1`
+Completed campaign: `small-bfd-phase1-v2`
 Implementation target: `src/biomodals/app/fold/alphafold3_msa_app.py`
 
 ## Outcome
@@ -21,7 +23,16 @@ The supporting research is in:
 
 - [AlphaFold 3 MSA database sharding](alphafold3-msa-sharding.md)
 - [AlphaFold 3 MSA storage scenarios](alphafold3-msa-storage-scenarios.md)
+- [Scientifically faithful MSA sharding](alphafold3-msa-scientific-sharding.md)
+- [Phase 1 benchmark results](alphafold3-msa-phase1-results.md)
 - [AlphaFold 3 performance guide](https://github.com/google-deepmind/alphafold3/blob/main/docs/performance.md)
+
+The original repeated matrix and GroEL stress phase below were not submitted.
+After the smoke gate passed, the user approved a smaller one-shot topology sweep
+to choose a production candidate without paying for repeated benchmark samples.
+The results document records the exact executed scope, durable evidence, and
+limitations; the remaining sections preserve the plan that guided the
+implementation.
 
 ## Hard boundaries
 

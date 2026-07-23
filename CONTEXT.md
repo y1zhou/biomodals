@@ -182,6 +182,10 @@ _Avoid_: complete run archive, global best prediction, worker output
 An atomic, generation-scoped coordination record granting one request ownership of computing one missing Seed Prediction. It is never evidence that the prediction completed; only the validated seed publication is authoritative.
 _Avoid_: seed completion marker, inference request, cache entry
 
+**Search Build Claim**:
+An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or Template Search Result. The corresponding validated cache publication, not the claim, is the reusable scientific evidence.
+_Avoid_: search identity, completion marker, database shard
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

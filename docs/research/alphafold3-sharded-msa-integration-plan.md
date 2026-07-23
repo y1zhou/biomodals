@@ -1,6 +1,6 @@
 # AlphaFold3 sharded-MSA production integration plan
 
-Status: proposed for final shared-understanding confirmation.
+Status: accepted.
 
 Scope: finish the sharding method in
 `src/biomodals/app/fold/alphafold3_msa_app.py`, validate it, then integrate the

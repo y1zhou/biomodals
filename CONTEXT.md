@@ -202,6 +202,10 @@ _Avoid_: seed completion marker, inference request, cache entry
 An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or Template Search Result. The corresponding validated cache publication, not the claim, is the reusable scientific evidence.
 _Avoid_: search identity, completion marker, database shard
 
+**MSA Worker Budget**:
+The request-wide maximum number of active sequence-by-database Modal search containers. It bounds operational fanout independently of the shard concurrency inside each container.
+_Avoid_: shard count, HMMER thread count, number of input chains
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

@@ -255,7 +255,7 @@ An Inference Request for which at least one normalized requested seed has a Seed
 _Avoid_: failed seed prediction, completed request, empty run
 
 **Request Retrieval Archive**:
-A local `.tar.zst` materialization of one Inference Request Result, assembled by downloading only its manifest-declared canonical artifacts. It is a caller convenience rather than a durable output-Volume publication.
+A local `.tar.zst` materialization of one Inference Request Result, assembled by downloading only its manifest-declared canonical artifacts. Its filename combines the Presentation Output Name with a request-ID prefix so different seed sets cannot collide.
 _Avoid_: inference request result, global run archive, remote function payload
 
 **Seed Build Claim**:

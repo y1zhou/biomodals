@@ -80,11 +80,12 @@ domZ are the validated source sequence count. RNA Z is the validated total
 nucleotide count divided by 1,000,000.
 
 The completed `small-bfd-64-v1` benchmark profile remains available only until
-all seven production candidates and both scientific oracles pass.
+all seven production candidates pass their profile validation.
 `small-bfd-64-v2` is a new production candidate because its published payload
 omits the monolithic source and its shuffled FASTA stays under `/tmp`. After
 validation, remove the v1 profile and abandoned staging generations so
 `/profiles/` contains exactly the seven fixed profile directories listed above.
+Run the protein and RNA scientific oracles only after that cleanup barrier.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never

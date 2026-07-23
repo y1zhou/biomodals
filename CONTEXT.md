@@ -170,6 +170,14 @@ _Avoid_: seed prediction, canonical output tree, local scratch directory
 The single finalized set of upstream-style top-level data, ranking, and best-prediction files derived from the accumulated union of every validated Seed Prediction beneath one AlphaFold Run Root.
 _Avoid_: worker-local ranking, seed sample directory, completion marker
 
+**Inference Request**:
+One invocation's requested model-seed set against an Inference Run Identity. It may reuse existing Seed Predictions and compute missing ones without changing the shared run identity.
+_Avoid_: inference run identity, GPU worker assignment, newly computed seeds only
+
+**Inference Request Result**:
+The return view restricted to one Inference Request: all requested Seed Predictions, a requested-seed ranking and best prediction, and a manifest distinguishing reused from newly computed seeds while referencing the accumulated run summary.
+_Avoid_: complete run archive, global best prediction, worker output
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

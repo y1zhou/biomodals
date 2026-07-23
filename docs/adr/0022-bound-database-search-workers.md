@@ -1,6 +1,6 @@
 # Bound database search workers
 
-Status: accepted.
+Status: superseded by ADR 0028.
 
 The production AlphaFold3 entrypoint replaces `search_chains_in_parallel` and
 `max_parallel_data_pipelines` with `max_parallel_msa_workers`, defaulting to 4.

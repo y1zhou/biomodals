@@ -226,6 +226,10 @@ _Avoid_: inference request result, global run archive, remote function payload
 An atomic, generation-scoped coordination record granting one request ownership of computing one missing Seed Prediction. It is never evidence that the prediction completed; only the validated seed publication is authoritative.
 _Avoid_: seed completion marker, inference request, cache entry
 
+**Summary Build Claim**:
+An atomic, generation-scoped coordination record granting one finalizer ownership of rebuilding the mutable Inference Run Summary. It serializes publication but never proves which seeds the current summary contains.
+_Avoid_: seed build claim, run-summary marker, inference request
+
 **Search Build Claim**:
 An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or publishing one sequence-root combined-MSA or template result. Claims follow the exclusive output path they protect; the validated publication, not the claim, is the reusable scientific evidence.
 _Avoid_: search identity, completion marker, database shard

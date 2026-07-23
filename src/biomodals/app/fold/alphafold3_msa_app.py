@@ -85,6 +85,7 @@ JACKHMMER_MAX_SEQUENCES = 5_000
 JACKHMMER_FILTER_F1 = 5e-4
 JACKHMMER_FILTER_F2 = 5e-5
 JACKHMMER_FILTER_F3 = 5e-7
+SCIENTIFIC_COMPARISON_POLICY = "top-target-order-exact-modulo-evalue-bit-score-ties-v2"
 RESOURCE_TRACE_INTERVAL_SECONDS = 1.0
 MODAL_CPU_USD_PER_CORE_SECOND = 0.0000131
 MODAL_MEMORY_USD_PER_GIB_SECOND = 0.00000222
@@ -3154,6 +3155,34 @@ def _unique_hit_rows(
     return unique_rows
 
 
+def _top_hits_tie_equivalent(
+    oracle_rows: list[dict[str, object]],
+    candidate_rows: list[dict[str, object]],
+) -> bool:
+    """Compare ranked hits while ignoring order inside exact score ties."""
+    if len(oracle_rows) != len(candidate_rows):
+        return False
+
+    def tie_blocks(
+        rows: list[dict[str, object]],
+    ) -> list[tuple[tuple[str, str], tuple[str, ...]]]:
+        blocks: list[tuple[tuple[str, str], tuple[str, ...]]] = []
+        current_key: tuple[str, str] | None = None
+        current_ids: list[str] = []
+        for row in rows:
+            key = (str(row["e_value_text"]), str(row["bit_score_text"]))
+            if current_key is not None and key != current_key:
+                blocks.append((current_key, tuple(sorted(current_ids))))
+                current_ids = []
+            current_key = key
+            current_ids.append(str(row["target_id"]))
+        if current_key is not None:
+            blocks.append((current_key, tuple(sorted(current_ids))))
+        return blocks
+
+    return tie_blocks(oracle_rows) == tie_blocks(candidate_rows)
+
+
 def _compare_normalized_hits(
     oracle_rows: list[dict[str, object]],
     candidate_rows: list[dict[str, object]],
@@ -3167,6 +3196,10 @@ def _compare_normalized_hits(
     top_oracle = oracle_ids[:top_width]
     top_candidate = candidate_ids[:top_width]
     top_hits_exact = top_oracle == top_candidate
+    top_hits_tie_equivalent = _top_hits_tie_equivalent(
+        oracle_unique[:top_width],
+        candidate_unique[:top_width],
+    )
 
     oracle_by_id = {str(row["target_id"]): row for row in oracle_unique}
     candidate_by_id = {str(row["target_id"]): row for row in candidate_unique}
@@ -3239,16 +3272,21 @@ def _compare_normalized_hits(
         and oracle_only_is_displaced_tail
     )
     passed = (
-        top_hits_exact
+        top_hits_tie_equivalent
         and not score_mismatches
         and not sequence_mismatches
         and overlap >= 0.99
         and differences_characterized
     )
     return {
+        "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
         "passed": passed,
         "top_comparison_width": top_width,
         "top_hits_exact": top_hits_exact,
+        "top_hits_tie_equivalent": top_hits_tie_equivalent,
+        "top_order_differs_only_within_ties": (
+            top_hits_tie_equivalent and not top_hits_exact
+        ),
         "oracle_top_ids": top_oracle,
         "candidate_top_ids": top_candidate,
         "oracle_unique_hits": len(oracle_ids),
@@ -3373,7 +3411,10 @@ def _smoke_summary_markdown(
         "B1 is the explicit-Z oracle. B0 is descriptive only; S3 is the "
         "required sharded scientific gate.",
         "",
+        f"Scientific comparison policy: {SCIENTIFIC_COMPARISON_POLICY}",
         f"S3/B1 top hits exact: {comparisons['S3_vs_B1']['top_hits_exact']}",
+        "S3/B1 top hits equivalent modulo exact score ties: "
+        f"{comparisons['S3_vs_B1']['top_hits_tie_equivalent']}",
         f"S3/B1 full unique-hit Jaccard: {float(jaccard):.6f}",
         "",
     ])
@@ -3389,6 +3430,7 @@ def _smoke_operation_identity(
         _json_bytes({
             "schema_version": 1,
             "campaign_id": CAMPAIGN_ID,
+            "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
             "profile_manifest_sha256": manifest_sha256,
             "plan": _build_search_plan("smoke"),
             "sample_identities": sample_identities,
@@ -3531,6 +3573,7 @@ def _submit_search_smoke() -> dict[str, object]:
         "operation": "search",
         "mode": "smoke",
         "operation_identity": operation_identity,
+        "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
         "profile_manifest_sha256": manifest_sha256,
         "scientific_gate_passed": scientific_gate_passed,
         "oracle_case": "B1",
@@ -3602,6 +3645,7 @@ def _matrix_operation_identity(manifest_sha256: str) -> str:
         _json_bytes({
             "schema_version": 1,
             "campaign_id": CAMPAIGN_ID,
+            "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
             "profile_manifest_sha256": manifest_sha256,
             "plan": _build_search_plan("matrix"),
         })
@@ -4395,6 +4439,7 @@ def _submit_search_matrix() -> dict[str, object]:
         "schema_version": 1,
         "campaign_id": CAMPAIGN_ID,
         "operation_identity": operation_identity,
+        "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
         "status": rankings["status"],
         "sample_count": len(screening_results),
         "remote_function_inputs_submitted": submitted_inputs,
@@ -4418,6 +4463,7 @@ def _submit_search_matrix() -> dict[str, object]:
             "operation": "search",
             "mode": "matrix",
             "operation_identity": operation_identity,
+            "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
             "profile_manifest_sha256": manifest_sha256,
             "screening_samples": len(screening_results),
             "stress_samples": 0,
@@ -4446,6 +4492,7 @@ def _submit_search_matrix() -> dict[str, object]:
             "operation": "search",
             "mode": "matrix",
             "operation_identity": operation_identity,
+            "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
             "profile_manifest_sha256": manifest_sha256,
             "screening_samples": len(screening_results),
             "stress_samples": 0,
@@ -4501,6 +4548,7 @@ def _submit_search_matrix() -> dict[str, object]:
         "operation": "search",
         "mode": "matrix",
         "operation_identity": operation_identity,
+        "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
         "profile_manifest_sha256": manifest_sha256,
         "screening_samples": len(screening_results),
         "stress_samples": len(stress_results),

@@ -182,6 +182,10 @@ _Avoid_: raw input, model features, partially populated search fields
 Non-empty MSA or template data supplied for one request, either inline or materialized from a caller path. It may contribute to an Enriched AlphaFold Input but never becomes shared canonical search evidence.
 _Avoid_: raw database MSA, combined MSA publication, template search result
 
+**Staged Custom Template**:
+A caller-supplied mmCIF made remotely accessible at a content-addressed path beneath one AlphaFold Run Root. Its content digest and residue mappings define biological identity; its original and staged paths do not.
+_Avoid_: template search result, local template path, shared template cache
+
 **Search Field Resolution**:
 The request-scoped selection or generation of each MSA and template field independently. A populated field neither authorizes its replacement nor implies that a missing sibling field is resolved.
 _Avoid_: chain-wide search, all-or-nothing data pipeline

@@ -10,6 +10,9 @@ path-backed: the helper uploads them with Modal Volume batch upload into
 `<run-root>/custom-templates/` and rewrites each path to its mounted remote
 location.
 
+Content-addressed template naming and run-identity ordering are refined by ADR
+0031.
+
 The AlphaFold3 output Volume is mounted at that same AlphaFold Run Root during
 inference. AlphaFold writes its output tree and logs below the run root and
 commits the Volume before reporting completion; the Volume copy is the durable

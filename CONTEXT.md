@@ -162,6 +162,14 @@ _Avoid_: sequence hash, model seed, display name
 The independently complete inference output for one model seed beneath an AlphaFold Run Root. Its diffusion samples use upstream's `seed-{seed}_sample-{sample_index}` directories; optional embeddings and distogram directories belong to the same Seed Prediction.
 _Avoid_: inference run identity, container part, combined top-level output
 
+**Inference Worker Staging**:
+An exclusive, temporary subtree on the AlphaFold3 output Volume where one GPU container lets upstream write results for its disjoint seed list without colliding with another container's shared files.
+_Avoid_: seed prediction, canonical output tree, local scratch directory
+
+**Inference Run Summary**:
+The single finalized set of upstream-style top-level data, ranking, and best-prediction files derived from validated Seed Predictions beneath one AlphaFold Run Root.
+_Avoid_: worker-local ranking, seed sample directory, completion marker
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

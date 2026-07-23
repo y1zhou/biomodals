@@ -159,7 +159,7 @@ The stable digest that groups predictions for one Enriched AlphaFold Input and o
 _Avoid_: sequence hash, model seed, display name
 
 **Seed Prediction**:
-The independently complete inference output for one model seed beneath an AlphaFold Run Root. Diffusion samples for that seed belong to the same Seed Prediction.
+The independently complete inference output for one model seed beneath an AlphaFold Run Root. Its diffusion samples use upstream's `seed-{seed}_sample-{sample_index}` directories; optional embeddings and distogram directories belong to the same Seed Prediction.
 _Avoid_: inference run identity, container part, combined top-level output
 
 **Search Identity**:

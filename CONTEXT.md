@@ -190,6 +190,10 @@ _Avoid_: template search result, local template path, shared template cache
 The request-scoped selection or generation of each MSA and template field independently. A populated field neither authorizes its replacement nor implies that a missing sibling field is resolved.
 _Avoid_: chain-wide search, all-or-nothing data pipeline
 
+**Partial Search Resolution**:
+A Search Field Resolution with reusable canonical database or template results but at least one required field still incomplete after a surfaced CPU-task failure. It cannot produce an Enriched AlphaFold Input.
+_Avoid_: empty search result, enriched input, failed request cache
+
 **AlphaFold Run Root**:
 The job-scoped directory on the AlphaFold3 output Volume that makes staged caller inputs available to remote functions and durably owns that job's inference outputs, logs, and completion state.
 _Avoid_: MSA cache root, database Volume, local download directory

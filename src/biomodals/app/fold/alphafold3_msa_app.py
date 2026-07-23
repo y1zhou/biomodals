@@ -19,8 +19,8 @@ written to ``AlphaFold3-MSA-Benchmark-outputs``.
 
 The production-candidate operations build seven fixed immutable profiles
 without copying their monolithic sources into the sharded Volume. They stage
-the shuffled FASTA and SeqKit index under ``/tmp`` and retain only shards,
-validation evidence, and a manifest-last publication.
+the shuffled FASTA under ``/tmp``, leave SeqKit's index beside the source, and
+retain only shards, validation evidence, and a manifest-last publication.
 """
 
 from __future__ import annotations

@@ -418,10 +418,17 @@ When the final deployed Function completes, the control plane atomically stores
 that persisted value rather than the time of an individual packaging attempt.
 Packaging can therefore be repeated safely for the same completed run because
 the member order, ZIP metadata, timestamps, and contents are deterministic for
-the recorded Job. Unchanged Volume outputs reproduce the same archive bytes,
-size, and SHA-256 digest. The single-worker control plane remains responsible
-for preventing ordinary concurrent publication. No API-specific registry or
-Function is added to the GROMACS App.
+the recorded Job. Archive schema version 4 encodes each selected Volume file's
+integer `FileEntry.mtime` exactly in the standard extended Unix
+modification-time field and also writes the nearest ZIP/DOS timestamp fallback.
+Service-generated `metadata/` members retain a fixed timestamp. Unchanged
+Volume contents and modification times therefore reproduce the same archive
+bytes, size, and SHA-256 digest. The Modal Volume API exposes no separate
+per-file `ctime`, and POSIX `ctime` cannot be restored when an extractor creates
+a new local inode; the destination filesystem necessarily assigns it. The
+single-worker control plane remains responsible for preventing ordinary
+concurrent publication. No API-specific registry or Function is added to the
+GROMACS App.
 
 The ZIP has exactly three top-level entries or namespaces:
 

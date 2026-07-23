@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import io
 import struct
+import time
 import zipfile
 import zlib
 
@@ -16,6 +17,7 @@ import pytest
 
 from biomodals.service.artifacts import ArtifactSourceMissingError
 from biomodals.service.gromacs.archive import (
+    GROMACS_ARCHIVE_SCHEMA_VERSION,
     BuiltGromacsArchive,
     validate_gromacs_archive,
     write_gromacs_archive,
@@ -86,6 +88,15 @@ def _remote_files() -> dict[str, bytes]:
     }
 
 
+def _mtime_for_files(remote_files: dict[str, bytes]):
+    def mtime_for_file(path: str) -> int:
+        if path not in remote_files:
+            raise FileNotFoundError(path)
+        return 1_700_000_000
+
+    return mtime_for_file
+
+
 def test_service_packages_established_remote_files_deterministically() -> None:
     prefix = f"production_{RUN_NAME}"
     remote_files = _remote_files()
@@ -113,6 +124,7 @@ def test_service_packages_established_remote_files_deterministically() -> None:
                 started_at=1,
                 completed_at=2,
                 read_file=read_file,
+                mtime_for_file=_mtime_for_files(remote_files),
             )
         )
         return output.getvalue(), result
@@ -137,6 +149,8 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         assert archive.read(f"outputs/rmsf_{prefix}.png") == PNG
         assert archive.read("metadata/parameters.json") == PARAMETERS.encode()
         provenance = orjson.loads(archive.read("metadata/provenance.json"))
+        assert provenance["archive_schema_version"] == 4
+        assert GROMACS_ARCHIVE_SCHEMA_VERSION == 4
         assert provenance["modal_app_version"] == 17
         assert provenance["software_version"] == "GROMACS 2026.1"
         assert {name.split("/", 1)[0] for name in archive.namelist()} == {
@@ -144,6 +158,58 @@ def test_service_packages_established_remote_files_deterministically() -> None:
             "outputs",
             "metadata",
         }
+
+
+def test_service_preserves_remote_file_modification_times() -> None:
+    prefix = f"production_{RUN_NAME}"
+    remote_files = _remote_files()
+    diagnostic_path = f"{RUN_NAME}/{prefix}.log"
+    remote_files[diagnostic_path] = b"production log\n"
+    remote_mtimes = {
+        path: 1_718_372_121 + index * 120 for index, path in enumerate(remote_files)
+    }
+
+    async def read_file(path: str):
+        try:
+            yield remote_files[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+
+    def mtime_for_file(path: str) -> int:
+        try:
+            return remote_mtimes[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+
+    output = io.BytesIO()
+    asyncio.run(
+        write_gromacs_archive(
+            output,
+            run_name=RUN_NAME,
+            parameters_json=PARAMETERS,
+            modal_app_name="Gromacs",
+            modal_app_version=17,
+            job_id="11111111-1111-4111-8111-111111111111",
+            stages_json="[]",
+            started_at=1,
+            completed_at=2,
+            read_file=read_file,
+            mtime_for_file=mtime_for_file,
+        )
+    )
+
+    expected = {
+        "input.pdb": remote_mtimes[f"{RUN_NAME}/{RUN_NAME}.pdb"],
+        f"outputs/{prefix}_nopbc.xtc": remote_mtimes[f"{RUN_NAME}/{prefix}_nopbc.xtc"],
+        f"metadata/gromacs/{prefix}.log": remote_mtimes[diagnostic_path],
+    }
+    with zipfile.ZipFile(output) as archive:
+        for name, mtime in expected.items():
+            info = archive.getinfo(name)
+            expected_dos_time = time.gmtime(mtime)[:6]
+            expected_dos_time = (*expected_dos_time[:5], expected_dos_time[5] // 2 * 2)
+            assert info.date_time == expected_dos_time
+            assert info.extra == struct.pack("<HHBI", 0x5455, 5, 1, mtime)
 
 
 @pytest.mark.parametrize(
@@ -215,6 +281,7 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
                 started_at=1,
                 completed_at=2,
                 read_file=read_file,
+                mtime_for_file=_mtime_for_files(remote_files),
             )
         )
 
@@ -250,6 +317,7 @@ def test_large_centered_structure_and_diagnostics_stream_without_a_size_cap() ->
             started_at=1,
             completed_at=2,
             read_file=read_file,
+            mtime_for_file=_mtime_for_files(remote_files),
         )
     )
 
@@ -286,5 +354,6 @@ def test_missing_required_remote_output_has_a_distinct_failure() -> None:
                 started_at=1,
                 completed_at=2,
                 read_file=read_file,
+                mtime_for_file=_mtime_for_files(remote_files),
             )
         )

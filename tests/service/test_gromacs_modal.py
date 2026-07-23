@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import io
 import struct
+import time
 import zipfile
 import zlib
 from contextlib import asynccontextmanager
@@ -71,6 +72,7 @@ XTC = struct.pack(
 )
 _TPR_VERSION = b"VERSION 2026.1"
 TPR = (struct.pack(">II", 15, len(_TPR_VERSION)) + _TPR_VERSION).ljust(1024, b"\0")
+_FIXTURE_MTIME = 1_700_000_000
 
 
 def _png_chunk(chunk_type: bytes, content: bytes) -> bytes:
@@ -242,7 +244,22 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in members.items():
-            archive.writestr(name, content)
+            if name == "input.pdb" or name.startswith("outputs/"):
+                source_time = time.gmtime(_FIXTURE_MTIME)[:6]
+                info = zipfile.ZipInfo(
+                    name,
+                    date_time=(*source_time[:5], source_time[5] // 2 * 2),
+                )
+                info.extra = struct.pack(
+                    "<HHBI",
+                    0x5455,
+                    5,
+                    1,
+                    _FIXTURE_MTIME,
+                )
+                archive.writestr(info, content)
+            else:
+                archive.writestr(name, content)
         archive.writestr("metadata/manifest.json", manifest)
         archive.writestr("metadata/checksums.sha256", checksums)
     request_digest = hashlib.sha256()
@@ -269,28 +286,51 @@ def _replace_archive_member(
     output = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as source:
         members = [
-            (info.filename, content if info.filename == name else source.read(info))
+            (info, content if info.filename == name else source.read(info))
             for info in source.infolist()
         ]
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for member_name, member_content in members:
-            archive.writestr(member_name, member_content)
+        for info, member_content in members:
+            archive.writestr(info, member_content)
     return output.getvalue()
 
 
 def _install_volume(
     monkeypatch: pytest.MonkeyPatch,
     files: dict[str, bytes],
+    *,
+    mtimes: dict[str, int] | None = None,
 ) -> None:
+    source_mtimes = (
+        mtimes if mtimes is not None else {path: 1_700_000_000 for path in files}
+    )
+
+    @dataclass(frozen=True)
+    class FakeFileEntry:
+        path: str
+        mtime: int
+
     class FakeVolume:
         def __init__(self) -> None:
             self.read_file = AsyncMethod(self._read_file)
+            self.listdir = AsyncMethod(self._listdir)
             self.batch_upload = AsyncMethod(self._batch_upload)
 
         async def _read_file(self, path: str):
             if path not in files:
                 raise FileNotFoundError(path)
             yield files[path]
+
+        async def _listdir(self, path: str):
+            if path in files:
+                return [FakeFileEntry(path, source_mtimes[path])]
+            prefix = f"{path.strip('/')}/"
+            return [
+                FakeFileEntry(file_path, source_mtimes[file_path])
+                for file_path in files
+                if file_path.startswith(prefix)
+                and "/" not in file_path.removeprefix(prefix)
+            ]
 
         @asynccontextmanager
         async def _batch_upload(self, *, force: bool):
@@ -849,7 +889,8 @@ def test_service_packages_and_publishes_established_app_outputs(
         operation="collect_traj_stats:production_",
     )
     files = _established_output_files()
-    _install_volume(monkeypatch, files)
+    mtimes = {path: 1_718_372_121 + index * 120 for index, path in enumerate(files)}
+    _install_volume(monkeypatch, files, mtimes=mtimes)
 
     archive = asyncio.run(_adapter({}).publish_archive(job, completed_at=10))
 
@@ -863,6 +904,14 @@ def test_service_packages_and_publishes_established_app_outputs(
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as result:
         assert result.read("input.pdb") == files[f"{RUN_NAME}/{RUN_NAME}.pdb"]
         assert result.read(f"outputs/production_{RUN_NAME}_nopbc.xtc") == XTC
+        input_mtime = mtimes[f"{RUN_NAME}/{RUN_NAME}.pdb"]
+        assert result.getinfo("input.pdb").extra == struct.pack(
+            "<HHBI",
+            0x5455,
+            5,
+            1,
+            input_mtime,
+        )
 
 
 def test_published_archive_is_promoted_into_the_local_cache(

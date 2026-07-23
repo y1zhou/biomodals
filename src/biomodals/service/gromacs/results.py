@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, cast
 
 import modal
@@ -261,6 +261,19 @@ class ModalGromacsResults:
             async for chunk in volume.read_file.aio(path):
                 yield chunk
 
+        remote_mtimes: dict[str, int] = {}
+        for entry in await volume.listdir.aio(job.run_name):
+            path = PurePosixPath(entry.path).as_posix().lstrip("/")
+            if path in remote_mtimes or type(entry.mtime) is not int:
+                raise GromacsResultInvalidError("GROMACS output metadata is invalid")
+            remote_mtimes[path] = entry.mtime
+
+        def mtime_for_file(path: str) -> int:
+            try:
+                return remote_mtimes[path]
+            except KeyError as exc:
+                raise FileNotFoundError(path) from exc
+
         stages = [
             stage.model_dump(mode="json")
             for stage in JobView.from_record(job).stage_history
@@ -283,6 +296,7 @@ class ModalGromacsResults:
                 started_at=job.created_at,
                 completed_at=completed_at,
                 read_file=read_file,
+                mtime_for_file=mtime_for_file,
                 run_bounded=(
                     self.artifact_cache.run_bounded
                     if self.artifact_cache is not None

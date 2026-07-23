@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import stat
 import struct
+import time
 import zipfile
 import zlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
@@ -24,6 +25,7 @@ _MAX_PDB_BYTES = 10 * 1024 * 1024
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 ReadRemoteFile = Callable[[str], AsyncIterable[bytes]]
+MtimeForRemoteFile = Callable[[str], int]
 _T = TypeVar("_T")
 
 
@@ -57,7 +59,7 @@ class BuiltGromacsArchive:
     sha256: str
 
 
-GROMACS_ARCHIVE_SCHEMA_VERSION = 3
+GROMACS_ARCHIVE_SCHEMA_VERSION = 4
 
 
 def _required_output_files(run_name: str) -> list[tuple[str, str]]:
@@ -349,11 +351,22 @@ def _member_digest(
     return size, digest.hexdigest()
 
 
-def _zip_info(name: str) -> zipfile.ZipInfo:
-    info = zipfile.ZipInfo(name, date_time=_ZIP_TIMESTAMP)
+def _zip_info(name: str, *, mtime: int | None = None) -> zipfile.ZipInfo:
+    if mtime is None:
+        date_time = _ZIP_TIMESTAMP
+    else:
+        if type(mtime) is not int or not 0 <= mtime <= 0xFFFFFFFF:
+            raise ValueError("Remote GROMACS file has an invalid modification time")
+        source_time = time.gmtime(mtime)[:6]
+        date_time = (
+            source_time if source_time[0] >= _ZIP_TIMESTAMP[0] else _ZIP_TIMESTAMP
+        )
+    info = zipfile.ZipInfo(name, date_time=date_time)
     info.create_system = 3
     info.external_attr = 0o100600 << 16
     info.compress_type = zipfile.ZIP_STORED
+    if mtime is not None:
+        info.extra = struct.pack("<HHBI", 0x5455, 5, 1, mtime)
     return info
 
 
@@ -363,8 +376,9 @@ def _write_bytes(
     name: str,
     role: str,
     content: bytes,
+    mtime: int | None = None,
 ) -> dict[str, str | int]:
-    archive.writestr(_zip_info(name), content)
+    archive.writestr(_zip_info(name, mtime=mtime), content)
     return {
         "path": name,
         "role": role,
@@ -391,6 +405,7 @@ async def _write_remote(
     archive: zipfile.ZipFile,
     *,
     read_file: ReadRemoteFile,
+    mtime: int,
     remote_path: str,
     name: str,
     role: str,
@@ -398,6 +413,7 @@ async def _write_remote(
     return await _write_remote_chunks(
         archive,
         chunks=read_file(remote_path),
+        mtime=mtime,
         name=name,
         role=role,
     )
@@ -407,13 +423,14 @@ async def _write_remote_chunks(
     archive: zipfile.ZipFile,
     *,
     chunks: AsyncIterable[bytes],
+    mtime: int,
     name: str,
     role: str,
 ) -> dict[str, str | int]:
     digest = hashlib.sha256()
     size_bytes = 0
     with archive.open(
-        _zip_info(name),
+        _zip_info(name, mtime=mtime),
         mode="w",
         force_zip64=True,
     ) as destination:
@@ -433,10 +450,15 @@ async def _write_optional_remote(
     archive: zipfile.ZipFile,
     *,
     read_file: ReadRemoteFile,
+    mtime_for_file: MtimeForRemoteFile,
     remote_path: str,
     name: str,
     role: str,
 ) -> dict[str, str | int] | None:
+    try:
+        mtime = mtime_for_file(remote_path)
+    except FileNotFoundError:
+        return None
     chunks = read_file(remote_path).__aiter__()
     try:
         first = await anext(chunks)
@@ -454,6 +476,7 @@ async def _write_optional_remote(
     return await _write_remote_chunks(
         archive,
         chunks=with_first(),
+        mtime=mtime,
         name=name,
         role=role,
     )
@@ -471,6 +494,7 @@ async def write_gromacs_archive(
     started_at: int,
     completed_at: int,
     read_file: ReadRemoteFile,
+    mtime_for_file: MtimeForRemoteFile,
     run_bounded: RunBounded | None = None,
 ) -> BuiltGromacsArchive:
     """Package the established GROMACS app's expected Volume files."""
@@ -484,12 +508,21 @@ async def write_gromacs_archive(
                 "A required GROMACS output is missing"
             ) from exc
 
+    def required_mtime(path: str) -> int:
+        try:
+            return mtime_for_file(path)
+        except FileNotFoundError as exc:
+            raise ArtifactSourceMissingError(
+                "A required GROMACS output is missing"
+            ) from exc
+
     binary_handle = cast("BinaryIO", handle)
     binary_handle.seek(0)
     binary_handle.truncate(0)
+    input_path = f"{run_name}/{run_name}.pdb"
     input_bytes = await _read_bounded(
         read_required,
-        f"{run_name}/{run_name}.pdb",
+        input_path,
         max_bytes=_MAX_PDB_BYTES,
     )
     parameters_bytes = parameters_json.encode()
@@ -518,14 +551,17 @@ async def write_gromacs_archive(
                 name="input.pdb",
                 role="input_structure",
                 content=input_bytes,
+                mtime=required_mtime(input_path),
             )
         )
         for name, role in _required_output_files(run_name):
+            remote_path = f"{run_name}/{PurePosixPath(name).name}"
             records.append(
                 await _write_remote(
                     archive,
                     read_file=read_required,
-                    remote_path=f"{run_name}/{PurePosixPath(name).name}",
+                    mtime=required_mtime(remote_path),
+                    remote_path=remote_path,
                     name=name,
                     role=role,
                 )
@@ -559,6 +595,7 @@ async def write_gromacs_archive(
             record = await _write_optional_remote(
                 archive,
                 read_file=read_file,
+                mtime_for_file=mtime_for_file,
                 remote_path=f"{run_name}/{remote_name}",
                 name=name,
                 role=role,

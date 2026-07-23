@@ -303,10 +303,11 @@ Within one API process, provider-identity mutations serialize their effective
 setting read, preflight, and database commit. A concurrent Environment and Tool
 edit therefore cannot commit a combined identity that was never preflighted.
 
-Job admission snapshots the Modal Environment, App name, and exact deployment
-version in one transaction. Every direct deployed-Function lookup for that Job
-passes the snapshot as Modal's `version` argument, so an App redeployment cannot
-mix Function implementations within an in-flight workflow. Administrators use
+Job admission snapshots the Modal Environment, App name, exact deployment
+version, expected artifact-request digest, and initial Modal-operation lease in
+one transaction. Every direct deployed-Function lookup for that Job passes the
+snapshot as Modal's `version` argument, so an App redeployment cannot mix
+Function implementations within an in-flight workflow. Administrators use
 `modal app history <app> --env <environment> --json` to discover deployment
 version integers; the Admin Tool form configures and restores the value with
 the same field-specific source behavior as App name and limits. Result
@@ -556,6 +557,10 @@ publication; absence or an empty mandatory file produces terminal
 `failed/result_invalid`. Publication also performs inexpensive structural
 checks for PDB, MDP, XTC, TPR, CSV, PNG, and JSON members so a checksummed but
 obviously truncated archive cannot become a successful Result.
+Publication and recovery must also reproduce the artifact-request digest
+persisted at admission from the exact PDB bytes and normalized parameters.
+Remote input or parameter drift therefore cannot publish under the admitted
+Job identity.
 Allowlisted GROMACS logs and `.mdp` files are diagnostic and included only when
 present. Their absence does not invalidate an otherwise complete Result. The
 manifest enumerates the exact optional members included.
@@ -652,7 +657,8 @@ After preparation, the cache holds a short-lived one-download reservation.
 `Clear cache` treats that reservation like an active lease, so cleanup cannot
 remove the archive between the `204` response and the browser's immediate GET.
 The GET consumes the reservation when it acquires its streaming descriptor;
-an abandoned reservation expires automatically.
+an abandoned reservation expires automatically. The optional `Range` request
+header and the corresponding `206`/`416` behavior are declared in OpenAPI.
 
 The GET response uses a safe `Content-Disposition` filename derived only from
 the sanitized display name: `<display-name>-results.zip`, with

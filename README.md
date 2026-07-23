@@ -66,7 +66,7 @@ Environment used by your development server:
 
 ```bash
 uv sync --extra api
-MODAL_ENVIRONMENT=production uv run biomodals app deploy gromacs
+uv run biomodals app deploy gromacs --env production
 ```
 
 Copy [`.env.example`](.env.example), fill in a Modal service-user token, and

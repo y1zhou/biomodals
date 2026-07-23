@@ -1,6 +1,7 @@
 # FastAPI identity design for Biomodals
 
-Status: accepted for the department development service
+Status: superseded by `api-service-architecture.md`; retained as decision
+research for the implemented identity boundary
 
 Decision date: 2026-07-16
 
@@ -97,7 +98,7 @@ chat or in person after identifying the employee. The link expires after one
 hour and has this shape:
 
 ```text
-https://biomodals.internal/set-password#token=<random-token>
+https://biomodals.example.com/set-password#token=<random-token>
 ```
 
 The secret is in the URL fragment, which is not sent to the web server or
@@ -208,9 +209,10 @@ digests, and private job metadata. The essential tables are:
 
 SQLite runs in WAL mode on local disk with foreign keys and a busy timeout. Run
 one FastAPI worker. The state directory is separate from the rebuildable
-artifact cache and must be included in company backups. Backups must use a
-SQLite-aware backup or snapshot: copying only `service.sqlite3` while its WAL
-is active can omit committed data.
+artifact cache. Pre-release state is currently disposable; before real
+production Users are onboarded, the state directory must be included in
+company backups. Backups must use a SQLite-aware backup or snapshot: copying
+only `service.sqlite3` while its WAL is active can omit committed data.
 
 ## Options considered
 

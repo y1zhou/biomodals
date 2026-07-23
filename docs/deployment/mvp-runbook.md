@@ -31,6 +31,17 @@ database, or cache directory. A pre-release copy must use
 paths above. An intentionally shared Modal Environment does not change this
 requirement.
 
+Keep paid-work limits deliberately small during pre-release validation:
+
+```dotenv
+BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT=1
+BIOMODALS_GROMACS_ACTIVE_LIMIT=1
+BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=1
+```
+
+These values constrain only the selected service database. They do not
+coordinate with another BioModals deployment that targets the same Modal App.
+
 ## API service example
 
 [`deploy/README.md`](../../deploy/README.md) documents three alternatives:
@@ -119,6 +130,9 @@ The checklist must order these actions:
    cookie mode, state path, cache path, Modal Environment, App name, exact App
    deployment version, and limits. Confirm the version against `modal app
    history <app> --env <environment> --json` before any real Submission.
+   If the durable operation plan changed, confirm that no active Job from the
+   prior plan remains or that the candidate explicitly supports its plan
+   version.
 3. Deploy a changed GROMACS App before an API that calls its changed contract;
    otherwise explicitly mark that paid deployment step irrelevant.
 4. Start or restart the candidate API and wait for readiness before exposing

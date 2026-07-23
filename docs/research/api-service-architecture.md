@@ -12,7 +12,7 @@ Biomodals apps and workflows
 Run one unified FastAPI control plane on the department's internal Linux host.
 Run it as one Uvicorn worker supervised by systemd, with a local SQLite database
 in WAL mode. The frontend and API share one browser origin: the production
-reverse proxy serves the frontend at `https://biomodals.internal/` and proxies
+reverse proxy serves the frontend at `https://biomodals.example.com/` and proxies
 `/api/*` to FastAPI. A frontend development server uses the same `/api` proxy
 pattern.
 
@@ -26,9 +26,11 @@ trajectory-analysis, and production Functions through a fixed durable
 dependency graph. After preparation, NVT analysis, NPT analysis, and production
 run concurrently; production analysis starts when production finishes; Result
 preparation waits for all three analyses. The control plane then packages the
-established Volume outputs itself. The GROMACS App and its command-line behavior
-remain unchanged. This keeps the HTTP contract and account data local while
-preserving independent compute images, scaling, and deployment lifecycles.
+established Volume outputs itself. The service preserves the deployed Function
+and Local Entrypoint interfaces; the separate restart-safe analysis-output
+correction does not add an API-only App path. This keeps the HTTP contract and
+account data local while preserving independent compute images, scaling, and
+deployment lifecycles.
 [Modal: invoking deployed Functions](https://modal.com/docs/guide/trigger-deployed-functions)
 
 No Modal Web Function, webhook, `@modal.asgi_app`, or
@@ -108,14 +110,17 @@ src/biomodals/service/
   admin_api.py       User, Modal and storage administration routes
   job_logs_api.py    authorized Stage log diagnostics
   config.py          host configuration
+  runtime_config.py  effective process and Administrator settings
   auth.py            manual accounts and opaque browser sessions
   store.py           SQLite users, sessions and jobs
   jobs.py            common job view and workload registration
+  workloads.py       fixed executable-workload descriptors
   submission.py      shared operation lease, spawn and attachment boundary
   artifacts.py       verified final-ZIP staging and cache
   modal_logs.py      call-filtered Modal CLI log access
   gromacs/
-    router.py        GROMACS request schema and submission route
+    contracts.py     GROMACS request schema and stable request identity
+    router.py        GROMACS submission route
     plan.py          pure operation graph and deployed-function arguments
     provider.py      Modal lookup, submission, polling and cancellation
     results.py       Result publication, recovery and cache access
@@ -174,10 +179,11 @@ reasons: compute Functions already have independent containers.
 The browser supplies a UUID `Idempotency-Key` when submitting a job. The key is
 scoped to `(owner_user_id, workload)`. Repeating the same key and payload
 returns the existing job; reusing it with different inputs returns `409`.
-Admission and active-job limits are checked in one SQLite write transaction.
+Admission, active-job limits, the Job's expected artifact-request digest, and
+the initial Modal-operation lease are recorded in one SQLite write transaction.
 That transaction also rechecks that the User is enabled before returning an
 existing same-payload admission, so a request racing with Disable cannot claim
-an unsubmitted Job's provider lease.
+an unsubmitted Job's provider lease or leave a newly admitted Job without one.
 Limits are non-negative integers and zero intentionally blocks new Submissions
 within that scope. Lowering a User, Tool, or Global limit below its current
 count never cancels admitted work; new Submissions are rejected until the
@@ -198,13 +204,14 @@ Stage selectors and access their live or historical provider logs for any Job,
 but it cannot inspect Input, download Result, cancel work, or retrieve a
 provider call identifier.
 
-The submit route persists the Job, leases preparation, spawns it, attaches its
-Modal call identifier to the leased operation, and returns `202`. SQLite keeps
-one ordered `job_operations` row per remote or local operation. Modal rows own
-their call identifier and submission lease; local Result packaging uses the
-same lifecycle without pretending to be a provider call. When calls complete,
-the reconciler evaluates the fixed GROMACS dependencies and attaches every
-newly ready call. Several direct stages may therefore be active at once.
+The submit route atomically persists the Job and leases preparation, spawns it,
+attaches its Modal call identifier to the leased operation, and returns `202`.
+SQLite keeps one ordered `job_operations` row per remote or local operation.
+Modal rows own their call identifier and submission lease; local Result
+packaging uses the same lifecycle without pretending to be a provider call.
+When calls complete, the reconciler evaluates the fixed GROMACS dependencies
+and attaches every newly ready call. Several direct stages may therefore be
+active at once.
 
 `JobView.active_stages` exposes every active sanitized stage code and deployed
 Function name. The singular `stage` remains as a compatibility summary of the
@@ -325,8 +332,9 @@ action records a safe `compute_failed` terminal failure and releases admission
 capacity; it does not itself contact or cancel Modal. No automatic or owner
 transition leaves `state_unknown`.
 
-Initial submission uses an operation-scoped SQLite lease and a stable run name made from a
-sanitized display-name slug plus the full Job UUID, for example
+Initial admission creates an operation-scoped SQLite lease in the same
+transaction as the Job and uses a stable run name made from a sanitized
+display-name slug plus the full Job UUID, for example
 `kinase-trial-<job UUID without hyphens>`. The deployed GROMACS App uses that
 single value for both its Volume directory and scientific filenames, so the
 UUID suffix prevents repeated display names from silently reusing another
@@ -409,9 +417,11 @@ state for a downloadable result with warnings; GROMACS v1 itself emits
 streams an explicit allowlist of files from `Gromacs-outputs` into a
 deterministic local ZIP, validates it, then uploads `result.zip` followed by a
 small completion marker under `api-results/<run_name>/`. The marker records the
-request identity, byte size, and SHA-256 digest. The archive and marker are the
-durable success boundary; the control plane does not mark a job complete until
-the ZIP contract validates.
+artifact-request identity, byte size, and SHA-256 digest. Publication and
+recovery compare that identity with the digest persisted at Job admission, so
+altered remote input or parameters cannot be accepted as the admitted Result.
+The archive and marker are the durable success boundary; the control plane does
+not mark a job complete until the ZIP contract validates.
 
 When the final deployed Function completes, the control plane atomically stores
 `finalization_started_at` as it enters `finalizing`. Archive provenance uses
@@ -511,7 +521,8 @@ through the per-Job coordination lock and returns `204`; the following GET
 streams the prepared file with normal browser download handling. Cache-fill
 work is shared so cancellation of one HTTP waiter does not cancel or corrupt
 the underlying fill. This adds neither scientific work nor an external task
-queue.
+queue. The GET's optional `Range` request header and `206`/`416` responses are
+part of OpenAPI.
 
 The GET supplies a sanitized `Content-Disposition` filename of
 `<display-name>-results.zip`, falling back to `gromacs-results.zip`. It never
@@ -574,10 +585,11 @@ Modal Volume or network filesystem: Modal Volumes use filesystem consistency
 semantics and are not a multi-writer relational database.
 [Modal: Volume consistency](https://modal.com/docs/guide/volumes#filesystem-consistency)
 
-The state directory and cache directory are separate. Company backups must
-cover the state directory and use a SQLite-aware backup/snapshot procedure;
-copying only the main database file while its WAL is active is insufficient.
-The cache does not need backup.
+The state directory and cache directory are separate. The current pre-release
+state is explicitly disposable. Before real production Users are onboarded,
+company backups must cover the state directory and use a SQLite-aware
+backup/snapshot procedure; copying only the main database file while its WAL is
+active is insufficient. The cache does not need backup.
 
 Run Uvicorn with `--workers 1`. Multiple workers would each start a reconciler
 and would invalidate the current single-process SQLite assumptions. If the
@@ -661,6 +673,11 @@ location and never truncates, rewrites, or deletes it automatically. During
 active development an Administrator may explicitly migrate selected records or
 remove the unsupported database while the service is stopped, then restart to
 initialize a fresh schema. This reset policy ends at the first release.
+
+The durable GROMACS operation plan is likewise a pre-release contract. Before
+changing operation names or dependencies, drain active Jobs or add an explicit
+plan-version compatibility path; a restarted service must not reinterpret an
+in-flight Job under a different graph.
 
 Pre-release and production service definitions select distinct
 `BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` values. Pre-release sets

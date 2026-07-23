@@ -206,6 +206,10 @@ _Avoid_: sequence hash, model seed, display name
 The deterministic, run-derived name given to upstream inference so every durable output filename is stable across caller display names. It uses `af3-{run_id[:16]}` and is not a user-facing run label.
 _Avoid_: display name, run ID, local archive name
 
+**Presentation Output Name**:
+The sanitized caller display name applied to filenames only while creating a Request Retrieval Archive. It never renames or identifies durable prediction artifacts.
+_Avoid_: canonical output name, inference run identity, Volume path
+
 **Seed Prediction**:
 The independently complete inference output for one model seed beneath an AlphaFold Run Root. Its diffusion samples use upstream's `seed-{seed}_sample-{sample_index}` directories; optional embeddings and distogram directories belong to the same Seed Prediction.
 _Avoid_: inference run identity, container part, combined top-level output

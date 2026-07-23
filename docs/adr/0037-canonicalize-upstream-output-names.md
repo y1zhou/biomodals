@@ -17,3 +17,9 @@ A later request with another display name reuses those files without renaming
 or duplicating them. This avoids first-writer-dependent filenames beneath a
 seed-independent shared run while retaining the caller's label as presentation
 metadata.
+
+When the local entrypoint builds a Request Retrieval Archive, it renames
+downloaded copies whose basenames begin with the Canonical Output Name to the
+request's Presentation Output Name. It does not alter file contents, seed/sample
+directory names, or durable Volume files. The request manifest records the
+canonical-to-presentation prefix mapping.

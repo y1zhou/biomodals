@@ -223,7 +223,7 @@ The independently complete inference output for one model seed beneath an AlphaF
 _Avoid_: inference run identity, container part, combined top-level output
 
 **Seed Completion Marker**:
-The minimal authoritative record that a Seed Prediction's upstream process succeeded and its promoted output was committed. Readers trust the marker without revalidating individual prediction artifacts.
+The minimal authoritative record that a Seed Prediction's upstream process succeeded and its promoted output was committed. It carries sample ranking scores for summary derivation, while readers trust completion without revalidating individual prediction artifacts.
 _Avoid_: artifact inventory, worker exit alone, seed build claim
 
 **Inference Worker Staging**:

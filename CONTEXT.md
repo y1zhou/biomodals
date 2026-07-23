@@ -199,7 +199,7 @@ A Search Field Resolution with reusable canonical database or template results b
 _Avoid_: empty search result, enriched input, failed request cache
 
 **AlphaFold Run Root**:
-The job-scoped directory on the AlphaFold3 output Volume that makes staged caller inputs available to remote functions and durably owns that job's inference outputs, logs, and completion state.
+The seed-independent `/{run_id[:2]}/{run_id}/` directory at the AlphaFold3 output-Volume root. It makes staged caller inputs available to remote functions and durably owns inference outputs, requests, logs, and completion state.
 _Avoid_: MSA cache root, database Volume, local download directory
 
 **Inference Run Identity**:

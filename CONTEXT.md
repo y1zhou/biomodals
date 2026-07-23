@@ -202,6 +202,10 @@ _Avoid_: MSA cache root, database Volume, local download directory
 The stable digest that groups predictions for one Enriched AlphaFold Input and one set of seed-independent inference settings. Model seeds are deliberately excluded so additional seeds can publish beneath the same AlphaFold Run Root.
 _Avoid_: sequence hash, model seed, display name
 
+**Declared Model Identity**:
+The code-owned checkpoint label and pinned AlphaFold/app version used in Inference Run Identity without hashing the model file. It assumes the checkpoint is not replaced in place.
+_Avoid_: checkpoint digest, model Volume path alone, model seed
+
 **Canonical Output Name**:
 The deterministic, run-derived name given to upstream inference so every durable output filename is stable across caller display names. It uses `af3-{run_id[:16]}` and is not a user-facing run label.
 _Avoid_: display name, run ID, local archive name

@@ -146,6 +146,10 @@ _Avoid_: combined unpaired MSA, RNA MSA
 A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and one template-reference snapshot. An empty list is a complete result and is distinct from an unfinished search.
 _Avoid_: PDB/mmCIF reference store, raw database MSA, missing result
 
+**Enriched AlphaFold Input**:
+An AlphaFold input whose protein and RNA search fields are all explicit, using searched evidence, non-empty caller-supplied values, or deliberate empty sentinels according to the selected search policy. It is ready for inference without rerunning AlphaFold's data pipeline.
+_Avoid_: raw input, model features, partially populated search fields
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

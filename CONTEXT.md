@@ -163,7 +163,7 @@ The latest validated sequence-root `unpaired.a3m` and, for protein, `paired.a3m`
 _Avoid_: raw database MSA, unmarked legacy file, versioned assembly archive
 
 **Template Search Result**:
-A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and one template-reference snapshot. An empty list is a complete result and is distinct from an unfinished search.
+A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and one template-reference snapshot. The sequence root retains only the latest publication, and an empty list is a complete result distinct from an unfinished search.
 _Avoid_: PDB/mmCIF reference store, raw database MSA, missing result
 
 **Enriched AlphaFold Input**:

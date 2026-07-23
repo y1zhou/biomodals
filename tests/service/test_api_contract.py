@@ -759,6 +759,11 @@ def test_job_owner_and_admin_can_select_and_stream_owner_visible_logs(
 
     owner_targets = client.get(f"/api/v1/jobs/{job_id}/log-targets")
     assert owner_targets.status_code == 200
+    owner_streamed = client.get(f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation")
+    assert owner_streamed.status_code == 200
+    assert owner_streamed.headers["x-biomodals-log-mode"] == "live"
+    assert "fc-1" not in owner_streamed.text
+    adapter.log_requests.clear()
 
     client.cookies.clear()
     _login(client, "admin@example.com")
@@ -879,6 +884,11 @@ def test_admin_can_restrict_tool_logs_without_blocking_admin_access(
     forbidden = client.get(f"/api/v1/jobs/{job_id}/log-targets")
     assert forbidden.status_code == 403
     assert forbidden.json()["code"] == "job_logs_forbidden"
+    forbidden_stream = client.get(
+        f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation"
+    )
+    assert forbidden_stream.status_code == 403
+    assert forbidden_stream.json()["code"] == "job_logs_forbidden"
 
     client.cookies.clear()
     admin_csrf = _login(client, "admin@example.com")

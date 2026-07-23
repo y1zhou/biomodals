@@ -95,7 +95,6 @@ class _WorkloadDefaults:
     modal_app_name: str
     modal_app_version: int
     active_job_limit: int
-    job_logs_visible_to_owner: bool
 
 
 class RuntimeConfiguration:
@@ -113,9 +112,6 @@ class RuntimeConfiguration:
                 modal_app_name=settings.gromacs_app_name,
                 modal_app_version=settings.gromacs_app_version,
                 active_job_limit=settings.gromacs_active_limit,
-                job_logs_visible_to_owner=(
-                    GROMACS_WORKLOAD.job_logs_visible_to_owner_default
-                ),
             )
         }
 
@@ -200,7 +196,7 @@ class RuntimeConfiguration:
                 database_value=(
                     stored.job_logs_visible_to_owner if stored is not None else None
                 ),
-                default=defaults.job_logs_visible_to_owner,
+                default=definition.job_logs_visible_to_owner_default,
             ),
         )
 

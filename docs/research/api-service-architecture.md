@@ -677,5 +677,5 @@ an intentionally authorized pre-release service may still target the Modal
 | Modal Dict as the job database | Rejected. Job history and ownership must outlive short Modal call/Dict retention. |
 | Modal Dict as an atomic final-archive publication registry | Rejected. The single control-plane reconciler publishes deterministic archives directly, so another registry adds no useful authority. |
 | PostgreSQL and multiple API workers | Deferred. It adds operations without benefit at the current scale; it becomes necessary before horizontal API scaling. |
-| Owner-visible provider log streaming | Rejected for the MVP. Raw logs are operational diagnostics, not safe Job status. |
-| Admin-only per-call Modal CLI stream | **Selected.** The supported CLI filters by Function Call ID while the HTTP contract exposes only safe stage selectors. |
+| Unconditional owner-visible provider log streaming | Rejected. Raw logs are operational diagnostics unless a Tool has explicitly reviewed them for owner access. |
+| Per-Tool log visibility with Administrator access | **Selected.** Administrators always retain access; reviewed Tools may permit Job owners, while new Tools default to Administrator-only. The supported Modal CLI filters by Function Call ID while the HTTP contract exposes only safe stage selectors. |

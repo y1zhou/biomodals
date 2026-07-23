@@ -222,6 +222,10 @@ _Avoid_: inference run identity, GPU worker assignment, newly computed seeds onl
 The durable return view restricted to one Inference Request: references to all requested canonical Seed Predictions, request-specific ranking and best files, and a manifest distinguishing reused from newly computed seeds while referencing the accumulated run summary. It does not duplicate full seed artifacts.
 _Avoid_: complete run archive, global best prediction, worker output
 
+**Partial Inference Request**:
+An Inference Request for which at least one normalized requested seed has a Seed Completion Marker and at least one remains unmarked after a surfaced failure. It retains reusable seeds and diagnostics but has no successful Inference Request Result.
+_Avoid_: failed seed prediction, completed request, empty run
+
 **Request Retrieval Archive**:
 A local `.tar.zst` materialization of one Inference Request Result, assembled by downloading only its manifest-declared canonical artifacts. It is a caller convenience rather than a durable output-Volume publication.
 _Avoid_: inference request result, global run archive, remote function payload

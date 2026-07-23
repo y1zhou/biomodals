@@ -242,6 +242,10 @@ _Avoid_: seed prediction, canonical output tree, local scratch directory
 The single finalized set of upstream-style top-level data, ranking, and best-prediction files derived from the accumulated union of every validated Seed Prediction beneath one AlphaFold Run Root.
 _Avoid_: worker-local ranking, seed sample directory, completion marker
 
+**Prediction Ranking Order**:
+The deterministic ordering shared by request-scoped and global prediction summaries: descending ranking score, then ascending model seed, then ascending sample index. It makes equal-score best-sample selection independent of worker completion order.
+_Avoid_: worker completion order, submission order, arbitrary equal-score winner
+
 **Inference Request**:
 One invocation's requested model-seed set against an Inference Run Identity. It may reuse existing Seed Predictions and compute missing ones without changing the shared run identity.
 _Avoid_: inference run identity, GPU worker assignment, newly computed seeds only

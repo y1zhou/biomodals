@@ -171,8 +171,12 @@ The latest validated sequence-root `unpaired.a3m` and, for protein, `paired.a3m`
 _Avoid_: raw database MSA, unmarked legacy file, versioned assembly archive
 
 **Template Search Result**:
-A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and one template-reference snapshot. The sequence root retains only the latest publication, and an empty list is a complete result distinct from an unfinished search.
+A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and the Immutable Template Store. The sequence root retains only the latest publication, and an empty list is a complete result distinct from an unfinished search.
 _Avoid_: PDB/mmCIF reference store, raw database MSA, missing result
+
+**Immutable Template Store**:
+The fixed upstream PDB seqres file and `mmcif_files/` directory used for protein template search. Their contents are treated as immutable infrastructure and do not receive a separate cache identity or digest.
+_Avoid_: sharded database profile, template search result, versioned reference
 
 **Enriched AlphaFold Input**:
 An AlphaFold input whose protein and RNA search fields are all explicit, using searched evidence, non-empty caller-supplied values, or deliberate empty sentinels according to the selected search policy. It is ready for inference without rerunning AlphaFold's data pipeline.

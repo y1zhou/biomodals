@@ -3,9 +3,9 @@
 Status: accepted.
 
 Protein template search is a durable stage after Combined Unpaired MSA
-assembly. Its identity binds the combined A3M digest, PDB seqres and mmCIF
-reference snapshot, maximum template date, pinned AlphaFold and HMMER versions,
-and result-affecting search parameters. The stage always publishes
+assembly. Its identity binds the combined A3M digest, maximum template date,
+pinned AlphaFold and HMMER versions, and result-affecting search parameters.
+Reference-store identity is refined by ADR 0039. The stage always publishes
 `templates.json`, including a valid empty list, followed by a validating
 completion marker. A cache hit requires both artifacts to be valid.
 

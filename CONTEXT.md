@@ -154,6 +154,10 @@ _Avoid_: runtime override, profile manifest, arbitrary FASTA
 A unique biological sequence that requires database-generated MSA evidence and may be referenced by one or more input chains.
 _Avoid_: chain identifier, duplicate homomer chain
 
+**Polymer Cache Namespace**:
+The top-level `Protein/` or `RNA/` directory that separates MSA cache entries for identical sequence hashes interpreted as different polymer types.
+_Avoid_: database ID, polymer-aware sequence hash, chain type suffix
+
 **Raw Database MSA**:
 A validated result of searching one MSA Search Subject against one reference database profile. It is independently complete and reusable before AlphaFold constructs combined unpaired or paired MSAs.
 _Avoid_: combined unpaired MSA, paired MSA, benchmark summary

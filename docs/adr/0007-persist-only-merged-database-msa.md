@@ -5,7 +5,7 @@ Status: accepted.
 Each production Raw Database MSA cache entry contains the database-level
 `result.a3m`, compact `metrics.json` and `run.log` provenance, and a
 digest-validating `done.json` completion marker written last. It lives at
-`/{prefix}/{sequence_hash}/raw-msa/{database_id}/{search_identity}/`.
+`/{polymer}/{prefix}/{sequence_hash}/raw-msa/{database_id}/{search_identity}/`.
 
 Per-shard `tblout` files are transient worker scratch. The pinned Jackhmmer and
 Nhmmer implementations use them to rank and merge shard hits, then discard

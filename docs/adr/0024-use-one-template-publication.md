@@ -3,11 +3,11 @@
 Status: accepted.
 
 Protein templates remain at the existing sequence-root
-`/{prefix}/{sequence_hash}/templates.json` path. Production does not add a
-template-identity directory. A `templates.done.json` marker written last binds
-the file to the combined unpaired-MSA digest, maximum template date, pinned tool
-behavior, and template file size and digest. The fixed reference store is
-governed by ADR 0039.
+`/Protein/{prefix}/{sequence_hash}/templates.json` path. Production does not
+add a template-identity directory. A `templates.done.json` marker written last
+binds the file to the combined unpaired-MSA digest, maximum template date,
+pinned tool behavior, and template file size and digest. The fixed reference
+store is governed by ADR 0039.
 
 The pipeline always writes `templates.json`, including a valid empty list.
 Existing unmarked template files are ignored as cache evidence and remain

@@ -3,7 +3,7 @@
 Status: accepted.
 
 Combined MSAs remain at the existing sequence-root paths:
-`/{prefix}/{sequence_hash}/unpaired.a3m` and, for proteins,
+`/{polymer}/{prefix}/{sequence_hash}/unpaired.a3m` and, for proteins,
 `paired.a3m`. Production does not add an assembly-identity directory. A
 `combined.done.json` manifest written last binds those files to the exact Raw
 Database MSA completion digests, pinned upstream merge semantics, file sizes,

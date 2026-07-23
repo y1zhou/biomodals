@@ -4,9 +4,10 @@ Status: accepted.
 
 Search Build Claims follow the exclusive cache path they protect. Versioned
 Raw Database MSA paths retain claims keyed by
-`(sequence_hash, database_id, search_identity)`. The mutable combined-MSA files
-use one claim namespace per `sequence_hash`, and the mutable template file uses
-a separate claim namespace per `sequence_hash`.
+`(polymer_type, sequence_hash, database_id, search_identity)`. The mutable
+combined-MSA files use one claim namespace per
+`(polymer_type, sequence_hash)`, and the mutable template file uses a separate
+claim namespace per protein `sequence_hash`.
 
 For each flat publication, the desired raw-dependency or template identity is
 stored in the claim generation and completion marker rather than in the claim

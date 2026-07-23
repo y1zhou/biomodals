@@ -134,6 +134,10 @@ _Avoid_: fastest sample, benchmark harness
 An immutable, manifest-validated publication of every shard for one logical MSA database. Its manifest preserves the source FASTA identity and construction recipe, but the published profile does not retain a duplicate source FASTA.
 _Avoid_: source database directory, incomplete shard staging, benchmark sample
 
+**Profile ID**:
+A code-owned identifier for one immutable Sharded Database Profile, fixing its source database generation, shard count, and build recipe. It is selected by the Supported Database Specification rather than through a mutable runtime alias.
+_Avoid_: current profile, database ID, manifest digest
+
 **Source FASTA Policy**:
 The explicit post-publication choice to keep, round-trip-verify and compress, or delete an original database FASTA after its Sharded Database Profile is durably validated.
 _Avoid_: temporary builder cleanup, shard compression, implicit retention

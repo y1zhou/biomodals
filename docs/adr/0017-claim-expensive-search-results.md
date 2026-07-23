@@ -4,10 +4,8 @@ Status: accepted.
 
 Every missing expensive search-cache publication uses the same append-only
 claim-generation protocol as Seed Predictions. A Raw Database MSA claim is
-keyed by `(sequence_hash, database_id, search_identity)`. A Template Search
-Result claim is keyed by `(sequence_hash, template_identity)`, where the
-template identity already binds the completed unpaired MSA and template
-reference snapshot.
+keyed by `(sequence_hash, database_id, search_identity)`. Claim scoping for the
+flat combined-MSA and template publications is refined by ADR 0025.
 
 The request that atomically creates the current Search Build Claim writes into
 generation-exclusive staging and may publish only while it retains ownership.

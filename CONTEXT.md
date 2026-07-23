@@ -203,7 +203,7 @@ An atomic, generation-scoped coordination record granting one request ownership 
 _Avoid_: seed completion marker, inference request, cache entry
 
 **Search Build Claim**:
-An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or Template Search Result. The corresponding validated cache publication, not the claim, is the reusable scientific evidence.
+An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or publishing one sequence-root combined-MSA or template result. Claims follow the exclusive output path they protect; the validated publication, not the claim, is the reusable scientific evidence.
 _Avoid_: search identity, completion marker, database shard
 
 **MSA Worker Budget**:

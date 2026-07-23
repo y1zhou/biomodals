@@ -147,8 +147,8 @@ A digest of the result-affecting inputs for one Raw Database MSA, stored beneath
 _Avoid_: sequence hash, benchmark sample ID, resource configuration
 
 **Canonical Search Result**:
-The production-cache artifact published at a Search Identity root only after its search strategy has passed the scientific and performance gates. Benchmark runs never publish this artifact; they write only Benchmark Samples beneath `samples/`.
-_Avoid_: arbitrary benchmark result, fastest unvalidated sample
+The immutable production-cache publication for one Raw Database MSA, stored at its Search Identity root only after validation. It preserves the merged database alignment and compact provenance needed for reuse; per-shard merge evidence is transient execution data.
+_Avoid_: arbitrary benchmark result, fastest unvalidated sample, shard tblout
 
 **Benchmark Sample**:
 One measured execution of a search case within a Benchmark Campaign, identified by a human-readable sample ID such as `screen-S3-block-01`. Multiple Benchmark Samples may share one Search Identity while measuring different operational layouts or repetitions. Query-derived evidence always lives beneath `/{sequence_hash_prefix}/{sequence_hash}/raw-msa/`.

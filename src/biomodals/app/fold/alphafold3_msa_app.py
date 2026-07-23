@@ -127,6 +127,7 @@ HMMALIGN_BINARY_PATH = "/hmmer/bin/hmmalign"
 HMMBUILD_BINARY_PATH = "/hmmer/bin/hmmbuild"
 PRODUCTION_SEARCH_N_CPU = 2
 PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS = 16
+ORACLE_MONOLITH_N_CPU = 8
 
 
 CONF = AppConfig(
@@ -6393,15 +6394,13 @@ def _validate_profile_query(
     return sequence
 
 
-def _production_search_parameters(
+def _production_scientific_search_parameters(
     spec: DatabaseProfileSpec,
 ) -> dict[str, object]:
     """Return result-affecting parameters from the pinned data pipeline."""
     common: dict[str, object] = {
         "database_id": spec.database_id,
         "polymer": spec.polymer,
-        "n_cpu": PRODUCTION_SEARCH_N_CPU,
-        "max_parallel_shards": PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
         "max_sequences": spec.max_sequences,
         "z_value": spec.search_space_value,
     }
@@ -6421,6 +6420,20 @@ def _production_search_parameters(
         "filter_f3": 1e-5,
         "alphabet": "rna",
         "short_sequence_filter_f3": 0.02,
+    }
+
+
+def _production_search_parameters(
+    spec: DatabaseProfileSpec,
+    layout: str = "sharded",
+) -> dict[str, object]:
+    """Return scientific and operational parameters for evidence."""
+    monolith = layout == "monolith"
+    return _production_scientific_search_parameters(spec) | {
+        "n_cpu": ORACLE_MONOLITH_N_CPU if monolith else PRODUCTION_SEARCH_N_CPU,
+        "max_parallel_shards": (
+            1 if monolith else PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS
+        ),
     }
 
 
@@ -6460,6 +6473,7 @@ def _profile_search_identity(
     spec: DatabaseProfileSpec,
     sequence: str,
     manifest_sha256: str,
+    layout: str,
 ) -> str:
     """Hash the scientific identity of one sequence-by-profile search."""
     return _sha256_bytes(
@@ -6467,8 +6481,9 @@ def _profile_search_identity(
             "schema_version": 1,
             "profile_id": spec.profile_id,
             "profile_manifest_sha256": manifest_sha256,
+            "layout": layout,
             "sequence": sequence,
-            "parameters": _production_search_parameters(spec),
+            "parameters": _production_scientific_search_parameters(spec),
             "alphafold_commit": CONF.repo_commit_hash,
             "hmmer_version": HMMER_VERSION,
             "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
@@ -6480,6 +6495,7 @@ def _profile_search_relpath(
     spec: DatabaseProfileSpec,
     sequence: str,
     search_identity: str,
+    layout: str,
 ) -> str:
     """Return one deterministic experimental raw-result directory."""
     sequence_hash = hashlib.sha256(sequence.encode()).hexdigest()
@@ -6487,7 +6503,7 @@ def _profile_search_relpath(
     return (
         "production-candidates/searches/"
         f"{polymer_dir}/{sequence_hash[:2]}/{sequence_hash}/raw-msa/"
-        f"{spec.database_id}/{search_identity}"
+        f"{spec.database_id}/{layout}/{search_identity}"
     )
 
 
@@ -6507,33 +6523,213 @@ def _load_reusable_profile_search(
     ):
         return None
     result_record = done.get("result")
-    if not isinstance(result_record, dict):
+    hits_record = done.get("hits")
+    if not isinstance(result_record, dict) or not isinstance(hits_record, dict):
         return None
     result_path = result_root / "result.a3m"
-    if not result_path.is_file():
+    hits_path = result_root / "hits.parquet"
+    if not result_path.is_file() or not hits_path.is_file():
         return None
     result_bytes = result_path.read_bytes()
+    hits_bytes = hits_path.read_bytes()
     if (
         result_record.get("size_bytes") != len(result_bytes)
         or result_record.get("sha256") != hashlib.sha256(result_bytes).hexdigest()
+        or hits_record.get("size_bytes") != len(hits_bytes)
+        or hits_record.get("sha256") != hashlib.sha256(hits_bytes).hexdigest()
     ):
         return None
-    metrics = _load_json_object(result_root / "metrics.json")
+    metrics_path = result_root / "metrics.json"
+    if not metrics_path.is_file():
+        return None
+    metrics = _load_json_object(metrics_path)
     return metrics | {"status": "reused"}
+
+
+def _validate_profile_search_layout(layout: str) -> str:
+    """Validate the two fixed scientific-oracle database layouts."""
+    if layout not in {"monolith", "sharded"}:
+        raise ValueError("layout must be 'monolith' or 'sharded'")
+    return layout
+
+
+def _normalized_rna_hit_rows(
+    merged_a3m: str,
+    raw_tblouts: list[tuple[str, str]],
+) -> list[dict[str, object]]:
+    """Normalize Nhmmer A3M/tblout evidence using its coordinate hit ID."""
+    latest_by_target: dict[str, dict[str, object]] = {}
+    occurrences: dict[str, list[dict[str, object]]] = {}
+    for source, tblout in raw_tblouts:
+        for line_number, line in enumerate(tblout.splitlines(), start=1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            fields = line.split(maxsplit=15)
+            if len(fields) < 14:
+                raise ValueError(
+                    f"Invalid Nhmmer tblout line {line_number} from {source}: {line!r}"
+                )
+            target_id = f"{fields[0]}/{fields[6]}-{fields[7]}"
+            entry: dict[str, object] = {
+                "target_id": target_id,
+                "e_value_text": fields[12],
+                "bit_score_text": fields[13],
+                "e_value": float(fields[12]),
+                "bit_score": float(fields[13]),
+                "source": source,
+                "line": line,
+            }
+            occurrences.setdefault(target_id, []).append(entry)
+            latest_by_target[target_id] = entry
+
+    rows: list[dict[str, object]] = []
+    for ordinal, (sequence, description) in enumerate(
+        _parse_a3m_records(merged_a3m)[1:],
+        start=1,
+    ):
+        target_id = description.partition(" ")[0]
+        hit_entry = latest_by_target.get(target_id)
+        if hit_entry is None:
+            raise ValueError(f"Merged RNA A3M target has no tblout row: {target_id}")
+        target_occurrences = occurrences[target_id]
+        occurrence_sources = [str(item["source"]) for item in target_occurrences]
+        normalized_sequence = _normalize_a3m_sequence(sequence)
+        rows.append({
+            "ordinal": ordinal,
+            "target_id": target_id,
+            "description": description,
+            "aligned_sequence": sequence,
+            "normalized_sequence": normalized_sequence,
+            "normalized_sequence_sha256": _sha256_bytes(normalized_sequence.encode()),
+            "e_value": hit_entry["e_value"],
+            "e_value_text": hit_entry["e_value_text"],
+            "bit_score": hit_entry["bit_score"],
+            "bit_score_text": hit_entry["bit_score_text"],
+            "tblout_source": hit_entry["source"],
+            "tblout_line": hit_entry["line"],
+            "raw_occurrence_count": len(target_occurrences),
+            "raw_occurrence_sources": ",".join(occurrence_sources),
+            "cross_shard_duplicate": len(set(occurrence_sources)) > 1,
+        })
+    return rows
+
+
+def _execute_profile_database_search(
+    spec: DatabaseProfileSpec,
+    sequence: str,
+    layout: str,
+    profile_root: Path,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Run a monolithic or sharded pinned search while retaining tblout."""
+    from importlib import import_module
+
+    selected_layout = _validate_profile_search_layout(layout)
+    if selected_layout == "monolith":
+        database_path = str(Path(APP_INFO.source_db_dir) / spec.source_filename)
+        search_paths = (Path(database_path),)
+    else:
+        database_path = (
+            profile_root / "shards" / spec.source_filename
+        ).as_posix() + f"@{spec.shard_count}"
+        search_paths = tuple(
+            profile_root / "shards" / name for name in _production_shard_names(spec)
+        )
+    n_cpu = (
+        ORACLE_MONOLITH_N_CPU
+        if selected_layout == "monolith"
+        else PRODUCTION_SEARCH_N_CPU
+    )
+
+    if spec.polymer == "protein":
+        module = import_module("alphafold3.data.tools.jackhmmer")
+        tool = module.Jackhmmer(
+            binary_path=JACKHMMER_BINARY_PATH,
+            database_path=database_path,
+            n_cpu=n_cpu,
+            n_iter=1,
+            e_value=JACKHMMER_E_VALUE,
+            z_value=spec.search_space_value,
+            dom_z_value=spec.search_space_value,
+            max_sequences=spec.max_sequences,
+            filter_f1=JACKHMMER_FILTER_F1,
+            filter_f2=JACKHMMER_FILTER_F2,
+            filter_f3=JACKHMMER_FILTER_F3,
+            max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
+        )
+    else:
+        module = import_module("alphafold3.data.tools.nhmmer")
+        tool = module.Nhmmer(
+            binary_path=NHMMER_BINARY_PATH,
+            hmmalign_binary_path=HMMALIGN_BINARY_PATH,
+            hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
+            database_path=database_path,
+            n_cpu=n_cpu,
+            e_value=1e-3,
+            z_value=spec.search_space_value,
+            max_sequences=spec.max_sequences,
+            filter_f3=1e-5,
+            alphabet="rna",
+            max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
+        )
+
+    global_temp_dir = tempfile.mkdtemp(
+        prefix=f"af3-{spec.database_id}-{selected_layout}-",
+        dir=PRODUCTION_SCRATCH_ROOT,
+    )
+
+    def query_one(search_path: Path) -> Any:
+        return tool._query_db_shard(  # noqa: SLF001
+            target_sequence=sequence,
+            db_shard_path=str(search_path),
+            get_tblout=True,
+            global_temp_dir=global_temp_dir,
+        )
+
+    try:
+        if selected_layout == "monolith":
+            results = (query_one(search_paths[0]),)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS
+            ) as executor:
+                results = tuple(executor.map(query_one, search_paths))
+    finally:
+        shutil.rmtree(global_temp_dir, ignore_errors=True)
+
+    raw_tblouts: list[tuple[str, str]] = []
+    for search_path, result in zip(search_paths, results, strict=True):
+        if result.tblout is None:
+            raise ValueError(f"{search_path.name} search did not return tblout")
+        raw_tblouts.append((search_path.name, result.tblout))
+    if selected_layout == "monolith":
+        merged = results[0]
+    elif spec.polymer == "protein":
+        merged = module._merge_jackhmmer_results(  # noqa: SLF001
+            results,
+            spec.max_sequences,
+        )
+    else:
+        merged = module._merge_nhmmer_results(  # noqa: SLF001
+            results,
+            spec.max_sequences,
+        )
+    return merged.a3m, raw_tblouts
 
 
 def _run_profile_search(
     database_id: str,
     sequence: str,
+    layout: str,
 ) -> dict[str, object]:
     """Search one fixed published profile using the pinned upstream wrapper."""
-    from importlib import import_module
-
     spec = _database_profile_spec(database_id)
     query = _validate_profile_query(spec, sequence)
+    selected_layout = _validate_profile_search_layout(layout)
     sharded_root = Path(APP_INFO.sharded_db_dir)
     output_root = Path(APP_INFO.output_dir)
     profile_root = _production_profile_root(sharded_root, spec)
+    if selected_layout == "monolith":
+        SOURCE_MSA_DB_VOLUME.reload()
     SHARDED_MSA_DB_VOLUME.reload()
     BENCHMARK_OUTPUT_VOLUME.reload()
     manifest_path = profile_root / "manifest.json"
@@ -6545,11 +6741,13 @@ def _run_profile_search(
         spec,
         query,
         manifest_sha256,
+        selected_layout,
     )
     result_root = output_root / _profile_search_relpath(
         spec,
         query,
         search_identity,
+        selected_layout,
     )
     reusable = _load_reusable_profile_search(result_root, search_identity)
     if reusable is not None:
@@ -6559,54 +6757,36 @@ def _run_profile_search(
     result_root.mkdir(parents=True, exist_ok=True)
     _append_log(
         log_path,
-        f"Searching {spec.profile_id} for a {len(query)}-residue query",
+        f"Searching {spec.profile_id} {selected_layout} for a "
+        f"{len(query)}-residue query",
     )
-    database_path = (
-        profile_root / "shards" / spec.source_filename
-    ).as_posix() + f"@{spec.shard_count}"
     started = perf_counter()
     try:
-        if spec.polymer == "protein":
-            jackhmmer = import_module("alphafold3.data.tools.jackhmmer")
-            tool = jackhmmer.Jackhmmer(
-                binary_path=JACKHMMER_BINARY_PATH,
-                database_path=database_path,
-                n_cpu=PRODUCTION_SEARCH_N_CPU,
-                n_iter=1,
-                e_value=JACKHMMER_E_VALUE,
-                z_value=spec.search_space_value,
-                dom_z_value=spec.search_space_value,
-                max_sequences=spec.max_sequences,
-                filter_f1=JACKHMMER_FILTER_F1,
-                filter_f2=JACKHMMER_FILTER_F2,
-                filter_f3=JACKHMMER_FILTER_F3,
-                max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
-            )
-        else:
-            nhmmer = import_module("alphafold3.data.tools.nhmmer")
-            tool = nhmmer.Nhmmer(
-                binary_path=NHMMER_BINARY_PATH,
-                hmmalign_binary_path=HMMALIGN_BINARY_PATH,
-                hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
-                database_path=database_path,
-                n_cpu=PRODUCTION_SEARCH_N_CPU,
-                e_value=1e-3,
-                z_value=spec.search_space_value,
-                max_sequences=spec.max_sequences,
-                filter_f3=1e-5,
-                alphabet="rna",
-                max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
-            )
-        result = tool.query(query)
-        a3m = result.a3m
+        a3m, raw_tblouts = _execute_profile_database_search(
+            spec,
+            query,
+            selected_layout,
+            profile_root,
+        )
         if not isinstance(a3m, str) or not a3m.startswith(">query\n"):
             raise ValueError("Pinned MSA wrapper returned an invalid A3M")
+        hit_rows = (
+            _normalized_hit_rows(a3m, raw_tblouts)
+            if spec.polymer == "protein"
+            else _normalized_rna_hit_rows(a3m, raw_tblouts)
+        )
         result_bytes = a3m.encode()
+        hits_bytes = _normalized_hits_parquet(hit_rows)
         elapsed_seconds = perf_counter() - started
         result_record = {
             "path": "result.a3m",
             "size_bytes": len(result_bytes),
             "sha256": hashlib.sha256(result_bytes).hexdigest(),
+        }
+        hits_record = {
+            "path": "hits.parquet",
+            "size_bytes": len(hits_bytes),
+            "sha256": hashlib.sha256(hits_bytes).hexdigest(),
         }
         metrics: dict[str, object] = {
             "schema_version": 1,
@@ -6614,15 +6794,28 @@ def _run_profile_search(
             "database_id": spec.database_id,
             "profile_id": spec.profile_id,
             "profile_manifest_sha256": manifest_sha256,
+            "layout": selected_layout,
             "search_identity": search_identity,
             "sequence_sha256": hashlib.sha256(query.encode()).hexdigest(),
             "sequence_length": len(query),
             "elapsed_seconds": elapsed_seconds,
-            "parameters": _production_search_parameters(spec),
+            "parameters": _production_search_parameters(
+                spec,
+                selected_layout,
+            ),
+            "hit_rows": len(hit_rows),
             "result": result_record,
+            "hits": hits_record,
             "result_path": str(result_root / "result.a3m"),
+            "hits_path": str(result_root / "hits.parquet"),
         }
+        _append_log(
+            log_path,
+            f"Completed {selected_layout} search with {len(hit_rows)} hit rows "
+            f"in {elapsed_seconds:.3f} seconds",
+        )
         _write_bytes_atomic(result_root / "result.a3m", result_bytes)
+        _write_bytes_atomic(result_root / "hits.parquet", hits_bytes)
         _write_json_atomic(result_root / "metrics.json", metrics)
         BENCHMARK_OUTPUT_VOLUME.commit()
         _write_json_atomic(
@@ -6633,17 +6826,23 @@ def _run_profile_search(
                 "search_identity": search_identity,
                 "completed_at": _utc_now(),
                 "result": result_record,
+                "hits": hits_record,
             },
         )
         BENCHMARK_OUTPUT_VOLUME.commit()
         return metrics
     except Exception as exc:
+        _append_log(
+            log_path,
+            f"Failed with {type(exc).__name__}: {exc}",
+        )
         _write_json_atomic(
             result_root / "failure.json",
             {
                 "failed_at": _utc_now(),
                 "database_id": spec.database_id,
                 "profile_id": spec.profile_id,
+                "layout": selected_layout,
                 "search_identity": search_identity,
                 "error_type": type(exc).__name__,
                 "message": str(exc),
@@ -6670,7 +6869,552 @@ def search_database_profile(
     sequence: str,
 ) -> dict[str, object]:
     """Search one published experimental profile without revalidating shards."""
-    return _run_profile_search(database_id, sequence)
+    return _run_profile_search(database_id, sequence, "sharded")
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 131_072),
+    timeout=CONF.timeout,
+    max_containers=4,
+    volumes={
+        APP_INFO.source_db_dir: SOURCE_MSA_DB_VOLUME.with_mount_options(read_only=True),
+        APP_INFO.sharded_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
+            read_only=True
+        ),
+        APP_INFO.output_dir: BENCHMARK_OUTPUT_VOLUME,
+    },
+)
+def search_unsharded_database_oracle(
+    database_id: str,
+    sequence: str,
+) -> dict[str, object]:
+    """Run the matching monolithic search for current-pipeline evidence."""
+    return _run_profile_search(database_id, sequence, "monolith")
+
+
+@dataclass(frozen=True)
+class MsaOracleCase:
+    """One fixed current-pipeline versus sharded scientific gate."""
+
+    case_id: str
+    polymer: str
+    sequence: str
+    database_ids: tuple[str, ...]
+
+
+MSA_ORACLE_CASES = (
+    MsaOracleCase(
+        case_id="pembrolizumab-vh",
+        polymer="protein",
+        sequence=PEMBROLIZUMAB_VH_SEQUENCE,
+        database_ids=("uniref90", "small_bfd", "mgnify", "uniprot"),
+    ),
+    MsaOracleCase(
+        case_id="upstream-rna-25nt",
+        polymer="rna",
+        sequence=RNA_ORACLE_SEQUENCE,
+        database_ids=("rfam", "rnacentral", "ntrna"),
+    ),
+)
+
+
+def _msa_oracle_case(case_id: str) -> MsaOracleCase:
+    """Resolve one fixed scientific oracle case."""
+    for case in MSA_ORACLE_CASES:
+        if case.case_id == case_id:
+            return case
+    choices = ", ".join(case.case_id for case in MSA_ORACLE_CASES)
+    raise ValueError(f"Unknown oracle_case {case_id!r}; expected one of {choices}")
+
+
+def _msa_oracle_plan(case_id: str) -> dict[str, object]:
+    """Build a side-effect-free monolith-versus-sharded validation plan."""
+    case = _msa_oracle_case(case_id)
+    return {
+        "operation": "validate-oracle",
+        "case_id": case.case_id,
+        "polymer": case.polymer,
+        "sequence_length": len(case.sequence),
+        "sequence_sha256": hashlib.sha256(case.sequence.encode()).hexdigest(),
+        "database_ids": list(case.database_ids),
+        "remote_calls": len(case.database_ids) * 2 + 1,
+        "batches": [
+            {
+                "layout": "monolith",
+                "workers": len(case.database_ids),
+                "maximum_concurrent_workers": 4,
+            },
+            {
+                "layout": "sharded",
+                "workers": len(case.database_ids),
+                "maximum_concurrent_workers": 4,
+            },
+            {
+                "operation": "assemble-and-compare",
+                "workers": 1,
+            },
+        ],
+        "search_resources_per_worker": {
+            "cpu": [0.125, 32.125],
+            "memory_mib": [1024, 131_072],
+            "monolith_hmmer_cpus": ORACLE_MONOLITH_N_CPU,
+            "sharded_hmmer_cpus": PRODUCTION_SEARCH_N_CPU,
+            "sharded_active_shards": PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
+        },
+        "scientific_gate": {
+            "per_database": [
+                "hit identities",
+                "E-values",
+                "bit scores",
+                "aligned sequences",
+            ],
+            "final_fields": (
+                ["unpairedMsa", "pairedMsa"]
+                if case.polymer == "protein"
+                else ["unpairedMsa"]
+            ),
+            "equal_score_permutations": "equivalent",
+            "rna_requires_non_query_monolithic_hit": case.polymer == "rna",
+        },
+        "inference": False,
+        "template_search": False,
+        "output_volume": OUTPUT_VOLUME_NAME,
+    }
+
+
+def _read_profile_search_evidence(
+    result: dict[str, object],
+    *,
+    expected_spec: DatabaseProfileSpec,
+    expected_layout: str,
+) -> tuple[str, list[dict[str, object]]]:
+    """Read one worker's result and normalized hits from the output Volume."""
+    if result.get("database_id") != expected_spec.database_id:
+        raise ValueError("Oracle search result database ID differs")
+    if result.get("profile_id") != expected_spec.profile_id:
+        raise ValueError("Oracle search result Profile ID differs")
+    if result.get("layout") != expected_layout:
+        raise ValueError("Oracle search result layout differs")
+    search_identity = result.get("search_identity")
+    result_path_value = result.get("result_path")
+    hits_path_value = result.get("hits_path")
+    if (
+        not isinstance(search_identity, str)
+        or not isinstance(result_path_value, str)
+        or not isinstance(hits_path_value, str)
+    ):
+        raise ValueError("Oracle search result paths are invalid")
+
+    output_root = Path(APP_INFO.output_dir).resolve()
+    result_path = Path(result_path_value).resolve()
+    hits_path = Path(hits_path_value).resolve()
+    if not result_path.is_relative_to(output_root) or not hits_path.is_relative_to(
+        output_root
+    ):
+        raise ValueError("Oracle search result escapes the output Volume")
+    _require_regular_file(result_path)
+    _require_regular_file(hits_path)
+    a3m = result_path.read_text(encoding="utf-8")
+
+    import polars as pl
+
+    hit_rows = pl.read_parquet(hits_path).to_dicts()
+    return a3m, hit_rows
+
+
+def _compare_profile_hit_rows(
+    spec: DatabaseProfileSpec,
+    oracle_rows: list[dict[str, object]],
+    candidate_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    """Compare one database while allowing only characterized tail effects."""
+    oracle_unique = _unique_hit_rows(oracle_rows)
+    candidate_unique = _unique_hit_rows(candidate_rows)
+    oracle_ids = [str(row["target_id"]) for row in oracle_unique]
+    candidate_ids = [str(row["target_id"]) for row in candidate_unique]
+    top_width = min(100, max(len(oracle_ids), len(candidate_ids)))
+    top_hits_exact = oracle_ids[:top_width] == candidate_ids[:top_width]
+    top_hits_tie_equivalent = _top_hits_tie_equivalent(
+        oracle_unique[:top_width],
+        candidate_unique[:top_width],
+    )
+    oracle_by_id = {str(row["target_id"]): row for row in oracle_unique}
+    candidate_by_id = {str(row["target_id"]): row for row in candidate_unique}
+    shared_ids = set(oracle_by_id) & set(candidate_by_id)
+    score_mismatches = sorted(
+        target_id
+        for target_id in shared_ids
+        if (
+            oracle_by_id[target_id]["e_value_text"],
+            oracle_by_id[target_id]["bit_score_text"],
+        )
+        != (
+            candidate_by_id[target_id]["e_value_text"],
+            candidate_by_id[target_id]["bit_score_text"],
+        )
+    )
+    sequence_mismatches = sorted(
+        target_id
+        for target_id in shared_ids
+        if oracle_by_id[target_id]["normalized_sequence_sha256"]
+        != candidate_by_id[target_id]["normalized_sequence_sha256"]
+    )
+    oracle_set = set(oracle_ids)
+    candidate_set = set(candidate_ids)
+    union = oracle_set | candidate_set
+    overlap = len(oracle_set & candidate_set) / len(union) if union else 1.0
+    oracle_only = [
+        target_id for target_id in oracle_ids if target_id not in candidate_set
+    ]
+    candidate_only = [
+        target_id for target_id in candidate_ids if target_id not in oracle_set
+    ]
+    candidate_duplicate_rows = len(candidate_rows) - len(candidate_unique)
+    both_reached_limit = (
+        len(oracle_rows) == spec.max_sequences - 1
+        and len(candidate_rows) == spec.max_sequences - 1
+    )
+    oracle_positions = {
+        target_id: position for position, target_id in enumerate(oracle_ids, start=1)
+    }
+    oracle_tail_start = len(oracle_ids) - candidate_duplicate_rows + 1
+    duplicate_tail_only = (
+        bool(oracle_only)
+        and not candidate_only
+        and both_reached_limit
+        and 0 < candidate_duplicate_rows <= spec.shard_count
+        and all(
+            oracle_positions[target_id] >= oracle_tail_start
+            for target_id in oracle_only
+        )
+        and any(row.get("cross_shard_duplicate") is True for row in candidate_rows)
+    )
+    identifiers_equivalent = (
+        not oracle_only and not candidate_only
+    ) or duplicate_tail_only
+    full_order_tie_equivalent = (
+        not oracle_only
+        and not candidate_only
+        and _top_hits_tie_equivalent(oracle_unique, candidate_unique)
+    )
+    order_equivalent = (
+        full_order_tie_equivalent
+        if not oracle_only and not candidate_only
+        else top_hits_tie_equivalent and duplicate_tail_only
+    )
+    passed = (
+        order_equivalent
+        and not score_mismatches
+        and not sequence_mismatches
+        and overlap >= 0.99
+        and identifiers_equivalent
+    )
+    return {
+        "database_id": spec.database_id,
+        "passed": passed,
+        "top_comparison_width": top_width,
+        "top_hits_exact": top_hits_exact,
+        "top_hits_tie_equivalent": top_hits_tie_equivalent,
+        "top_order_differs_only_within_ties": (
+            top_hits_tie_equivalent and not top_hits_exact
+        ),
+        "full_order_tie_equivalent": full_order_tie_equivalent,
+        "oracle_hit_rows": len(oracle_rows),
+        "candidate_hit_rows": len(candidate_rows),
+        "oracle_unique_hits": len(oracle_ids),
+        "candidate_unique_hits": len(candidate_ids),
+        "full_unique_hit_jaccard": overlap,
+        "score_mismatch_count": len(score_mismatches),
+        "score_mismatch_ids": score_mismatches,
+        "sequence_mismatch_count": len(sequence_mismatches),
+        "sequence_mismatch_ids": sequence_mismatches,
+        "oracle_only_ids": oracle_only,
+        "candidate_only_ids": candidate_only,
+        "candidate_duplicate_hit_rows": candidate_duplicate_rows,
+        "both_results_reached_hit_limit": both_reached_limit,
+        "differences_characterized_as_duplicate_tail": duplicate_tail_only,
+    }
+
+
+def _compare_final_a3m(oracle: str, candidate: str) -> dict[str, object]:
+    """Compare final upstream-assembled A3Ms modulo record permutation."""
+    from collections import Counter
+
+    oracle_records = _parse_a3m_records(oracle)
+    candidate_records = _parse_a3m_records(candidate)
+    query_equal = oracle_records[0] == candidate_records[0]
+    aligned_record_multiset_equal = Counter(oracle_records[1:]) == Counter(
+        candidate_records[1:]
+    )
+    return {
+        "passed": query_equal and aligned_record_multiset_equal,
+        "byte_exact": oracle == candidate,
+        "query_equal": query_equal,
+        "aligned_record_multiset_equal": aligned_record_multiset_equal,
+        "oracle_depth": len(oracle_records),
+        "candidate_depth": len(candidate_records),
+        "order_differs_only": (
+            oracle != candidate and query_equal and aligned_record_multiset_equal
+        ),
+    }
+
+
+def _assert_pinned_msa_assembly_contract() -> dict[str, str]:
+    """Bind the local assembly adapter to the pinned upstream function bodies."""
+    import inspect
+    from importlib import import_module
+
+    pipeline = import_module("alphafold3.data.pipeline")
+    msa_module = import_module("alphafold3.data.msa")
+    protein_source = inspect.getsource(
+        pipeline._get_protein_msa_and_templates  # noqa: SLF001
+    )
+    rna_source = inspect.getsource(pipeline._get_rna_msa)  # noqa: SLF001
+    compact_protein = re.sub(r"\s+", "", protein_source)
+    compact_rna = re.sub(r"\s+", "", rna_source)
+    required_protein = (
+        "msas=[uniref90_msa,small_bfd_msa,mgnify_msa],deduplicate=True",
+        "msas=[uniprot_msa],deduplicate=False",
+    )
+    required_rna = "msas=[rfam_msa,rnacentral_msa,nt_rna_msa],deduplicate=True"
+    if not all(pattern in compact_protein for pattern in required_protein):
+        raise RuntimeError("Pinned protein MSA assembly contract changed")
+    if required_rna not in compact_rna:
+        raise RuntimeError("Pinned RNA MSA assembly contract changed")
+    get_msa_source = inspect.getsource(msa_module.get_msa)
+    deduplicate_parameter = inspect.signature(msa_module.get_msa).parameters.get(
+        "deduplicate"
+    )
+    if (
+        deduplicate_parameter is None
+        or deduplicate_parameter.default is not False
+        or "deduplicate=deduplicate" not in re.sub(r"\s+", "", get_msa_source)
+    ):
+        raise RuntimeError("Pinned per-database MSA deduplication contract changed")
+    return {
+        "protein_function_sha256": hashlib.sha256(protein_source.encode()).hexdigest(),
+        "rna_function_sha256": hashlib.sha256(rna_source.encode()).hexdigest(),
+        "get_msa_function_sha256": hashlib.sha256(get_msa_source.encode()).hexdigest(),
+    }
+
+
+def _assemble_current_pipeline_msas(
+    case: MsaOracleCase,
+    database_a3ms: dict[str, str],
+) -> dict[str, str]:
+    """Apply the exact pinned upstream database order and deduplication."""
+    from importlib import import_module
+
+    msa = import_module("alphafold3.data.msa")
+    mmcif_names = import_module("alphafold3.constants.mmcif_names")
+    if case.polymer == "protein":
+        unpaired = msa.Msa.from_multiple_a3ms(
+            a3ms=[
+                database_a3ms["uniref90"],
+                database_a3ms["small_bfd"],
+                database_a3ms["mgnify"],
+            ],
+            chain_poly_type=mmcif_names.PROTEIN_CHAIN,
+            deduplicate=True,
+        ).to_a3m()
+        paired = msa.Msa.from_multiple_a3ms(
+            a3ms=[database_a3ms["uniprot"]],
+            chain_poly_type=mmcif_names.PROTEIN_CHAIN,
+            deduplicate=False,
+        ).to_a3m()
+        return {"unpairedMsa": unpaired, "pairedMsa": paired}
+    unpaired = msa.Msa.from_multiple_a3ms(
+        a3ms=[
+            database_a3ms["rfam"],
+            database_a3ms["rnacentral"],
+            database_a3ms["ntrna"],
+        ],
+        chain_poly_type=mmcif_names.RNA_CHAIN,
+        deduplicate=True,
+    ).to_a3m()
+    return {"unpairedMsa": unpaired}
+
+
+def _oracle_fold_input(
+    case: MsaOracleCase,
+    msa_fields: dict[str, str],
+    *,
+    name: str,
+) -> dict[str, object]:
+    """Create the MSA-bearing JSON produced by the current data stage."""
+    chain: dict[str, object] = {
+        "id": "A",
+        "sequence": case.sequence,
+        **msa_fields,
+    }
+    if case.polymer == "protein":
+        chain["templates"] = []
+    return {
+        "name": name,
+        "modelSeeds": [1],
+        "sequences": [{case.polymer: chain}],
+        "dialect": "alphafold3",
+        "version": 1,
+    }
+
+
+def _run_msa_oracle_comparison(
+    case_id: str,
+    monolith_results: list[dict[str, object]],
+    sharded_results: list[dict[str, object]],
+) -> dict[str, object]:
+    """Assemble current-pipeline fields and publish one scientific verdict."""
+    case = _msa_oracle_case(case_id)
+    if len(monolith_results) != len(case.database_ids) or len(sharded_results) != len(
+        case.database_ids
+    ):
+        raise ValueError("Oracle comparison received an incomplete search set")
+    BENCHMARK_OUTPUT_VOLUME.reload()
+    contract = _assert_pinned_msa_assembly_contract()
+    monolith_a3ms: dict[str, str] = {}
+    sharded_a3ms: dict[str, str] = {}
+    database_comparisons: dict[str, dict[str, object]] = {}
+    search_identities: dict[str, dict[str, str]] = {}
+    monolith_non_query_hits = 0
+    for database_id, monolith_result, sharded_result in zip(
+        case.database_ids,
+        monolith_results,
+        sharded_results,
+        strict=True,
+    ):
+        spec = _database_profile_spec(database_id)
+        monolith_a3m, monolith_hits = _read_profile_search_evidence(
+            monolith_result,
+            expected_spec=spec,
+            expected_layout="monolith",
+        )
+        sharded_a3m, sharded_hits = _read_profile_search_evidence(
+            sharded_result,
+            expected_spec=spec,
+            expected_layout="sharded",
+        )
+        monolith_a3ms[database_id] = monolith_a3m
+        sharded_a3ms[database_id] = sharded_a3m
+        monolith_non_query_hits += len(monolith_hits)
+        database_comparisons[database_id] = _compare_profile_hit_rows(
+            spec,
+            monolith_hits,
+            sharded_hits,
+        )
+        monolith_identity = monolith_result.get("search_identity")
+        sharded_identity = sharded_result.get("search_identity")
+        if not isinstance(monolith_identity, str) or not isinstance(
+            sharded_identity,
+            str,
+        ):
+            raise ValueError("Oracle search identity is invalid")
+        search_identities[database_id] = {
+            "monolith": monolith_identity,
+            "sharded": sharded_identity,
+        }
+
+    monolith_fields = _assemble_current_pipeline_msas(case, monolith_a3ms)
+    sharded_fields = _assemble_current_pipeline_msas(case, sharded_a3ms)
+    final_comparisons = {
+        field: _compare_final_a3m(monolith_fields[field], sharded_fields[field])
+        for field in monolith_fields
+    }
+    rna_hit_gate = case.polymer != "rna" or monolith_non_query_hits > 0
+    passed = (
+        rna_hit_gate
+        and all(
+            comparison["passed"] is True for comparison in database_comparisons.values()
+        )
+        and all(
+            comparison["passed"] is True for comparison in final_comparisons.values()
+        )
+    )
+    oracle_identity = _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "case_id": case.case_id,
+            "sequence": case.sequence,
+            "search_identities": search_identities,
+            "assembly_contract": contract,
+        })
+    )
+    sequence_hash = hashlib.sha256(case.sequence.encode()).hexdigest()
+    output_root = (
+        Path(APP_INFO.output_dir)
+        / "production-candidates"
+        / "oracles"
+        / case.case_id
+        / sequence_hash[:2]
+        / sequence_hash
+        / oracle_identity
+    )
+    oracle_input = _oracle_fold_input(
+        case,
+        monolith_fields,
+        name=f"{case.case_id}-unsharded",
+    )
+    candidate_input = _oracle_fold_input(
+        case,
+        sharded_fields,
+        name=f"{case.case_id}-sharded",
+    )
+    summary: dict[str, object] = {
+        "schema_version": 1,
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "case_id": case.case_id,
+        "polymer": case.polymer,
+        "sequence_sha256": sequence_hash,
+        "oracle_identity": oracle_identity,
+        "search_identities": search_identities,
+        "assembly_contract": contract,
+        "database_comparisons": database_comparisons,
+        "final_msa_comparisons": final_comparisons,
+        "monolith_non_query_hits": monolith_non_query_hits,
+        "rna_non_query_hit_gate_passed": rna_hit_gate,
+        "completed_at": _utc_now(),
+        "output_path": str(output_root),
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(output_root / "unsharded-current-pipeline.json", oracle_input)
+    _write_json_atomic(output_root / "sharded-candidate.json", candidate_input)
+    _write_json_atomic(output_root / "summary.json", summary)
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    _write_json_atomic(
+        output_root / "done.json",
+        {
+            "schema_version": 1,
+            "status": "complete",
+            "oracle_identity": oracle_identity,
+            "scientific_gate_passed": passed,
+            "completed_at": _utc_now(),
+        },
+    )
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    return summary
+
+
+@app.function(
+    cpu=2,
+    memory=4096,
+    timeout=1_800,
+    max_containers=1,
+    volumes={
+        APP_INFO.output_dir: BENCHMARK_OUTPUT_VOLUME,
+    },
+)
+def compare_msa_profile_oracle(
+    case_id: str,
+    monolith_results: list[dict[str, object]],
+    sharded_results: list[dict[str, object]],
+) -> dict[str, object]:
+    """Assemble and compare one fixed protein or RNA oracle."""
+    return _run_msa_oracle_comparison(
+        case_id,
+        monolith_results,
+        sharded_results,
+    )
 
 
 @app.local_entrypoint()
@@ -6682,12 +7426,13 @@ def submit_alphafold3_msa_task(
     database_id: str = "small_bfd",
     source_policy: str = "keep",
     sequence: str = "",
+    oracle_case: str = "pembrolizumab-vh",
 ) -> None:
     """Plan or submit one isolated AlphaFold 3 MSA benchmark operation.
 
     Args:
         operation: Operation to plan or run: ``prepare``, ``build-profile``,
-            ``search-profile``, ``scan``, or ``search``.
+            ``search-profile``, ``validate-oracle``, ``scan``, or ``search``.
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
         seqkit_threads: SeqKit thread count for profile preparation, default 8.
@@ -6695,6 +7440,7 @@ def submit_alphafold3_msa_task(
         database_id: Fixed database ID for production-candidate operations.
         source_policy: Post-validation source action: keep, compress, or delete.
         sequence: Optional profile-search query; defaults by polymer type.
+        oracle_case: Fixed scientific comparison case.
     """
     if operation == "prepare":
         plan = _build_prepare_plan(seqkit_threads)
@@ -6706,6 +7452,8 @@ def submit_alphafold3_msa_task(
         )
     elif operation == "search-profile":
         plan = _production_search_plan(database_id, sequence)
+    elif operation == "validate-oracle":
+        plan = _msa_oracle_plan(oracle_case)
     elif operation == "scan":
         plan = _build_scan_plan()
     elif operation == "search":
@@ -6713,7 +7461,7 @@ def submit_alphafold3_msa_task(
     else:
         raise ValueError(
             "operation must be 'prepare', 'build-profile', 'search-profile', "
-            "'scan', or 'search'"
+            "'validate-oracle', 'scan', or 'search'"
         )
     print(_json_bytes(plan).decode(), end="")
     if not submit:
@@ -6739,6 +7487,22 @@ def submit_alphafold3_msa_task(
         result = search_database_profile.remote(
             database_id=database_id,
             sequence=query,
+        )
+    elif operation == "validate-oracle":
+        case = _msa_oracle_case(oracle_case)
+        inputs = [(database_id, case.sequence) for database_id in case.database_ids]
+        print(
+            "🧬 Submitting the fixed monolithic current-pipeline "
+            f"{case.case_id} searches..."
+        )
+        monolith_results = list(search_unsharded_database_oracle.starmap(inputs))
+        print(f"🧬 Submitting the fixed sharded {case.case_id} searches...")
+        sharded_results = list(search_database_profile.starmap(inputs))
+        print("🧬 Submitting the upstream assembly and scientific comparison...")
+        result = compare_msa_profile_oracle.remote(
+            case_id=case.case_id,
+            monolith_results=monolith_results,
+            sharded_results=sharded_results,
         )
     elif operation == "scan":
         print("🧬 Submitting the sequential Volume scan matrix...")

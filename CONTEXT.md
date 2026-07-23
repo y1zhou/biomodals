@@ -170,6 +170,10 @@ _Avoid_: PDB/mmCIF reference store, raw database MSA, missing result
 An AlphaFold input whose protein and RNA search fields are all explicit, using searched evidence, non-empty caller-supplied values, or deliberate empty sentinels according to the selected search policy. It is ready for inference without rerunning AlphaFold's data pipeline.
 _Avoid_: raw input, model features, partially populated search fields
 
+**Caller-Supplied Search Evidence**:
+Non-empty MSA or template data supplied for one request, either inline or materialized from a caller path. It may contribute to an Enriched AlphaFold Input but never becomes shared canonical search evidence.
+_Avoid_: raw database MSA, combined MSA publication, template search result
+
 **AlphaFold Run Root**:
 The job-scoped directory on the AlphaFold3 output Volume that makes staged caller inputs available to remote functions and durably owns that job's inference outputs, logs, and completion state.
 _Avoid_: MSA cache root, database Volume, local download directory

@@ -154,6 +154,14 @@ _Avoid_: raw input, model features, partially populated search fields
 The job-scoped directory on the AlphaFold3 output Volume that makes staged caller inputs available to remote functions and durably owns that job's inference outputs, logs, and completion state.
 _Avoid_: MSA cache root, database Volume, local download directory
 
+**Inference Run Identity**:
+The stable digest that groups predictions for one Enriched AlphaFold Input and one set of seed-independent inference settings. Model seeds are deliberately excluded so additional seeds can publish beneath the same AlphaFold Run Root.
+_Avoid_: sequence hash, model seed, display name
+
+**Seed Prediction**:
+The independently complete inference output for one model seed beneath an AlphaFold Run Root. Diffusion samples for that seed belong to the same Seed Prediction.
+_Avoid_: inference run identity, container part, combined top-level output
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

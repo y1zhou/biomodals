@@ -142,6 +142,10 @@ _Avoid_: raw database MSA, simple FASTA concatenation
 The AlphaFold-ready paired protein alignment assembled from the UniProt Raw Database MSA without deduplication. RNA inputs have no paired MSA.
 _Avoid_: combined unpaired MSA, RNA MSA
 
+**Template Search Result**:
+A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and one template-reference snapshot. An empty list is a complete result and is distinct from an unfinished search.
+_Avoid_: PDB/mmCIF reference store, raw database MSA, missing result
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

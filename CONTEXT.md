@@ -131,7 +131,7 @@ A unique biological sequence that requires database-generated MSA evidence and m
 _Avoid_: chain identifier, duplicate homomer chain
 
 **Raw Database MSA**:
-A validated per-database MSA result produced for one MSA Search Subject before AlphaFold combines database results.
+A validated result of searching one MSA Search Subject against one reference database profile. It is independently complete and reusable before AlphaFold constructs combined unpaired or paired MSAs.
 _Avoid_: combined unpaired MSA, paired MSA, benchmark summary
 
 **Search Identity**:

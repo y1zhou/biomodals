@@ -514,11 +514,14 @@ Every archive member uses ZIP's stored method so byte identity does not depend
 on the host zlib implementation.
 
 Each completed Job also persists the positive Result archive schema version
-used for its publication. Cache reconstruction dispatches only to a retained
-builder for that exact Tool/schema pair; it never rebuilds an older Result with
-the current writer by assumption. If that builder is unavailable, the Result
-moves to `blocked/result_integrity` and remains recoverable from its published
-Modal ZIP.
+used for its publication. Before the first release, finalization and
+reconstruction support only the current archive schema; archive-schema changes
+follow the accepted fresh-state policy. A completed Job can still stream its
+recorded published Modal ZIP while that ZIP and marker remain available, but
+the pre-release service does not retain older builders or validators. Starting
+with the first release, reconstruction must dispatch to a retained builder for
+the exact Tool/schema pair and must never rebuild an older Result with the
+current writer by assumption.
 
 The GROMACS Result ZIP has exactly three top-level entries or namespaces:
 `input.pdb`, `outputs/`, and `metadata/`. `outputs/` contains the files useful

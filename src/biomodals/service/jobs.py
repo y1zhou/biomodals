@@ -175,10 +175,11 @@ def _job_stage(
     )
 
 
-def _job_stage_history(
+def job_stage_history(
     record: JobRecord,
     history: Sequence[JobStageRecord],
 ) -> list[JobStageView]:
+    """Project durable operation events into safe public Stage views."""
     if record.workload not in WORKLOAD_DEFINITIONS:
         return []
     return [
@@ -304,7 +305,7 @@ class JobView(BaseModel):
             state=record.state,
             stage=_job_stage(record, stage_history),
             active_stages=active_stages,
-            stage_history=_job_stage_history(record, stage_history),
+            stage_history=job_stage_history(record, stage_history),
             created_at=datetime.fromtimestamp(record.created_at, UTC),
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),
             completed_at=(

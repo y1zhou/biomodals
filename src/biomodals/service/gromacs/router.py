@@ -6,7 +6,6 @@ import hashlib
 import logging
 import re
 import time
-import unicodedata
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Protocol
@@ -22,10 +21,15 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.auth import AuthenticatedSession
+from biomodals.service.gromacs.contracts import (
+    MAX_SIMULATION_TIME_NS,
+    GromacsJobOptions,
+    artifact_request_sha256,
+    gromacs_run_name,
+)
 from biomodals.service.gromacs.plan import prepare_operation
 from biomodals.service.http_contract import (
     CodedAPIError,
@@ -51,6 +55,7 @@ from biomodals.service.runtime_config import (
 )
 from biomodals.service.store import (
     IdempotencyConflictError,
+    InitialModalOperation,
     JobLimitExceededError,
     JobOperationState,
     JobRecord,
@@ -65,48 +70,7 @@ from biomodals.service.workloads import GROMACS_WORKLOAD
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
-MAX_SIMULATION_TIME_NS = 200
 LOGGER = logging.getLogger(__name__)
-_RUN_NAME_SEPARATOR = re.compile(r"[^a-z0-9]+")
-_RUN_NAME_SUFFIX = re.compile(r"[0-9a-f]{32}")
-_MAX_RUN_NAME_SLUG_LENGTH = 64
-
-
-def gromacs_run_name(display_name: str, job_id: UUID) -> str:
-    """Build a readable, path-safe name with collision-proof job identity."""
-    ascii_name = (
-        unicodedata
-        .normalize("NFKD", display_name)
-        .encode("ascii", "ignore")
-        .decode()
-        .lower()
-    )
-    slug = _RUN_NAME_SEPARATOR.sub("-", ascii_name).strip("-")
-    slug = slug[:_MAX_RUN_NAME_SLUG_LENGTH].rstrip("-")
-    return f"{slug or 'gromacs-simulation'}-{job_id.hex}"
-
-
-def is_gromacs_run_name(value: str) -> bool:
-    """Return whether a service-generated GROMACS run name is path-safe."""
-    slug, separator, suffix = value.rpartition("-")
-    return bool(
-        separator
-        and 1 <= len(slug) <= _MAX_RUN_NAME_SLUG_LENGTH
-        and _RUN_NAME_SEPARATOR.sub("-", slug) == slug
-        and not slug.startswith("-")
-        and not slug.endswith("-")
-        and _RUN_NAME_SUFFIX.fullmatch(suffix)
-    )
-
-
-class GromacsJobOptions(BaseModel):
-    """Bounded GROMACS settings accepted from the browser."""
-
-    model_config = ConfigDict(frozen=True)
-
-    simulation_time_ns: int = Field(default=5, ge=1, le=MAX_SIMULATION_TIME_NS)
-    run_pdbfixer: bool = False
-    cpu_only: bool = False
 
 
 class PdbInvalidResponse(CodedErrorResponse):
@@ -190,15 +154,20 @@ def _request_identity(
     *,
     display_identity: str,
     options: GromacsJobOptions,
-) -> tuple[str, str]:
-    encoded = orjson.dumps(options.model_dump(), option=orjson.OPT_SORT_KEYS)
+) -> tuple[str, str, str]:
+    parameters_json = options.model_dump_json()
+    encoded = parameters_json.encode()
     encoded_display_identity = orjson.dumps({"display_name": display_identity})
     digest = hashlib.sha256()
     digest.update(len(pdb_content).to_bytes(8, "big"))
     digest.update(pdb_content)
     digest.update(encoded)
     digest.update(encoded_display_identity)
-    return digest.hexdigest(), encoded.decode()
+    return (
+        digest.hexdigest(),
+        parameters_json,
+        artifact_request_sha256(pdb_content, parameters_json),
+    )
 
 
 def create_router(
@@ -247,7 +216,7 @@ def create_router(
             else None
         )
         normalized_name = _display_name(pdb.filename, normalized_supplied_name)
-        request_hash, parameters_json = _request_identity(
+        request_hash, parameters_json, artifact_digest = _request_identity(
             pdb_content,
             display_identity=(
                 normalized_supplied_name or _filename_display_identity(pdb.filename)
@@ -258,6 +227,14 @@ def create_router(
         configuration: RuntimeConfiguration = request.app.state.configuration
         admission_configuration = configuration.admission_configuration("gromacs")
         now = int(time.time())
+        new_job_id = uuid4()
+        operation = prepare_operation(cpu_only=options.cpu_only)
+        submission_token = uuid4().hex
+        initial_operation = InitialModalOperation(
+            operation=operation,
+            run_name=gromacs_run_name(normalized_name, new_job_id),
+            submission_token=submission_token,
+        )
         try:
             admission = store.admit_job(
                 owner_user_id=session.principal.user_id,
@@ -265,8 +242,11 @@ def create_router(
                 idempotency_key=str(idempotency_key),
                 request_hash=request_hash,
                 parameters_json=parameters_json,
+                artifact_request_sha256=artifact_digest,
                 configuration=admission_configuration,
                 now=now,
+                new_job_id=new_job_id,
+                initial_operation=initial_operation,
             )
         except IdempotencyConflictError as exc:
             raise CodedAPIError(409, "idempotency_conflict", str(exc)) from exc
@@ -295,7 +275,6 @@ def create_router(
             admission.job.display_name,
             admission.job.job_id,
         )
-        operation = prepare_operation(cpu_only=options.cpu_only)
         submitter = ModalJobSubmitter(store, lifecycle_locks)
 
         async def spawn(claimed_job: JobRecord) -> SubmittedModalOperation:
@@ -311,9 +290,12 @@ def create_router(
                 admission.job,
                 operation=operation,
                 run_name=run_name,
-                submission_token=uuid4().hex,
+                submission_token=(
+                    submission_token if admission.created else uuid4().hex
+                ),
                 spawn=spawn,
                 cancel=adapter.cancel,
+                operation_preclaimed=admission.created,
             )
         except Exception as exc:
             LOGGER.exception(

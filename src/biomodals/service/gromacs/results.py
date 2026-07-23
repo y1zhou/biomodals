@@ -26,12 +26,12 @@ from biomodals.service.gromacs.archive import (
     validate_gromacs_archive,
     write_gromacs_archive,
 )
+from biomodals.service.gromacs.contracts import is_gromacs_run_name
 from biomodals.service.gromacs.provider import (
     DEFINITE_SUBMISSION_ERRORS,
     MODAL_SERVICE_ERRORS,
 )
-from biomodals.service.gromacs.router import is_gromacs_run_name
-from biomodals.service.jobs import JobView
+from biomodals.service.jobs import job_stage_history
 from biomodals.service.store import JobRecord, JobState
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -270,7 +270,7 @@ class ModalGromacsResults:
 
         stages = [
             stage.model_dump(mode="json")
-            for stage in JobView.from_record(job).stage_history
+            for stage in job_stage_history(job, job.stage_history)
         ]
         if stages and stages[-1]["code"] == "prepare_result":
             stages[-1]["ended_at"] = time.strftime(
@@ -279,7 +279,7 @@ class ModalGromacsResults:
             )
             stages[-1]["outcome"] = "completed"
         try:
-            return await write_gromacs_archive(
+            built = await write_gromacs_archive(
                 handle,
                 run_name=job.run_name,
                 parameters_json=job.parameters_json,
@@ -299,6 +299,14 @@ class ModalGromacsResults:
             )
         except ValueError as exc:
             raise GromacsResultInvalidError(str(exc)) from exc
+        if (
+            job.artifact_request_sha256 is None
+            or built.request_sha256 != job.artifact_request_sha256
+        ):
+            raise GromacsResultInvalidError(
+                "GROMACS Result does not match the admitted request"
+            )
+        return built
 
     async def rebuild_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
         """Rebuild exact recorded bytes from raw outputs without compute."""
@@ -378,6 +386,11 @@ class ModalGromacsResults:
             or _SHA256.fullmatch(request_sha256) is None
         ):
             raise ValueError("GROMACS result marker is invalid")
+        if (
+            job.artifact_request_sha256 is None
+            or request_sha256 != job.artifact_request_sha256
+        ):
+            raise ValueError("GROMACS Result does not match the admitted request")
         return _ResultMarker(
             request_sha256=request_sha256,
             archive_sha256=archive_sha256,

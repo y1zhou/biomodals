@@ -16,6 +16,7 @@ from biomodals.service.artifacts import (
     ArtifactSourceMissingError,
 )
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
+from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.plan import (
     FINAL_OPERATION,
     all_operations_completed,
@@ -35,7 +36,6 @@ from biomodals.service.gromacs.results import (
     GromacsResultInvalidError,
     ResultIdentityMismatchError,
 )
-from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.store import (
     JobOperationRecord,
@@ -363,8 +363,29 @@ class GromacsReconciler:
         calls: Iterable[JobOperationRecord],
     ) -> bool:
         """Request fail-fast cancellation and report whether every call stopped."""
+        stopped, expired = await self._cancel_and_observe(job, calls)
+        if expired:
+            self.store.mark_state_unknown(
+                job.job_id,
+                reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
+                now=self._now(),
+                uncertain_operations=(call.operation for call in expired),
+            )
+            return False
+        refreshed = self.store.list_operations(job.job_id)
+        return stopped and not any(
+            call.state in {JobOperationState.SUBMITTING, JobOperationState.RUNNING}
+            for call in refreshed
+        )
+
+    async def _cancel_and_observe(
+        self,
+        job: JobRecord,
+        calls: Iterable[JobOperationRecord],
+    ) -> tuple[bool, list[JobOperationRecord]]:
+        """Cancel active calls and persist every provider-confirmed outcome."""
         stopped = True
-        status_unknown = False
+        expired: list[JobOperationRecord] = []
         for call in calls:
             if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
                 continue
@@ -388,7 +409,7 @@ class GromacsReconciler:
                 stopped = False
                 continue
             if outcome.kind == "expired":
-                status_unknown = True
+                expired.append(call)
                 continue
             self.store.record_operation_outcome(
                 job.job_id,
@@ -397,18 +418,7 @@ class GromacsReconciler:
                 outcome=JobOperationState(outcome.kind),
                 now=self._now(),
             )
-        if status_unknown:
-            self.store.mark_state_unknown(
-                job.job_id,
-                reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
-                now=self._now(),
-            )
-            return False
-        refreshed = self.store.list_operations(job.job_id)
-        return stopped and not any(
-            call.state in {JobOperationState.SUBMITTING, JobOperationState.RUNNING}
-            for call in refreshed
-        )
+        return stopped, expired
 
     async def _settle_failed_job(
         self,
@@ -457,37 +467,7 @@ class GromacsReconciler:
         calls: Iterable[JobOperationRecord],
     ) -> None:
         """Cancel every active branch without claiming an unknown outcome."""
-        expired: list[JobOperationRecord] = []
-        for call in calls:
-            if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
-                continue
-            try:
-                await self.adapter.cancel(call.modal_call_id)
-                outcome = await self.adapter.poll(
-                    call.modal_call_id,
-                    operation=call.operation,
-                )
-            except modal.exception.NotFoundError:
-                outcome = PollOutcome("expired")
-            except MODAL_SERVICE_ERRORS:
-                LOGGER.exception(
-                    "Modal is unavailable while cancelling stage %s for job %s",
-                    call.operation,
-                    job.job_id,
-                )
-                continue
-            if outcome.kind == "running":
-                continue
-            if outcome.kind == "expired":
-                expired.append(call)
-                continue
-            self.store.record_operation_outcome(
-                job.job_id,
-                operation=call.operation,
-                expected_modal_call_id=call.modal_call_id,
-                outcome=JobOperationState(outcome.kind),
-                now=self._now(),
-            )
+        _stopped, expired = await self._cancel_and_observe(job, calls)
 
         refreshed = self.store.list_operations(job.job_id)
         if expired:
@@ -531,6 +511,7 @@ class GromacsReconciler:
                 job.job_id,
                 reason=JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN,
                 now=self._now(),
+                uncertain_operations=(call.operation for call in expired),
             )
             return
         if any(

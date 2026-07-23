@@ -9,12 +9,12 @@ from typing import Literal
 
 import modal
 
+from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.plan import (
     REQUIRED_FUNCTIONS,
     modal_invocation,
     prepare_operation,
 )
-from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import JobRecord
 from biomodals.service.submission import SubmissionOutcomeUnknownError
@@ -112,30 +112,19 @@ class ModalGromacsProvider:
     ) -> SubmittedModalCall:
         """Spawn the first deployed compute stage without a remote coordinator."""
         function_name = prepare_operation(cpu_only=options.cpu_only)
-        function = self._function_resolver(
-            modal_configuration.app_name,
-            function_name,
+        return await self._spawn(
+            app_name=modal_configuration.app_name,
+            app_version=modal_configuration.app_version,
             environment_name=modal_configuration.environment,
-            version=modal_configuration.app_version,
-        )
-        try:
-            call = await function.spawn.aio(
-                pdb_content=pdb_content,
-                run_name=run_name,
-                simulation_time_ns=options.simulation_time_ns,
-                run_pdbfixer=options.run_pdbfixer,
-            )
-            modal_call_id = call.object_id
-        except DEFINITE_SUBMISSION_ERRORS:
-            raise
-        except Exception as exc:
-            raise SubmissionOutcomeUnknownError(
-                "Modal did not return a durable FunctionCall handle"
-            ) from exc
-        return SubmittedModalCall(
-            modal_call_id=modal_call_id,
-            run_name=run_name,
+            function_name=function_name,
             operation=function_name,
+            run_name=run_name,
+            kwargs={
+                "pdb_content": pdb_content,
+                "run_name": run_name,
+                "simulation_time_ns": options.simulation_time_ns,
+                "run_pdbfixer": options.run_pdbfixer,
+            },
         )
 
     async def submit_operation(
@@ -154,14 +143,36 @@ class ModalGromacsProvider:
             simulation_time_ns=options.simulation_time_ns,
         )
 
-        function = self._function_resolver(
-            job.modal_app_name,
-            invocation.function_name,
+        return await self._spawn(
+            app_name=job.modal_app_name,
+            app_version=job.modal_app_version,
             environment_name=job.modal_environment,
-            version=job.modal_app_version,
+            function_name=invocation.function_name,
+            operation=operation,
+            run_name=job.run_name,
+            kwargs=invocation.kwargs,
+        )
+
+    async def _spawn(
+        self,
+        *,
+        app_name: str,
+        app_version: int,
+        environment_name: str,
+        function_name: str,
+        operation: str,
+        run_name: str,
+        kwargs: dict[str, object],
+    ) -> SubmittedModalCall:
+        """Resolve, spawn, and classify one deployed Function invocation."""
+        function = self._function_resolver(
+            app_name,
+            function_name,
+            environment_name=environment_name,
+            version=app_version,
         )
         try:
-            call = await function.spawn.aio(**invocation.kwargs)
+            call = await function.spawn.aio(**kwargs)
             modal_call_id = call.object_id
         except DEFINITE_SUBMISSION_ERRORS:
             raise
@@ -171,7 +182,7 @@ class ModalGromacsProvider:
             ) from exc
         return SubmittedModalCall(
             modal_call_id=modal_call_id,
-            run_name=job.run_name,
+            run_name=run_name,
             operation=operation,
         )
 

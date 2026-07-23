@@ -23,14 +23,18 @@ import pytest
 
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
+from biomodals.service.gromacs.contracts import (
+    GromacsJobOptions,
+    artifact_request_sha256,
+)
 from biomodals.service.gromacs.modal import (
     ArchiveNotReadyError,
     FinalArchive,
     GromacsReconciler,
+    GromacsResultInvalidError,
     ModalGromacsAdapter,
     PollOutcome,
 )
-from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
@@ -191,7 +195,7 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
     prefix = f"production_{RUN_NAME}"
     members = {
         "input.pdb": PDB,
-        "metadata/parameters.json": b"{}\n",
+        "metadata/parameters.json": b"{}",
         "metadata/provenance.json": b"{}\n",
         "metadata/stages.json": b"[]\n",
         "metadata/run.log": b"completed\n",
@@ -448,6 +452,7 @@ def _submitted_job(
         idempotency_key=str(uuid4()),
         request_hash="request-digest",
         parameters_json="{}",
+        artifact_request_sha256=artifact_request_sha256(PDB, "{}"),
         configuration=_admission_configuration(),
         now=2,
     )
@@ -924,6 +929,27 @@ def test_service_packages_and_publishes_established_app_outputs(
         )
 
 
+def test_publication_rejects_volume_input_that_differs_from_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _store, job = _submitted_job(
+        tmp_path,
+        operation="collect_traj_stats:production_",
+    )
+    files = _established_output_files()
+    files[f"{RUN_NAME}/{RUN_NAME}.pdb"] = (
+        b"ATOM      2  CA  GLY A   1       1.000   1.000   1.000\nEND\n"
+    )
+    _install_volume(monkeypatch, files)
+
+    with pytest.raises(
+        GromacsResultInvalidError,
+        match="does not match the admitted request",
+    ):
+        asyncio.run(_adapter({}).publish_archive(job, completed_at=10))
+
+
 def test_published_archive_is_promoted_into_the_local_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1204,7 +1230,7 @@ def test_parallel_stage_failure_keeps_expired_sibling_state_unknown(
     assert unresolved.state_unknown_reason == "cancellation_outcome_unknown"
     states = {call.operation: call.state for call in store.list_operations(job.job_id)}
     assert states["collect_traj_stats:nvt_"] == JobOperationState.FAILED
-    assert states["collect_traj_stats:npt_"] == JobOperationState.RUNNING
+    assert states["collect_traj_stats:npt_"] == JobOperationState.STATE_UNKNOWN
     assert states["production_run_gpu"] == JobOperationState.CANCELLED
 
 
@@ -2044,7 +2070,30 @@ def test_expired_provider_status_is_not_reported_as_confirmed_cancellation(
     assert unresolved.state_unknown_at == 10
     assert unresolved.state_unknown_reason == "cancellation_outcome_unknown"
     assert unresolved.error_code is None
+    assert unresolved.operations[0].state == JobOperationState.STATE_UNKNOWN
     assert f"api-results/{RUN_NAME}/result.zip" not in files
+
+
+def test_recovery_rejects_archive_identity_from_another_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _store, job = _submitted_job(tmp_path)
+    archive_bytes, request_sha256 = _valid_archive_bytes()
+    mismatched = replace(job, artifact_request_sha256="0" * 64)
+    _install_volume(
+        monkeypatch,
+        {
+            f"api-results/{RUN_NAME}/result.json": _result_marker(
+                archive_bytes,
+                request_sha256,
+            ),
+            f"api-results/{RUN_NAME}/result.zip": archive_bytes,
+        },
+    )
+
+    with pytest.raises(ValueError, match="does not match the admitted request"):
+        asyncio.run(_adapter({}).recover_archive(mismatched))
 
 
 def test_expired_cancellation_retries_transient_result_recovery(

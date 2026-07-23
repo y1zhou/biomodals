@@ -1,9 +1,9 @@
 """GROMACS HTTP routes and Modal compute adapter."""
 
+from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.modal import GromacsReconciler, ModalGromacsAdapter
 from biomodals.service.gromacs.router import (
     GromacsAdapter,
-    GromacsJobOptions,
     create_registration,
     create_router,
 )

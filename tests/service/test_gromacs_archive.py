@@ -192,6 +192,28 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         }
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "content"),
+    [
+        ("rmsd", b"time_ns,rmsd\n0.0,nan\n"),
+        ("rg", b"time_ns,rg\n0.0,inf\n"),
+        ("rmsd", b"time_ns,rmsd\n0.0,0.1\n0.0,0.2\n"),
+        ("rg", b"time_ns,rg\n1.0,1.2\n0.5,1.3\n"),
+        ("rmsf", b"residue_index,rmsf\n1.5,0.2\n"),
+    ],
+)
+def test_archive_validator_rejects_invalid_analysis_axes_and_values(
+    relative_path: str,
+    content: bytes,
+) -> None:
+    remote_files = _remote_files()
+    prefix = f"production_{RUN_NAME}"
+    remote_files[f"{RUN_NAME}/{relative_path}_{prefix}.csv"] = content
+
+    with pytest.raises(ValueError, match="wrong schema"):
+        _build_archive(remote_files=remote_files)
+
+
 def test_service_preserves_remote_file_modification_times() -> None:
     prefix = f"production_{RUN_NAME}"
     remote_files = _remote_files()

@@ -4,7 +4,10 @@
 
 from uuid import UUID
 
+import pytest
+
 from biomodals.service.gromacs.plan import (
+    REQUIRED_FUNCTIONS,
     all_operations_completed,
     modal_invocation,
     operation_dependencies,
@@ -15,6 +18,7 @@ from biomodals.service.store import (
     JobOperationRecord,
     JobOperationState,
 )
+from biomodals.service.workloads import GROMACS_WORKLOAD
 
 JOB_ID = UUID("11111111-1111-4111-8111-111111111111")
 
@@ -46,6 +50,18 @@ def test_preparation_fans_out_and_production_analysis_joins_production() -> None
         "production_run_gpu": ("prepare_tpr_gpu",),
         "collect_traj_stats:production_": ("production_run_gpu",),
     }
+
+
+@pytest.mark.parametrize("cpu_only", [False, True])
+def test_every_planned_operation_has_public_stage_metadata(
+    cpu_only: bool,
+) -> None:
+    operations = operation_dependencies(cpu_only=cpu_only)
+
+    for operation_name in operations:
+        stage = GROMACS_WORKLOAD.stage(operation_name)
+        assert stage is not None
+        assert stage.function_name in REQUIRED_FUNCTIONS
 
 
 def test_ready_operations_preserve_parallel_plan_order() -> None:

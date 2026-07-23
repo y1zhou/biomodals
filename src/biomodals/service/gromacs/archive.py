@@ -17,6 +17,7 @@ import orjson
 import polars as pl
 
 from biomodals.service.artifacts import ArtifactSourceMissingError
+from biomodals.service.gromacs.contracts import artifact_request_sha256
 
 _CHUNK_SIZE = 1024 * 1024
 _SHA256_LENGTH = 64
@@ -198,6 +199,14 @@ def _validate_csv_member(
             frame.columns != list(header)
             or frame.height == 0
             or any(frame.null_count().row(0))
+            or any(not column.is_finite().all() for column in frame.iter_columns())
+        ):
+            raise ValueError
+        axis = frame.get_column(header[0])
+        if (
+            cast("float", axis.min()) < (1 if header[0] == "residue_index" else 0)
+            or axis.diff().drop_nulls().le(0).any()
+            or (header[0] == "residue_index" and axis.ne(axis.floor()).any())
         ):
             raise ValueError
     except (pl.exceptions.PolarsError, ValueError) as exc:
@@ -926,8 +935,9 @@ def validate_gromacs_archive(
     except zipfile.BadZipFile as exc:
         raise ValueError("GROMACS result archive is invalid") from exc
 
-    request_digest = hashlib.sha256()
-    request_digest.update(len(input_bytes).to_bytes(8, byteorder="big"))
-    request_digest.update(input_bytes)
-    request_digest.update(parameters_bytes)
-    return ValidatedGromacsArchive(request_sha256=request_digest.hexdigest())
+    return ValidatedGromacsArchive(
+        request_sha256=artifact_request_sha256(
+            input_bytes,
+            parameters_bytes.decode(),
+        )
+    )

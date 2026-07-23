@@ -1496,7 +1496,8 @@ def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
     client, _auth, _store, _adapter = _service(tmp_path)
 
     schema = client.get("/openapi.json").json()
-    responses = schema["paths"]["/api/v1/jobs/{job_id}/download"]["get"]["responses"]
+    operation = schema["paths"]["/api/v1/jobs/{job_id}/download"]["get"]
+    responses = operation["responses"]
     binary_zip = {"application/zip": {"schema": {"type": "string", "format": "binary"}}}
 
     assert responses["200"]["content"] == binary_zip
@@ -1511,6 +1512,16 @@ def test_openapi_documents_binary_job_download(tmp_path: Path) -> None:
     assert responses["206"]["content"] == binary_zip
     assert common_headers <= set(responses["206"]["headers"])
     assert "Content-Range" in responses["206"]["headers"]
+    range_header = next(
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["in"] == "header" and parameter["name"] == "Range"
+    )
+    assert range_header["required"] is False
+    assert range_header["schema"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
 
 
 def test_openapi_describes_conditional_job_fields(tmp_path: Path) -> None:

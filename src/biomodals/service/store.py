@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -122,7 +122,7 @@ TERMINAL_JOB_STATES = (
 )
 RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 2
+_SERVICE_SCHEMA_VERSION = 3
 _RESULT_PACKAGING_OPERATION = "result_packaging"
 _JOB_OPERATIONS_TABLE_SQL = """
 CREATE TABLE job_operations (
@@ -208,6 +208,7 @@ class JobRecord:
     idempotency_key: str
     request_hash: str
     parameters_json: str
+    artifact_request_sha256: str | None
     state: JobState
     modal_environment: str
     modal_app_name: str
@@ -327,6 +328,16 @@ class JobOperationRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class InitialModalOperation:
+    """First paid operation durably leased in the Job admission transaction."""
+
+    operation: str
+    run_name: str
+    submission_token: str
+    lease_seconds: int = 120
+
+
+@dataclass(frozen=True, slots=True)
 class WorkloadConfigurationRecord:
     """Optional database overrides for one fixed API workload."""
 
@@ -427,6 +438,7 @@ class ServiceStore:
                         idempotency_key TEXT NOT NULL,
                         request_hash TEXT NOT NULL,
                         parameters_json TEXT NOT NULL,
+                        artifact_request_sha256 TEXT,
                         state TEXT NOT NULL,
                         modal_environment TEXT NOT NULL,
                         modal_app_name TEXT NOT NULL,
@@ -1224,11 +1236,34 @@ class ServiceStore:
         idempotency_key: str,
         request_hash: str,
         parameters_json: str,
+        artifact_request_sha256: str | None = None,
         configuration: JobAdmissionConfiguration,
         now: int,
+        new_job_id: UUID | None = None,
+        initial_operation: InitialModalOperation | None = None,
     ) -> JobAdmission:
         """Atomically apply idempotency and every active Job admission limit."""
         workload = configuration.workload
+        if artifact_request_sha256 is not None and (
+            len(artifact_request_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in artifact_request_sha256
+            )
+        ):
+            raise ValueError("Artifact request SHA-256 must be lowercase hexadecimal")
+        if initial_operation is not None:
+            operation = initial_operation.operation.strip()
+            run_name = initial_operation.run_name.strip()
+            submission_token = initial_operation.submission_token.strip()
+            if not operation:
+                raise ValueError("Initial Job operation must not be empty")
+            if not run_name:
+                raise ValueError("Initial Job run name must not be empty")
+            if not submission_token:
+                raise ValueError("Initial Job submission token must not be empty")
+            if initial_operation.lease_seconds < 1:
+                raise ValueError("Initial Job lease must be positive")
         with self._transaction() as conn:
             existing = conn.execute(
                 """
@@ -1348,16 +1383,17 @@ class ServiceStore:
                     f"Global active Job limit ({global_active_job_limit}) reached"
                 )
 
-            job_id = uuid4()
+            job_id = new_job_id or uuid4()
             conn.execute(
                 """
                 INSERT INTO jobs (
                     job_id, owner_user_id, workload, display_name,
-                    idempotency_key, request_hash, parameters_json, state,
+                    idempotency_key, request_hash, parameters_json,
+                    artifact_request_sha256, state,
                     modal_environment, modal_app_name, modal_app_version,
-                    created_at, updated_at
+                    run_name, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1368,14 +1404,34 @@ class ServiceStore:
                     idempotency_key,
                     request_hash,
                     parameters_json,
+                    artifact_request_sha256,
                     JobState.QUEUED.value,
                     modal_environment.strip(),
                     modal_app_name.strip(),
                     modal_app_version,
+                    run_name if initial_operation is not None else None,
                     now,
                     now,
                 ),
             )
+            if initial_operation is not None:
+                conn.execute(
+                    """
+                    INSERT INTO job_operations (
+                        job_id, operation, ordinal, executor, modal_call_id, state,
+                        submission_token, submission_lease_until,
+                        started_at, completed_at
+                    ) VALUES (?, ?, 0, ?, NULL, ?, ?, ?, NULL, NULL)
+                    """,
+                    (
+                        str(job_id),
+                        operation,
+                        JobOperationExecutor.MODAL.value,
+                        JobOperationState.SUBMITTING.value,
+                        submission_token,
+                        now + initial_operation.lease_seconds,
+                    ),
+                )
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
@@ -1973,8 +2029,10 @@ class ServiceStore:
         *,
         reason: JobStateUnknownReason,
         now: int,
+        uncertain_operations: Iterable[str] = (),
     ) -> JobRecord:
         """Stop automation when the existence of remote work is ambiguous."""
+        uncertain = tuple(dict.fromkeys(uncertain_operations))
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1983,25 +2041,27 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             current_state = JobState(row["state"])
-            if current_state == JobState.STATE_UNKNOWN:
+            if current_state not in {
+                *PROVIDER_TRACKED_JOB_STATES,
+                JobState.STATE_UNKNOWN,
+            }:
                 return _job_from_row_with_operations(conn, row)
-            if current_state not in PROVIDER_TRACKED_JOB_STATES:
-                return _job_from_row_with_operations(conn, row)
-            conn.execute(
-                """
-                UPDATE jobs
-                SET state = ?, state_unknown_at = ?, state_unknown_reason = ?,
-                    updated_at = ?
-                WHERE job_id = ?
-                """,
-                (
-                    JobState.STATE_UNKNOWN.value,
-                    now,
-                    reason.value,
-                    now,
-                    str(job_id),
-                ),
-            )
+            if current_state != JobState.STATE_UNKNOWN:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, state_unknown_at = ?, state_unknown_reason = ?,
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        JobState.STATE_UNKNOWN.value,
+                        now,
+                        reason.value,
+                        now,
+                        str(job_id),
+                    ),
+                )
             conn.execute(
                 """
                 UPDATE job_operations
@@ -2015,6 +2075,21 @@ class ServiceStore:
                     JobOperationState.SUBMITTING.value,
                 ),
             )
+            for operation in uncertain:
+                conn.execute(
+                    """
+                    UPDATE job_operations
+                    SET state = ?, submission_token = NULL,
+                        submission_lease_until = NULL
+                    WHERE job_id = ? AND operation = ? AND state = ?
+                    """,
+                    (
+                        JobOperationState.STATE_UNKNOWN.value,
+                        str(job_id),
+                        operation,
+                        JobOperationState.RUNNING.value,
+                    ),
+                )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
@@ -2457,6 +2532,7 @@ def _job_from_row(
         idempotency_key=str(row["idempotency_key"]),
         request_hash=str(row["request_hash"]),
         parameters_json=str(row["parameters_json"]),
+        artifact_request_sha256=row["artifact_request_sha256"],
         state=JobState(row["state"]),
         modal_environment=str(row["modal_environment"]),
         modal_app_name=str(row["modal_app_name"]),

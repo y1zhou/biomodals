@@ -17,6 +17,7 @@ from biomodals.service.runtime_config import (
 )
 from biomodals.service.store import (
     IdempotencyConflictError,
+    InitialModalOperation,
     JobLimitExceededError,
     JobNotCancellableError,
     JobOperationExecutor,
@@ -139,6 +140,9 @@ def admit(
     user_limit: int = 2,
     workload_limit: int = 10,
     global_limit: int = 20,
+    new_job_id: UUID | None = None,
+    initial_operation: InitialModalOperation | None = None,
+    artifact_request_sha256: str | None = None,
 ):
     store.update_user(
         owner_user_id,
@@ -162,8 +166,11 @@ def admit(
         idempotency_key=key,
         request_hash=request_hash,
         parameters_json='{"simulation_time_ns":5}',
+        artifact_request_sha256=artifact_request_sha256,
         configuration=configuration,
         now=1_800_000_000,
+        new_job_id=new_job_id,
+        initial_operation=initial_operation,
     )
 
 
@@ -192,6 +199,45 @@ def attach_operation(
         submission_token=token,
         now=now,
     )
+
+
+def test_admission_atomically_persists_the_initial_modal_lease(
+    tmp_path: Path,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    job_id = UUID("11111111-1111-4111-8111-111111111111")
+    run_name = f"simulation-{job_id.hex}"
+    initial = InitialModalOperation(
+        operation="prepare_tpr_gpu",
+        run_name=run_name,
+        submission_token="initial-submitter",
+        lease_seconds=120,
+    )
+
+    admitted = admit(
+        store,
+        alice,
+        key="11111111-1111-4111-8111-111111111111",
+        new_job_id=job_id,
+        initial_operation=initial,
+        artifact_request_sha256="b" * 64,
+    )
+
+    assert admitted.created is True
+    assert admitted.job.job_id == job_id
+    assert admitted.job.run_name == run_name
+    assert admitted.job.artifact_request_sha256 == "b" * 64
+    assert len(admitted.job.operations) == 1
+    operation = admitted.job.operations[0]
+    assert operation.operation == "prepare_tpr_gpu"
+    assert operation.state == JobOperationState.SUBMITTING
+    assert operation.submission_token == "initial-submitter"
+    assert operation.submission_lease_until == 1_800_000_120
+
+    reopened = ServiceStore(store.path)
+    reopened.initialize()
+    persisted = reopened.get_job(alice, job_id)
+    assert persisted == admitted.job
 
 
 def test_idempotency_is_scoped_to_owner_and_payload(tmp_path: Path) -> None:

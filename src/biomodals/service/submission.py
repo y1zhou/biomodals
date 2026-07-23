@@ -10,7 +10,10 @@ from typing import Protocol
 
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.store import (
+    JobOperationRecord,
+    JobOperationState,
     JobRecord,
+    JobState,
     JobStateUnknownReason,
     ServiceStore,
 )
@@ -81,19 +84,28 @@ class ModalJobSubmitter:
         cancel: CancelModalCall,
         can_submit: CanSubmitOperation | None = None,
         is_retryable_spawn_error: IsRetryableSpawnError | None = None,
+        operation_preclaimed: bool = False,
     ) -> SubmissionResult:
         """Claim, spawn, and attach one Modal operation without duplicate work."""
         async with self.lifecycle_locks.for_job(job.job_id):
             current = self._reload(job)
             if can_submit is not None and not can_submit(current):
                 return SubmissionResult(job=current, attached=False)
-            claimed = self.store.claim_modal_operation(
-                job.job_id,
-                operation=operation,
-                run_name=run_name,
-                submission_token=submission_token,
-                now=self._now(),
-            )
+            if operation_preclaimed:
+                claimed = self._preclaimed_operation(
+                    current,
+                    operation=operation,
+                    run_name=run_name,
+                    submission_token=submission_token,
+                )
+            else:
+                claimed = self.store.claim_modal_operation(
+                    job.job_id,
+                    operation=operation,
+                    run_name=run_name,
+                    submission_token=submission_token,
+                    now=self._now(),
+                )
             if claimed is None:
                 return SubmissionResult(job=self._reload(job), attached=False)
             claimed_job = self._reload(job)
@@ -165,6 +177,30 @@ class ModalJobSubmitter:
                     attached=False,
                 )
             return SubmissionResult(job=attached, attached=True)
+
+    @staticmethod
+    def _preclaimed_operation(
+        job: JobRecord,
+        *,
+        operation: str,
+        run_name: str,
+        submission_token: str,
+    ) -> JobOperationRecord | None:
+        """Verify the operation created atomically with a fresh admission."""
+        if job.state not in {JobState.QUEUED, JobState.RUNNING}:
+            return None
+        if job.run_name != run_name:
+            raise RuntimeError("Preclaimed Modal operation has the wrong run name")
+        return next(
+            (
+                candidate
+                for candidate in job.operations
+                if candidate.operation == operation
+                and candidate.state == JobOperationState.SUBMITTING
+                and candidate.submission_token == submission_token
+            ),
+            None,
+        )
 
     def _reload(self, job: JobRecord) -> JobRecord:
         current = self.store.get_job(job.owner_user_id, job.job_id)

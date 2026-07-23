@@ -11,7 +11,7 @@ from collections.abc import AsyncIterable, Mapping
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 
 from biomodals.service.artifacts import (
@@ -130,18 +130,17 @@ def _download_filename(display_name: str) -> str:
 
 
 def _cached_archive_response(
-    request: Request,
     *,
     lease: ArtifactLease,
     filename: str,
     sha256: str,
     size_bytes: int,
+    range_header: str | None,
 ) -> StreamingResponse:
     """Stream a held local archive, including one standard byte range."""
     first = 0
     last = size_bytes - 1
     response_status = status.HTTP_200_OK
-    range_header = request.headers.get("Range")
     if range_header is not None:
         unit, separator, raw_range = range_header.partition("=")
         start_text, dash, end_text = raw_range.partition("-")
@@ -547,6 +546,15 @@ def create_jobs_router(
         request: Request,
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_session)],
+        range_header: Annotated[
+            str | None,
+            Header(
+                alias="Range",
+                description=(
+                    "Optional single byte range for a prepared Result archive."
+                ),
+            ),
+        ] = None,
     ) -> Response:
         job = store.get_job(session.principal.user_id, job_id)
         if job is None:
@@ -590,11 +598,11 @@ def create_jobs_router(
                 ) from exc
             if cached is not None:
                 return _cached_archive_response(
-                    request,
                     lease=cached,
                     filename=_download_filename(job.display_name),
                     sha256=job.result_sha256,
                     size_bytes=job.result_size_bytes,
+                    range_header=range_header,
                 )
         store.set_result_cached(job.job_id, cached=False)
         raise CodedAPIError(

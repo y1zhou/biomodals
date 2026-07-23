@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import modal
 
 from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.coordinator import GromacsReconciler
 from biomodals.service.gromacs.provider import (
     ModalGromacsProvider,
@@ -21,7 +22,6 @@ from biomodals.service.gromacs.results import (
     ModalGromacsResults,
     ResultIdentityMismatchError,
 )
-from biomodals.service.gromacs.router import GromacsJobOptions
 from biomodals.service.jobs import OperationLogRequest, operation_log_mode
 from biomodals.service.modal_logs import ModalCLILogSource
 from biomodals.service.runtime_config import ModalConfigurationSnapshot

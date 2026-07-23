@@ -138,6 +138,10 @@ _Avoid_: temporary builder cleanup, shard compression, implicit retention
 The full unsharded database size used by HMMER to scale hit E-values across a Sharded Database Profile. It is the exact sequence count for protein searches and the exact nucleotide count expressed in megabases for RNA searches.
 _Avoid_: shard count, FASTA byte size, per-shard record count
 
+**Supported Database Specification**:
+The code-owned production definition of one official AlphaFold MSA database, including its logical identifier, source filename and molecule type, accepted shard count, and expected source statistics.
+_Avoid_: runtime override, profile manifest, arbitrary FASTA
+
 **MSA Search Subject**:
 A unique biological sequence that requires database-generated MSA evidence and may be referenced by one or more input chains.
 _Avoid_: chain identifier, duplicate homomer chain

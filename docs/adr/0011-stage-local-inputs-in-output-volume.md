@@ -5,8 +5,16 @@ Status: accepted.
 Before submitting remote work, an AlphaFold3 local helper materializes
 file-backed caller inputs. It reads protein and RNA `unpairedMsaPath` values and
 protein `pairedMsaPath` values into their corresponding inline MSA strings, then
-clears the path fields. Caller-supplied template `mmcifPath` files remain
-path-backed: the helper uploads them with Modal Volume batch upload into
+clears the path fields. All relative caller paths are resolved against the
+input JSON's parent directory.
+
+The helper also reads `userCCDPath` into inline `userCCD` and clears the path
+before constructing run identity. CCD content participates in identity, while
+its source path does not. Setting both non-empty `userCCD` and `userCCDPath` is
+rejected as ambiguous.
+
+Caller-supplied template `mmcifPath` files remain path-backed: the helper
+uploads them with Modal Volume batch upload into
 `<run-root>/custom-templates/` and rewrites each path to its mounted remote
 location.
 

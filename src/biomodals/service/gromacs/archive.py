@@ -8,7 +8,7 @@ import struct
 import time
 import zipfile
 import zlib
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import BinaryIO, Protocol, TypeVar, cast
@@ -25,7 +25,6 @@ _MAX_PDB_BYTES = 10 * 1024 * 1024
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
 ReadRemoteFile = Callable[[str], AsyncIterable[bytes]]
-MtimeForRemoteFile = Callable[[str], int]
 _T = TypeVar("_T")
 
 
@@ -448,14 +447,14 @@ async def _write_optional_remote(
     archive: zipfile.ZipFile,
     *,
     read_file: ReadRemoteFile,
-    mtime_for_file: MtimeForRemoteFile,
+    remote_mtimes: Mapping[str, int],
     remote_path: str,
     name: str,
     role: str,
 ) -> dict[str, str | int] | None:
     try:
-        mtime = mtime_for_file(remote_path)
-    except FileNotFoundError:
+        mtime = remote_mtimes[remote_path]
+    except KeyError:
         return None
     chunks = read_file(remote_path).__aiter__()
     try:
@@ -492,7 +491,7 @@ async def write_gromacs_archive(
     started_at: int,
     completed_at: int,
     read_file: ReadRemoteFile,
-    mtime_for_file: MtimeForRemoteFile,
+    remote_mtimes: Mapping[str, int],
     run_bounded: RunBounded | None = None,
 ) -> BuiltGromacsArchive:
     """Package the established GROMACS app's expected Volume files."""
@@ -508,8 +507,8 @@ async def write_gromacs_archive(
 
     def required_mtime(path: str) -> int:
         try:
-            return mtime_for_file(path)
-        except FileNotFoundError as exc:
+            return remote_mtimes[path]
+        except KeyError as exc:
             raise ArtifactSourceMissingError(
                 "A required GROMACS output is missing"
             ) from exc
@@ -593,7 +592,7 @@ async def write_gromacs_archive(
             record = await _write_optional_remote(
                 archive,
                 read_file=read_file,
-                mtime_for_file=mtime_for_file,
+                remote_mtimes=remote_mtimes,
                 remote_path=f"{run_name}/{remote_name}",
                 name=name,
                 role=role,

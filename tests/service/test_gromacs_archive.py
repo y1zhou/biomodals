@@ -88,13 +88,8 @@ def _remote_files() -> dict[str, bytes]:
     }
 
 
-def _mtime_for_files(remote_files: dict[str, bytes]):
-    def mtime_for_file(path: str) -> int:
-        if path not in remote_files:
-            raise FileNotFoundError(path)
-        return 1_700_000_000
-
-    return mtime_for_file
+def _mtimes_for_files(remote_files: dict[str, bytes]) -> dict[str, int]:
+    return dict.fromkeys(remote_files, 1_700_000_000)
 
 
 def test_service_packages_established_remote_files_deterministically() -> None:
@@ -124,7 +119,7 @@ def test_service_packages_established_remote_files_deterministically() -> None:
                 started_at=1,
                 completed_at=2,
                 read_file=read_file,
-                mtime_for_file=_mtime_for_files(remote_files),
+                remote_mtimes=_mtimes_for_files(remote_files),
             )
         )
         return output.getvalue(), result
@@ -175,12 +170,6 @@ def test_service_preserves_remote_file_modification_times() -> None:
         except KeyError as exc:
             raise FileNotFoundError(path) from exc
 
-    def mtime_for_file(path: str) -> int:
-        try:
-            return remote_mtimes[path]
-        except KeyError as exc:
-            raise FileNotFoundError(path) from exc
-
     output = io.BytesIO()
     asyncio.run(
         write_gromacs_archive(
@@ -194,7 +183,7 @@ def test_service_preserves_remote_file_modification_times() -> None:
             started_at=1,
             completed_at=2,
             read_file=read_file,
-            mtime_for_file=mtime_for_file,
+            remote_mtimes=remote_mtimes,
         )
     )
 
@@ -281,7 +270,7 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
                 started_at=1,
                 completed_at=2,
                 read_file=read_file,
-                mtime_for_file=_mtime_for_files(remote_files),
+                remote_mtimes=_mtimes_for_files(remote_files),
             )
         )
 
@@ -317,7 +306,7 @@ def test_large_centered_structure_and_diagnostics_stream_without_a_size_cap() ->
             started_at=1,
             completed_at=2,
             read_file=read_file,
-            mtime_for_file=_mtime_for_files(remote_files),
+            remote_mtimes=_mtimes_for_files(remote_files),
         )
     )
 
@@ -354,6 +343,6 @@ def test_missing_required_remote_output_has_a_distinct_failure() -> None:
                 started_at=1,
                 completed_at=2,
                 read_file=read_file,
-                mtime_for_file=_mtime_for_files(remote_files),
+                remote_mtimes=_mtimes_for_files(remote_files),
             )
         )

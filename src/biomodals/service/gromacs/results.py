@@ -268,12 +268,6 @@ class ModalGromacsResults:
                 raise GromacsResultInvalidError("GROMACS output metadata is invalid")
             remote_mtimes[path] = entry.mtime
 
-        def mtime_for_file(path: str) -> int:
-            try:
-                return remote_mtimes[path]
-            except KeyError as exc:
-                raise FileNotFoundError(path) from exc
-
         stages = [
             stage.model_dump(mode="json")
             for stage in JobView.from_record(job).stage_history
@@ -296,7 +290,7 @@ class ModalGromacsResults:
                 started_at=job.created_at,
                 completed_at=completed_at,
                 read_file=read_file,
-                mtime_for_file=mtime_for_file,
+                remote_mtimes=remote_mtimes,
                 run_bounded=(
                     self.artifact_cache.run_bounded
                     if self.artifact_cache is not None

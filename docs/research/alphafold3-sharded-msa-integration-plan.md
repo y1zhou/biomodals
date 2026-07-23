@@ -7,8 +7,9 @@ Scope: finish the sharding method in
 minimal production implementation into
 `src/biomodals/app/fold/alphafold3_app.py`.
 
-This plan consolidates ADRs 0005–0048. Those ADRs remain authoritative when
-this document abbreviates a boundary.
+This plan implements
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md). That consolidated decision
+record remains authoritative when this document abbreviates a boundary.
 
 ## Outcome
 

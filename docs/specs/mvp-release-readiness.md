@@ -511,7 +511,14 @@ publication retries and later reconstruction never substitute their current
 time. Together with fixed ZIP metadata and ordered members, unchanged remote
 outputs must therefore reproduce the same bytes, size, and SHA-256 digest.
 Every archive member uses ZIP's stored method so byte identity does not depend
-on the host zlib implementation.
+on the host zlib implementation. Schema-v4 validation rejects any other
+compression method, requires each source-backed member's exact `0x5455`
+modification-time field and matching ZIP/DOS fallback, and requires fixed
+timestamps on service-generated members in both the local ZIP headers and the
+central directory. The `0x5455` field is a signed 32-bit Unix timestamp, so
+schema 4 rejects source modification times after `2038-01-19T03:14:07Z`; a
+later schema must define a validated, interoperable 64-bit replacement before
+that boundary.
 
 Each completed Job also persists the positive Result archive schema version
 used for its publication. Before the first release, finalization and

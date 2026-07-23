@@ -419,16 +419,22 @@ that persisted value rather than the time of an individual packaging attempt.
 Packaging can therefore be repeated safely for the same completed run because
 the member order, ZIP metadata, timestamps, and contents are deterministic for
 the recorded Job. Archive schema version 4 encodes each selected Volume file's
-integer `FileEntry.mtime` exactly in the standard extended Unix
+integer `FileEntry.mtime` exactly in Info-ZIP's `0x5455` extended Unix
 modification-time field and also writes the nearest ZIP/DOS timestamp fallback.
-Service-generated `metadata/` members retain a fixed timestamp. Unchanged
-Volume contents and modification times therefore reproduce the same archive
-bytes, size, and SHA-256 digest. The Modal Volume API exposes no separate
-per-file `ctime`, and POSIX `ctime` cannot be restored when an extractor creates
-a new local inode; the destination filesystem necessarily assigns it. The
-single-worker control plane remains responsible for preventing ordinary
-concurrent publication. No API-specific registry or Function is added to the
-GROMACS App.
+Because that field is a signed 32-bit Unix timestamp, the writer rejects source
+times after `2038-01-19T03:14:07Z` instead of emitting an ambiguous value that
+some extractors interpret as pre-1970. A future archive schema must select and
+validate a broadly interoperable 64-bit timestamp representation before that
+boundary. Service-generated `metadata/` members retain a fixed timestamp. The
+schema-v4 validator requires the stored compression method, exact source
+timestamp field shape, matching DOS fallback, and fixed generated timestamps
+in both the local headers and central directory. Unchanged Volume contents and
+modification times therefore reproduce the same archive bytes, size, and
+SHA-256 digest. The Modal Volume API exposes no separate per-file `ctime`, and
+POSIX `ctime` cannot be restored when an extractor creates a new local inode;
+the destination filesystem necessarily assigns it. The single-worker control
+plane remains responsible for preventing ordinary concurrent publication. No
+API-specific registry or Function is added to the GROMACS App.
 
 The ZIP has exactly three top-level entries or namespaces:
 

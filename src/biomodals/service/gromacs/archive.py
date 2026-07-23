@@ -23,6 +23,11 @@ _SHA256_LENGTH = 64
 _SMALL_DOCUMENT_LIMIT = 1024 * 1024
 _MAX_PDB_BYTES = 10 * 1024 * 1024
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+_EXTENDED_TIMESTAMP_HEADER_ID = 0x5455
+_MIN_EXTENDED_TIMESTAMP = -0x80000000
+_MAX_EXTENDED_TIMESTAMP = 0x7FFFFFFF
+_LOCAL_HEADER = struct.Struct("<4s5H3I2H")
+_LOCAL_HEADER_SIGNATURE = b"PK\x03\x04"
 
 ReadRemoteFile = Callable[[str], AsyncIterable[bytes]]
 _T = TypeVar("_T")
@@ -354,17 +359,163 @@ def _zip_info(name: str, *, mtime: int | None = None) -> zipfile.ZipInfo:
     if mtime is None:
         date_time = _ZIP_EPOCH
     else:
-        if type(mtime) is not int or not 0 <= mtime <= 0xFFFFFFFF:
-            raise ValueError("Remote GROMACS file has an invalid modification time")
-        source_time = time.gmtime(mtime)[:6]
-        date_time = source_time if source_time[0] >= _ZIP_EPOCH[0] else _ZIP_EPOCH
+        if (
+            type(mtime) is not int
+            or not _MIN_EXTENDED_TIMESTAMP <= mtime <= _MAX_EXTENDED_TIMESTAMP
+        ):
+            raise ValueError(
+                "Remote GROMACS file modification time must fit a signed 32-bit "
+                "extended timestamp"
+            )
+        date_time = _dos_timestamp(mtime)
     info = zipfile.ZipInfo(name, date_time=date_time)
     info.create_system = 3
     info.external_attr = 0o100600 << 16
     info.compress_type = zipfile.ZIP_STORED
     if mtime is not None:
-        info.extra = struct.pack("<HHBI", 0x5455, 5, 1, mtime)
+        info.extra = struct.pack(
+            "<HHBi",
+            _EXTENDED_TIMESTAMP_HEADER_ID,
+            5,
+            1,
+            mtime,
+        )
     return info
+
+
+def _source_member(name: str) -> bool:
+    return (
+        name == "input.pdb"
+        or name.startswith("outputs/")
+        or name.startswith("metadata/gromacs/")
+    )
+
+
+def _dos_timestamp(mtime: int) -> tuple[int, int, int, int, int, int]:
+    source_time = time.gmtime(mtime)[:6]
+    date_time = source_time if source_time[0] >= _ZIP_EPOCH[0] else _ZIP_EPOCH
+    return (*date_time[:5], date_time[5] // 2 * 2)
+
+
+def _encoded_dos_timestamp(
+    date_time: tuple[int, int, int, int, int, int],
+) -> tuple[int, int]:
+    year, month, day, hour, minute, second = date_time
+    return (
+        hour << 11 | minute << 5 | second // 2,
+        (year - _ZIP_EPOCH[0]) << 9 | month << 5 | day,
+    )
+
+
+def _extra_fields(extra: bytes) -> dict[int, bytes]:
+    fields: dict[int, bytes] = {}
+    offset = 0
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise ValueError("GROMACS archive ZIP extra fields are invalid")
+        header_id, size = struct.unpack_from("<HH", extra, offset)
+        data_offset = offset + 4
+        offset = data_offset + size
+        if offset > len(extra):
+            raise ValueError("GROMACS archive ZIP extra fields are invalid")
+        if header_id in fields:
+            raise ValueError("GROMACS archive ZIP extra fields are invalid")
+        fields[header_id] = extra[data_offset:offset]
+    return fields
+
+
+def _local_zip_metadata(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+) -> tuple[int, int, int, bytes]:
+    source = archive.fp
+    if source is None:
+        raise ValueError("GROMACS archive local ZIP header is unavailable")
+    previous_offset = source.tell()
+    try:
+        source.seek(info.header_offset)
+        header = source.read(_LOCAL_HEADER.size)
+        if len(header) != _LOCAL_HEADER.size:
+            raise ValueError("GROMACS archive local ZIP header is invalid")
+        (
+            signature,
+            _extract_version,
+            flags,
+            compression,
+            dos_time,
+            dos_date,
+            _crc,
+            _compressed_size,
+            _file_size,
+            name_length,
+            extra_length,
+        ) = _LOCAL_HEADER.unpack(header)
+        local_name = source.read(name_length)
+        local_extra = source.read(extra_length)
+    finally:
+        source.seek(previous_offset)
+    expected_name = info.filename.encode("utf-8" if info.flag_bits & 0x800 else "cp437")
+    if (
+        signature != _LOCAL_HEADER_SIGNATURE
+        or flags != info.flag_bits
+        or local_name != expected_name
+        or len(local_extra) != extra_length
+    ):
+        raise ValueError("GROMACS archive local ZIP header is invalid")
+    return compression, dos_time, dos_date, local_extra
+
+
+def _source_mtime(info: zipfile.ZipInfo) -> int:
+    fields = _extra_fields(info.extra)
+    if set(fields) - {0x0001, _EXTENDED_TIMESTAMP_HEADER_ID}:
+        raise ValueError("GROMACS archive source timestamp metadata is invalid")
+    try:
+        flags, mtime = struct.unpack(
+            "<Bi",
+            fields[_EXTENDED_TIMESTAMP_HEADER_ID],
+        )
+    except struct.error as exc:
+        raise ValueError(
+            "GROMACS archive source timestamp metadata is invalid"
+        ) from exc
+    except KeyError as exc:
+        raise ValueError(
+            "GROMACS archive source timestamp metadata is invalid"
+        ) from exc
+    if flags != 1 or info.date_time != _dos_timestamp(mtime):
+        raise ValueError("GROMACS archive source timestamp metadata is invalid")
+    return mtime
+
+
+def _validate_zip_metadata(
+    archive: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+) -> None:
+    for info in infos:
+        local_compression, local_time, local_date, local_extra = _local_zip_metadata(
+            archive,
+            info,
+        )
+        expected_time, expected_date = _encoded_dos_timestamp(info.date_time)
+        if (
+            info.compress_type != zipfile.ZIP_STORED
+            or local_compression != zipfile.ZIP_STORED
+        ):
+            raise ValueError("GROMACS archive members must use the stored ZIP method")
+        if (local_time, local_date) != (expected_time, expected_date):
+            raise ValueError("GROMACS archive local timestamp metadata is invalid")
+        if _source_member(info.filename):
+            mtime = _source_mtime(info)
+            local_fields = _extra_fields(local_extra)
+            if set(local_fields) - {
+                0x0001,
+                _EXTENDED_TIMESTAMP_HEADER_ID,
+            } or local_fields.get(_EXTENDED_TIMESTAMP_HEADER_ID) != struct.pack(
+                "<Bi", 1, mtime
+            ):
+                raise ValueError("GROMACS archive source timestamp metadata is invalid")
+        elif info.extra or info.date_time != _ZIP_EPOCH or local_extra:
+            raise ValueError("GROMACS archive generated timestamp metadata is invalid")
 
 
 def _write_bytes(
@@ -694,6 +845,7 @@ def validate_gromacs_archive(
                 raise ValueError("GROMACS result archive has unexpected members")
             if not all(_safe_member(info) for info in infos):
                 raise ValueError("GROMACS result archive has an unsafe member")
+            _validate_zip_metadata(archive, infos)
 
             try:
                 manifest = orjson.loads(_read_small(archive, "metadata/manifest.json"))

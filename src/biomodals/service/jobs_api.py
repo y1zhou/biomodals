@@ -215,19 +215,31 @@ def create_jobs_router(
     """Create shared Job routes over registered workload capabilities."""
     router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
-    def job_view(job: JobRecord, session: AuthenticatedSession) -> JobView:
-        registration = workloads.get(job.workload)
+    def caller_can_view_logs(
+        workload: str,
+        session: AuthenticatedSession,
+    ) -> bool:
+        registration = workloads.get(workload)
         logs_supported = bool(
             registration is not None and registration.open_operation_logs is not None
         )
-        can_view_logs = can_view_job_logs(
+        return can_view_job_logs(
             is_admin=session.principal.is_admin,
             owner_visibility_enabled=bool(
                 logs_supported
-                and configuration.workload(job.workload).job_logs_visible_to_owner.value
+                and configuration.workload(workload).job_logs_visible_to_owner.value
             ),
             logs_supported=logs_supported,
         )
+
+    def job_view(
+        job: JobRecord,
+        session: AuthenticatedSession,
+        *,
+        can_view_logs: bool | None = None,
+    ) -> JobView:
+        if can_view_logs is None:
+            can_view_logs = caller_can_view_logs(job.workload, session)
         return JobView.from_record(job, can_view_logs=can_view_logs)
 
     @router.get(
@@ -251,8 +263,19 @@ def create_jobs_router(
             )
         except JobCursorError as exc:
             raise HTTPException(400, str(exc)) from exc
+        log_visibility = {
+            workload: caller_can_view_logs(workload, session)
+            for workload in dict.fromkeys(job.workload for job in page.jobs)
+        }
         return JobPageView(
-            jobs=[job_view(job, session) for job in page.jobs],
+            jobs=[
+                job_view(
+                    job,
+                    session,
+                    can_view_logs=log_visibility[job.workload],
+                )
+                for job in page.jobs
+            ],
             next_cursor=page.next_cursor,
         )
 

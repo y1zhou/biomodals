@@ -242,26 +242,36 @@ def _valid_archive_bytes() -> tuple[bytes, str]:
         f"{hashlib.sha256(manifest).hexdigest()}  metadata/manifest.json\n",
     ]).encode()
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+
+    def archive_info(name: str, *, source: bool = False) -> zipfile.ZipInfo:
+        if source:
+            source_time = time.gmtime(_FIXTURE_MTIME)[:6]
+            date_time = (*source_time[:5], source_time[5] // 2 * 2)
+        else:
+            date_time = (1980, 1, 1, 0, 0, 0)
+        info = zipfile.ZipInfo(name, date_time=date_time)
+        info.compress_type = zipfile.ZIP_STORED
+        if source:
+            info.extra = struct.pack(
+                "<HHBI",
+                0x5455,
+                5,
+                1,
+                _FIXTURE_MTIME,
+            )
+        return info
+
+    with zipfile.ZipFile(output, "w") as archive:
         for name, content in members.items():
-            if name == "input.pdb" or name.startswith("outputs/"):
-                source_time = time.gmtime(_FIXTURE_MTIME)[:6]
-                info = zipfile.ZipInfo(
+            archive.writestr(
+                archive_info(
                     name,
-                    date_time=(*source_time[:5], source_time[5] // 2 * 2),
-                )
-                info.extra = struct.pack(
-                    "<HHBI",
-                    0x5455,
-                    5,
-                    1,
-                    _FIXTURE_MTIME,
-                )
-                archive.writestr(info, content)
-            else:
-                archive.writestr(name, content)
-        archive.writestr("metadata/manifest.json", manifest)
-        archive.writestr("metadata/checksums.sha256", checksums)
+                    source=name == "input.pdb" or name.startswith("outputs/"),
+                ),
+                content,
+            )
+        archive.writestr(archive_info("metadata/manifest.json"), manifest)
+        archive.writestr(archive_info("metadata/checksums.sha256"), checksums)
     request_digest = hashlib.sha256()
     request_digest.update(len(members["input.pdb"]).to_bytes(8, "big"))
     request_digest.update(members["input.pdb"])

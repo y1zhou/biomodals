@@ -2173,6 +2173,45 @@ def test_job_history_uses_an_owner_scoped_cursor(tmp_path: Path) -> None:
     assert response_schema["$ref"].endswith("/JobPageView")
 
 
+def test_job_history_resolves_log_visibility_once_per_workload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, auth, store, _adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    for index in range(2):
+        submitted = _submit(
+            client,
+            csrf_token,
+            idempotency_key=str(uuid4()),
+            display_name=f"Simulation {index}",
+        )
+        assert submitted.status_code == 202
+        store.fail_job(
+            UUID(submitted.json()["job_id"]),
+            error_code="compute_failed",
+            error_message="Completed test fixture",
+            now=1_800_000_001 + index,
+        )
+
+    configuration: RuntimeConfiguration = client.app.state.configuration
+    original_workload = configuration.workload
+    workload_lookups: list[str] = []
+
+    def workload(workload_name: str):
+        workload_lookups.append(workload_name)
+        return original_workload(workload_name)
+
+    monkeypatch.setattr(configuration, "workload", workload)
+
+    response = client.get("/api/v1/jobs")
+
+    assert response.status_code == 200
+    assert len(_jobs(response)) == 2
+    assert workload_lookups == ["gromacs"]
+
+
 def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:
     client, auth, store, _adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")

@@ -42,6 +42,10 @@ _Avoid_: shard directory, test database, database copy
 A Benchmark Database Profile whose source identity, shard equivalence, and balance have passed validation and whose readiness manifest has been published.
 _Avoid_: complete directory, prepared database
 
+**Profile Audit**:
+An explicit maintenance operation that rechecks the declared artifacts and scientific validation evidence of a Published Database Profile. It is never an implicit prerequisite for an MSA search.
+_Avoid_: search startup check, profile preparation, manifest read
+
 **Profile Preparation**:
 The explicit pre-measurement operation that creates, validates, and publishes a Benchmark Database Profile.
 _Avoid_: benchmark setup, lazy shard creation

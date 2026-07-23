@@ -207,8 +207,8 @@ The seed-independent `/{run_id[:2]}/{run_id}/` directory at the AlphaFold3 outpu
 _Avoid_: MSA cache root, database Volume, local download directory
 
 **Inference Run Identity**:
-The stable digest that groups predictions for one Enriched AlphaFold Input and one set of seed-independent inference settings. Model seeds are deliberately excluded so additional seeds can publish beneath the same AlphaFold Run Root.
-_Avoid_: sequence hash, model seed, display name
+The stable digest that groups predictions for one Enriched AlphaFold Input and one set of seed-independent scientific inference settings. Model seeds and accelerator class are deliberately excluded so additional seeds and operationally different GPU deployments can share the same AlphaFold Run Root.
+_Avoid_: sequence hash, model seed, GPU accelerator class, display name
 
 **Inference Identity View**:
 The normalized Enriched AlphaFold Input used to derive Inference Run Identity after removing display name and seeds and replacing operational template paths with content digests. It conservatively retains every other validated input field.

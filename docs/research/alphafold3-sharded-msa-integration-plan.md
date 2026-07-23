@@ -79,9 +79,12 @@ recipe version, SeqKit version and seed, and compatibility pins. Protein Z and
 domZ are the validated source sequence count. RNA Z is the validated total
 nucleotide count divided by 1,000,000.
 
-The completed `small-bfd-64-v1` benchmark profile is retained unchanged.
+The completed `small-bfd-64-v1` benchmark profile remains available only until
+all seven production candidates and both scientific oracles pass.
 `small-bfd-64-v2` is a new production candidate because its published payload
-omits the monolithic source and its shuffle/index scratch stays under `/tmp`.
+omits the monolithic source and its shuffled FASTA stays under `/tmp`. After
+validation, remove the v1 profile and abandoned staging generations so
+`/profiles/` contains exactly the seven fixed profile directories listed above.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never
@@ -110,7 +113,9 @@ One invocation handles one logical database:
    exists, fail with instructions to restore it manually in a Modal Sandbox or
    equivalent environment.
 5. Run full source `seqkit stats`, source hashing, and scratch-space preflight.
-6. Write the two-pass shuffled FASTA and its SeqKit index under `/tmp`.
+6. Write the two-pass shuffled FASTA under `/tmp`. SeqKit keeps its FAI sidecar
+   beside the source FASTA on the source Volume; the source FASTA itself is not
+   copied to local disk.
 7. Recover every record omitted by SeqKit's duplicate-header FAI behavior from
    the reported byte offsets, prefix recovered headers with generation-unique
    UUIDs, append them to the shuffled FASTA, and run `seqkit split2`.
@@ -135,9 +140,9 @@ Failure cleanup removes only that generation's partial shard payload and local
 scratch while retaining compact diagnostics. It never modifies an existing
 published profile.
 
-The builder uses `(0.125, 32.125)` CPUs and the default 512 GiB ephemeral disk.
-It does not request extra disk or place the shuffled FASTA on either persistent
-Volume.
+The builder uses `(0.125, 32.125)` CPUs, the default 512 GiB ephemeral disk,
+and Modal's 24-hour maximum function timeout. It does not request extra disk,
+copy the source FASTA, or place the shuffled FASTA on either persistent Volume.
 
 ## Search cache layout
 

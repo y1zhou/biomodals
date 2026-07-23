@@ -297,6 +297,13 @@ names by default, so rename and validate every output. See the official
 and
 [split2 documentation](https://bioinf.shenwei.me/seqkit/usage/#split2).
 
+Keep the source FASTA on the source Modal Volume. Write only the shuffled FASTA
+to container-local `/tmp`; SeqKit's FAI remains a sidecar beside the source.
+After all seven database profiles and the protein and RNA oracle comparisons
+pass, the sharded Volume's `/profiles/` directory contains exactly one
+published directory per genetic database. Remove abandoned staging generations
+and the obsolete small-BFD benchmark profile at that barrier.
+
 The manifest should contain, for each logical database:
 
 - source filename, snapshot/date, byte size, digest, record count, and residue

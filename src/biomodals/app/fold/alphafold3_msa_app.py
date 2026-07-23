@@ -109,7 +109,8 @@ PRODUCTION_PROFILE_RECIPE_VERSION = 3
 PRODUCTION_PROFILE_ROOT = "profiles"
 PRODUCTION_PREPARATION_ROOT = "production-candidates/profile-builds"
 PRODUCTION_PROFILE_CLAIM_DICT_NAME = "AlphaFold3-msa-profile-build-claims"
-PRODUCTION_PROFILE_STALE_SECONDS = 21_600 + 900
+PRODUCTION_BUILD_TIMEOUT_SECONDS = 86_400
+PRODUCTION_PROFILE_STALE_SECONDS = PRODUCTION_BUILD_TIMEOUT_SECONDS + 900
 PRODUCTION_SCRATCH_ROOT = Path(tempfile.gettempdir())
 SOURCE_POLICIES = ("keep", "compress", "delete")
 PRODUCTION_VALIDATION_RELPATHS = (
@@ -1555,7 +1556,7 @@ def _production_profile_plan(
             "cpu": [0.125, 32.125],
             "memory_mib": [1024, 131_072],
             "ephemeral_disk_mib": "platform-default",
-            "timeout_seconds": CONF.timeout,
+            "timeout_seconds": PRODUCTION_BUILD_TIMEOUT_SECONDS,
         },
         "source": {
             "volume": SOURCE_DB_VOLUME_NAME,
@@ -1573,7 +1574,9 @@ def _production_profile_plan(
         },
         "scratch": {
             "shuffle": str(PRODUCTION_SCRATCH_ROOT),
-            "seqkit_index": str(PRODUCTION_SCRATCH_ROOT),
+            "seqkit_index": (
+                f"{SOURCE_DB_VOLUME_NAME}/{spec.source_filename}.seqkit.fai"
+            ),
             "raw_shards": SHARDED_DB_VOLUME_NAME,
         },
         "seqkit": {
@@ -2669,7 +2672,7 @@ def _build_production_profile(
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 131_072),
-    timeout=CONF.timeout,
+    timeout=PRODUCTION_BUILD_TIMEOUT_SECONDS,
     max_containers=len(DATABASE_PROFILE_SPECS),
     volumes={
         APP_INFO.source_db_dir: SOURCE_MSA_DB_VOLUME,

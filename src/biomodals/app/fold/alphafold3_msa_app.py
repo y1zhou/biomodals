@@ -1,13 +1,14 @@
-"""Benchmark AlphaFold 3 MSA searches against a sharded small-BFD database.
+"""Develop and benchmark deterministic AlphaFold 3 database sharding.
 
 Upstream sources:
 
 - <https://github.com/google-deepmind/alphafold3>
 - <https://github.com/google-deepmind/alphafold3/blob/main/docs/performance.md>
 
-This is an isolated, temporary benchmark app. It does not mount AlphaFold model
-weights or the production MSA cache, and it never imports ``alphafold3_app``.
-Commands are plan-only unless ``--submit`` is explicitly supplied.
+This is an isolated, temporary development app. It does not mount AlphaFold
+model weights or the production MSA cache, and it never imports
+``alphafold3_app``. Commands are plan-only unless ``--submit`` is explicitly
+supplied.
 
 The first operation copies small BFD from the read-only production database
 Volume, creates 64 deterministic SeqKit shards in
@@ -15,6 +16,11 @@ Volume, creates 64 deterministic SeqKit shards in
 last. Duplicate full headers omitted by SeqKit's two-pass FASTA index are
 recovered from its logged byte offsets before splitting. Benchmark evidence is
 written to ``AlphaFold3-MSA-Benchmark-outputs``.
+
+The production-candidate operations build seven fixed immutable profiles
+without copying their monolithic sources into the sharded Volume. They stage
+the shuffled FASTA and SeqKit index under ``/tmp`` and retain only shards,
+validation evidence, and a manifest-last publication.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from statistics import median
 from threading import Event, Lock, Thread
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any, BinaryIO
 
 import modal
@@ -98,6 +104,30 @@ _FAI_DUPLICATE_WARNING = re.compile(
     rb"at byte offset (?P<offset>[0-9]+)\r?\n?$"
 )
 
+PRODUCTION_PROFILE_SCHEMA_VERSION = 2
+PRODUCTION_PROFILE_RECIPE_VERSION = 3
+PRODUCTION_PROFILE_ROOT = "profiles"
+PRODUCTION_PREPARATION_ROOT = "production-candidates/profile-builds"
+PRODUCTION_PROFILE_CLAIM_DICT_NAME = "AlphaFold3-msa-profile-build-claims"
+PRODUCTION_PROFILE_STALE_SECONDS = 21_600 + 900
+PRODUCTION_SCRATCH_ROOT = Path(tempfile.gettempdir())
+SOURCE_POLICIES = ("keep", "compress", "delete")
+PRODUCTION_VALIDATION_RELPATHS = (
+    "validation/source-stats.tsv",
+    "validation/shard-stats.tsv",
+    "validation/shard-summary.parquet",
+    "validation/source-sum.tsv",
+    "validation/shard-sum.tsv",
+    "validation/seqkit-sum.json",
+    "validation/shuffle-stderr.log",
+    "validation/duplicate-recovery.jsonl",
+)
+NHMMER_BINARY_PATH = "/hmmer/bin/nhmmer"
+HMMALIGN_BINARY_PATH = "/hmmer/bin/hmmalign"
+HMMBUILD_BINARY_PATH = "/hmmer/bin/hmmbuild"
+PRODUCTION_SEARCH_N_CPU = 2
+PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS = 16
+
 
 CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
@@ -131,6 +161,120 @@ class FaiDuplicateWarning:
     sequence_offset: int
 
 
+@dataclass(frozen=True)
+class DatabaseProfileSpec:
+    """One code-owned immutable database-sharding specification."""
+
+    database_id: str
+    profile_id: str
+    source_filename: str
+    shard_count: int
+    polymer: str
+    expected_num_seqs: int | None
+    expected_sum_len: int | None
+    max_sequences: int
+
+    @property
+    def search_space_value(self) -> int | float:
+        """Return the full-database HMMER search-space value."""
+        if self.polymer == "protein":
+            if self.expected_num_seqs is None:
+                raise RuntimeError(
+                    f"{self.database_id} lacks an expected sequence count"
+                )
+            return self.expected_num_seqs
+        if self.polymer == "rna":
+            if self.expected_sum_len is None:
+                raise RuntimeError(
+                    f"{self.database_id} lacks an expected residue count"
+                )
+            return self.expected_sum_len / 1_000_000
+        raise RuntimeError(f"Unsupported polymer type: {self.polymer}")
+
+    @property
+    def search_space_unit(self) -> str:
+        """Return the unit expected by the pinned HMMER wrapper."""
+        if self.polymer == "protein":
+            return "sequences"
+        if self.polymer == "rna":
+            return "megabases"
+        raise RuntimeError(f"Unsupported polymer type: {self.polymer}")
+
+
+DATABASE_PROFILE_SPECS = (
+    DatabaseProfileSpec(
+        database_id="small_bfd",
+        profile_id="small-bfd-64-v2",
+        source_filename="bfd-first_non_consensus_sequences.fasta",
+        shard_count=64,
+        polymer="protein",
+        expected_num_seqs=65_984_053,
+        expected_sum_len=None,
+        max_sequences=5_000,
+    ),
+    DatabaseProfileSpec(
+        database_id="mgnify",
+        profile_id="mgnify-512-v1",
+        source_filename="mgy_clusters_2022_05.fa",
+        shard_count=512,
+        polymer="protein",
+        expected_num_seqs=623_796_864,
+        expected_sum_len=None,
+        max_sequences=5_000,
+    ),
+    DatabaseProfileSpec(
+        database_id="uniprot",
+        profile_id="uniprot-256-v1",
+        source_filename="uniprot_all_2021_04.fa",
+        shard_count=256,
+        polymer="protein",
+        expected_num_seqs=225_619_586,
+        expected_sum_len=None,
+        max_sequences=50_000,
+    ),
+    DatabaseProfileSpec(
+        database_id="uniref90",
+        profile_id="uniref90-128-v1",
+        source_filename="uniref90_2022_05.fa",
+        shard_count=128,
+        polymer="protein",
+        expected_num_seqs=153_742_194,
+        expected_sum_len=None,
+        max_sequences=10_000,
+    ),
+    DatabaseProfileSpec(
+        database_id="ntrna",
+        profile_id="nt-rna-256-v1",
+        source_filename="nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
+        shard_count=256,
+        polymer="rna",
+        expected_num_seqs=None,
+        expected_sum_len=76_752_808_514,
+        max_sequences=10_000,
+    ),
+    DatabaseProfileSpec(
+        database_id="rfam",
+        profile_id="rfam-16-v1",
+        source_filename="rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
+        shard_count=16,
+        polymer="rna",
+        expected_num_seqs=None,
+        expected_sum_len=138_115_553,
+        max_sequences=10_000,
+    ),
+    DatabaseProfileSpec(
+        database_id="rnacentral",
+        profile_id="rnacentral-64-v1",
+        source_filename="rnacentral_active_seq_id_90_cov_80_linclust.fasta",
+        shard_count=64,
+        polymer="rna",
+        expected_num_seqs=None,
+        expected_sum_len=13_271_415_730,
+        max_sequences=10_000,
+    ),
+)
+
+
 APP_INFO = AppInfo()
 
 SOURCE_MSA_DB_VOLUME = modal.Volume.from_name(
@@ -146,6 +290,10 @@ BENCHMARK_OUTPUT_VOLUME = modal.Volume.from_name(
     OUTPUT_VOLUME_NAME,
     create_if_missing=True,
     version=2,
+)
+PROFILE_BUILD_CLAIMS = modal.Dict.from_name(
+    PRODUCTION_PROFILE_CLAIM_DICT_NAME,
+    create_if_missing=True,
 )
 
 
@@ -266,6 +414,20 @@ def _write_json_atomic(path: Path, value: object) -> None:
     try:
         with temporary.open("xb") as handle:
             handle.write(_json_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Atomically publish one immutable byte payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -1313,6 +1475,1220 @@ def prepare_small_bfd_profile(
         raise
 
 
+def _database_profile_spec(database_id: str) -> DatabaseProfileSpec:
+    """Resolve one fixed database ID without accepting free-form paths."""
+    if not isinstance(database_id, str):
+        raise TypeError("database_id must be a string")
+    for spec in DATABASE_PROFILE_SPECS:
+        if spec.database_id == database_id:
+            return spec
+    choices = ", ".join(spec.database_id for spec in DATABASE_PROFILE_SPECS)
+    raise ValueError(f"Unknown database_id {database_id!r}; expected one of {choices}")
+
+
+def _validate_source_policy(source_policy: str) -> str:
+    """Validate the post-publication source-retirement policy."""
+    if not isinstance(source_policy, str):
+        raise TypeError("source_policy must be a string")
+    if source_policy not in SOURCE_POLICIES:
+        choices = ", ".join(SOURCE_POLICIES)
+        raise ValueError(
+            f"Unknown source_policy {source_policy!r}; expected one of {choices}"
+        )
+    return source_policy
+
+
+def _production_shard_filename(
+    spec: DatabaseProfileSpec,
+    index: int,
+) -> str:
+    """Return one fixed AlphaFold-compatible shard filename."""
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TypeError("shard index must be an integer")
+    if not 0 <= index < spec.shard_count:
+        raise ValueError(f"shard index must be in [0, {spec.shard_count}), got {index}")
+    return f"{spec.source_filename}-{index:05d}-of-{spec.shard_count:05d}"
+
+
+def _production_shard_names(
+    spec: DatabaseProfileSpec,
+) -> tuple[str, ...]:
+    """Return every expected production-candidate shard name."""
+    return tuple(
+        _production_shard_filename(spec, index) for index in range(spec.shard_count)
+    )
+
+
+def _production_profile_root(
+    sharded_root: Path,
+    spec: DatabaseProfileSpec,
+) -> Path:
+    """Return the fixed profile root below the sharded Volume."""
+    return sharded_root / PRODUCTION_PROFILE_ROOT / spec.profile_id
+
+
+def _production_profile_plan(
+    database_id: str,
+    seqkit_threads: int,
+    source_policy: str,
+) -> dict[str, object]:
+    """Build a side-effect-free production-candidate profile plan."""
+    spec = _database_profile_spec(database_id)
+    threads = _validate_seqkit_threads(seqkit_threads)
+    policy = _validate_source_policy(source_policy)
+    return {
+        "operation": "build-profile",
+        "remote_calls": 1,
+        "database": {
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "polymer": spec.polymer,
+            "source_filename": spec.source_filename,
+            "shard_count": spec.shard_count,
+            "expected_num_seqs": spec.expected_num_seqs,
+            "expected_sum_len": spec.expected_sum_len,
+            "search_space_value": spec.search_space_value,
+            "search_space_unit": spec.search_space_unit,
+        },
+        "resources": {
+            "cpu": [0.125, 32.125],
+            "memory_mib": [1024, 131_072],
+            "ephemeral_disk_mib": "platform-default",
+            "timeout_seconds": CONF.timeout,
+        },
+        "source": {
+            "volume": SOURCE_DB_VOLUME_NAME,
+            "path": spec.source_filename,
+            "policy_after_validation": policy,
+        },
+        "destination": {
+            "volume": SHARDED_DB_VOLUME_NAME,
+            "profile": (f"{PRODUCTION_PROFILE_ROOT}/{spec.profile_id}"),
+            "persistent_payloads": [
+                "shards",
+                "validation",
+                "manifest.json",
+            ],
+        },
+        "scratch": {
+            "shuffle": str(PRODUCTION_SCRATCH_ROOT),
+            "seqkit_index": str(PRODUCTION_SCRATCH_ROOT),
+            "raw_shards": SHARDED_DB_VOLUME_NAME,
+        },
+        "seqkit": {
+            "version": SEQKIT_VERSION,
+            "threads": threads,
+            "random_seed": SHARD_RANDOM_SEED,
+            "shuffle": ["--two-pass", "--update-faidx"],
+        },
+        "existing_profile_policy": "validate-and-reuse",
+    }
+
+
+def _recover_profile_duplicate_records(
+    source_path: Path,
+    shuffled_path: Path,
+    warnings: tuple[FaiDuplicateWarning, ...],
+    report_path: Path,
+    *,
+    temporary_namespace: str,
+) -> dict[str, int | str | None]:
+    """Recover all FAI omissions while keeping a non-empty audit artifact."""
+    detail_path = report_path.parent / f".{report_path.name}.details"
+    if warnings:
+        recovered = _append_recovered_fasta_records(
+            source_path,
+            shuffled_path,
+            warnings,
+            detail_path,
+            temporary_namespace=temporary_namespace,
+        )
+        recovered_records = recovered["recovered_records"]
+        recovered_residues = recovered["recovered_residues"]
+        first_byte_offset: int | None = recovered["first_byte_offset"]
+        last_byte_offset: int | None = recovered["last_byte_offset"]
+    else:
+        recovered_records = 0
+        recovered_residues = 0
+        first_byte_offset = None
+        last_byte_offset = None
+    metrics = {
+        "recovered_records": recovered_records,
+        "recovered_residues": recovered_residues,
+        "first_byte_offset": first_byte_offset,
+        "last_byte_offset": last_byte_offset,
+    }
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("xb") as report:
+        report.write(
+            orjson.dumps(
+                {
+                    "kind": "summary",
+                    **metrics,
+                    "warning_source": "seqkit-fai-sequence-byte-offset",
+                },
+                option=JSONL_OPTIONS,
+            )
+        )
+        if detail_path.is_file():
+            with detail_path.open("rb") as details:
+                shutil.copyfileobj(details, report, length=1024 * 1024)
+        report.flush()
+        os.fsync(report.fileno())
+    detail_path.unlink(missing_ok=True)
+    return metrics | {
+        "temporary_namespace": temporary_namespace,
+        "temporary_header_pattern": _recovery_header_pattern(temporary_namespace),
+    }
+
+
+def _run_production_shuffle_split(
+    spec: DatabaseProfileSpec,
+    source_path: Path,
+    scratch_root: Path,
+    raw_shard_dir: Path,
+    shard_dir: Path,
+    validation_dir: Path,
+    log_path: Path,
+    *,
+    seqkit_threads: int,
+) -> dict[str, int | str | None]:
+    """Shuffle locally, split to the Volume, and restore omitted headers."""
+    seqkit = _require_executable("seqkit")
+    shuffled_path = scratch_root / "shuffled.fasta"
+    seqkit_tmp_dir = scratch_root / "seqkit"
+    seqkit_tmp_dir.mkdir(parents=True)
+    shuffle_diagnostics_path = validation_dir / "shuffle-stderr.log"
+    recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
+    shuffle_argv = [
+        seqkit,
+        "shuffle",
+        "-j",
+        str(seqkit_threads),
+        "--two-pass",
+        "--update-faidx",
+        "--tmp-dir",
+        str(seqkit_tmp_dir),
+        "--rand-seed",
+        str(SHARD_RANDOM_SEED),
+        str(source_path),
+    ]
+    _append_log(log_path, f"Running command: {shlex.join(shuffle_argv)}")
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    with (
+        shuffled_path.open("xb") as shuffled,
+        shuffle_diagnostics_path.open("xb") as diagnostics,
+    ):
+        shuffle_process = subprocess.run(  # noqa: S603
+            shuffle_argv,
+            check=False,
+            stdout=shuffled,
+            stderr=diagnostics,
+        )
+    _append_diagnostic_file(shuffle_diagnostics_path, log_path)
+    if shuffle_process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            shuffle_process.returncode,
+            shuffle_argv,
+        )
+
+    warnings = _parse_fai_duplicate_warnings(shuffle_diagnostics_path)
+    temporary_namespace = f"{RECOVERED_HEADER_NAMESPACE}{uuid.uuid4().hex}_"
+    recovery_metrics = _recover_profile_duplicate_records(
+        source_path,
+        shuffled_path,
+        warnings,
+        recovery_report_path,
+        temporary_namespace=temporary_namespace,
+    )
+    _append_log(
+        log_path,
+        "Recovered "
+        f"{recovery_metrics['recovered_records']} FAI-omitted records "
+        f"({recovery_metrics['recovered_residues']} residues)",
+    )
+
+    split_argv = [
+        seqkit,
+        "split2",
+        "-j",
+        str(seqkit_threads),
+        "--by-part",
+        str(spec.shard_count),
+        "--out-dir",
+        str(raw_shard_dir),
+        "--force",
+        "--out-prefix",
+        "part_",
+        str(shuffled_path),
+    ]
+    _append_log(log_path, f"Running command: {shlex.join(split_argv)}")
+    raw_shard_dir.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as log:
+        split_process = subprocess.run(  # noqa: S603
+            split_argv,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+        )
+    if split_process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            split_process.returncode,
+            split_argv,
+        )
+
+    raw_shards = sorted(
+        path
+        for path in raw_shard_dir.iterdir()
+        if path.is_file() and not path.is_symlink()
+    )
+    if len(raw_shards) != spec.shard_count:
+        raise ValueError(
+            f"Expected {spec.shard_count} raw shards, found {len(raw_shards)}"
+        )
+
+    shuffled_path.unlink()
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    recovery_pattern = _recovery_header_pattern(temporary_namespace)
+    for index, raw_shard in enumerate(raw_shards):
+        if raw_shard.stat().st_size <= 0:
+            raise ValueError(f"SeqKit produced empty shard: {raw_shard}")
+        final_shard = shard_dir / _production_shard_filename(spec, index)
+        _run_to_file(
+            [
+                seqkit,
+                "replace",
+                "-j",
+                str(seqkit_threads),
+                "--pattern",
+                recovery_pattern,
+                "--replacement",
+                "",
+                str(raw_shard),
+            ],
+            final_shard,
+            log_path,
+        )
+        _require_regular_file(final_shard)
+        raw_shard.unlink()
+    raw_shard_dir.rmdir()
+    return recovery_metrics
+
+
+def _validate_production_profile_statistics(
+    spec: DatabaseProfileSpec,
+    source_stats_path: Path,
+    shard_stats_path: Path,
+    shard_summary_path: Path,
+) -> dict[str, int | float]:
+    """Validate full source/shard statistics for one fixed specification."""
+    import polars as pl
+
+    source_stats = pl.read_csv(source_stats_path, separator="\t")
+    shard_stats = pl.read_csv(shard_stats_path, separator="\t")
+    required_columns = {"file", "num_seqs", "sum_len"}
+    if not required_columns.issubset(source_stats.columns):
+        raise ValueError(f"Source stats missing columns: {required_columns}")
+    if not required_columns.issubset(shard_stats.columns):
+        raise ValueError(f"Shard stats missing columns: {required_columns}")
+    if source_stats.height != 1:
+        raise ValueError(f"Expected one source stats row, got {source_stats.height}")
+    if shard_stats.height != spec.shard_count:
+        raise ValueError(
+            f"Expected {spec.shard_count} shard stats rows, got {shard_stats.height}"
+        )
+
+    shard_stats = shard_stats.with_columns(
+        pl
+        .col("file")
+        .cast(pl.String)
+        .str.replace_all(r"\\", "/")
+        .str.split("/")
+        .list.last()
+        .alias("basename")
+    ).sort("basename")
+    if shard_stats.get_column("basename").to_list() != list(
+        _production_shard_names(spec)
+    ):
+        raise ValueError("SeqKit stats shard names do not match the profile")
+
+    source_num_seqs = int(source_stats.item(0, "num_seqs"))
+    source_sum_len = int(source_stats.item(0, "sum_len"))
+    shard_num_seqs = int(shard_stats.get_column("num_seqs").sum())
+    shard_sum_len = int(shard_stats.get_column("sum_len").sum())
+    if spec.expected_num_seqs is not None and source_num_seqs != spec.expected_num_seqs:
+        raise ValueError(
+            f"{spec.database_id} sequence count {source_num_seqs} does not "
+            f"match expected {spec.expected_num_seqs}"
+        )
+    if spec.expected_sum_len is not None and source_sum_len != spec.expected_sum_len:
+        raise ValueError(
+            f"{spec.database_id} residue count {source_sum_len} does not "
+            f"match expected {spec.expected_sum_len}"
+        )
+    if shard_num_seqs != source_num_seqs:
+        raise ValueError(
+            f"Shard sequence count {shard_num_seqs} != source {source_num_seqs}"
+        )
+    if shard_sum_len != source_sum_len:
+        raise ValueError(
+            f"Shard residue count {shard_sum_len} != source {source_sum_len}"
+        )
+
+    mean_sum_len = source_sum_len / spec.shard_count
+    maximum_imbalance = max(
+        abs(int(value) - mean_sum_len) / mean_sum_len
+        for value in shard_stats.get_column("sum_len")
+    )
+    if maximum_imbalance > MAX_PROFILE_IMBALANCE:
+        raise ValueError(
+            "Shard residue imbalance exceeds "
+            f"{MAX_PROFILE_IMBALANCE:.0%}: {maximum_imbalance:.3%}"
+        )
+
+    shard_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    shard_stats.write_parquet(shard_summary_path)
+    return {
+        "num_seqs": source_num_seqs,
+        "sum_len": source_sum_len,
+        "maximum_residue_imbalance": maximum_imbalance,
+    }
+
+
+def _validate_production_profile_manifest(
+    manifest: dict[str, Any],
+    spec: DatabaseProfileSpec,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate one production-candidate manifest without filesystem access."""
+    if manifest.get("schema_version") != PRODUCTION_PROFILE_SCHEMA_VERSION:
+        raise ValueError("Unexpected production profile schema version")
+    if manifest.get("profile_id") != spec.profile_id:
+        raise ValueError("Unexpected production profile ID")
+    if manifest.get("database_id") != spec.database_id:
+        raise ValueError("Unexpected production database ID")
+    if manifest.get("polymer") != spec.polymer:
+        raise ValueError("Unexpected production profile polymer")
+    if manifest.get("shard_count") != spec.shard_count:
+        raise ValueError("Unexpected production profile shard count")
+    if manifest.get("shard_prefix") != f"shards/{spec.source_filename}":
+        raise ValueError("Unexpected production profile shard prefix")
+    if manifest.get("search_space_value") != spec.search_space_value:
+        raise ValueError("Unexpected production profile search-space value")
+    if manifest.get("search_space_unit") != spec.search_space_unit:
+        raise ValueError("Unexpected production profile search-space unit")
+
+    source = manifest.get("source")
+    shards = manifest.get("shards")
+    validation = manifest.get("validation")
+    recipe = manifest.get("recipe")
+    compatibility = manifest.get("compatibility")
+    if not isinstance(source, dict):
+        raise ValueError("Production profile source must be an object")
+    if source.get("volume") != SOURCE_DB_VOLUME_NAME:
+        raise ValueError("Production profile source Volume is invalid")
+    if source.get("path") != spec.source_filename:
+        raise ValueError("Production profile source path is invalid")
+    if not isinstance(source.get("size_bytes"), int) or source["size_bytes"] <= 0:
+        raise ValueError("Production profile source size is invalid")
+    if not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64:
+        raise ValueError("Production profile source SHA-256 is invalid")
+    if (
+        not isinstance(source.get("num_seqs"), int)
+        or source["num_seqs"] <= 0
+        or not isinstance(source.get("sum_len"), int)
+        or source["sum_len"] <= 0
+    ):
+        raise ValueError("Production profile source statistics are invalid")
+    if (
+        spec.expected_num_seqs is not None
+        and source["num_seqs"] != spec.expected_num_seqs
+    ):
+        raise ValueError("Production profile source sequence count is invalid")
+    if spec.expected_sum_len is not None and source["sum_len"] != spec.expected_sum_len:
+        raise ValueError("Production profile source residue count is invalid")
+
+    if not isinstance(shards, list) or len(shards) != spec.shard_count:
+        raise ValueError(f"Production profile must declare {spec.shard_count} shards")
+    if not isinstance(recipe, dict):
+        raise ValueError("Production profile recipe must be an object")
+    if compatibility != {
+        "alphafold_repository": CONF.repo_url,
+        "alphafold_commit": CONF.repo_commit_hash,
+        "hmmer_version": HMMER_VERSION,
+        "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+    }:
+        raise ValueError("Unexpected production profile compatibility pin")
+    if recipe.get("version") != PRODUCTION_PROFILE_RECIPE_VERSION:
+        raise ValueError("Unexpected production profile recipe version")
+    if recipe.get("seqkit_version") != SEQKIT_VERSION:
+        raise ValueError("Unexpected production profile SeqKit version")
+    if recipe.get("random_seed") != SHARD_RANDOM_SEED:
+        raise ValueError("Unexpected production profile shuffle seed")
+    if recipe.get("shuffle") != [
+        "--two-pass",
+        "--update-faidx",
+        "--tmp-dir=/tmp",
+    ]:
+        raise ValueError("Unexpected production profile shuffle recipe")
+    if recipe.get("split") != ["--by-part", spec.shard_count]:
+        raise ValueError("Unexpected production profile split recipe")
+    if recipe.get("duplicate_recovery") != {
+        "warning_source": "seqkit-fai-sequence-byte-offset",
+        "temporary_header_identity": "generation-unique-uuid",
+        "append_after_shuffle": True,
+        "strip_after_split": True,
+    }:
+        raise ValueError("Unexpected production duplicate-recovery recipe")
+    try:
+        _validate_seqkit_threads(recipe.get("seqkit_threads"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid production profile SeqKit threads") from exc
+
+    if not isinstance(validation, dict) or validation.get("passed") is not True:
+        raise ValueError("Production profile does not declare passed validation")
+    if validation.get("temporary_recovery_prefix_absent") is not True:
+        raise ValueError("Production profile may retain recovery prefixes")
+    if validation.get("num_seqs") != source["num_seqs"]:
+        raise ValueError("Production profile validation sequence count is invalid")
+    if validation.get("sum_len") != source["sum_len"]:
+        raise ValueError("Production profile validation residue count is invalid")
+    validation_artifacts = validation.get("artifacts")
+    if not isinstance(validation_artifacts, list):
+        raise ValueError("Production validation artifacts must be a list")
+
+    expected_shard_paths = [f"shards/{name}" for name in _production_shard_names(spec)]
+    actual_shard_paths: list[str] = []
+    for record in [*shards, *validation_artifacts]:
+        if not isinstance(record, dict):
+            raise ValueError("Production artifact record must be an object")
+        relative = record.get("path")
+        size_bytes = record.get("size_bytes")
+        digest = record.get("sha256")
+        if not isinstance(relative, str) or Path(relative).is_absolute():
+            raise ValueError("Production artifact path must be relative")
+        if ".." in PurePosixPath(relative).parts:
+            raise ValueError(f"Production artifact escapes root: {relative}")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes <= 0
+        ):
+            raise ValueError(f"Production artifact is empty: {relative}")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(f"Invalid production artifact digest: {relative}")
+        if relative.startswith("shards/"):
+            actual_shard_paths.append(relative)
+    if actual_shard_paths != expected_shard_paths:
+        raise ValueError("Production profile shard order or names are invalid")
+    if [str(record["path"]) for record in validation_artifacts] != list(
+        PRODUCTION_VALIDATION_RELPATHS
+    ):
+        raise ValueError("Production validation artifact paths are invalid")
+    return source, shards, validation_artifacts
+
+
+def _validate_published_production_profile(
+    profile_root: Path,
+    spec: DatabaseProfileSpec,
+    *,
+    verify_digests: bool,
+) -> dict[str, Any]:
+    """Deeply validate a manifest-last production-candidate publication."""
+    manifest_path = profile_root / "manifest.json"
+    _require_regular_file(manifest_path)
+    if (profile_root / "source").exists():
+        raise ValueError("Production profile must not contain a source copy")
+    manifest = _load_json_object(manifest_path)
+    _, shards, validation_artifacts = _validate_production_profile_manifest(
+        manifest,
+        spec,
+    )
+    resolved_root = profile_root.resolve()
+    for record in [*shards, *validation_artifacts]:
+        relative = str(record["path"])
+        artifact_path = (profile_root / relative).resolve()
+        if not artifact_path.is_relative_to(resolved_root):
+            raise ValueError(f"Production artifact escapes root: {relative}")
+        _require_regular_file(artifact_path)
+        if artifact_path.stat().st_size != record["size_bytes"]:
+            raise ValueError(f"Production artifact size mismatch: {relative}")
+        if verify_digests and _sha256_file(artifact_path) != record["sha256"]:
+            raise ValueError(f"Production artifact digest mismatch: {relative}")
+    return manifest
+
+
+def _profile_claim_key(spec: DatabaseProfileSpec) -> str:
+    """Return the one mutable election-slot key for a fixed Profile ID."""
+    return f"active:{spec.profile_id}"
+
+
+def _profile_owner_key(spec: DatabaseProfileSpec, generation_id: str) -> str:
+    """Return one append-only claim-owner record key."""
+    return f"owner:{spec.profile_id}:{generation_id}"
+
+
+def _profile_status_key(spec: DatabaseProfileSpec, generation_id: str) -> str:
+    """Return one append-only claim-terminal record key."""
+    return f"status:{spec.profile_id}:{generation_id}"
+
+
+def _acquire_profile_build_claim(
+    spec: DatabaseProfileSpec,
+    generation_id: str,
+) -> dict[str, object]:
+    """Elect one builder, failing immediately on a non-stale conflict."""
+    owner = {
+        "profile_id": spec.profile_id,
+        "database_id": spec.database_id,
+        "generation_id": generation_id,
+        "container_id": _CONTAINER_INSTANCE_ID,
+        "hostname": socket.gethostname(),
+        "started_at": _utc_now(),
+        "started_at_epoch_seconds": time(),
+        "maximum_age_seconds": PRODUCTION_PROFILE_STALE_SECONDS,
+    }
+    active_key = _profile_claim_key(spec)
+    if PROFILE_BUILD_CLAIMS.put(active_key, owner, skip_if_exists=True):
+        if not PROFILE_BUILD_CLAIMS.put(
+            _profile_owner_key(spec, generation_id),
+            owner,
+            skip_if_exists=True,
+        ):
+            PROFILE_BUILD_CLAIMS.pop(active_key, None)
+            raise RuntimeError("Profile generation owner key already exists")
+        return owner
+
+    active = PROFILE_BUILD_CLAIMS.get(active_key, None)
+    if not isinstance(active, dict):
+        raise RuntimeError(f"Profile {spec.profile_id} has an invalid active claim")
+    started_at = active.get("started_at_epoch_seconds")
+    if not isinstance(started_at, int | float):
+        raise RuntimeError(f"Profile {spec.profile_id} has an invalid claim time")
+    age_seconds = time() - float(started_at)
+    if age_seconds <= PRODUCTION_PROFILE_STALE_SECONDS:
+        raise RuntimeError(
+            f"Profile {spec.profile_id} is already being built by generation "
+            f"{active.get('generation_id')!r}"
+        )
+
+    removed = PROFILE_BUILD_CLAIMS.pop(active_key, None)
+    if removed != active:
+        raise RuntimeError(
+            f"Profile {spec.profile_id} claim changed during stale recovery"
+        )
+    stale_generation = active.get("generation_id")
+    if isinstance(stale_generation, str):
+        PROFILE_BUILD_CLAIMS.put(
+            _profile_status_key(spec, stale_generation),
+            {
+                "status": "abandoned",
+                "abandoned_at": _utc_now(),
+                "age_seconds": age_seconds,
+                "replaced_by_generation_id": generation_id,
+            },
+            skip_if_exists=True,
+        )
+    if not PROFILE_BUILD_CLAIMS.put(active_key, owner, skip_if_exists=True):
+        raise RuntimeError(f"Profile {spec.profile_id} claim was acquired concurrently")
+    if not PROFILE_BUILD_CLAIMS.put(
+        _profile_owner_key(spec, generation_id),
+        owner,
+        skip_if_exists=True,
+    ):
+        PROFILE_BUILD_CLAIMS.pop(active_key, None)
+        raise RuntimeError("Profile generation owner key already exists")
+    return owner
+
+
+def _finish_profile_build_claim(
+    spec: DatabaseProfileSpec,
+    generation_id: str,
+    *,
+    status: str,
+    detail: dict[str, object],
+) -> None:
+    """Append terminal claim status and release this generation's slot."""
+    PROFILE_BUILD_CLAIMS.put(
+        _profile_status_key(spec, generation_id),
+        {
+            "status": status,
+            "finished_at": _utc_now(),
+            **detail,
+        },
+        skip_if_exists=True,
+    )
+    active_key = _profile_claim_key(spec)
+    active = PROFILE_BUILD_CLAIMS.get(active_key, None)
+    if isinstance(active, dict) and active.get("generation_id") == generation_id:
+        PROFILE_BUILD_CLAIMS.pop(active_key, None)
+
+
+def _hash_decompressed_zstd(
+    archive_path: Path,
+    log_path: Path,
+) -> tuple[str, int]:
+    """Stream one zstd archive through SHA-256 without materializing it."""
+    zstd = _require_executable("zstd")
+    argv = [zstd, "--quiet", "--decompress", "--stdout", str(archive_path)]
+    _append_log(log_path, f"Running command: {shlex.join(argv)}")
+    with log_path.open("ab") as log:
+        process = subprocess.Popen(  # noqa: S603
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=log,
+        )
+        if process.stdout is None:
+            process.kill()
+            raise RuntimeError("zstd did not expose decompressed stdout")
+        digest = hashlib.sha256()
+        size_bytes = 0
+        while chunk := process.stdout.read(8 * 1024 * 1024):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        process.stdout.close()
+        returncode = process.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, argv)
+    return digest.hexdigest(), size_bytes
+
+
+def _apply_source_policy(
+    spec: DatabaseProfileSpec,
+    manifest: dict[str, Any],
+    source_policy: str,
+    log_path: Path,
+    *,
+    seqkit_threads: int,
+) -> dict[str, object]:
+    """Retire a source only after a valid profile publication exists."""
+    policy = _validate_source_policy(source_policy)
+    source_path = Path(APP_INFO.source_db_dir) / spec.source_filename
+    archive_path = source_path.with_name(f"{source_path.name}.zst")
+    if policy == "keep":
+        return {
+            "source_policy": policy,
+            "source_status": "kept" if source_path.is_file() else "already-retired",
+        }
+
+    source_record = manifest.get("source")
+    if not isinstance(source_record, dict):
+        raise ValueError("Validated manifest lost its source record")
+    expected_sha256 = source_record.get("sha256")
+    expected_size = source_record.get("size_bytes")
+    if not isinstance(expected_sha256, str) or not isinstance(expected_size, int):
+        raise ValueError("Validated manifest source identity is invalid")
+
+    if not source_path.is_file():
+        if policy == "compress" and archive_path.is_file():
+            archive_sha256, archive_size = _hash_decompressed_zstd(
+                archive_path,
+                log_path,
+            )
+            if (archive_sha256, archive_size) != (
+                expected_sha256,
+                expected_size,
+            ):
+                raise ValueError(
+                    f"Existing archive does not reproduce {spec.source_filename}"
+                )
+            return {
+                "source_policy": policy,
+                "source_status": "already-compressed",
+                "archive_path": str(archive_path),
+            }
+        if policy == "delete":
+            return {
+                "source_policy": policy,
+                "source_status": "already-deleted",
+            }
+        raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
+
+    if policy == "delete":
+        if (
+            source_path.stat().st_size != expected_size
+            or _sha256_file(source_path) != expected_sha256
+        ):
+            raise ValueError(
+                f"Refusing to delete changed source {spec.source_filename}"
+            )
+        source_path.unlink()
+        SOURCE_MSA_DB_VOLUME.commit()
+        return {
+            "source_policy": policy,
+            "source_status": "deleted",
+        }
+
+    if archive_path.is_file():
+        archive_sha256, archive_size = _hash_decompressed_zstd(
+            archive_path,
+            log_path,
+        )
+        if (archive_sha256, archive_size) != (expected_sha256, expected_size):
+            raise ValueError(
+                f"Existing archive does not reproduce {spec.source_filename}"
+            )
+    else:
+        zstd = _require_executable("zstd")
+        temporary_archive = archive_path.with_name(
+            f".{archive_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        argv = [
+            zstd,
+            f"-T{seqkit_threads}",
+            "--quiet",
+            "--stdout",
+            str(source_path),
+        ]
+        _append_log(log_path, f"Running command: {shlex.join(argv)}")
+        try:
+            with temporary_archive.open("xb") as archive, log_path.open("ab") as log:
+                completed = subprocess.run(  # noqa: S603
+                    argv,
+                    check=False,
+                    stdout=archive,
+                    stderr=log,
+                )
+                archive.flush()
+                os.fsync(archive.fileno())
+            if completed.returncode != 0:
+                raise subprocess.CalledProcessError(completed.returncode, argv)
+            archive_sha256, archive_size = _hash_decompressed_zstd(
+                temporary_archive,
+                log_path,
+            )
+            if (archive_sha256, archive_size) != (
+                expected_sha256,
+                expected_size,
+            ):
+                raise ValueError(
+                    f"Compressed archive does not reproduce {spec.source_filename}"
+                )
+            temporary_archive.replace(archive_path)
+            SOURCE_MSA_DB_VOLUME.commit()
+        finally:
+            temporary_archive.unlink(missing_ok=True)
+
+    source_path.unlink()
+    SOURCE_MSA_DB_VOLUME.commit()
+    return {
+        "source_policy": policy,
+        "source_status": "compressed",
+        "archive_path": str(archive_path),
+        "archive_size_bytes": archive_path.stat().st_size,
+    }
+
+
+def _build_production_profile(
+    database_id: str,
+    seqkit_threads: int,
+    source_policy: str,
+) -> dict[str, object]:
+    """Build, publish, deeply validate, and optionally retire one source."""
+    spec = _database_profile_spec(database_id)
+    threads = _validate_seqkit_threads(seqkit_threads)
+    policy = _validate_source_policy(source_policy)
+    generation_id = uuid.uuid4().hex
+    source_root = Path(APP_INFO.source_db_dir)
+    sharded_root = Path(APP_INFO.sharded_db_dir)
+    output_root = Path(APP_INFO.output_dir)
+    source_path = source_root / spec.source_filename
+    profile_root = _production_profile_root(sharded_root, spec)
+    evidence_root = (
+        output_root / PRODUCTION_PREPARATION_ROOT / spec.profile_id / generation_id
+    )
+    log_path = evidence_root / "run.log"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    _append_log(log_path, f"Preparing production profile {spec.profile_id}")
+
+    SOURCE_MSA_DB_VOLUME.reload()
+    SHARDED_MSA_DB_VOLUME.reload()
+    BENCHMARK_OUTPUT_VOLUME.reload()
+    if (profile_root / "manifest.json").is_file():
+        manifest = _validate_published_production_profile(
+            profile_root,
+            spec,
+            verify_digests=True,
+        )
+        source_result = _apply_source_policy(
+            spec,
+            manifest,
+            policy,
+            log_path,
+            seqkit_threads=threads,
+        )
+        result = {
+            "status": "reused",
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "generation_id": generation_id,
+            "profile_path": str(profile_root),
+            "manifest_sha256": _sha256_file(profile_root / "manifest.json"),
+            **source_result,
+        }
+        _write_json_atomic(evidence_root / "metrics.json", result)
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _write_json_atomic(
+            evidence_root / "done.json",
+            result | {"completed_at": _utc_now()},
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        return result
+
+    claim = _acquire_profile_build_claim(spec, generation_id)
+    _write_json_atomic(evidence_root / "claim.json", claim)
+    BENCHMARK_OUTPUT_VOLUME.commit()
+    staging_root = sharded_root / ".staging" / f"{spec.profile_id}-{generation_id}"
+    raw_shard_dir = staging_root / ".raw-shards"
+    shard_dir = staging_root / "shards"
+    validation_dir = staging_root / "validation"
+    payload_moved = False
+    manifest_published = False
+    try:
+        if profile_root.exists():
+            orphan_root = sharded_root / ".orphaned"
+            orphan_root.mkdir(parents=True, exist_ok=True)
+            profile_root.replace(orphan_root / f"{spec.profile_id}-{uuid.uuid4().hex}")
+            SHARDED_MSA_DB_VOLUME.commit()
+
+        if not source_path.is_file():
+            archive_path = source_path.with_name(f"{source_path.name}.zst")
+            if archive_path.is_file():
+                raise FileNotFoundError(
+                    f"{source_path} is archived as {archive_path}. Restore the "
+                    "plain FASTA manually in a Modal Sandbox before rebuilding."
+                )
+            raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
+        _require_regular_file(source_path)
+        source_size = source_path.stat().st_size
+        scratch_free = shutil.disk_usage(PRODUCTION_SCRATCH_ROOT).free
+        scratch_required = int(source_size * 1.05)
+        if scratch_free < scratch_required:
+            raise OSError(
+                f"Insufficient /tmp space for {spec.database_id}: need at least "
+                f"{scratch_required} bytes, found {scratch_free}"
+            )
+
+        shard_dir.mkdir(parents=True)
+        validation_dir.mkdir(parents=True)
+        seqkit = _require_executable("seqkit")
+        version_output = subprocess.run(  # noqa: S603
+            [seqkit, "version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if SEQKIT_VERSION not in version_output:
+            raise RuntimeError(
+                f"Expected SeqKit {SEQKIT_VERSION}, observed {version_output!r}"
+            )
+        _append_log(log_path, f"Using {version_output}")
+
+        source_stats_path = validation_dir / "source-stats.tsv"
+        shard_stats_path = validation_dir / "shard-stats.tsv"
+        shard_summary_path = validation_dir / "shard-summary.parquet"
+        source_sum_path = validation_dir / "source-sum.tsv"
+        shard_sum_path = validation_dir / "shard-sum.tsv"
+        _run_to_file(
+            [
+                seqkit,
+                "stats",
+                "-j",
+                str(threads),
+                "--all",
+                "--tabular",
+                str(source_path),
+            ],
+            source_stats_path,
+            log_path,
+        )
+
+        import polars as pl
+
+        source_stats = pl.read_csv(source_stats_path, separator="\t")
+        if source_stats.height != 1:
+            raise ValueError(
+                f"Expected one source stats row, got {source_stats.height}"
+            )
+        source_num_seqs = int(source_stats.item(0, "num_seqs"))
+        source_sum_len = int(source_stats.item(0, "sum_len"))
+        if (
+            spec.expected_num_seqs is not None
+            and source_num_seqs != spec.expected_num_seqs
+        ):
+            raise ValueError(
+                f"{spec.database_id} sequence count {source_num_seqs} does not "
+                f"match expected {spec.expected_num_seqs}"
+            )
+        if (
+            spec.expected_sum_len is not None
+            and source_sum_len != spec.expected_sum_len
+        ):
+            raise ValueError(
+                f"{spec.database_id} residue count {source_sum_len} does not "
+                f"match expected {spec.expected_sum_len}"
+            )
+        source_sha256 = _sha256_file(source_path)
+        _run_to_file(
+            [
+                seqkit,
+                "sum",
+                "-j",
+                str(threads),
+                "--all",
+                str(source_path),
+            ],
+            source_sum_path,
+            log_path,
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix=f"af3-{spec.database_id}-",
+            dir=PRODUCTION_SCRATCH_ROOT,
+        ) as scratch_dir:
+            recovery_metrics = _run_production_shuffle_split(
+                spec,
+                source_path,
+                Path(scratch_dir),
+                raw_shard_dir,
+                shard_dir,
+                validation_dir,
+                log_path,
+                seqkit_threads=threads,
+            )
+
+        shard_paths = tuple(shard_dir / name for name in _production_shard_names(spec))
+        _run_to_file(
+            [
+                seqkit,
+                "stats",
+                "-j",
+                str(threads),
+                "--all",
+                "--tabular",
+                *(str(path) for path in shard_paths),
+            ],
+            shard_stats_path,
+            log_path,
+        )
+        _run_aggregate_seqkit_sum(
+            shard_paths,
+            shard_sum_path,
+            log_path,
+            seqkit_threads=threads,
+        )
+        source_sum = _seqkit_sum_digest(source_sum_path)
+        shard_sum = _seqkit_sum_digest(shard_sum_path)
+        if source_sum != shard_sum:
+            raise ValueError("Aggregate shard SeqKit sum does not match source")
+        statistics = _validate_production_profile_statistics(
+            spec,
+            source_stats_path,
+            shard_stats_path,
+            shard_summary_path,
+        )
+        _write_json_atomic(
+            validation_dir / "seqkit-sum.json",
+            {
+                "source": source_sum,
+                "aggregate_shards": shard_sum,
+                "match": True,
+                "seqkit_version": SEQKIT_VERSION,
+            },
+        )
+
+        temporary_namespace = recovery_metrics.get("temporary_namespace")
+        if not isinstance(temporary_namespace, str):
+            raise RuntimeError(
+                "Duplicate recovery did not return a temporary namespace"
+            )
+        forbidden_recovery_header = b">" + temporary_namespace.encode("ascii")
+        shard_records = [
+            _artifact_record(
+                shard_path,
+                staging_root,
+                forbidden_bytes=forbidden_recovery_header,
+            )
+            for shard_path in shard_paths
+        ]
+        validation_records = [
+            _artifact_record(staging_root / relative, staging_root)
+            for relative in PRODUCTION_VALIDATION_RELPATHS
+        ]
+        manifest: dict[str, object] = {
+            "schema_version": PRODUCTION_PROFILE_SCHEMA_VERSION,
+            "profile_id": spec.profile_id,
+            "database_id": spec.database_id,
+            "polymer": spec.polymer,
+            "created_at": _utc_now(),
+            "generation_id": generation_id,
+            "source": {
+                "volume": SOURCE_DB_VOLUME_NAME,
+                "path": spec.source_filename,
+                "size_bytes": source_size,
+                "sha256": source_sha256,
+                "num_seqs": statistics["num_seqs"],
+                "sum_len": statistics["sum_len"],
+            },
+            "shard_count": spec.shard_count,
+            "shard_prefix": f"shards/{spec.source_filename}",
+            "shards": shard_records,
+            "search_space_value": (
+                statistics["num_seqs"]
+                if spec.polymer == "protein"
+                else statistics["sum_len"] / 1_000_000
+            ),
+            "search_space_unit": spec.search_space_unit,
+            "compatibility": {
+                "alphafold_repository": CONF.repo_url,
+                "alphafold_commit": CONF.repo_commit_hash,
+                "hmmer_version": HMMER_VERSION,
+                "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+            },
+            "recipe": {
+                "version": PRODUCTION_PROFILE_RECIPE_VERSION,
+                "seqkit_version": SEQKIT_VERSION,
+                "seqkit_threads": threads,
+                "random_seed": SHARD_RANDOM_SEED,
+                "shuffle": [
+                    "--two-pass",
+                    "--update-faidx",
+                    "--tmp-dir=/tmp",
+                ],
+                "duplicate_recovery": {
+                    "warning_source": "seqkit-fai-sequence-byte-offset",
+                    "temporary_header_identity": "generation-unique-uuid",
+                    "append_after_shuffle": True,
+                    "strip_after_split": True,
+                },
+                "split": ["--by-part", spec.shard_count],
+            },
+            "validation": {
+                "passed": True,
+                "seqkit_sum": source_sum,
+                "num_seqs": statistics["num_seqs"],
+                "sum_len": statistics["sum_len"],
+                "maximum_residue_imbalance": (statistics["maximum_residue_imbalance"]),
+                "maximum_allowed_residue_imbalance": MAX_PROFILE_IMBALANCE,
+                "recovered_records": recovery_metrics["recovered_records"],
+                "recovered_residues": recovery_metrics["recovered_residues"],
+                "first_recovered_byte_offset": recovery_metrics["first_byte_offset"],
+                "last_recovered_byte_offset": recovery_metrics["last_byte_offset"],
+                "temporary_recovery_prefix_absent": True,
+                "artifacts": validation_records,
+            },
+        }
+        _validate_production_profile_manifest(
+            manifest,
+            spec,
+        )
+
+        SHARDED_MSA_DB_VOLUME.commit()
+        profile_root.parent.mkdir(parents=True, exist_ok=True)
+        staging_root.replace(profile_root)
+        payload_moved = True
+        SHARDED_MSA_DB_VOLUME.commit()
+        _write_json_atomic(profile_root / "manifest.json", manifest)
+        SHARDED_MSA_DB_VOLUME.commit()
+        manifest_published = True
+        published_manifest = _validate_published_production_profile(
+            profile_root,
+            spec,
+            verify_digests=True,
+        )
+        source_result = _apply_source_policy(
+            spec,
+            published_manifest,
+            policy,
+            log_path,
+            seqkit_threads=threads,
+        )
+        result = {
+            "status": "published",
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "generation_id": generation_id,
+            "profile_path": str(profile_root),
+            "manifest_sha256": _sha256_file(profile_root / "manifest.json"),
+            "source_size_bytes": source_size,
+            "source_sha256": source_sha256,
+            "num_seqs": statistics["num_seqs"],
+            "sum_len": statistics["sum_len"],
+            "search_space_value": manifest["search_space_value"],
+            "search_space_unit": spec.search_space_unit,
+            "maximum_residue_imbalance": (statistics["maximum_residue_imbalance"]),
+            "recovered_records": recovery_metrics["recovered_records"],
+            "recovered_residues": recovery_metrics["recovered_residues"],
+            **source_result,
+        }
+        _write_json_atomic(evidence_root / "metrics.json", result)
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _write_json_atomic(
+            evidence_root / "done.json",
+            result | {"completed_at": _utc_now()},
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _finish_profile_build_claim(
+            spec,
+            generation_id,
+            status="complete",
+            detail={"manifest_sha256": result["manifest_sha256"]},
+        )
+        return result
+    except Exception as exc:
+        if not manifest_published:
+            if payload_moved and profile_root.exists():
+                shutil.rmtree(profile_root)
+            elif staging_root.exists():
+                shutil.rmtree(staging_root)
+            SHARDED_MSA_DB_VOLUME.commit()
+        failure = {
+            "failed_at": _utc_now(),
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "generation_id": generation_id,
+            "profile_published": manifest_published,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        _write_json_atomic(evidence_root / "failure.json", failure)
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _finish_profile_build_claim(
+            spec,
+            generation_id,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "profile_published": manifest_published,
+            },
+        )
+        raise
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 131_072),
+    timeout=CONF.timeout,
+    max_containers=len(DATABASE_PROFILE_SPECS),
+    volumes={
+        APP_INFO.source_db_dir: SOURCE_MSA_DB_VOLUME,
+        APP_INFO.sharded_db_dir: SHARDED_MSA_DB_VOLUME,
+        APP_INFO.output_dir: BENCHMARK_OUTPUT_VOLUME,
+    },
+)
+def build_sharded_database(
+    database_id: str,
+    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+    source_policy: str = "keep",
+) -> dict[str, object]:
+    """Build one fixed, immutable production-candidate database profile."""
+    return _build_production_profile(
+        database_id,
+        seqkit_threads,
+        source_policy,
+    )
+
+
 SCAN_BUFFER_SIZE = 8 * 1024 * 1024
 DONE_SCHEMA_VERSION = 1
 SCAN_PASS_NAMES = ("first-pass", "immediate-repeat")
@@ -2097,6 +3473,7 @@ PEMBROLIZUMAB_VH_SEQUENCE = (
 PEMBROLIZUMAB_VH_SHA256 = (
     "5d92fab232244fa55131fc3b8d31b34990aa778623cdd906d58cf920dbdaf28f"
 )
+RNA_ORACLE_SEQUENCE = "GGCCCGAUAGCUCAGUCGGUAGAGC"
 ECOLI_K12_GROEL_SEQUENCE = (
     "MAAKDVKFGNDARVKMLRGVNVLADAVKVTLGPKGRNVVLDKSFGAPTITKDGVSVAREIELEDKFENMG"
     "AQMVKEVASKANDAAGDGTTTATVLAQAIITEGLKAVAAGMNPMDLKRGIDKAVTAAVEELKALSVPCSD"
@@ -4992,30 +6369,352 @@ def _submit_search_matrix() -> dict[str, object]:
     return summary
 
 
+def _default_profile_query(spec: DatabaseProfileSpec) -> str:
+    """Return the fixed representative query for one polymer class."""
+    if spec.polymer == "protein":
+        return PEMBROLIZUMAB_VH_SEQUENCE
+    if spec.polymer == "rna":
+        return RNA_ORACLE_SEQUENCE
+    raise RuntimeError(f"Unsupported polymer type: {spec.polymer}")
+
+
+def _validate_profile_query(
+    spec: DatabaseProfileSpec,
+    sequence: str,
+) -> str:
+    """Validate a query before it reaches an upstream command wrapper."""
+    if not isinstance(sequence, str):
+        raise TypeError("sequence must be a string")
+    if not 1 <= len(sequence) <= 10_000:
+        raise ValueError("sequence length must be between 1 and 10,000")
+    pattern = r"[A-Z]+" if spec.polymer == "protein" else r"[ACGU]+"
+    if re.fullmatch(pattern, sequence) is None:
+        raise ValueError(f"sequence contains invalid {spec.polymer} characters")
+    return sequence
+
+
+def _production_search_parameters(
+    spec: DatabaseProfileSpec,
+) -> dict[str, object]:
+    """Return result-affecting parameters from the pinned data pipeline."""
+    common: dict[str, object] = {
+        "database_id": spec.database_id,
+        "polymer": spec.polymer,
+        "n_cpu": PRODUCTION_SEARCH_N_CPU,
+        "max_parallel_shards": PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
+        "max_sequences": spec.max_sequences,
+        "z_value": spec.search_space_value,
+    }
+    if spec.polymer == "protein":
+        return common | {
+            "tool": "jackhmmer",
+            "n_iter": 1,
+            "e_value": JACKHMMER_E_VALUE,
+            "dom_z_value": spec.search_space_value,
+            "filter_f1": JACKHMMER_FILTER_F1,
+            "filter_f2": JACKHMMER_FILTER_F2,
+            "filter_f3": JACKHMMER_FILTER_F3,
+        }
+    return common | {
+        "tool": "nhmmer",
+        "e_value": 1e-3,
+        "filter_f3": 1e-5,
+        "alphabet": "rna",
+        "short_sequence_filter_f3": 0.02,
+    }
+
+
+def _production_search_plan(
+    database_id: str,
+    sequence: str,
+) -> dict[str, object]:
+    """Build one side-effect-free fixed profile-search plan."""
+    spec = _database_profile_spec(database_id)
+    query = _validate_profile_query(
+        spec,
+        sequence or _default_profile_query(spec),
+    )
+    return {
+        "operation": "search-profile",
+        "remote_calls": 1,
+        "database_id": spec.database_id,
+        "profile_id": spec.profile_id,
+        "sequence_length": len(query),
+        "sequence_sha256": hashlib.sha256(query.encode()).hexdigest(),
+        "parameters": _production_search_parameters(spec),
+        "resources": {
+            "cpu": [0.125, 32.125],
+            "memory_mib": [1024, 131_072],
+            "timeout_seconds": CONF.timeout,
+        },
+        "input_volume": {
+            "name": SHARDED_DB_VOLUME_NAME,
+            "mount": "read-only",
+        },
+        "output_volume": OUTPUT_VOLUME_NAME,
+        "existing_result_policy": "validate-and-reuse",
+    }
+
+
+def _profile_search_identity(
+    spec: DatabaseProfileSpec,
+    sequence: str,
+    manifest_sha256: str,
+) -> str:
+    """Hash the scientific identity of one sequence-by-profile search."""
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "profile_id": spec.profile_id,
+            "profile_manifest_sha256": manifest_sha256,
+            "sequence": sequence,
+            "parameters": _production_search_parameters(spec),
+            "alphafold_commit": CONF.repo_commit_hash,
+            "hmmer_version": HMMER_VERSION,
+            "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+        })
+    )
+
+
+def _profile_search_relpath(
+    spec: DatabaseProfileSpec,
+    sequence: str,
+    search_identity: str,
+) -> str:
+    """Return one deterministic experimental raw-result directory."""
+    sequence_hash = hashlib.sha256(sequence.encode()).hexdigest()
+    polymer_dir = "Protein" if spec.polymer == "protein" else "RNA"
+    return (
+        "production-candidates/searches/"
+        f"{polymer_dir}/{sequence_hash[:2]}/{sequence_hash}/raw-msa/"
+        f"{spec.database_id}/{search_identity}"
+    )
+
+
+def _load_reusable_profile_search(
+    result_root: Path,
+    search_identity: str,
+) -> dict[str, object] | None:
+    """Validate and return one completed experimental search result."""
+    done_path = result_root / "done.json"
+    if not done_path.is_file():
+        return None
+    done = _load_json_object(done_path)
+    if (
+        done.get("schema_version") != 1
+        or done.get("status") != "complete"
+        or done.get("search_identity") != search_identity
+    ):
+        return None
+    result_record = done.get("result")
+    if not isinstance(result_record, dict):
+        return None
+    result_path = result_root / "result.a3m"
+    if not result_path.is_file():
+        return None
+    result_bytes = result_path.read_bytes()
+    if (
+        result_record.get("size_bytes") != len(result_bytes)
+        or result_record.get("sha256") != hashlib.sha256(result_bytes).hexdigest()
+    ):
+        return None
+    metrics = _load_json_object(result_root / "metrics.json")
+    return metrics | {"status": "reused"}
+
+
+def _run_profile_search(
+    database_id: str,
+    sequence: str,
+) -> dict[str, object]:
+    """Search one fixed published profile using the pinned upstream wrapper."""
+    from importlib import import_module
+
+    spec = _database_profile_spec(database_id)
+    query = _validate_profile_query(spec, sequence)
+    sharded_root = Path(APP_INFO.sharded_db_dir)
+    output_root = Path(APP_INFO.output_dir)
+    profile_root = _production_profile_root(sharded_root, spec)
+    SHARDED_MSA_DB_VOLUME.reload()
+    BENCHMARK_OUTPUT_VOLUME.reload()
+    manifest_path = profile_root / "manifest.json"
+    _require_regular_file(manifest_path)
+    manifest = _load_json_object(manifest_path)
+    _validate_production_profile_manifest(manifest, spec)
+    manifest_sha256 = _sha256_file(manifest_path)
+    search_identity = _profile_search_identity(
+        spec,
+        query,
+        manifest_sha256,
+    )
+    result_root = output_root / _profile_search_relpath(
+        spec,
+        query,
+        search_identity,
+    )
+    reusable = _load_reusable_profile_search(result_root, search_identity)
+    if reusable is not None:
+        return reusable
+
+    log_path = result_root / "run.log"
+    result_root.mkdir(parents=True, exist_ok=True)
+    _append_log(
+        log_path,
+        f"Searching {spec.profile_id} for a {len(query)}-residue query",
+    )
+    database_path = (
+        profile_root / "shards" / spec.source_filename
+    ).as_posix() + f"@{spec.shard_count}"
+    started = perf_counter()
+    try:
+        if spec.polymer == "protein":
+            jackhmmer = import_module("alphafold3.data.tools.jackhmmer")
+            tool = jackhmmer.Jackhmmer(
+                binary_path=JACKHMMER_BINARY_PATH,
+                database_path=database_path,
+                n_cpu=PRODUCTION_SEARCH_N_CPU,
+                n_iter=1,
+                e_value=JACKHMMER_E_VALUE,
+                z_value=spec.search_space_value,
+                dom_z_value=spec.search_space_value,
+                max_sequences=spec.max_sequences,
+                filter_f1=JACKHMMER_FILTER_F1,
+                filter_f2=JACKHMMER_FILTER_F2,
+                filter_f3=JACKHMMER_FILTER_F3,
+                max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
+            )
+        else:
+            nhmmer = import_module("alphafold3.data.tools.nhmmer")
+            tool = nhmmer.Nhmmer(
+                binary_path=NHMMER_BINARY_PATH,
+                hmmalign_binary_path=HMMALIGN_BINARY_PATH,
+                hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
+                database_path=database_path,
+                n_cpu=PRODUCTION_SEARCH_N_CPU,
+                e_value=1e-3,
+                z_value=spec.search_space_value,
+                max_sequences=spec.max_sequences,
+                filter_f3=1e-5,
+                alphabet="rna",
+                max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
+            )
+        result = tool.query(query)
+        a3m = result.a3m
+        if not isinstance(a3m, str) or not a3m.startswith(">query\n"):
+            raise ValueError("Pinned MSA wrapper returned an invalid A3M")
+        result_bytes = a3m.encode()
+        elapsed_seconds = perf_counter() - started
+        result_record = {
+            "path": "result.a3m",
+            "size_bytes": len(result_bytes),
+            "sha256": hashlib.sha256(result_bytes).hexdigest(),
+        }
+        metrics: dict[str, object] = {
+            "schema_version": 1,
+            "status": "published",
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "profile_manifest_sha256": manifest_sha256,
+            "search_identity": search_identity,
+            "sequence_sha256": hashlib.sha256(query.encode()).hexdigest(),
+            "sequence_length": len(query),
+            "elapsed_seconds": elapsed_seconds,
+            "parameters": _production_search_parameters(spec),
+            "result": result_record,
+            "result_path": str(result_root / "result.a3m"),
+        }
+        _write_bytes_atomic(result_root / "result.a3m", result_bytes)
+        _write_json_atomic(result_root / "metrics.json", metrics)
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _write_json_atomic(
+            result_root / "done.json",
+            {
+                "schema_version": 1,
+                "status": "complete",
+                "search_identity": search_identity,
+                "completed_at": _utc_now(),
+                "result": result_record,
+            },
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        return metrics
+    except Exception as exc:
+        _write_json_atomic(
+            result_root / "failure.json",
+            {
+                "failed_at": _utc_now(),
+                "database_id": spec.database_id,
+                "profile_id": spec.profile_id,
+                "search_identity": search_identity,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        raise
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 131_072),
+    timeout=CONF.timeout,
+    max_containers=4,
+    volumes={
+        APP_INFO.sharded_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
+            read_only=True
+        ),
+        APP_INFO.output_dir: BENCHMARK_OUTPUT_VOLUME,
+    },
+)
+def search_database_profile(
+    database_id: str,
+    sequence: str,
+) -> dict[str, object]:
+    """Search one published experimental profile without revalidating shards."""
+    return _run_profile_search(database_id, sequence)
+
+
 @app.local_entrypoint()
 def submit_alphafold3_msa_task(
     operation: str = "prepare",
     submit: bool = False,
     seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
     search_mode: str = "smoke",
+    database_id: str = "small_bfd",
+    source_policy: str = "keep",
+    sequence: str = "",
 ) -> None:
     """Plan or submit one isolated AlphaFold 3 MSA benchmark operation.
 
     Args:
-        operation: Operation to plan or run: ``prepare``, ``scan``, or ``search``.
+        operation: Operation to plan or run: ``prepare``, ``build-profile``,
+            ``search-profile``, ``scan``, or ``search``.
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
         seqkit_threads: SeqKit thread count for profile preparation, default 8.
         search_mode: Fixed search workload: ``smoke``, ``sweep``, or ``matrix``.
+        database_id: Fixed database ID for production-candidate operations.
+        source_policy: Post-validation source action: keep, compress, or delete.
+        sequence: Optional profile-search query; defaults by polymer type.
     """
     if operation == "prepare":
         plan = _build_prepare_plan(seqkit_threads)
+    elif operation == "build-profile":
+        plan = _production_profile_plan(
+            database_id,
+            seqkit_threads,
+            source_policy,
+        )
+    elif operation == "search-profile":
+        plan = _production_search_plan(database_id, sequence)
     elif operation == "scan":
         plan = _build_scan_plan()
     elif operation == "search":
         plan = _build_search_plan(search_mode)
     else:
-        raise ValueError("operation must be 'prepare', 'scan', or 'search'")
+        raise ValueError(
+            "operation must be 'prepare', 'build-profile', 'search-profile', "
+            "'scan', or 'search'"
+        )
     print(_json_bytes(plan).decode(), end="")
     if not submit:
         print("🧬 Plan only; no Modal function was submitted.")
@@ -5023,6 +6722,24 @@ def submit_alphafold3_msa_task(
     if operation == "prepare":
         print("🧬 Submitting one small-BFD profile preparation function...")
         result = prepare_small_bfd_profile.remote(seqkit_threads=seqkit_threads)
+    elif operation == "build-profile":
+        print(f"🧬 Submitting the fixed {database_id} profile builder...")
+        result = build_sharded_database.remote(
+            database_id=database_id,
+            seqkit_threads=seqkit_threads,
+            source_policy=source_policy,
+        )
+    elif operation == "search-profile":
+        spec = _database_profile_spec(database_id)
+        query = _validate_profile_query(
+            spec,
+            sequence or _default_profile_query(spec),
+        )
+        print(f"🧬 Submitting one fixed {database_id} profile search...")
+        result = search_database_profile.remote(
+            database_id=database_id,
+            sequence=query,
+        )
     elif operation == "scan":
         print("🧬 Submitting the sequential Volume scan matrix...")
         result = _submit_scan_matrix()

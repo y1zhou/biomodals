@@ -66,7 +66,7 @@ value, or polymer type.
 
 | `database_id` | Profile ID | Official source | Shards | Polymer |
 | --- | --- | --- | ---: | --- |
-| `small_bfd` | `small-bfd-64-v1` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
+| `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
 | `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
 | `uniprot` | `uniprot-256-v1` | `uniprot_all_2021_04.fa` | 256 | protein |
 | `uniref90` | `uniref90-128-v1` | `uniref90_2022_05.fa` | 128 | protein |
@@ -78,6 +78,10 @@ Each specification also fixes the expected official source statistic, profile
 recipe version, SeqKit version and seed, and compatibility pins. Protein Z and
 domZ are the validated source sequence count. RNA Z is the validated total
 nucleotide count divided by 1,000,000.
+
+The completed `small-bfd-64-v1` benchmark profile is retained unchanged.
+`small-bfd-64-v2` is a new production candidate because its published payload
+omits the monolithic source and its shuffle/index scratch stays under `/tmp`.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never

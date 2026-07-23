@@ -51,7 +51,7 @@ source paths, shard counts, polymer types, Z values, or profile IDs.
 
 | Database ID | Profile ID | Source FASTA | Shards | Polymer |
 | --- | --- | --- | ---: | --- |
-| `small_bfd` | `small-bfd-64-v1` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
+| `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
 | `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
 | `uniprot` | `uniprot-256-v1` | `uniprot_all_2021_04.fa` | 256 | protein |
 | `uniref90` | `uniref90-128-v1` | `uniref90_2022_05.fa` | 128 | protein |
@@ -62,6 +62,10 @@ source paths, shard counts, polymer types, Z values, or profile IDs.
 Each specification also fixes the source snapshot guards, construction recipe,
 SeqKit version and seed, and AlphaFold compatibility pin. A scientific change
 requires a new Profile ID and a reviewed app deployment.
+
+`small-bfd-64-v1` remains immutable benchmark evidence. The production
+candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
+`/tmp` and does not retain the monolithic FASTA inside the profile.
 
 `seqkit_threads` is an operational builder control. Changing it does not select
 a different scientific specification or Profile ID.

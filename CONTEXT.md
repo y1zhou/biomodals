@@ -174,6 +174,10 @@ _Avoid_: raw input, model features, partially populated search fields
 Non-empty MSA or template data supplied for one request, either inline or materialized from a caller path. It may contribute to an Enriched AlphaFold Input but never becomes shared canonical search evidence.
 _Avoid_: raw database MSA, combined MSA publication, template search result
 
+**Search Field Resolution**:
+The request-scoped selection or generation of each MSA and template field independently. A populated field neither authorizes its replacement nor implies that a missing sibling field is resolved.
+_Avoid_: chain-wide search, all-or-nothing data pipeline
+
 **AlphaFold Run Root**:
 The job-scoped directory on the AlphaFold3 output Volume that makes staged caller inputs available to remote functions and durably owns that job's inference outputs, logs, and completion state.
 _Avoid_: MSA cache root, database Volume, local download directory

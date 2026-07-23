@@ -167,7 +167,7 @@ An exclusive, temporary subtree on the AlphaFold3 output Volume where one GPU co
 _Avoid_: seed prediction, canonical output tree, local scratch directory
 
 **Inference Run Summary**:
-The single finalized set of upstream-style top-level data, ranking, and best-prediction files derived from validated Seed Predictions beneath one AlphaFold Run Root.
+The single finalized set of upstream-style top-level data, ranking, and best-prediction files derived from the accumulated union of every validated Seed Prediction beneath one AlphaFold Run Root.
 _Avoid_: worker-local ranking, seed sample directory, completion marker
 
 **Search Identity**:

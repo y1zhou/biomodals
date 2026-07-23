@@ -138,6 +138,10 @@ _Avoid_: source database directory, incomplete shard staging, benchmark sample
 A code-owned identifier for one immutable Sharded Database Profile, fixing its source database generation, shard count, and build recipe. It is selected by the Supported Database Specification rather than through a mutable runtime alias.
 _Avoid_: current profile, database ID, manifest digest
 
+**Profile Build Claim**:
+A minimal, append-only Modal Dict election record allowing one invocation to construct one Profile ID. Conflicts fail fast; a later explicit invocation may advance beyond a failed or conservatively stale generation.
+_Avoid_: published profile, search build claim, polling lock service
+
 **Source FASTA Policy**:
 The explicit post-publication choice to keep, round-trip-verify and archivally compress, or delete an original database FASTA after its Sharded Database Profile is durably validated. A compressed source must be restored manually before another profile build.
 _Avoid_: temporary builder cleanup, shard compression, implicit retention, automatic source restore

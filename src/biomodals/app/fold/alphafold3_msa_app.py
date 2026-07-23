@@ -3684,6 +3684,25 @@ def _validate_screening_block_orders() -> None:
             raise ValueError("Each screening block must contain every case once")
 
 
+def _focused_sweep_operation_identity(
+    manifest_sha256: str,
+    sample_identities: dict[str, str],
+) -> str:
+    """Hash the one-shot sweep plan, policy, profile, and sample identities."""
+    if set(sample_identities) != set(FOCUSED_SWEEP_CASE_IDS):
+        raise ValueError("Focused sweep sample identities do not match its cases")
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": 1,
+            "campaign_id": CAMPAIGN_ID,
+            "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
+            "profile_manifest_sha256": manifest_sha256,
+            "plan": _build_search_plan("sweep"),
+            "sample_identities": sample_identities,
+        })
+    )
+
+
 def _matrix_operation_identity(manifest_sha256: str) -> str:
     """Hash the fixed one-shot matrix plan and profile identity."""
     _validate_screening_block_orders()
@@ -3740,7 +3759,7 @@ def _run_or_reuse_matrix_sample(
     sample_id: str,
     *,
     sample_kind: str,
-    block_index: int,
+    block_index: int | None,
 ) -> tuple[dict[str, Any], bool]:
     """Check durable evidence before submitting exactly one remote sample."""
     spec = _matrix_sample_spec(
@@ -3781,6 +3800,33 @@ def _run_or_reuse_matrix_sample(
         },
         not reused,
     )
+
+
+def _load_focused_sweep_reference(
+    profile_scientific_identity: str,
+    case_id: str,
+) -> dict[str, Any]:
+    """Load one smoke result after the prerequisite gate validated its marker."""
+    if case_id not in FOCUSED_SWEEP_REUSED_CASE_IDS:
+        raise ValueError("Focused sweep references must be B1 or S3")
+    case = _search_case(case_id)
+    sample_id = _focused_sweep_sample_id(case_id)
+    spec = _matrix_sample_spec(
+        profile_scientific_identity,
+        SCREENING_QUERY,
+        case,
+        sample_id,
+    )
+    result = _read_volume_json(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{spec['sample_relpath']}/metrics.json",
+    )
+    return result | {
+        "sample_kind": "sweep-reference",
+        "block_index": None,
+        "remote_call_wall_seconds": 0.0,
+        "reused": True,
+    }
 
 
 def _require_passing_smoke_gate(
@@ -3967,6 +4013,148 @@ def _matrix_comparisons(
     return comparisons
 
 
+def _focused_sweep_comparisons(
+    results: list[dict[str, Any]],
+) -> dict[str, dict[str, object]]:
+    """Compare each one-shot sharded topology with the reused B1 oracle."""
+    indexed = {str(result["case"]["case_id"]): result for result in results}
+    if set(indexed) != set(FOCUSED_SWEEP_CASE_IDS) or len(indexed) != len(results):
+        raise ValueError("Focused sweep results do not contain each case exactly once")
+    hit_tables = {
+        case_id: _read_normalized_hits(str(result["result_path"]))
+        for case_id, result in indexed.items()
+    }
+    oracle = hit_tables["B1"]
+    return {
+        f"{case_id}-vs-B1": _compare_normalized_hits(
+            oracle,
+            hit_tables[case_id],
+        )
+        | {
+            "oracle_case": "B1",
+            "candidate_case": case_id,
+            "is_gate": True,
+        }
+        for case_id in FOCUSED_SWEEP_CASE_IDS
+        if case_id != "B1"
+    }
+
+
+def _rank_focused_sweep_cases(
+    results: list[dict[str, Any]],
+    comparisons: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Rank one sample per topology without claiming measured stability."""
+    indexed = {str(result["case"]["case_id"]): result for result in results}
+    if set(indexed) != set(FOCUSED_SWEEP_CASE_IDS) or len(indexed) != len(results):
+        raise ValueError("Focused sweep results do not contain each case exactly once")
+    b1_search = _metric_float(indexed["B1"], "search_wall_seconds")
+    b1_sample = _metric_float(indexed["B1"], "sample_wall_seconds")
+    candidate_rows: list[dict[str, object]] = []
+    for case_id in FOCUSED_SWEEP_CASE_IDS:
+        if case_id == "B1":
+            continue
+        result = indexed[case_id]
+        case = _search_case(case_id)
+        resource = result.get("resource_summary")
+        if not isinstance(resource, dict):
+            raise ValueError(f"Focused sweep result {case_id} lacks resource metrics")
+        comparison = comparisons.get(f"{case_id}-vs-B1")
+        if not isinstance(comparison, dict):
+            raise ValueError(f"Focused sweep result {case_id} lacks a comparison")
+        search_wall = _metric_float(result, "search_wall_seconds")
+        sample_wall = _metric_float(result, "sample_wall_seconds")
+        search_improvement = 1.0 - search_wall / b1_search
+        sample_improvement = 1.0 - sample_wall / b1_sample
+        scientific_valid = comparison.get("passed") is True
+        meaningful = (
+            scientific_valid and search_improvement >= 0.20 and sample_improvement > 0
+        )
+        candidate_rows.append({
+            "case_id": case_id,
+            "jackhmmer_n_cpu": case.jackhmmer_n_cpu,
+            "active_shards": case.active_shards,
+            "aggregate_cpu_slots": case.jackhmmer_n_cpu * case.active_shards,
+            "scientific_valid": scientific_valid,
+            "search_wall_seconds": search_wall,
+            "sample_wall_seconds": sample_wall,
+            "search_improvement_vs_B1": search_improvement,
+            "sample_improvement_vs_B1": sample_improvement,
+            "cpu_core_seconds": _metric_float(resource, "cpu_core_seconds"),
+            "peak_interval_cpu_cores": _metric_float(
+                resource,
+                "peak_interval_cpu_cores",
+            ),
+            "estimated_compute_cost_usd": _sample_cost(result),
+            "meaningful_20_percent_success": meaningful,
+        })
+
+    invalid_cases = [
+        str(row["case_id"])
+        for row in candidate_rows
+        if row["scientific_valid"] is False
+    ]
+    meaningful = [
+        row for row in candidate_rows if row["meaningful_20_percent_success"] is True
+    ]
+    fastest_case_id: str | None = None
+    lowest_cost_case_id: str | None = None
+    selected_case_ids: list[str] = []
+    close_case_ids: list[str] = []
+    if meaningful:
+        fastest = min(
+            meaningful,
+            key=lambda row: (
+                _ranking_float(row, "search_wall_seconds"),
+                _ranking_float(row, "estimated_compute_cost_usd"),
+                str(row["case_id"]),
+            ),
+        )
+        fastest_case_id = str(fastest["case_id"])
+        fastest_wall = _ranking_float(fastest, "search_wall_seconds")
+        near_fastest = [
+            row
+            for row in meaningful
+            if _ranking_float(row, "search_wall_seconds") <= fastest_wall * 1.15
+        ]
+        lowest_cost = min(
+            near_fastest,
+            key=lambda row: (
+                _ranking_float(row, "estimated_compute_cost_usd"),
+                _ranking_float(row, "search_wall_seconds"),
+                str(row["case_id"]),
+            ),
+        )
+        lowest_cost_case_id = str(lowest_cost["case_id"])
+        selected_case_ids = list(dict.fromkeys((fastest_case_id, lowest_cost_case_id)))
+        close_case_ids = sorted(
+            str(row["case_id"])
+            for row in near_fastest
+            if row["case_id"] != fastest_case_id
+        )
+
+    if invalid_cases:
+        status = "complete_scientific_review_required"
+    elif not meaningful:
+        status = "complete_no_meaningful_candidate"
+    else:
+        status = "complete"
+    return {
+        "status": status,
+        "single_sample_only": True,
+        "stability_measured": False,
+        "scientific_gate_passed": not invalid_cases,
+        "invalid_scientific_case_ids": invalid_cases,
+        "fastest_case_id": fastest_case_id,
+        "lowest_cost_within_15_percent_case_id": lowest_cost_case_id,
+        "selected_case_ids": selected_case_ids,
+        "close_case_ids": close_case_ids,
+        "requires_tiebreak_review": bool(close_case_ids),
+        "candidate_rankings": candidate_rows,
+        "rules": _build_search_plan("sweep")["selection_policy"],
+    }
+
+
 def _rank_screening_cases(
     results: list[dict[str, Any]],
     comparisons: dict[str, dict[str, object]],
@@ -4119,6 +4307,75 @@ def _matrix_sample_records(results: list[dict[str, Any]]) -> list[dict[str, obje
     ]
 
 
+def _focused_sweep_summary_markdown(
+    summary: dict[str, object],
+    rankings: dict[str, object],
+) -> str:
+    """Render the one-shot topology sweep and its explicit limitations."""
+    candidates = rankings.get("candidate_rankings")
+    if not isinstance(candidates, list):
+        raise ValueError("Focused sweep rankings are missing candidates")
+    typed_candidates: list[dict[str, object]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("Focused sweep candidate must be an object")
+        typed_candidates.append({str(key): value for key, value in candidate.items()})
+    ordered = sorted(
+        typed_candidates,
+        key=lambda row: (
+            not bool(row["scientific_valid"]),
+            _ranking_float(row, "search_wall_seconds"),
+            _ranking_float(row, "estimated_compute_cost_usd"),
+            str(row["case_id"]),
+        ),
+    )
+    selected = summary.get("selected_case_ids")
+    if not isinstance(selected, list):
+        raise ValueError("Focused sweep summary has invalid selected cases")
+    lines = [
+        f"# {CAMPAIGN_ID} focused topology sweep",
+        "",
+        f"Status: **{summary['status']}**",
+        f"Scientific gate: **{'PASS' if summary['scientific_gate_passed'] else 'FAIL'}**",
+        f"Submitted remote samples: {summary['remote_function_inputs_submitted']}",
+        f"Reused smoke samples: {summary['reused_smoke_samples']}",
+        f"Fastest case: {rankings['fastest_case_id']}",
+        "Lowest-cost case within 15%: "
+        f"{rankings['lowest_cost_within_15_percent_case_id']}",
+        f"Selected cases: {', '.join(str(item) for item in selected) or 'none'}",
+        "",
+        "| Rank | Case | Shards | CPU/shard | Slots | Scientific | Search (s) | "
+        "vs B1 | Sample (s) | CPU-core-s | Peak cores | Cost (USD) |",
+        "| ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | "
+        "---: | ---: | ---: |",
+    ]
+    for rank, candidate in enumerate(ordered, start=1):
+        lines.append(
+            f"| {rank} | {candidate['case_id']} | {candidate['active_shards']} | "
+            f"{candidate['jackhmmer_n_cpu']} | {candidate['aggregate_cpu_slots']} | "
+            f"{'PASS' if candidate['scientific_valid'] else 'FAIL'} | "
+            f"{_ranking_float(candidate, 'search_wall_seconds'):.3f} | "
+            f"{_ranking_float(candidate, 'search_improvement_vs_B1'):.1%} | "
+            f"{_ranking_float(candidate, 'sample_wall_seconds'):.3f} | "
+            f"{_ranking_float(candidate, 'cpu_core_seconds'):.3f} | "
+            f"{_ranking_float(candidate, 'peak_interval_cpu_cores'):.3f} | "
+            f"{_ranking_float(candidate, 'estimated_compute_cost_usd'):.6f} |"
+        )
+    lines.extend([
+        "",
+        "B1 Search Wall Time: "
+        f"{_ranking_float(summary, 'oracle_search_wall_seconds'):.3f} s",
+        "B1 Sample Wall Time: "
+        f"{_ranking_float(summary, 'oracle_sample_wall_seconds'):.3f} s",
+        "",
+        "Each new topology was measured once. Stability was not measured; cases "
+        "within 15% of the fastest require review before a tie-break run.",
+        "No stress-query sample was submitted automatically.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def _matrix_summary_markdown(
     summary: dict[str, object],
     rankings: dict[str, object],
@@ -4241,6 +4498,10 @@ def _campaign_results_parquet(
             f"benchmarks/{CAMPAIGN_ID}/storage-scans/results.parquet",
         ),
         ("smoke", f"benchmarks/{CAMPAIGN_ID}/search/smoke/results.parquet"),
+        (
+            "focused-sweep",
+            f"benchmarks/{CAMPAIGN_ID}/search/focused-sweep/results.parquet",
+        ),
     )
     for campaign_stage, relative_path in operation_paths:
         try:
@@ -4426,6 +4687,113 @@ def _completed_matrix_is_valid(
             expected_identity=sample_identity,
         ):
             return None
+    return summary
+
+
+def _submit_focused_sweep() -> dict[str, object]:
+    """Run only missing one-shot topology samples and publish their ranking."""
+    _ensure_campaign_plan_client()
+    manifest_relpath = f"{APP_INFO.profile_relpath}/manifest.json"
+    manifest_bytes = _read_volume_bytes(SHARDED_MSA_DB_VOLUME, manifest_relpath)
+    manifest = orjson.loads(manifest_bytes)
+    if not isinstance(manifest, dict):
+        raise ValueError("Profile manifest must be a JSON object")
+    _validate_profile_manifest(manifest)
+    manifest_sha256 = _sha256_bytes(manifest_bytes)
+    profile_scientific_identity = _profile_scientific_identity(manifest)
+    _require_passing_smoke_gate(
+        manifest_sha256,
+        profile_scientific_identity,
+    )
+
+    sample_specs = {
+        case_id: _matrix_sample_spec(
+            profile_scientific_identity,
+            SCREENING_QUERY,
+            _search_case(case_id),
+            _focused_sweep_sample_id(case_id),
+        )
+        for case_id in FOCUSED_SWEEP_CASE_IDS
+    }
+    operation_identity = _focused_sweep_operation_identity(
+        manifest_sha256,
+        {case_id: spec["sample_identity"] for case_id, spec in sample_specs.items()},
+    )
+    operation_root = f"benchmarks/{CAMPAIGN_ID}/search/focused-sweep"
+    completed = _completed_matrix_is_valid(operation_root, operation_identity)
+    if completed is not None:
+        return completed | {
+            "status": "reused",
+            "remote_function_inputs_submitted": 0,
+        }
+
+    results = [
+        _load_focused_sweep_reference(profile_scientific_identity, case_id)
+        for case_id in FOCUSED_SWEEP_REUSED_CASE_IDS
+    ]
+    submitted_inputs = 0
+    for case_id in FOCUSED_SWEEP_NEW_CASE_IDS:
+        result, submitted = _run_or_reuse_matrix_sample(
+            profile_scientific_identity,
+            SCREENING_QUERY,
+            _search_case(case_id),
+            _focused_sweep_sample_id(case_id),
+            sample_kind="focused-sweep",
+            block_index=None,
+        )
+        results.append(result)
+        submitted_inputs += submitted
+
+    comparisons = _focused_sweep_comparisons(results)
+    rankings = _rank_focused_sweep_cases(results, comparisons)
+    selected_case_ids = rankings.get("selected_case_ids")
+    if not isinstance(selected_case_ids, list):
+        raise ValueError("Focused sweep rankings have invalid selected cases")
+    scientific_gate_passed = rankings.get("scientific_gate_passed") is True
+    summary: dict[str, object] = {
+        "schema_version": 1,
+        "status": rankings["status"],
+        "campaign_id": CAMPAIGN_ID,
+        "operation": "search",
+        "mode": "sweep",
+        "operation_identity": operation_identity,
+        "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
+        "profile_manifest_sha256": manifest_sha256,
+        "scientific_gate_passed": scientific_gate_passed,
+        "oracle_case": "B1",
+        "oracle_search_wall_seconds": _metric_float(
+            results[0],
+            "search_wall_seconds",
+        ),
+        "oracle_sample_wall_seconds": _metric_float(
+            results[0],
+            "sample_wall_seconds",
+        ),
+        "selected_case_ids": selected_case_ids,
+        "requires_tiebreak_review": rankings["requires_tiebreak_review"],
+        "reused_smoke_samples": len(FOCUSED_SWEEP_REUSED_CASE_IDS),
+        "reused_new_samples": len(FOCUSED_SWEEP_NEW_CASE_IDS) - submitted_inputs,
+        "new_samples": len(FOCUSED_SWEEP_NEW_CASE_IDS),
+        "stress_samples": 0,
+        "remote_function_inputs_submitted": submitted_inputs,
+        "samples": _matrix_sample_records(results),
+        "completed_at": _utc_now(),
+        "results_path": f"{operation_root}/results.parquet",
+        "comparisons_path": f"{operation_root}/comparisons.json",
+        "rankings_path": f"{operation_root}/rankings.json",
+    }
+    artifacts = {
+        "results.parquet": _search_results_parquet(results),
+        "comparisons.json": _json_bytes(comparisons),
+        "rankings.json": _json_bytes(rankings),
+        "summary.json": _json_bytes(summary),
+        "summary.md": _focused_sweep_summary_markdown(summary, rankings).encode(),
+    }
+    _finalize_matrix_operation(
+        operation_root,
+        operation_identity,
+        artifacts,
+    )
     return summary
 
 
@@ -4638,7 +5006,7 @@ def submit_alphafold3_msa_task(
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
         seqkit_threads: SeqKit thread count for profile preparation, default 8.
-        search_mode: Fixed search workload: ``smoke`` or ``matrix``.
+        search_mode: Fixed search workload: ``smoke``, ``sweep``, or ``matrix``.
     """
     if operation == "prepare":
         plan = _build_prepare_plan(seqkit_threads)
@@ -4662,6 +5030,9 @@ def submit_alphafold3_msa_task(
         if search_mode == "smoke":
             print("🧬 Submitting the sequential small-BFD search smoke...")
             result = _submit_search_smoke()
+        elif search_mode == "sweep":
+            print("🧬 Submitting the focused one-shot small-BFD sweep...")
+            result = _submit_focused_sweep()
         else:
             print("🧬 Submitting the one-shot measured small-BFD matrix...")
             result = _submit_search_matrix()

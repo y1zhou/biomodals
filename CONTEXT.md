@@ -187,7 +187,7 @@ An AlphaFold input whose protein and RNA search fields are all explicit, using s
 _Avoid_: raw input, model features, partially populated search fields
 
 **Caller-Supplied Search Evidence**:
-Non-empty MSA or template data supplied for one request, either inline or materialized from a caller path. It may contribute to an Enriched AlphaFold Input but never becomes shared canonical search evidence.
+Non-empty MSA or template data supplied for one chain in one request, either inline or materialized from a caller path. It may contribute to that chain's Enriched AlphaFold Input but is neither propagated to identical sibling chains nor made shared canonical search evidence.
 _Avoid_: raw database MSA, combined MSA publication, template search result
 
 **Staged Custom Template**:

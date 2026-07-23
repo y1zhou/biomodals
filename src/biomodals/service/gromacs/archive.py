@@ -22,7 +22,7 @@ _CHUNK_SIZE = 1024 * 1024
 _SHA256_LENGTH = 64
 _SMALL_DOCUMENT_LIMIT = 1024 * 1024
 _MAX_PDB_BYTES = 10 * 1024 * 1024
-_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
 ReadRemoteFile = Callable[[str], AsyncIterable[bytes]]
 MtimeForRemoteFile = Callable[[str], int]
@@ -353,14 +353,12 @@ def _member_digest(
 
 def _zip_info(name: str, *, mtime: int | None = None) -> zipfile.ZipInfo:
     if mtime is None:
-        date_time = _ZIP_TIMESTAMP
+        date_time = _ZIP_EPOCH
     else:
         if type(mtime) is not int or not 0 <= mtime <= 0xFFFFFFFF:
             raise ValueError("Remote GROMACS file has an invalid modification time")
         source_time = time.gmtime(mtime)[:6]
-        date_time = (
-            source_time if source_time[0] >= _ZIP_TIMESTAMP[0] else _ZIP_TIMESTAMP
-        )
+        date_time = source_time if source_time[0] >= _ZIP_EPOCH[0] else _ZIP_EPOCH
     info = zipfile.ZipInfo(name, date_time=date_time)
     info.create_system = 3
     info.external_attr = 0o100600 << 16

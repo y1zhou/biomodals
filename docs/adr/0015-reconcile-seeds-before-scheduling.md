@@ -8,6 +8,12 @@ separate stable identity built with `hash_sequences` from the `run_id` and its
 sorted requested seed set; that request identity names a return view and never
 serves as the seed cache key.
 
+The submitted seed list must be non-empty and is normalized to a sorted unique
+set before request identity, reconciliation, or worker partitioning. The
+request manifest preserves both the submitted list and normalized set, and the
+entrypoint logs any removed duplicates. Repeated seeds are scientifically
+redundant and never create duplicate GPU work.
+
 Before partitioning GPU work, the coordinator validates each requested seed's
 completion marker. It divides the request into the intersection of requested
 and valid completed seeds, which are reused, and the requested seeds with no

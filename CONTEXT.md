@@ -139,8 +139,8 @@ A code-owned identifier for one immutable Sharded Database Profile, fixing its s
 _Avoid_: current profile, database ID, manifest digest
 
 **Source FASTA Policy**:
-The explicit post-publication choice to keep, round-trip-verify and compress, or delete an original database FASTA after its Sharded Database Profile is durably validated.
-_Avoid_: temporary builder cleanup, shard compression, implicit retention
+The explicit post-publication choice to keep, round-trip-verify and archivally compress, or delete an original database FASTA after its Sharded Database Profile is durably validated. A compressed source must be restored manually before another profile build.
+_Avoid_: temporary builder cleanup, shard compression, implicit retention, automatic source restore
 
 **Database Search Space**:
 The full unsharded database size used by HMMER to scale hit E-values across a Sharded Database Profile. It is the exact sequence count for protein searches and the exact nucleotide count expressed in megabases for RNA searches.

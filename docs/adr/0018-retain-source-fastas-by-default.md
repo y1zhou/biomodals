@@ -14,6 +14,12 @@ source byte count and SHA-256 before committing the archive and deleting the
 plain FASTA. A compression or verification failure leaves the original intact
 and does not advertise the archive as complete.
 
+The builder only accepts the official uncompressed source FASTA. If that file
+is absent but its `.zst` archive exists, it raises an actionable error asking
+the user to restore the archive manually, for example in a Modal Sandbox,
+before retrying. The app does not provide a restore function and never performs
+an implicit full-database decompression or hidden Volume write.
+
 `delete` removes the original only after the same profile checks pass and only
 when explicitly selected. Both destructive policies record their outcome
 durably. Source retirement does not change the profile identity because the

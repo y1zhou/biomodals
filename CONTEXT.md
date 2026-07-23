@@ -134,6 +134,10 @@ _Avoid_: source database directory, incomplete shard staging, benchmark sample
 The explicit post-publication choice to keep, round-trip-verify and compress, or delete an original database FASTA after its Sharded Database Profile is durably validated.
 _Avoid_: temporary builder cleanup, shard compression, implicit retention
 
+**Database Search Space**:
+The full unsharded database size used by HMMER to scale hit E-values across a Sharded Database Profile. It is the exact sequence count for protein searches and the exact nucleotide count expressed in megabases for RNA searches.
+_Avoid_: shard count, FASTA byte size, per-shard record count
+
 **MSA Search Subject**:
 A unique biological sequence that requires database-generated MSA evidence and may be referenced by one or more input chains.
 _Avoid_: chain identifier, duplicate homomer chain

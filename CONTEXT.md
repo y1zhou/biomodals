@@ -215,8 +215,12 @@ One invocation's requested model-seed set against an Inference Run Identity. It 
 _Avoid_: inference run identity, GPU worker assignment, newly computed seeds only
 
 **Inference Request Result**:
-The return view restricted to one Inference Request: all requested Seed Predictions, a requested-seed ranking and best prediction, and a manifest distinguishing reused from newly computed seeds while referencing the accumulated run summary.
+The durable return view restricted to one Inference Request: references to all requested canonical Seed Predictions, request-specific ranking and best files, and a manifest distinguishing reused from newly computed seeds while referencing the accumulated run summary. It does not duplicate full seed artifacts.
 _Avoid_: complete run archive, global best prediction, worker output
+
+**Request Retrieval Archive**:
+A local `.tar.zst` materialization of one Inference Request Result, assembled by downloading only its manifest-declared canonical artifacts. It is a caller convenience rather than a durable output-Volume publication.
+_Avoid_: inference request result, global run archive, remote function payload
 
 **Seed Build Claim**:
 An atomic, generation-scoped coordination record granting one request ownership of computing one missing Seed Prediction. It is never evidence that the prediction completed; only the validated seed publication is authoritative.

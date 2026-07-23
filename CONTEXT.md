@@ -222,6 +222,10 @@ _Avoid_: sequence hash, search identity
 A sharded-search discrepancy attributable only to cross-shard duplicate hits and their effect at the truncated end of an MSA result.
 _Avoid_: unexplained hit difference, scientific equivalence
 
+**RNA Sharding Oracle**:
+The pinned monolithic-versus-sharded Nhmmer comparison for a documented RNA query, covering every RNA database result and the final upstream-order deduplicated unpaired MSA.
+_Avoid_: query-only smoke test, protein oracle, performance benchmark
+
 **Benchmark CPU Floor**:
 The minimum Modal CPU reserved throughout a Benchmark Run, balancing guaranteed compute availability against cost during low-utilization phases.
 _Avoid_: HMMER CPU layout, CPU limit

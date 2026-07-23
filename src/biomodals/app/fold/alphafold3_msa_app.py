@@ -2111,6 +2111,10 @@ ECOLI_K12_GROEL_SHA256 = (
     "40544c6fee0f15b6fe78d6ab7e5e27d8080224fe28dc0d6ca6f2e9a790dd24d4"
 )
 SMOKE_CASE_IDS = ("B0", "B1", "S3")
+MATRIX_CASE_IDS = ("B0", "B1", "S0", "S1", "S2", "S3", "S4", "S5")
+FOCUSED_SWEEP_REUSED_CASE_IDS = ("B1", "S3")
+FOCUSED_SWEEP_NEW_CASE_IDS = ("S1", "S2", "S4", "S5", "S6")
+FOCUSED_SWEEP_CASE_IDS = ("B1", "S1", "S2", "S3", "S4", "S5", "S6")
 SCREENING_BLOCK_ORDERS = (
     ("B1", "S3", "S0", "B0", "S5", "S2", "S4", "S1"),
     ("S3", "S0", "B1", "S5", "S2", "B0", "S4", "S1"),
@@ -2181,6 +2185,7 @@ SEARCH_CASES = (
     SearchCase("S3", "shards", 2, 16, SMALL_BFD_Z),
     SearchCase("S4", "shards", 4, 8, SMALL_BFD_Z),
     SearchCase("S5", "shards", 8, 4, SMALL_BFD_Z),
+    SearchCase("S6", "shards", 1, 32, SMALL_BFD_Z),
 )
 
 
@@ -2204,6 +2209,17 @@ def _search_query(query_id: str) -> SearchQuery:
             return query
     choices = ", ".join(query.query_id for query in queries)
     raise ValueError(f"Unknown search query {query_id!r}; expected one of {choices}")
+
+
+def _focused_sweep_sample_id(case_id: str) -> str:
+    """Return the fixed reused or new sample ID for one sweep case."""
+    _search_case(case_id)
+    if case_id in FOCUSED_SWEEP_REUSED_CASE_IDS:
+        return f"smoke-{case_id.lower()}"
+    if case_id in FOCUSED_SWEEP_NEW_CASE_IDS:
+        return f"sweep-{case_id.lower()}"
+    choices = ", ".join(FOCUSED_SWEEP_CASE_IDS)
+    raise ValueError(f"Focused sweep case must be one of {choices}")
 
 
 def _validate_sample_id(sample_id: str) -> str:
@@ -2349,6 +2365,36 @@ def _build_search_plan(mode: str) -> dict[str, object]:
             "oracle_case": "B1",
             "scientific_gate_case": "S3",
         }
+    if mode == "sweep":
+        return common | {
+            "query": SCREENING_QUERY.as_dict(),
+            "prerequisite": "completed passing smoke gate",
+            "oracle_case": "B1",
+            "scientific_comparison_policy": SCIENTIFIC_COMPARISON_POLICY,
+            "reused_samples": [
+                {
+                    "case_id": case_id,
+                    "sample_id": _focused_sweep_sample_id(case_id),
+                }
+                for case_id in FOCUSED_SWEEP_REUSED_CASE_IDS
+            ],
+            "new_samples": [
+                {
+                    "case": _search_case(case_id).as_dict(),
+                    "sample_id": _focused_sweep_sample_id(case_id),
+                }
+                for case_id in FOCUSED_SWEEP_NEW_CASE_IDS
+            ],
+            "remote_function_inputs": len(FOCUSED_SWEEP_NEW_CASE_IDS),
+            "total_case_results": len(FOCUSED_SWEEP_CASE_IDS),
+            "runs_per_new_case": 1,
+            "stress_samples": 0,
+            "selection_policy": {
+                "minimum_search_wall_improvement_vs_B1": 0.20,
+                "cost_candidate_maximum_slowdown_vs_fastest": 0.15,
+                "close_results_require_review_within": 0.15,
+            },
+        }
     if mode == "matrix":
         return common | {
             "screening_query": SCREENING_QUERY.as_dict(),
@@ -2376,7 +2422,7 @@ def _build_search_plan(mode: str) -> dict[str, object]:
                 "source": MODAL_PRICING_URL,
             },
         }
-    raise ValueError("search mode must be 'smoke' or 'matrix'")
+    raise ValueError("search mode must be 'smoke', 'sweep', or 'matrix'")
 
 
 def _campaign_plan_bytes() -> bytes:
@@ -3628,7 +3674,7 @@ def _submit_search_smoke() -> dict[str, object]:
 
 def _validate_screening_block_orders() -> None:
     """Require three distinct permutations of every fixed search case."""
-    expected = {case.case_id for case in SEARCH_CASES}
+    expected = set(MATRIX_CASE_IDS)
     if len(SCREENING_BLOCK_ORDERS) != 3:
         raise ValueError("The screening matrix must contain three blocks")
     if len(set(SCREENING_BLOCK_ORDERS)) != len(SCREENING_BLOCK_ORDERS):
@@ -3930,7 +3976,8 @@ def _rank_screening_cases(
     b1_search = _case_statistic_float(statistics, "B1", "search_wall_seconds", "median")
     b1_sample = _case_statistic_float(statistics, "B1", "sample_wall_seconds", "median")
     candidate_rows: list[dict[str, object]] = []
-    for case in SEARCH_CASES:
+    for case_id in MATRIX_CASE_IDS:
+        case = _search_case(case_id)
         if not case.case_id.startswith("S"):
             continue
         scientific_valid = all(
@@ -4428,7 +4475,7 @@ def _submit_search_matrix() -> dict[str, object]:
             submitted_inputs += submitted
 
     sharded_case_ids = tuple(
-        case.case_id for case in SEARCH_CASES if case.case_id.startswith("S")
+        case_id for case_id in MATRIX_CASE_IDS if case_id.startswith("S")
     )
     screening_comparisons = _matrix_comparisons(
         screening_results,

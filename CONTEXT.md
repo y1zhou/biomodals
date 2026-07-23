@@ -134,6 +134,14 @@ _Avoid_: chain identifier, duplicate homomer chain
 A validated result of searching one MSA Search Subject against one reference database profile. It is independently complete and reusable before AlphaFold constructs combined unpaired or paired MSAs.
 _Avoid_: combined unpaired MSA, paired MSA, benchmark summary
 
+**Combined Unpaired MSA**:
+The AlphaFold-ready unpaired alignment assembled from validated Raw Database MSAs in pinned upstream order, with duplicate aligned sequences removed after ignoring lowercase insertions. Protein order is UniRef90, small BFD, then MGnify; RNA order is RFam, RNAcentral, then NT-RNA.
+_Avoid_: raw database MSA, simple FASTA concatenation
+
+**Combined Paired MSA**:
+The AlphaFold-ready paired protein alignment assembled from the UniProt Raw Database MSA without deduplication. RNA inputs have no paired MSA.
+_Avoid_: combined unpaired MSA, RNA MSA
+
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
 _Avoid_: sequence hash, benchmark sample ID, resource configuration

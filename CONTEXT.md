@@ -126,6 +126,14 @@ _Avoid_: benchmark service, production workload
 A scientifically valid database layout and search-resource configuration selected for possible incorporation into the production AlphaFold3 app. Benchmarking may rank candidates but never migrates one automatically; production promotion is a separate, explicitly approved implementation step.
 _Avoid_: fastest sample, benchmark harness
 
+**Sharded Database Profile**:
+An immutable, manifest-validated publication of every shard for one logical MSA database. Its manifest preserves the source FASTA identity and construction recipe, but the published profile does not retain a duplicate source FASTA.
+_Avoid_: source database directory, incomplete shard staging, benchmark sample
+
+**Source FASTA Policy**:
+The explicit post-publication choice to keep, round-trip-verify and compress, or delete an original database FASTA after its Sharded Database Profile is durably validated.
+_Avoid_: temporary builder cleanup, shard compression, implicit retention
+
 **MSA Search Subject**:
 A unique biological sequence that requires database-generated MSA evidence and may be referenced by one or more input chains.
 _Avoid_: chain identifier, duplicate homomer chain

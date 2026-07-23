@@ -43,6 +43,7 @@ from biomodals.service.jobs import (
     ReadArtifact,
     Reconciler,
     WorkloadRegistration,
+    can_view_job_logs,
 )
 from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
@@ -339,12 +340,12 @@ def create_router(
             )
         return JobView.from_record(
             job,
-            can_view_logs=(
-                job_logs_supported
-                and (
-                    session.principal.is_admin
-                    or configuration.workload("gromacs").job_logs_visible_to_owner.value
-                )
+            can_view_logs=can_view_job_logs(
+                is_admin=session.principal.is_admin,
+                owner_visibility_enabled=configuration.workload(
+                    "gromacs"
+                ).job_logs_visible_to_owner.value,
+                logs_supported=job_logs_supported,
             ),
         )
 

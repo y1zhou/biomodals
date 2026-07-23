@@ -113,10 +113,11 @@ active administrator cannot be disabled or demoted, and the first User must be
 created with `--admin`.
 
 Administrators can manage Users, per-Tool Job Log visibility, and non-secret
-live Modal configuration in the web interface. Runtime setting precedence is
-process environment, database Admin value, configured `.env` file, then
+live Modal configuration in the web interface. Modal runtime setting precedence
+is process environment, database Admin value, configured `.env` file, then
 built-in default. Process-controlled fields are read-only in the Admin
-interface.
+interface. Job Log visibility is a live database override over the Tool's
+built-in default; it has no process-environment or `.env` override.
 
 ### Production deployment
 

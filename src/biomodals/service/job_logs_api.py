@@ -25,6 +25,7 @@ from biomodals.service.jobs import (
     OperationLogMode,
     OperationLogRequest,
     WorkloadRegistration,
+    can_view_job_logs,
     operation_log_mode,
 )
 from biomodals.service.store import (
@@ -289,11 +290,19 @@ def create_job_logs_router() -> APIRouter:
         registration: WorkloadRegistration | None = request.app.state.workloads.get(
             job.workload
         )
-        if not session.principal.is_admin and (
-            registration is None
-            or not request.app.state.configuration.workload(
+        logs_supported = bool(
+            registration is not None and registration.open_operation_logs is not None
+        )
+        owner_visibility_enabled = bool(
+            logs_supported
+            and request.app.state.configuration.workload(
                 job.workload
             ).job_logs_visible_to_owner.value
+        )
+        if not session.principal.is_admin and not can_view_job_logs(
+            is_admin=False,
+            owner_visibility_enabled=owner_visibility_enabled,
+            logs_supported=logs_supported,
         ):
             raise CodedAPIError(
                 403,

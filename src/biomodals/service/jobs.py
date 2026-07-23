@@ -69,6 +69,16 @@ def operation_log_mode(state: JobOperationState) -> OperationLogMode | None:
     return None
 
 
+def can_view_job_logs(
+    *,
+    is_admin: bool,
+    owner_visibility_enabled: bool,
+    logs_supported: bool,
+) -> bool:
+    """Return whether a caller may inspect logs exposed by one workload."""
+    return logs_supported and (is_admin or owner_visibility_enabled)
+
+
 class JobLifecycleLocks:
     """Serialize paid provider transitions with durable cancellation per Job.
 

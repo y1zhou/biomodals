@@ -30,7 +30,12 @@ from biomodals.service.http_contract import (
     require_session,
     require_unsafe_session,
 )
-from biomodals.service.jobs import JobPageView, JobView, WorkloadRegistration
+from biomodals.service.jobs import (
+    JobPageView,
+    JobView,
+    WorkloadRegistration,
+    can_view_job_logs,
+)
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobCursorError,
@@ -212,13 +217,16 @@ def create_jobs_router(
 
     def job_view(job: JobRecord, session: AuthenticatedSession) -> JobView:
         registration = workloads.get(job.workload)
-        can_view_logs = bool(
-            registration is not None
-            and registration.open_operation_logs is not None
-            and (
-                session.principal.is_admin
-                or configuration.workload(job.workload).job_logs_visible_to_owner.value
-            )
+        logs_supported = bool(
+            registration is not None and registration.open_operation_logs is not None
+        )
+        can_view_logs = can_view_job_logs(
+            is_admin=session.principal.is_admin,
+            owner_visibility_enabled=bool(
+                logs_supported
+                and configuration.workload(job.workload).job_logs_visible_to_owner.value
+            ),
+            logs_supported=logs_supported,
         )
         return JobView.from_record(job, can_view_logs=can_view_logs)
 

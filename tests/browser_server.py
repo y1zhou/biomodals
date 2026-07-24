@@ -220,7 +220,6 @@ def _create_browser_app():
     })
     store = ServiceStore(settings.database_path)
     store.initialize()
-    configuration = RuntimeConfiguration(store, settings)
     auth = AuthService(store, frontend_url=ORIGIN)
     adapter = _FakeGromacsAdapter(root / "stats.json")
     link = auth.create_user(
@@ -242,21 +241,27 @@ def _create_browser_app():
         lifecycle_locks=lifecycle_locks,
     )
     cache = ArtifactCache(settings.cache_dir / "results")
+    workloads = [
+        create_registration(
+            cast(Any, adapter),
+            reconciler=reconciler,
+            lifecycle_locks=lifecycle_locks,
+            open_operation_logs=adapter.open_operation_logs,
+            preflight=adapter.preflight,
+            read_artifact=adapter.read_artifact,
+            rebuild_artifact=adapter.rebuild_artifact,
+        )
+    ]
+    configuration = RuntimeConfiguration(
+        store,
+        settings,
+        workload_definitions=[workload.definition for workload in workloads],
+    )
     return create_app(
         store=store,
         auth=auth,
         configuration=configuration,
-        workloads=[
-            create_registration(
-                cast(Any, adapter),
-                reconciler=reconciler,
-                lifecycle_locks=lifecycle_locks,
-                open_operation_logs=adapter.open_operation_logs,
-                preflight=adapter.preflight,
-                read_artifact=adapter.read_artifact,
-                rebuild_artifact=adapter.rebuild_artifact,
-            )
-        ],
+        workloads=workloads,
         allowed_origin=ORIGIN,
         secure_cookies=False,
         cache=cache,

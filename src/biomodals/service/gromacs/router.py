@@ -310,7 +310,10 @@ def create_router(
 
         job = result.job
         if result.attached:
-            stage = JobView.from_record(job).stage
+            stage = JobView.from_record(
+                job,
+                definition=GROMACS_WORKLOAD,
+            ).stage
             LOGGER.info(
                 "event=stage_attached job_id=%s workload=gromacs stage=%s "
                 "function=%s request_id=%s",
@@ -321,6 +324,7 @@ def create_router(
             )
         return JobView.from_record(
             job,
+            definition=GROMACS_WORKLOAD,
             can_view_logs=can_view_job_logs(
                 is_admin=session.principal.is_admin,
                 owner_visibility_enabled=configuration.workload(

@@ -10,6 +10,7 @@ import pytest
 from biomodals.service.config import ServiceSettings
 from biomodals.service.runtime_config import RuntimeConfiguration, SettingOverrideError
 from biomodals.service.store import ServiceStore
+from biomodals.service.workloads import GROMACS_WORKLOAD
 
 
 def _configuration(
@@ -27,7 +28,11 @@ def _configuration(
     settings = ServiceSettings.from_environment(environment)
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    return RuntimeConfiguration(store, settings)
+    return RuntimeConfiguration(
+        store,
+        settings,
+        workload_definitions=[GROMACS_WORKLOAD],
+    )
 
 
 def test_database_overrides_file_and_updates_are_live(tmp_path: Path) -> None:

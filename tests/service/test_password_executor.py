@@ -82,6 +82,7 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
         configuration=RuntimeConfiguration(
             store,
             ServiceSettings.from_environment({}),
+            workload_definitions=[],
         ),
         workloads=[],
         allowed_origin=ORIGIN,

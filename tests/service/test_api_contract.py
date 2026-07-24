@@ -16,7 +16,8 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import FastAPI
+import pytest
+from fastapi import APIRouter, FastAPI
 
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
@@ -34,8 +35,18 @@ from biomodals.service.runtime_config import (
     ModalConfigurationSnapshot,
     RuntimeConfiguration,
 )
-from biomodals.service.store import JobOperationState, JobState, ServiceStore
+from biomodals.service.store import (
+    InitialModalOperation,
+    JobOperationState,
+    JobState,
+    ServiceStore,
+)
 from biomodals.service.submission import SubmissionOutcomeUnknownError
+from biomodals.service.workloads import (
+    GROMACS_WORKLOAD,
+    WorkloadDefinition,
+    WorkloadStageDefinition,
+)
 
 ORIGIN = "https://biomodals.internal"
 PASSWORD = "correct horse battery staple"  # noqa: S105 - test credential
@@ -214,7 +225,11 @@ def _service(
         "MODAL_TOKEN_ID": "test-token-id",
         "MODAL_TOKEN_SECRET": "test-token-secret",
     })
-    configuration = RuntimeConfiguration(store, settings)
+    configuration = RuntimeConfiguration(
+        store,
+        settings,
+        workload_definitions=[GROMACS_WORKLOAD],
+    )
     auth = AuthService(store, frontend_url=ORIGIN)
     adapter = FakeGromacsAdapter()
     registration = create_registration(
@@ -1355,6 +1370,144 @@ def test_health_is_live_before_startup_and_ready_is_local_after_preflight(
     asyncio.run(scenario())
 
 
+def test_registered_workload_drives_runtime_admin_and_job_views(
+    tmp_path: Path,
+) -> None:
+    definition = WorkloadDefinition(
+        name="structure_prediction",
+        display_name="Structure prediction",
+        modal_app_name_environment="BIOMODALS_STRUCTURE_APP",
+        modal_app_version_environment="BIOMODALS_STRUCTURE_APP_VERSION",
+        active_job_limit_environment="BIOMODALS_STRUCTURE_ACTIVE_LIMIT",
+        default_modal_app_name="StructureApp",
+        default_modal_app_version=3,
+        default_active_job_limit=4,
+        stages=(
+            WorkloadStageDefinition(
+                operation="predict_structure",
+                code="predict_structure",
+                function_name="predict_structure",
+            ),
+        ),
+    )
+    settings = ServiceSettings.from_environment({
+        "BIOMODALS_STRUCTURE_APP": "ConfiguredStructureApp",
+        "BIOMODALS_STRUCTURE_APP_VERSION": "9",
+        "BIOMODALS_STRUCTURE_ACTIVE_LIMIT": "6",
+        "MODAL_TOKEN_ID": "test-token-id",
+        "MODAL_TOKEN_SECRET": "test-token-secret",
+    })
+    store = ServiceStore(tmp_path / "state.sqlite3")
+    store.initialize()
+    configuration = RuntimeConfiguration(
+        store,
+        settings,
+        workload_definitions=[definition],
+    )
+    auth = AuthService(store, frontend_url=ORIGIN)
+    _activate(auth, "admin@example.com", is_admin=True)
+    owner = store.list_users()[0]
+    preflights: list[tuple[str, str, int]] = []
+
+    async def preflight(
+        app_name: str,
+        environment_name: str,
+        app_version: int,
+    ) -> None:
+        preflights.append((app_name, environment_name, app_version))
+
+    registration = WorkloadRegistration(
+        definition=definition,
+        router=APIRouter(),
+        lifecycle_locks=JobLifecycleLocks(),
+        preflight=preflight,
+    )
+    app = create_app(
+        store=store,
+        auth=auth,
+        configuration=configuration,
+        workloads=[registration],
+        allowed_origin=ORIGIN,
+        secure_cookies=True,
+    )
+    with pytest.raises(
+        ValueError,
+        match="Runtime workload definitions must match registrations",
+    ):
+        create_app(
+            store=store,
+            auth=auth,
+            configuration=RuntimeConfiguration(
+                store,
+                settings,
+                workload_definitions=[],
+            ),
+            workloads=[registration],
+            allowed_origin=ORIGIN,
+            secure_cookies=True,
+        )
+    submission_key = uuid4().hex
+    admitted = store.admit_job(
+        owner_user_id=owner.user_id,
+        display_name="Example prediction",
+        idempotency_key="11111111-1111-4111-8111-111111111111",
+        request_hash="a" * 64,
+        parameters_json="{}",
+        artifact_request_sha256=None,
+        configuration=configuration.admission_configuration(definition.name),
+        now=1_800_000_000,
+        new_job_id=UUID("22222222-2222-4222-8222-222222222222"),
+        initial_operation=InitialModalOperation(
+            operation="predict_structure",
+            run_name="example-prediction",
+            submission_token=submission_key,
+        ),
+    )
+    job = store.attach_modal_call(
+        admitted.job.job_id,
+        operation="predict_structure",
+        modal_call_id="fc-predict",
+        submission_token=submission_key,
+        now=1_800_000_001,
+    )
+
+    client = APIClient(app)
+    _login(client, owner.email)
+    modal = client.get("/api/v1/admin/modal")
+    assert modal.status_code == 200
+    [tool] = modal.json()["tools"]
+    assert (
+        tool["workload"],
+        tool["display_name"],
+        tool["modal_app_name"]["value"],
+        tool["modal_app_version"]["value"],
+        tool["active_jobs"],
+        tool["active_job_limit"]["value"],
+    ) == (
+        "structure_prediction",
+        "Structure prediction",
+        "ConfiguredStructureApp",
+        9,
+        1,
+        6,
+    )
+    inspected = client.get(f"/api/v1/jobs/{job.job_id}")
+    assert inspected.status_code == 200
+    assert inspected.json()["stage"] == {
+        "code": "predict_structure",
+        "function_name": "predict_structure",
+        "started_at": "2027-01-15T08:00:01Z",
+    }
+
+    async def startup() -> None:
+        async with app.router.lifespan_context(app):
+            assert preflights == [
+                ("ConfiguredStructureApp", "production", 9),
+            ]
+
+    asyncio.run(startup())
+
+
 def test_cache_metadata_is_reconciled_before_job_reconciliation_starts(
     tmp_path: Path,
     monkeypatch,
@@ -1365,7 +1518,11 @@ def test_cache_metadata_is_reconciled_before_job_reconciliation_starts(
         "MODAL_TOKEN_ID": "test-token-id",
         "MODAL_TOKEN_SECRET": "test-token-secret",
     })
-    configuration = RuntimeConfiguration(store, settings)
+    configuration = RuntimeConfiguration(
+        store,
+        settings,
+        workload_definitions=[GROMACS_WORKLOAD],
+    )
     adapter = FakeGromacsAdapter()
 
     class RecordingReconciler:

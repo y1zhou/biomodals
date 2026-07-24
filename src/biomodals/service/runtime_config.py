@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from biomodals.service.config import ServiceSettings
-from biomodals.service.workloads import (
-    GROMACS_WORKLOAD,
-    WORKLOAD_DEFINITIONS,
-    WorkloadDefinition,
-)
+from biomodals.service.workloads import WorkloadDefinition
 
 if TYPE_CHECKING:
     from biomodals.service.store import ServiceStore
@@ -103,22 +99,53 @@ class RuntimeConfiguration:
     _MODAL_ENVIRONMENT_KEY = "modal_environment"
     _GLOBAL_ACTIVE_LIMIT_KEY = "global_active_job_limit"
 
-    def __init__(self, store: ServiceStore, settings: ServiceSettings) -> None:
+    def __init__(
+        self,
+        store: ServiceStore,
+        settings: ServiceSettings,
+        *,
+        workload_definitions: Sequence[WorkloadDefinition],
+    ) -> None:
         """Bind live database overrides to immutable startup sources."""
         self.store = store
         self.settings = settings
+        self._workload_definitions = {
+            definition.name: definition for definition in workload_definitions
+        }
+        if len(self._workload_definitions) != len(workload_definitions):
+            raise ValueError("Workload definition names must be unique")
+        sources = settings.sources
         self._workload_defaults = {
-            GROMACS_WORKLOAD.name: _WorkloadDefaults(
-                modal_app_name=settings.gromacs_app_name,
-                modal_app_version=settings.gromacs_app_version,
-                active_job_limit=settings.gromacs_active_limit,
+            definition.name: _WorkloadDefaults(
+                modal_app_name=_nonempty(
+                    sources.value(
+                        definition.modal_app_name_environment,
+                        definition.default_modal_app_name,
+                    ),
+                    definition.modal_app_name_environment,
+                ),
+                modal_app_version=_parse_positive(
+                    sources.value(
+                        definition.modal_app_version_environment,
+                        str(definition.default_modal_app_version),
+                    ),
+                    definition.modal_app_version_environment,
+                ),
+                active_job_limit=_parse_nonnegative(
+                    sources.value(
+                        definition.active_job_limit_environment,
+                        str(definition.default_active_job_limit),
+                    ),
+                    definition.active_job_limit_environment,
+                ),
             )
+            for definition in workload_definitions
         }
 
     def workload_definition(self, workload: str) -> WorkloadDefinition:
         """Return the static descriptor for one registered workload."""
         try:
-            return WORKLOAD_DEFINITIONS[workload]
+            return self._workload_definitions[workload]
         except KeyError as exc:
             raise ValueError(f"Unknown workload: {workload}") from exc
 

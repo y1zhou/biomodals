@@ -45,6 +45,8 @@ def create_app(
     registrations = {workload.name: workload for workload in workloads}
     if len(registrations) != len(workloads):
         raise ValueError("Workload names must be unique")
+    if configuration.workload_names() != tuple(registrations):
+        raise ValueError("Runtime workload definitions must match registrations")
     if reconcile_interval_seconds <= 0:
         raise ValueError("reconcile_interval_seconds must be positive")
     if any(workload.max_body_bytes < 1 for workload in workloads):
@@ -170,7 +172,6 @@ def create_deployed_app() -> FastAPI:
 
     store = ServiceStore(settings.database_path)
     store.initialize()
-    configuration = RuntimeConfiguration(store, settings)
     auth = AuthService(store, frontend_url=settings.public_url)
     cache = ArtifactCache(settings.cache_dir / "results")
     adapter = ModalGromacsAdapter(
@@ -191,11 +192,17 @@ def create_deployed_app() -> FastAPI:
         open_operation_logs=adapter.open_operation_logs,
         preflight=adapter.preflight,
     )
+    workloads = [registration]
+    configuration = RuntimeConfiguration(
+        store,
+        settings,
+        workload_definitions=[workload.definition for workload in workloads],
+    )
     return create_app(
         store=store,
         auth=auth,
         configuration=configuration,
-        workloads=[registration],
+        workloads=workloads,
         allowed_origin=settings.public_url,
         secure_cookies=settings.secure_cookies,
         cache=cache,

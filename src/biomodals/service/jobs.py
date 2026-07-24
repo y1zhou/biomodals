@@ -23,7 +23,7 @@ from biomodals.service.store import (
     JobState,
     ServiceStore,
 )
-from biomodals.service.workloads import WORKLOAD_DEFINITIONS, WorkloadDefinition
+from biomodals.service.workloads import WorkloadDefinition
 
 LOGGER = logging.getLogger(__name__)
 JobErrorCode = Literal["compute_failed", "result_invalid"]
@@ -118,11 +118,10 @@ class JobStageView(BaseModel):
 
 
 def _stage_view(
-    workload: str,
+    definition: WorkloadDefinition | None,
     operation: str,
     event: JobStageRecord | None = None,
 ) -> JobStageView | None:
-    definition = WORKLOAD_DEFINITIONS.get(workload)
     stage = definition.stage(operation) if definition is not None else None
     if stage is None or event is None:
         return None
@@ -142,9 +141,8 @@ def _stage_view(
 def _job_stage(
     record: JobRecord,
     history: Sequence[JobStageRecord],
+    definition: WorkloadDefinition | None,
 ) -> JobStageView | None:
-    if record.workload not in WORKLOAD_DEFINITIONS:
-        return None
     active = [event for event in history if event.completed_at is None]
     if active:
         event = active[-1]
@@ -169,25 +167,22 @@ def _job_stage(
     else:
         event = history[-1] if history else None
     return (
-        _stage_view(record.workload, event.operation, event)
-        if event is not None
-        else None
+        _stage_view(definition, event.operation, event) if event is not None else None
     )
 
 
 def job_stage_history(
     record: JobRecord,
     history: Sequence[JobStageRecord],
+    definition: WorkloadDefinition | None,
 ) -> list[JobStageView]:
     """Project durable operation events into safe public Stage views."""
-    if record.workload not in WORKLOAD_DEFINITIONS:
-        return []
     return [
         stage
         for event in history
         if (
             stage := _stage_view(
-                record.workload,
+                definition,
                 event.operation,
                 event,
             )
@@ -273,6 +268,7 @@ class JobView(BaseModel):
         cls,
         record: JobRecord,
         *,
+        definition: WorkloadDefinition | None,
         can_view_logs: bool = False,
     ) -> JobView:
         """Build a safe public view without exposing Modal identifiers or paths."""
@@ -290,7 +286,7 @@ class JobView(BaseModel):
             if event.completed_at is None
             and (
                 stage := _stage_view(
-                    record.workload,
+                    definition,
                     event.operation,
                     event,
                 )
@@ -303,9 +299,9 @@ class JobView(BaseModel):
             display_name=record.display_name,
             can_view_logs=can_view_logs,
             state=record.state,
-            stage=_job_stage(record, stage_history),
+            stage=_job_stage(record, stage_history, definition),
             active_stages=active_stages,
-            stage_history=job_stage_history(record, stage_history),
+            stage_history=job_stage_history(record, stage_history, definition),
             created_at=datetime.fromtimestamp(record.created_at, UTC),
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),
             completed_at=(

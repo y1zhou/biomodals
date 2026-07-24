@@ -239,7 +239,12 @@ def create_jobs_router(
     ) -> JobView:
         if can_view_logs is None:
             can_view_logs = caller_can_view_logs(job.workload, session)
-        return JobView.from_record(job, can_view_logs=can_view_logs)
+        registration = workloads.get(job.workload)
+        return JobView.from_record(
+            job,
+            definition=(registration.definition if registration is not None else None),
+            can_view_logs=can_view_logs,
+        )
 
     @router.get(
         "",
@@ -340,7 +345,10 @@ def create_jobs_router(
                     "job_not_cancellable",
                     str(exc),
                 ) from exc
-        stage = JobView.from_record(job).stage
+        stage = JobView.from_record(
+            job,
+            definition=(registration.definition if registration is not None else None),
+        ).stage
         LOGGER.info(
             "event=cancellation_requested job_id=%s workload=%s stage=%s request_id=%s",
             job.job_id,

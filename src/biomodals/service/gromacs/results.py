@@ -33,6 +33,7 @@ from biomodals.service.gromacs.provider import (
 )
 from biomodals.service.jobs import job_stage_history
 from biomodals.service.store import JobRecord, JobState
+from biomodals.service.workloads import GROMACS_WORKLOAD
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 MODAL_PUBLICATION_ERRORS = MODAL_SERVICE_ERRORS + (
@@ -270,7 +271,11 @@ class ModalGromacsResults:
 
         stages = [
             orjson.loads(stage.model_dump_json())
-            for stage in job_stage_history(job, job.stage_history)
+            for stage in job_stage_history(
+                job,
+                job.stage_history,
+                GROMACS_WORKLOAD,
+            )
         ]
         if stages and stages[-1]["code"] == "prepare_result":
             stages[-1]["ended_at"] = time.strftime(

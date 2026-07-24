@@ -113,15 +113,18 @@ One invocation handles one logical database:
 4. Require the official uncompressed source FASTA. If only `<filename>.zst`
    exists, fail with instructions to restore it manually in a Modal Sandbox or
    equivalent environment.
-5. Run full source `seqkit stats`, source hashing, and scratch-space preflight.
+5. Run full source `seqkit stats`, source hashing, and an exact scratch-space
+   preflight for two FASTA payloads, the occurrence index, and 1 GiB headroom.
 6. Run the pinned occurrence-indexed two-pass helper. Its first sequential pass
-   writes only fixed-width source offsets under `/tmp`; it never copies the
-   source FASTA. It creates a deterministic seed-23 Fisher--Yates permutation
-   over `uint32` record ordinals.
-7. In pass two, issue bounded concurrent reads from the source Volume and write
-   completed records strictly in permutation order to `/tmp/shuffled.fasta`.
-   Index by source occurrence so duplicate full headers are preserved without
-   FAI recovery. Normalize only a missing terminal newline.
+   tees the source into an ephemeral `/tmp` copy while writing fixed-width
+   occurrence offsets. It syncs the local copy, closes the Volume file, and
+   creates a deterministic seed-23 Fisher--Yates permutation over `uint32`
+   record ordinals.
+7. In pass two, issue bounded concurrent reads only from the local copy and
+   write completed records strictly in permutation order to
+   `/tmp/shuffled.fasta`. Index by source occurrence so duplicate full headers
+   are preserved without FAI recovery. Normalize only a missing terminal
+   newline.
 8. Run `seqkit split2`, which writes generation-scoped raw shards to the
    sharded Volume. Delete the local shuffled payload and rename raw shards to
    their exact AlphaFold-compatible filenames.
@@ -142,9 +145,10 @@ Failure cleanup removes only that generation's partial shard payload and local
 scratch while retaining compact diagnostics. It never modifies an existing
 published profile.
 
-The builder uses `(0.125, 32.125)` CPUs, the default 512 GiB ephemeral disk,
-and Modal's 24-hour maximum function timeout. It does not request extra disk,
-copy the source FASTA, or place the shuffled FASTA on either persistent Volume.
+The builder uses `(0.125, 32.125)` CPUs, `(1024, 262144)` MiB
+requested/maximum memory, the default 512 GiB ephemeral disk, and Modal's
+24-hour maximum function timeout. It does not request extra disk or place the
+ephemeral source copy or shuffled FASTA on either persistent Volume.
 
 ## Search cache layout
 
@@ -554,7 +558,7 @@ Not included initially:
 - per-shard durable retries;
 - automatic `.zst` source restoration;
 - shard revalidation during normal searches;
-- compressed runtime shards or SSD staging;
+- compressed runtime shards or prediction-time SSD staging;
 - mutable profile aliases or automatic database upgrades;
 - app-level automatic retry loops;
 - GPU-class-specific inference cache identity;

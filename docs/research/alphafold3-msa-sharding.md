@@ -296,11 +296,12 @@ reads produced only about 1.9 MB/s. It is not feasible for MGnify under the
 [source and runtime audit](alphafold3-seqkit-two-pass-shuffle-audit.md).
 
 Use the pinned occurrence-indexed two-pass helper instead. Pass one scans the
-source sequentially into compact fixed-width offsets and creates an explicit
-seed-23 Fisher--Yates permutation. Pass two uses bounded concurrent reads while
-writing in permutation order. This preserves duplicate headers by occurrence
-and keeps the source FASTA only on the source Modal Volume. Write only the
-compact index and shuffled FASTA to container-local `/tmp`.
+source sequentially into compact fixed-width offsets while teeing the exact
+bytes into container-local `/tmp`, then creates an explicit seed-23
+Fisher--Yates permutation. Pass two uses bounded concurrent reads from the
+local copy while writing in permutation order. This preserves duplicate
+headers by occurrence. The source of record remains only on the source Modal
+Volume; the local source copy, compact index, and shuffled FASTA are ephemeral.
 
 `split2 --by-part` does not emit AF3's required zero-based padded names by
 default, so rename and validate every output. See the official

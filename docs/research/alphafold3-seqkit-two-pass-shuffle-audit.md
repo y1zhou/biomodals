@@ -279,38 +279,35 @@ tens of GiB of `fai.Record` values, map keys/values, and a multi-GiB
 permutation. Running it unchanged would spend time building a large FAI and
 then likely fail before or during output.
 
-## Recommended next step
+## Implemented follow-up
 
-The current UniProt job may finish if its resident memory remains stable; there
-is no evidence that cancelling and resubmitting the same command would improve
-it. Capture its final peak RSS, output rate, and completion evidence. Do not
-launch MGnify afterward.
-
-Before MGnify, implement and test a narrowly scoped, pinned two-pass shuffler
+The initial no-source-copy recommendation was reversed after the stock
+UniProt run demonstrated that serialized random Volume reads were the dominant
+runtime. The replacement remains a narrowly scoped, pinned two-pass shuffler
 for this database shape:
 
-1. Keep a first sequential pass over the original source without copying it.
+1. Use the first sequential pass over the original source to tee an exact
+   ephemeral copy onto container-local SSD while building the index.
 2. Store ordinal record offsets and lengths in compact fixed-width arrays,
    rather than maps keyed by duplicated full headers.
 3. Store the permutation as 32-bit ordinals; all seven databases have fewer
    than \(2^{32}\) records.
 4. Preserve seed 23 and deterministic Fisher--Yates permutation semantics.
-5. In the second pass, use a bounded concurrent `ReadAt` prefetch window, but
-   write completed records in permutation order. This preserves deterministic
-   output while exposing enough I/O concurrency to test the Volume.
+5. Close the Volume source after pass one. In the second pass, use a bounded
+   concurrent `pread` window against only the local copy, but write completed
+   records in permutation order.
 6. Index records by occurrence, not header, so duplicate full headers are
    preserved naturally. Retain byte-offset diagnostics and the existing
    occurrence/header validation gates.
-7. First compare the helper against stock SeqKit on a manageable database:
-   exact record/header/sequence occurrence multiset, deterministic rerun,
-   aggregate `seqkit stats` and `seqkit sum`, shard balance, and the existing
-   scientific search oracle. Benchmark several small prefetch bounds before
-   selecting one.
+7. Require exact source-copy bytes, exact record/header/sequence occurrence
+   multiset, deterministic rerun, aggregate `seqkit stats` and `seqkit sum`,
+   shard balance, and the existing scientific search oracle.
 
 This is a change to the implementation behind "two-pass shuffle," not to the
 scientific sharding recipe: the source is still scanned/indexed first, records
 are still assigned a deterministic random permutation, and only the shuffled
-output is stored under `/tmp`.
+output is stored under `/tmp`. The source staging changes only I/O topology;
+it does not change record identity, permutation order, or shard membership.
 
 If "use two-pass shuffle" is interpreted as requiring the **unmodified stock
 SeqKit binary**, then the current constraints cannot all be satisfied:
@@ -320,6 +317,8 @@ SeqKit binary**, then the current constraints cannot all be satisfied:
 - stock SeqKit preserves the full-header maps and record-count-scaled memory;
 - writing output to `/tmp` changes neither behavior.
 
-Under that stricter interpretation, the only choices are to accept the current
-runtime and raise memory substantially, or relax the no-source-copy constraint.
-There is no command correction that supplies a third option.
+The project chose the latter option: the persistent source remains immutable
+on its Volume, but the one-time builder creates an ephemeral local copy. The
+general builder now has a `(1024, 262144)` MiB memory request/limit range; its
+compact offset and permutation structures, rather than that higher ceiling,
+make MGnify feasible.

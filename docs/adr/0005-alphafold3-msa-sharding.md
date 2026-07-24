@@ -24,9 +24,14 @@ The selected worker topology was 16 active shard searches with two HMMER CPUs
 each in a Modal container allocated `(0.125, 32.125)` CPUs. It completed the
 medium query in about 49.05 seconds, roughly 5.1 times faster than the baseline.
 
-The campaign did not show Modal Volume bandwidth to be the primary bottleneck.
-The production design therefore reads uncompressed shards directly from the
-Volume and does not copy sequence databases to ephemeral SSD.
+The campaign did not show Modal Volume bandwidth to be the primary bottleneck
+for HMMER search. Prediction workers therefore read uncompressed shards
+directly from the Volume and do not copy sequence databases to ephemeral SSD.
+
+Stock SeqKit shuffling exposed a different access pattern. Its serialized
+random reads from the monolithic source produced only about 1.9 MB/s for
+UniProt, so the one-time profile builder stages that source on ephemeral SSD
+before randomized output.
 
 ## Decision
 
@@ -105,27 +110,36 @@ build_sharded_database(
 ) -> dict[str, object]
 ```
 
-One invocation builds one logical database. It uses `(0.125, 32.125)` CPUs and
-the default 512 GiB ephemeral disk without requesting a larger disk.
+One invocation builds one logical database. It uses `(0.125, 32.125)` CPUs,
+`(1024, 262144)` MiB requested/maximum memory, and the default 512 GiB
+ephemeral disk without requesting a larger disk.
 
 The builder reads the official monolithic FASTA from `AlphaFold3-msa-db`. It
-writes the two-pass shuffled FASTA and a compact occurrence-offset index under
-`/tmp`. It never copies the source FASTA.
+writes an ephemeral source copy, the two-pass shuffled FASTA, and a compact
+occurrence-offset index under `/tmp`. It never copies the monolithic source
+into the sharded Volume.
 
-The first pass scans the source sequentially and indexes every record by source
-occurrence in a fixed-width `uint64` offset array. It then creates a
-seed-23, SplitMix64 Fisher--Yates permutation of `uint32` ordinals. The second
-pass uses bounded concurrent `pread` calls but buffers and writes each batch in
-permutation order. The helper normalizes a missing final newline so moving the
-last source record cannot merge it with the next header.
+The first pass scans the source sequentially, tees the exact bytes into the
+container-local copy, and indexes every record by source occurrence in a
+fixed-width `uint64` offset array. The helper syncs the local copy, closes the
+Volume file, and creates a seed-23, SplitMix64 Fisher--Yates permutation of
+`uint32` ordinals. The second pass uses bounded concurrent `pread` calls
+against only the local copy, but buffers and writes each batch in permutation
+order. The helper normalizes a missing final newline so moving the last source
+record cannot merge it with the next header.
+
+Before work starts, the builder requires scratch for the exact source copy,
+normalized shuffled output, occurrence index, and 1 GiB headroom. This is
+about 204.68 GiB for UniProt and 245.15 GiB for MGnify, both below Modal's
+default 512 GiB per-container disk quota.
 
 Occurrence identity preserves duplicate full headers without FAI lookup,
 temporary header prefixes, or recovery. The manifest pins the helper source
 digest, offset representation, permutation, and ordered-read behavior.
 
 The builder then runs `seqkit split2`. Generation-scoped raw shards are written
-to the sharded Volume; the shuffled FASTA is never written to a persistent
-Volume.
+to the sharded Volume; the ephemeral source copy, occurrence index, and
+shuffled FASTA are never written to a persistent Volume.
 
 After splitting, the builder deletes the shuffled payload and renames each
 generation-scoped raw shard to its exact AlphaFold-compatible filename.
@@ -685,8 +699,10 @@ scientific gates. Normal searches do not revalidate it.
 Successful database searches, template results, and seed predictions survive
 later explicit reruns at useful scientific boundaries.
 
-Direct Volume reads avoid a full database copy and its SSD capacity and billing
-requirements. Fixed immutable profiles make search provenance reviewable.
+Prediction-time direct Volume reads avoid a full database copy for every query.
+The one-time profile builder accepts ephemeral SSD capacity as the tradeoff for
+tractable shuffling. Fixed immutable profiles make search provenance
+reviewable.
 
 The design adds app-owned orchestration, completion markers, claims, and
 upstream contract coupling. It intentionally keeps that state above the pinned
@@ -704,7 +720,7 @@ The following risks are accepted:
 The initial implementation does not include:
 
 - per-shard durable retries;
-- compressed runtime shards or SSD staging;
+- compressed runtime shards or prediction-time SSD staging;
 - automatic source-archive restoration;
 - mutable profile aliases or automatic database upgrades;
 - normal-search shard audits;

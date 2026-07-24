@@ -221,9 +221,6 @@ class ServiceSettings:
     public_url: str
     secure_cookies: bool
     modal_environment: str
-    gromacs_app_name: str
-    gromacs_app_version: int
-    gromacs_active_limit: int
     global_active_job_limit: int
     default_user_active_job_limit: int
     reconcile_interval_seconds: float
@@ -264,21 +261,6 @@ class ServiceSettings:
                 sources,
                 "BIOMODALS_MODAL_ENVIRONMENT",
                 "production",
-            ),
-            gromacs_app_name=_required_text(
-                sources,
-                "BIOMODALS_GROMACS_APP",
-                "Gromacs",
-            ),
-            gromacs_app_version=_positive_integer(
-                sources,
-                "BIOMODALS_GROMACS_APP_VERSION",
-                1,
-            ),
-            gromacs_active_limit=_nonnegative_integer(
-                sources,
-                "BIOMODALS_GROMACS_ACTIVE_LIMIT",
-                2,
             ),
             global_active_job_limit=_nonnegative_integer(
                 sources,

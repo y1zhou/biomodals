@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Thread
@@ -1394,6 +1394,7 @@ def test_registered_workload_drives_runtime_admin_and_job_views(
         "BIOMODALS_STRUCTURE_APP": "ConfiguredStructureApp",
         "BIOMODALS_STRUCTURE_APP_VERSION": "9",
         "BIOMODALS_STRUCTURE_ACTIVE_LIMIT": "6",
+        "BIOMODALS_GROMACS_APP_VERSION": "irrelevant-invalid",
         "MODAL_TOKEN_ID": "test-token-id",
         "MODAL_TOKEN_SECRET": "test-token-secret",
     })
@@ -1441,6 +1442,24 @@ def test_registered_workload_drives_runtime_admin_and_job_views(
                 store,
                 settings,
                 workload_definitions=[],
+            ),
+            workloads=[registration],
+            allowed_origin=ORIGIN,
+            secure_cookies=True,
+        )
+    with pytest.raises(
+        ValueError,
+        match="Runtime workload definitions must match registrations",
+    ):
+        create_app(
+            store=store,
+            auth=auth,
+            configuration=RuntimeConfiguration(
+                store,
+                settings,
+                workload_definitions=[
+                    replace(definition, display_name="Drifted display name"),
+                ],
             ),
             workloads=[registration],
             allowed_origin=ORIGIN,

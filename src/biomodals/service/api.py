@@ -45,7 +45,11 @@ def create_app(
     registrations = {workload.name: workload for workload in workloads}
     if len(registrations) != len(workloads):
         raise ValueError("Workload names must be unique")
-    if configuration.workload_names() != tuple(registrations):
+    configured_definitions = tuple(
+        configuration.workload_definition(name)
+        for name in configuration.workload_names()
+    )
+    if configured_definitions != tuple(workload.definition for workload in workloads):
         raise ValueError("Runtime workload definitions must match registrations")
     if reconcile_interval_seconds <= 0:
         raise ValueError("reconcile_interval_seconds must be positive")

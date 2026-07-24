@@ -113,17 +113,53 @@ def test_reset_removes_only_one_database_override(tmp_path: Path) -> None:
 def test_process_environment_is_effective_and_read_only(tmp_path: Path) -> None:
     configuration = _configuration(
         tmp_path,
-        process={"BIOMODALS_MODAL_ENVIRONMENT": "process-env"},
-        config_file="BIOMODALS_MODAL_ENVIRONMENT=file-env\n",
+        process={
+            "BIOMODALS_MODAL_ENVIRONMENT": "process-env",
+            "BIOMODALS_GROMACS_APP": "ProcessApp",
+            "BIOMODALS_GROMACS_APP_VERSION": "17",
+            "BIOMODALS_GROMACS_ACTIVE_LIMIT": "0",
+        },
+        config_file=(
+            "BIOMODALS_MODAL_ENVIRONMENT=file-env\n"
+            "BIOMODALS_GROMACS_APP=FileApp\n"
+            "BIOMODALS_GROMACS_APP_VERSION=3\n"
+            "BIOMODALS_GROMACS_ACTIVE_LIMIT=4\n"
+        ),
     )
 
     setting = configuration.modal_environment()
+    workload = configuration.workload("gromacs")
 
     assert setting.value == "process-env"
     assert setting.source == "process_environment"
     assert setting.editable is False
+    assert workload.modal_app_name.value == "ProcessApp"
+    assert workload.modal_app_version.value == 17
+    assert workload.active_job_limit.value == 0
+    assert workload.modal_app_name.editable is False
+    assert workload.modal_app_version.editable is False
+    assert workload.active_job_limit.editable is False
     with pytest.raises(SettingOverrideError, match="environment variable"):
         configuration.update_environment(modal_environment="database-env")
+    with pytest.raises(SettingOverrideError, match="environment variable"):
+        configuration.set_workload("gromacs", modal_app_version=18)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("BIOMODALS_GROMACS_APP", " "),
+        ("BIOMODALS_GROMACS_APP_VERSION", "0"),
+        ("BIOMODALS_GROMACS_ACTIVE_LIMIT", "-1"),
+    ],
+)
+def test_workload_environment_is_validated_from_its_descriptor(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError):
+        _configuration(tmp_path, process={name: value})
 
 
 def test_admission_resolves_database_settings_inside_store_transaction(

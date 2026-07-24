@@ -161,6 +161,15 @@ requested/maximum memory, the default 512 GiB ephemeral disk, and Modal's
 24-hour maximum function timeout. It does not request extra disk or place the
 ephemeral source copy or shuffled FASTA on either persistent Volume.
 
+The 2026-07-24 source-Volume inventory reports a 75.4 GiB NT-RNA FASTA and a
+119.7 GiB MGnify FASTA. Using the rounded MGnify size and its known
+623,796,864 records, the implemented preflight requires about 245 GiB:
+239.4 GiB for the staged and shuffled FASTA payloads, about 4.65 GiB for
+64-bit occurrence offsets, and 1 GiB headroom. This remains well below the
+default 512 GiB container disk quota. The runtime still computes the exact
+requirement from the unrounded source size and measured record count before
+creating local payloads.
+
 ## Search cache layout
 
 `sequence_hash` remains a hash of sequence text only. Polymer namespaces

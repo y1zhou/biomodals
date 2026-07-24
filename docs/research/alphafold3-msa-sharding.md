@@ -310,8 +310,17 @@ first pass and 120.57 MB/s for the full 108.45 GB second pass, versus about
 performance bottleneck was the single-input aggregate `seqkit sum`: `-j 8`
 parallelizes across files, but concatenating the shards into the one logical
 input required for direct source comparison leaves one global hash sort. Use a
-parallel, deliberately composable multiset validator before building MGnify;
+parallel, deliberately composable multiset validator for subsequent builds;
 independent per-shard SeqKit digests cannot be substituted for the aggregate.
+
+Production-candidate recipe v5 implements that validator. It hashes canonical
+full `(header, sequence)` records with SHA-256 and reduces all four digest lanes
+using commutative sum, XOR, and sum-of-squares accumulators plus exact record,
+header-byte, and sequence-byte totals. The source is scanned sequentially and
+shards are scanned concurrently. Matching signatures therefore validate the
+order-independent, multiplicity-sensitive full-record multiset without
+SeqKit's global sort, while independent `seqkit stats` remains as a second
+record/residue conservation check. Existing recipe v4 profiles remain valid.
 
 `split2 --by-part` does not emit AF3's required zero-based padded names by
 default, so rename and validate every output. See the official

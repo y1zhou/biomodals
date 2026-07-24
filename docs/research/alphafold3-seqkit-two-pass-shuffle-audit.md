@@ -301,8 +301,8 @@ for this database shape:
    occurrence/header validation gates.
 7. Require exact source-copy bytes, a bijective source-occurrence permutation,
    deterministic duplicate-header regression coverage, aggregate
-   `seqkit stats` and `seqkit sum`, shard balance, and the existing scientific
-   search oracle.
+   `seqkit stats`, a canonical full-record multiset comparison, shard balance,
+   and the existing scientific search oracle.
 
 This is a change to the implementation behind "two-pass shuffle," not to the
 scientific sharding recipe: the source is still scanned/indexed first, records
@@ -368,13 +368,26 @@ operationally serial: SeqKit parallelizes `sum` across input files, while this
 command has one stdin input and one global sort of 225,619,586 per-sequence
 hashes. Running `seqkit sum <256 shard paths>` would use file-level
 parallelism, but would produce 256 non-composable final digests rather than the
-required aggregate digest. The current aggregate validation should therefore
-be replaced before MGnify by an explicitly composable parallel multiset
-validator, not by the scientifically different multi-file command.
+required aggregate digest.
 
 `seqkit sum` ignores headers and validates the sequence multiset only. The
 duplicate-header guarantee instead comes from the helper's source-occurrence
 index and bijective permutation, the exact record-count gate, and the
-byte-for-byte duplicate-header regression. A future composable validator
-should include canonical full headers as well as sequences so the production
-artifact independently demonstrates that invariant.
+byte-for-byte duplicate-header regression.
+
+Recipe v5 replaces this serial checksum for all subsequent profile builds with
+an explicitly composable record-multiset validator. For each parsed FASTA
+record it computes a domain-separated SHA-256 over the full header, concatenated
+sequence, and explicit header and sequence lengths. Header and sequence case
+are significant; line endings and sequence line wrapping are not. The report
+combines all four 64-bit digest lanes using modular sums, XORs, and sums of
+squares, together with record, header-byte, and sequence-byte totals. These
+commutative aggregates are order-independent and multiplicity-sensitive.
+
+The original source is scanned as one sequential file, while the final shards
+are scanned concurrently over up to the configured worker count. Their
+canonical signatures must match exactly, and their record and sequence-byte
+totals must also match the independently generated SeqKit statistics. This
+removes both the global hash sort and the header-awareness gap. Recipe v4
+manifests, including the already published UniProt profile above, remain
+readable and do not need to be rebuilt.

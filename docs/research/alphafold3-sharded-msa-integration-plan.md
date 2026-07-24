@@ -128,9 +128,12 @@ One invocation handles one logical database:
 8. Run `seqkit split2`, which writes generation-scoped raw shards to the
    sharded Volume. Delete the local shuffled payload and rename raw shards to
    their exact AlphaFold-compatible filenames.
-9. Run aggregate and per-shard `seqkit stats` and `seqkit sum --all`; validate
-   source/shard sequence and residue conservation, occurrence preservation,
-   filenames, shard count, balance, sizes, and digests.
+9. Run source and per-shard `seqkit stats`, then compare the source and shard
+   union with the recipe-v5 canonical full-record multiset validator. It scans
+   shard files concurrently and combines domain-separated per-record SHA-256
+   values with commutative sum, XOR, and sum-of-squares accumulators. Validate
+   sequence and residue conservation, full-header occurrence preservation,
+   filenames, shard count, balance, sizes, and artifact digests.
 10. Derive Z/domZ from the measured source, write compact validation evidence
     including the native helper identity and metrics,
     commit the shard payload, and publish `manifest.json` last.

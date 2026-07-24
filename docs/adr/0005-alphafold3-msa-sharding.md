@@ -58,10 +58,10 @@ reuse these scientific cache paths.
 
 Mature construction primitives live under
 `src/biomodals/app/fold/alphafold3/`. That package owns the pinned C source
-assets, source-code identities, native compilation and execution, record
-multiset parsing, scratch sizing, and staged-file verification. It has no
-knowledge of Modal Volumes, profile manifests, benchmark campaigns, or
-publication claims.
+assets, source-code identities, shared file/digest/JSON/log primitives, native
+compilation and execution, record multiset parsing, scratch sizing, and
+staged-file verification. It has no knowledge of Modal Volumes, profile
+manifests, benchmark campaigns, or publication claims.
 
 The temporary MSA Benchmark App remains the composition root while the
 sharding recipe is being validated. It owns Modal images and resources,

@@ -29,7 +29,9 @@ a manifest-last publication remain on the sharded Volume.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import io
+import itertools
 import os
 import re
 import shlex
@@ -39,6 +41,7 @@ import subprocess
 import tempfile
 import uuid
 from collections import Counter
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -161,6 +164,7 @@ PRODUCTION_SCRATCH_ROOT = Path(tempfile.gettempdir())
 MSA_ORACLE_COMPARISON_POLICY = (
     "full-hit-rows-exact-modulo-contiguous-evalue-bit-score-ties-v1"
 )
+NHMMER_SHARDED_MERGE_ORDER = "reported-evalue-descending-bit-score-name-v1"
 UNIPROT_V4_VALIDATION_BASELINE = {
     "source_seqkit_sum_seconds": 338.390180,
     "post_shard_stats_to_completion_seconds": 2242.917015,
@@ -6949,12 +6953,15 @@ def _production_search_parameters(
 ) -> dict[str, object]:
     """Return scientific and operational parameters for evidence."""
     monolith = layout == "monolith"
-    return _production_scientific_search_parameters(spec) | {
+    parameters = _production_scientific_search_parameters(spec) | {
         "n_cpu": ORACLE_MONOLITH_N_CPU if monolith else PRODUCTION_SEARCH_N_CPU,
         "max_parallel_shards": (
             1 if monolith else PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS
         ),
     }
+    if not monolith and spec.polymer == "rna":
+        parameters["sharded_merge_order"] = NHMMER_SHARDED_MERGE_ORDER
+    return parameters
 
 
 def _production_search_plan(
@@ -7157,6 +7164,80 @@ def _normalized_rna_hit_rows(
     return rows
 
 
+def _nhmmer_reported_score_sort_key(
+    row: tuple[str, str, str, str],
+) -> tuple[float, float, str]:
+    """Rank one Nhmmer hit by its reported E-value, score, and name."""
+    _, _, tblout_line, name = row
+    fields = tblout_line.split(maxsplit=15)
+    if len(fields) < 14:
+        raise ValueError(f"Invalid Nhmmer tblout row: {tblout_line!r}")
+    return float(fields[12]), -float(fields[13]), name
+
+
+def _merge_nhmmer_results_by_reported_score(
+    module: Any,
+    results: tuple[Any, ...],
+    max_sequences: int,
+) -> Any:
+    """Merge shards without allowing lower reported scores to win ties.
+
+    HMMER ranks hits by a full-precision log P-value, but ``tblout`` exposes
+    only a two-significant-digit E-value and a one-decimal bit score. The
+    upstream sharded merge uses only the rounded E-value and target name, which
+    can place a lower reported score ahead of a higher one and select the wrong
+    side of a capped MSA. The reported score is the strongest available
+    secondary key without maintaining a patched HMMER binary.
+    """
+    if max_sequences <= 1:
+        raise ValueError("max_sequences must be greater than one")
+    if not results:
+        raise ValueError("At least one Nhmmer result is required")
+    if len({result.target_sequence for result in results}) != 1:
+        raise ValueError("Nhmmer shard results have different target sequences")
+    if len({result.e_value for result in results}) != 1:
+        raise ValueError("Nhmmer shard results have different E-value thresholds")
+
+    tblout_by_id: dict[str, str] = {}
+    for result in results:
+        if result.tblout is None:
+            raise ValueError("Nhmmer shard result is missing tblout")
+        for line in result.tblout.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split(maxsplit=15)
+            if len(fields) < 14:
+                raise ValueError(f"Invalid Nhmmer tblout row: {line!r}")
+            hit_id = f"{fields[0]}/{fields[6]}-{fields[7]}"
+            tblout_by_id[hit_id] = line
+
+    def iter_shard_rows(a3m: str) -> Iterator[tuple[str, str, str, str]]:
+        records = iter(module.parsers.lazy_parse_fasta_string(a3m))
+        next(records)
+        for sequence, description in records:
+            name = description.partition(" ")[0]
+            if tblout_line := tblout_by_id.get(name):
+                yield sequence, description, tblout_line, name
+
+    top_rows = heapq.nsmallest(
+        max_sequences - 1,
+        itertools.chain.from_iterable(
+            iter_shard_rows(result.a3m) for result in results
+        ),
+        key=_nhmmer_reported_score_sort_key,
+    )
+    merged_a3m = [f">query\n{results[0].target_sequence}"]
+    merged_a3m.extend(
+        f">{description}\n{sequence}" for sequence, description, _, _ in top_rows
+    )
+    return module.msa_tool.MsaToolResult(
+        target_sequence=results[0].target_sequence,
+        a3m="\n".join(merged_a3m),
+        e_value=results[0].e_value,
+        tblout=None,
+    )
+
+
 def _execute_profile_database_search(
     spec: DatabaseProfileSpec,
     sequence: str,
@@ -7252,7 +7333,8 @@ def _execute_profile_database_search(
             spec.max_sequences,
         )
     else:
-        merged = module._merge_nhmmer_results(  # noqa: SLF001
+        merged = _merge_nhmmer_results_by_reported_score(
+            module,
             results,
             spec.max_sequences,
         )

@@ -10,20 +10,48 @@ import re
 import stat
 import time
 from collections.abc import AsyncIterable, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from shutil import disk_usage
 from threading import Lock
-from typing import TypeVar
 from uuid import UUID, uuid4
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 _WRITE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _PREPARED_ARTIFACT_SECONDS = 60
-_T = TypeVar("_T")
+
+
+async def _run_executor[T](
+    executor: Executor | None,
+    operation: Callable[..., T],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> T:
+    """Do not release an operation's resources while its worker still uses them."""
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(
+        executor,
+        partial(operation, *args, **kwargs),
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        await asyncio.gather(future, return_exceptions=True)
+        raise
+
+
+async def run_blocking_io[T](
+    operation: Callable[..., T],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> T:
+    """Run independent blocking I/O on the event loop's bounded worker pool."""
+    return await _run_executor(None, operation, *args, **kwargs)
 
 
 class ArtifactIntegrityError(RuntimeError):
@@ -154,18 +182,19 @@ class ArtifactCache:
         if not os.access(self.directory, os.R_OK | os.W_OK | os.X_OK):
             raise RuntimeError("Artifact cache directory is not usable")
 
-    async def run_bounded(
+    async def run_bounded[T](
         self,
-        operation: Callable[..., _T],
+        operation: Callable[..., T],
         /,
         *args: object,
         **kwargs: object,
-    ) -> _T:
+    ) -> T:
         """Run blocking artifact I/O on the single artifact worker."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        return await _run_executor(
             self._worker,
-            partial(operation, *args, **kwargs),
+            operation,
+            *args,
+            **kwargs,
         )
 
     async def check_ready_async(self) -> None:

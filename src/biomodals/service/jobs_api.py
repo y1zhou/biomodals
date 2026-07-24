@@ -19,6 +19,7 @@ from biomodals.service.artifacts import (
     ArtifactIntegrityError,
     ArtifactLease,
     ArtifactSourceMissingError,
+    run_blocking_io,
 )
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
@@ -186,9 +187,9 @@ def _cached_archive_response(
     async def content():
         remaining = length
         try:
-            await asyncio.to_thread(lease.seek, first)
+            await run_blocking_io(lease.seek, first)
             while remaining:
-                chunk = await asyncio.to_thread(
+                chunk = await run_blocking_io(
                     lease.read,
                     min(1024 * 1024, remaining),
                 )
@@ -197,7 +198,7 @@ def _cached_archive_response(
                 remaining -= len(chunk)
                 yield chunk
         finally:
-            await asyncio.to_thread(lease.close)
+            await run_blocking_io(lease.close)
 
     return StreamingResponse(
         content(),

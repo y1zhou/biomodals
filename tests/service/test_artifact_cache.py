@@ -7,6 +7,7 @@ import hashlib
 import os
 import stat
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -21,6 +22,35 @@ async def chunks(content: bytes):
 
 def digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def test_bounded_io_finishes_before_cancellation_unwinds(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        cache = ArtifactCache(tmp_path)
+        started = Event()
+        release = Event()
+        finished = Event()
+
+        def blocking_operation() -> None:
+            started.set()
+            release.wait(timeout=5)
+            finished.set()
+
+        task = asyncio.create_task(cache.run_bounded(blocking_operation))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        await asyncio.sleep(0)
+        cancellation_waits_for_io = not task.done()
+        release.set()
+        [outcome] = await asyncio.gather(task, return_exceptions=True)
+        await cache.shutdown()
+
+        assert cancellation_waits_for_io is True
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert finished.is_set()
+
+    asyncio.run(scenario())
 
 
 def test_cache_verifies_download_before_atomic_publish(tmp_path: Path) -> None:

@@ -546,6 +546,11 @@ def _write_bytes(
     }
 
 
+def _reset_handle(handle: BinaryIO) -> None:
+    handle.seek(0)
+    handle.truncate(0)
+
+
 async def _read_bounded(
     read_file: ReadRemoteFile,
     path: str,
@@ -688,8 +693,10 @@ async def write_gromacs_archive(
             ) from exc
 
     binary_handle = cast("BinaryIO", handle)
-    binary_handle.seek(0)
-    binary_handle.truncate(0)
+    if run_bounded is None:
+        _reset_handle(binary_handle)
+    else:
+        await run_bounded(_reset_handle, binary_handle)
     input_path = f"{run_name}/{run_name}.pdb"
     input_bytes = await _read_bounded(
         read_required,
@@ -716,15 +723,24 @@ async def write_gromacs_archive(
 
     records: list[dict[str, str | int]] = []
     with zipfile.ZipFile(binary_handle, mode="w", allowZip64=True) as archive:
-        records.append(
-            _write_bytes(
+        if run_bounded is None:
+            input_record = _write_bytes(
                 archive,
                 name="input.pdb",
                 role="input_structure",
                 content=input_bytes,
                 mtime=required_mtime(input_path),
             )
-        )
+        else:
+            input_record = await run_bounded(
+                _write_bytes,
+                archive,
+                name="input.pdb",
+                role="input_structure",
+                content=input_bytes,
+                mtime=required_mtime(input_path),
+            )
+        records.append(input_record)
         for name, role in _required_output_files(run_name):
             remote_path = f"{run_name}/{PurePosixPath(name).name}"
             records.append(
@@ -815,7 +831,6 @@ async def write_gromacs_archive(
             binary_handle,
             run_name,
         )
-    binary_handle.seek(0)
     return BuiltGromacsArchive(
         request_sha256=validated.request_sha256,
         size_bytes=size_bytes,

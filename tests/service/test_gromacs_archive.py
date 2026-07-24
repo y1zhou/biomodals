@@ -193,14 +193,22 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         }
 
 
-def test_remote_archive_writes_do_not_block_the_event_loop(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "blocking_content",
+    [PDB, XTC],
+    ids=["input-pdb", "remote-output"],
+)
+def test_archive_writes_do_not_block_the_event_loop(
+    tmp_path,
+    blocking_content: bytes,
+) -> None:
     files = _remote_files()
     write_started = Event()
     release_write = Event()
 
     class BlockingBuffer(io.BytesIO):
         def write(self, content: Buffer, /) -> int:
-            if bytes(content) == XTC and not write_started.is_set():
+            if bytes(content) == blocking_content and not write_started.is_set():
                 write_started.set()
                 if not release_write.wait(timeout=5):
                     raise RuntimeError("test archive write timed out")

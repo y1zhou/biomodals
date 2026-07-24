@@ -437,6 +437,20 @@ Commit: `fold: add RNA sharding oracle`
   final deduplicated RNA A3M;
 - retain equal-score permutation tolerance only.
 
+The temporary app implements this as
+`full-hit-rows-exact-modulo-contiguous-evalue-bit-score-ties-v1`. Every
+per-database row's target ID, complete description, exact aligned A3M
+sequence, textual E-value, textual bit score, and multiplicity must match.
+Only row order inside a contiguous block with the same E-value and bit score
+may differ. The earlier Phase 1 duplicate-tail/Jaccard characterization is
+diagnostic evidence only and cannot make a production-candidate oracle pass.
+
+The pinned RNA merge identifies hits as
+`accession/alignment_from-alignment_to`, uses the last tblout line for a
+repeated coordinate ID, and orders the merged rows by E-value then that ID.
+The oracle evidence normalizer mirrors those rules before applying the strict
+comparison above.
+
 No Modal job is submitted without explicit permission. Record successful or
 failed results in research documentation before production promotion.
 

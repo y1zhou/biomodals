@@ -299,9 +299,10 @@ for this database shape:
 6. Index records by occurrence, not header, so duplicate full headers are
    preserved naturally. Retain byte-offset diagnostics and the existing
    occurrence/header validation gates.
-7. Require exact source-copy bytes, exact record/header/sequence occurrence
-   multiset, deterministic rerun, aggregate `seqkit stats` and `seqkit sum`,
-   shard balance, and the existing scientific search oracle.
+7. Require exact source-copy bytes, a bijective source-occurrence permutation,
+   deterministic duplicate-header regression coverage, aggregate
+   `seqkit stats` and `seqkit sum`, shard balance, and the existing scientific
+   search oracle.
 
 This is a change to the implementation behind "two-pass shuffle," not to the
 scientific sharding recipe: the source is still scanned/indexed first, records
@@ -322,3 +323,58 @@ on its Volume, but the one-time builder creates an ephemeral local copy. The
 general builder now has a `(1024, 262144)` MiB memory request/limit range; its
 compact offset and permutation structures, rather than that higher ceiling,
 make MGnify feasible.
+
+## Staged-local UniProt result
+
+Generation `ec27ba8d37294ed38872720362daee44` published
+`uniprot-256-v1` on 2026-07-24. It used the occurrence-indexed C helper with
+eight workers, source policy `keep`, and a 256 GiB memory ceiling. The job ran
+from 02:28:34 to 03:46:49 UTC, including all source scans, sharding,
+validation, artifact hashing, Volume commits, and final deep verification.
+
+| Stage | Duration or rate |
+|---|---:|
+| source `seqkit stats` | 5m 08s |
+| source SHA-256 | 2m 14s |
+| source `seqkit sum --all` | 5m 38s |
+| first pass: Volume read plus local-source tee and occurrence index | 169.87s; 638.43 MB/s |
+| Fisher--Yates permutation | 5.44s |
+| second pass: eight ordered local-SSD `pread` workers | 899.48s; 120.57 MB/s |
+| `split2` plus final shard renames | 9m 04s; 199.52 MB/s of FASTA payload |
+| shard `seqkit stats` | 50.48s |
+| aggregate checksum, artifact digests, publication, and deep verification | 37m 23s |
+| complete builder | 1h 18m 15s |
+
+The second pass emitted 108,447,942,931 bytes and all 225,619,586 source
+occurrences. Warm one-minute intervals were 120--138 MB/s. The complete
+second-pass average was 120.57 MB/s, about 62 times the stock SeqKit
+observation of 1.94 MB/s. This validates the local-source staging hypothesis;
+the job was retained under the predeclared 20 MB/s stop threshold.
+
+The final profile contains 225,619,586 records and 78,608,056,346 residues.
+Its maximum shard residue imbalance is 0.2804%, recovered-record count is zero,
+and manifest SHA-256 is
+`62bac582c973db700de978fe89474fb311c067ea49fc7b69dc81ad07b0b12194`.
+
+The aggregate shard checksum used:
+
+```text
+cat <256 explicit shard paths> | seqkit sum -j 8 --all -
+```
+
+This is scientifically valid because it presents the shard union as one
+logical FASTA, directly comparable with the source checksum. It is also
+operationally serial: SeqKit parallelizes `sum` across input files, while this
+command has one stdin input and one global sort of 225,619,586 per-sequence
+hashes. Running `seqkit sum <256 shard paths>` would use file-level
+parallelism, but would produce 256 non-composable final digests rather than the
+required aggregate digest. The current aggregate validation should therefore
+be replaced before MGnify by an explicitly composable parallel multiset
+validator, not by the scientifically different multi-file command.
+
+`seqkit sum` ignores headers and validates the sequence multiset only. The
+duplicate-header guarantee instead comes from the helper's source-occurrence
+index and bijective permutation, the exact record-count gate, and the
+byte-for-byte duplicate-header regression. A future composable validator
+should include canonical full headers as well as sequences so the production
+artifact independently demonstrates that invariant.

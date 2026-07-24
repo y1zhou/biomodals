@@ -303,6 +303,16 @@ local copy while writing in permutation order. This preserves duplicate
 headers by occurrence. The source of record remains only on the source Modal
 Volume; the local source copy, compact index, and shuffled FASTA are ephemeral.
 
+The completed UniProt production-candidate build measured 638.43 MB/s for the
+first pass and 120.57 MB/s for the full 108.45 GB second pass, versus about
+1.94 MB/s for stock SeqKit's serialized random reads. It published all
+225,619,586 records with 0.2804% maximum residue imbalance. Its remaining
+performance bottleneck was the single-input aggregate `seqkit sum`: `-j 8`
+parallelizes across files, but concatenating the shards into the one logical
+input required for direct source comparison leaves one global hash sort. Use a
+parallel, deliberately composable multiset validator before building MGnify;
+independent per-shard SeqKit digests cannot be substituted for the aggregate.
+
 `split2 --by-part` does not emit AF3's required zero-based padded names by
 default, so rename and validate every output. See the official
 [split2 documentation](https://bioinf.shenwei.me/seqkit/usage/#split2).

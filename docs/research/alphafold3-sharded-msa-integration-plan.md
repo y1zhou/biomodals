@@ -79,6 +79,57 @@ The concurrent critical path fell from 3,074.5 seconds to 605.2 seconds, a
 $0.3515 because the low-latency topology uses more aggregate CPU, especially
 for UniProt.
 
+### Protein shard-count A/B
+
+A one-shot follow-up on 2026-07-24 tested whether bringing the larger protein
+shards closer to the roughly 270 MiB size of small BFD and MGnify helps while
+retaining the selected `16 active shards × 2 HMMER CPUs` topology. The
+temporary app selected new immutable profiles; it did not overwrite the
+baseline profiles:
+
+- `uniprot-384-v1`, averaging 269.33 MiB per shard instead of 404.00 MiB;
+- `uniref90-256-v1`, averaging 267.56 MiB per shard instead of 535.11 MiB.
+
+Both builders passed the full source-versus-shard canonical-record-multiset
+gate with zero recovered records. UniProt preserved 225,619,586 records and
+78,608,056,346 residues with 0.4696% maximum residue imbalance; its durable
+build took 2,238.45 seconds. UniRef90 preserved 153,742,194 records and
+52,375,181,535 residues with 0.4836% maximum residue imbalance; its durable
+build took 1,326.08 seconds.
+
+The new searches were submitted concurrently and compared with the existing
+pinned monolithic pembrolizumab-VH evidence. UniProt reproduced all 23,248 hit
+rows and the depth-23,249 A3M. UniRef90 reproduced all 9,999 hit rows and the
+depth-10,000 A3M. In both cases, the full row multiset was equal and ordering
+differences occurred only within equal printed E-value/bit-score blocks.
+
+| Database | Profiles | Average shard | Baseline 16x2 | Candidate 16x2 | Observed change | CPU-s | Estimated cost |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UniProt | 256 → 384 shards | 404.00 → 269.33 MiB | 605.2 s | 147.9 s | 4.09x faster | 12,430 → 4,189 | $0.1642 → $0.0552 |
+| UniRef90 | 128 → 256 shards | 535.11 → 267.56 MiB | 113.4 s | 218.5 s | 1.93x slower | 3,195 → 5,264 | $0.0421 → $0.0695 |
+
+The two-call critical path fell from 605.2 to 218.5 seconds and the summed
+successful-search estimate fell from $0.2063 to $0.1247. Those aggregates
+should not hide the opposite per-database outcomes. At fixed active fanout,
+UniRef90 doubled from eight to sixteen waves and became correspondingly
+slower, so `uniref90-256-v1` is not a production candidate for the 16x2
+topology.
+
+The UniProt result is promising but does not isolate shard count. The baseline
+ran in a four-database concurrent batch on GCP `europe-west1`; the candidate
+ran in a two-call batch on Azure `eastus2` immediately after its profile was
+published. UniRef90 likewise moved from Azure `eastus2` to `uksouth`. Each
+combination has one sample, by design. The measured outcomes are valid, but
+provider, region, concurrent Volume load, and profile warmth prevent treating
+the 4.09x UniProt difference as shard-count-only causality. The fixed
+production registry remains unchanged until that tradeoff is reviewed.
+
+The durable machine-readable summary is stored in
+`AlphaFold3-MSA-Benchmark-outputs` at
+`production-candidates/experiments/protein-shard-count-16x2-2026-07-24/summary.json`
+with SHA-256
+`1799ae134a3ec33fe84bc8268e99215608777082c4b7d071fd31cf7684162f48`.
+
 The Modal hourly billing report attributes $0.48946 to the main fresh protein
 app. Including the initial failed attempt that exposed invalid empty-A3M
 handling and the cached comparison retry gives a total campaign bill of
@@ -195,8 +246,10 @@ whose shuffled FASTA stays under `/tmp`. After all seven production candidates
 passed validation, a read-only Sandbox inventory on 2026-07-24 confirmed that
 `/profiles/` contains exactly the seven fixed directories listed above. The
 obsolete v1 profile is absent, `.staging` is empty, and `.orphaned` does not
-exist. The protein and RNA scientific oracles are the next cost-incurring
-gate.
+exist. That inventory predates the shard-count A/B: the Volume now also
+contains the validated immutable experimental profiles `uniprot-384-v1` and
+`uniref90-256-v1`. They do not change the fixed registry without a separate
+decision.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never
@@ -287,6 +340,9 @@ fixed profiles: `small-bfd-64-v2`, `mgnify-512-v1`, `rfam-16-v1`,
 `rnacentral-64-v1`, `uniref90-128-v1`, `uniprot-256-v1`, and
 `nt-rna-256-v1`. The final read-only Sandbox inventory found no obsolete
 profile, abandoned staging generation, or orphaned profile requiring cleanup.
+The later A/B added durable build evidence for `uniprot-384-v1` generation
+`fca8768dc0a946ba83bfb7205ac3de52` and `uniref90-256-v1` generation
+`2e372b231b584427aad022b3df07da64`.
 
 Generation `44178e3a52864732b330491758d10d8f` republished
 `small-bfd-64-v2` on 2026-07-24 after the mature C helpers and shared Python

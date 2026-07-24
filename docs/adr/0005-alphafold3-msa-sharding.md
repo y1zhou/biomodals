@@ -92,6 +92,13 @@ requires a new Profile ID and a reviewed app deployment.
 candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
 `/tmp` and does not retain the monolithic FASTA inside the profile.
 
+Scientifically validated shard-count alternatives `uniprot-384-v1` and
+`uniref90-256-v1` were built after this decision. A one-shot 16x2 search
+measured UniProt 4.09 times faster but moved provider/region and reduced the
+concurrent database load, so it did not isolate shard count. UniRef90 was 1.93
+times slower. These experimental profiles remain immutable evidence and do
+not change the fixed table above without a separate decision.
+
 `seqkit_threads` controls SeqKit statistics/splitting and the native shuffler
 and validator workers. It is operational: changing it does not select a
 different scientific specification or Profile ID, and ordered output makes the

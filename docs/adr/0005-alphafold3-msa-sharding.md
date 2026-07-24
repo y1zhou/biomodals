@@ -56,6 +56,19 @@ Contract checks bind that adapter to the pinned AlphaFold source. An upstream
 pin change requires comparison against the new source before its results can
 reuse these scientific cache paths.
 
+Mature construction primitives live under
+`src/biomodals/app/fold/alphafold3/`. That package owns the pinned C source
+assets, source-code identities, native compilation and execution, record
+multiset parsing, scratch sizing, and staged-file verification. It has no
+knowledge of Modal Volumes, profile manifests, benchmark campaigns, or
+publication claims.
+
+The temporary MSA Benchmark App remains the composition root while the
+sharding recipe is being validated. It owns Modal images and resources,
+profile orchestration, SeqKit splitting, durable evidence, and publication.
+After the scientific gates pass, the production AlphaFold3 app imports the
+same mature sharding package rather than copying its native implementation.
+
 ### Fixed database specifications
 
 Production accepts one code-owned `database_id`. It does not accept arbitrary
@@ -126,6 +139,11 @@ writes an ephemeral source copy, the two-pass shuffled FASTA, and a compact
 occurrence-offset index under `/tmp`. It never copies the monolithic source
 into the sharded Volume.
 
+Source `seqkit stats` remains serialized before shuffling. Its observed record
+count is a data dependency for exact scratch sizing and the native shuffler's
+`--expected-records` guard, so running it concurrently would not shorten the
+critical path without weakening those checks.
+
 The first pass scans the source sequentially, tees the exact bytes into the
 container-local copy, and indexes every record by source occurrence in a
 fixed-width `uint64` offset array. The helper syncs the local copy, closes the
@@ -144,9 +162,37 @@ Occurrence identity preserves duplicate full headers without FAI lookup,
 temporary header prefixes, or recovery. The manifest pins the helper source
 digest, offset representation, permutation, and ordered-read behavior.
 
-The builder then runs `seqkit split2`. Generation-scoped raw shards are written
-to the sharded Volume; the ephemeral source copy, occurrence index, and
-shuffled FASTA are never written to a persistent Volume.
+After shuffling, the builder checks the staged source's size and SHA-256 against
+the source identity already read from the database Volume. Only that
+cryptographically verified local copy can serve as the source-side validation
+oracle.
+
+The builder then starts the source-side C record-multiset scan on the local SSD
+copy and runs `seqkit split2` on the main path. After splitting, it starts the
+shard-side C scan. The source scan may overlap both operations, but the two
+signatures are joined before comparison and publication. A one-worker Python
+thread pool only launches and waits for the native C subprocess; the scans do
+not execute Python bytecode and are not serialized by the Python GIL.
+
+```mermaid
+flowchart TD
+    A["Source seqkit stats"] --> B["Scratch sizing and record-count guard"]
+    B --> C["Source SHA-256 on database Volume"]
+    C --> D["C shuffle pass 1: stage source and index occurrences"]
+    D --> E["C shuffle pass 2: local random reads, ordered output"]
+    E --> F["Verify staged-source size and SHA-256"]
+    F --> G["Start native source multiset scan on /tmp"]
+    F --> H["seqkit split2 to generation-scoped Volume paths"]
+    H --> I["Native shard multiset scan"]
+    G --> J["Join and compare canonical signatures"]
+    I --> J
+    J --> K["Shard seqkit stats and balance checks"]
+    K --> L["Commit payload, then publish manifest last"]
+```
+
+Generation-scoped raw shards are written to the sharded Volume; the ephemeral
+source copy, occurrence index, and shuffled FASTA are never written to a
+persistent Volume.
 
 After splitting, the builder deletes the shuffled payload and renames each
 generation-scoped raw shard to its exact AlphaFold-compatible filename.
@@ -213,6 +259,10 @@ older than the maximum function lifetime plus a margin may be marked
 Claims are never publication evidence and owner records are never deleted.
 Only a validated manifest proves completion. Different Profile IDs may build
 concurrently.
+
+The production batch entrypoint will therefore submit every missing Supported
+Database Specification concurrently. Each child invocation still builds one
+logical database and is independently bounded by its Profile Build Claim.
 
 ### Source FASTA policy
 

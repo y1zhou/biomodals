@@ -299,9 +299,9 @@ DATABASE_PROFILE_SPECS = (
     ),
     DatabaseProfileSpec(
         database_id="uniprot",
-        profile_id="uniprot-256-v1",
+        profile_id="uniprot-384-v1",
         source_filename="uniprot_all_2021_04.fa",
-        shard_count=256,
+        shard_count=384,
         polymer="protein",
         expected_num_seqs=225_619_586,
         expected_sum_len=None,
@@ -309,9 +309,9 @@ DATABASE_PROFILE_SPECS = (
     ),
     DatabaseProfileSpec(
         database_id="uniref90",
-        profile_id="uniref90-128-v1",
+        profile_id="uniref90-256-v1",
         source_filename="uniref90_2022_05.fa",
-        shard_count=128,
+        shard_count=256,
         polymer="protein",
         expected_num_seqs=153_742_194,
         expected_sum_len=None,

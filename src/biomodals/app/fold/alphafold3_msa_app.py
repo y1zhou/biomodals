@@ -41,7 +41,6 @@ import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from statistics import median
 from threading import Event, Lock, Thread
@@ -66,6 +65,30 @@ from biomodals.app.fold.alphafold3.sharding import (
     scan_record_multiset,
     shuffle_fasta_occurrences,
     verify_file,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    append_diagnostic_file as _append_diagnostic_file,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    append_log as _append_log,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    load_json_object as _load_json_object,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    require_executable as _require_executable,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    require_regular_file as _require_regular_file,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    sha256_file as _sha256_file,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    utc_now as _utc_now,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    write_json_atomic as _write_json_atomic,
 )
 from biomodals.helper import patch_image_for_helper
 
@@ -413,11 +436,6 @@ _CONTAINER_SAMPLE_COUNT = 0
 _CONTAINER_SAMPLE_LOCK = Lock()
 
 
-def _utc_now() -> str:
-    """Return an RFC 3339-compatible UTC timestamp."""
-    return datetime.now(UTC).isoformat()
-
-
 def _validate_seqkit_threads(seqkit_threads: int) -> int:
     """Validate the SeqKit concurrency argument."""
     if isinstance(seqkit_threads, bool) or not isinstance(seqkit_threads, int):
@@ -460,20 +478,6 @@ def _json_bytes(value: object) -> bytes:
     return orjson.dumps(value, option=JSON_OPTIONS)
 
 
-def _write_json_atomic(path: Path, value: object) -> None:
-    """Atomically publish one small JSON artifact."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(_json_bytes(value))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _write_bytes_atomic(path: Path, data: bytes) -> None:
     """Atomically publish one immutable byte payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,46 +490,6 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _load_json_object(path: Path) -> dict[str, Any]:
-    """Read a JSON object, rejecting all other top-level values."""
-    value = orjson.loads(path.read_bytes())
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected a JSON object in {path}")
-    return value
-
-
-def _require_regular_file(path: Path) -> None:
-    """Require a non-symlink regular file with at least one byte."""
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"Expected regular file: {path}")
-    if path.stat().st_size <= 0:
-        raise ValueError(f"Expected nonempty file: {path}")
-
-
-def _sha256_file(
-    path: Path,
-    *,
-    chunk_size: int = 16 * 1024 * 1024,
-    forbidden_bytes: bytes | None = None,
-) -> str:
-    """Compute a digest and optionally reject a byte marker while streaming."""
-    _require_regular_file(path)
-    if forbidden_bytes == b"":
-        raise ValueError("forbidden_bytes must be nonempty")
-    digest = hashlib.sha256()
-    overlap = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-            if forbidden_bytes is not None:
-                searchable = overlap + chunk
-                if forbidden_bytes in searchable:
-                    raise ValueError(f"Forbidden byte marker remains in {path}")
-                overlap_size = len(forbidden_bytes) - 1
-                overlap = searchable[-overlap_size:] if overlap_size else b""
-    return digest.hexdigest()
 
 
 def _copy_file_with_sha256(source: Path, destination: Path) -> tuple[str, int]:
@@ -542,21 +506,6 @@ def _copy_file_with_sha256(source: Path, destination: Path) -> tuple[str, int]:
         dest_handle.flush()
         os.fsync(dest_handle.fileno())
     return digest.hexdigest(), byte_count
-
-
-def _append_log(path: Path, message: str) -> None:
-    """Append one timestamped line to a durable operation log."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(f"{_utc_now()} {message}\n")
-
-
-def _append_diagnostic_file(source_path: Path, log_path: Path) -> None:
-    """Copy one command's raw diagnostics into the durable operation log."""
-    _require_regular_file(source_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with source_path.open("rb") as source, log_path.open("ab") as log:
-        shutil.copyfileobj(source, log, length=1024 * 1024)
 
 
 def _parse_fai_duplicate_warnings(
@@ -750,14 +699,6 @@ def _append_recovered_fasta_records(
         "first_byte_offset": warnings[0].sequence_offset,
         "last_byte_offset": warnings[-1].sequence_offset,
     }
-
-
-def _require_executable(name: str) -> str:
-    """Resolve a fixed executable name to an absolute path."""
-    executable = shutil.which(name)
-    if executable is None:
-        raise FileNotFoundError(f"Required executable is not installed: {name}")
-    return str(Path(executable).resolve())
 
 
 def _finalize_record_multiset_validation(

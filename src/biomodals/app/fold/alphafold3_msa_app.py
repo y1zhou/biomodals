@@ -7234,6 +7234,31 @@ def _execute_profile_database_search(
     return merged.a3m, raw_tblouts
 
 
+def _materialize_upstream_profile_msa(
+    spec: DatabaseProfileSpec,
+    sequence: str,
+    raw_a3m: str,
+) -> str:
+    """Apply the pinned ``get_msa`` empty-result and query-row behavior."""
+    if not isinstance(raw_a3m, str):
+        raise ValueError("Pinned MSA wrapper returned a non-string A3M")
+    from importlib import import_module
+
+    msa = import_module("alphafold3.data.msa")
+    mmcif_names = import_module("alphafold3.constants.mmcif_names")
+    chain_poly_type = (
+        mmcif_names.PROTEIN_CHAIN
+        if spec.polymer == "protein"
+        else mmcif_names.RNA_CHAIN
+    )
+    return msa.Msa.from_a3m(
+        query_sequence=sequence,
+        chain_poly_type=chain_poly_type,
+        a3m=raw_a3m,
+        deduplicate=False,
+    ).to_a3m()
+
+
 def _run_profile_search(
     database_id: str,
     sequence: str,
@@ -7310,7 +7335,7 @@ def _run_profile_search(
     trace_thread.start()
     try:
         search_started = perf_counter()
-        a3m, raw_tblouts = _execute_profile_database_search(
+        raw_a3m, raw_tblouts = _execute_profile_database_search(
             spec,
             query,
             selected_layout,
@@ -7318,8 +7343,11 @@ def _run_profile_search(
         )
         search_wall_seconds = perf_counter() - search_started
         _mark_resource_phase(phase_state, "normalize", sample_started)
-        if not isinstance(a3m, str) or not a3m.startswith(">query\n"):
-            raise ValueError("Pinned MSA wrapper returned an invalid A3M")
+        a3m = _materialize_upstream_profile_msa(
+            spec,
+            query,
+            raw_a3m,
+        )
         hit_rows = (
             _normalized_hit_rows(a3m, raw_tblouts)
             if spec.polymer == "protein"
@@ -7345,6 +7373,7 @@ def _run_profile_search(
         )
         _write_bytes_atomic(result_root / "result.a3m", result_bytes)
         _write_bytes_atomic(result_root / "hits.parquet", hits_bytes)
+        (result_root / "failure.json").unlink(missing_ok=True)
         BENCHMARK_OUTPUT_VOLUME.commit()
         _mark_resource_phase(phase_state, "complete", sample_started)
         trace_stop.set()

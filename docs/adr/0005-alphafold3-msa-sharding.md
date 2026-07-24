@@ -519,6 +519,12 @@ AACUCAGCUAGGGAGAGUAGCGAGCAUUACGUAAUACUACGUAUUACUCCAAUAACAUUGUCACUGAUGAGACCUAGACG
 It must contain at least one monolithic RFam hit and must not rely on a
 saturated cutoff to pass.
 
+The RAGATH-1 oracle passed on 2026-07-24. Monolithic and sharded hit rows were
+exactly equal, including order, for RFam (three hits), RNAcentral (one hit),
+and NT-RNA (zero hits). The final deduplicated `unpairedMsa` was byte-exact at
+depth 4. This result promotes the fixed RNA profile search and merge method;
+it does not make the saturated Picea cutoff substitution equivalent.
+
 For RFam, RNAcentral, and NT-RNA separately, the oracle compares monolithic and
 sharded identities, scores, E-values, and aligned-sequence multisets using the
 same full-database Z.

@@ -48,9 +48,10 @@ The generic builder subsequently validated and published all seven official
 profiles. The protein scientific oracle has passed across the four protein
 databases. The first RNA fixture returned no hits and was rejected. A
 hit-bearing Picea stress fixture then exposed a one-row saturated-cutoff
-limitation in stock Nhmmer output. The non-saturating RNA gate and
-integrated-pipeline gates below remain mandatory before the corresponding
-production paths are considered complete.
+limitation in stock Nhmmer output. The subsequent non-saturating RAGATH-1 RNA
+oracle passed all three databases and final MSA assembly. The integrated
+pipeline gates below remain mandatory before the corresponding production
+paths are considered complete.
 
 ### Scientific oracle evidence
 
@@ -132,6 +133,30 @@ without deliberately selecting a universal RNA family:
 ```text
 AACUCAGCUAGGGAGAGUAGCGAGCAUUACGUAAUACUACGUAUUACUCCAAUAACAUUGUCACUGAUGAGACCUAGACGAAACUACGGUAAACAUUUGCAUCAUACUGUAGUCUGAUA
 ```
+
+That oracle passed on 2026-07-24. RFam returned three non-query rows,
+RNAcentral returned one, and NT-RNA returned none. All three sharded row lists
+were exactly equal to their monolithic counterparts, including order. After
+cross-database deduplication, the final `unpairedMsa` was byte-exact with a
+depth of 4. The hit-bearing gate passed with four monolithic per-database hits
+before deduplication.
+
+The three database calls ran concurrently. Per-search cost below has the same
+successful-attempt telemetry basis as the protein table:
+
+| Database | Profile shards | Monolith search | Sharded search | Speedup | Monolith CPU-s | Sharded CPU-s | Monolith estimated cost | Sharded estimated cost | Hit rows | Scientific result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| RFam | 16 | 4.7 s | 1.8 s | 2.67x | 22 | 24 | $0.0003 | $0.0003 | 3 | exact |
+| RNAcentral | 64 | 201.9 s | 73.5 s | 2.75x | 1,685 | 2,134 | $0.0225 | $0.0281 | 1 | exact |
+| NT-RNA | 256 | 1,157.2 s | 452.1 s | 2.56x | 9,641 | 13,099 | $0.1289 | $0.1726 | 0 | exact |
+
+The concurrent search-batch wall time fell from 1,168.7 to 464.6 seconds,
+a 2.52-fold speedup. Summed successful-search estimates rose from $0.1517 to
+$0.2011. The complete seven-call remote campaign took 1,649.8 seconds,
+including queueing, container initialization, and the final comparison.
+Modal's closed 21:00--22:00 billing interval attributed $0.11562 to the app;
+the final partial interval is intentionally not inferred from telemetry and
+must be read from the next closed hourly report.
 
 ## Stores and immutable database registry
 

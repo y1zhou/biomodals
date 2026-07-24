@@ -52,6 +52,21 @@ import modal
 import orjson
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.sharding import (
+    CONTAINER_NATIVE_SOURCE_DIR,
+    NATIVE_SOURCE_DIR_ENV,
+    ORDINAL_SHUFFLER_PREFETCH_BYTES,
+    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+    ORDINAL_SHUFFLER_SOURCE_SHA256,
+    ORDINAL_SHUFFLER_VERSION,
+    compile_record_multiset_validator,
+    record_multiset_identity,
+    record_multiset_signature,
+    required_ordinal_shuffler_scratch_bytes,
+    scan_record_multiset,
+    shuffle_fasta_occurrences,
+    verify_file,
+)
 from biomodals.helper import patch_image_for_helper
 
 CAMPAIGN_ID = "small-bfd-phase1-v2"
@@ -120,15 +135,6 @@ PRODUCTION_BUILD_TIMEOUT_SECONDS = 86_400
 PRODUCTION_BUILD_MEMORY_MIB = (1024, 262_144)
 PRODUCTION_PROFILE_STALE_SECONDS = PRODUCTION_BUILD_TIMEOUT_SECONDS + 900
 PRODUCTION_SCRATCH_ROOT = Path(tempfile.gettempdir())
-PRODUCTION_SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024
-ORDINAL_SHUFFLER_VERSION = "af3-fasta-two-pass-v2"
-ORDINAL_SHUFFLER_PREFETCH_RECORDS = 65_536
-ORDINAL_SHUFFLER_PREFETCH_BYTES = 256 * 1024 * 1024
-RECORD_MULTISET_VERSION = "af3-fasta-record-multiset-v1"
-RECORD_MULTISET_CANONICALIZATION = (
-    "full-header-and-sequence-case-sensitive-line-ending-independent-v1"
-)
-RECORD_MULTISET_AGGREGATE = "sha256-lane-sum-xor-and-square-sum-with-counts-v1"
 MSA_ORACLE_COMPARISON_POLICY = (
     "full-hit-rows-exact-modulo-contiguous-evalue-bit-score-ties-v1"
 )
@@ -167,1707 +173,6 @@ HMMBUILD_BINARY_PATH = "/hmmer/bin/hmmbuild"
 PRODUCTION_SEARCH_N_CPU = 2
 PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS = 16
 ORACLE_MONOLITH_N_CPU = 8
-
-
-_ORDINAL_SHUFFLER_SOURCE = r"""
-#define _GNU_SOURCE
-#define _FILE_OFFSET_BITS 64
-#define _XOPEN_SOURCE 700
-
-#include <errno.h>
-#include <fcntl.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
-
-#define PROGRAM_VERSION "af3-fasta-two-pass-v2"
-#define INDEX_MAGIC UINT64_C(0x4146334f46465331)
-#define INDEX_VERSION UINT64_C(1)
-#define SCAN_BUFFER_BYTES (64U * 1024U * 1024U)
-#define OFFSET_BUFFER_RECORDS (1024U * 1024U)
-
-struct index_header {
-    uint64_t magic;
-    uint64_t version;
-    uint64_t source_size;
-    uint64_t output_size;
-    uint64_t record_count;
-    uint64_t maximum_record_size;
-};
-
-struct offset_writer {
-    int fd;
-    uint64_t *values;
-    size_t count;
-    uint64_t total;
-};
-
-struct read_task {
-    uint64_t source_offset;
-    size_t length;
-    size_t destination_offset;
-    bool append_newline;
-};
-
-struct read_pool {
-    int source_fd;
-    size_t thread_count;
-    pthread_t *threads;
-    pthread_barrier_t start_barrier;
-    pthread_barrier_t finish_barrier;
-    atomic_size_t next_task;
-    atomic_int failed;
-    atomic_int error_number;
-    atomic_bool stop;
-    struct read_task *tasks;
-    size_t task_count;
-    unsigned char *buffer;
-};
-
-static void fail_message(const char *message) {
-    fprintf(stderr, "af3-fasta-two-pass: %s\n", message);
-    exit(EXIT_FAILURE);
-}
-
-static void fail_errno(const char *operation) {
-    fprintf(
-        stderr,
-        "af3-fasta-two-pass: %s: %s\n",
-        operation,
-        strerror(errno)
-    );
-    exit(EXIT_FAILURE);
-}
-
-static uint64_t parse_u64(const char *value, const char *name) {
-    char *end = NULL;
-    errno = 0;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (
-        errno != 0
-        || end == value
-        || *end != '\0'
-    ) {
-        fprintf(stderr, "af3-fasta-two-pass: invalid %s: %s\n", name, value);
-        exit(EXIT_FAILURE);
-    }
-    return (uint64_t)parsed;
-}
-
-static double monotonic_seconds(void) {
-    struct timespec value;
-    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
-        fail_errno("clock_gettime");
-    }
-    return (double)value.tv_sec + (double)value.tv_nsec / 1000000000.0;
-}
-
-static void write_all(int fd, const void *data, size_t size) {
-    const unsigned char *cursor = data;
-    size_t remaining = size;
-    while (remaining > 0) {
-        ssize_t written = write(fd, cursor, remaining);
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written < 0) {
-            fail_errno("write");
-        }
-        if (written == 0) {
-            fail_message("write returned zero");
-        }
-        cursor += (size_t)written;
-        remaining -= (size_t)written;
-    }
-}
-
-static void pwrite_all(int fd, const void *data, size_t size, off_t offset) {
-    const unsigned char *cursor = data;
-    size_t remaining = size;
-    off_t position = offset;
-    while (remaining > 0) {
-        ssize_t written = pwrite(fd, cursor, remaining, position);
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written < 0) {
-            fail_errno("pwrite");
-        }
-        if (written == 0) {
-            fail_message("pwrite returned zero");
-        }
-        cursor += (size_t)written;
-        remaining -= (size_t)written;
-        position += written;
-    }
-}
-
-static void flush_offsets(struct offset_writer *writer) {
-    if (writer->count == 0) {
-        return;
-    }
-    write_all(
-        writer->fd,
-        writer->values,
-        writer->count * sizeof(*writer->values)
-    );
-    writer->total += (uint64_t)writer->count;
-    writer->count = 0;
-}
-
-static void append_offset(struct offset_writer *writer, uint64_t value) {
-    writer->values[writer->count++] = value;
-    if (writer->count == OFFSET_BUFFER_RECORDS) {
-        flush_offsets(writer);
-    }
-}
-
-static struct index_header build_offset_index(
-    int source_fd,
-    int staged_fd,
-    int index_fd,
-    uint64_t expected_records
-) {
-    struct stat source_stat;
-    if (fstat(source_fd, &source_stat) != 0) {
-        fail_errno("fstat source");
-    }
-    if (!S_ISREG(source_stat.st_mode) || source_stat.st_size <= 0) {
-        fail_message("source must be a nonempty regular file");
-    }
-    int allocation_error = posix_fallocate(
-        staged_fd,
-        0,
-        source_stat.st_size
-    );
-    if (allocation_error != 0) {
-        errno = allocation_error;
-        fail_errno("preallocate staged source");
-    }
-    if (lseek(staged_fd, 0, SEEK_SET) < 0) {
-        fail_errno("seek staged source");
-    }
-
-    struct index_header header = {0};
-    write_all(index_fd, &header, sizeof(header));
-
-    unsigned char *scan_buffer = malloc(SCAN_BUFFER_BYTES);
-    uint64_t *offset_buffer = malloc(
-        OFFSET_BUFFER_RECORDS * sizeof(*offset_buffer)
-    );
-    if (scan_buffer == NULL || offset_buffer == NULL) {
-        fail_message("failed to allocate first-pass buffers");
-    }
-    struct offset_writer writer = {
-        .fd = index_fd,
-        .values = offset_buffer,
-        .count = 0,
-        .total = 0,
-    };
-
-    (void)posix_fadvise(source_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    (void)posix_fadvise(staged_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    uint64_t source_position = 0;
-    uint64_t last_record_offset = 0;
-    uint64_t maximum_record_size = 0;
-    uint64_t record_count = 0;
-    unsigned char previous_byte = 0;
-    bool have_previous_byte = false;
-    double last_progress = monotonic_seconds();
-
-    for (;;) {
-        ssize_t read_size = read(source_fd, scan_buffer, SCAN_BUFFER_BYTES);
-        if (read_size < 0 && errno == EINTR) {
-            continue;
-        }
-        if (read_size < 0) {
-            fail_errno("read source during first pass");
-        }
-        if (read_size == 0) {
-            break;
-        }
-        size_t chunk_size = (size_t)read_size;
-        if (source_position == 0 && scan_buffer[0] != '>') {
-            fail_message("source does not begin with a FASTA header");
-        }
-        write_all(staged_fd, scan_buffer, chunk_size);
-
-        unsigned char *cursor = scan_buffer;
-        unsigned char *chunk_end = scan_buffer + chunk_size;
-        while (cursor < chunk_end) {
-            unsigned char *candidate = memchr(
-                cursor,
-                '>',
-                (size_t)(chunk_end - cursor)
-            );
-            if (candidate == NULL) {
-                break;
-            }
-            size_t local_offset = (size_t)(candidate - scan_buffer);
-            uint64_t absolute_offset = source_position + (uint64_t)local_offset;
-            bool at_line_start = absolute_offset == 0;
-            if (!at_line_start) {
-                unsigned char before = local_offset > 0
-                    ? candidate[-1]
-                    : previous_byte;
-                at_line_start = (
-                    (local_offset > 0 || have_previous_byte)
-                    && before == '\n'
-                );
-            }
-            if (at_line_start) {
-                if (record_count > 0) {
-                    uint64_t record_size = absolute_offset - last_record_offset;
-                    if (record_size == 0) {
-                        fail_message("encountered an empty FASTA record span");
-                    }
-                    if (record_size > maximum_record_size) {
-                        maximum_record_size = record_size;
-                    }
-                }
-                append_offset(&writer, absolute_offset);
-                last_record_offset = absolute_offset;
-                record_count += 1;
-            }
-            cursor = candidate + 1;
-        }
-
-        previous_byte = scan_buffer[chunk_size - 1];
-        have_previous_byte = true;
-        source_position += (uint64_t)chunk_size;
-        double now = monotonic_seconds();
-        if (now - last_progress >= 60.0) {
-            fprintf(
-                stderr,
-                "{\"event\":\"staging-progress\",\"records\":%" PRIu64
-                ",\"bytes\":%" PRIu64 "}\n",
-                record_count,
-                source_position
-            );
-            fflush(stderr);
-            last_progress = now;
-        }
-    }
-
-    uint64_t source_size = (uint64_t)source_stat.st_size;
-    if (source_position != source_size) {
-        fail_message("first-pass byte count does not match source size");
-    }
-    if (record_count == 0) {
-        fail_message("source contains no FASTA records");
-    }
-    uint64_t final_source_record_size = source_size - last_record_offset;
-    if (final_source_record_size == 0) {
-        fail_message("final FASTA record is empty");
-    }
-    bool append_final_newline = previous_byte != '\n';
-    uint64_t final_output_record_size = (
-        final_source_record_size + (append_final_newline ? 1U : 0U)
-    );
-    if (final_output_record_size > maximum_record_size) {
-        maximum_record_size = final_output_record_size;
-    }
-    append_offset(&writer, source_size);
-    flush_offsets(&writer);
-    if (writer.total != record_count + 1) {
-        fail_message("offset index count is inconsistent");
-    }
-    if (record_count != expected_records) {
-        fprintf(
-            stderr,
-            "af3-fasta-two-pass: indexed records %" PRIu64
-            " != expected %" PRIu64 "\n",
-            record_count,
-            expected_records
-        );
-        exit(EXIT_FAILURE);
-    }
-
-    header.magic = INDEX_MAGIC;
-    header.version = INDEX_VERSION;
-    header.source_size = source_size;
-    header.output_size = source_size + (append_final_newline ? 1U : 0U);
-    header.record_count = record_count;
-    header.maximum_record_size = maximum_record_size;
-    pwrite_all(index_fd, &header, sizeof(header), 0);
-    if (fdatasync(index_fd) != 0) {
-        fail_errno("fdatasync index");
-    }
-    fprintf(
-        stderr,
-        "{\"event\":\"staging-sync\",\"bytes\":%" PRIu64 "}\n",
-        source_size
-    );
-    fflush(stderr);
-    if (fdatasync(staged_fd) != 0) {
-        fail_errno("fdatasync staged source");
-    }
-    (void)posix_fadvise(staged_fd, 0, 0, POSIX_FADV_DONTNEED);
-    free(offset_buffer);
-    free(scan_buffer);
-    return header;
-}
-
-static uint64_t splitmix64_next(uint64_t *state) {
-    uint64_t value = (*state += UINT64_C(0x9e3779b97f4a7c15));
-    value = (
-        (value ^ (value >> 30))
-        * UINT64_C(0xbf58476d1ce4e5b9)
-    );
-    value = (
-        (value ^ (value >> 27))
-        * UINT64_C(0x94d049bb133111eb)
-    );
-    return value ^ (value >> 31);
-}
-
-static uint64_t bounded_random(uint64_t *state, uint64_t bound) {
-    if (bound == 0) {
-        fail_message("random bound must be positive");
-    }
-    uint64_t threshold = (uint64_t)(-bound) % bound;
-    for (;;) {
-        uint64_t value = splitmix64_next(state);
-        if (value >= threshold) {
-            return value % bound;
-        }
-    }
-}
-
-static uint32_t *build_permutation(uint64_t count, uint64_t seed) {
-    if (count == 0 || count > UINT32_MAX) {
-        fail_message("record count is outside the uint32 permutation domain");
-    }
-    if (count > SIZE_MAX / sizeof(uint32_t)) {
-        fail_message("permutation size overflows size_t");
-    }
-    size_t allocation_size = (size_t)count * sizeof(uint32_t);
-    uint32_t *permutation = mmap(
-        NULL,
-        allocation_size,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0
-    );
-    if (permutation == MAP_FAILED) {
-        fail_errno("mmap permutation");
-    }
-#ifdef MADV_HUGEPAGE
-    (void)madvise(permutation, allocation_size, MADV_HUGEPAGE);
-#endif
-    for (uint64_t index = 0; index < count; ++index) {
-        permutation[index] = (uint32_t)index;
-    }
-    uint64_t state = seed;
-    for (uint64_t index = count - 1; index > 0; --index) {
-        uint64_t swap_index = bounded_random(&state, index + 1);
-        uint32_t temporary = permutation[index];
-        permutation[index] = permutation[swap_index];
-        permutation[swap_index] = temporary;
-    }
-    return permutation;
-}
-
-static void set_pool_error(struct read_pool *pool, int error_number) {
-    int expected = 0;
-    if (
-        atomic_compare_exchange_strong(
-            &pool->failed,
-            &expected,
-            1
-        )
-    ) {
-        atomic_store(
-            &pool->error_number,
-            error_number == 0 ? EIO : error_number
-        );
-    }
-}
-
-static void *read_worker(void *argument) {
-    struct read_pool *pool = argument;
-    for (;;) {
-        (void)pthread_barrier_wait(&pool->start_barrier);
-        if (atomic_load(&pool->stop)) {
-            (void)pthread_barrier_wait(&pool->finish_barrier);
-            return NULL;
-        }
-        for (;;) {
-            size_t task_index = atomic_fetch_add(&pool->next_task, 1);
-            if (task_index >= pool->task_count) {
-                break;
-            }
-            if (atomic_load(&pool->failed)) {
-                continue;
-            }
-            const struct read_task *task = &pool->tasks[task_index];
-            size_t remaining = task->length;
-            size_t completed = 0;
-            while (remaining > 0) {
-                ssize_t read_size = pread(
-                    pool->source_fd,
-                    pool->buffer + task->destination_offset + completed,
-                    remaining,
-                    (off_t)(task->source_offset + completed)
-                );
-                if (read_size < 0 && errno == EINTR) {
-                    continue;
-                }
-                if (read_size < 0) {
-                    set_pool_error(pool, errno);
-                    break;
-                }
-                if (read_size == 0) {
-                    set_pool_error(pool, EIO);
-                    break;
-                }
-                completed += (size_t)read_size;
-                remaining -= (size_t)read_size;
-            }
-            if (!atomic_load(&pool->failed) && task->append_newline) {
-                pool->buffer[
-                    task->destination_offset + task->length
-                ] = '\n';
-            }
-        }
-        (void)pthread_barrier_wait(&pool->finish_barrier);
-    }
-}
-
-static void initialize_pool(
-    struct read_pool *pool,
-    int source_fd,
-    size_t thread_count,
-    struct read_task *tasks,
-    unsigned char *buffer
-) {
-    memset(pool, 0, sizeof(*pool));
-    pool->source_fd = source_fd;
-    pool->thread_count = thread_count;
-    pool->tasks = tasks;
-    pool->buffer = buffer;
-    pool->threads = calloc(thread_count, sizeof(*pool->threads));
-    if (pool->threads == NULL) {
-        fail_message("failed to allocate worker handles");
-    }
-    if (
-        pthread_barrier_init(
-            &pool->start_barrier,
-            NULL,
-            (unsigned int)thread_count + 1
-        ) != 0
-        || pthread_barrier_init(
-            &pool->finish_barrier,
-            NULL,
-            (unsigned int)thread_count + 1
-        ) != 0
-    ) {
-        fail_message("failed to initialize worker barriers");
-    }
-    atomic_init(&pool->next_task, 0);
-    atomic_init(&pool->failed, 0);
-    atomic_init(&pool->error_number, 0);
-    atomic_init(&pool->stop, false);
-    for (size_t index = 0; index < thread_count; ++index) {
-        if (
-            pthread_create(
-                &pool->threads[index],
-                NULL,
-                read_worker,
-                pool
-            ) != 0
-        ) {
-            fail_message("failed to create read worker");
-        }
-    }
-}
-
-static void dispatch_reads(struct read_pool *pool, size_t task_count) {
-    pool->task_count = task_count;
-    atomic_store(&pool->next_task, 0);
-    atomic_store(&pool->failed, 0);
-    atomic_store(&pool->error_number, 0);
-    (void)pthread_barrier_wait(&pool->start_barrier);
-    (void)pthread_barrier_wait(&pool->finish_barrier);
-    if (atomic_load(&pool->failed)) {
-        errno = atomic_load(&pool->error_number);
-        fail_errno("pread source during second pass");
-    }
-}
-
-static void destroy_pool(struct read_pool *pool) {
-    atomic_store(&pool->stop, true);
-    (void)pthread_barrier_wait(&pool->start_barrier);
-    (void)pthread_barrier_wait(&pool->finish_barrier);
-    for (size_t index = 0; index < pool->thread_count; ++index) {
-        if (pthread_join(pool->threads[index], NULL) != 0) {
-            fail_message("failed to join read worker");
-        }
-    }
-    (void)pthread_barrier_destroy(&pool->start_barrier);
-    (void)pthread_barrier_destroy(&pool->finish_barrier);
-    free(pool->threads);
-}
-
-static uint64_t shuffle_to_output(
-    int source_fd,
-    int output_fd,
-    const uint64_t *offsets,
-    const uint32_t *permutation,
-    const struct index_header *header,
-    size_t thread_count,
-    size_t prefetch_records,
-    size_t prefetch_bytes,
-    uint64_t *peak_batch_bytes
-) {
-    if (
-        header->maximum_record_size > SIZE_MAX
-        || prefetch_bytes > SIZE_MAX
-    ) {
-        fail_message("prefetch buffer is too large for this platform");
-    }
-    size_t buffer_size = prefetch_bytes;
-    if ((size_t)header->maximum_record_size > buffer_size) {
-        buffer_size = (size_t)header->maximum_record_size;
-    }
-    struct read_task *tasks = calloc(prefetch_records, sizeof(*tasks));
-    unsigned char *buffer = malloc(buffer_size);
-    if (tasks == NULL || buffer == NULL) {
-        fail_message("failed to allocate second-pass buffers");
-    }
-
-    struct read_pool pool;
-    initialize_pool(&pool, source_fd, thread_count, tasks, buffer);
-    (void)posix_fadvise(source_fd, 0, 0, POSIX_FADV_RANDOM);
-    uint64_t output_bytes = 0;
-    uint64_t output_records = 0;
-    double last_progress = monotonic_seconds();
-    while (output_records < header->record_count) {
-        size_t task_count = 0;
-        size_t batch_bytes = 0;
-        while (
-            output_records + (uint64_t)task_count < header->record_count
-            && task_count < prefetch_records
-        ) {
-            uint64_t position = output_records + (uint64_t)task_count;
-            uint32_t ordinal = permutation[position];
-            uint64_t start = offsets[ordinal];
-            uint64_t finish = offsets[(uint64_t)ordinal + 1];
-            if (finish <= start || finish - start > SIZE_MAX) {
-                fail_message("invalid record span in offset index");
-            }
-            size_t source_record_size = (size_t)(finish - start);
-            bool append_newline = (
-                (uint64_t)ordinal + 1 == header->record_count
-                && header->output_size > header->source_size
-            );
-            size_t output_record_size = (
-                source_record_size + (append_newline ? 1U : 0U)
-            );
-            if (
-                task_count > 0
-                && output_record_size > prefetch_bytes - batch_bytes
-            ) {
-                break;
-            }
-            tasks[task_count] = (struct read_task){
-                .source_offset = start,
-                .length = source_record_size,
-                .destination_offset = batch_bytes,
-                .append_newline = append_newline,
-            };
-            batch_bytes += output_record_size;
-            task_count += 1;
-        }
-        if (task_count == 0 || batch_bytes == 0 || batch_bytes > buffer_size) {
-            fail_message("failed to construct a nonempty bounded read batch");
-        }
-        if ((uint64_t)batch_bytes > *peak_batch_bytes) {
-            *peak_batch_bytes = (uint64_t)batch_bytes;
-        }
-        dispatch_reads(&pool, task_count);
-        write_all(output_fd, buffer, batch_bytes);
-        output_bytes += (uint64_t)batch_bytes;
-        output_records += (uint64_t)task_count;
-
-        double now = monotonic_seconds();
-        if (now - last_progress >= 60.0) {
-            fprintf(
-                stderr,
-                "{\"event\":\"progress\",\"records\":%" PRIu64
-                ",\"bytes\":%" PRIu64 "}\n",
-                output_records,
-                output_bytes
-            );
-            fflush(stderr);
-            last_progress = now;
-        }
-    }
-    destroy_pool(&pool);
-    free(buffer);
-    free(tasks);
-    return output_bytes;
-}
-
-static void usage(void) {
-    fprintf(
-        stderr,
-        "usage: af3-fasta-two-pass --source PATH --staged-source PATH "
-        "--output PATH --index PATH "
-        "--expected-records N --seed N --threads N "
-        "--prefetch-records N --prefetch-bytes N\n"
-    );
-}
-
-int main(int argc, char **argv) {
-    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        printf("%s\n", PROGRAM_VERSION);
-        return EXIT_SUCCESS;
-    }
-    const char *source_path = NULL;
-    const char *staged_source_path = NULL;
-    const char *output_path = NULL;
-    const char *index_path = NULL;
-    uint64_t expected_records = 0;
-    uint64_t seed = 0;
-    uint64_t thread_count_u64 = 0;
-    uint64_t prefetch_records_u64 = 0;
-    uint64_t prefetch_bytes_u64 = 0;
-
-    for (int index = 1; index < argc; index += 2) {
-        if (index + 1 >= argc) {
-            usage();
-            return EXIT_FAILURE;
-        }
-        const char *flag = argv[index];
-        const char *value = argv[index + 1];
-        if (strcmp(flag, "--source") == 0) {
-            source_path = value;
-        } else if (strcmp(flag, "--staged-source") == 0) {
-            staged_source_path = value;
-        } else if (strcmp(flag, "--output") == 0) {
-            output_path = value;
-        } else if (strcmp(flag, "--index") == 0) {
-            index_path = value;
-        } else if (strcmp(flag, "--expected-records") == 0) {
-            expected_records = parse_u64(value, "expected-records");
-        } else if (strcmp(flag, "--seed") == 0) {
-            seed = parse_u64(value, "seed");
-        } else if (strcmp(flag, "--threads") == 0) {
-            thread_count_u64 = parse_u64(value, "threads");
-        } else if (strcmp(flag, "--prefetch-records") == 0) {
-            prefetch_records_u64 = parse_u64(value, "prefetch-records");
-        } else if (strcmp(flag, "--prefetch-bytes") == 0) {
-            prefetch_bytes_u64 = parse_u64(value, "prefetch-bytes");
-        } else {
-            usage();
-            return EXIT_FAILURE;
-        }
-    }
-
-    if (
-        source_path == NULL
-        || staged_source_path == NULL
-        || output_path == NULL
-        || index_path == NULL
-        || expected_records == 0
-        || thread_count_u64 == 0
-        || thread_count_u64 > 256
-        || prefetch_records_u64 == 0
-        || prefetch_records_u64 > SIZE_MAX
-        || prefetch_bytes_u64 == 0
-        || prefetch_bytes_u64 > SIZE_MAX
-    ) {
-        usage();
-        return EXIT_FAILURE;
-    }
-    size_t thread_count = (size_t)thread_count_u64;
-    size_t prefetch_records = (size_t)prefetch_records_u64;
-    size_t prefetch_bytes = (size_t)prefetch_bytes_u64;
-
-    int source_fd = open(source_path, O_RDONLY | O_CLOEXEC);
-    if (source_fd < 0) {
-        fail_errno("open source");
-    }
-    int staged_fd = open(
-        staged_source_path,
-        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
-        0600
-    );
-    if (staged_fd < 0) {
-        fail_errno("open staged source");
-    }
-    int index_fd = open(
-        index_path,
-        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-        0600
-    );
-    if (index_fd < 0) {
-        fail_errno("open index");
-    }
-    fprintf(
-        stderr,
-        "{\"event\":\"start\",\"version\":\"%s\","
-        "\"expected_records\":%" PRIu64 ","
-        "\"random_read_source\":\"container-local-staged-copy\"}\n",
-        PROGRAM_VERSION,
-        expected_records
-    );
-    fflush(stderr);
-
-    double first_pass_started = monotonic_seconds();
-    struct index_header header = build_offset_index(
-        source_fd,
-        staged_fd,
-        index_fd,
-        expected_records
-    );
-    double first_pass_seconds = monotonic_seconds() - first_pass_started;
-    fprintf(
-        stderr,
-        "{\"event\":\"indexed\",\"records\":%" PRIu64
-        ",\"bytes\":%" PRIu64 ",\"seconds\":%.6f}\n",
-        header.record_count,
-        header.source_size,
-        first_pass_seconds
-    );
-    fflush(stderr);
-    if (close(staged_fd) != 0) {
-        fail_errno("close staged source writer");
-    }
-    if (close(source_fd) != 0) {
-        fail_errno("close source after staging");
-    }
-    int shuffled_source_fd = open(
-        staged_source_path,
-        O_RDONLY | O_CLOEXEC
-    );
-    if (shuffled_source_fd < 0) {
-        fail_errno("open staged source for second pass");
-    }
-    struct stat staged_stat;
-    if (fstat(shuffled_source_fd, &staged_stat) != 0) {
-        fail_errno("fstat staged source");
-    }
-    if (
-        !S_ISREG(staged_stat.st_mode)
-        || staged_stat.st_size < 0
-        || (uint64_t)staged_stat.st_size != header.source_size
-    ) {
-        fail_message("staged source size is inconsistent");
-    }
-
-    struct stat index_stat;
-    if (fstat(index_fd, &index_stat) != 0) {
-        fail_errno("fstat index");
-    }
-    size_t expected_index_size = (
-        sizeof(struct index_header)
-        + (size_t)(header.record_count + 1) * sizeof(uint64_t)
-    );
-    if (
-        index_stat.st_size < 0
-        || (uint64_t)index_stat.st_size != (uint64_t)expected_index_size
-    ) {
-        fail_message("offset index size is inconsistent");
-    }
-    void *index_mapping = mmap(
-        NULL,
-        expected_index_size,
-        PROT_READ,
-        MAP_SHARED,
-        index_fd,
-        0
-    );
-    if (index_mapping == MAP_FAILED) {
-        fail_errno("mmap index");
-    }
-    const struct index_header *mapped_header = index_mapping;
-    if (
-        mapped_header->magic != INDEX_MAGIC
-        || mapped_header->version != INDEX_VERSION
-        || mapped_header->source_size != header.source_size
-        || mapped_header->output_size != header.output_size
-        || mapped_header->record_count != header.record_count
-    ) {
-        fail_message("mapped index header is invalid");
-    }
-    const uint64_t *offsets = (const uint64_t *)(
-        (const unsigned char *)index_mapping + sizeof(struct index_header)
-    );
-
-    double permutation_started = monotonic_seconds();
-    uint32_t *permutation = build_permutation(header.record_count, seed);
-    double permutation_seconds = monotonic_seconds() - permutation_started;
-    fprintf(
-        stderr,
-        "{\"event\":\"permuted\",\"records\":%" PRIu64
-        ",\"seconds\":%.6f}\n",
-        header.record_count,
-        permutation_seconds
-    );
-    fflush(stderr);
-
-    int output_fd = open(
-        output_path,
-        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
-        0600
-    );
-    if (output_fd < 0) {
-        fail_errno("open output");
-    }
-    if (posix_fallocate(output_fd, 0, (off_t)header.output_size) != 0) {
-        fail_message("failed to preallocate output");
-    }
-    if (lseek(output_fd, 0, SEEK_SET) < 0) {
-        fail_errno("seek output");
-    }
-
-    double second_pass_started = monotonic_seconds();
-    uint64_t peak_batch_bytes = 0;
-    uint64_t output_bytes = shuffle_to_output(
-        shuffled_source_fd,
-        output_fd,
-        offsets,
-        permutation,
-        &header,
-        thread_count,
-        prefetch_records,
-        prefetch_bytes,
-        &peak_batch_bytes
-    );
-    double second_pass_seconds = monotonic_seconds() - second_pass_started;
-    if (output_bytes != header.output_size) {
-        fail_message("output byte count does not match normalized output size");
-    }
-    if (close(output_fd) != 0) {
-        fail_errno("close output");
-    }
-    if (
-        munmap(
-            permutation,
-            (size_t)header.record_count * sizeof(uint32_t)
-        ) != 0
-    ) {
-        fail_errno("munmap permutation");
-    }
-    if (munmap(index_mapping, expected_index_size) != 0) {
-        fail_errno("munmap index");
-    }
-    if (close(index_fd) != 0) {
-        fail_errno("close index");
-    }
-    if (close(shuffled_source_fd) != 0) {
-        fail_errno("close staged source");
-    }
-
-    fprintf(
-        stderr,
-        "{\"event\":\"complete\",\"records\":%" PRIu64
-        ",\"bytes\":%" PRIu64 ",\"seconds\":%.6f}\n",
-        header.record_count,
-        output_bytes,
-        second_pass_seconds
-    );
-    fflush(stderr);
-    printf(
-        "{\"schema_version\":1,\"version\":\"%s\","
-        "\"source_size_bytes\":%" PRIu64 ","
-        "\"staged_source_size_bytes\":%" PRIu64 ","
-        "\"output_size_bytes\":%" PRIu64 ","
-        "\"record_count\":%" PRIu64 ","
-        "\"offset_index_size_bytes\":%zu,"
-        "\"permutation_size_bytes\":%" PRIu64 ","
-        "\"seed\":%" PRIu64 ","
-        "\"threads\":%zu,"
-        "\"prefetch_records\":%zu,"
-        "\"prefetch_bytes\":%zu,"
-        "\"peak_batch_bytes\":%" PRIu64 ","
-        "\"random_read_source\":\"container-local-staged-copy\","
-        "\"first_pass_seconds\":%.6f,"
-        "\"permutation_seconds\":%.6f,"
-        "\"second_pass_seconds\":%.6f}\n",
-        PROGRAM_VERSION,
-        header.source_size,
-        header.source_size,
-        header.output_size,
-        header.record_count,
-        expected_index_size,
-        header.record_count * sizeof(uint32_t),
-        seed,
-        thread_count,
-        prefetch_records,
-        prefetch_bytes,
-        peak_batch_bytes,
-        first_pass_seconds,
-        permutation_seconds,
-        second_pass_seconds
-    );
-    return EXIT_SUCCESS;
-}
-"""
-ORDINAL_SHUFFLER_SOURCE_SHA256 = hashlib.sha256(
-    _ORDINAL_SHUFFLER_SOURCE.encode("utf-8")
-).hexdigest()
-
-_RECORD_MULTISET_SOURCE = r"""
-#define _GNU_SOURCE
-#define _FILE_OFFSET_BITS 64
-
-#include <errno.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <pthread.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#define PROGRAM_VERSION "af3-fasta-record-multiset-v1"
-#define CANONICALIZATION \
-    "full-header-and-sequence-case-sensitive-line-ending-independent-v1"
-#define AGGREGATE "sha256-lane-sum-xor-and-square-sum-with-counts-v1"
-#define IO_BUFFER_BYTES (8U * 1024U * 1024U)
-#define ERROR_BYTES 2048U
-
-static const unsigned char RECORD_DOMAIN[] = "AF3_FASTA_RECORD_V1";
-
-typedef struct {
-    uint64_t records;
-    uint64_t header_bytes;
-    uint64_t sequence_bytes;
-    uint64_t sum[4];
-    uint64_t xor_value[4];
-    uint64_t square_sum[4];
-} aggregate_t;
-
-typedef struct {
-    char **paths;
-    size_t path_count;
-    size_t next_path;
-    pthread_mutex_t mutex;
-    aggregate_t total;
-    bool failed;
-    char error[ERROR_BYTES];
-} work_queue_t;
-
-typedef struct {
-    uint32_t state[8];
-    uint64_t total_bytes;
-    unsigned char block[64];
-    size_t block_size;
-} sha256_context_t;
-
-static const uint32_t SHA256_CONSTANTS[64] = {
-    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
-    0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
-    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
-    0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
-    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
-    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
-    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
-    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
-    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
-    0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
-    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
-    0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
-    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
-    0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
-    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
-    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
-};
-
-static uint32_t rotate_right_u32(uint32_t value, unsigned int bits) {
-    return (value >> bits) | (value << (32U - bits));
-}
-
-static uint32_t load_u32_be(const unsigned char *bytes) {
-    return ((uint32_t) bytes[0] << 24)
-        | ((uint32_t) bytes[1] << 16)
-        | ((uint32_t) bytes[2] << 8)
-        | (uint32_t) bytes[3];
-}
-
-static void store_u32_be(unsigned char *bytes, uint32_t value) {
-    bytes[0] = (unsigned char) (value >> 24);
-    bytes[1] = (unsigned char) (value >> 16);
-    bytes[2] = (unsigned char) (value >> 8);
-    bytes[3] = (unsigned char) value;
-}
-
-static void sha256_transform(
-    sha256_context_t *context,
-    const unsigned char block[64]
-) {
-    uint32_t words[64];
-    uint32_t a = 0;
-    uint32_t b = 0;
-    uint32_t c = 0;
-    uint32_t d = 0;
-    uint32_t e = 0;
-    uint32_t f = 0;
-    uint32_t g = 0;
-    uint32_t h = 0;
-
-    for (size_t index = 0; index < 16; ++index) {
-        words[index] = load_u32_be(block + index * 4);
-    }
-    for (size_t index = 16; index < 64; ++index) {
-        uint32_t left = words[index - 15];
-        uint32_t right = words[index - 2];
-        uint32_t sigma_zero = rotate_right_u32(left, 7)
-            ^ rotate_right_u32(left, 18)
-            ^ (left >> 3);
-        uint32_t sigma_one = rotate_right_u32(right, 17)
-            ^ rotate_right_u32(right, 19)
-            ^ (right >> 10);
-        words[index] = words[index - 16]
-            + sigma_zero
-            + words[index - 7]
-            + sigma_one;
-    }
-
-    a = context->state[0];
-    b = context->state[1];
-    c = context->state[2];
-    d = context->state[3];
-    e = context->state[4];
-    f = context->state[5];
-    g = context->state[6];
-    h = context->state[7];
-    for (size_t index = 0; index < 64; ++index) {
-        uint32_t choice = (e & f) ^ ((~e) & g);
-        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
-        uint32_t upper_zero = rotate_right_u32(a, 2)
-            ^ rotate_right_u32(a, 13)
-            ^ rotate_right_u32(a, 22);
-        uint32_t upper_one = rotate_right_u32(e, 6)
-            ^ rotate_right_u32(e, 11)
-            ^ rotate_right_u32(e, 25);
-        uint32_t temporary_one = h
-            + upper_one
-            + choice
-            + SHA256_CONSTANTS[index]
-            + words[index];
-        uint32_t temporary_two = upper_zero + majority;
-
-        h = g;
-        g = f;
-        f = e;
-        e = d + temporary_one;
-        d = c;
-        c = b;
-        b = a;
-        a = temporary_one + temporary_two;
-    }
-    context->state[0] += a;
-    context->state[1] += b;
-    context->state[2] += c;
-    context->state[3] += d;
-    context->state[4] += e;
-    context->state[5] += f;
-    context->state[6] += g;
-    context->state[7] += h;
-}
-
-static void sha256_init(sha256_context_t *context) {
-    static const uint32_t initial_state[8] = {
-        0x6a09e667U,
-        0xbb67ae85U,
-        0x3c6ef372U,
-        0xa54ff53aU,
-        0x510e527fU,
-        0x9b05688cU,
-        0x1f83d9abU,
-        0x5be0cd19U,
-    };
-    memcpy(context->state, initial_state, sizeof(initial_state));
-    context->total_bytes = 0;
-    context->block_size = 0;
-}
-
-static void sha256_update(
-    sha256_context_t *context,
-    const void *data,
-    size_t size
-) {
-    const unsigned char *input = data;
-    context->total_bytes += (uint64_t) size;
-    while (size > 0) {
-        size_t available = sizeof(context->block) - context->block_size;
-        size_t copy_size = size < available ? size : available;
-        memcpy(context->block + context->block_size, input, copy_size);
-        context->block_size += copy_size;
-        input += copy_size;
-        size -= copy_size;
-        if (context->block_size == sizeof(context->block)) {
-            sha256_transform(context, context->block);
-            context->block_size = 0;
-        }
-    }
-}
-
-static void sha256_final(
-    sha256_context_t *context,
-    unsigned char digest[32]
-) {
-    uint64_t bit_length = context->total_bytes * 8;
-    context->block[context->block_size++] = 0x80;
-    if (context->block_size > 56) {
-        while (context->block_size < sizeof(context->block)) {
-            context->block[context->block_size++] = 0;
-        }
-        sha256_transform(context, context->block);
-        context->block_size = 0;
-    }
-    while (context->block_size < 56) {
-        context->block[context->block_size++] = 0;
-    }
-    for (size_t index = 0; index < 8; ++index) {
-        context->block[63 - index] = (unsigned char) (bit_length >> (index * 8));
-    }
-    sha256_transform(context, context->block);
-    for (size_t index = 0; index < 8; ++index) {
-        store_u32_be(digest + index * 4, context->state[index]);
-    }
-}
-
-static uint64_t load_u64_le(const unsigned char *bytes) {
-    uint64_t value = 0;
-    for (size_t index = 0; index < 8; ++index) {
-        value |= ((uint64_t) bytes[index]) << (index * 8);
-    }
-    return value;
-}
-
-static void store_u64_le(unsigned char *bytes, uint64_t value) {
-    for (size_t index = 0; index < 8; ++index) {
-        bytes[index] = (unsigned char) (value >> (index * 8));
-    }
-}
-
-static int checked_add(
-    uint64_t left,
-    uint64_t right,
-    uint64_t *result,
-    const char *field,
-    char *error,
-    size_t error_bytes
-) {
-    if (UINT64_MAX - left < right) {
-        (void) snprintf(error, error_bytes, "%s exceeds uint64", field);
-        return -1;
-    }
-    *result = left + right;
-    return 0;
-}
-
-static int merge_aggregate(
-    aggregate_t *destination,
-    const aggregate_t *source,
-    char *error,
-    size_t error_bytes
-) {
-    if (
-        checked_add(
-            destination->records,
-            source->records,
-            &destination->records,
-            "record count",
-            error,
-            error_bytes
-        ) != 0
-        || checked_add(
-            destination->header_bytes,
-            source->header_bytes,
-            &destination->header_bytes,
-            "header bytes",
-            error,
-            error_bytes
-        ) != 0
-        || checked_add(
-            destination->sequence_bytes,
-            source->sequence_bytes,
-            &destination->sequence_bytes,
-            "sequence bytes",
-            error,
-            error_bytes
-        ) != 0
-    ) {
-        return -1;
-    }
-    for (size_t lane = 0; lane < 4; ++lane) {
-        destination->sum[lane] += source->sum[lane];
-        destination->xor_value[lane] ^= source->xor_value[lane];
-        destination->square_sum[lane] += source->square_sum[lane];
-    }
-    return 0;
-}
-
-static void start_record(
-    sha256_context_t *context,
-    const char *header,
-    size_t header_size
-) {
-    static const unsigned char header_tag = 1;
-    static const unsigned char sequence_tag = 2;
-
-    sha256_init(context);
-    sha256_update(context, RECORD_DOMAIN, sizeof(RECORD_DOMAIN) - 1);
-    sha256_update(context, &header_tag, sizeof(header_tag));
-    sha256_update(context, header, header_size);
-    sha256_update(context, &sequence_tag, sizeof(sequence_tag));
-}
-
-static int finish_record(
-    sha256_context_t *context,
-    uint64_t header_bytes,
-    uint64_t sequence_bytes,
-    aggregate_t *aggregate,
-    char *error,
-    size_t error_bytes
-) {
-    unsigned char lengths[16];
-    unsigned char digest[32];
-
-    store_u64_le(lengths, header_bytes);
-    store_u64_le(lengths + 8, sequence_bytes);
-    sha256_update(context, lengths, sizeof(lengths));
-    sha256_final(context, digest);
-    if (
-        checked_add(
-            aggregate->records,
-            1,
-            &aggregate->records,
-            "record count",
-            error,
-            error_bytes
-        ) != 0
-        || checked_add(
-            aggregate->header_bytes,
-            header_bytes,
-            &aggregate->header_bytes,
-            "header bytes",
-            error,
-            error_bytes
-        ) != 0
-        || checked_add(
-            aggregate->sequence_bytes,
-            sequence_bytes,
-            &aggregate->sequence_bytes,
-            "sequence bytes",
-            error,
-            error_bytes
-        ) != 0
-    ) {
-        return -1;
-    }
-    for (size_t lane = 0; lane < 4; ++lane) {
-        uint64_t value = load_u64_le(digest + lane * 8);
-        aggregate->sum[lane] += value;
-        aggregate->xor_value[lane] ^= value;
-        aggregate->square_sum[lane] += value * value;
-    }
-    return 0;
-}
-
-static size_t line_content_size(const char *line, ssize_t read_size) {
-    size_t size = (size_t) read_size;
-    if (size > 0 && line[size - 1] == '\n') {
-        --size;
-    }
-    if (size > 0 && line[size - 1] == '\r') {
-        --size;
-    }
-    return size;
-}
-
-static int digest_file(
-    const char *path,
-    aggregate_t *aggregate,
-    char *error,
-    size_t error_bytes
-) {
-    FILE *input = NULL;
-    sha256_context_t context = {0};
-    char *line = NULL;
-    char *io_buffer = NULL;
-    size_t line_capacity = 0;
-    ssize_t read_size = 0;
-    bool active_record = false;
-    uint64_t header_bytes = 0;
-    uint64_t sequence_bytes = 0;
-    int result = -1;
-
-    input = fopen(path, "rb");
-    if (input == NULL) {
-        (void) snprintf(
-            error,
-            error_bytes,
-            "cannot open %s: %s",
-            path,
-            strerror(errno)
-        );
-        goto cleanup;
-    }
-    io_buffer = malloc(IO_BUFFER_BYTES);
-    if (io_buffer == NULL) {
-        (void) snprintf(error, error_bytes, "cannot allocate input buffer");
-        goto cleanup;
-    }
-    if (setvbuf(input, io_buffer, _IOFBF, IO_BUFFER_BYTES) != 0) {
-        (void) snprintf(error, error_bytes, "cannot configure input buffer");
-        goto cleanup;
-    }
-    while ((read_size = getline(&line, &line_capacity, input)) >= 0) {
-        size_t content_size = line_content_size(line, read_size);
-        if (content_size > 0 && line[0] == '>') {
-            if (
-                active_record
-                && finish_record(
-                    &context,
-                    header_bytes,
-                    sequence_bytes,
-                    aggregate,
-                    error,
-                    error_bytes
-                ) != 0
-            ) {
-                goto cleanup;
-            }
-            header_bytes = (uint64_t) (content_size - 1);
-            sequence_bytes = 0;
-            start_record(&context, line + 1, content_size - 1);
-            active_record = true;
-            continue;
-        }
-        if (!active_record) {
-            if (content_size == 0) {
-                continue;
-            }
-            (void) snprintf(
-                error,
-                error_bytes,
-                "nonempty data precedes first FASTA header in %s",
-                path
-            );
-            goto cleanup;
-        }
-        if (UINT64_MAX - sequence_bytes < content_size) {
-            (void) snprintf(
-                error,
-                error_bytes,
-                "sequence length exceeds uint64 in %s",
-                path
-            );
-            goto cleanup;
-        }
-        sha256_update(&context, line, content_size);
-        sequence_bytes += (uint64_t) content_size;
-    }
-    if (ferror(input)) {
-        (void) snprintf(
-            error,
-            error_bytes,
-            "error reading %s: %s",
-            path,
-            strerror(errno)
-        );
-        goto cleanup;
-    }
-    if (!active_record) {
-        (void) snprintf(error, error_bytes, "no FASTA records in %s", path);
-        goto cleanup;
-    }
-    if (
-        finish_record(
-            &context,
-            header_bytes,
-            sequence_bytes,
-            aggregate,
-            error,
-            error_bytes
-        ) != 0
-    ) {
-        goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    free(line);
-    if (input != NULL && fclose(input) != 0 && result == 0) {
-        (void) snprintf(
-            error,
-            error_bytes,
-            "cannot close %s: %s",
-            path,
-            strerror(errno)
-        );
-        result = -1;
-    }
-    free(io_buffer);
-    return result;
-}
-
-static void *worker_main(void *argument) {
-    work_queue_t *queue = argument;
-    for (;;) {
-        size_t path_index = 0;
-        aggregate_t local = {0};
-        char error[ERROR_BYTES] = {0};
-
-        (void) pthread_mutex_lock(&queue->mutex);
-        if (queue->failed || queue->next_path >= queue->path_count) {
-            (void) pthread_mutex_unlock(&queue->mutex);
-            return NULL;
-        }
-        path_index = queue->next_path++;
-        (void) pthread_mutex_unlock(&queue->mutex);
-
-        if (
-            digest_file(
-                queue->paths[path_index],
-                &local,
-                error,
-                sizeof(error)
-            ) != 0
-        ) {
-            (void) pthread_mutex_lock(&queue->mutex);
-            if (!queue->failed) {
-                queue->failed = true;
-                (void) snprintf(
-                    queue->error,
-                    sizeof(queue->error),
-                    "%s",
-                    error
-                );
-            }
-            (void) pthread_mutex_unlock(&queue->mutex);
-            return NULL;
-        }
-
-        (void) pthread_mutex_lock(&queue->mutex);
-        if (
-            !queue->failed
-            && merge_aggregate(
-                &queue->total,
-                &local,
-                queue->error,
-                sizeof(queue->error)
-            ) != 0
-        ) {
-            queue->failed = true;
-        }
-        (void) pthread_mutex_unlock(&queue->mutex);
-    }
-}
-
-static int parse_thread_count(const char *text, size_t *thread_count) {
-    char *end = NULL;
-    unsigned long value = 0;
-
-    errno = 0;
-    value = strtoul(text, &end, 10);
-    if (
-        errno != 0
-        || end == text
-        || *end != '\0'
-        || value == 0
-        || value > 64
-    ) {
-        return -1;
-    }
-    *thread_count = (size_t) value;
-    return 0;
-}
-
-static int write_report(
-    const char *path,
-    size_t path_count,
-    size_t thread_count,
-    const aggregate_t *aggregate
-) {
-    FILE *output = fopen(path, "wx");
-    int close_result = 0;
-    if (output == NULL) {
-        (void) fprintf(
-            stderr,
-            "cannot create %s: %s\n",
-            path,
-            strerror(errno)
-        );
-        return -1;
-    }
-    if (
-        fprintf(
-            output,
-            "{\n"
-            "  \"version\":\"%s\",\n"
-            "  \"canonicalization\":\"%s\",\n"
-            "  \"digest\":\"sha256\",\n"
-            "  \"aggregate\":\"%s\",\n"
-            "  \"files\":%zu,\n"
-            "  \"threads\":%zu,\n"
-            "  \"records\":%" PRIu64 ",\n"
-            "  \"header_bytes\":%" PRIu64 ",\n"
-            "  \"sequence_bytes\":%" PRIu64 ",\n"
-            "  \"sum_sha256_lanes\":["
-            "\"%016" PRIx64 "\",\"%016" PRIx64 "\","
-            "\"%016" PRIx64 "\",\"%016" PRIx64 "\"],\n"
-            "  \"xor_sha256_lanes\":["
-            "\"%016" PRIx64 "\",\"%016" PRIx64 "\","
-            "\"%016" PRIx64 "\",\"%016" PRIx64 "\"],\n"
-            "  \"sum_square_sha256_lanes\":["
-            "\"%016" PRIx64 "\",\"%016" PRIx64 "\","
-            "\"%016" PRIx64 "\",\"%016" PRIx64 "\"]\n"
-            "}\n",
-            PROGRAM_VERSION,
-            CANONICALIZATION,
-            AGGREGATE,
-            path_count,
-            thread_count,
-            aggregate->records,
-            aggregate->header_bytes,
-            aggregate->sequence_bytes,
-            aggregate->sum[0],
-            aggregate->sum[1],
-            aggregate->sum[2],
-            aggregate->sum[3],
-            aggregate->xor_value[0],
-            aggregate->xor_value[1],
-            aggregate->xor_value[2],
-            aggregate->xor_value[3],
-            aggregate->square_sum[0],
-            aggregate->square_sum[1],
-            aggregate->square_sum[2],
-            aggregate->square_sum[3]
-        ) < 0
-    ) {
-        (void) fprintf(stderr, "cannot write %s\n", path);
-        (void) fclose(output);
-        return -1;
-    }
-    if (fflush(output) != 0) {
-        (void) fprintf(stderr, "cannot flush %s: %s\n", path, strerror(errno));
-        (void) fclose(output);
-        return -1;
-    }
-    close_result = fclose(output);
-    if (close_result != 0) {
-        (void) fprintf(stderr, "cannot close %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    size_t requested_threads = 0;
-    size_t thread_count = 0;
-    size_t path_count = 0;
-    size_t created_threads = 0;
-    pthread_t *threads = NULL;
-    work_queue_t queue = {0};
-    int result = EXIT_FAILURE;
-
-    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        (void) printf("%s\n", PROGRAM_VERSION);
-        return EXIT_SUCCESS;
-    }
-    if (
-        argc < 4
-        || parse_thread_count(argv[1], &requested_threads) != 0
-    ) {
-        (void) fprintf(
-            stderr,
-            "usage: %s THREADS OUTPUT_JSON FASTA [FASTA ...]\n",
-            argv[0]
-        );
-        return EXIT_FAILURE;
-    }
-    path_count = (size_t) argc - 3;
-    thread_count = requested_threads < path_count
-        ? requested_threads
-        : path_count;
-    queue.paths = argv + 3;
-    queue.path_count = path_count;
-    if (pthread_mutex_init(&queue.mutex, NULL) != 0) {
-        (void) fprintf(stderr, "cannot initialize worker mutex\n");
-        return EXIT_FAILURE;
-    }
-    threads = calloc(thread_count, sizeof(*threads));
-    if (threads == NULL) {
-        (void) fprintf(stderr, "cannot allocate worker handles\n");
-        goto cleanup;
-    }
-    for (; created_threads < thread_count; ++created_threads) {
-        int create_result = pthread_create(
-            &threads[created_threads],
-            NULL,
-            worker_main,
-            &queue
-        );
-        if (create_result != 0) {
-            (void) pthread_mutex_lock(&queue.mutex);
-            queue.failed = true;
-            (void) snprintf(
-                queue.error,
-                sizeof(queue.error),
-                "cannot create worker: %s",
-                strerror(create_result)
-            );
-            (void) pthread_mutex_unlock(&queue.mutex);
-            break;
-        }
-    }
-    for (size_t index = 0; index < created_threads; ++index) {
-        int join_result = pthread_join(threads[index], NULL);
-        if (join_result != 0) {
-            (void) fprintf(
-                stderr,
-                "cannot join worker: %s\n",
-                strerror(join_result)
-            );
-            return EXIT_FAILURE;
-        }
-    }
-    if (queue.failed) {
-        (void) fprintf(stderr, "%s\n", queue.error);
-        goto cleanup;
-    }
-    if (
-        write_report(
-            argv[2],
-            path_count,
-            thread_count,
-            &queue.total
-        ) != 0
-    ) {
-        goto cleanup;
-    }
-    result = EXIT_SUCCESS;
-
-cleanup:
-    free(threads);
-    (void) pthread_mutex_destroy(&queue.mutex);
-    return result;
-}
-"""
-RECORD_MULTISET_SOURCE_SHA256 = hashlib.sha256(
-    _RECORD_MULTISET_SOURCE.encode("utf-8")
-).hexdigest()
 
 
 CONF = AppConfig(
@@ -2091,7 +396,14 @@ runtime_image = (
     .uv_pip_install(str(CONF.git_clone_dir))
     .run_commands("build_data")
     .env({"PATH": "/hmmer/bin:$PATH"})
+    .add_local_dir(
+        Path(__file__).parent / "alphafold3" / "native",
+        str(CONTAINER_NATIVE_SOURCE_DIR),
+        copy=True,
+    )
+    .env({NATIVE_SOURCE_DIR_ENV: str(CONTAINER_NATIVE_SOURCE_DIR)})
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.alphafold3")
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
@@ -2448,218 +760,6 @@ def _require_executable(name: str) -> str:
     return str(Path(executable).resolve())
 
 
-def _compile_ordinal_shuffler(
-    scratch_root: Path,
-    log_path: Path,
-) -> Path:
-    """Compile the pinned bounded-memory FASTA shuffler in local scratch."""
-    compiler = _require_executable("cc")
-    source_path = scratch_root / "af3-fasta-two-pass.c"
-    executable_path = scratch_root / ORDINAL_SHUFFLER_VERSION
-    source_path.write_text(_ORDINAL_SHUFFLER_SOURCE, encoding="utf-8")
-    if _sha256_file(source_path) != ORDINAL_SHUFFLER_SOURCE_SHA256:
-        raise RuntimeError("Native shuffler source digest changed while writing")
-    compile_argv = [
-        compiler,
-        "-std=c11",
-        "-O3",
-        "-pthread",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        str(source_path),
-        "-o",
-        str(executable_path),
-    ]
-    _append_log(log_path, f"Running command: {shlex.join(compile_argv)}")
-    with log_path.open("ab") as log:
-        completed = subprocess.run(  # noqa: S603
-            compile_argv,
-            check=False,
-            stdout=log,
-            stderr=log,
-        )
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, compile_argv)
-    _require_regular_file(executable_path)
-    if not os.access(executable_path, os.X_OK):
-        raise PermissionError(f"Native shuffler is not executable: {executable_path}")
-    version = subprocess.run(  # noqa: S603
-        [str(executable_path), "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if version != ORDINAL_SHUFFLER_VERSION:
-        raise RuntimeError(
-            f"Expected native shuffler {ORDINAL_SHUFFLER_VERSION}, got {version!r}"
-        )
-    return executable_path
-
-
-def _record_multiset_identity() -> dict[str, str]:
-    """Return the fixed canonical-record multiset algorithm identity."""
-    return {
-        "version": RECORD_MULTISET_VERSION,
-        "source_code_sha256": RECORD_MULTISET_SOURCE_SHA256,
-        "canonicalization": RECORD_MULTISET_CANONICALIZATION,
-        "digest": "sha256",
-        "aggregate": RECORD_MULTISET_AGGREGATE,
-    }
-
-
-def _compile_record_multiset_helper(
-    scratch_root: Path,
-    log_path: Path,
-) -> Path:
-    """Compile the pinned composable FASTA-record validator in local scratch."""
-    compiler = _require_executable("cc")
-    source_path = scratch_root / "af3-fasta-record-multiset.c"
-    executable_path = scratch_root / RECORD_MULTISET_VERSION
-    source_path.write_text(_RECORD_MULTISET_SOURCE, encoding="utf-8")
-    if _sha256_file(source_path) != RECORD_MULTISET_SOURCE_SHA256:
-        raise RuntimeError("Record-multiset helper source digest changed while writing")
-    compile_argv = [
-        compiler,
-        "-std=c11",
-        "-O3",
-        "-pthread",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        str(source_path),
-        "-o",
-        str(executable_path),
-    ]
-    _append_log(log_path, f"Running command: {shlex.join(compile_argv)}")
-    with log_path.open("ab") as log:
-        completed = subprocess.run(  # noqa: S603
-            compile_argv,
-            check=False,
-            stdout=log,
-            stderr=log,
-        )
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, compile_argv)
-    _require_regular_file(executable_path)
-    if not os.access(executable_path, os.X_OK):
-        raise PermissionError(
-            f"Record-multiset helper is not executable: {executable_path}"
-        )
-    version = subprocess.run(  # noqa: S603
-        [str(executable_path), "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if version != RECORD_MULTISET_VERSION:
-        raise RuntimeError(
-            f"Expected validator {RECORD_MULTISET_VERSION}, got {version!r}"
-        )
-    return executable_path
-
-
-def _record_multiset_signature(report: dict[str, Any]) -> dict[str, object]:
-    """Validate one helper report and return its composable signature."""
-    expected_strings = _record_multiset_identity()
-    for field in ("version", "canonicalization", "digest", "aggregate"):
-        if report.get(field) != expected_strings[field]:
-            raise ValueError(f"Unexpected record-multiset {field}")
-    for field in ("files", "threads", "records", "header_bytes", "sequence_bytes"):
-        value = report.get(field)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"Record-multiset {field} must be an integer")
-        if value < (1 if field in {"files", "threads", "records"} else 0):
-            raise ValueError(f"Record-multiset {field} is outside its range")
-    if report["threads"] > report["files"]:
-        raise ValueError("Record-multiset threads exceed input files")
-    signature: dict[str, object] = {
-        "records": report["records"],
-        "header_bytes": report["header_bytes"],
-        "sequence_bytes": report["sequence_bytes"],
-    }
-    for field in (
-        "sum_sha256_lanes",
-        "xor_sha256_lanes",
-        "sum_square_sha256_lanes",
-    ):
-        values = report.get(field)
-        if (
-            not isinstance(values, list)
-            or len(values) != 4
-            or any(
-                not isinstance(value, str)
-                or re.fullmatch(r"[0-9a-f]{16}", value) is None
-                for value in values
-            )
-        ):
-            raise ValueError(f"Invalid record-multiset {field}")
-        signature[field] = values
-    return signature
-
-
-def _run_record_multiset_helper(
-    executable: Path,
-    input_paths: tuple[Path, ...],
-    output_path: Path,
-    log_path: Path,
-    *,
-    threads: int,
-) -> dict[str, object]:
-    """Scan one file set and return a validated composable multiset report."""
-    if not input_paths:
-        raise ValueError("Record-multiset validation requires at least one input")
-    selected_threads = min(_validate_seqkit_threads(threads), len(input_paths))
-    input_bytes = 0
-    for path in input_paths:
-        _require_regular_file(path)
-        input_bytes += path.stat().st_size
-    argv = [
-        str(executable),
-        str(selected_threads),
-        str(output_path),
-        *(str(path) for path in input_paths),
-    ]
-    start_message = (
-        "Running record-multiset helper with "
-        f"{selected_threads} threads over {len(input_paths)} files "
-        f"({input_bytes} bytes)"
-    )
-    _append_log(log_path, start_message)
-    print(f"🧬 validator {start_message}", flush=True)
-    started = perf_counter()
-    with log_path.open("ab") as log:
-        completed = subprocess.run(  # noqa: S603
-            argv,
-            check=False,
-            stdout=log,
-            stderr=log,
-        )
-    elapsed = perf_counter() - started
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, argv)
-    _require_regular_file(output_path)
-    report = _load_json_object(output_path)
-    if report.get("files") != len(input_paths):
-        raise ValueError("Record-multiset helper reported the wrong file count")
-    if report.get("threads") != selected_threads:
-        raise ValueError("Record-multiset helper reported the wrong thread count")
-    _record_multiset_signature(report)
-    completed_message = (
-        "Completed record-multiset helper in "
-        f"{elapsed:.6f}s at "
-        f"{input_bytes / elapsed if elapsed else 0.0:.3f} bytes/s"
-    )
-    _append_log(log_path, completed_message)
-    print(f"🧬 validator {completed_message}", flush=True)
-    return {
-        "input_bytes": input_bytes,
-        "wall_seconds": elapsed,
-        "throughput_bytes_per_second": (input_bytes / elapsed if elapsed else 0.0),
-        "report": report,
-    }
-
-
 def _finalize_record_multiset_validation(
     source_result: dict[str, object],
     shard_result: dict[str, object],
@@ -2672,14 +772,14 @@ def _finalize_record_multiset_validation(
     shard_report = shard_result.get("report")
     if not isinstance(source_report, dict) or not isinstance(shard_report, dict):
         raise TypeError("Record-multiset helper result lost its report")
-    source_signature = _record_multiset_signature(cast(dict[str, Any], source_report))
-    shard_signature = _record_multiset_signature(cast(dict[str, Any], shard_report))
+    source_signature = record_multiset_signature(cast(dict[str, Any], source_report))
+    shard_signature = record_multiset_signature(cast(dict[str, Any], shard_report))
     source_signature_sha256 = hashlib.sha256(_json_bytes(source_signature)).hexdigest()
     shard_signature_sha256 = hashlib.sha256(_json_bytes(shard_signature)).hexdigest()
     match = source_signature == shard_signature
     result: dict[str, object] = {
         "match": match,
-        "algorithm": _record_multiset_identity(),
+        "algorithm": record_multiset_identity(),
         "source_signature_sha256": source_signature_sha256,
         "shard_signature_sha256": shard_signature_sha256,
         "source_signature": source_signature,
@@ -2708,15 +808,15 @@ def _run_record_multiset_validation(
     threads: int,
 ) -> dict[str, object]:
     """Compare canonical full-record multisets with composable shard scans."""
-    executable = _compile_record_multiset_helper(scratch_root, log_path)
-    source_result = _run_record_multiset_helper(
+    executable = compile_record_multiset_validator(scratch_root, log_path)
+    source_result = scan_record_multiset(
         executable,
         (source_path,),
         scratch_root / "source-record-multiset.json",
         log_path,
         threads=1,
     )
-    shard_result = _run_record_multiset_helper(
+    shard_result = scan_record_multiset(
         executable,
         shard_paths,
         scratch_root / "shard-record-multiset.json",
@@ -2728,162 +828,6 @@ def _run_record_multiset_validation(
         shard_result,
         output_path,
     )
-
-
-def _required_ordinal_shuffler_scratch_bytes(
-    source_size: int,
-    record_count: int,
-) -> int:
-    """Return local bytes needed for the staged source, shuffle, and index."""
-    if (
-        isinstance(source_size, bool)
-        or not isinstance(source_size, int)
-        or source_size <= 0
-    ):
-        raise ValueError("source_size must be a positive integer")
-    if (
-        isinstance(record_count, bool)
-        or not isinstance(record_count, int)
-        or record_count <= 0
-    ):
-        raise ValueError("record_count must be a positive integer")
-    index_size = 48 + (record_count + 1) * 8
-    return (
-        source_size + source_size + 1 + index_size + PRODUCTION_SCRATCH_HEADROOM_BYTES
-    )
-
-
-def _run_ordinal_two_pass_shuffle(
-    source_path: Path,
-    shuffled_path: Path,
-    scratch_root: Path,
-    diagnostics_path: Path,
-    metrics_path: Path,
-    log_path: Path,
-    *,
-    expected_records: int,
-    worker_threads: int,
-) -> dict[str, Any]:
-    """Shuffle occurrences with a compact index and ordered concurrent reads."""
-    if (
-        isinstance(expected_records, bool)
-        or not isinstance(expected_records, int)
-        or expected_records <= 0
-    ):
-        raise ValueError("expected_records must be a positive integer")
-    threads = _validate_seqkit_threads(worker_threads)
-    _require_regular_file(source_path)
-    executable = _compile_ordinal_shuffler(scratch_root, log_path)
-    staged_source_path = scratch_root / "source.fasta"
-    index_path = scratch_root / "occurrence-offsets.bin"
-    argv = [
-        str(executable),
-        "--source",
-        str(source_path),
-        "--staged-source",
-        str(staged_source_path),
-        "--output",
-        str(shuffled_path),
-        "--index",
-        str(index_path),
-        "--expected-records",
-        str(expected_records),
-        "--seed",
-        str(SHARD_RANDOM_SEED),
-        "--threads",
-        str(threads),
-        "--prefetch-records",
-        str(ORDINAL_SHUFFLER_PREFETCH_RECORDS),
-        "--prefetch-bytes",
-        str(ORDINAL_SHUFFLER_PREFETCH_BYTES),
-    ]
-    _append_log(log_path, f"Running command: {shlex.join(argv)}")
-    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
-    with diagnostics_path.open("xb") as diagnostics:
-        process = subprocess.Popen(  # noqa: S603
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if process.stdout is None or process.stderr is None:
-            process.kill()
-            raise RuntimeError("Native shuffler did not expose output streams")
-        for line in iter(process.stderr.readline, b""):
-            diagnostics.write(line)
-            diagnostics.flush()
-            print(f"🧬 shuffler {line.decode(errors='replace')}", end="", flush=True)
-        process.stderr.close()
-        metrics_bytes = process.stdout.read()
-        process.stdout.close()
-        returncode = process.wait()
-    _append_diagnostic_file(diagnostics_path, log_path)
-    if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, argv)
-    try:
-        metrics = orjson.loads(metrics_bytes)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError("Native shuffler returned invalid metrics JSON") from exc
-    if not isinstance(metrics, dict):
-        raise ValueError("Native shuffler metrics must be a JSON object")
-    source_size = source_path.stat().st_size
-    with source_path.open("rb") as source:
-        source.seek(-1, os.SEEK_END)
-        output_size = source_size + (source.read(1) != b"\n")
-    expected_metrics = {
-        "schema_version": 1,
-        "version": ORDINAL_SHUFFLER_VERSION,
-        "record_count": expected_records,
-        "source_size_bytes": source_size,
-        "staged_source_size_bytes": source_size,
-        "output_size_bytes": output_size,
-        "seed": SHARD_RANDOM_SEED,
-        "threads": threads,
-        "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-        "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
-        "random_read_source": "container-local-staged-copy",
-    }
-    for key, expected in expected_metrics.items():
-        if metrics.get(key) != expected:
-            raise ValueError(
-                f"Native shuffler metric {key!r} is {metrics.get(key)!r}, "
-                f"expected {expected!r}"
-            )
-    if metrics.get("offset_index_size_bytes") != 48 + (expected_records + 1) * 8:
-        raise ValueError("Native shuffler offset index has an unexpected size")
-    if metrics.get("permutation_size_bytes") != expected_records * 4:
-        raise ValueError("Native shuffler permutation has an unexpected size")
-    for key in (
-        "peak_batch_bytes",
-        "first_pass_seconds",
-        "permutation_seconds",
-        "second_pass_seconds",
-    ):
-        value = metrics.get(key)
-        if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
-            raise ValueError(f"Native shuffler metric {key!r} is invalid")
-    _require_regular_file(shuffled_path)
-    if shuffled_path.stat().st_size != output_size:
-        raise ValueError("Native shuffler output size is not normalized")
-    _require_regular_file(staged_source_path)
-    if staged_source_path.stat().st_size != source_size:
-        raise ValueError("Native shuffler staged source size does not match source")
-    first_pass_seconds = float(metrics["first_pass_seconds"])
-    second_pass_seconds = float(metrics["second_pass_seconds"])
-    published_metrics = metrics | {
-        "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
-        "index_identity": "uint64-source-occurrence-offsets-v1",
-        "permutation_identity": "splitmix64-fisher-yates-u32-v1",
-        "staging_identity": "first-pass-tee-to-container-local-v1",
-        "read_identity": "bounded-concurrent-local-pread-ordered-write-v2",
-        "first_pass_bytes_per_second": (
-            source_size / first_pass_seconds if first_pass_seconds > 0 else None
-        ),
-        "second_pass_bytes_per_second": (
-            output_size / second_pass_seconds if second_pass_seconds > 0 else None
-        ),
-    }
-    _write_json_atomic(metrics_path, published_metrics)
-    return published_metrics
 
 
 def _run_to_file(argv: list[str], output_path: Path, log_path: Path) -> None:
@@ -3776,9 +1720,11 @@ def _production_profile_plan(
             "operations": ["stats", "split2"],
         },
         "record_multiset": {
-            **_record_multiset_identity(),
+            **record_multiset_identity(),
             "source_threads": 1,
             "shard_threads": threads,
+            "source_input": "sha256-verified-container-local-staged-copy",
+            "execution": "native-source-scan-overlaps-split-and-shard-scan",
             "source_and_shards_compared": True,
         },
         "existing_profile_policy": "validate-and-reuse",
@@ -3801,7 +1747,7 @@ def _record_multiset_benchmark_plan(
             "shard_count": spec.shard_count,
         },
         "validator": {
-            **_record_multiset_identity(),
+            **record_multiset_identity(),
             "source_threads": 1,
             "shard_threads": threads,
         },
@@ -3891,12 +1837,11 @@ def _run_production_shuffle(
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Shuffle every occurrence into a container-local FASTA."""
     shuffled_path = scratch_root / "shuffled.fasta"
-    staged_source_path = scratch_root / "source.fasta"
     shuffle_diagnostics_path = validation_dir / "shuffle-stderr.log"
     shuffler_metrics_path = validation_dir / "shuffler-metrics.json"
     recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
     validation_dir.mkdir(parents=True, exist_ok=True)
-    shuffler_metrics = _run_ordinal_two_pass_shuffle(
+    shuffle_result = shuffle_fasta_occurrences(
         source_path,
         shuffled_path,
         scratch_root,
@@ -3904,6 +1849,7 @@ def _run_production_shuffle(
         shuffler_metrics_path,
         log_path,
         expected_records=expected_records,
+        seed=SHARD_RANDOM_SEED,
         worker_threads=seqkit_threads,
     )
     recovery_metrics: dict[str, int | str | None] = {
@@ -3934,11 +1880,10 @@ def _run_production_shuffle(
         "Preserved every FASTA record by source occurrence; FAI duplicate "
         "recovery is not applicable",
     )
-    _require_regular_file(staged_source_path)
     return (
-        staged_source_path,
+        shuffle_result.staged_source_path,
         shuffled_path,
-        recovery_metrics | {"shuffler": shuffler_metrics},
+        recovery_metrics | {"shuffler": shuffle_result.metrics},
     )
 
 
@@ -4165,7 +2110,7 @@ def _validate_production_profile_recipe(
     if recipe_version == ORDINAL_SHUFFLER_RECIPE_VERSION:
         return recipe_version, ORDINAL_PRODUCTION_VALIDATION_RELPATHS
     if recipe.get("record_multiset") != (
-        _record_multiset_identity() | {"shard_threads": seqkit_threads}
+        record_multiset_identity() | {"shard_threads": seqkit_threads}
     ):
         raise ValueError("Unexpected composable record-multiset validator")
     return recipe_version, PRODUCTION_VALIDATION_RELPATHS
@@ -4740,7 +2685,7 @@ def _build_production_profile(
                 f"match expected {spec.expected_sum_len}"
             )
         scratch_free = shutil.disk_usage(PRODUCTION_SCRATCH_ROOT).free
-        scratch_required = _required_ordinal_shuffler_scratch_bytes(
+        scratch_required = required_ordinal_shuffler_scratch_bytes(
             source_size,
             source_num_seqs,
         )
@@ -4761,7 +2706,7 @@ def _build_production_profile(
             dir=PRODUCTION_SCRATCH_ROOT,
         ) as scratch_dir:
             scratch_root = Path(scratch_dir)
-            _staged_source_path, shuffled_path, recovery_metrics = (
+            staged_source_path, shuffled_path, recovery_metrics = (
                 _run_production_shuffle(
                     spec,
                     source_path,
@@ -4772,21 +2717,69 @@ def _build_production_profile(
                     seqkit_threads=threads,
                 )
             )
-            shard_paths = _run_production_split(
-                spec,
-                shuffled_path,
-                raw_shard_dir,
-                shard_dir,
-                log_path,
-                seqkit_threads=threads,
+            staged_verification = verify_file(
+                staged_source_path,
+                expected_size=source_size,
+                expected_sha256=source_sha256,
             )
-            record_multiset = _run_record_multiset_validation(
-                source_path,
-                shard_paths,
-                scratch_root,
-                record_multiset_path,
+            _append_log(
                 log_path,
-                threads=threads,
+                "Verified container-local staged source against the Volume "
+                f"source SHA-256 in {staged_verification.wall_seconds:.6f}s",
+            )
+            validator = compile_record_multiset_validator(scratch_root, log_path)
+            parallel_started = perf_counter()
+            with ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="af3-source-validator",
+            ) as source_validator_pool:
+                # The worker waits on the native C subprocess; Python does not
+                # perform the scan and therefore does not serialize it on the GIL.
+                source_future = source_validator_pool.submit(
+                    scan_record_multiset,
+                    validator,
+                    (staged_source_path,),
+                    scratch_root / "source-record-multiset.json",
+                    log_path,
+                    threads=1,
+                )
+                split_started = perf_counter()
+                shard_paths = _run_production_split(
+                    spec,
+                    shuffled_path,
+                    raw_shard_dir,
+                    shard_dir,
+                    log_path,
+                    seqkit_threads=threads,
+                )
+                split_seconds = perf_counter() - split_started
+                source_result = source_future.result() if source_future.done() else None
+                shard_result = scan_record_multiset(
+                    validator,
+                    shard_paths,
+                    scratch_root / "shard-record-multiset.json",
+                    log_path,
+                    threads=threads,
+                )
+                if source_result is None:
+                    source_result = source_future.result()
+            parallel_seconds = perf_counter() - parallel_started
+            record_multiset = _finalize_record_multiset_validation(
+                source_result,
+                shard_result,
+                record_multiset_path,
+                execution={
+                    "strategy": ("native-source-scan-overlaps-split-and-shard-scan-v1"),
+                    "python_role": "subprocess-orchestration-only",
+                    "source_input": ("sha256-verified-container-local-staged-copy"),
+                    "staged_source_size_bytes": staged_verification.size_bytes,
+                    "staged_source_sha256": staged_verification.sha256,
+                    "staged_source_verification_seconds": (
+                        staged_verification.wall_seconds
+                    ),
+                    "split_seconds": split_seconds,
+                    "parallel_stage_wall_seconds": parallel_seconds,
+                },
             )
 
         _run_to_file(
@@ -4897,7 +2890,7 @@ def _build_production_profile(
                     "append_after_shuffle": False,
                     "strip_after_split": False,
                 },
-                "record_multiset": _record_multiset_identity()
+                "record_multiset": record_multiset_identity()
                 | {"shard_threads": threads},
                 "split": ["--by-part", spec.shard_count],
             },
@@ -5133,7 +3126,7 @@ def _benchmark_published_uniprot_record_multiset(
             "profile_id": spec.profile_id,
             "generation_id": generation_id,
             "profile_manifest_sha256": manifest_sha256,
-            "validator": _record_multiset_identity(),
+            "validator": record_multiset_identity(),
             "threads": threads,
             "source_size_bytes": source_size,
             "shard_size_bytes": declared_shard_bytes,

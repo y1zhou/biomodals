@@ -173,11 +173,21 @@ creating local payloads.
 The same inventory found all seven required uncompressed source FASTAs.
 Durable `production-candidates/profile-builds/` evidence currently exists for
 `small-bfd-64-v2`, `rfam-16-v1`, `rnacentral-64-v1`,
-`uniref90-128-v1`, and `uniprot-256-v1`. There is not yet build evidence for
-`nt-rna-256-v1` or `mgnify-512-v1`; neither profile may be counted as ready
-until its builder publishes and validates a manifest. The final sharded-Volume
-inventory and removal of obsolete profiles remain a separate post-build
-Sandbox gate.
+`uniref90-128-v1`, `uniprot-256-v1`, and `nt-rna-256-v1`. There is not yet
+build evidence for `mgnify-512-v1`; it may not be counted as ready until its
+builder publishes and validates a manifest. The final sharded-Volume inventory
+and removal of obsolete profiles remain a separate post-build Sandbox gate.
+
+Generation `6a08f17a689943b9ace9947ba285ece9` published the first recipe-v5
+profile, `nt-rna-256-v1`, on 2026-07-24. The builder preserved all 37,105,891
+record occurrences and 76,752,808,514 residues, recovered no records, and
+measured 0.9710% maximum shard residue imbalance. Its one-file C validator
+scan took 404.359 seconds at 200.260 MB/s; its eight-thread, 256-file scan took
+47.284 seconds at 1.739 GB/s. The source and shard canonical full-record
+multisets matched. The durable completion marker binds manifest SHA-256
+`65c031c30fa49f300de25d2d9b55a6c467770cda5cf32fc45684fa1f5b8b33ed`;
+the remote worker completed in 32 minutes 31 seconds, and the local Modal
+invocation completed in 33 minutes 5 seconds.
 
 ## Search cache layout
 

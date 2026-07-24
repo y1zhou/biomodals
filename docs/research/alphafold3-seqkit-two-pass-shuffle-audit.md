@@ -434,3 +434,37 @@ independent statistics and splitting, not aggregate checksum validation. The
 current simple file-parallel validator is the accepted implementation; a
 future optimization may reuse a source signature produced while staging only
 if it preserves the same canonicalization and aggregate contract.
+
+### First recipe-v5 builder: NT-RNA
+
+Generation `6a08f17a689943b9ace9947ba285ece9` published
+`nt-rna-256-v1` on 2026-07-24 with source policy `keep`. The remote worker ran
+from 05:59:13.946 to 06:31:44.713 UTC. The local Modal invocation, including
+app startup and final log handling, completed in 33 minutes 5 seconds.
+
+| Stage | Duration or rate |
+|---|---:|
+| source `seqkit stats` | 428.425s (7m 08.425s) |
+| source SHA-256 and shuffle setup | 76.513s |
+| first pass: Volume read plus local-source tee and occurrence index | 61.930s; 1.308 GB/s |
+| Fisher--Yates permutation | 1.124s |
+| second pass: eight ordered local-SSD `pread` workers | 150.303s; 538.760 MB/s |
+| `split2` plus final shard renames | 577.031s (9m 37.031s); 140.334 MB/s of source payload |
+| source full-record validator | 404.359s; 200.260 MB/s |
+| 256-shard full-record validator, eight threads | 47.284s; 1.739 GB/s |
+| shard statistics through durable completion marker | 191.285s |
+| complete remote worker | 1,950.767s (32m 30.767s) |
+
+The source contained 37,105,891 records, 76,752,808,514 residues, and
+80,977,012,680 physical bytes. SeqKit's split output occupied 82,237,359,282
+physical bytes because FASTA wrapping changed, but the validator's
+line-ending- and wrapping-independent full-record signatures matched exactly.
+No record required recovery. The maximum shard residue imbalance was 0.9710%,
+below the 5% publication threshold.
+
+The published manifest SHA-256 is
+`65c031c30fa49f300de25d2d9b55a6c467770cda5cf32fc45684fa1f5b8b33ed`.
+Durable evidence is under
+`production-candidates/profile-builds/nt-rna-256-v1/`
+`6a08f17a689943b9ace9947ba285ece9/` on
+`AlphaFold3-MSA-Benchmark-outputs`.

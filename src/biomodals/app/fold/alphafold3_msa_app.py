@@ -4694,6 +4694,16 @@ def _estimate_compute_cost(
         if isinstance(sampled_billed_memory, int | float)
         else max(minimum_memory_gib * sample_wall_seconds, observed_memory)
     )
+    cpu_basis = (
+        "sampled-cgroup-integral-with-request-floor"
+        if isinstance(sampled_billed_cpu, int | float)
+        else "aggregate-cgroup-use-with-request-floor"
+    )
+    memory_basis = (
+        "sampled-cgroup-integral-with-request-floor"
+        if isinstance(sampled_billed_memory, int | float)
+        else "request-floor-fallback"
+    )
     cpu_cost = billed_cpu * MODAL_CPU_USD_PER_CORE_SECOND
     memory_cost = billed_memory * MODAL_MEMORY_USD_PER_GIB_SECOND
     return {
@@ -4704,7 +4714,7 @@ def _estimate_compute_cost(
         "estimated_compute_cost_usd": cpu_cost + memory_cost,
         "minimum_cpu_cores": minimum_cpu_cores,
         "minimum_memory_gib": minimum_memory_gib,
-        "metering_basis": "sampled-integral-max-resource-request-or-cgroup-use",
+        "metering_basis": f"cpu={cpu_basis};memory={memory_basis}",
         "pricing_observed_date": MODAL_PRICING_OBSERVED_DATE,
         "pricing_source": MODAL_PRICING_URL,
     }
@@ -5764,6 +5774,16 @@ def _metric_float(result: dict[str, Any], key: str) -> float:
     if numeric < 0 or numeric == float("inf") or numeric != numeric:
         raise ValueError(f"Search result has non-finite metric {key!r}")
     return numeric
+
+
+def _optional_metric_float(
+    result: dict[str, Any],
+    key: str,
+) -> float | None:
+    """Read one optional finite, nonnegative numeric sample metric."""
+    if result.get(key) is None:
+        return None
+    return _metric_float(result, key)
 
 
 def _sample_cost(result: dict[str, Any]) -> float:
@@ -7057,7 +7077,9 @@ def _load_reusable_profile_search(
         _metric_float(metrics, "search_wall_seconds")
         _metric_float(metrics, "sample_wall_seconds")
         _metric_float(resource_summary, "cpu_core_seconds")
-        _metric_float(resource_summary, "memory_gib_seconds")
+        _optional_metric_float(resource_summary, "memory_gib_seconds")
+        _metric_float(cost_estimate, "estimated_billed_cpu_core_seconds")
+        _metric_float(cost_estimate, "estimated_billed_memory_gib_seconds")
         _sample_cost(metrics)
     except ValueError:
         return None
@@ -7907,6 +7929,10 @@ def _profile_search_performance(
     typed_resource_summary = cast(dict[str, Any], resource_summary)
     typed_cost_estimate = cast(dict[str, Any], cost_estimate)
     typed_container = cast(dict[str, Any], container)
+    observed_memory_gib_seconds = _optional_metric_float(
+        typed_resource_summary,
+        "memory_gib_seconds",
+    )
     return {
         "layout": layout,
         "result_status": result.get("status"),
@@ -7916,9 +7942,14 @@ def _profile_search_performance(
             typed_resource_summary,
             "cpu_core_seconds",
         ),
-        "memory_gib_seconds": _metric_float(
-            typed_resource_summary,
-            "memory_gib_seconds",
+        "memory_gib_seconds": observed_memory_gib_seconds,
+        "observed_memory_telemetry_available": (
+            observed_memory_gib_seconds is not None
+        ),
+        "memory_cost_basis": (
+            "sampled-cgroup-memory"
+            if observed_memory_gib_seconds is not None
+            else "one-gib-request-floor-fallback"
         ),
         "peak_interval_cpu_cores": _metric_float(
             typed_resource_summary,
@@ -7965,11 +7996,13 @@ def _summed_oracle_search_performance(
         "search_wall_seconds",
         "sample_wall_seconds",
         "cpu_core_seconds",
-        "memory_gib_seconds",
         "estimated_billed_cpu_core_seconds",
         "estimated_billed_memory_gib_seconds",
         "estimated_compute_cost_usd",
     )
+    observed_memory = [
+        _optional_metric_float(record, "memory_gib_seconds") for record in records
+    ]
     return {
         "database_calls": len(records),
         "duration_semantics": (
@@ -7980,6 +8013,14 @@ def _summed_oracle_search_performance(
             f"{metric}_sum": sum(_metric_float(record, metric) for record in records)
             for metric in metric_names
         },
+        "memory_gib_seconds_sum": (
+            sum(cast(float, value) for value in observed_memory)
+            if all(value is not None for value in observed_memory)
+            else None
+        ),
+        "observed_memory_telemetry_complete": all(
+            value is not None for value in observed_memory
+        ),
     }
 
 
@@ -8196,21 +8237,41 @@ def _run_msa_oracle_comparison(
     comparison_cost_estimate["metering_basis"] = (
         "fixed-resource-request-times-in-container-processing-wall"
     )
-    batch_speedup = _oracle_performance_ratio(
-        _metric_float(
-            checked_batch_metrics["monolith"],
-            "client_wall_seconds",
-        ),
-        _metric_float(
-            checked_batch_metrics["sharded"],
-            "client_wall_seconds",
-        ),
-        metric="search_batch.client_wall_seconds",
+    batches_are_fresh_executions = all(
+        batch.get("executed_searches") == len(case.database_ids)
+        for batch in checked_batch_metrics.values()
     )
+    batch_speedup = (
+        _oracle_performance_ratio(
+            _metric_float(
+                checked_batch_metrics["monolith"],
+                "client_wall_seconds",
+            ),
+            _metric_float(
+                checked_batch_metrics["sharded"],
+                "client_wall_seconds",
+            ),
+            metric="search_batch.client_wall_seconds",
+        )
+        if batches_are_fresh_executions
+        else None
+    )
+    critical_path_search_wall = {
+        layout: max(_metric_float(record, "search_wall_seconds") for record in records)
+        for layout, records in layout_performance.items()
+    }
+    critical_path_sample_wall = {
+        layout: max(_metric_float(record, "sample_wall_seconds") for record in records)
+        for layout, records in layout_performance.items()
+    }
     search_call_sums = {
         layout: _summed_oracle_search_performance(records)
         for layout, records in layout_performance.items()
     }
+    observed_memory_telemetry_complete = all(
+        summary.get("observed_memory_telemetry_complete") is True
+        for summary in search_call_sums.values()
+    )
     monolith_search_cost = _metric_float(
         search_call_sums["monolith"],
         "estimated_compute_cost_usd_sum",
@@ -8227,14 +8288,35 @@ def _run_msa_oracle_comparison(
         "cost_is_estimate_not_invoice": True,
         "metering_semantics": (
             "Modal bills each interval at the greater of the resource request "
-            "or actual use; search estimates integrate one-second cgroup "
-            "samples with the 0.125 CPU and 1 GiB request floors"
+            "or actual use; search estimates integrate one-second CPU cgroup "
+            "samples with the 0.125 CPU request floor; memory uses the same "
+            "method when cgroup counters are available and otherwise uses the "
+            "1 GiB request floor"
         ),
+        "observed_memory_telemetry_complete": observed_memory_telemetry_complete,
         "pricing_observed_date": MODAL_PRICING_OBSERVED_DATE,
         "pricing_source": MODAL_PRICING_URL,
         "database_comparisons": database_performance,
         "search_batches": checked_batch_metrics,
+        "search_batch_timings_are_fresh_executions": (batches_are_fresh_executions),
         "search_batch_wall_speedup": batch_speedup,
+        "search_batch_speedup_unavailable_reason": (
+            None
+            if batches_are_fresh_executions
+            else "one or both retry batches returned cached search evidence"
+        ),
+        "critical_path_search_wall_seconds": critical_path_search_wall,
+        "critical_path_search_wall_speedup": _oracle_performance_ratio(
+            critical_path_search_wall["monolith"],
+            critical_path_search_wall["sharded"],
+            metric="critical_path.search_wall_seconds",
+        ),
+        "critical_path_sample_wall_seconds": critical_path_sample_wall,
+        "critical_path_sample_wall_speedup": _oracle_performance_ratio(
+            critical_path_sample_wall["monolith"],
+            critical_path_sample_wall["sharded"],
+            metric="critical_path.sample_wall_seconds",
+        ),
         "search_call_sums": search_call_sums,
         "comparison_call": {
             "processing_wall_seconds": comparison_processing_wall_seconds,

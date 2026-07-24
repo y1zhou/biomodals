@@ -35,7 +35,7 @@ _T = TypeVar("_T")
 
 
 class RunBounded(Protocol):
-    """Execute a blocking whole-file operation outside the event loop."""
+    """Execute blocking artifact I/O outside the event loop."""
 
     def __call__(
         self,
@@ -568,6 +568,7 @@ async def _write_remote(
     remote_path: str,
     name: str,
     role: str,
+    run_bounded: RunBounded | None,
 ) -> dict[str, str | int]:
     return await _write_remote_chunks(
         archive,
@@ -575,6 +576,7 @@ async def _write_remote(
         mtime=mtime,
         name=name,
         role=role,
+        run_bounded=run_bounded,
     )
 
 
@@ -585,6 +587,7 @@ async def _write_remote_chunks(
     mtime: int,
     name: str,
     role: str,
+    run_bounded: RunBounded | None,
 ) -> dict[str, str | int]:
     digest = hashlib.sha256()
     size_bytes = 0
@@ -593,10 +596,17 @@ async def _write_remote_chunks(
         mode="w",
         force_zip64=True,
     ) as destination:
-        async for chunk in chunks:
-            size_bytes += len(chunk)
+
+        def write_chunk(chunk: bytes) -> None:
             digest.update(chunk)
             destination.write(chunk)
+
+        async for chunk in chunks:
+            size_bytes += len(chunk)
+            if run_bounded is None:
+                write_chunk(chunk)
+            else:
+                await run_bounded(write_chunk, chunk)
     return {
         "path": name,
         "role": role,
@@ -613,6 +623,7 @@ async def _write_optional_remote(
     remote_path: str,
     name: str,
     role: str,
+    run_bounded: RunBounded | None,
 ) -> dict[str, str | int] | None:
     try:
         mtime = remote_mtimes[remote_path]
@@ -638,6 +649,7 @@ async def _write_optional_remote(
         mtime=mtime,
         name=name,
         role=role,
+        run_bounded=run_bounded,
     )
 
 
@@ -723,6 +735,7 @@ async def write_gromacs_archive(
                     remote_path=remote_path,
                     name=name,
                     role=role,
+                    run_bounded=run_bounded,
                 )
             )
         topology_name = f"outputs/production_{run_name}.tpr"
@@ -758,6 +771,7 @@ async def write_gromacs_archive(
                 remote_path=f"{run_name}/{remote_name}",
                 name=name,
                 role=role,
+                run_bounded=run_bounded,
             )
             if record is not None:
                 records.append(record)

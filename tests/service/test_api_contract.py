@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
@@ -20,7 +20,7 @@ import pytest
 from fastapi import APIRouter, FastAPI
 
 from biomodals.service.api import create_app
-from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.artifacts import ArtifactCache, ArtifactLease
 from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
@@ -2574,6 +2574,88 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     assert range_contract["headers"]["Content-Range"]["schema"] == {"type": "string"}
     assert adapter.downloads == 1
     assert [path.name for path in (tmp_path / "cache").iterdir()] == [f"{job_id}.zip"]
+
+
+def test_cached_result_reads_do_not_block_core_requests(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    content = adapter.artifact_content
+    store.complete_job(
+        job_id,
+        state=JobState.SUCCEEDED,
+        result_volume_name="Gromacs-outputs",
+        result_volume_path=f"api-results/{job_id}/result.zip",
+        result_filename="simulation.zip",
+        result_size_bytes=len(content),
+        result_sha256=hashlib.sha256(content).hexdigest(),
+        result_archive_schema_version=1,
+        now=1_800_000_001,
+    )
+    assert (
+        client.post(
+            f"/api/v1/jobs/{job_id}/prepare-download",
+            headers=_unsafe_headers(csrf_token),
+        ).status_code
+        == 204
+    )
+    original_read = ArtifactLease.read
+    read_started = Event()
+    release_read = Event()
+
+    def delayed_read(lease: ArtifactLease, size: int) -> bytes:
+        read_started.set()
+        if not release_read.wait(timeout=5):
+            raise RuntimeError("test cache read timed out")
+        return original_read(lease, size)
+
+    monkeypatch.setattr(ArtifactLease, "read", delayed_read)
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=ORIGIN,
+            cookies=client.cookies,
+        ) as browser:
+            loop = asyncio.get_running_loop()
+            health_ready = asyncio.Event()
+            health_finished = Event()
+            health_tasks: list[asyncio.Task[httpx.Response]] = []
+            responsive: list[bool] = []
+
+            def start_health() -> None:
+                task = asyncio.create_task(browser.get("/api/v1/health"))
+                health_tasks.append(task)
+                task.add_done_callback(lambda _task: health_finished.set())
+                health_ready.set()
+
+            def probe() -> None:
+                if not read_started.wait(timeout=5):
+                    responsive.append(False)
+                    release_read.set()
+                    return
+                loop.call_soon_threadsafe(start_health)
+                responsive.append(health_finished.wait(timeout=0.5))
+                release_read.set()
+
+            probe_thread = Thread(target=probe)
+            probe_thread.start()
+            downloaded = await browser.get(f"/api/v1/jobs/{job_id}/download")
+            await health_ready.wait()
+            health = await health_tasks[0]
+            probe_thread.join(timeout=5)
+
+            assert responsive == [True]
+            assert health.status_code == 200
+            assert downloaded.content == content
+
+    asyncio.run(scenario())
 
 
 def test_local_result_storage_failures_are_503_and_preserve_the_job(

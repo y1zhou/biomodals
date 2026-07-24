@@ -12,12 +12,13 @@ import struct
 import time
 import zipfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Buffer, Callable
+from threading import Event, Thread
 
 import orjson
 import pytest
 
-from biomodals.service.artifacts import ArtifactSourceMissingError
+from biomodals.service.artifacts import ArtifactCache, ArtifactSourceMissingError
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     BuiltGromacsArchive,
@@ -190,6 +191,70 @@ def test_service_packages_established_remote_files_deterministically() -> None:
             "outputs",
             "metadata",
         }
+
+
+def test_remote_archive_writes_do_not_block_the_event_loop(tmp_path) -> None:
+    files = _remote_files()
+    write_started = Event()
+    release_write = Event()
+
+    class BlockingBuffer(io.BytesIO):
+        def write(self, content: Buffer, /) -> int:
+            if bytes(content) == XTC and not write_started.is_set():
+                write_started.set()
+                if not release_write.wait(timeout=5):
+                    raise RuntimeError("test archive write timed out")
+            return super().write(content)
+
+    async def read_file(path: str):
+        yield files[path]
+
+    async def scenario() -> None:
+        cache = ArtifactCache(tmp_path / "cache")
+        loop = asyncio.get_running_loop()
+        heartbeat = asyncio.Event()
+        heartbeat_observed = Event()
+        responsive: list[bool] = []
+
+        async def observe_heartbeat() -> None:
+            await heartbeat.wait()
+            heartbeat_observed.set()
+
+        def probe() -> None:
+            if not write_started.wait(timeout=5):
+                responsive.append(False)
+                release_write.set()
+                return
+            loop.call_soon_threadsafe(heartbeat.set)
+            responsive.append(heartbeat_observed.wait(timeout=0.5))
+            release_write.set()
+
+        observer = asyncio.create_task(observe_heartbeat())
+        probe_thread = Thread(target=probe)
+        probe_thread.start()
+        try:
+            await write_gromacs_archive(
+                BlockingBuffer(),
+                run_name=RUN_NAME,
+                parameters_json=PARAMETERS,
+                modal_app_name="Gromacs",
+                modal_app_version=17,
+                job_id="11111111-1111-4111-8111-111111111111",
+                stages_json="[]",
+                started_at=1,
+                completed_at=2,
+                read_file=read_file,
+                remote_mtimes=_mtimes_for_files(files),
+                run_bounded=cache.run_bounded,
+            )
+            await observer
+            probe_thread.join(timeout=5)
+            assert responsive == [True]
+        finally:
+            release_write.set()
+            await cache.shutdown()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

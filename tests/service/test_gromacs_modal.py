@@ -391,9 +391,11 @@ def _adapter(
     *,
     output_volume_name: str = "Gromacs-outputs",
     function_resolver=None,
+    artifact_cache: ArtifactCache | None = None,
 ) -> ModalGromacsAdapter:
     return ModalGromacsAdapter(
         output_volume_name=output_volume_name,
+        artifact_cache=artifact_cache,
         call_resolver=cast(Any, calls.__getitem__),
         function_resolver=function_resolver,
     )
@@ -1814,6 +1816,74 @@ def test_rebuild_rejects_an_unavailable_archive_builder(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unsupported Result archive schema"):
         asyncio.run(rebuild())
+
+
+def test_rebuild_streams_staged_bytes_through_the_bounded_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, running = _submitted_job(
+        tmp_path,
+        operation="collect_traj_stats:production_",
+    )
+    files = _established_output_files()
+    _install_volume(monkeypatch, files)
+    cache = ArtifactCache(tmp_path / "cache")
+    adapter = _adapter({}, artifact_cache=cache)
+    completed_operations = store.record_operation_outcome(
+        running.job_id,
+        operation="collect_traj_stats:production_",
+        expected_modal_call_id="fc-root",
+        outcome=JobOperationState.COMPLETED,
+        now=10,
+    )
+    assert completed_operations is not None
+    finalizing = store.set_job_state(
+        completed_operations.job_id,
+        JobState.FINALIZING,
+        now=10,
+    )
+    published = asyncio.run(adapter.publish_archive(finalizing, completed_at=10))
+    completed = store.complete_job(
+        running.job_id,
+        state=published.state,
+        result_volume_name=published.volume_name,
+        result_volume_path=published.path,
+        result_filename=published.filename,
+        result_size_bytes=published.size_bytes,
+        result_sha256=published.sha256,
+        result_archive_schema_version=GROMACS_ARCHIVE_SCHEMA_VERSION,
+        now=10,
+    )
+    if published.cache_lease is not None:
+        published.cache_lease.close()
+    operations: list[str] = []
+    original_run_bounded = cache.run_bounded
+
+    async def recording_run_bounded(operation, /, *args, **kwargs):
+        operations.append(operation.__name__)
+        return await original_run_bounded(operation, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "run_bounded", recording_run_bounded)
+
+    async def exercise_staging() -> bytes:
+        try:
+            rebuilt = b"".join([
+                chunk async for chunk in adapter.rebuild_artifact(completed)
+            ])
+            assert "seek" in operations
+            assert "read" in operations
+            operations.clear()
+            recovered = await adapter.recover_archive(completed)
+            assert recovered.sha256 == published.sha256
+            assert "write" in operations
+            return rebuilt
+        finally:
+            await cache.shutdown()
+
+    rebuilt = asyncio.run(exercise_staging())
+
+    assert hashlib.sha256(rebuilt).hexdigest() == published.sha256
 
 
 def test_expired_call_output_recovers_completed_archive_from_volume_marker(

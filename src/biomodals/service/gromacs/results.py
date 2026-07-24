@@ -345,9 +345,17 @@ class ModalGromacsResults:
                     raise ValueError(
                         "Rebuilt Result does not match its published identity"
                     )
-                handle.seek(0)
-                while chunk := handle.read(1024 * 1024):
-                    yield chunk
+                if self.artifact_cache is None:
+                    handle.seek(0)
+                    while chunk := handle.read(1024 * 1024):
+                        yield chunk
+                else:
+                    await self.artifact_cache.run_bounded(handle.seek, 0)
+                    while chunk := await self.artifact_cache.run_bounded(
+                        handle.read,
+                        1024 * 1024,
+                    ):
+                        yield chunk
         finally:
             local_path.unlink(missing_ok=True)
 
@@ -433,7 +441,13 @@ class ModalGromacsResults:
                             raise ValueError(
                                 "GROMACS result archive is larger than recorded"
                             )
-                        archive_handle.write(chunk)
+                        if self.artifact_cache is None:
+                            archive_handle.write(chunk)
+                        else:
+                            await self.artifact_cache.run_bounded(
+                                archive_handle.write,
+                                chunk,
+                            )
                 except FileNotFoundError as exc:
                     raise ArchiveNotReadyError(
                         "GROMACS result archive is missing"

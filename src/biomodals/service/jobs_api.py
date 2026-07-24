@@ -186,15 +186,18 @@ def _cached_archive_response(
     async def content():
         remaining = length
         try:
-            lease.seek(first)
+            await asyncio.to_thread(lease.seek, first)
             while remaining:
-                chunk = lease.read(min(1024 * 1024, remaining))
+                chunk = await asyncio.to_thread(
+                    lease.read,
+                    min(1024 * 1024, remaining),
+                )
                 if not chunk:
                     raise RuntimeError("Cached archive ended unexpectedly")
                 remaining -= len(chunk)
                 yield chunk
         finally:
-            lease.close()
+            await asyncio.to_thread(lease.close)
 
     return StreamingResponse(
         content(),

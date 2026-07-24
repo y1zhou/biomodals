@@ -161,7 +161,7 @@ class ArtifactCache:
         *args: object,
         **kwargs: object,
     ) -> _T:
-        """Run whole-file or directory work on the single artifact worker."""
+        """Run blocking artifact I/O on the single artifact worker."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._worker,

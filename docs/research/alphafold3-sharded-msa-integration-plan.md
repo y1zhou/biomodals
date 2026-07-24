@@ -103,6 +103,14 @@ build_sharded_database(
 ) -> dict[str, object]
 ```
 
+The production setup entrypoint validates the seven fixed profile locations,
+collects only missing databases, and submits all missing database IDs to this
+function concurrently. Each invocation retains its own Profile-ID claim and
+generation-scoped paths, so valid profiles are skipped and the same database
+cannot be built twice. The coordinator waits for all builders before running a
+single final inventory/cleanup pass; individual workers never remove shared
+staging state.
+
 One invocation handles one logical database:
 
 1. Resolve the code-owned specification.
@@ -441,6 +449,9 @@ Commit: `fold: add sharded database builder`
   split/validation code;
 - add manifest-last publication, minimal claim, `/tmp` staging, and source
   policy;
+- add a setup coordinator that submits every missing database profile
+  concurrently, reuses valid profiles, and performs cleanup only after all
+  builders finish;
 - do not import benchmark code or campaign types.
 
 ### 4. Replace the production data-pipeline worker

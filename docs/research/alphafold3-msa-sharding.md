@@ -322,6 +322,15 @@ order-independent, multiplicity-sensitive full-record multiset without
 SeqKit's global sort, while independent `seqkit stats` remains as a second
 record/residue conservation check. Existing recipe v4 profiles remain valid.
 
+When this builder moves into the production AlphaFold3 app, its setup
+entrypoint must first validate all seven fixed profile manifests, collect only
+the missing database IDs, and submit one builder container per missing database
+concurrently. Builders retain their per-Profile-ID claims and write only to
+distinct source, staging, profile, and evidence paths. Existing valid profiles
+are reused rather than rebuilt. The coordinator waits for every submitted
+builder before performing the one final Volume inventory and cleanup check;
+workers must not clean shared staging state while peers are still active.
+
 `split2 --by-part` does not emit AF3's required zero-based padded names by
 default, so rename and validate every output. See the official
 [split2 documentation](https://bioinf.shenwei.me/seqkit/usage/#split2).

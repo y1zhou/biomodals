@@ -170,6 +170,15 @@ default 512 GiB container disk quota. The runtime still computes the exact
 requirement from the unrounded source size and measured record count before
 creating local payloads.
 
+The same inventory found all seven required uncompressed source FASTAs.
+Durable `production-candidates/profile-builds/` evidence currently exists for
+`small-bfd-64-v2`, `rfam-16-v1`, `rnacentral-64-v1`,
+`uniref90-128-v1`, and `uniprot-256-v1`. There is not yet build evidence for
+`nt-rna-256-v1` or `mgnify-512-v1`; neither profile may be counted as ready
+until its builder publishes and validates a manifest. The final sharded-Volume
+inventory and removal of obsolete profiles remain a separate post-build
+Sandbox gate.
+
 ## Search cache layout
 
 `sequence_hash` remains a hash of sequence text only. Polymer namespaces

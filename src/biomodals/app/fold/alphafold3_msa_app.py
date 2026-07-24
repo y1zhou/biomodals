@@ -137,7 +137,7 @@ SCIENTIFIC_COMPARISON_POLICY = "top-target-order-exact-modulo-evalue-bit-score-t
 RESOURCE_TRACE_INTERVAL_SECONDS = 1.0
 MODAL_CPU_USD_PER_CORE_SECOND = 0.0000131
 MODAL_MEMORY_USD_PER_GIB_SECOND = 0.00000222
-MODAL_PRICING_OBSERVED_DATE = "2026-07-22"
+MODAL_PRICING_OBSERVED_DATE = "2026-07-24"
 MODAL_PRICING_URL = "https://modal.com/pricing"
 JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
@@ -196,6 +196,8 @@ HMMBUILD_BINARY_PATH = "/hmmer/bin/hmmbuild"
 PRODUCTION_SEARCH_N_CPU = 2
 PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS = 16
 ORACLE_MONOLITH_N_CPU = 8
+ORACLE_COMPARISON_CPU = 2
+ORACLE_COMPARISON_MEMORY_MIB = 4096
 
 
 CONF = AppConfig(
@@ -4545,7 +4547,12 @@ def _trace_resources(
                 return
 
 
-def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]:
+def _summarize_resource_trace(
+    trace_path: Path,
+    *,
+    minimum_cpu_cores: float = 0.125,
+    minimum_memory_gib: float = 1.0,
+) -> dict[str, int | float | None]:
     """Reduce the raw trace to actual CPU, throttling, and memory signals."""
     snapshots = [
         orjson.loads(line)
@@ -4557,6 +4564,10 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
     cpu_rates: list[float] = []
     memory_gib_seconds = 0.0
     has_memory_integral = False
+    estimated_billed_cpu_core_seconds = 0.0
+    has_billed_cpu_integral = False
+    estimated_billed_memory_gib_seconds = 0.0
+    has_billed_memory_integral = False
     for previous, current in zip(snapshots, snapshots[1:], strict=False):
         elapsed = float(current["elapsed_seconds"]) - float(previous["elapsed_seconds"])
         previous_cpu = previous.get("cpu_usage_usec")
@@ -4566,7 +4577,12 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
             and isinstance(current_cpu, int)
             and elapsed > 0
         ):
-            cpu_rates.append((current_cpu - previous_cpu) / 1_000_000 / elapsed)
+            cpu_rate = max(0.0, (current_cpu - previous_cpu) / 1_000_000 / elapsed)
+            cpu_rates.append(cpu_rate)
+            estimated_billed_cpu_core_seconds += (
+                max(minimum_cpu_cores, cpu_rate) * elapsed
+            )
+            has_billed_cpu_integral = True
         previous_memory = previous.get("memory_current_bytes")
         current_memory = current.get("memory_current_bytes")
         if (
@@ -4575,8 +4591,13 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
             and elapsed > 0
         ):
             mean_memory_bytes = (previous_memory + current_memory) / 2
-            memory_gib_seconds += mean_memory_bytes / (1024**3) * elapsed
+            mean_memory_gib = mean_memory_bytes / (1024**3)
+            memory_gib_seconds += mean_memory_gib * elapsed
             has_memory_integral = True
+            estimated_billed_memory_gib_seconds += (
+                max(minimum_memory_gib, mean_memory_gib) * elapsed
+            )
+            has_billed_memory_integral = True
 
     first_cpu = snapshots[0].get("cpu_usage_usec")
     last_cpu = snapshots[-1].get("cpu_usage_usec")
@@ -4627,11 +4648,17 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
         "observations": len(snapshots),
         "elapsed_seconds": float(snapshots[-1]["elapsed_seconds"]),
         "cpu_core_seconds": cpu_core_seconds,
+        "estimated_billed_cpu_core_seconds": (
+            estimated_billed_cpu_core_seconds if has_billed_cpu_integral else None
+        ),
         "child_process_cpu_seconds": child_cpu_seconds,
         "peak_interval_cpu_cores": max(cpu_rates) if cpu_rates else None,
         "cpu_throttled_periods": throttled_periods,
         "cpu_throttled_seconds": throttled_seconds,
         "memory_gib_seconds": memory_gib_seconds if has_memory_integral else None,
+        "estimated_billed_memory_gib_seconds": (
+            estimated_billed_memory_gib_seconds if has_billed_memory_integral else None
+        ),
         "peak_memory_current_bytes": max(memory_values) if memory_values else None,
         "cgroup_memory_peak_bytes": max(peak_values) if peak_values else None,
     }
@@ -4640,10 +4667,15 @@ def _summarize_resource_trace(trace_path: Path) -> dict[str, int | float | None]
 def _estimate_compute_cost(
     resource_summary: dict[str, int | float | None],
     sample_wall_seconds: float,
+    *,
+    minimum_cpu_cores: float = 0.125,
+    minimum_memory_gib: float = 1.0,
 ) -> dict[str, float | str]:
     """Estimate billed CPU and memory using Modal's published Function rates."""
     cpu_core_seconds = resource_summary.get("cpu_core_seconds")
     memory_gib_seconds = resource_summary.get("memory_gib_seconds")
+    sampled_billed_cpu = resource_summary.get("estimated_billed_cpu_core_seconds")
+    sampled_billed_memory = resource_summary.get("estimated_billed_memory_gib_seconds")
     observed_cpu = (
         float(cpu_core_seconds) if isinstance(cpu_core_seconds, int | float) else 0.0
     )
@@ -4652,8 +4684,16 @@ def _estimate_compute_cost(
         if isinstance(memory_gib_seconds, int | float)
         else 0.0
     )
-    billed_cpu = max(0.125 * sample_wall_seconds, observed_cpu)
-    billed_memory = max(1.0 * sample_wall_seconds, observed_memory)
+    billed_cpu = (
+        float(sampled_billed_cpu)
+        if isinstance(sampled_billed_cpu, int | float)
+        else max(minimum_cpu_cores * sample_wall_seconds, observed_cpu)
+    )
+    billed_memory = (
+        float(sampled_billed_memory)
+        if isinstance(sampled_billed_memory, int | float)
+        else max(minimum_memory_gib * sample_wall_seconds, observed_memory)
+    )
     cpu_cost = billed_cpu * MODAL_CPU_USD_PER_CORE_SECOND
     memory_cost = billed_memory * MODAL_MEMORY_USD_PER_GIB_SECOND
     return {
@@ -4662,6 +4702,9 @@ def _estimate_compute_cost(
         "estimated_cpu_cost_usd": cpu_cost,
         "estimated_memory_cost_usd": memory_cost,
         "estimated_compute_cost_usd": cpu_cost + memory_cost,
+        "minimum_cpu_cores": minimum_cpu_cores,
+        "minimum_memory_gib": minimum_memory_gib,
+        "metering_basis": "sampled-integral-max-resource-request-or-cgroup-use",
         "pricing_observed_date": MODAL_PRICING_OBSERVED_DATE,
         "pricing_source": MODAL_PRICING_URL,
     }
@@ -6978,25 +7021,46 @@ def _load_reusable_profile_search(
         return None
     result_record = done.get("result")
     hits_record = done.get("hits")
-    if not isinstance(result_record, dict) or not isinstance(hits_record, dict):
+    trace_record = done.get("resource_trace")
+    if (
+        not isinstance(result_record, dict)
+        or not isinstance(hits_record, dict)
+        or not isinstance(trace_record, dict)
+    ):
         return None
     result_path = result_root / "result.a3m"
     hits_path = result_root / "hits.parquet"
-    if not result_path.is_file() or not hits_path.is_file():
+    trace_path = result_root / "resource-trace.jsonl"
+    if not result_path.is_file() or not hits_path.is_file() or not trace_path.is_file():
         return None
     result_bytes = result_path.read_bytes()
     hits_bytes = hits_path.read_bytes()
+    trace_bytes = trace_path.read_bytes()
     if (
         result_record.get("size_bytes") != len(result_bytes)
         or result_record.get("sha256") != hashlib.sha256(result_bytes).hexdigest()
         or hits_record.get("size_bytes") != len(hits_bytes)
         or hits_record.get("sha256") != hashlib.sha256(hits_bytes).hexdigest()
+        or trace_record.get("size_bytes") != len(trace_bytes)
+        or trace_record.get("sha256") != hashlib.sha256(trace_bytes).hexdigest()
     ):
         return None
     metrics_path = result_root / "metrics.json"
     if not metrics_path.is_file():
         return None
     metrics = _load_json_object(metrics_path)
+    resource_summary = metrics.get("resource_summary")
+    cost_estimate = metrics.get("cost_estimate")
+    if not isinstance(resource_summary, dict) or not isinstance(cost_estimate, dict):
+        return None
+    try:
+        _metric_float(metrics, "search_wall_seconds")
+        _metric_float(metrics, "sample_wall_seconds")
+        _metric_float(resource_summary, "cpu_core_seconds")
+        _metric_float(resource_summary, "memory_gib_seconds")
+        _sample_cost(metrics)
+    except ValueError:
+        return None
     return metrics | {"status": "reused"}
 
 
@@ -7214,14 +7278,46 @@ def _run_profile_search(
         f"Searching {spec.profile_id} {selected_layout} for a "
         f"{len(query)}-residue query",
     )
-    started = perf_counter()
+    sample_started = perf_counter()
+    started_at = _utc_now()
+    container = _container_sample_metadata()
+    container["modal_function_call_id"] = modal.current_function_call_id()
+    phase_state: dict[str, Any] = {"current": None, "events": []}
+    _mark_resource_phase(phase_state, "search", sample_started)
+    trace_temp_path = (
+        Path(tempfile.gettempdir()) / f"af3-profile-resource-{uuid.uuid4().hex}.jsonl"
+    )
+    resource_trace_path = result_root / "resource-trace.jsonl"
+    trace_stop = Event()
+    trace_thread = Thread(
+        target=_trace_resources,
+        args=(
+            trace_temp_path,
+            trace_stop,
+            sample_started,
+            phase_state,
+            {
+                "database_id": spec.database_id,
+                "profile_id": spec.profile_id,
+                "layout": selected_layout,
+                "sequence_sha256": hashlib.sha256(query.encode()).hexdigest(),
+                "container_instance_id": container["container_instance_id"],
+            },
+        ),
+        daemon=True,
+    )
+    trace_stopped = False
+    trace_thread.start()
     try:
+        search_started = perf_counter()
         a3m, raw_tblouts = _execute_profile_database_search(
             spec,
             query,
             selected_layout,
             profile_root,
         )
+        search_wall_seconds = perf_counter() - search_started
+        _mark_resource_phase(phase_state, "normalize", sample_started)
         if not isinstance(a3m, str) or not a3m.startswith(">query\n"):
             raise ValueError("Pinned MSA wrapper returned an invalid A3M")
         hit_rows = (
@@ -7231,7 +7327,6 @@ def _run_profile_search(
         )
         result_bytes = a3m.encode()
         hits_bytes = _normalized_hits_parquet(hit_rows)
-        elapsed_seconds = perf_counter() - started
         result_record = {
             "path": "result.a3m",
             "size_bytes": len(result_bytes),
@@ -7241,6 +7336,31 @@ def _run_profile_search(
             "path": "hits.parquet",
             "size_bytes": len(hits_bytes),
             "sha256": hashlib.sha256(hits_bytes).hexdigest(),
+        }
+        _mark_resource_phase(phase_state, "publish", sample_started)
+        _append_log(
+            log_path,
+            f"Completed {selected_layout} search with {len(hit_rows)} hit rows "
+            f"in {search_wall_seconds:.3f} seconds",
+        )
+        _write_bytes_atomic(result_root / "result.a3m", result_bytes)
+        _write_bytes_atomic(result_root / "hits.parquet", hits_bytes)
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _mark_resource_phase(phase_state, "complete", sample_started)
+        trace_stop.set()
+        trace_thread.join()
+        trace_stopped = True
+        sample_wall_seconds = perf_counter() - sample_started
+        resource_summary = _summarize_resource_trace(trace_temp_path)
+        cost_estimate = _estimate_compute_cost(
+            resource_summary,
+            sample_wall_seconds,
+        )
+        trace_bytes = trace_temp_path.read_bytes()
+        trace_record = {
+            "path": "resource-trace.jsonl",
+            "size_bytes": len(trace_bytes),
+            "sha256": hashlib.sha256(trace_bytes).hexdigest(),
         }
         metrics: dict[str, object] = {
             "schema_version": 1,
@@ -7252,7 +7372,12 @@ def _run_profile_search(
             "search_identity": search_identity,
             "sequence_sha256": hashlib.sha256(query.encode()).hexdigest(),
             "sequence_length": len(query),
-            "elapsed_seconds": elapsed_seconds,
+            "started_at": started_at,
+            "completed_at": _utc_now(),
+            "elapsed_seconds": search_wall_seconds,
+            "search_wall_seconds": search_wall_seconds,
+            "sample_wall_seconds": sample_wall_seconds,
+            "sample_wall_endpoint": "durable-result-and-hit-evidence-commit",
             "parameters": _production_search_parameters(
                 spec,
                 selected_layout,
@@ -7260,16 +7385,15 @@ def _run_profile_search(
             "hit_rows": len(hit_rows),
             "result": result_record,
             "hits": hits_record,
+            "resource_trace": trace_record,
+            "resource_summary": resource_summary,
+            "cost_estimate": cost_estimate,
+            "container": container,
             "result_path": str(result_root / "result.a3m"),
             "hits_path": str(result_root / "hits.parquet"),
+            "resource_trace_path": str(resource_trace_path),
         }
-        _append_log(
-            log_path,
-            f"Completed {selected_layout} search with {len(hit_rows)} hit rows "
-            f"in {elapsed_seconds:.3f} seconds",
-        )
-        _write_bytes_atomic(result_root / "result.a3m", result_bytes)
-        _write_bytes_atomic(result_root / "hits.parquet", hits_bytes)
+        _write_bytes_atomic(resource_trace_path, trace_bytes)
         _write_json_atomic(result_root / "metrics.json", metrics)
         BENCHMARK_OUTPUT_VOLUME.commit()
         _write_json_atomic(
@@ -7281,11 +7405,18 @@ def _run_profile_search(
                 "completed_at": _utc_now(),
                 "result": result_record,
                 "hits": hits_record,
+                "resource_trace": trace_record,
             },
         )
         BENCHMARK_OUTPUT_VOLUME.commit()
         return metrics
     except Exception as exc:
+        if not trace_stopped:
+            trace_stop.set()
+            trace_thread.join()
+            trace_stopped = True
+        if trace_temp_path.is_file():
+            _write_bytes_atomic(resource_trace_path, trace_temp_path.read_bytes())
         _append_log(
             log_path,
             f"Failed with {type(exc).__name__}: {exc}",
@@ -7300,10 +7431,18 @@ def _run_profile_search(
                 "search_identity": search_identity,
                 "error_type": type(exc).__name__,
                 "message": str(exc),
+                "started_at": started_at,
+                "failed_after_seconds": perf_counter() - sample_started,
+                "resource_trace_path": str(resource_trace_path),
             },
         )
         BENCHMARK_OUTPUT_VOLUME.commit()
         raise
+    finally:
+        trace_stop.set()
+        if trace_thread.is_alive():
+            trace_thread.join()
+        trace_temp_path.unlink(missing_ok=True)
 
 
 @app.function(
@@ -7434,6 +7573,21 @@ def _msa_oracle_plan(case_id: str) -> dict[str, object]:
             "equal_score_permutations": "equivalent",
             "all_other_row_differences": "fail",
             "rna_requires_non_query_monolithic_hit": case.polymer == "rna",
+        },
+        "performance_evidence": {
+            "per_search_resource_trace_interval_seconds": (
+                RESOURCE_TRACE_INTERVAL_SECONDS
+            ),
+            "per_database_search_and_sample_wall_time": True,
+            "per_database_cpu_and_memory_usage": True,
+            "per_database_estimated_compute_cost": True,
+            "client_observed_batch_and_campaign_wall_time": True,
+            "cost_is_estimate_not_invoice": True,
+            "billing_model": "per-interval-max-resource-request-or-actual-use",
+            "cpu_usd_per_core_second": MODAL_CPU_USD_PER_CORE_SECOND,
+            "memory_usd_per_gib_second": MODAL_MEMORY_USD_PER_GIB_SECOND,
+            "pricing_observed_date": MODAL_PRICING_OBSERVED_DATE,
+            "pricing_source": MODAL_PRICING_URL,
         },
         "inference": False,
         "template_search": False,
@@ -7705,22 +7859,150 @@ def _oracle_fold_input(
     }
 
 
+def _profile_search_performance(
+    result: dict[str, object],
+) -> dict[str, object]:
+    """Extract one search worker's checked timing and cost evidence."""
+    layout = result.get("layout")
+    if layout not in {"monolith", "sharded"}:
+        raise ValueError("Oracle search result has an invalid layout")
+    resource_summary = result.get("resource_summary")
+    cost_estimate = result.get("cost_estimate")
+    container = result.get("container")
+    if not isinstance(resource_summary, dict):
+        raise ValueError("Oracle search result is missing resource telemetry")
+    if not isinstance(cost_estimate, dict):
+        raise ValueError("Oracle search result is missing cost telemetry")
+    if not isinstance(container, dict):
+        raise ValueError("Oracle search result is missing container telemetry")
+    typed_resource_summary = cast(dict[str, Any], resource_summary)
+    typed_cost_estimate = cast(dict[str, Any], cost_estimate)
+    typed_container = cast(dict[str, Any], container)
+    return {
+        "layout": layout,
+        "result_status": result.get("status"),
+        "search_wall_seconds": _metric_float(result, "search_wall_seconds"),
+        "sample_wall_seconds": _metric_float(result, "sample_wall_seconds"),
+        "cpu_core_seconds": _metric_float(
+            typed_resource_summary,
+            "cpu_core_seconds",
+        ),
+        "memory_gib_seconds": _metric_float(
+            typed_resource_summary,
+            "memory_gib_seconds",
+        ),
+        "peak_interval_cpu_cores": _metric_float(
+            typed_resource_summary,
+            "peak_interval_cpu_cores",
+        ),
+        "estimated_billed_cpu_core_seconds": _metric_float(
+            typed_cost_estimate,
+            "estimated_billed_cpu_core_seconds",
+        ),
+        "estimated_billed_memory_gib_seconds": _metric_float(
+            typed_cost_estimate,
+            "estimated_billed_memory_gib_seconds",
+        ),
+        "estimated_compute_cost_usd": _sample_cost(result),
+        "metering_basis": typed_cost_estimate.get("metering_basis"),
+        "pricing_observed_date": typed_cost_estimate.get("pricing_observed_date"),
+        "pricing_source": typed_cost_estimate.get("pricing_source"),
+        "modal_function_call_id": typed_container.get("modal_function_call_id"),
+        "modal_task_id": typed_container.get("modal_task_id"),
+        "container_instance_id": typed_container.get("container_instance_id"),
+        "container_reused_for_sample": typed_container.get(
+            "container_reused_for_sample"
+        ),
+    }
+
+
+def _oracle_performance_ratio(
+    numerator: float,
+    denominator: float,
+    *,
+    metric: str,
+) -> float:
+    """Return one finite positive performance ratio."""
+    if numerator <= 0 or denominator <= 0:
+        raise ValueError(f"Oracle performance metric {metric!r} must be positive")
+    return numerator / denominator
+
+
+def _summed_oracle_search_performance(
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    """Sum resource and duration evidence across concurrent database calls."""
+    metric_names = (
+        "search_wall_seconds",
+        "sample_wall_seconds",
+        "cpu_core_seconds",
+        "memory_gib_seconds",
+        "estimated_billed_cpu_core_seconds",
+        "estimated_billed_memory_gib_seconds",
+        "estimated_compute_cost_usd",
+    )
+    return {
+        "database_calls": len(records),
+        "duration_semantics": (
+            "per-call sums; database calls ran concurrently and these are not "
+            "campaign elapsed times"
+        ),
+        **{
+            f"{metric}_sum": sum(_metric_float(record, metric) for record in records)
+            for metric in metric_names
+        },
+    }
+
+
 def _run_msa_oracle_comparison(
     case_id: str,
     monolith_results: list[dict[str, object]],
     sharded_results: list[dict[str, object]],
+    search_batch_metrics: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     """Assemble current-pipeline fields and publish one scientific verdict."""
+    comparison_started = perf_counter()
     case = _msa_oracle_case(case_id)
     if len(monolith_results) != len(case.database_ids) or len(sharded_results) != len(
         case.database_ids
     ):
         raise ValueError("Oracle comparison received an incomplete search set")
+    checked_batch_metrics: dict[str, dict[str, object]] = {}
+    for layout in ("monolith", "sharded"):
+        batch = search_batch_metrics.get(layout)
+        if not isinstance(batch, dict):
+            raise ValueError(f"Oracle comparison is missing {layout} batch timing")
+        wall_seconds = _metric_float(batch, "client_wall_seconds")
+        submitted_calls = batch.get("submitted_calls")
+        reused_results = batch.get("reused_results")
+        if (
+            isinstance(submitted_calls, bool)
+            or not isinstance(submitted_calls, int)
+            or submitted_calls != len(case.database_ids)
+        ):
+            raise ValueError(f"Oracle {layout} batch call count differs")
+        if (
+            isinstance(reused_results, bool)
+            or not isinstance(reused_results, int)
+            or not 0 <= reused_results <= submitted_calls
+        ):
+            raise ValueError(f"Oracle {layout} batch reuse count is invalid")
+        checked_batch_metrics[layout] = {
+            "client_wall_seconds": wall_seconds,
+            "submitted_calls": submitted_calls,
+            "executed_searches": submitted_calls - reused_results,
+            "reused_results": reused_results,
+        }
     BENCHMARK_OUTPUT_VOLUME.reload()
     contract = _assert_pinned_msa_assembly_contract()
     monolith_a3ms: dict[str, str] = {}
     sharded_a3ms: dict[str, str] = {}
     database_comparisons: dict[str, dict[str, object]] = {}
+    database_performance: dict[str, dict[str, object]] = {}
+    layout_performance: dict[str, list[dict[str, object]]] = {
+        "monolith": [],
+        "sharded": [],
+    }
     search_identities: dict[str, dict[str, str]] = {}
     monolith_non_query_hits = 0
     for database_id, monolith_result, sharded_result in zip(
@@ -7748,6 +8030,62 @@ def _run_msa_oracle_comparison(
             monolith_hits,
             sharded_hits,
         )
+        monolith_performance = _profile_search_performance(monolith_result)
+        sharded_performance = _profile_search_performance(sharded_result)
+        layout_performance["monolith"].append(monolith_performance)
+        layout_performance["sharded"].append(sharded_performance)
+        monolith_search_wall = _metric_float(
+            monolith_performance,
+            "search_wall_seconds",
+        )
+        sharded_search_wall = _metric_float(
+            sharded_performance,
+            "search_wall_seconds",
+        )
+        monolith_sample_wall = _metric_float(
+            monolith_performance,
+            "sample_wall_seconds",
+        )
+        sharded_sample_wall = _metric_float(
+            sharded_performance,
+            "sample_wall_seconds",
+        )
+        monolith_cpu = _metric_float(monolith_performance, "cpu_core_seconds")
+        sharded_cpu = _metric_float(sharded_performance, "cpu_core_seconds")
+        monolith_cost = _metric_float(
+            monolith_performance,
+            "estimated_compute_cost_usd",
+        )
+        sharded_cost = _metric_float(
+            sharded_performance,
+            "estimated_compute_cost_usd",
+        )
+        database_performance[database_id] = {
+            "monolith": monolith_performance,
+            "sharded": sharded_performance,
+            "search_wall_speedup": _oracle_performance_ratio(
+                monolith_search_wall,
+                sharded_search_wall,
+                metric=f"{database_id}.search_wall_seconds",
+            ),
+            "search_wall_reduction_fraction": (
+                1.0 - sharded_search_wall / monolith_search_wall
+            ),
+            "sample_wall_speedup": _oracle_performance_ratio(
+                monolith_sample_wall,
+                sharded_sample_wall,
+                metric=f"{database_id}.sample_wall_seconds",
+            ),
+            "sharded_to_monolith_cpu_core_seconds_ratio": (
+                sharded_cpu / monolith_cpu if monolith_cpu > 0 else None
+            ),
+            "estimated_cost_speedup": _oracle_performance_ratio(
+                monolith_cost,
+                sharded_cost,
+                metric=f"{database_id}.estimated_compute_cost_usd",
+            ),
+            "estimated_cost_change_fraction": (sharded_cost / monolith_cost - 1.0),
+        }
         monolith_identity = monolith_result.get("search_identity")
         sharded_identity = sharded_result.get("search_identity")
         if not isinstance(monolith_identity, str) or not isinstance(
@@ -7805,6 +8143,84 @@ def _run_msa_oracle_comparison(
         sharded_fields,
         name=f"{case.case_id}-sharded",
     )
+    comparison_processing_wall_seconds = perf_counter() - comparison_started
+    comparison_resource_seconds: dict[str, int | float | None] = {
+        "cpu_core_seconds": (
+            ORACLE_COMPARISON_CPU * comparison_processing_wall_seconds
+        ),
+        "memory_gib_seconds": (
+            ORACLE_COMPARISON_MEMORY_MIB / 1024 * comparison_processing_wall_seconds
+        ),
+        "estimated_billed_cpu_core_seconds": (
+            ORACLE_COMPARISON_CPU * comparison_processing_wall_seconds
+        ),
+        "estimated_billed_memory_gib_seconds": (
+            ORACLE_COMPARISON_MEMORY_MIB / 1024 * comparison_processing_wall_seconds
+        ),
+    }
+    comparison_cost_estimate = _estimate_compute_cost(
+        comparison_resource_seconds,
+        comparison_processing_wall_seconds,
+        minimum_cpu_cores=ORACLE_COMPARISON_CPU,
+        minimum_memory_gib=ORACLE_COMPARISON_MEMORY_MIB / 1024,
+    )
+    comparison_cost_estimate["metering_basis"] = (
+        "fixed-resource-request-times-in-container-processing-wall"
+    )
+    batch_speedup = _oracle_performance_ratio(
+        _metric_float(
+            checked_batch_metrics["monolith"],
+            "client_wall_seconds",
+        ),
+        _metric_float(
+            checked_batch_metrics["sharded"],
+            "client_wall_seconds",
+        ),
+        metric="search_batch.client_wall_seconds",
+    )
+    search_call_sums = {
+        layout: _summed_oracle_search_performance(records)
+        for layout, records in layout_performance.items()
+    }
+    monolith_search_cost = _metric_float(
+        search_call_sums["monolith"],
+        "estimated_compute_cost_usd_sum",
+    )
+    sharded_search_cost = _metric_float(
+        search_call_sums["sharded"],
+        "estimated_compute_cost_usd_sum",
+    )
+    comparison_cost = _metric_float(
+        comparison_cost_estimate,
+        "estimated_compute_cost_usd",
+    )
+    performance_summary: dict[str, object] = {
+        "cost_is_estimate_not_invoice": True,
+        "metering_semantics": (
+            "Modal bills each interval at the greater of the resource request "
+            "or actual use; search estimates integrate one-second cgroup "
+            "samples with the 0.125 CPU and 1 GiB request floors"
+        ),
+        "pricing_observed_date": MODAL_PRICING_OBSERVED_DATE,
+        "pricing_source": MODAL_PRICING_URL,
+        "database_comparisons": database_performance,
+        "search_batches": checked_batch_metrics,
+        "search_batch_wall_speedup": batch_speedup,
+        "search_call_sums": search_call_sums,
+        "comparison_call": {
+            "processing_wall_seconds": comparison_processing_wall_seconds,
+            "processing_wall_endpoint": "comparison-results-ready-before-publication",
+            "cpu_request": ORACLE_COMPARISON_CPU,
+            "memory_request_mib": ORACLE_COMPARISON_MEMORY_MIB,
+            "cost_estimate": comparison_cost_estimate,
+        },
+        "estimated_search_compute_cost_usd": (
+            monolith_search_cost + sharded_search_cost
+        ),
+        "estimated_oracle_compute_cost_usd": (
+            monolith_search_cost + sharded_search_cost + comparison_cost
+        ),
+    }
     summary: dict[str, object] = {
         "schema_version": 1,
         "status": "passed" if passed else "failed",
@@ -7818,6 +8234,7 @@ def _run_msa_oracle_comparison(
         "scientific_comparison_policy": MSA_ORACLE_COMPARISON_POLICY,
         "database_comparisons": database_comparisons,
         "final_msa_comparisons": final_comparisons,
+        "performance": performance_summary,
         "monolith_non_query_hits": monolith_non_query_hits,
         "rna_non_query_hit_gate_passed": rna_hit_gate,
         "completed_at": _utc_now(),
@@ -7843,8 +8260,8 @@ def _run_msa_oracle_comparison(
 
 
 @app.function(
-    cpu=2,
-    memory=4096,
+    cpu=ORACLE_COMPARISON_CPU,
+    memory=ORACLE_COMPARISON_MEMORY_MIB,
     timeout=1_800,
     max_containers=1,
     volumes={
@@ -7855,13 +8272,84 @@ def compare_msa_profile_oracle(
     case_id: str,
     monolith_results: list[dict[str, object]],
     sharded_results: list[dict[str, object]],
+    search_batch_metrics: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     """Assemble and compare one fixed protein or RNA oracle."""
     return _run_msa_oracle_comparison(
         case_id,
         monolith_results,
         sharded_results,
+        search_batch_metrics,
     )
+
+
+def _publish_oracle_client_timing(
+    result: dict[str, object],
+    *,
+    search_batch_metrics: dict[str, dict[str, object]],
+    comparison_remote_wall_seconds: float,
+    campaign_remote_wall_seconds: float,
+) -> dict[str, object]:
+    """Persist client-observed remote-call timing beside oracle evidence."""
+    output_path_value = result.get("output_path")
+    oracle_identity = result.get("oracle_identity")
+    if not isinstance(output_path_value, str) or not isinstance(
+        oracle_identity,
+        str,
+    ):
+        raise ValueError("Oracle result does not identify its output directory")
+    output_mount = Path(APP_INFO.output_dir).resolve()
+    output_path = Path(output_path_value).resolve()
+    if not output_path.is_relative_to(output_mount):
+        raise ValueError("Oracle output path escapes the output Volume")
+    output_relpath = output_path.relative_to(output_mount).as_posix()
+    search_remote_calls = 0
+    for batch in search_batch_metrics.values():
+        submitted_calls = batch.get("submitted_calls")
+        if isinstance(submitted_calls, bool) or not isinstance(
+            submitted_calls,
+            int,
+        ):
+            raise ValueError("Oracle client timing has an invalid call count")
+        search_remote_calls += submitted_calls
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "oracle_identity": oracle_identity,
+        "observed_at": _utc_now(),
+        "timing_observer": "local-entrypoint-perf-counter",
+        "search_batches": search_batch_metrics,
+        "comparison_remote_wall_seconds": comparison_remote_wall_seconds,
+        "campaign_remote_wall_seconds": campaign_remote_wall_seconds,
+        "remote_calls": search_remote_calls + 1,
+        "cost_basis": (
+            "Remote wall includes queueing and container initialization; cost "
+            "estimates use in-container resource telemetry instead"
+        ),
+    }
+    receipt_bytes = _json_bytes(receipt)
+    receipt_relpath = f"{output_relpath}/client-timing.json"
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        receipt_relpath,
+        receipt_bytes,
+    )
+    marker = {
+        "schema_version": 1,
+        "status": "complete",
+        "oracle_identity": oracle_identity,
+        "completed_at": _utc_now(),
+        "artifact": {
+            "path": "client-timing.json",
+            "size_bytes": len(receipt_bytes),
+            "sha256": _sha256_bytes(receipt_bytes),
+        },
+    }
+    _upload_volume_bytes(
+        BENCHMARK_OUTPUT_VOLUME,
+        f"{output_relpath}/client-timing.done.json",
+        _json_bytes(marker),
+    )
+    return receipt | {"path": receipt_relpath}
 
 
 @app.local_entrypoint()
@@ -7947,19 +8435,53 @@ def submit_alphafold3_msa_task(
     elif operation == "validate-oracle":
         case = _msa_oracle_case(oracle_case)
         inputs = [(database_id, case.sequence) for database_id in case.database_ids]
+        campaign_remote_started = perf_counter()
         print(
             "🧬 Submitting the fixed monolithic current-pipeline "
             f"{case.case_id} searches..."
         )
+        monolith_started = perf_counter()
         monolith_results = list(search_unsharded_database_oracle.starmap(inputs))
+        monolith_wall_seconds = perf_counter() - monolith_started
         print(f"🧬 Submitting the fixed sharded {case.case_id} searches...")
+        sharded_started = perf_counter()
         sharded_results = list(search_database_profile.starmap(inputs))
+        sharded_wall_seconds = perf_counter() - sharded_started
+        search_batch_metrics: dict[str, dict[str, object]] = {
+            "monolith": {
+                "client_wall_seconds": monolith_wall_seconds,
+                "submitted_calls": len(monolith_results),
+                "reused_results": sum(
+                    str(search.get("status", "")).startswith("reused")
+                    for search in monolith_results
+                ),
+            },
+            "sharded": {
+                "client_wall_seconds": sharded_wall_seconds,
+                "submitted_calls": len(sharded_results),
+                "reused_results": sum(
+                    str(search.get("status", "")).startswith("reused")
+                    for search in sharded_results
+                ),
+            },
+        }
         print("🧬 Submitting the upstream assembly and scientific comparison...")
+        comparison_remote_started = perf_counter()
         result = compare_msa_profile_oracle.remote(
             case_id=case.case_id,
             monolith_results=monolith_results,
             sharded_results=sharded_results,
+            search_batch_metrics=search_batch_metrics,
         )
+        comparison_remote_wall_seconds = perf_counter() - comparison_remote_started
+        campaign_remote_wall_seconds = perf_counter() - campaign_remote_started
+        client_timing = _publish_oracle_client_timing(
+            result,
+            search_batch_metrics=search_batch_metrics,
+            comparison_remote_wall_seconds=comparison_remote_wall_seconds,
+            campaign_remote_wall_seconds=campaign_remote_wall_seconds,
+        )
+        result = result | {"client_timing": client_timing}
     elif operation == "scan":
         print("🧬 Submitting the sequential Volume scan matrix...")
         result = _submit_scan_matrix()

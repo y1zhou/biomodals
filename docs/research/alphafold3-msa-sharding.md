@@ -353,6 +353,12 @@ Volume's `/profiles/` directory contains exactly one published directory per
 genetic database. Run the protein and RNA oracle comparisons only after that
 cleanup barrier.
 
+That barrier passed on 2026-07-24. A read-only Sandbox found exactly the seven
+fixed profile directories, an empty `.staging` directory, and no `.orphaned`
+directory. The final `mgnify-512-v1` build preserved all 623,796,864 records
+and produced an exact source/shard canonical full-record multiset match. The
+protein and RNA search oracles are now the next validation gate.
+
 The manifest should contain, for each logical database:
 
 - source filename, snapshot/date, byte size, digest, record count, and residue

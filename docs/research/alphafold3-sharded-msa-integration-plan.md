@@ -79,13 +79,14 @@ recipe version, SeqKit version and seed, and compatibility pins. Protein Z and
 domZ are the validated source sequence count. RNA Z is the validated total
 nucleotide count divided by 1,000,000.
 
-The completed `small-bfd-64-v1` benchmark profile remains available only until
-all seven production candidates pass their profile validation.
-`small-bfd-64-v2` is a new production candidate because its published payload
-omits the monolithic source and its shuffled FASTA stays under `/tmp`. After
-validation, remove the v1 profile and abandoned staging generations so
-`/profiles/` contains exactly the seven fixed profile directories listed above.
-Run the protein and RNA scientific oracles only after that cleanup barrier.
+The completed `small-bfd-64-v1` profile was a benchmark-only predecessor to
+`small-bfd-64-v2`, whose published payload omits the monolithic source and
+whose shuffled FASTA stays under `/tmp`. After all seven production candidates
+passed validation, a read-only Sandbox inventory on 2026-07-24 confirmed that
+`/profiles/` contains exactly the seven fixed directories listed above. The
+obsolete v1 profile is absent, `.staging` is empty, and `.orphaned` does not
+exist. The protein and RNA scientific oracles are the next cost-incurring
+gate.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never
@@ -171,12 +172,11 @@ requirement from the unrounded source size and measured record count before
 creating local payloads.
 
 The same inventory found all seven required uncompressed source FASTAs.
-Durable `production-candidates/profile-builds/` evidence currently exists for
-`small-bfd-64-v2`, `rfam-16-v1`, `rnacentral-64-v1`,
-`uniref90-128-v1`, `uniprot-256-v1`, and `nt-rna-256-v1`. There is not yet
-build evidence for `mgnify-512-v1`; it may not be counted as ready until its
-builder publishes and validates a manifest. The final sharded-Volume inventory
-and removal of obsolete profiles remain a separate post-build Sandbox gate.
+Durable `production-candidates/profile-builds/` evidence exists for all seven
+fixed profiles: `small-bfd-64-v2`, `mgnify-512-v1`, `rfam-16-v1`,
+`rnacentral-64-v1`, `uniref90-128-v1`, `uniprot-256-v1`, and
+`nt-rna-256-v1`. The final read-only Sandbox inventory found no obsolete
+profile, abandoned staging generation, or orphaned profile requiring cleanup.
 
 Generation `44178e3a52864732b330491758d10d8f` republished
 `small-bfd-64-v2` on 2026-07-24 after the mature C helpers and shared Python
@@ -202,6 +202,16 @@ multisets matched. The durable completion marker binds manifest SHA-256
 `65c031c30fa49f300de25d2d9b55a6c467770cda5cf32fc45684fa1f5b8b33ed`;
 the remote worker completed in 32 minutes 31 seconds, and the local Modal
 invocation completed in 33 minutes 5 seconds.
+
+Generation `660774ec2a9d4008bef5f3334ef909d1` published
+`mgnify-512-v1` on 2026-07-24. The builder preserved all 623,796,864 record
+occurrences and 114,578,946,467 residues, recovered no records, and measured
+0.3403% maximum shard residue imbalance. The 128.580 GB source and 130.166 GB
+shard union produced the same canonical full-record signature,
+`cbd27240746abf41258fdf5cd173567142fb8bfa81051372c4da74a561fb49be`.
+The claim-to-completion interval was 1 hour 7 minutes 35.758 seconds. Its
+manifest SHA-256 is
+`0f7236eeb26fe29032b2094511b797f916a7c515a9378cd2ef4fa4b09be8cc46`.
 
 ## Search cache layout
 

@@ -516,10 +516,61 @@ FAI. The occurrence-indexed implementation recovered zero records because no
 occurrence was discarded in the first place. This result therefore validates
 the refactored construction path and eliminates the known duplicate-ID
 omission mechanism. It does not replace the end-to-end protein and RNA MSA
-search oracles, which remain scheduled after the final MGnify profile and
-inventory gate.
+search oracles. The final MGnify profile and inventory gates have now passed,
+so those oracles are the next cost-incurring validation step.
 
 Durable evidence is under
 `production-candidates/profile-builds/small-bfd-64-v2/`
 `44178e3a52864732b330491758d10d8f/` on
+`AlphaFold3-MSA-Benchmark-outputs`.
+
+### Final recipe-v5 builder: MGnify
+
+Generation `660774ec2a9d4008bef5f3334ef909d1` published
+`mgnify-512-v1` on 2026-07-24 with source policy `keep`. The claim ran from
+07:52:46.256 to 09:00:22.014 UTC, or 4,055.758 seconds
+(1h 07m 35.758s).
+
+| Stage | Duration or rate |
+|---|---:|
+| source `seqkit stats` | 505.443s (8m 25.443s) |
+| source SHA-256 and shuffle setup | 130.723s |
+| first pass: Volume read plus local-source tee and occurrence index | 150.550s; 854.066 MB/s |
+| Fisher--Yates permutation | 23.495s |
+| second pass: eight ordered local-SSD `pread` workers | 1,507.247s (25m 07.247s); 85.308 MB/s |
+| staged-source SHA-256 verification | 95.302s |
+| `split2` to 512 Volume shards | 1,158.053s (19m 18.053s) |
+| source full-record validator | 812.756s (13m 32.756s); 158.202 MB/s |
+| 512-shard full-record validator, eight threads | 160.347s; 811.776 MB/s |
+| overlapping split and validator stage | 1,319.231s (21m 59.231s) |
+
+The source contained 623,796,864 records, 114,578,946,467 residues,
+12,129,365,959 header bytes, and 128,579,703,018 physical bytes. The 512
+shards occupied 130,165,736,027 physical bytes after SeqKit rewrapping.
+Source and shard scans matched every aggregate lane and produced canonical
+signature SHA-256:
+
+```text
+cbd27240746abf41258fdf5cd173567142fb8bfa81051372c4da74a561fb49be
+```
+
+No duplicate-header record required recovery. Maximum shard residue imbalance
+was 0.3403%, and the staged copy matched source SHA-256
+`9e7f50956c19cbcd8181dc5e9d7d6eebc08257cc858fc07d3ec88fd6b48dbbc9`.
+The published manifest SHA-256 is
+`0f7236eeb26fe29032b2094511b797f916a7c515a9378cd2ef4fa4b09be8cc46`.
+
+The ordered second pass averaged 85.308 MB/s despite MGnify's 623.8 million
+short records, approximately 44 times the abandoned stock SeqKit observation
+of 1.94 MB/s. This confirms that the occurrence-indexed C implementation
+remains practical for the largest official AlphaFold 3 database under the
+256 GiB memory ceiling.
+
+A final read-only Sandbox inventory found exactly the seven fixed profile
+directories under `/profiles/`, an empty `.staging` directory, and no
+`.orphaned` directory. No cleanup mutation was required.
+
+Durable evidence is under
+`production-candidates/profile-builds/mgnify-512-v1/`
+`660774ec2a9d4008bef5f3334ef909d1/` on
 `AlphaFold3-MSA-Benchmark-outputs`.

@@ -475,14 +475,28 @@ The app-owned adapter constructs combined alignments in pinned upstream order:
 - protein paired: UniProt without cross-database deduplication;
 - RNA unpaired: RFam, RNAcentral, then NT-RNA with deduplication.
 
-RNA profile selection is gated by the documented 25-nucleotide query:
+The first RNA fixture was the 25-nucleotide query:
 
 ```text
 GGCCCGAUAGCUCAGUCGGUAGAGC
 ```
 
-The monolithic result must contain at least one non-query hit. Otherwise a
-longer documented RNA query must replace the fixture before the gate can pass.
+It returned no non-query hit from RFam, RNAcentral, or NT-RNA. Its monolithic
+and sharded query-only A3Ms matched, but that result does not exercise hit
+merging or deduplication and therefore cannot promote the RNA profiles.
+
+The replacement gate uses the following 121-nucleotide sequence from the
+official RFam 14.9 source record
+`ALWZ042362541.1/2041-2161` (with `T` represented as `U` for the AlphaFold RNA
+alphabet):
+
+```text
+GUGCAUGCCUAUAGCAUAUCAUUAAUGCACCAGAUCCCAUUAUAACUCCUCAUGUAAGCGUGCUCGAGAUAGAUUAGUACUGGGAUGGUUGACUGCAAAGGAAGUCUUAGUGUUUUACAUG
+```
+
+Because this is an exact member of the source database, the monolithic RFam
+result must contain at least one non-query hit. The gate still fails if it
+does not.
 
 For RFam, RNAcentral, and NT-RNA separately, the oracle compares monolithic and
 sharded identities, scores, E-values, and aligned-sequence multisets using the

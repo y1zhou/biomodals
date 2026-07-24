@@ -44,9 +44,67 @@ The small-BFD Phase 1 campaign established:
   bottleneck;
 - copying a full database to ephemeral SSD is not justified.
 
-That evidence does not establish RNA equivalence or validate every official
-database profile. The RNA and integrated-pipeline gates below remain mandatory
+The generic builder subsequently validated and published all seven official
+profiles. The protein scientific oracle has passed across the four protein
+databases. The first RNA fixture returned no hits and was rejected; the
+hit-bearing RNA gate and integrated-pipeline gates below remain mandatory
 before the corresponding production paths are considered complete.
+
+### Scientific oracle evidence
+
+The 120-residue pembrolizumab VH oracle passed on 2026-07-24. Every monolithic
+and sharded database hit-row multiset was equal, and every ordering difference
+was confined to an exact E-value/bit-score tie block. The final unpaired and
+paired A3M record multisets were equal at depths 10,600 and 23,249,
+respectively.
+
+The database calls ran concurrently, so per-call times below are not summed
+campaign elapsed times. Cost is a per-search estimate from one-second CPU
+cgroup samples and the one-GiB requested-memory floor at the Modal rates
+observed on 2026-07-24. It is useful for database-to-database comparison but is
+not an invoice.
+
+| Database | Monolith search | Sharded search | Speedup | Monolith CPU-s | Sharded CPU-s | Monolith estimated cost | Sharded estimated cost | Hit rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MGnify | 3,074.5 s | 412.0 s | 7.46x | 7,721 | 10,096 | $0.1080 | $0.1332 | 594 |
+| small BFD | 247.8 s | 31.0 s | 7.99x | 774 | 914 | $0.0107 | $0.0120 | 142 |
+| UniProt | 1,609.3 s | 605.2 s | 2.66x | 4,175 | 12,430 | $0.0583 | $0.1642 | 23,248 |
+| UniRef90 | 1,326.6 s | 113.4 s | 11.70x | 3,280 | 3,195 | $0.0459 | $0.0421 | 9,999 |
+
+The concurrent critical path fell from 3,074.5 seconds to 605.2 seconds, a
+5.08-fold speedup. Summed successful-search estimates rose from $0.2229 to
+$0.3515 because the low-latency topology uses more aggregate CPU, especially
+for UniProt.
+
+The Modal hourly billing report attributes $0.48946 to the main fresh protein
+app. Including the initial failed attempt that exposed invalid empty-A3M
+handling and the cached comparison retry gives a total campaign bill of
+$0.53402:
+
+| Protein app | Outcome | Shell elapsed | CPU bill | Memory bill | Total bill |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Initial attempt | Failed; prompted empty-A3M fix | 4m41s | $0.04091 | $0.00227 | $0.04318 |
+| Fresh search attempt | Search evidence completed; comparison telemetry bug | 1h11m35s | $0.47014 | $0.01932 | $0.48946 |
+| Cached comparison retry | Scientific gate passed | 1m01s | $0.00078 | $0.00060 | $0.00138 |
+
+The original 25-nucleotide RNA fixture produced zero non-query hits in all
+three monolithic searches. Its query-only results matched, but the explicit
+non-query-hit gate correctly rejected it because it could not test RNA hit
+merging or deduplication. Its successful-attempt search timings remain useful
+only as performance diagnostics:
+
+| Database | Monolith search | Sharded search | Speedup | Monolith estimated cost | Sharded estimated cost | Hit rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NT-RNA | 1,968.2 s | 258.8 s | 7.61x | $0.1130 | $0.0881 | 0 |
+| RFam | 5.2 s | 2.5 s | 2.10x | $0.0005 | $0.0007 | 0 |
+| RNAcentral | 262.8 s | 60.7 s | 4.33x | $0.0195 | $0.0245 | 0 |
+
+A sharded NT-RNA preemption made the client-observed sharded batch take
+3,280.4 seconds even though its restarted successful attempt took 258.8
+seconds. The app's exact bill was $0.54123, versus a $0.24646
+successful-attempt estimate. This is why final reports keep platform-billed
+campaign cost, client-observed latency, and successful-attempt telemetry as
+separate measurements.
 
 ## Stores and immutable database registry
 
@@ -480,8 +538,9 @@ in scope.
 
 Commit: `fold: add RNA sharding oracle`
 
-- use the upstream documented 25-nt query
-  `GGCCCGAUAGCUCAGUCGGUAGAGC`;
+- retain the 25-nucleotide query as a rejected query-only negative control;
+- use the official RFam 14.9 record `ALWZ042362541.1/2041-2161` as the
+  hit-bearing 121-nucleotide gate;
 - require at least one non-query monolithic hit;
 - compare monolithic and sharded RFam, RNAcentral, and NT-RNA searches using
   the same full-database Z;

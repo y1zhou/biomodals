@@ -38,6 +38,7 @@ import socket
 import subprocess
 import tempfile
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -128,6 +129,9 @@ RECORD_MULTISET_CANONICALIZATION = (
     "full-header-and-sequence-case-sensitive-line-ending-independent-v1"
 )
 RECORD_MULTISET_AGGREGATE = "sha256-lane-sum-xor-and-square-sum-with-counts-v1"
+MSA_ORACLE_COMPARISON_POLICY = (
+    "full-hit-rows-exact-modulo-contiguous-evalue-bit-score-ties-v1"
+)
 UNIPROT_V4_VALIDATION_BASELINE = {
     "source_seqkit_sum_seconds": 338.390180,
     "post_shard_stats_to_completion_seconds": 2242.917015,
@@ -9440,11 +9444,14 @@ def _msa_oracle_plan(case_id: str) -> dict[str, object]:
             "sharded_active_shards": PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
         },
         "scientific_gate": {
+            "policy": MSA_ORACLE_COMPARISON_POLICY,
             "per_database": [
                 "hit identities",
+                "descriptions",
                 "E-values",
                 "bit scores",
                 "aligned sequences",
+                "hit multiplicities",
             ],
             "final_fields": (
                 ["unpairedMsa", "pairedMsa"]
@@ -9452,6 +9459,7 @@ def _msa_oracle_plan(case_id: str) -> dict[str, object]:
                 else ["unpairedMsa"]
             ),
             "equal_score_permutations": "equivalent",
+            "all_other_row_differences": "fail",
             "rna_requires_non_query_monolithic_hit": case.polymer == "rna",
         },
         "inference": False,
@@ -9505,119 +9513,107 @@ def _compare_profile_hit_rows(
     oracle_rows: list[dict[str, object]],
     candidate_rows: list[dict[str, object]],
 ) -> dict[str, object]:
-    """Compare one database while allowing only characterized tail effects."""
-    oracle_unique = _unique_hit_rows(oracle_rows)
-    candidate_unique = _unique_hit_rows(candidate_rows)
-    oracle_ids = [str(row["target_id"]) for row in oracle_unique]
-    candidate_ids = [str(row["target_id"]) for row in candidate_unique]
-    top_width = min(100, max(len(oracle_ids), len(candidate_ids)))
-    top_hits_exact = oracle_ids[:top_width] == candidate_ids[:top_width]
-    top_hits_tie_equivalent = _top_hits_tie_equivalent(
-        oracle_unique[:top_width],
-        candidate_unique[:top_width],
-    )
-    oracle_by_id = {str(row["target_id"]): row for row in oracle_unique}
-    candidate_by_id = {str(row["target_id"]): row for row in candidate_unique}
-    shared_ids = set(oracle_by_id) & set(candidate_by_id)
-    score_mismatches = sorted(
-        target_id
-        for target_id in shared_ids
-        if (
-            oracle_by_id[target_id]["e_value_text"],
-            oracle_by_id[target_id]["bit_score_text"],
+    """Compare every scientific hit field, permitting exact-score tie order."""
+
+    def score_key(row: dict[str, object]) -> tuple[str, str]:
+        return str(row["e_value_text"]), str(row["bit_score_text"])
+
+    def row_identity(row: dict[str, object]) -> tuple[str, str, str]:
+        return (
+            str(row["target_id"]),
+            str(row["description"]),
+            str(row["aligned_sequence"]),
         )
-        != (
-            candidate_by_id[target_id]["e_value_text"],
-            candidate_by_id[target_id]["bit_score_text"],
-        )
+
+    def row_key(
+        row: dict[str, object],
+    ) -> tuple[tuple[str, str], tuple[str, str, str]]:
+        return score_key(row), row_identity(row)
+
+    def tie_blocks(
+        rows: list[dict[str, object]],
+    ) -> list[tuple[tuple[str, str], tuple[tuple[str, str, str], ...]]]:
+        blocks: list[tuple[tuple[str, str], tuple[tuple[str, str, str], ...]]] = []
+        current_score: tuple[str, str] | None = None
+        current_rows: list[tuple[str, str, str]] = []
+        for row in rows:
+            score = score_key(row)
+            if current_score is not None and score != current_score:
+                blocks.append((current_score, tuple(sorted(current_rows))))
+                current_rows = []
+            current_score = score
+            current_rows.append(row_identity(row))
+        if current_score is not None:
+            blocks.append((current_score, tuple(sorted(current_rows))))
+        return blocks
+
+    def difference_examples(
+        differences: Counter[tuple[tuple[str, str], tuple[str, str, str]]],
+    ) -> list[dict[str, object]]:
+        examples: list[dict[str, object]] = []
+        for (score, identity), count in differences.most_common(20):
+            target_id, description, aligned_sequence = identity
+            examples.append({
+                "target_id": target_id,
+                "description": description,
+                "aligned_sequence_sha256": _sha256_bytes(aligned_sequence.encode()),
+                "e_value_text": score[0],
+                "bit_score_text": score[1],
+                "count": count,
+            })
+        return examples
+
+    oracle_keys = [row_key(row) for row in oracle_rows]
+    candidate_keys = [row_key(row) for row in candidate_rows]
+    oracle_counter = Counter(oracle_keys)
+    candidate_counter = Counter(candidate_keys)
+    oracle_only_rows = oracle_counter - candidate_counter
+    candidate_only_rows = candidate_counter - oracle_counter
+    oracle_target_counts = Counter(str(row["target_id"]) for row in oracle_rows)
+    candidate_target_counts = Counter(str(row["target_id"]) for row in candidate_rows)
+    oracle_targets = set(oracle_target_counts)
+    candidate_targets = set(candidate_target_counts)
+    target_union = oracle_targets | candidate_targets
+    target_jaccard = (
+        len(oracle_targets & candidate_targets) / len(target_union)
+        if target_union
+        else 1.0
     )
-    sequence_mismatches = sorted(
-        target_id
-        for target_id in shared_ids
-        if oracle_by_id[target_id]["normalized_sequence_sha256"]
-        != candidate_by_id[target_id]["normalized_sequence_sha256"]
-    )
-    oracle_set = set(oracle_ids)
-    candidate_set = set(candidate_ids)
-    union = oracle_set | candidate_set
-    overlap = len(oracle_set & candidate_set) / len(union) if union else 1.0
-    oracle_only = [
-        target_id for target_id in oracle_ids if target_id not in candidate_set
-    ]
-    candidate_only = [
-        target_id for target_id in candidate_ids if target_id not in oracle_set
-    ]
-    candidate_duplicate_rows = len(candidate_rows) - len(candidate_unique)
-    both_reached_limit = (
-        len(oracle_rows) == spec.max_sequences - 1
-        and len(candidate_rows) == spec.max_sequences - 1
-    )
-    oracle_positions = {
-        target_id: position for position, target_id in enumerate(oracle_ids, start=1)
-    }
-    oracle_tail_start = len(oracle_ids) - candidate_duplicate_rows + 1
-    duplicate_tail_only = (
-        bool(oracle_only)
-        and not candidate_only
-        and both_reached_limit
-        and 0 < candidate_duplicate_rows <= spec.shard_count
-        and all(
-            oracle_positions[target_id] >= oracle_tail_start
-            for target_id in oracle_only
-        )
-        and any(row.get("cross_shard_duplicate") is True for row in candidate_rows)
-    )
-    identifiers_equivalent = (
-        not oracle_only and not candidate_only
-    ) or duplicate_tail_only
-    full_order_tie_equivalent = (
-        not oracle_only
-        and not candidate_only
-        and _top_hits_tie_equivalent(oracle_unique, candidate_unique)
-    )
-    order_equivalent = (
-        full_order_tie_equivalent
-        if not oracle_only and not candidate_only
-        else top_hits_tie_equivalent and duplicate_tail_only
-    )
-    passed = (
-        order_equivalent
-        and not score_mismatches
-        and not sequence_mismatches
-        and overlap >= 0.99
-        and identifiers_equivalent
-    )
+    exact_row_order = oracle_keys == candidate_keys
+    row_multiset_equal = oracle_counter == candidate_counter
+    full_order_tie_equivalent = tie_blocks(oracle_rows) == tie_blocks(candidate_rows)
+    passed = full_order_tie_equivalent
     return {
         "database_id": spec.database_id,
+        "scientific_comparison_policy": MSA_ORACLE_COMPARISON_POLICY,
         "passed": passed,
-        "top_comparison_width": top_width,
-        "top_hits_exact": top_hits_exact,
-        "top_hits_tie_equivalent": top_hits_tie_equivalent,
-        "top_order_differs_only_within_ties": (
-            top_hits_tie_equivalent and not top_hits_exact
-        ),
+        "exact_row_order": exact_row_order,
+        "row_multiset_equal": row_multiset_equal,
         "full_order_tie_equivalent": full_order_tie_equivalent,
+        "order_differs_only_within_equal_score_blocks": (
+            full_order_tie_equivalent and not exact_row_order
+        ),
         "oracle_hit_rows": len(oracle_rows),
         "candidate_hit_rows": len(candidate_rows),
-        "oracle_unique_hits": len(oracle_ids),
-        "candidate_unique_hits": len(candidate_ids),
-        "full_unique_hit_jaccard": overlap,
-        "score_mismatch_count": len(score_mismatches),
-        "score_mismatch_ids": score_mismatches,
-        "sequence_mismatch_count": len(sequence_mismatches),
-        "sequence_mismatch_ids": sequence_mismatches,
-        "oracle_only_ids": oracle_only,
-        "candidate_only_ids": candidate_only,
-        "candidate_duplicate_hit_rows": candidate_duplicate_rows,
-        "both_results_reached_hit_limit": both_reached_limit,
-        "differences_characterized_as_duplicate_tail": duplicate_tail_only,
+        "oracle_unique_targets": len(oracle_targets),
+        "candidate_unique_targets": len(candidate_targets),
+        "unique_target_jaccard": target_jaccard,
+        "target_multiplicities_equal": (
+            oracle_target_counts == candidate_target_counts
+        ),
+        "oracle_only_row_count": sum(oracle_only_rows.values()),
+        "candidate_only_row_count": sum(candidate_only_rows.values()),
+        "oracle_only_row_examples": difference_examples(oracle_only_rows),
+        "candidate_only_row_examples": difference_examples(candidate_only_rows),
+        "oracle_duplicate_target_rows": (len(oracle_rows) - len(oracle_targets)),
+        "candidate_duplicate_target_rows": (
+            len(candidate_rows) - len(candidate_targets)
+        ),
     }
 
 
 def _compare_final_a3m(oracle: str, candidate: str) -> dict[str, object]:
     """Compare final upstream-assembled A3Ms modulo record permutation."""
-    from collections import Counter
-
     oracle_records = _parse_a3m_records(oracle)
     candidate_records = _parse_a3m_records(candidate)
     query_equal = oracle_records[0] == candidate_records[0]
@@ -9846,6 +9842,7 @@ def _run_msa_oracle_comparison(
         "oracle_identity": oracle_identity,
         "search_identities": search_identities,
         "assembly_contract": contract,
+        "scientific_comparison_policy": MSA_ORACLE_COMPARISON_POLICY,
         "database_comparisons": database_comparisons,
         "final_msa_comparisons": final_comparisons,
         "monolith_non_query_hits": monolith_non_query_hits,

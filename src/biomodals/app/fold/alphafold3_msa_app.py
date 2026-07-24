@@ -19,8 +19,10 @@ written to ``AlphaFold3-MSA-Benchmark-outputs``.
 
 The production-candidate operations build seven fixed immutable profiles
 without copying their monolithic sources into the sharded Volume. They stage
-the shuffled FASTA under ``/tmp``, leave SeqKit's index beside the source, and
-retain only shards, validation evidence, and a manifest-last publication.
+the shuffled FASTA and a compact occurrence-offset index under ``/tmp``. A
+pinned native two-pass helper preserves duplicate headers and uses bounded
+concurrent reads without copying the source. Only shards, validation evidence,
+and a manifest-last publication remain on the sharded Volume.
 """
 
 from __future__ import annotations
@@ -105,7 +107,7 @@ _FAI_DUPLICATE_WARNING = re.compile(
 )
 
 PRODUCTION_PROFILE_SCHEMA_VERSION = 2
-PRODUCTION_PROFILE_RECIPE_VERSION = 3
+LEGACY_PRODUCTION_PROFILE_RECIPE_VERSION = 3
 ORDINAL_SHUFFLER_RECIPE_VERSION = 4
 PRODUCTION_PROFILE_ROOT = "profiles"
 PRODUCTION_PREPARATION_ROOT = "production-candidates/profile-builds"
@@ -171,6 +173,7 @@ struct index_header {
     uint64_t magic;
     uint64_t version;
     uint64_t source_size;
+    uint64_t output_size;
     uint64_t record_count;
     uint64_t maximum_record_size;
 };
@@ -186,6 +189,7 @@ struct read_task {
     uint64_t source_offset;
     size_t length;
     size_t destination_offset;
+    bool append_newline;
 };
 
 struct read_pool {
@@ -407,12 +411,16 @@ static struct index_header build_offset_index(
     if (record_count == 0) {
         fail_message("source contains no FASTA records");
     }
-    uint64_t final_record_size = source_size - last_record_offset;
-    if (final_record_size == 0) {
+    uint64_t final_source_record_size = source_size - last_record_offset;
+    if (final_source_record_size == 0) {
         fail_message("final FASTA record is empty");
     }
-    if (final_record_size > maximum_record_size) {
-        maximum_record_size = final_record_size;
+    bool append_final_newline = previous_byte != '\n';
+    uint64_t final_output_record_size = (
+        final_source_record_size + (append_final_newline ? 1U : 0U)
+    );
+    if (final_output_record_size > maximum_record_size) {
+        maximum_record_size = final_output_record_size;
     }
     append_offset(&writer, source_size);
     flush_offsets(&writer);
@@ -433,6 +441,7 @@ static struct index_header build_offset_index(
     header.magic = INDEX_MAGIC;
     header.version = INDEX_VERSION;
     header.source_size = source_size;
+    header.output_size = source_size + (append_final_newline ? 1U : 0U);
     header.record_count = record_count;
     header.maximum_record_size = maximum_record_size;
     pwrite_all(index_fd, &header, sizeof(header), 0);
@@ -561,6 +570,11 @@ static void *read_worker(void *argument) {
                 completed += (size_t)read_size;
                 remaining -= (size_t)read_size;
             }
+            if (!atomic_load(&pool->failed) && task->append_newline) {
+                pool->buffer[
+                    task->destination_offset + task->length
+                ] = '\n';
+            }
         }
         (void)pthread_barrier_wait(&pool->finish_barrier);
     }
@@ -688,19 +702,27 @@ static uint64_t shuffle_to_output(
             if (finish <= start || finish - start > SIZE_MAX) {
                 fail_message("invalid record span in offset index");
             }
-            size_t record_size = (size_t)(finish - start);
+            size_t source_record_size = (size_t)(finish - start);
+            bool append_newline = (
+                (uint64_t)ordinal + 1 == header->record_count
+                && header->output_size > header->source_size
+            );
+            size_t output_record_size = (
+                source_record_size + (append_newline ? 1U : 0U)
+            );
             if (
                 task_count > 0
-                && record_size > prefetch_bytes - batch_bytes
+                && output_record_size > prefetch_bytes - batch_bytes
             ) {
                 break;
             }
             tasks[task_count] = (struct read_task){
                 .source_offset = start,
-                .length = record_size,
+                .length = source_record_size,
                 .destination_offset = batch_bytes,
+                .append_newline = append_newline,
             };
-            batch_bytes += record_size;
+            batch_bytes += output_record_size;
             task_count += 1;
         }
         if (task_count == 0 || batch_bytes == 0 || batch_bytes > buffer_size) {
@@ -872,6 +894,7 @@ int main(int argc, char **argv) {
         mapped_header->magic != INDEX_MAGIC
         || mapped_header->version != INDEX_VERSION
         || mapped_header->source_size != header.source_size
+        || mapped_header->output_size != header.output_size
         || mapped_header->record_count != header.record_count
     ) {
         fail_message("mapped index header is invalid");
@@ -900,7 +923,7 @@ int main(int argc, char **argv) {
     if (output_fd < 0) {
         fail_errno("open output");
     }
-    if (posix_fallocate(output_fd, 0, (off_t)header.source_size) != 0) {
+    if (posix_fallocate(output_fd, 0, (off_t)header.output_size) != 0) {
         fail_message("failed to preallocate output");
     }
     if (lseek(output_fd, 0, SEEK_SET) < 0) {
@@ -921,8 +944,8 @@ int main(int argc, char **argv) {
         &peak_batch_bytes
     );
     double second_pass_seconds = monotonic_seconds() - second_pass_started;
-    if (output_bytes != header.source_size) {
-        fail_message("output byte count does not match source size");
+    if (output_bytes != header.output_size) {
+        fail_message("output byte count does not match normalized output size");
     }
     if (close(output_fd) != 0) {
         fail_errno("close output");
@@ -957,6 +980,7 @@ int main(int argc, char **argv) {
     printf(
         "{\"schema_version\":1,\"version\":\"%s\","
         "\"source_size_bytes\":%" PRIu64 ","
+        "\"output_size_bytes\":%" PRIu64 ","
         "\"record_count\":%" PRIu64 ","
         "\"offset_index_size_bytes\":%zu,"
         "\"permutation_size_bytes\":%" PRIu64 ","
@@ -970,6 +994,7 @@ int main(int argc, char **argv) {
         "\"second_pass_seconds\":%.6f}\n",
         PROGRAM_VERSION,
         header.source_size,
+        header.output_size,
         header.record_count,
         expected_index_size,
         header.record_count * sizeof(uint32_t),
@@ -1676,11 +1701,16 @@ def _run_ordinal_two_pass_shuffle(
         raise ValueError("Native shuffler returned invalid metrics JSON") from exc
     if not isinstance(metrics, dict):
         raise ValueError("Native shuffler metrics must be a JSON object")
+    source_size = source_path.stat().st_size
+    with source_path.open("rb") as source:
+        source.seek(-1, os.SEEK_END)
+        output_size = source_size + (source.read(1) != b"\n")
     expected_metrics = {
         "schema_version": 1,
         "version": ORDINAL_SHUFFLER_VERSION,
         "record_count": expected_records,
-        "source_size_bytes": source_path.stat().st_size,
+        "source_size_bytes": source_size,
+        "output_size_bytes": output_size,
         "seed": SHARD_RANDOM_SEED,
         "threads": threads,
         "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
@@ -1692,7 +1722,7 @@ def _run_ordinal_two_pass_shuffle(
                 f"Native shuffler metric {key!r} is {metrics.get(key)!r}, "
                 f"expected {expected!r}"
             )
-    if metrics.get("offset_index_size_bytes") != 40 + (expected_records + 1) * 8:
+    if metrics.get("offset_index_size_bytes") != 48 + (expected_records + 1) * 8:
         raise ValueError("Native shuffler offset index has an unexpected size")
     if metrics.get("permutation_size_bytes") != expected_records * 4:
         raise ValueError("Native shuffler permutation has an unexpected size")
@@ -1706,8 +1736,8 @@ def _run_ordinal_two_pass_shuffle(
         if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
             raise ValueError(f"Native shuffler metric {key!r} is invalid")
     _require_regular_file(shuffled_path)
-    if shuffled_path.stat().st_size != source_path.stat().st_size:
-        raise ValueError("Native shuffler output size does not match its source")
+    if shuffled_path.stat().st_size != output_size:
+        raise ValueError("Native shuffler output size is not normalized")
     published_metrics = metrics | {
         "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
         "index_identity": "uint64-source-occurrence-offsets-v1",
@@ -2583,16 +2613,26 @@ def _production_profile_plan(
         },
         "scratch": {
             "shuffle": str(PRODUCTION_SCRATCH_ROOT),
-            "seqkit_index": (
-                f"{SOURCE_DB_VOLUME_NAME}/{spec.source_filename}.seqkit.fai"
-            ),
+            "occurrence_index": str(PRODUCTION_SCRATCH_ROOT),
+            "permutation": "memory",
             "raw_shards": SHARDED_DB_VOLUME_NAME,
+        },
+        "shuffle": {
+            "version": ORDINAL_SHUFFLER_VERSION,
+            "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
+            "passes": 2,
+            "record_identity": "source-occurrence",
+            "random_seed": SHARD_RANDOM_SEED,
+            "permutation": "splitmix64-fisher-yates-u32-v1",
+            "worker_threads": threads,
+            "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+            "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+            "ordered_output": True,
         },
         "seqkit": {
             "version": SEQKIT_VERSION,
             "threads": threads,
-            "random_seed": SHARD_RANDOM_SEED,
-            "shuffle": ["--two-pass", "--update-faidx"],
+            "operations": ["stats", "sum", "split2"],
         },
         "existing_profile_policy": "validate-and-reuse",
     }
@@ -2665,61 +2705,53 @@ def _run_production_shuffle_split(
     validation_dir: Path,
     log_path: Path,
     *,
+    expected_records: int,
     seqkit_threads: int,
-) -> dict[str, int | str | None]:
-    """Shuffle locally, split to the Volume, and restore omitted headers."""
+) -> dict[str, Any]:
+    """Shuffle occurrences locally and split the validated result to the Volume."""
     seqkit = _require_executable("seqkit")
     shuffled_path = scratch_root / "shuffled.fasta"
-    seqkit_tmp_dir = scratch_root / "seqkit"
-    seqkit_tmp_dir.mkdir(parents=True)
     shuffle_diagnostics_path = validation_dir / "shuffle-stderr.log"
+    shuffler_metrics_path = validation_dir / "shuffler-metrics.json"
     recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
-    shuffle_argv = [
-        seqkit,
-        "shuffle",
-        "-j",
-        str(seqkit_threads),
-        "--two-pass",
-        "--update-faidx",
-        "--tmp-dir",
-        str(seqkit_tmp_dir),
-        "--rand-seed",
-        str(SHARD_RANDOM_SEED),
-        str(source_path),
-    ]
-    _append_log(log_path, f"Running command: {shlex.join(shuffle_argv)}")
     validation_dir.mkdir(parents=True, exist_ok=True)
-    with (
-        shuffled_path.open("xb") as shuffled,
-        shuffle_diagnostics_path.open("xb") as diagnostics,
-    ):
-        shuffle_process = subprocess.run(  # noqa: S603
-            shuffle_argv,
-            check=False,
-            stdout=shuffled,
-            stderr=diagnostics,
-        )
-    _append_diagnostic_file(shuffle_diagnostics_path, log_path)
-    if shuffle_process.returncode != 0:
-        raise subprocess.CalledProcessError(
-            shuffle_process.returncode,
-            shuffle_argv,
-        )
-
-    warnings = _parse_fai_duplicate_warnings(shuffle_diagnostics_path)
-    temporary_namespace = f"{RECOVERED_HEADER_NAMESPACE}{uuid.uuid4().hex}_"
-    recovery_metrics = _recover_profile_duplicate_records(
+    shuffler_metrics = _run_ordinal_two_pass_shuffle(
         source_path,
         shuffled_path,
-        warnings,
-        recovery_report_path,
-        temporary_namespace=temporary_namespace,
+        scratch_root,
+        shuffle_diagnostics_path,
+        shuffler_metrics_path,
+        log_path,
+        expected_records=expected_records,
+        worker_threads=seqkit_threads,
     )
+    recovery_metrics: dict[str, int | str | None] = {
+        "recovered_records": 0,
+        "recovered_residues": 0,
+        "first_byte_offset": None,
+        "last_byte_offset": None,
+        "temporary_namespace": None,
+        "temporary_header_pattern": None,
+    }
+    with recovery_report_path.open("xb") as report:
+        report.write(
+            orjson.dumps(
+                {
+                    "kind": "summary",
+                    **recovery_metrics,
+                    "warning_source": None,
+                    "record_identity": "source-occurrence",
+                    "fai_duplicate_omission_possible": False,
+                },
+                option=JSONL_OPTIONS,
+            )
+        )
+        report.flush()
+        os.fsync(report.fileno())
     _append_log(
         log_path,
-        "Recovered "
-        f"{recovery_metrics['recovered_records']} FAI-omitted records "
-        f"({recovery_metrics['recovered_residues']} residues)",
+        "Preserved every FASTA record by source occurrence; FAI duplicate "
+        "recovery is not applicable",
     )
 
     split_argv = [
@@ -2763,30 +2795,14 @@ def _run_production_shuffle_split(
 
     shuffled_path.unlink()
     shard_dir.mkdir(parents=True, exist_ok=True)
-    recovery_pattern = _recovery_header_pattern(temporary_namespace)
     for index, raw_shard in enumerate(raw_shards):
         if raw_shard.stat().st_size <= 0:
             raise ValueError(f"SeqKit produced empty shard: {raw_shard}")
         final_shard = shard_dir / _production_shard_filename(spec, index)
-        _run_to_file(
-            [
-                seqkit,
-                "replace",
-                "-j",
-                str(seqkit_threads),
-                "--pattern",
-                recovery_pattern,
-                "--replacement",
-                "",
-                str(raw_shard),
-            ],
-            final_shard,
-            log_path,
-        )
+        raw_shard.replace(final_shard)
         _require_regular_file(final_shard)
-        raw_shard.unlink()
     raw_shard_dir.rmdir()
-    return recovery_metrics
+    return recovery_metrics | {"shuffler": shuffler_metrics}
 
 
 def _validate_production_profile_statistics(
@@ -2869,6 +2885,81 @@ def _validate_production_profile_statistics(
     }
 
 
+def _validate_production_profile_recipe(
+    recipe: dict[str, Any],
+    spec: DatabaseProfileSpec,
+) -> tuple[int, tuple[str, ...]]:
+    """Validate one supported immutable sharding recipe."""
+    if recipe.get("seqkit_version") != SEQKIT_VERSION:
+        raise ValueError("Unexpected production profile SeqKit version")
+    if recipe.get("random_seed") != SHARD_RANDOM_SEED:
+        raise ValueError("Unexpected production profile shuffle seed")
+    if recipe.get("split") != ["--by-part", spec.shard_count]:
+        raise ValueError("Unexpected production profile split recipe")
+    raw_seqkit_threads = recipe.get("seqkit_threads")
+    if isinstance(raw_seqkit_threads, bool) or not isinstance(
+        raw_seqkit_threads,
+        int,
+    ):
+        raise ValueError("Invalid production profile SeqKit threads")
+    try:
+        seqkit_threads = _validate_seqkit_threads(raw_seqkit_threads)
+    except ValueError as exc:
+        raise ValueError("Invalid production profile SeqKit threads") from exc
+
+    recipe_version = recipe.get("version")
+    if recipe_version == LEGACY_PRODUCTION_PROFILE_RECIPE_VERSION:
+        if recipe.get("shuffle") != [
+            "--two-pass",
+            "--update-faidx",
+            "--tmp-dir=/tmp",
+        ]:
+            raise ValueError("Unexpected legacy production shuffle recipe")
+        if recipe.get("duplicate_recovery") != {
+            "warning_source": "seqkit-fai-sequence-byte-offset",
+            "temporary_header_identity": "generation-unique-uuid",
+            "append_after_shuffle": True,
+            "strip_after_split": True,
+        }:
+            raise ValueError("Unexpected legacy duplicate-recovery recipe")
+        return recipe_version, LEGACY_PRODUCTION_VALIDATION_RELPATHS
+
+    if recipe_version != ORDINAL_SHUFFLER_RECIPE_VERSION:
+        raise ValueError("Unexpected production profile recipe version")
+    if recipe.get("shuffle") != [
+        "two-pass",
+        "source-occurrence-offset-index",
+        "splitmix64-fisher-yates-u32",
+        "bounded-concurrent-pread",
+        "ordered-write",
+    ]:
+        raise ValueError("Unexpected occurrence-indexed shuffle recipe")
+    if recipe.get("shuffler") != {
+        "version": ORDINAL_SHUFFLER_VERSION,
+        "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
+        "record_identity": "source-occurrence",
+        "offset_index": "uint64-source-occurrence-offsets-v1",
+        "permutation": "splitmix64-fisher-yates-u32-v1",
+        "read": "bounded-concurrent-pread-ordered-write-v1",
+        "ordered_output": True,
+    }:
+        raise ValueError("Unexpected native production shuffler identity")
+    if recipe.get("execution") != {
+        "worker_threads": seqkit_threads,
+        "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+        "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+    }:
+        raise ValueError("Unexpected native production shuffler execution plan")
+    if recipe.get("duplicate_recovery") != {
+        "warning_source": None,
+        "record_identity": "source-occurrence",
+        "append_after_shuffle": False,
+        "strip_after_split": False,
+    }:
+        raise ValueError("Unexpected occurrence-indexed duplicate policy")
+    return recipe_version, PRODUCTION_VALIDATION_RELPATHS
+
+
 def _validate_production_profile_manifest(
     manifest: dict[str, Any],
     spec: DatabaseProfileSpec,
@@ -2932,31 +3023,9 @@ def _validate_production_profile_manifest(
         "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
     }:
         raise ValueError("Unexpected production profile compatibility pin")
-    if recipe.get("version") != PRODUCTION_PROFILE_RECIPE_VERSION:
-        raise ValueError("Unexpected production profile recipe version")
-    if recipe.get("seqkit_version") != SEQKIT_VERSION:
-        raise ValueError("Unexpected production profile SeqKit version")
-    if recipe.get("random_seed") != SHARD_RANDOM_SEED:
-        raise ValueError("Unexpected production profile shuffle seed")
-    if recipe.get("shuffle") != [
-        "--two-pass",
-        "--update-faidx",
-        "--tmp-dir=/tmp",
-    ]:
-        raise ValueError("Unexpected production profile shuffle recipe")
-    if recipe.get("split") != ["--by-part", spec.shard_count]:
-        raise ValueError("Unexpected production profile split recipe")
-    if recipe.get("duplicate_recovery") != {
-        "warning_source": "seqkit-fai-sequence-byte-offset",
-        "temporary_header_identity": "generation-unique-uuid",
-        "append_after_shuffle": True,
-        "strip_after_split": True,
-    }:
-        raise ValueError("Unexpected production duplicate-recovery recipe")
-    try:
-        _validate_seqkit_threads(recipe.get("seqkit_threads"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Invalid production profile SeqKit threads") from exc
+    recipe_version, expected_validation_relpaths = _validate_production_profile_recipe(
+        recipe, spec
+    )
 
     if not isinstance(validation, dict) or validation.get("passed") is not True:
         raise ValueError("Production profile does not declare passed validation")
@@ -2966,6 +3035,16 @@ def _validate_production_profile_manifest(
         raise ValueError("Production profile validation sequence count is invalid")
     if validation.get("sum_len") != source["sum_len"]:
         raise ValueError("Production profile validation residue count is invalid")
+    if recipe_version == ORDINAL_SHUFFLER_RECIPE_VERSION:
+        if validation.get("record_occurrences_preserved") is not True:
+            raise ValueError("Production profile does not preserve record occurrences")
+        if (
+            validation.get("recovered_records") != 0
+            or validation.get("recovered_residues") != 0
+            or validation.get("first_recovered_byte_offset") is not None
+            or validation.get("last_recovered_byte_offset") is not None
+        ):
+            raise ValueError("Occurrence-indexed profile declares FAI recovery")
     validation_artifacts = validation.get("artifacts")
     if not isinstance(validation_artifacts, list):
         raise ValueError("Production validation artifacts must be a list")
@@ -2995,7 +3074,7 @@ def _validate_production_profile_manifest(
     if actual_shard_paths != expected_shard_paths:
         raise ValueError("Production profile shard order or names are invalid")
     if [str(record["path"]) for record in validation_artifacts] != list(
-        PRODUCTION_VALIDATION_RELPATHS
+        expected_validation_relpaths
     ):
         raise ValueError("Production validation artifact paths are invalid")
     return source, shards, validation_artifacts
@@ -3375,7 +3454,7 @@ def _build_production_profile(
         _require_regular_file(source_path)
         source_size = source_path.stat().st_size
         scratch_free = shutil.disk_usage(PRODUCTION_SCRATCH_ROOT).free
-        scratch_required = int(source_size * 1.05)
+        scratch_required = int(source_size * 1.10)
         if scratch_free < scratch_required:
             raise OSError(
                 f"Insufficient /tmp space for {spec.database_id}: need at least "
@@ -3467,6 +3546,7 @@ def _build_production_profile(
                 shard_dir,
                 validation_dir,
                 log_path,
+                expected_records=source_num_seqs,
                 seqkit_threads=threads,
             )
 
@@ -3510,19 +3590,10 @@ def _build_production_profile(
             },
         )
 
-        temporary_namespace = recovery_metrics.get("temporary_namespace")
-        if not isinstance(temporary_namespace, str):
-            raise RuntimeError(
-                "Duplicate recovery did not return a temporary namespace"
-            )
-        forbidden_recovery_header = b">" + temporary_namespace.encode("ascii")
+        if recovery_metrics.get("temporary_namespace") is not None:
+            raise RuntimeError("Occurrence shuffling must not create recovery headers")
         shard_records = [
-            _artifact_record(
-                shard_path,
-                staging_root,
-                forbidden_bytes=forbidden_recovery_header,
-            )
-            for shard_path in shard_paths
+            _artifact_record(shard_path, staging_root) for shard_path in shard_paths
         ]
         validation_records = [
             _artifact_record(staging_root / relative, staging_root)
@@ -3559,20 +3630,36 @@ def _build_production_profile(
                 "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
             },
             "recipe": {
-                "version": PRODUCTION_PROFILE_RECIPE_VERSION,
+                "version": ORDINAL_SHUFFLER_RECIPE_VERSION,
                 "seqkit_version": SEQKIT_VERSION,
                 "seqkit_threads": threads,
                 "random_seed": SHARD_RANDOM_SEED,
                 "shuffle": [
-                    "--two-pass",
-                    "--update-faidx",
-                    "--tmp-dir=/tmp",
+                    "two-pass",
+                    "source-occurrence-offset-index",
+                    "splitmix64-fisher-yates-u32",
+                    "bounded-concurrent-pread",
+                    "ordered-write",
                 ],
+                "shuffler": {
+                    "version": ORDINAL_SHUFFLER_VERSION,
+                    "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
+                    "record_identity": "source-occurrence",
+                    "offset_index": "uint64-source-occurrence-offsets-v1",
+                    "permutation": "splitmix64-fisher-yates-u32-v1",
+                    "read": "bounded-concurrent-pread-ordered-write-v1",
+                    "ordered_output": True,
+                },
+                "execution": {
+                    "worker_threads": threads,
+                    "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+                    "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+                },
                 "duplicate_recovery": {
-                    "warning_source": "seqkit-fai-sequence-byte-offset",
-                    "temporary_header_identity": "generation-unique-uuid",
-                    "append_after_shuffle": True,
-                    "strip_after_split": True,
+                    "warning_source": None,
+                    "record_identity": "source-occurrence",
+                    "append_after_shuffle": False,
+                    "strip_after_split": False,
                 },
                 "split": ["--by-part", spec.shard_count],
             },
@@ -3588,6 +3675,7 @@ def _build_production_profile(
                 "first_recovered_byte_offset": recovery_metrics["first_byte_offset"],
                 "last_recovered_byte_offset": recovery_metrics["last_byte_offset"],
                 "temporary_recovery_prefix_absent": True,
+                "record_occurrences_preserved": True,
                 "artifacts": validation_records,
             },
         }
@@ -8447,7 +8535,7 @@ def submit_alphafold3_msa_task(
             ``search-profile``, ``validate-oracle``, ``scan``, or ``search``.
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
-        seqkit_threads: SeqKit thread count for profile preparation, default 8.
+        seqkit_threads: SeqKit/native worker count for preparation, default 8.
         search_mode: Fixed search workload: ``smoke``, ``sweep``, or ``matrix``.
         database_id: Fixed database ID for production-candidate operations.
         source_policy: Post-validation source action: keep, compress, or delete.

@@ -19,10 +19,11 @@ written to ``AlphaFold3-MSA-Benchmark-outputs``.
 
 The production-candidate operations build seven fixed immutable profiles
 without copying their monolithic sources into the sharded Volume. They stage
-the shuffled FASTA and a compact occurrence-offset index under ``/tmp``. A
-pinned native two-pass helper preserves duplicate headers and uses bounded
-concurrent reads without copying the source. Only shards, validation evidence,
-and a manifest-last publication remain on the sharded Volume.
+an ephemeral source copy, the shuffled FASTA, and a compact occurrence-offset
+index under ``/tmp``. A pinned native two-pass helper preserves duplicate
+headers, tees its sequential indexing pass into the local copy, then uses
+bounded concurrent reads from local SSD. Only shards, validation evidence, and
+a manifest-last publication remain on the sharded Volume.
 """
 
 from __future__ import annotations
@@ -113,9 +114,11 @@ PRODUCTION_PROFILE_ROOT = "profiles"
 PRODUCTION_PREPARATION_ROOT = "production-candidates/profile-builds"
 PRODUCTION_PROFILE_CLAIM_DICT_NAME = "AlphaFold3-msa-profile-build-claims"
 PRODUCTION_BUILD_TIMEOUT_SECONDS = 86_400
+PRODUCTION_BUILD_MEMORY_MIB = (1024, 262_144)
 PRODUCTION_PROFILE_STALE_SECONDS = PRODUCTION_BUILD_TIMEOUT_SECONDS + 900
 PRODUCTION_SCRATCH_ROOT = Path(tempfile.gettempdir())
-ORDINAL_SHUFFLER_VERSION = "af3-fasta-two-pass-v1"
+PRODUCTION_SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024
+ORDINAL_SHUFFLER_VERSION = "af3-fasta-two-pass-v2"
 ORDINAL_SHUFFLER_PREFETCH_RECORDS = 65_536
 ORDINAL_SHUFFLER_PREFETCH_BYTES = 256 * 1024 * 1024
 SOURCE_POLICIES = ("keep", "compress", "delete")
@@ -163,7 +166,7 @@ _ORDINAL_SHUFFLER_SOURCE = r"""
 #include <time.h>
 #include <unistd.h>
 
-#define PROGRAM_VERSION "af3-fasta-two-pass-v1"
+#define PROGRAM_VERSION "af3-fasta-two-pass-v2"
 #define INDEX_MAGIC UINT64_C(0x4146334f46465331)
 #define INDEX_VERSION UINT64_C(1)
 #define SCAN_BUFFER_BYTES (64U * 1024U * 1024U)
@@ -307,6 +310,7 @@ static void append_offset(struct offset_writer *writer, uint64_t value) {
 
 static struct index_header build_offset_index(
     int source_fd,
+    int staged_fd,
     int index_fd,
     uint64_t expected_records
 ) {
@@ -316,6 +320,18 @@ static struct index_header build_offset_index(
     }
     if (!S_ISREG(source_stat.st_mode) || source_stat.st_size <= 0) {
         fail_message("source must be a nonempty regular file");
+    }
+    int allocation_error = posix_fallocate(
+        staged_fd,
+        0,
+        source_stat.st_size
+    );
+    if (allocation_error != 0) {
+        errno = allocation_error;
+        fail_errno("preallocate staged source");
+    }
+    if (lseek(staged_fd, 0, SEEK_SET) < 0) {
+        fail_errno("seek staged source");
     }
 
     struct index_header header = {0};
@@ -336,12 +352,14 @@ static struct index_header build_offset_index(
     };
 
     (void)posix_fadvise(source_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    (void)posix_fadvise(staged_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     uint64_t source_position = 0;
     uint64_t last_record_offset = 0;
     uint64_t maximum_record_size = 0;
     uint64_t record_count = 0;
     unsigned char previous_byte = 0;
     bool have_previous_byte = false;
+    double last_progress = monotonic_seconds();
 
     for (;;) {
         ssize_t read_size = read(source_fd, scan_buffer, SCAN_BUFFER_BYTES);
@@ -358,6 +376,7 @@ static struct index_header build_offset_index(
         if (source_position == 0 && scan_buffer[0] != '>') {
             fail_message("source does not begin with a FASTA header");
         }
+        write_all(staged_fd, scan_buffer, chunk_size);
 
         unsigned char *cursor = scan_buffer;
         unsigned char *chunk_end = scan_buffer + chunk_size;
@@ -402,6 +421,18 @@ static struct index_header build_offset_index(
         previous_byte = scan_buffer[chunk_size - 1];
         have_previous_byte = true;
         source_position += (uint64_t)chunk_size;
+        double now = monotonic_seconds();
+        if (now - last_progress >= 60.0) {
+            fprintf(
+                stderr,
+                "{\"event\":\"staging-progress\",\"records\":%" PRIu64
+                ",\"bytes\":%" PRIu64 "}\n",
+                record_count,
+                source_position
+            );
+            fflush(stderr);
+            last_progress = now;
+        }
     }
 
     uint64_t source_size = (uint64_t)source_stat.st_size;
@@ -448,6 +479,16 @@ static struct index_header build_offset_index(
     if (fdatasync(index_fd) != 0) {
         fail_errno("fdatasync index");
     }
+    fprintf(
+        stderr,
+        "{\"event\":\"staging-sync\",\"bytes\":%" PRIu64 "}\n",
+        source_size
+    );
+    fflush(stderr);
+    if (fdatasync(staged_fd) != 0) {
+        fail_errno("fdatasync staged source");
+    }
+    (void)posix_fadvise(staged_fd, 0, 0, POSIX_FADV_DONTNEED);
     free(offset_buffer);
     free(scan_buffer);
     return header;
@@ -758,7 +799,8 @@ static uint64_t shuffle_to_output(
 static void usage(void) {
     fprintf(
         stderr,
-        "usage: af3-fasta-two-pass --source PATH --output PATH --index PATH "
+        "usage: af3-fasta-two-pass --source PATH --staged-source PATH "
+        "--output PATH --index PATH "
         "--expected-records N --seed N --threads N "
         "--prefetch-records N --prefetch-bytes N\n"
     );
@@ -770,6 +812,7 @@ int main(int argc, char **argv) {
         return EXIT_SUCCESS;
     }
     const char *source_path = NULL;
+    const char *staged_source_path = NULL;
     const char *output_path = NULL;
     const char *index_path = NULL;
     uint64_t expected_records = 0;
@@ -787,6 +830,8 @@ int main(int argc, char **argv) {
         const char *value = argv[index + 1];
         if (strcmp(flag, "--source") == 0) {
             source_path = value;
+        } else if (strcmp(flag, "--staged-source") == 0) {
+            staged_source_path = value;
         } else if (strcmp(flag, "--output") == 0) {
             output_path = value;
         } else if (strcmp(flag, "--index") == 0) {
@@ -809,6 +854,7 @@ int main(int argc, char **argv) {
 
     if (
         source_path == NULL
+        || staged_source_path == NULL
         || output_path == NULL
         || index_path == NULL
         || expected_records == 0
@@ -830,6 +876,14 @@ int main(int argc, char **argv) {
     if (source_fd < 0) {
         fail_errno("open source");
     }
+    int staged_fd = open(
+        staged_source_path,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+        0600
+    );
+    if (staged_fd < 0) {
+        fail_errno("open staged source");
+    }
     int index_fd = open(
         index_path,
         O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -841,7 +895,8 @@ int main(int argc, char **argv) {
     fprintf(
         stderr,
         "{\"event\":\"start\",\"version\":\"%s\","
-        "\"expected_records\":%" PRIu64 "}\n",
+        "\"expected_records\":%" PRIu64 ","
+        "\"random_read_source\":\"container-local-staged-copy\"}\n",
         PROGRAM_VERSION,
         expected_records
     );
@@ -850,6 +905,7 @@ int main(int argc, char **argv) {
     double first_pass_started = monotonic_seconds();
     struct index_header header = build_offset_index(
         source_fd,
+        staged_fd,
         index_fd,
         expected_records
     );
@@ -863,6 +919,30 @@ int main(int argc, char **argv) {
         first_pass_seconds
     );
     fflush(stderr);
+    if (close(staged_fd) != 0) {
+        fail_errno("close staged source writer");
+    }
+    if (close(source_fd) != 0) {
+        fail_errno("close source after staging");
+    }
+    int shuffled_source_fd = open(
+        staged_source_path,
+        O_RDONLY | O_CLOEXEC
+    );
+    if (shuffled_source_fd < 0) {
+        fail_errno("open staged source for second pass");
+    }
+    struct stat staged_stat;
+    if (fstat(shuffled_source_fd, &staged_stat) != 0) {
+        fail_errno("fstat staged source");
+    }
+    if (
+        !S_ISREG(staged_stat.st_mode)
+        || staged_stat.st_size < 0
+        || (uint64_t)staged_stat.st_size != header.source_size
+    ) {
+        fail_message("staged source size is inconsistent");
+    }
 
     struct stat index_stat;
     if (fstat(index_fd, &index_stat) != 0) {
@@ -933,7 +1013,7 @@ int main(int argc, char **argv) {
     double second_pass_started = monotonic_seconds();
     uint64_t peak_batch_bytes = 0;
     uint64_t output_bytes = shuffle_to_output(
-        source_fd,
+        shuffled_source_fd,
         output_fd,
         offsets,
         permutation,
@@ -964,8 +1044,8 @@ int main(int argc, char **argv) {
     if (close(index_fd) != 0) {
         fail_errno("close index");
     }
-    if (close(source_fd) != 0) {
-        fail_errno("close source");
+    if (close(shuffled_source_fd) != 0) {
+        fail_errno("close staged source");
     }
 
     fprintf(
@@ -980,6 +1060,7 @@ int main(int argc, char **argv) {
     printf(
         "{\"schema_version\":1,\"version\":\"%s\","
         "\"source_size_bytes\":%" PRIu64 ","
+        "\"staged_source_size_bytes\":%" PRIu64 ","
         "\"output_size_bytes\":%" PRIu64 ","
         "\"record_count\":%" PRIu64 ","
         "\"offset_index_size_bytes\":%zu,"
@@ -989,10 +1070,12 @@ int main(int argc, char **argv) {
         "\"prefetch_records\":%zu,"
         "\"prefetch_bytes\":%zu,"
         "\"peak_batch_bytes\":%" PRIu64 ","
+        "\"random_read_source\":\"container-local-staged-copy\","
         "\"first_pass_seconds\":%.6f,"
         "\"permutation_seconds\":%.6f,"
         "\"second_pass_seconds\":%.6f}\n",
         PROGRAM_VERSION,
+        header.source_size,
         header.source_size,
         header.output_size,
         header.record_count,
@@ -1642,6 +1725,29 @@ def _compile_ordinal_shuffler(
     return executable_path
 
 
+def _required_ordinal_shuffler_scratch_bytes(
+    source_size: int,
+    record_count: int,
+) -> int:
+    """Return local bytes needed for the staged source, shuffle, and index."""
+    if (
+        isinstance(source_size, bool)
+        or not isinstance(source_size, int)
+        or source_size <= 0
+    ):
+        raise ValueError("source_size must be a positive integer")
+    if (
+        isinstance(record_count, bool)
+        or not isinstance(record_count, int)
+        or record_count <= 0
+    ):
+        raise ValueError("record_count must be a positive integer")
+    index_size = 48 + (record_count + 1) * 8
+    return (
+        source_size + source_size + 1 + index_size + PRODUCTION_SCRATCH_HEADROOM_BYTES
+    )
+
+
 def _run_ordinal_two_pass_shuffle(
     source_path: Path,
     shuffled_path: Path,
@@ -1663,11 +1769,14 @@ def _run_ordinal_two_pass_shuffle(
     threads = _validate_seqkit_threads(worker_threads)
     _require_regular_file(source_path)
     executable = _compile_ordinal_shuffler(scratch_root, log_path)
+    staged_source_path = scratch_root / "source.fasta"
     index_path = scratch_root / "occurrence-offsets.bin"
     argv = [
         str(executable),
         "--source",
         str(source_path),
+        "--staged-source",
+        str(staged_source_path),
         "--output",
         str(shuffled_path),
         "--index",
@@ -1686,17 +1795,27 @@ def _run_ordinal_two_pass_shuffle(
     _append_log(log_path, f"Running command: {shlex.join(argv)}")
     diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     with diagnostics_path.open("xb") as diagnostics:
-        completed = subprocess.run(  # noqa: S603
+        process = subprocess.Popen(  # noqa: S603
             argv,
-            check=False,
             stdout=subprocess.PIPE,
-            stderr=diagnostics,
+            stderr=subprocess.PIPE,
         )
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            raise RuntimeError("Native shuffler did not expose output streams")
+        for line in iter(process.stderr.readline, b""):
+            diagnostics.write(line)
+            diagnostics.flush()
+            print(f"🧬 shuffler {line.decode(errors='replace')}", end="", flush=True)
+        process.stderr.close()
+        metrics_bytes = process.stdout.read()
+        process.stdout.close()
+        returncode = process.wait()
     _append_diagnostic_file(diagnostics_path, log_path)
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(completed.returncode, argv)
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, argv)
     try:
-        metrics = orjson.loads(completed.stdout)
+        metrics = orjson.loads(metrics_bytes)
     except orjson.JSONDecodeError as exc:
         raise ValueError("Native shuffler returned invalid metrics JSON") from exc
     if not isinstance(metrics, dict):
@@ -1710,11 +1829,13 @@ def _run_ordinal_two_pass_shuffle(
         "version": ORDINAL_SHUFFLER_VERSION,
         "record_count": expected_records,
         "source_size_bytes": source_size,
+        "staged_source_size_bytes": source_size,
         "output_size_bytes": output_size,
         "seed": SHARD_RANDOM_SEED,
         "threads": threads,
         "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
         "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+        "random_read_source": "container-local-staged-copy",
     }
     for key, expected in expected_metrics.items():
         if metrics.get(key) != expected:
@@ -1738,11 +1859,23 @@ def _run_ordinal_two_pass_shuffle(
     _require_regular_file(shuffled_path)
     if shuffled_path.stat().st_size != output_size:
         raise ValueError("Native shuffler output size is not normalized")
+    _require_regular_file(staged_source_path)
+    if staged_source_path.stat().st_size != source_size:
+        raise ValueError("Native shuffler staged source size does not match source")
+    first_pass_seconds = float(metrics["first_pass_seconds"])
+    second_pass_seconds = float(metrics["second_pass_seconds"])
     published_metrics = metrics | {
         "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
         "index_identity": "uint64-source-occurrence-offsets-v1",
         "permutation_identity": "splitmix64-fisher-yates-u32-v1",
-        "read_identity": "bounded-concurrent-pread-ordered-write-v1",
+        "staging_identity": "first-pass-tee-to-container-local-v1",
+        "read_identity": "bounded-concurrent-local-pread-ordered-write-v2",
+        "first_pass_bytes_per_second": (
+            source_size / first_pass_seconds if first_pass_seconds > 0 else None
+        ),
+        "second_pass_bytes_per_second": (
+            output_size / second_pass_seconds if second_pass_seconds > 0 else None
+        ),
     }
     _write_json_atomic(metrics_path, published_metrics)
     return published_metrics
@@ -2593,7 +2726,7 @@ def _production_profile_plan(
         },
         "resources": {
             "cpu": [0.125, 32.125],
-            "memory_mib": [1024, 131_072],
+            "memory_mib": list(PRODUCTION_BUILD_MEMORY_MIB),
             "ephemeral_disk_mib": "platform-default",
             "timeout_seconds": PRODUCTION_BUILD_TIMEOUT_SECONDS,
         },
@@ -2612,6 +2745,7 @@ def _production_profile_plan(
             ],
         },
         "scratch": {
+            "staged_source": str(PRODUCTION_SCRATCH_ROOT),
             "shuffle": str(PRODUCTION_SCRATCH_ROOT),
             "occurrence_index": str(PRODUCTION_SCRATCH_ROOT),
             "permutation": "memory",
@@ -2622,6 +2756,8 @@ def _production_profile_plan(
             "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
             "passes": 2,
             "record_identity": "source-occurrence",
+            "source_staging": "first-pass-tee-to-container-local-v1",
+            "random_read_source": "container-local-staged-copy",
             "random_seed": SHARD_RANDOM_SEED,
             "permutation": "splitmix64-fisher-yates-u32-v1",
             "worker_threads": threads,
@@ -2928,9 +3064,10 @@ def _validate_production_profile_recipe(
         raise ValueError("Unexpected production profile recipe version")
     if recipe.get("shuffle") != [
         "two-pass",
+        "first-pass-stage-local-source",
         "source-occurrence-offset-index",
         "splitmix64-fisher-yates-u32",
-        "bounded-concurrent-pread",
+        "bounded-concurrent-local-pread",
         "ordered-write",
     ]:
         raise ValueError("Unexpected occurrence-indexed shuffle recipe")
@@ -2940,7 +3077,8 @@ def _validate_production_profile_recipe(
         "record_identity": "source-occurrence",
         "offset_index": "uint64-source-occurrence-offsets-v1",
         "permutation": "splitmix64-fisher-yates-u32-v1",
-        "read": "bounded-concurrent-pread-ordered-write-v1",
+        "staging": "first-pass-tee-to-container-local-v1",
+        "read": "bounded-concurrent-local-pread-ordered-write-v2",
         "ordered_output": True,
     }:
         raise ValueError("Unexpected native production shuffler identity")
@@ -3453,13 +3591,6 @@ def _build_production_profile(
             raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
         _require_regular_file(source_path)
         source_size = source_path.stat().st_size
-        scratch_free = shutil.disk_usage(PRODUCTION_SCRATCH_ROOT).free
-        scratch_required = int(source_size * 1.10)
-        if scratch_free < scratch_required:
-            raise OSError(
-                f"Insufficient /tmp space for {spec.database_id}: need at least "
-                f"{scratch_required} bytes, found {scratch_free}"
-            )
 
         shard_dir.mkdir(parents=True)
         validation_dir.mkdir(parents=True)
@@ -3520,6 +3651,21 @@ def _build_production_profile(
                 f"{spec.database_id} residue count {source_sum_len} does not "
                 f"match expected {spec.expected_sum_len}"
             )
+        scratch_free = shutil.disk_usage(PRODUCTION_SCRATCH_ROOT).free
+        scratch_required = _required_ordinal_shuffler_scratch_bytes(
+            source_size,
+            source_num_seqs,
+        )
+        if scratch_free < scratch_required:
+            raise OSError(
+                f"Insufficient /tmp space for {spec.database_id}: need at least "
+                f"{scratch_required} bytes, found {scratch_free}"
+            )
+        _append_log(
+            log_path,
+            f"Reserved scratch budget {scratch_required} bytes for local source "
+            "staging, shuffled FASTA, and occurrence index",
+        )
         source_sha256 = _sha256_file(source_path)
         _run_to_file(
             [
@@ -3636,9 +3782,10 @@ def _build_production_profile(
                 "random_seed": SHARD_RANDOM_SEED,
                 "shuffle": [
                     "two-pass",
+                    "first-pass-stage-local-source",
                     "source-occurrence-offset-index",
                     "splitmix64-fisher-yates-u32",
-                    "bounded-concurrent-pread",
+                    "bounded-concurrent-local-pread",
                     "ordered-write",
                 ],
                 "shuffler": {
@@ -3647,7 +3794,8 @@ def _build_production_profile(
                     "record_identity": "source-occurrence",
                     "offset_index": "uint64-source-occurrence-offsets-v1",
                     "permutation": "splitmix64-fisher-yates-u32-v1",
-                    "read": "bounded-concurrent-pread-ordered-write-v1",
+                    "staging": "first-pass-tee-to-container-local-v1",
+                    "read": "bounded-concurrent-local-pread-ordered-write-v2",
                     "ordered_output": True,
                 },
                 "execution": {
@@ -3768,7 +3916,7 @@ def _build_production_profile(
 
 @app.function(
     cpu=(0.125, 32.125),
-    memory=(1024, 131_072),
+    memory=PRODUCTION_BUILD_MEMORY_MIB,
     timeout=PRODUCTION_BUILD_TIMEOUT_SECONDS,
     max_containers=len(DATABASE_PROFILE_SPECS),
     volumes={

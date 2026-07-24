@@ -322,6 +322,18 @@ order-independent, multiplicity-sensitive full-record multiset without
 SeqKit's global sort, while independent `seqkit stats` remains as a second
 record/residue conservation check. Existing recipe v4 profiles remain valid.
 
+A read-only UniProt benchmark validated all 225,619,586 records and produced
+identical full-record signatures for the monolith and 256 shards. The
+single-file, single-thread source scan took 488.801 seconds at 221.865 MB/s;
+the eight-thread shard scan took 113.268 seconds at 957.449 MB/s; combined
+scanner time was 602.069 seconds. This is 3.73 times shorter than the
+historical 2,242.917-second post-shard-statistics-to-completion window, although
+that old window also included artifact hashing, publication, and deep
+verification. Keep these measurements as the decision baseline rather than
+selecting a production validator strategy before the implementation tradeoff
+is reviewed. Full evidence and caveats are in the
+[shuffle audit](alphafold3-seqkit-two-pass-shuffle-audit.md#read-only-recipe-v5-validator-benchmark).
+
 When this builder moves into the production AlphaFold3 app, its setup
 entrypoint must first validate all seven fixed profile manifests, collect only
 the missing database IDs, and submit one builder container per missing database

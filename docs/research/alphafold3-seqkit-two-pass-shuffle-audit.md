@@ -391,3 +391,43 @@ totals must also match the independently generated SeqKit statistics. This
 removes both the global hash sort and the header-awareness gap. Recipe v4
 manifests, including the already published UniProt profile above, remain
 readable and do not need to be rebuilt.
+
+### Read-only recipe-v5 validator benchmark
+
+A read-only benchmark against the published `uniprot-256-v1` profile completed
+on 2026-07-24. Generation `cf1bff66cb1542d0ab288deaf0d75f08`
+mounted both the source and sharded database Volumes read-only and wrote only
+to the benchmark-output Volume. It did not mutate the source or profile.
+
+| Scan | Files | Threads | Duration | Throughput |
+|---|---:|---:|---:|---:|
+| source monolith | 1 | 1 | 488.801s (8m 08.801s) | 221.865 MB/s |
+| published shards | 256 | 8 | 113.268s (1m 53.268s) | 957.449 MB/s |
+| combined scanner time | 257 | source 1; shards 8 | 602.069s (10m 02.069s) | — |
+
+The source and shard sides both contained 225,619,586 records,
+27,966,533,331 header bytes, and 78,608,056,346 sequence bytes. Every
+aggregate lane matched, producing signature SHA-256
+`f32c0e9f8f6ab2a8a647e84323e916485f4f761eecc1db1440ce5f99ca276c34`.
+This is a full canonical `(header, sequence)` multiset result, not only a
+sequence checksum.
+
+The one-file source side is intentionally single-threaded in the current
+helper because its parallelism is across files. The 256-file shard side used
+all eight requested workers and was 4.32 times faster by throughput. The
+source scan was 1.44 times slower than the historical 338.390-second source
+`seqkit sum --all` scan. Conversely, the 602.069-second combined validation
+was 3.73 times shorter than the historical 2,242.917-second interval from
+completed shard statistics through the old builder's completion. That latter
+ratio is contextual rather than a direct validator-only comparison: the old
+interval also included artifact hashing, Volume publication, and final deep
+verification.
+
+The persistent evidence is under
+`production-candidates/record-multiset-benchmarks/uniprot-256-v1/`
+`cf1bff66cb1542d0ab288deaf0d75f08/` on
+`AlphaFold3-MSA-Benchmark-outputs`. These measurements establish the baseline;
+they do not yet choose whether production should retain the simple
+file-parallel implementation, add intra-file source parallelism, or reuse a
+source signature produced while staging the source. Make that choice after
+comparing the implementation complexity and measured end-to-end impact.

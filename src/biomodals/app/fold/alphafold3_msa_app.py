@@ -2660,6 +2660,44 @@ def _run_record_multiset_helper(
     }
 
 
+def _finalize_record_multiset_validation(
+    source_result: dict[str, object],
+    shard_result: dict[str, object],
+    output_path: Path,
+    *,
+    execution: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Compare two helper reports and publish their validation result."""
+    source_report = source_result.get("report")
+    shard_report = shard_result.get("report")
+    if not isinstance(source_report, dict) or not isinstance(shard_report, dict):
+        raise TypeError("Record-multiset helper result lost its report")
+    source_signature = _record_multiset_signature(cast(dict[str, Any], source_report))
+    shard_signature = _record_multiset_signature(cast(dict[str, Any], shard_report))
+    source_signature_sha256 = hashlib.sha256(_json_bytes(source_signature)).hexdigest()
+    shard_signature_sha256 = hashlib.sha256(_json_bytes(shard_signature)).hexdigest()
+    match = source_signature == shard_signature
+    result: dict[str, object] = {
+        "match": match,
+        "algorithm": _record_multiset_identity(),
+        "source_signature_sha256": source_signature_sha256,
+        "shard_signature_sha256": shard_signature_sha256,
+        "source_signature": source_signature,
+        "shard_signature": shard_signature,
+        "source": source_result,
+        "shards": shard_result,
+    }
+    if execution is not None:
+        result["execution"] = execution
+    if match:
+        result["signature_sha256"] = source_signature_sha256
+        result["signature"] = source_signature
+    _write_json_atomic(output_path, result)
+    if not match:
+        raise ValueError("Canonical source and shard record multisets differ")
+    return result
+
+
 def _run_record_multiset_validation(
     source_path: Path,
     shard_paths: tuple[Path, ...],
@@ -2685,32 +2723,11 @@ def _run_record_multiset_validation(
         log_path,
         threads=threads,
     )
-    source_report = source_result.get("report")
-    shard_report = shard_result.get("report")
-    if not isinstance(source_report, dict) or not isinstance(shard_report, dict):
-        raise TypeError("Record-multiset helper result lost its report")
-    source_signature = _record_multiset_signature(cast(dict[str, Any], source_report))
-    shard_signature = _record_multiset_signature(cast(dict[str, Any], shard_report))
-    source_signature_sha256 = hashlib.sha256(_json_bytes(source_signature)).hexdigest()
-    shard_signature_sha256 = hashlib.sha256(_json_bytes(shard_signature)).hexdigest()
-    match = source_signature == shard_signature
-    result: dict[str, object] = {
-        "match": match,
-        "algorithm": _record_multiset_identity(),
-        "source_signature_sha256": source_signature_sha256,
-        "shard_signature_sha256": shard_signature_sha256,
-        "source_signature": source_signature,
-        "shard_signature": shard_signature,
-        "source": source_result,
-        "shards": shard_result,
-    }
-    if match:
-        result["signature_sha256"] = source_signature_sha256
-        result["signature"] = source_signature
-    _write_json_atomic(output_path, result)
-    if not match:
-        raise ValueError("Canonical source and shard record multisets differ")
-    return result
+    return _finalize_record_multiset_validation(
+        source_result,
+        shard_result,
+        output_path,
+    )
 
 
 def _required_ordinal_shuffler_scratch_bytes(
@@ -3862,21 +3879,19 @@ def _recover_profile_duplicate_records(
     }
 
 
-def _run_production_shuffle_split(
+def _run_production_shuffle(
     spec: DatabaseProfileSpec,
     source_path: Path,
     scratch_root: Path,
-    raw_shard_dir: Path,
-    shard_dir: Path,
     validation_dir: Path,
     log_path: Path,
     *,
     expected_records: int,
     seqkit_threads: int,
-) -> dict[str, Any]:
-    """Shuffle occurrences locally and split the validated result to the Volume."""
-    seqkit = _require_executable("seqkit")
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Shuffle every occurrence into a container-local FASTA."""
     shuffled_path = scratch_root / "shuffled.fasta"
+    staged_source_path = scratch_root / "source.fasta"
     shuffle_diagnostics_path = validation_dir / "shuffle-stderr.log"
     shuffler_metrics_path = validation_dir / "shuffler-metrics.json"
     recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
@@ -3919,7 +3934,26 @@ def _run_production_shuffle_split(
         "Preserved every FASTA record by source occurrence; FAI duplicate "
         "recovery is not applicable",
     )
+    _require_regular_file(staged_source_path)
+    return (
+        staged_source_path,
+        shuffled_path,
+        recovery_metrics | {"shuffler": shuffler_metrics},
+    )
 
+
+def _run_production_split(
+    spec: DatabaseProfileSpec,
+    shuffled_path: Path,
+    raw_shard_dir: Path,
+    shard_dir: Path,
+    log_path: Path,
+    *,
+    seqkit_threads: int,
+) -> tuple[Path, ...]:
+    """Split one local shuffle and return normalized Volume shard paths."""
+    seqkit = _require_executable("seqkit")
+    _require_regular_file(shuffled_path)
     split_argv = [
         seqkit,
         "split2",
@@ -3968,7 +4002,7 @@ def _run_production_shuffle_split(
         raw_shard.replace(final_shard)
         _require_regular_file(final_shard)
     raw_shard_dir.rmdir()
-    return recovery_metrics | {"shuffler": shuffler_metrics}
+    return tuple(shard_dir / name for name in _production_shard_names(spec))
 
 
 def _validate_production_profile_statistics(
@@ -4727,19 +4761,24 @@ def _build_production_profile(
             dir=PRODUCTION_SCRATCH_ROOT,
         ) as scratch_dir:
             scratch_root = Path(scratch_dir)
-            recovery_metrics = _run_production_shuffle_split(
+            _staged_source_path, shuffled_path, recovery_metrics = (
+                _run_production_shuffle(
+                    spec,
+                    source_path,
+                    scratch_root,
+                    validation_dir,
+                    log_path,
+                    expected_records=source_num_seqs,
+                    seqkit_threads=threads,
+                )
+            )
+            shard_paths = _run_production_split(
                 spec,
-                source_path,
-                scratch_root,
+                shuffled_path,
                 raw_shard_dir,
                 shard_dir,
-                validation_dir,
                 log_path,
-                expected_records=source_num_seqs,
                 seqkit_threads=threads,
-            )
-            shard_paths = tuple(
-                shard_dir / name for name in _production_shard_names(spec)
             )
             record_multiset = _run_record_multiset_validation(
                 source_path,

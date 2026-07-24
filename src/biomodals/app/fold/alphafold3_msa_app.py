@@ -113,6 +113,7 @@ ORDINAL_SHUFFLER_RECIPE_VERSION = 4
 COMPOSABLE_MULTISET_RECIPE_VERSION = 5
 PRODUCTION_PROFILE_ROOT = "profiles"
 PRODUCTION_PREPARATION_ROOT = "production-candidates/profile-builds"
+RECORD_MULTISET_BENCHMARK_ROOT = "production-candidates/record-multiset-benchmarks"
 PRODUCTION_PROFILE_CLAIM_DICT_NAME = "AlphaFold3-msa-profile-build-claims"
 PRODUCTION_BUILD_TIMEOUT_SECONDS = 86_400
 PRODUCTION_BUILD_MEMORY_MIB = (1024, 262_144)
@@ -127,6 +128,11 @@ RECORD_MULTISET_CANONICALIZATION = (
     "full-header-and-sequence-case-sensitive-line-ending-independent-v1"
 )
 RECORD_MULTISET_AGGREGATE = "sha256-lane-sum-xor-and-square-sum-with-counts-v1"
+UNIPROT_V4_VALIDATION_BASELINE = {
+    "source_seqkit_sum_seconds": 338.390180,
+    "post_shard_stats_to_completion_seconds": 2242.917015,
+    "complete_builder_seconds": 4695.084267,
+}
 SOURCE_POLICIES = ("keep", "compress", "delete")
 LEGACY_PRODUCTION_VALIDATION_RELPATHS = (
     "validation/source-stats.tsv",
@@ -2610,12 +2616,13 @@ def _run_record_multiset_helper(
         str(output_path),
         *(str(path) for path in input_paths),
     ]
-    _append_log(
-        log_path,
+    start_message = (
         "Running record-multiset helper with "
         f"{selected_threads} threads over {len(input_paths)} files "
-        f"({input_bytes} bytes)",
+        f"({input_bytes} bytes)"
     )
+    _append_log(log_path, start_message)
+    print(f"🧬 validator {start_message}", flush=True)
     started = perf_counter()
     with log_path.open("ab") as log:
         completed = subprocess.run(  # noqa: S603
@@ -2634,12 +2641,13 @@ def _run_record_multiset_helper(
     if report.get("threads") != selected_threads:
         raise ValueError("Record-multiset helper reported the wrong thread count")
     _record_multiset_signature(report)
-    _append_log(
-        log_path,
+    completed_message = (
         "Completed record-multiset helper in "
         f"{elapsed:.6f}s at "
-        f"{input_bytes / elapsed if elapsed else 0.0:.3f} bytes/s",
+        f"{input_bytes / elapsed if elapsed else 0.0:.3f} bytes/s"
     )
+    _append_log(log_path, completed_message)
+    print(f"🧬 validator {completed_message}", flush=True)
     return {
         "input_bytes": input_bytes,
         "wall_seconds": elapsed,
@@ -2679,18 +2687,25 @@ def _run_record_multiset_validation(
         raise TypeError("Record-multiset helper result lost its report")
     source_signature = _record_multiset_signature(cast(dict[str, Any], source_report))
     shard_signature = _record_multiset_signature(cast(dict[str, Any], shard_report))
-    if source_signature != shard_signature:
-        raise ValueError("Canonical source and shard record multisets differ")
-    signature_sha256 = hashlib.sha256(_json_bytes(source_signature)).hexdigest()
+    source_signature_sha256 = hashlib.sha256(_json_bytes(source_signature)).hexdigest()
+    shard_signature_sha256 = hashlib.sha256(_json_bytes(shard_signature)).hexdigest()
+    match = source_signature == shard_signature
     result: dict[str, object] = {
-        "match": True,
+        "match": match,
         "algorithm": _record_multiset_identity(),
-        "signature_sha256": signature_sha256,
-        "signature": source_signature,
+        "source_signature_sha256": source_signature_sha256,
+        "shard_signature_sha256": shard_signature_sha256,
+        "source_signature": source_signature,
+        "shard_signature": shard_signature,
         "source": source_result,
         "shards": shard_result,
     }
+    if match:
+        result["signature_sha256"] = source_signature_sha256
+        result["signature"] = source_signature
     _write_json_atomic(output_path, result)
+    if not match:
+        raise ValueError("Canonical source and shard record multisets differ")
     return result
 
 
@@ -3746,6 +3761,42 @@ def _production_profile_plan(
             "source_and_shards_compared": True,
         },
         "existing_profile_policy": "validate-and-reuse",
+    }
+
+
+def _record_multiset_benchmark_plan(
+    seqkit_threads: int,
+) -> dict[str, object]:
+    """Plan the read-only recipe-v5 validator control on published UniProt."""
+    threads = _validate_seqkit_threads(seqkit_threads)
+    spec = _database_profile_spec("uniprot")
+    return {
+        "operation": "benchmark-validator",
+        "remote_calls": 1,
+        "database": {
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "source_filename": spec.source_filename,
+            "shard_count": spec.shard_count,
+        },
+        "validator": {
+            **_record_multiset_identity(),
+            "source_threads": 1,
+            "shard_threads": threads,
+        },
+        "inputs": {
+            "source_volume": SOURCE_DB_VOLUME_NAME,
+            "sharded_volume": SHARDED_DB_VOLUME_NAME,
+            "mounts": "read-only",
+            "source_and_shards_mutated": False,
+        },
+        "output_volume": OUTPUT_VOLUME_NAME,
+        "baseline": UNIPROT_V4_VALIDATION_BASELINE,
+        "resources": {
+            "cpu": [0.125, 32.125],
+            "memory_mib": list(PRODUCTION_BUILD_MEMORY_MIB),
+            "timeout_seconds": CONF.timeout,
+        },
     }
 
 
@@ -4933,6 +4984,187 @@ def build_sharded_database(
         seqkit_threads,
         source_policy,
     )
+
+
+def _benchmark_published_uniprot_record_multiset(
+    seqkit_threads: int,
+) -> dict[str, object]:
+    """Compare recipe-v5 validation with the measured recipe-v4 UniProt run."""
+    threads = _validate_seqkit_threads(seqkit_threads)
+    spec = _database_profile_spec("uniprot")
+    generation_id = uuid.uuid4().hex
+    source_root = Path(APP_INFO.source_db_dir)
+    sharded_root = Path(APP_INFO.sharded_db_dir)
+    output_root = Path(APP_INFO.output_dir)
+    source_path = source_root / spec.source_filename
+    profile_root = _production_profile_root(sharded_root, spec)
+    evidence_root = (
+        output_root / RECORD_MULTISET_BENCHMARK_ROOT / spec.profile_id / generation_id
+    )
+    log_path = evidence_root / "run.log"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    _append_log(
+        log_path,
+        f"Benchmarking recipe-v5 record validation on {spec.profile_id}",
+    )
+    try:
+        SOURCE_MSA_DB_VOLUME.reload()
+        SHARDED_MSA_DB_VOLUME.reload()
+        BENCHMARK_OUTPUT_VOLUME.reload()
+        manifest = _validate_published_production_profile(
+            profile_root,
+            spec,
+            verify_digests=False,
+        )
+        manifest_sha256 = _sha256_file(profile_root / "manifest.json")
+        source_record = manifest.get("source")
+        shard_records = manifest.get("shards")
+        if not isinstance(source_record, dict) or not isinstance(shard_records, list):
+            raise TypeError("Published UniProt manifest lost its artifact records")
+        _require_regular_file(source_path)
+        source_size = source_path.stat().st_size
+        if source_record.get("size_bytes") != source_size:
+            raise ValueError("Published UniProt source size no longer matches")
+        shard_paths = tuple(
+            profile_root / "shards" / name for name in _production_shard_names(spec)
+        )
+        declared_shard_bytes = 0
+        for record in shard_records:
+            if not isinstance(record, dict):
+                raise TypeError("Published UniProt shard record is invalid")
+            size_bytes = record.get("size_bytes")
+            if isinstance(size_bytes, bool) or not isinstance(size_bytes, int):
+                raise TypeError("Published UniProt shard size is invalid")
+            declared_shard_bytes += size_bytes
+
+        with tempfile.TemporaryDirectory(
+            prefix="af3-record-multiset-benchmark-",
+            dir=PRODUCTION_SCRATCH_ROOT,
+        ) as scratch_dir:
+            validation = _run_record_multiset_validation(
+                source_path,
+                shard_paths,
+                Path(scratch_dir),
+                evidence_root / "record-multiset.json",
+                log_path,
+                threads=threads,
+            )
+
+        signature = validation.get("signature")
+        source_result = validation.get("source")
+        shard_result = validation.get("shards")
+        if (
+            not isinstance(signature, dict)
+            or not isinstance(source_result, dict)
+            or not isinstance(shard_result, dict)
+        ):
+            raise TypeError("Record-multiset benchmark lost validator metrics")
+        signature = cast(dict[str, Any], signature)
+        source_result = cast(dict[str, Any], source_result)
+        shard_result = cast(dict[str, Any], shard_result)
+        if signature.get("records") != source_record.get("num_seqs"):
+            raise ValueError("Validator record count differs from v4 manifest")
+        if signature.get("sequence_bytes") != source_record.get("sum_len"):
+            raise ValueError("Validator residue count differs from v4 manifest")
+        if source_result.get("input_bytes") != source_size:
+            raise ValueError("Validator source byte count is invalid")
+        if shard_result.get("input_bytes") != declared_shard_bytes:
+            raise ValueError("Validator shard byte count is invalid")
+        source_seconds = source_result.get("wall_seconds")
+        shard_seconds = shard_result.get("wall_seconds")
+        if (
+            isinstance(source_seconds, bool)
+            or not isinstance(source_seconds, int | float)
+            or source_seconds <= 0
+            or isinstance(shard_seconds, bool)
+            or not isinstance(shard_seconds, int | float)
+            or shard_seconds <= 0
+        ):
+            raise ValueError("Validator benchmark timing is invalid")
+        combined_seconds = float(source_seconds) + float(shard_seconds)
+        baseline = UNIPROT_V4_VALIDATION_BASELINE
+        result: dict[str, object] = {
+            "schema_version": 1,
+            "status": "passed",
+            "database_id": spec.database_id,
+            "profile_id": spec.profile_id,
+            "generation_id": generation_id,
+            "profile_manifest_sha256": manifest_sha256,
+            "validator": _record_multiset_identity(),
+            "threads": threads,
+            "source_size_bytes": source_size,
+            "shard_size_bytes": declared_shard_bytes,
+            "records": signature["records"],
+            "sequence_bytes": signature["sequence_bytes"],
+            "signature_sha256": validation["signature_sha256"],
+            "source_wall_seconds": float(source_seconds),
+            "shard_wall_seconds": float(shard_seconds),
+            "combined_wall_seconds": combined_seconds,
+            "source_bytes_per_second": source_result["throughput_bytes_per_second"],
+            "shard_bytes_per_second": shard_result["throughput_bytes_per_second"],
+            "baseline": baseline,
+            "comparisons": {
+                "source_seqkit_sum_over_new_source_ratio": (
+                    baseline["source_seqkit_sum_seconds"] / float(source_seconds)
+                ),
+                "historical_post_stats_window_over_new_combined_ratio": (
+                    baseline["post_shard_stats_to_completion_seconds"]
+                    / combined_seconds
+                ),
+            },
+            "source_and_shards_mutated": False,
+            "evidence_path": str(evidence_root),
+            "completed_at": _utc_now(),
+        }
+        _write_json_atomic(evidence_root / "metrics.json", result)
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        _write_json_atomic(
+            evidence_root / "done.json",
+            {
+                "schema_version": 1,
+                "status": "complete",
+                "generation_id": generation_id,
+                "signature_sha256": validation["signature_sha256"],
+                "completed_at": _utc_now(),
+            },
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        return result
+    except Exception as exc:
+        _append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
+        _write_json_atomic(
+            evidence_root / "failure.json",
+            {
+                "failed_at": _utc_now(),
+                "database_id": spec.database_id,
+                "profile_id": spec.profile_id,
+                "generation_id": generation_id,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        BENCHMARK_OUTPUT_VOLUME.commit()
+        raise
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=PRODUCTION_BUILD_MEMORY_MIB,
+    timeout=CONF.timeout,
+    max_containers=1,
+    volumes={
+        APP_INFO.source_db_dir: SOURCE_MSA_DB_VOLUME.with_mount_options(read_only=True),
+        APP_INFO.sharded_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
+            read_only=True
+        ),
+        APP_INFO.output_dir: BENCHMARK_OUTPUT_VOLUME,
+    },
+)
+def benchmark_record_multiset_validator(
+    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+) -> dict[str, object]:
+    """Benchmark recipe-v5 validation on the published recipe-v4 UniProt."""
+    return _benchmark_published_uniprot_record_multiset(seqkit_threads)
 
 
 SCAN_BUFFER_SIZE = 8 * 1024 * 1024
@@ -9677,7 +9909,8 @@ def submit_alphafold3_msa_task(
 
     Args:
         operation: Operation to plan or run: ``prepare``, ``build-profile``,
-            ``search-profile``, ``validate-oracle``, ``scan``, or ``search``.
+            ``benchmark-validator``, ``search-profile``, ``validate-oracle``,
+            ``scan``, or ``search``.
         submit: Submit the displayed remote work. Defaults to false, which only
             prints the plan and incurs no Modal compute work.
         seqkit_threads: SeqKit/native worker count for preparation, default 8.
@@ -9695,6 +9928,8 @@ def submit_alphafold3_msa_task(
             seqkit_threads,
             source_policy,
         )
+    elif operation == "benchmark-validator":
+        plan = _record_multiset_benchmark_plan(seqkit_threads)
     elif operation == "search-profile":
         plan = _production_search_plan(database_id, sequence)
     elif operation == "validate-oracle":
@@ -9705,8 +9940,9 @@ def submit_alphafold3_msa_task(
         plan = _build_search_plan(search_mode)
     else:
         raise ValueError(
-            "operation must be 'prepare', 'build-profile', 'search-profile', "
-            "'validate-oracle', 'scan', or 'search'"
+            "operation must be 'prepare', 'build-profile', "
+            "'benchmark-validator', 'search-profile', 'validate-oracle', "
+            "'scan', or 'search'"
         )
     print(_json_bytes(plan).decode(), end="")
     if not submit:
@@ -9721,6 +9957,11 @@ def submit_alphafold3_msa_task(
             database_id=database_id,
             seqkit_threads=seqkit_threads,
             source_policy=source_policy,
+        )
+    elif operation == "benchmark-validator":
+        print("🧬 Submitting the read-only UniProt validator benchmark...")
+        result = benchmark_record_multiset_validator.remote(
+            seqkit_threads=seqkit_threads,
         )
     elif operation == "search-profile":
         spec = _database_profile_spec(database_id)

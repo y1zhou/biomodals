@@ -3930,7 +3930,10 @@ PEMBROLIZUMAB_VH_SEQUENCE = (
 PEMBROLIZUMAB_VH_SHA256 = (
     "5d92fab232244fa55131fc3b8d31b34990aa778623cdd906d58cf920dbdaf28f"
 )
-RNA_ORACLE_SEQUENCE = "GGCCCGAUAGCUCAGUCGGUAGAGC"
+RFAM_PICEA_GLAUCA_121NT_SEQUENCE = (
+    "GUGCAUGCCUAUAGCAUAUCAUUAAUGCACCAGAUCCCAUUAUAACUCCUCAUGUAAGCGUGCUCGAGA"
+    "UAGAUUAGUACUGGGAUGGUUGACUGCAAAGGAAGUCUUAGUGUUUUACAUG"
+)
 ECOLI_K12_GROEL_SEQUENCE = (
     "MAAKDVKFGNDARVKMLRGVNVLADAVKVTLGPKGRNVVLDKSFGAPTITKDGVSVAREIELEDKFENMG"
     "AQMVKEVASKANDAAGDGTTTATVLAQAIITEGLKAVAAGMNPMDLKRGIDKAVTAAVEELKALSVPCSD"
@@ -6892,7 +6895,7 @@ def _default_profile_query(spec: DatabaseProfileSpec) -> str:
     if spec.polymer == "protein":
         return PEMBROLIZUMAB_VH_SEQUENCE
     if spec.polymer == "rna":
-        return RNA_ORACLE_SEQUENCE
+        return RFAM_PICEA_GLAUCA_121NT_SEQUENCE
     raise RuntimeError(f"Unsupported polymer type: {spec.polymer}")
 
 
@@ -7555,9 +7558,9 @@ MSA_ORACLE_CASES = (
         database_ids=("uniref90", "small_bfd", "mgnify", "uniprot"),
     ),
     MsaOracleCase(
-        case_id="upstream-rna-25nt",
+        case_id="rfam-picea-glauca-121nt",
         polymer="rna",
-        sequence=RNA_ORACLE_SEQUENCE,
+        sequence=RFAM_PICEA_GLAUCA_121NT_SEQUENCE,
         database_ids=("rfam", "rnacentral", "ntrna"),
     ),
 )

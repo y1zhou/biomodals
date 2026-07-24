@@ -289,16 +289,23 @@ for example:
 ```
 
 Do the shuffle/split operation once in a dedicated setup job, not during a
-prediction. SeqKit's `shuffle --two-pass` is deterministic with its default
-seed, but the seed and SeqKit version should be explicit. `split2 --by-part`
-uses round-robin partitioning and does not emit AF3's required zero-based padded
-names by default, so rename and validate every output. See the official
-[SeqKit shuffle documentation](https://bioinf.shenwei.me/seqkit/usage/#shuffle)
-and
+prediction. Stock SeqKit `shuffle --two-pass` is deterministic, but its
+full-header maps reached 123.54 GiB RSS for UniProt and its serialized random
+reads produced only about 1.9 MB/s. It is not feasible for MGnify under the
+128 GiB limit; see the
+[source and runtime audit](alphafold3-seqkit-two-pass-shuffle-audit.md).
+
+Use the pinned occurrence-indexed two-pass helper instead. Pass one scans the
+source sequentially into compact fixed-width offsets and creates an explicit
+seed-23 Fisher--Yates permutation. Pass two uses bounded concurrent reads while
+writing in permutation order. This preserves duplicate headers by occurrence
+and keeps the source FASTA only on the source Modal Volume. Write only the
+compact index and shuffled FASTA to container-local `/tmp`.
+
+`split2 --by-part` does not emit AF3's required zero-based padded names by
+default, so rename and validate every output. See the official
 [split2 documentation](https://bioinf.shenwei.me/seqkit/usage/#split2).
 
-Keep the source FASTA on the source Modal Volume. Write only the shuffled FASTA
-to container-local `/tmp`; SeqKit's FAI remains a sidecar beside the source.
 After all seven database profiles pass validation, remove abandoned staging
 generations and the obsolete small-BFD benchmark profile so the sharded
 Volume's `/profiles/` directory contains exactly one published directory per

@@ -114,21 +114,22 @@ One invocation handles one logical database:
    exists, fail with instructions to restore it manually in a Modal Sandbox or
    equivalent environment.
 5. Run full source `seqkit stats`, source hashing, and scratch-space preflight.
-6. Write the two-pass shuffled FASTA under `/tmp`. SeqKit keeps its FAI sidecar
-   beside the source FASTA on the source Volume; the source FASTA itself is not
-   copied to local disk.
-7. Recover every record omitted by SeqKit's duplicate-header FAI behavior from
-   the reported byte offsets, prefix recovered headers with generation-unique
-   UUIDs, append them to the shuffled FASTA, and run `seqkit split2`.
-   `split2` writes generation-scoped raw shards to the sharded Volume; no
-   persistent Volume receives the shuffled FASTA.
-8. Delete the local shuffled payload after splitting. Rewrite one raw shard at
-   a time to remove recovery prefixes, publish the final shard, and delete that
-   raw shard before proceeding.
-9. Run aggregate and per-shard `seqkit stats`; validate source/shard sequence
-   and residue conservation, filenames, shard count, headers, sizes, and
-   digests.
-10. Derive Z/domZ from the measured source, write compact validation evidence,
+6. Run the pinned occurrence-indexed two-pass helper. Its first sequential pass
+   writes only fixed-width source offsets under `/tmp`; it never copies the
+   source FASTA. It creates a deterministic seed-23 Fisher--Yates permutation
+   over `uint32` record ordinals.
+7. In pass two, issue bounded concurrent reads from the source Volume and write
+   completed records strictly in permutation order to `/tmp/shuffled.fasta`.
+   Index by source occurrence so duplicate full headers are preserved without
+   FAI recovery. Normalize only a missing terminal newline.
+8. Run `seqkit split2`, which writes generation-scoped raw shards to the
+   sharded Volume. Delete the local shuffled payload and rename raw shards to
+   their exact AlphaFold-compatible filenames.
+9. Run aggregate and per-shard `seqkit stats` and `seqkit sum --all`; validate
+   source/shard sequence and residue conservation, occurrence preservation,
+   filenames, shard count, balance, sizes, and digests.
+10. Derive Z/domZ from the measured source, write compact validation evidence
+    including the native helper identity and metrics,
     commit the shard payload, and publish `manifest.json` last.
 11. Deeply revalidate the published profile.
 12. Apply `source_policy` only after successful publication:
@@ -429,7 +430,8 @@ failed results in research documentation before production promotion.
 Commit: `fold: add sharded database builder`
 
 - add the separate sharded Volume and fixed registry;
-- port only the proven shuffle/recovery/split/validation code;
+- add the pinned compact occurrence-indexed shuffle and the proven
+  split/validation code;
 - add manifest-last publication, minimal claim, `/tmp` staging, and source
   policy;
 - do not import benchmark code or campaign types.

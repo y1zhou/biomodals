@@ -67,8 +67,10 @@ requires a new Profile ID and a reviewed app deployment.
 candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
 `/tmp` and does not retain the monolithic FASTA inside the profile.
 
-`seqkit_threads` is an operational builder control. Changing it does not select
-a different scientific specification or Profile ID.
+`seqkit_threads` controls both SeqKit validation/splitting and the native
+shuffler's bounded read workers. It is operational: changing it does not select
+a different scientific specification or Profile ID, and ordered output makes
+the permutation independent of worker completion order.
 
 ### Immutable profile layout
 
@@ -107,19 +109,26 @@ One invocation builds one logical database. It uses `(0.125, 32.125)` CPUs and
 the default 512 GiB ephemeral disk without requesting a larger disk.
 
 The builder reads the official monolithic FASTA from `AlphaFold3-msa-db`. It
-writes the two-pass shuffled FASTA and SeqKit index under `/tmp`.
+writes the two-pass shuffled FASTA and a compact occurrence-offset index under
+`/tmp`. It never copies the source FASTA.
 
-SeqKit FAI can omit records with duplicate header keys. The builder identifies
-each omission from the reported source byte offset, prefixes its header with a
-generation-unique UUID, and appends it to the shuffled FASTA.
+The first pass scans the source sequentially and indexes every record by source
+occurrence in a fixed-width `uint64` offset array. It then creates a
+seed-23, SplitMix64 Fisher--Yates permutation of `uint32` ordinals. The second
+pass uses bounded concurrent `pread` calls but buffers and writes each batch in
+permutation order. The helper normalizes a missing final newline so moving the
+last source record cannot merge it with the next header.
+
+Occurrence identity preserves duplicate full headers without FAI lookup,
+temporary header prefixes, or recovery. The manifest pins the helper source
+digest, offset representation, permutation, and ordered-read behavior.
 
 The builder then runs `seqkit split2`. Generation-scoped raw shards are written
 to the sharded Volume; the shuffled FASTA is never written to a persistent
 Volume.
 
-After splitting, the builder deletes the shuffled payload. It removes recovery
-prefixes from one raw shard at a time, publishes the final shard, and deletes
-that raw shard before processing the next one.
+After splitting, the builder deletes the shuffled payload and renames each
+generation-scoped raw shard to its exact AlphaFold-compatible filename.
 
 Construction is the scientific trust boundary. Before publication, the builder
 checks all of the following:
@@ -127,7 +136,8 @@ checks all of the following:
 - source and aggregate-shard `seqkit stats`;
 - sequence and residue conservation;
 - order-independent `seqkit sum --all`;
-- recovered duplicate records and removal of temporary prefixes;
+- occurrence-index construction and native shuffler metrics;
+- duplicate-header occurrence preservation with no recovery prefixes;
 - exact shard names, count, balance, sizes, and digests;
 - source identity, recipe, and declared compatibility.
 
@@ -142,6 +152,11 @@ statistics are guards; a mismatch fails publication for inspection.
 After the shard payload is committed, the builder writes the manifest last and
 deeply revalidates the published profile. Failure cleanup removes only that
 generation's partial shards and retains compact diagnostics.
+
+Profiles already published with the earlier SeqKit FAI recipe remain accepted
+under recipe version 3. New builds use occurrence-indexed recipe version 4.
+Both recipes require full conservation evidence and must pass the same
+database-search oracle before production promotion.
 
 Normal search workers trust the published profile. They may read its small
 manifest for identity and Z, but they never stat, hash, walk, or run SeqKit over

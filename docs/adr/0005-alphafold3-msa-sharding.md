@@ -485,8 +485,8 @@ It returned no non-query hit from RFam, RNAcentral, or NT-RNA. Its monolithic
 and sharded query-only A3Ms matched, but that result does not exercise hit
 merging or deduplication and therefore cannot promote the RNA profiles.
 
-The replacement gate uses the following 121-nucleotide sequence from the
-official RFam 14.9 source record
+The first hit-bearing stress gate uses the following 121-nucleotide sequence
+from the official RFam 14.9 source record
 `ALWZ042362541.1/2041-2161` (with `T` represented as `U` for the AlphaFold RNA
 alphabet):
 
@@ -497,6 +497,27 @@ GUGCAUGCCUAUAGCAUAUCAUUAAUGCACCAGAUCCCAUUAUAACUCCUCAUGUAAGCGUGCUCGAGAUAGAUUAGUAC
 Because this is an exact member of the source database, the monolithic RFam
 result must contain at least one non-query hit. The gate still fails if it
 does not.
+
+That query produced 27,240 monolithic non-query hits. After the sharded Nhmmer
+merge was corrected to sort by printed E-value, descending printed bit score,
+and target ID, RFam and NT-RNA matched the monolith modulo equal-score
+permutations. RNAcentral saturated the 9,999-hit limit and retained one
+different cutoff row. The two alternatives have the same printed E-value and
+bit score but different identities and aligned sequences. HMMER's internal
+full-precision ranking value is rounded in `tblout`, so an exact monolithic
+cutoff cannot be reconstructed from stock shard outputs. A substituted row is
+not a permutation and does not pass this decision's scientific gate.
+
+The non-saturating promotion gate uses the following 119-nucleotide sequence
+from the exact official RFam 14.9 RAGATH-1 hammerhead ribozyme record
+`URS0000D698D3_12908/1-119`:
+
+```text
+AACUCAGCUAGGGAGAGUAGCGAGCAUUACGUAAUACUACGUAUUACUCCAAUAACAUUGUCACUGAUGAGACCUAGACGAAACUACGGUAAACAUUUGCAUCAUACUGUAGUCUGAUA
+```
+
+It must contain at least one monolithic RFam hit and must not rely on a
+saturated cutoff to pass.
 
 For RFam, RNAcentral, and NT-RNA separately, the oracle compares monolithic and
 sharded identities, scores, E-values, and aligned-sequence multisets using the

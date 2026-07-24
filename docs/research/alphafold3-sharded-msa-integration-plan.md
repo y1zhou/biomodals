@@ -46,9 +46,11 @@ The small-BFD Phase 1 campaign established:
 
 The generic builder subsequently validated and published all seven official
 profiles. The protein scientific oracle has passed across the four protein
-databases. The first RNA fixture returned no hits and was rejected; the
-hit-bearing RNA gate and integrated-pipeline gates below remain mandatory
-before the corresponding production paths are considered complete.
+databases. The first RNA fixture returned no hits and was rejected. A
+hit-bearing Picea stress fixture then exposed a one-row saturated-cutoff
+limitation in stock Nhmmer output. The non-saturating RNA gate and
+integrated-pipeline gates below remain mandatory before the corresponding
+production paths are considered complete.
 
 ### Scientific oracle evidence
 
@@ -105,6 +107,31 @@ seconds. The app's exact bill was $0.54123, versus a $0.24646
 successful-attempt estimate. This is why final reports keep platform-billed
 campaign cost, client-observed latency, and successful-attempt telemetry as
 separate measurements.
+
+The next 121-nucleotide Picea fixture produced 27,240 monolithic non-query
+hits and therefore exercised all three database merges and final RNA
+deduplication. The first comparison showed that sorting shard hits by printed
+E-value and target ID, as upstream currently does, can place a lower printed
+bit score ahead of a higher one. Sorting by printed E-value, descending
+printed bit score, and target ID repaired RFam and NT-RNA: both then had
+identical hit-row multisets and differed only within equal-score blocks.
+
+RNAcentral remained saturated at 9,999 hits. Its corrected result differed
+from the monolith by exactly one cutoff row; both alternatives had printed
+E-value `2.4e-08` and bit score `46.8`, but different identities and aligned
+sequences. Stock HMMER ranks with an internal full-precision score while
+`tblout` exposes rounded values, so the monolithic cutoff choice cannot be
+reconstructed exactly from the shard outputs. This is not an equal-score
+permutation and remains a scientific gate failure.
+
+The fixed non-saturating oracle therefore uses the exact RFam 14.9
+RAGATH-1 hammerhead ribozyme representative
+`URS0000D698D3_12908/1-119`. Its 119 nucleotides guarantee a real RFam hit
+without deliberately selecting a universal RNA family:
+
+```text
+AACUCAGCUAGGGAGAGUAGCGAGCAUUACGUAAUACUACGUAUUACUCCAAUAACAUUGUCACUGAUGAGACCUAGACGAAACUACGGUAAACAUUUGCAUCAUACUGUAGUCUGAUA
+```
 
 ## Stores and immutable database registry
 

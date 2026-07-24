@@ -178,6 +178,20 @@ build evidence for `mgnify-512-v1`; it may not be counted as ready until its
 builder publishes and validates a manifest. The final sharded-Volume inventory
 and removal of obsolete profiles remain a separate post-build Sandbox gate.
 
+Generation `44178e3a52864732b330491758d10d8f` republished
+`small-bfd-64-v2` on 2026-07-24 after the mature C helpers and shared Python
+sharding primitives were extracted into
+`src/biomodals/app/fold/alphafold3/`. The refactored builder preserved the
+source SHA-256, all 65,984,053 record occurrences, and all 16,748,600,902
+residues. Its source and 64-shard canonical full-record signatures matched at
+`5b07a3e612a0ef0e7d6957f2ef057e0e082a97b8f9f6e798093e22d18b371909`;
+no duplicate-header record required recovery. Maximum shard residue imbalance
+was 0.2269%, and the manifest SHA-256 is
+`b2288d239d5f3b1d86582c0c8c9de5e339f83204c277cffdeec59ab97647f270`.
+The durable operation took 8 minutes 11.852 seconds from its first log event
+through its completion marker; the local Modal invocation, including image
+startup, took 9 minutes 14 seconds.
+
 Generation `6a08f17a689943b9ace9947ba285ece9` published the first recipe-v5
 profile, `nt-rna-256-v1`, on 2026-07-24. The builder preserved all 37,105,891
 record occurrences and 76,752,808,514 residues, recovered no records, and

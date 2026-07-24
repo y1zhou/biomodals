@@ -468,3 +468,58 @@ Durable evidence is under
 `production-candidates/profile-builds/nt-rna-256-v1/`
 `6a08f17a689943b9ace9947ba285ece9/` on
 `AlphaFold3-MSA-Benchmark-outputs`.
+
+### Refactor regression: small BFD
+
+Generation `44178e3a52864732b330491758d10d8f` rebuilt
+`small-bfd-64-v2` on 2026-07-24 after the native helpers and shared Python
+sharding primitives moved into `src/biomodals/app/fold/alphafold3/`. The
+remote operation ran from its first durable log event at 07:34:50.826 UTC to
+the completion marker at 07:43:02.678 UTC, or 491.852 seconds. The local Modal
+invocation, including image startup and final log handling, completed in
+9 minutes 14 seconds.
+
+| Stage | Duration or rate |
+|---|---:|
+| source `seqkit stats` | 86.084s |
+| source SHA-256 and shuffle setup | 32.327s |
+| first pass: Volume read plus local-source tee and occurrence index | 28.048s; 647.880 MB/s |
+| Fisher--Yates permutation | 1.997s |
+| second pass: eight ordered local-SSD `pread` workers | 181.106s; 100.337 MB/s |
+| staged-source SHA-256 verification | 12.963s |
+| `split2` to 64 Volume shards | 83.270s |
+| source full-record validator | 93.692s; 193.951 MB/s |
+| 64-shard full-record validator, eight threads | 13.969s; 1.318 GB/s |
+| overlapping split and validator stage | 97.410s |
+
+The rebuilt profile contains exactly 64 shards, 65,984,053 record
+occurrences, and 16,748,600,902 residues. The shard files occupy
+18,417,671,014 physical bytes after SeqKit rewrapping, compared with the
+18,171,626,364-byte source. Source and shard scans both reported
+1,225,073,303 header bytes and the same canonical signature SHA-256:
+
+```text
+5b07a3e612a0ef0e7d6957f2ef057e0e082a97b8f9f6e798093e22d18b371909
+```
+
+Every aggregate sum, XOR, and sum-of-squares lane matched. The staged source
+also matched the immutable Volume source SHA-256
+`fd87dca06401b03f4ac3c59a82dac14db491a7933ed6abaa19e14e02c6eb1af5`.
+Maximum shard residue imbalance was 0.2269%, below the 5% publication gate.
+The published manifest SHA-256 is
+`b2288d239d5f3b1d86582c0c8c9de5e339f83204c277cffdeec59ab97647f270`.
+
+The earlier generation `d2eeaef371b249bd90734fb885127cf8` had the same
+source identity, final record count, and residue total only after recovering
+55,187 records and 24,934,582 residues omitted by SeqKit's duplicate-header
+FAI. The occurrence-indexed implementation recovered zero records because no
+occurrence was discarded in the first place. This result therefore validates
+the refactored construction path and eliminates the known duplicate-ID
+omission mechanism. It does not replace the end-to-end protein and RNA MSA
+search oracles, which remain scheduled after the final MGnify profile and
+inventory gate.
+
+Durable evidence is under
+`production-candidates/profile-builds/small-bfd-64-v2/`
+`44178e3a52864732b330491758d10d8f/` on
+`AlphaFold3-MSA-Benchmark-outputs`.

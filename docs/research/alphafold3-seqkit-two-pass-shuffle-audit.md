@@ -426,8 +426,11 @@ verification.
 The persistent evidence is under
 `production-candidates/record-multiset-benchmarks/uniprot-256-v1/`
 `cf1bff66cb1542d0ab288deaf0d75f08/` on
-`AlphaFold3-MSA-Benchmark-outputs`. These measurements establish the baseline;
-they do not yet choose whether production should retain the simple
-file-parallel implementation, add intra-file source parallelism, or reuse a
-source signature produced while staging the source. Make that choice after
-comparing the implementation complexity and measured end-to-end impact.
+`AlphaFold3-MSA-Benchmark-outputs`.
+
+The final decision is to use the occurrence-indexed C shuffler and this
+full-record C validator for new profiles. SeqKit remains in the builder for
+independent statistics and splitting, not aggregate checksum validation. The
+current simple file-parallel validator is the accepted implementation; a
+future optimization may reuse a source signature produced while staging only
+if it preserves the same canonicalization and aggregate contract.

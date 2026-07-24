@@ -33,6 +33,13 @@ random reads from the monolithic source produced only about 1.9 MB/s for
 UniProt, so the one-time profile builder stages that source on ephemeral SSD
 before randomized output.
 
+The original aggregate `seqkit sum --all` validation also ignored FASTA
+headers and turned the shard union into one serial input with a global
+per-sequence hash sort. The replacement C validator's measured source scan was
+slower than the source-side SeqKit checksum, but its complete UniProt
+source-plus-256-shard scan took 10m 02s and compared the multiplicity-sensitive
+full `(header, sequence)` multiset.
+
 ## Decision
 
 ### Ownership and upstream compatibility
@@ -72,10 +79,10 @@ requires a new Profile ID and a reviewed app deployment.
 candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
 `/tmp` and does not retain the monolithic FASTA inside the profile.
 
-`seqkit_threads` controls both SeqKit validation/splitting and the native
-shuffler's bounded read workers. It is operational: changing it does not select
-a different scientific specification or Profile ID, and ordered output makes
-the permutation independent of worker completion order.
+`seqkit_threads` controls SeqKit statistics/splitting and the native shuffler
+and validator workers. It is operational: changing it does not select a
+different scientific specification or Profile ID, and ordered output makes the
+permutation independent of worker completion order.
 
 ### Immutable profile layout
 
@@ -149,11 +156,20 @@ checks all of the following:
 
 - source and aggregate-shard `seqkit stats`;
 - sequence and residue conservation;
-- order-independent `seqkit sum --all`;
+- an order-independent, multiplicity-sensitive C validation of the complete
+  canonical `(header, sequence)` multiset;
 - occurrence-index construction and native shuffler metrics;
 - duplicate-header occurrence preservation with no recovery prefixes;
 - exact shard names, count, balance, sizes, and digests;
 - source identity, recipe, and declared compatibility.
+
+The validator hashes each full header, concatenated sequence, and explicit
+header and sequence lengths with SHA-256. Header and sequence case are
+significant; line endings and sequence wrapping are not. It combines all four
+64-bit digest lanes with modular sums, XORs, and sums of squares, plus exact
+record, header-byte, and sequence-byte totals. The source and aggregate shard
+signatures must match. SeqKit is not used for aggregate checksums in new
+profiles; it remains responsible for `stats` and `split2`.
 
 For protein profiles, HMMER Z and domZ equal the exact source sequence count.
 For RNA profiles, Nhmmer Z equals the exact nucleotide count divided by
@@ -168,9 +184,12 @@ deeply revalidates the published profile. Failure cleanup removes only that
 generation's partial shards and retains compact diagnostics.
 
 Profiles already published with the earlier SeqKit FAI recipe remain accepted
-under recipe version 3. New builds use occurrence-indexed recipe version 4.
-Both recipes require full conservation evidence and must pass the same
-database-search oracle before production promotion.
+under recipe version 3. Occurrence-indexed profiles published with the C
+shuffler and SeqKit sequence checksum remain accepted under recipe version 4.
+New builds use recipe version 5: the occurrence-indexed C shuffler and
+full-record C validator together. Existing immutable profiles are not rebuilt
+solely to revise their validation recipe; every selected profile must still
+pass the same database-search oracle before production promotion.
 
 Normal search workers trust the published profile. They may read its small
 manifest for identity and Z, but they never stat, hash, walk, or run SeqKit over

@@ -329,9 +329,9 @@ the eight-thread shard scan took 113.268 seconds at 957.449 MB/s; combined
 scanner time was 602.069 seconds. This is 3.73 times shorter than the
 historical 2,242.917-second post-shard-statistics-to-completion window, although
 that old window also included artifact hashing, publication, and deep
-verification. Keep these measurements as the decision baseline rather than
-selecting a production validator strategy before the implementation tradeoff
-is reviewed. Full evidence and caveats are in the
+verification. The selected production-candidate recipe uses the C shuffler and
+full-record C validator; SeqKit remains responsible for statistics and
+splitting. Full evidence and caveats are in the
 [shuffle audit](alphafold3-seqkit-two-pass-shuffle-audit.md#read-only-recipe-v5-validator-benchmark).
 
 When this builder moves into the production AlphaFold3 app, its setup

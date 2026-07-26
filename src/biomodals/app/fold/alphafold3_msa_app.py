@@ -54,6 +54,59 @@ import modal
 import orjson
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.profiles import (
+    BUILD_MEMORY_MIB as PRODUCTION_BUILD_MEMORY_MIB,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    BUILD_TIMEOUT_SECONDS as PRODUCTION_BUILD_TIMEOUT_SECONDS,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    COMPOSABLE_MULTISET_RECIPE_VERSION,
+    DATABASE_PROFILE_SPECS,
+    DEFAULT_SEQKIT_THREADS,
+    HMMER_VERSION,
+    JACKHMMER_PATCH_SHA256,
+    LEGACY_PROFILE_RECIPE_VERSION,
+    LEGACY_VALIDATION_RELPATHS,
+    MAX_PROFILE_IMBALANCE,
+    ORDINAL_SHUFFLER_RECIPE_VERSION,
+    ORDINAL_VALIDATION_RELPATHS,
+    PROFILE_BUILD_CLAIM_DICT_NAME,
+    PROFILE_ROOT,
+    SEQKIT_VERSION,
+    SHARD_RANDOM_SEED,
+    SHARDED_DB_VOLUME_NAME,
+    SOURCE_DB_VOLUME_NAME,
+    VALIDATION_RELPATHS,
+    DatabaseProfileSpec,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    PROFILE_SCHEMA_VERSION as PRODUCTION_PROFILE_SCHEMA_VERSION,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    PROFILE_STALE_SECONDS as PRODUCTION_PROFILE_STALE_SECONDS,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    SCRATCH_ROOT as PRODUCTION_SCRATCH_ROOT,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    profile_root as _production_profile_root,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    resolve_database_profile as _database_profile_spec,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    shard_filename as _production_shard_filename,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    shard_names as _production_shard_names,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    validate_seqkit_threads as _validate_seqkit_threads,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    validate_source_policy as _validate_source_policy,
+)
 from biomodals.app.fold.alphafold3.sharding import (
     CONTAINER_NATIVE_SOURCE_DIR,
     NATIVE_SOURCE_DIR_ENV,
@@ -99,19 +152,12 @@ CAMPAIGN_ID = "small-bfd-phase1-v2"
 PROFILE_ID = "small-bfd-64-v1"
 PROFILE_SCHEMA_VERSION = 1
 SOURCE_DB_FILENAME = "bfd-first_non_consensus_sequences.fasta"
-SOURCE_DB_VOLUME_NAME = "AlphaFold3-msa-db"
-SHARDED_DB_VOLUME_NAME = "AlphaFold3-msa-db-sharded"
 OUTPUT_VOLUME_NAME = "AlphaFold3-MSA-Benchmark-outputs"
 DATABASE_ID = "small-bfd"
 SHARD_COUNT = 64
-SHARD_RANDOM_SEED = 23
 SMALL_BFD_Z = 65_984_053
 EXPECTED_RECOVERED_RECORDS = 55_187
 EXPECTED_RECOVERED_RESIDUES = 24_934_582
-SEQKIT_VERSION = "2.13.0"
-DEFAULT_SEQKIT_THREADS = 8
-MAX_SEQKIT_THREADS = 32
-MAX_PROFILE_IMBALANCE = 0.05
 PROFILE_RECIPE_VERSION = 2
 RECOVERED_HEADER_NAMESPACE = "__AF3_RECOVERED_"
 MAX_FASTA_HEADER_BYTES = 1024 * 1024
@@ -124,10 +170,6 @@ PROFILE_VALIDATION_RELPATHS = (
     "validation/seqkit-sum.json",
     "validation/shuffle-stderr.log",
     "validation/duplicate-recovery.jsonl",
-)
-HMMER_VERSION = "3.4"
-JACKHMMER_PATCH_SHA256 = (
-    "df9e3ae35ad1659921d96ebfca67a9616a7a467ddde2be18a56f9bd3edb38c41"
 )
 JACKHMMER_BINARY_PATH = "/hmmer/bin/jackhmmer"
 JACKHMMER_N_ITER = 1
@@ -149,18 +191,11 @@ _FAI_DUPLICATE_WARNING = re.compile(
     rb"at byte offset (?P<offset>[0-9]+)\r?\n?$"
 )
 
-PRODUCTION_PROFILE_SCHEMA_VERSION = 2
-LEGACY_PRODUCTION_PROFILE_RECIPE_VERSION = 3
-ORDINAL_SHUFFLER_RECIPE_VERSION = 4
-COMPOSABLE_MULTISET_RECIPE_VERSION = 5
-PRODUCTION_PROFILE_ROOT = "profiles"
+LEGACY_PRODUCTION_PROFILE_RECIPE_VERSION = LEGACY_PROFILE_RECIPE_VERSION
+PRODUCTION_PROFILE_ROOT = PROFILE_ROOT
 PRODUCTION_PREPARATION_ROOT = "production-candidates/profile-builds"
 RECORD_MULTISET_BENCHMARK_ROOT = "production-candidates/record-multiset-benchmarks"
-PRODUCTION_PROFILE_CLAIM_DICT_NAME = "AlphaFold3-msa-profile-build-claims"
-PRODUCTION_BUILD_TIMEOUT_SECONDS = 86_400
-PRODUCTION_BUILD_MEMORY_MIB = (1024, 262_144)
-PRODUCTION_PROFILE_STALE_SECONDS = PRODUCTION_BUILD_TIMEOUT_SECONDS + 900
-PRODUCTION_SCRATCH_ROOT = Path(tempfile.gettempdir())
+PRODUCTION_PROFILE_CLAIM_DICT_NAME = PROFILE_BUILD_CLAIM_DICT_NAME
 MSA_ORACLE_COMPARISON_POLICY = (
     "full-hit-rows-exact-modulo-contiguous-evalue-bit-score-ties-v1"
 )
@@ -170,30 +205,9 @@ UNIPROT_V4_VALIDATION_BASELINE = {
     "post_shard_stats_to_completion_seconds": 2242.917015,
     "complete_builder_seconds": 4695.084267,
 }
-SOURCE_POLICIES = ("keep", "compress", "delete")
-LEGACY_PRODUCTION_VALIDATION_RELPATHS = (
-    "validation/source-stats.tsv",
-    "validation/shard-stats.tsv",
-    "validation/shard-summary.parquet",
-    "validation/source-sum.tsv",
-    "validation/shard-sum.tsv",
-    "validation/seqkit-sum.json",
-    "validation/shuffle-stderr.log",
-    "validation/duplicate-recovery.jsonl",
-)
-ORDINAL_PRODUCTION_VALIDATION_RELPATHS = (
-    *LEGACY_PRODUCTION_VALIDATION_RELPATHS,
-    "validation/shuffler-metrics.json",
-)
-PRODUCTION_VALIDATION_RELPATHS = (
-    "validation/source-stats.tsv",
-    "validation/shard-stats.tsv",
-    "validation/shard-summary.parquet",
-    "validation/record-multiset.json",
-    "validation/shuffle-stderr.log",
-    "validation/duplicate-recovery.jsonl",
-    "validation/shuffler-metrics.json",
-)
+LEGACY_PRODUCTION_VALIDATION_RELPATHS = LEGACY_VALIDATION_RELPATHS
+ORDINAL_PRODUCTION_VALIDATION_RELPATHS = ORDINAL_VALIDATION_RELPATHS
+PRODUCTION_VALIDATION_RELPATHS = VALIDATION_RELPATHS
 NHMMER_BINARY_PATH = "/hmmer/bin/nhmmer"
 HMMALIGN_BINARY_PATH = "/hmmer/bin/hmmalign"
 HMMBUILD_BINARY_PATH = "/hmmer/bin/hmmbuild"
@@ -234,120 +248,6 @@ class FaiDuplicateWarning:
 
     sequence_name: bytes
     sequence_offset: int
-
-
-@dataclass(frozen=True)
-class DatabaseProfileSpec:
-    """One code-owned immutable database-sharding specification."""
-
-    database_id: str
-    profile_id: str
-    source_filename: str
-    shard_count: int
-    polymer: str
-    expected_num_seqs: int | None
-    expected_sum_len: int | None
-    max_sequences: int
-
-    @property
-    def search_space_value(self) -> int | float:
-        """Return the full-database HMMER search-space value."""
-        if self.polymer == "protein":
-            if self.expected_num_seqs is None:
-                raise RuntimeError(
-                    f"{self.database_id} lacks an expected sequence count"
-                )
-            return self.expected_num_seqs
-        if self.polymer == "rna":
-            if self.expected_sum_len is None:
-                raise RuntimeError(
-                    f"{self.database_id} lacks an expected residue count"
-                )
-            return self.expected_sum_len / 1_000_000
-        raise RuntimeError(f"Unsupported polymer type: {self.polymer}")
-
-    @property
-    def search_space_unit(self) -> str:
-        """Return the unit expected by the pinned HMMER wrapper."""
-        if self.polymer == "protein":
-            return "sequences"
-        if self.polymer == "rna":
-            return "megabases"
-        raise RuntimeError(f"Unsupported polymer type: {self.polymer}")
-
-
-DATABASE_PROFILE_SPECS = (
-    DatabaseProfileSpec(
-        database_id="small_bfd",
-        profile_id="small-bfd-64-v2",
-        source_filename="bfd-first_non_consensus_sequences.fasta",
-        shard_count=64,
-        polymer="protein",
-        expected_num_seqs=65_984_053,
-        expected_sum_len=None,
-        max_sequences=5_000,
-    ),
-    DatabaseProfileSpec(
-        database_id="mgnify",
-        profile_id="mgnify-512-v1",
-        source_filename="mgy_clusters_2022_05.fa",
-        shard_count=512,
-        polymer="protein",
-        expected_num_seqs=623_796_864,
-        expected_sum_len=None,
-        max_sequences=5_000,
-    ),
-    DatabaseProfileSpec(
-        database_id="uniprot",
-        profile_id="uniprot-384-v1",
-        source_filename="uniprot_all_2021_04.fa",
-        shard_count=384,
-        polymer="protein",
-        expected_num_seqs=225_619_586,
-        expected_sum_len=None,
-        max_sequences=50_000,
-    ),
-    DatabaseProfileSpec(
-        database_id="uniref90",
-        profile_id="uniref90-256-v1",
-        source_filename="uniref90_2022_05.fa",
-        shard_count=256,
-        polymer="protein",
-        expected_num_seqs=153_742_194,
-        expected_sum_len=None,
-        max_sequences=10_000,
-    ),
-    DatabaseProfileSpec(
-        database_id="ntrna",
-        profile_id="nt-rna-256-v1",
-        source_filename="nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
-        shard_count=256,
-        polymer="rna",
-        expected_num_seqs=None,
-        expected_sum_len=76_752_808_514,
-        max_sequences=10_000,
-    ),
-    DatabaseProfileSpec(
-        database_id="rfam",
-        profile_id="rfam-16-v1",
-        source_filename="rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
-        shard_count=16,
-        polymer="rna",
-        expected_num_seqs=None,
-        expected_sum_len=138_115_553,
-        max_sequences=10_000,
-    ),
-    DatabaseProfileSpec(
-        database_id="rnacentral",
-        profile_id="rnacentral-64-v1",
-        source_filename="rnacentral_active_seq_id_90_cov_80_linclust.fasta",
-        shard_count=64,
-        polymer="rna",
-        expected_num_seqs=None,
-        expected_sum_len=13_271_415_730,
-        max_sequences=10_000,
-    ),
-)
 
 
 APP_INFO = AppInfo()
@@ -440,18 +340,6 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 _CONTAINER_INSTANCE_ID = uuid.uuid4().hex
 _CONTAINER_SAMPLE_COUNT = 0
 _CONTAINER_SAMPLE_LOCK = Lock()
-
-
-def _validate_seqkit_threads(seqkit_threads: int) -> int:
-    """Validate the SeqKit concurrency argument."""
-    if isinstance(seqkit_threads, bool) or not isinstance(seqkit_threads, int):
-        raise TypeError("seqkit_threads must be an integer")
-    if not 1 <= seqkit_threads <= MAX_SEQKIT_THREADS:
-        raise ValueError(
-            f"seqkit_threads must be between 1 and {MAX_SEQKIT_THREADS}, "
-            f"got {seqkit_threads}"
-        )
-    return seqkit_threads
 
 
 def _shard_filename(index: int) -> str:
@@ -1543,58 +1431,6 @@ def prepare_small_bfd_profile(
         )
         BENCHMARK_OUTPUT_VOLUME.commit()
         raise
-
-
-def _database_profile_spec(database_id: str) -> DatabaseProfileSpec:
-    """Resolve one fixed database ID without accepting free-form paths."""
-    if not isinstance(database_id, str):
-        raise TypeError("database_id must be a string")
-    for spec in DATABASE_PROFILE_SPECS:
-        if spec.database_id == database_id:
-            return spec
-    choices = ", ".join(spec.database_id for spec in DATABASE_PROFILE_SPECS)
-    raise ValueError(f"Unknown database_id {database_id!r}; expected one of {choices}")
-
-
-def _validate_source_policy(source_policy: str) -> str:
-    """Validate the post-publication source-retirement policy."""
-    if not isinstance(source_policy, str):
-        raise TypeError("source_policy must be a string")
-    if source_policy not in SOURCE_POLICIES:
-        choices = ", ".join(SOURCE_POLICIES)
-        raise ValueError(
-            f"Unknown source_policy {source_policy!r}; expected one of {choices}"
-        )
-    return source_policy
-
-
-def _production_shard_filename(
-    spec: DatabaseProfileSpec,
-    index: int,
-) -> str:
-    """Return one fixed AlphaFold-compatible shard filename."""
-    if isinstance(index, bool) or not isinstance(index, int):
-        raise TypeError("shard index must be an integer")
-    if not 0 <= index < spec.shard_count:
-        raise ValueError(f"shard index must be in [0, {spec.shard_count}), got {index}")
-    return f"{spec.source_filename}-{index:05d}-of-{spec.shard_count:05d}"
-
-
-def _production_shard_names(
-    spec: DatabaseProfileSpec,
-) -> tuple[str, ...]:
-    """Return every expected production-candidate shard name."""
-    return tuple(
-        _production_shard_filename(spec, index) for index in range(spec.shard_count)
-    )
-
-
-def _production_profile_root(
-    sharded_root: Path,
-    spec: DatabaseProfileSpec,
-) -> Path:
-    """Return the fixed profile root below the sharded Volume."""
-    return sharded_root / PRODUCTION_PROFILE_ROOT / spec.profile_id
 
 
 def _production_profile_plan(

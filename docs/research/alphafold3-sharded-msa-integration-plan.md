@@ -121,8 +121,13 @@ ran in a two-call batch on Azure `eastus2` immediately after its profile was
 published. UniRef90 likewise moved from Azure `eastus2` to `uksouth`. Each
 combination has one sample, by design. The measured outcomes are valid, but
 provider, region, concurrent Volume load, and profile warmth prevent treating
-the 4.09x UniProt difference as shard-count-only causality. The fixed
-production registry remains unchanged until that tradeoff is reviewed.
+the 4.09x UniProt difference as shard-count-only causality.
+
+The Checklist 3 production decision keeps `uniref90-128-v1`, because its
+finer candidate was scientifically equivalent but slower, and selects
+`uniprot-384-v1`. The latter remains scientifically equivalent and was
+materially faster in the one-shot observation; the fixed identity makes the
+choice reversible if later production telemetry contradicts it.
 
 The durable machine-readable summary is stored in
 `AlphaFold3-MSA-Benchmark-outputs` at
@@ -229,7 +234,7 @@ value, or polymer type.
 | --- | --- | --- | ---: | --- |
 | `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
 | `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
-| `uniprot` | `uniprot-256-v1` | `uniprot_all_2021_04.fa` | 256 | protein |
+| `uniprot` | `uniprot-384-v1` | `uniprot_all_2021_04.fa` | 384 | protein |
 | `uniref90` | `uniref90-128-v1` | `uniref90_2022_05.fa` | 128 | protein |
 | `ntrna` | `nt-rna-256-v1` | `nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta` | 256 | RNA |
 | `rfam` | `rfam-16-v1` | `rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta` | 16 | RNA |
@@ -243,13 +248,11 @@ nucleotide count divided by 1,000,000.
 The completed `small-bfd-64-v1` profile was a benchmark-only predecessor to
 `small-bfd-64-v2`, whose published payload omits the monolithic source and
 whose shuffled FASTA stays under `/tmp`. After all seven production candidates
-passed validation, a read-only Sandbox inventory on 2026-07-24 confirmed that
-`/profiles/` contains exactly the seven fixed directories listed above. The
-obsolete v1 profile is absent, `.staging` is empty, and `.orphaned` does not
-exist. That inventory predates the shard-count A/B: the Volume now also
-contains the validated immutable experimental profiles `uniprot-384-v1` and
-`uniref90-256-v1`. They do not change the fixed registry without a separate
-decision.
+passed validation, a read-only Sandbox inventory on 2026-07-24 confirmed the
+then-fixed seven directories. That inventory predates the shard-count A/B.
+The Volume now also contains the validated immutable experimental profiles
+`uniprot-384-v1` and `uniref90-256-v1`; Checklist 3 promotes the former and
+keeps the latter as non-production evidence.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never
@@ -335,12 +338,13 @@ requirement from the unrounded source size and measured record count before
 creating local payloads.
 
 The same inventory found all seven required uncompressed source FASTAs.
-Durable `production-candidates/profile-builds/` evidence exists for all seven
-fixed profiles: `small-bfd-64-v2`, `mgnify-512-v1`, `rfam-16-v1`,
+Durable `production-candidates/profile-builds/` evidence exists for the seven
+baseline profiles: `small-bfd-64-v2`, `mgnify-512-v1`, `rfam-16-v1`,
 `rnacentral-64-v1`, `uniref90-128-v1`, `uniprot-256-v1`, and
-`nt-rna-256-v1`. The final read-only Sandbox inventory found no obsolete
+`nt-rna-256-v1`. The then-final read-only Sandbox inventory found no obsolete
 profile, abandoned staging generation, or orphaned profile requiring cleanup.
-The later A/B added durable build evidence for `uniprot-384-v1` generation
+The later A/B added durable build evidence for the now-selected
+`uniprot-384-v1` generation
 `fca8768dc0a946ba83bfb7205ac3de52` and `uniref90-256-v1` generation
 `2e372b231b584427aad022b3df07da64`.
 

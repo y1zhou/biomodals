@@ -51,8 +51,12 @@ from biomodals.app.fold.alphafold3.profiles import (
     DATABASE_PROFILE_SPECS,
     DEFAULT_SEQKIT_THREADS,
     PROFILE_BUILD_CLAIM_DICT_NAME,
+    PROFILE_BUILD_MAX_CONTAINERS,
     SEQKIT_VERSION,
     SHARDED_DB_VOLUME_NAME,
+    SOURCE_DB_VOLUME_NAME,
+    SourcePolicy,
+    profile_build_slot_budget,
     validate_seqkit_threads,
     validate_source_policy,
 )
@@ -221,7 +225,7 @@ def _profile_builder_runtime() -> ProfileBuilderRuntime:
     cpu=(0.125, 32.125),
     memory=BUILD_MEMORY_MIB,
     timeout=BUILD_TIMEOUT_SECONDS,
-    max_containers=len(DATABASE_PROFILE_SPECS),
+    max_containers=PROFILE_BUILD_MAX_CONTAINERS,
     volumes={
         APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
         APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME,
@@ -231,7 +235,7 @@ def _profile_builder_runtime() -> ProfileBuilderRuntime:
 def build_sharded_database(
     database_id: str,
     seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
-    source_policy: str = "keep",
+    source_policy: SourcePolicy = "keep",
 ) -> dict[str, object]:
     """Build one fixed immutable database profile."""
     return build_profile(
@@ -332,6 +336,10 @@ def _sharded_database_setup_plan(
             "memory_mib": list(BUILD_MEMORY_MIB),
             "timeout_seconds": BUILD_TIMEOUT_SECONDS,
         },
+        "fanout_budget": profile_build_slot_budget(
+            len(DATABASE_PROFILE_SPECS),
+            threads,
+        ),
         "coordination": [
             "inspect-fixed-profile-manifests",
             "submit-all-missing-profiles-concurrently",
@@ -339,9 +347,14 @@ def _sharded_database_setup_plan(
             "final-inventory-and-workspace-cleanup",
         ],
         "volumes": {
-            "source": "AlphaFold3-msa-db",
+            "source": SOURCE_DB_VOLUME_NAME,
             "shards": SHARDED_DB_VOLUME_NAME,
             "evidence": CONF.output_volume_name,
+        },
+        "cleanup": {
+            "barrier": "all-selected-profiles-valid-and-no-active-claims",
+            "remove_generation_workspaces": [".staging", ".orphaned"],
+            "remove_unselected_profile_directories": True,
         },
     }
 
@@ -825,6 +838,12 @@ def setup_sharded_databases(
         source_policy,
     )
     missing = [database_id for database_id, _, _ in inputs]
+    budget = profile_build_slot_budget(len(inputs), seqkit_threads)
+    print(
+        "🧬 Effective profile-build fanout: "
+        f"{budget['builder_containers']} containers, "
+        f"{budget['maximum_effective_worker_slots']} configured worker slots."
+    )
 
     results: list[dict[str, object] | BaseException] = []
     if missing:

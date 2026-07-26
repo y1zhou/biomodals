@@ -45,6 +45,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
+    SourcePolicy,
     profile_root,
     resolve_database_profile,
     shard_filename,
@@ -104,10 +105,6 @@ class ClaimStore(Protocol):
 
     def get(self, key: str, default: object = None) -> object:
         """Return a stored value or the supplied default."""
-        ...
-
-    def pop(self, key: str, default: object = None) -> object:
-        """Remove and return a stored value or the supplied default."""
         ...
 
 
@@ -645,16 +642,108 @@ def validate_published_profile(
     return manifest
 
 
-def _profile_claim_key(spec: DatabaseProfileSpec) -> str:
+def _legacy_profile_claim_key(spec: DatabaseProfileSpec) -> str:
     return f"active:{spec.profile_id}"
 
 
-def _profile_owner_key(spec: DatabaseProfileSpec, generation_id: str) -> str:
-    return f"owner:{spec.profile_id}:{generation_id}"
+def _profile_claim_root_key(spec: DatabaseProfileSpec) -> str:
+    return f"claim:{spec.profile_id}:root"
+
+
+def _profile_successor_key(
+    spec: DatabaseProfileSpec,
+    generation_id: str,
+) -> str:
+    return f"claim:{spec.profile_id}:after:{generation_id}"
 
 
 def _profile_status_key(spec: DatabaseProfileSpec, generation_id: str) -> str:
     return f"status:{spec.profile_id}:{generation_id}"
+
+
+def _validate_claim_owner(
+    spec: DatabaseProfileSpec,
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Profile {spec.profile_id} has an invalid claim owner")
+    if (
+        value.get("profile_id") != spec.profile_id
+        or value.get("database_id") != spec.database_id
+    ):
+        raise RuntimeError(f"Profile {spec.profile_id} claim identity is invalid")
+    generation_id = value.get("generation_id")
+    if not isinstance(generation_id, str) or not generation_id or ":" in generation_id:
+        raise RuntimeError(f"Profile {spec.profile_id} claim generation is invalid")
+    started_at = value.get("started_at_epoch_seconds")
+    if not isinstance(started_at, int | float):
+        raise RuntimeError(f"Profile {spec.profile_id} claim time is invalid")
+    return cast(dict[str, object], value)
+
+
+def _latest_claim_owner(
+    claims: ClaimStore,
+    spec: DatabaseProfileSpec,
+) -> dict[str, object] | None:
+    """Follow append-only successors to the current profile generation."""
+    current = claims.get(_profile_claim_root_key(spec), None)
+    if current is None:
+        return None
+    seen: set[str] = set()
+    while True:
+        owner = _validate_claim_owner(spec, current)
+        generation_id = cast(str, owner["generation_id"])
+        if generation_id in seen:
+            raise RuntimeError(
+                f"Profile {spec.profile_id} claim chain contains a cycle"
+            )
+        seen.add(generation_id)
+        successor = claims.get(
+            _profile_successor_key(spec, generation_id),
+            None,
+        )
+        if successor is None:
+            return owner
+        current = successor
+
+
+def _claim_status(
+    claims: ClaimStore,
+    spec: DatabaseProfileSpec,
+    generation_id: str,
+) -> dict[str, object] | None:
+    value = claims.get(_profile_status_key(spec, generation_id), None)
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("status") not in {
+        "complete",
+        "failed",
+        "abandoned",
+    }:
+        raise RuntimeError(
+            f"Profile {spec.profile_id} generation {generation_id} "
+            "has an invalid terminal status"
+        )
+    return cast(dict[str, object], value)
+
+
+def _adopt_legacy_claim(
+    claims: ClaimStore,
+    spec: DatabaseProfileSpec,
+) -> dict[str, object] | None:
+    """Adopt an old active-key owner as the append-only claim root."""
+    legacy_claim = claims.get(_legacy_profile_claim_key(spec), None)
+    if legacy_claim is None:
+        return None
+    legacy_owner = _validate_claim_owner(spec, legacy_claim)
+    root_key = _profile_claim_root_key(spec)
+    claims.put(root_key, legacy_owner, skip_if_exists=True)
+    root_owner = _validate_claim_owner(spec, claims.get(root_key, None))
+    if root_owner["generation_id"] != legacy_owner["generation_id"]:
+        raise RuntimeError(
+            f"Profile {spec.profile_id} legacy and append-only claims conflict"
+        )
+    return legacy_owner
 
 
 def _acquire_claim(
@@ -662,7 +751,7 @@ def _acquire_claim(
     spec: DatabaseProfileSpec,
     generation_id: str,
 ) -> dict[str, object]:
-    """Elect one builder, failing immediately on a non-stale conflict."""
+    """Append one elected generation after a terminal or stale predecessor."""
     owner = {
         "profile_id": spec.profile_id,
         "database_id": spec.database_id,
@@ -673,57 +762,65 @@ def _acquire_claim(
         "started_at_epoch_seconds": time(),
         "maximum_age_seconds": PROFILE_STALE_SECONDS,
     }
-    active_key = _profile_claim_key(spec)
-    if runtime.claims.put(active_key, owner, skip_if_exists=True):
-        if not runtime.claims.put(
-            _profile_owner_key(spec, generation_id),
+    legacy_owner = _adopt_legacy_claim(runtime.claims, spec)
+    if legacy_owner is None:
+        if runtime.claims.put(
+            _profile_claim_root_key(spec),
             owner,
             skip_if_exists=True,
         ):
-            runtime.claims.pop(active_key, None)
-            raise RuntimeError("Profile generation owner key already exists")
-        return owner
+            return owner
 
-    active = runtime.claims.get(active_key, None)
-    if not isinstance(active, dict):
-        raise RuntimeError(f"Profile {spec.profile_id} has an invalid active claim")
-    started_at = active.get("started_at_epoch_seconds")
-    if not isinstance(started_at, int | float):
-        raise RuntimeError(f"Profile {spec.profile_id} has an invalid claim time")
-    age_seconds = time() - float(started_at)
-    if age_seconds <= PROFILE_STALE_SECONDS:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} is already being built by generation "
-            f"{active.get('generation_id')!r}"
+    while True:
+        predecessor = _latest_claim_owner(runtime.claims, spec)
+        if predecessor is None:
+            raise RuntimeError(f"Profile {spec.profile_id} claim root disappeared")
+        predecessor_generation = cast(str, predecessor["generation_id"])
+        predecessor_status = _claim_status(
+            runtime.claims,
+            spec,
+            predecessor_generation,
         )
+        if predecessor_status is None:
+            started_at = cast(int | float, predecessor["started_at_epoch_seconds"])
+            age_seconds = time() - float(started_at)
+            if age_seconds <= PROFILE_STALE_SECONDS:
+                raise RuntimeError(
+                    f"Profile {spec.profile_id} is already being built by "
+                    f"generation {predecessor_generation!r}"
+                )
+            runtime.claims.put(
+                _profile_status_key(spec, predecessor_generation),
+                {
+                    "status": "abandoned",
+                    "abandoned_at": utc_now(),
+                    "age_seconds": age_seconds,
+                },
+                skip_if_exists=True,
+            )
+            predecessor_status = _claim_status(
+                runtime.claims,
+                spec,
+                predecessor_generation,
+            )
+            if predecessor_status is None:
+                raise RuntimeError(
+                    f"Profile {spec.profile_id} stale claim was not fenced"
+                )
+            predecessor_status_name = cast(str, predecessor_status["status"])
+        else:
+            predecessor_status_name = cast(str, predecessor_status["status"])
 
-    removed = runtime.claims.pop(active_key, None)
-    if removed != active:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} claim changed during stale recovery"
-        )
-    stale_generation = active.get("generation_id")
-    if isinstance(stale_generation, str):
-        runtime.claims.put(
-            _profile_status_key(spec, stale_generation),
-            {
-                "status": "abandoned",
-                "abandoned_at": utc_now(),
-                "age_seconds": age_seconds,
-                "replaced_by_generation_id": generation_id,
-            },
+        successor = owner | {
+            "predecessor_generation_id": predecessor_generation,
+            "predecessor_status": predecessor_status_name,
+        }
+        if runtime.claims.put(
+            _profile_successor_key(spec, predecessor_generation),
+            successor,
             skip_if_exists=True,
-        )
-    if not runtime.claims.put(active_key, owner, skip_if_exists=True):
-        raise RuntimeError(f"Profile {spec.profile_id} claim was acquired concurrently")
-    if not runtime.claims.put(
-        _profile_owner_key(spec, generation_id),
-        owner,
-        skip_if_exists=True,
-    ):
-        runtime.claims.pop(active_key, None)
-        raise RuntimeError("Profile generation owner key already exists")
-    return owner
+        ):
+            return successor
 
 
 def _finish_claim(
@@ -734,8 +831,8 @@ def _finish_claim(
     status: str,
     detail: dict[str, object],
 ) -> None:
-    """Append terminal claim status and release this generation's slot."""
-    runtime.claims.put(
+    """Append terminal status, releasing this generation for a successor."""
+    created = runtime.claims.put(
         _profile_status_key(spec, generation_id),
         {
             "status": status,
@@ -744,10 +841,13 @@ def _finish_claim(
         },
         skip_if_exists=True,
     )
-    active_key = _profile_claim_key(spec)
-    active = runtime.claims.get(active_key, None)
-    if isinstance(active, dict) and active.get("generation_id") == generation_id:
-        runtime.claims.pop(active_key, None)
+    if not created:
+        existing = _claim_status(runtime.claims, spec, generation_id)
+        if existing is None or existing.get("status") != status:
+            raise RuntimeError(
+                f"Profile {spec.profile_id} generation {generation_id} "
+                "already has a different terminal status"
+            )
 
 
 def _hash_decompressed_zstd(
@@ -783,7 +883,7 @@ def _apply_source_policy(
     runtime: ProfileBuilderRuntime,
     spec: DatabaseProfileSpec,
     manifest: dict[str, Any],
-    source_policy: str,
+    source_policy: SourcePolicy,
     log_path: Path,
     *,
     seqkit_threads: int,
@@ -847,6 +947,13 @@ def _apply_source_policy(
         }
 
     if archive_path.is_file():
+        if (
+            source_path.stat().st_size != expected_size
+            or sha256_file(source_path) != expected_sha256
+        ):
+            raise ValueError(
+                f"Refusing to replace changed source {spec.source_filename}"
+            )
         archive_sha256, archive_size = _hash_decompressed_zstd(
             archive_path,
             log_path,
@@ -920,11 +1027,49 @@ def _write_success_evidence(
     runtime.output_volume.commit()
 
 
+def _reuse_published_profile(
+    runtime: ProfileBuilderRuntime,
+    spec: DatabaseProfileSpec,
+    published_root: Path,
+    evidence_root: Path,
+    log_path: Path,
+    generation_id: str,
+    source_policy: SourcePolicy,
+    *,
+    seqkit_threads: int,
+) -> dict[str, object]:
+    """Deeply validate and reuse a publication that won a setup race."""
+    manifest = validate_published_profile(
+        published_root,
+        spec,
+        verify_digests=True,
+    )
+    source_result = _apply_source_policy(
+        runtime,
+        spec,
+        manifest,
+        source_policy,
+        log_path,
+        seqkit_threads=seqkit_threads,
+    )
+    result = {
+        "status": "reused",
+        "database_id": spec.database_id,
+        "profile_id": spec.profile_id,
+        "generation_id": generation_id,
+        "profile_path": str(published_root),
+        "manifest_sha256": sha256_file(published_root / "manifest.json"),
+        **source_result,
+    }
+    _write_success_evidence(runtime, evidence_root, result)
+    return result
+
+
 def build_profile(
     runtime: ProfileBuilderRuntime,
     database_id: str,
     seqkit_threads: int,
-    source_policy: str,
+    source_policy: SourcePolicy,
 ) -> dict[str, object]:
     """Build, publish, deeply validate, and optionally retire one source."""
     spec = resolve_database_profile(database_id)
@@ -944,34 +1089,18 @@ def build_profile(
     runtime.sharded_volume.reload()
     runtime.output_volume.reload()
     if (published_root / "manifest.json").is_file():
-        manifest = validate_published_profile(
-            published_root,
-            spec,
-            verify_digests=True,
-        )
-        source_result = _apply_source_policy(
+        return _reuse_published_profile(
             runtime,
             spec,
-            manifest,
-            policy,
+            published_root,
+            evidence_root,
             log_path,
+            generation_id,
+            policy,
             seqkit_threads=threads,
         )
-        result = {
-            "status": "reused",
-            "database_id": spec.database_id,
-            "profile_id": spec.profile_id,
-            "generation_id": generation_id,
-            "profile_path": str(published_root),
-            "manifest_sha256": sha256_file(published_root / "manifest.json"),
-            **source_result,
-        }
-        _write_success_evidence(runtime, evidence_root, result)
-        return result
 
     claim = _acquire_claim(runtime, spec, generation_id)
-    write_json_atomic(evidence_root / "claim.json", claim)
-    runtime.output_volume.commit()
     staging_root = (
         runtime.sharded_root / ".staging" / f"{spec.profile_id}-{generation_id}"
     )
@@ -980,7 +1109,29 @@ def build_profile(
     validation_dir = staging_root / "validation"
     payload_moved = False
     manifest_published = False
+    claim_status = "failed"
+    claim_detail: dict[str, object] = {
+        "error_type": "IncompleteProfileBuild",
+        "profile_published": False,
+    }
     try:
+        write_json_atomic(evidence_root / "claim.json", claim)
+        runtime.output_volume.commit()
+        runtime.sharded_volume.reload()
+        if (published_root / "manifest.json").is_file():
+            result = _reuse_published_profile(
+                runtime,
+                spec,
+                published_root,
+                evidence_root,
+                log_path,
+                generation_id,
+                policy,
+                seqkit_threads=threads,
+            )
+            claim_status = "complete"
+            claim_detail = {"manifest_sha256": result["manifest_sha256"]}
+            return result
         if published_root.exists():
             orphan_root = runtime.sharded_root / ".orphaned"
             orphan_root.mkdir(parents=True, exist_ok=True)
@@ -1325,21 +1476,10 @@ def build_profile(
             **source_result,
         }
         _write_success_evidence(runtime, evidence_root, result)
-        _finish_claim(
-            runtime,
-            spec,
-            generation_id,
-            status="complete",
-            detail={"manifest_sha256": result["manifest_sha256"]},
-        )
+        claim_status = "complete"
+        claim_detail = {"manifest_sha256": result["manifest_sha256"]}
         return result
     except Exception as exc:
-        if not manifest_published:
-            if payload_moved and published_root.exists():
-                shutil.rmtree(published_root)
-            elif staging_root.exists():
-                shutil.rmtree(staging_root)
-            runtime.sharded_volume.commit()
         failure = {
             "failed_at": utc_now(),
             "database_id": spec.database_id,
@@ -1349,19 +1489,46 @@ def build_profile(
             "error_type": type(exc).__name__,
             "message": str(exc),
         }
-        write_json_atomic(evidence_root / "failure.json", failure)
-        runtime.output_volume.commit()
+        evidence_committed = False
+        cleanup_completed = manifest_published
+        try:
+            write_json_atomic(evidence_root / "failure.json", failure)
+            runtime.output_volume.commit()
+            evidence_committed = True
+        except Exception as evidence_exc:
+            exc.add_note(
+                "Could not commit durable profile-build failure evidence: "
+                f"{type(evidence_exc).__name__}: {evidence_exc}"
+            )
+
+        if evidence_committed and not manifest_published:
+            try:
+                if payload_moved and published_root.exists():
+                    shutil.rmtree(published_root)
+                elif staging_root.exists():
+                    shutil.rmtree(staging_root)
+                runtime.sharded_volume.commit()
+                cleanup_completed = True
+            except Exception as cleanup_exc:
+                exc.add_note(
+                    "Could not clean the failed profile generation: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+        claim_detail = {
+            "error_type": type(exc).__name__,
+            "profile_published": manifest_published,
+            "failure_evidence_committed": evidence_committed,
+            "cleanup_completed": cleanup_completed,
+        }
+        raise
+    finally:
         _finish_claim(
             runtime,
             spec,
             generation_id,
-            status="failed",
-            detail={
-                "error_type": type(exc).__name__,
-                "profile_published": manifest_published,
-            },
+            status=claim_status,
+            detail=claim_detail,
         )
-        raise
 
 
 def inspect_profile_registry(sharded_root: Path) -> dict[str, object]:
@@ -1412,7 +1579,7 @@ def plan_missing_profile_builds(
     inventory: dict[str, object],
     seqkit_threads: int,
     source_policy: str,
-) -> tuple[tuple[str, int, str], ...]:
+) -> tuple[tuple[str, int, SourcePolicy], ...]:
     """Return ordered builder inputs for only missing fixed profiles."""
     threads = validate_seqkit_threads(seqkit_threads)
     policy = validate_source_policy(source_policy)
@@ -1453,11 +1620,33 @@ def cleanup_profile_workspace(
         raise RuntimeError(
             "Cannot clean profile workspace before all profiles are valid"
         )
-    active = [
-        spec.profile_id
-        for spec in DATABASE_PROFILE_SPECS
-        if claims.get(_profile_claim_key(spec), None) is not None
-    ]
+    active: list[str] = []
+    for spec in DATABASE_PROFILE_SPECS:
+        _adopt_legacy_claim(claims, spec)
+        owner = _latest_claim_owner(claims, spec)
+        if owner is None:
+            continue
+        generation_id = cast(str, owner["generation_id"])
+        status = _claim_status(claims, spec, generation_id)
+        if status is not None:
+            continue
+        started_at = cast(int | float, owner["started_at_epoch_seconds"])
+        age_seconds = time() - float(started_at)
+        if age_seconds <= PROFILE_STALE_SECONDS:
+            active.append(spec.profile_id)
+            continue
+        claims.put(
+            _profile_status_key(spec, generation_id),
+            {
+                "status": "abandoned",
+                "abandoned_at": utc_now(),
+                "age_seconds": age_seconds,
+                "cleanup_recovery": True,
+            },
+            skip_if_exists=True,
+        )
+        if _claim_status(claims, spec, generation_id) is None:
+            active.append(spec.profile_id)
     if active:
         raise RuntimeError(f"Cannot clean while profile claims are active: {active}")
 

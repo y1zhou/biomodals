@@ -98,6 +98,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
+    SourcePolicy,
 )
 from biomodals.app.fold.alphafold3.profiles import (
     SCRATCH_ROOT as PRODUCTION_SCRATCH_ROOT,
@@ -1571,7 +1572,7 @@ def _profile_builder_runtime() -> ProfileBuilderRuntime:
 def build_sharded_database(
     database_id: str,
     seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
-    source_policy: str = "keep",
+    source_policy: SourcePolicy = "keep",
 ) -> dict[str, object]:
     """Build one fixed, immutable production-candidate database profile."""
     return _build_database_profile(

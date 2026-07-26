@@ -176,6 +176,7 @@ DATABASE_PROFILE_SPECS = (
 DATABASE_PROFILES_BY_ID = MappingProxyType({
     spec.database_id: spec for spec in DATABASE_PROFILE_SPECS
 })
+PROFILE_BUILD_MAX_CONTAINERS = len(DATABASE_PROFILE_SPECS)
 
 
 def resolve_database_profile(database_id: str) -> DatabaseProfileSpec:
@@ -213,6 +214,32 @@ def validate_source_policy(source_policy: str) -> SourcePolicy:
             f"Unknown source_policy {source_policy!r}; expected one of {choices}"
         )
     return source_policy
+
+
+def profile_build_slot_budget(
+    builder_count: int,
+    seqkit_threads: int,
+) -> dict[str, int]:
+    """Describe the bounded process-worker fanout for one setup run."""
+    if (
+        isinstance(builder_count, bool)
+        or not isinstance(builder_count, int)
+        or not 0 <= builder_count <= PROFILE_BUILD_MAX_CONTAINERS
+    ):
+        raise ValueError(
+            "builder_count must be between 0 and "
+            f"{PROFILE_BUILD_MAX_CONTAINERS}, got {builder_count!r}"
+        )
+    threads = validate_seqkit_threads(seqkit_threads)
+    source_validator_threads = 1
+    return {
+        "builder_containers": builder_count,
+        "container_cap": PROFILE_BUILD_MAX_CONTAINERS,
+        "local_worker_threads_per_builder": threads,
+        "overlapping_source_validator_threads_per_builder": (source_validator_threads),
+        "maximum_effective_worker_slots": builder_count
+        * (threads + source_validator_threads),
+    }
 
 
 def shard_filename(spec: DatabaseProfileSpec, index: int) -> str:

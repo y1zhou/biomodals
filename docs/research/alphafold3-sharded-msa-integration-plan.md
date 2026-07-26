@@ -705,7 +705,18 @@ inventory, rejects invalid publications, uses `starmap` with
 then runs the final cleanup/inventory barrier. That barrier removes abandoned
 staging/orphan generations and non-selected immutable profile directories, so
 `/profiles/` contains exactly the seven code-owned selections. Setup evidence
-is committed under `msa-profile-builds/` in `AlphaFold3-outputs`.
+is committed under `msa-profile-builds/` in `AlphaFold3-outputs`. The plan and
+submission log expose the container cap, local worker count, and maximum
+effective worker slots. Claims are released from a `finally` path; stale
+takeover appends one atomically elected successor after fencing the expired
+generation as abandoned. Claim and successor records are never deleted, so an
+interrupted takeover remains resumable. A legacy active owner is adopted as
+the root instead of being deleted. After election, the builder reloads the
+Volume and reuses any manifest published during the claim race. On failure,
+compact evidence is committed before that generation's partial payload is
+removed. An existing compressed source never authorizes deleting a changed
+plain FASTA: the plain source must still match the published source size and
+digest.
 
 ### 4. Replace the production data-pipeline worker
 

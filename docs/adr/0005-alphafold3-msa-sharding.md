@@ -56,18 +56,18 @@ Contract checks bind that adapter to the pinned AlphaFold source. An upstream
 pin change requires comparison against the new source before its results can
 reuse these scientific cache paths.
 
-Mature construction primitives live under
-`src/biomodals/app/fold/alphafold3/`. That package owns the pinned C source
+Mature construction code lives under
+`src/biomodals/app/fold/alphafold3/`. `sharding.py` owns the pinned C source
 assets, source-code identities, shared file/digest/JSON/log primitives, native
 compilation and execution, record multiset parsing, scratch sizing, and
-staged-file verification. It has no knowledge of Modal Volumes, profile
-manifests, benchmark campaigns, or publication claims.
+staged-file verification. `profiles.py` owns fixed production identities, and
+`profile_builder.py` owns the Modal-independent construction, validation,
+claim, evidence, source-policy, and cleanup lifecycle.
 
-The temporary MSA Benchmark App remains the composition root while the
-sharding recipe is being validated. It owns Modal images and resources,
-profile orchestration, SeqKit splitting, durable evidence, and publication.
-After the scientific gates pass, the production AlphaFold3 app imports the
-same mature sharding package rather than copying its native implementation.
+The temporary MSA Benchmark App remains an independent scientific-validation
+harness. It and the production AlphaFold3 app bind their own Modal resources
+to the same shared builder; the production app never imports benchmark
+campaign code or the temporary app.
 
 ### Fixed database specifications
 
@@ -78,7 +78,7 @@ source paths, shard counts, polymer types, Z values, or profile IDs.
 | --- | --- | --- | ---: | --- |
 | `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
 | `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
-| `uniprot` | `uniprot-256-v1` | `uniprot_all_2021_04.fa` | 256 | protein |
+| `uniprot` | `uniprot-384-v1` | `uniprot_all_2021_04.fa` | 384 | protein |
 | `uniref90` | `uniref90-128-v1` | `uniref90_2022_05.fa` | 128 | protein |
 | `ntrna` | `nt-rna-256-v1` | `nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta` | 256 | RNA |
 | `rfam` | `rfam-16-v1` | `rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta` | 16 | RNA |
@@ -92,12 +92,12 @@ requires a new Profile ID and a reviewed app deployment.
 candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
 `/tmp` and does not retain the monolithic FASTA inside the profile.
 
-Scientifically validated shard-count alternatives `uniprot-384-v1` and
-`uniref90-256-v1` were built after this decision. A one-shot 16x2 search
-measured UniProt 4.09 times faster but moved provider/region and reduced the
-concurrent database load, so it did not isolate shard count. UniRef90 was 1.93
-times slower. These experimental profiles remain immutable evidence and do
-not change the fixed table above without a separate decision.
+Scientifically validated alternatives `uniprot-384-v1` and
+`uniref90-256-v1` were compared with the earlier profiles. The selection
+promotes UniProt 384 because its observed 16x2 search was materially faster
+while retaining scientific equivalence, and keeps UniRef90 128 because the
+256-shard observation was slower. `uniprot-256-v1` and `uniref90-256-v1`
+remain immutable experimental evidence but are not production selections.
 
 `seqkit_threads` controls SeqKit statistics/splitting and the native shuffler
 and validator workers. It is operational: changing it does not select a
@@ -233,8 +233,8 @@ and unit, source digests, shard artifacts, and recipe. Code-owned expected
 statistics are guards; a mismatch fails publication for inspection.
 
 After the shard payload is committed, the builder writes the manifest last and
-deeply revalidates the published profile. Failure cleanup removes only that
-generation's partial shards and retains compact diagnostics.
+deeply revalidates the published profile. On failure, it commits compact
+diagnostics before removing only that generation's partial shards.
 
 Profiles already published with the earlier SeqKit FAI recipe remain accepted
 under recipe version 3. Occurrence-indexed profiles published with the C
@@ -261,7 +261,17 @@ generation. It has no polling loop or heartbeat.
 
 An active conflict fails immediately. Normal failure records `failed`; work
 older than the maximum function lifetime plus a margin may be marked
-`abandoned`, allowing one later generation to take ownership.
+`abandoned`, allowing one later generation to take ownership. Claims form an
+append-only chain: terminal status fences the predecessor, and atomic insertion
+of its single successor elects the next generation. No takeover deletes or
+replaces another owner's record, so interruption at any point leaves a chain
+that a later invocation can continue. Terminal status is written from the
+builder's `finally` path. A legacy `active:{profile_id}` owner is adopted as
+the chain root on first access; it is not deleted, and a stale legacy owner can
+therefore be fenced and succeeded by the same protocol. Rollout must not
+overlap an actively starting pre-chain builder, because insertion of the old
+`active:` key and the new root are separate Dict operations; persisted legacy
+owners are supported once old-code submissions have stopped.
 
 Claims are never publication evidence and owner records are never deleted.
 Only a validated manifest proves completion. Different Profile IDs may build
@@ -270,6 +280,8 @@ concurrently.
 The production batch entrypoint will therefore submit every missing Supported
 Database Specification concurrently. Each child invocation still builds one
 logical database and is independently bounded by its Profile Build Claim.
+The plan and submission log expose the seven-container cap, configured local
+workers, and maximum effective worker slots for the selected missing set.
 
 ### Source FASTA policy
 
@@ -278,7 +290,9 @@ profile is committed and deeply revalidated.
 
 `compress` writes `<complete-source-filename>.zst` beside the source. It checks
 that decompression reproduces the recorded byte count and SHA-256 before it
-commits the archive and removes the plain FASTA.
+commits the archive and removes the plain FASTA. If that archive already
+exists, both the archive and the current plain source must match the published
+source identity before the plain source can be removed.
 
 `delete` removes the plain source only after the explicit request and successful
 profile publication.

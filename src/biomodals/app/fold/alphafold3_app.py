@@ -22,6 +22,7 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 
 import os
 import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -37,6 +38,30 @@ from uniaf3.schema.alphafold3 import (
 )
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.profile_builder import (
+    ProfileBuilderRuntime,
+    build_profile,
+    cleanup_profile_workspace,
+    inspect_profile_registry,
+    plan_missing_profile_builds,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    BUILD_MEMORY_MIB,
+    BUILD_TIMEOUT_SECONDS,
+    DATABASE_PROFILE_SPECS,
+    DEFAULT_SEQKIT_THREADS,
+    PROFILE_BUILD_CLAIM_DICT_NAME,
+    SEQKIT_VERSION,
+    SHARDED_DB_VOLUME_NAME,
+    validate_seqkit_threads,
+    validate_source_policy,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    CONTAINER_NATIVE_SOURCE_DIR,
+    NATIVE_SOURCE_DIR_ENV,
+    utc_now,
+    write_json_atomic,
+)
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
@@ -79,15 +104,28 @@ class AppInfo:
 
     # Volume mount path for genetic search databases
     msa_db_dir: str = f"/{CONF.name}-msa-db"
+    # Volume mount path for immutable sharded genetic databases
+    sharded_msa_db_dir: str = f"/{SHARDED_DB_VOLUME_NAME}"
     # Volume mount path for MSA output cache
     msa_cache_dir: str = f"/{MSA_CACHE_VOLUME_NAME}"
     msa_cache_volume_subdir: str = f"/{CONF.name}"
+    # Durable setup evidence below the app's output Volume
+    profile_build_evidence_dir: str = "msa-profile-builds"
 
 
 ##########################################
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
+SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
+    SHARDED_DB_VOLUME_NAME,
+    create_if_missing=True,
+    version=2,
+)
+PROFILE_BUILD_CLAIMS = modal.Dict.from_name(
+    PROFILE_BUILD_CLAIM_DICT_NAME,
+    create_if_missing=True,
+)
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
 runtime_image = (
@@ -135,12 +173,179 @@ runtime_image = (
     .env({"PATH": "/hmmer/bin:$PATH"})
     .pipe(patch_image_for_helper)
 )
+
+# Database preparation does not need the AlphaFold runtime or model stack.
+sharding_image = (
+    modal.Image
+    .micromamba(python_version=CONF.python_version)
+    .apt_install("build-essential", "zstd")
+    .micromamba_install(
+        f"seqkit={SEQKIT_VERSION}",
+        channels=["conda-forge", "bioconda"],
+    )
+    .run_commands("seqkit version")
+    .add_local_dir(
+        Path(__file__).parent / "alphafold3" / "native",
+        str(CONTAINER_NATIVE_SOURCE_DIR),
+        copy=True,
+    )
+    .env({NATIVE_SOURCE_DIR_ENV: str(CONTAINER_NATIVE_SOURCE_DIR)})
+    .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.alphafold3")
+)
+
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+_CONTAINER_INSTANCE_ID = uuid.uuid4().hex
 
 
 ##########################################
 # Helper functions
 ##########################################
+def _profile_builder_runtime() -> ProfileBuilderRuntime:
+    """Bind the shared builder to production mounts and persistence objects."""
+    return ProfileBuilderRuntime(
+        source_root=Path(APP_INFO.msa_db_dir),
+        sharded_root=Path(APP_INFO.sharded_msa_db_dir),
+        output_root=Path(CONF.output_volume_mountpoint),
+        evidence_relpath=APP_INFO.profile_build_evidence_dir,
+        source_volume=AF3_MSA_DB_VOLUME,
+        sharded_volume=SHARDED_MSA_DB_VOLUME,
+        output_volume=CONF.output_volume,
+        claims=PROFILE_BUILD_CLAIMS,
+        container_id=_CONTAINER_INSTANCE_ID,
+    )
+
+
+@app.function(
+    image=sharding_image,
+    cpu=(0.125, 32.125),
+    memory=BUILD_MEMORY_MIB,
+    timeout=BUILD_TIMEOUT_SECONDS,
+    max_containers=len(DATABASE_PROFILE_SPECS),
+    volumes={
+        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
+        APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME,
+        CONF.output_volume_mountpoint: CONF.output_volume,
+    },
+)
+def build_sharded_database(
+    database_id: str,
+    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+    source_policy: str = "keep",
+) -> dict[str, object]:
+    """Build one fixed immutable database profile."""
+    return build_profile(
+        _profile_builder_runtime(),
+        database_id,
+        seqkit_threads,
+        source_policy,
+    )
+
+
+@app.function(
+    image=sharding_image,
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
+            read_only=True
+        ),
+    },
+)
+def inspect_sharded_database_profiles() -> dict[str, object]:
+    """Inspect all fixed profile manifests without expensive digest scans."""
+    SHARDED_MSA_DB_VOLUME.reload()
+    return inspect_profile_registry(Path(APP_INFO.sharded_msa_db_dir))
+
+
+@app.function(
+    image=sharding_image,
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME,
+        CONF.output_volume_mountpoint: CONF.output_volume,
+    },
+)
+def finalize_sharded_database_setup() -> dict[str, object]:
+    """Clean abandoned and unselected profiles after all builders complete."""
+    SHARDED_MSA_DB_VOLUME.reload()
+    CONF.output_volume.reload()
+    result = cleanup_profile_workspace(
+        Path(APP_INFO.sharded_msa_db_dir),
+        PROFILE_BUILD_CLAIMS,
+    )
+    SHARDED_MSA_DB_VOLUME.commit()
+    setup_id = uuid.uuid4().hex
+    evidence_root = (
+        Path(CONF.output_volume_mountpoint)
+        / APP_INFO.profile_build_evidence_dir
+        / "setup"
+        / setup_id
+    )
+    completed = result | {
+        "setup_id": setup_id,
+        "completed_at": utc_now(),
+    }
+    write_json_atomic(evidence_root / "inventory.json", completed)
+    CONF.output_volume.commit()
+    write_json_atomic(
+        evidence_root / "done.json",
+        {
+            "status": "complete",
+            "setup_id": setup_id,
+            "completed_at": utc_now(),
+        },
+    )
+    CONF.output_volume.commit()
+    return completed
+
+
+def _sharded_database_setup_plan(
+    seqkit_threads: int,
+    source_policy: str,
+) -> dict[str, object]:
+    """Build the cost-free plan for production profile setup."""
+    threads = validate_seqkit_threads(seqkit_threads)
+    policy = validate_source_policy(source_policy)
+    return {
+        "operation": "setup-sharded-databases",
+        "profiles": [
+            {
+                "database_id": spec.database_id,
+                "profile_id": spec.profile_id,
+                "source_filename": spec.source_filename,
+                "shard_count": spec.shard_count,
+                "polymer": spec.polymer,
+            }
+            for spec in DATABASE_PROFILE_SPECS
+        ],
+        "builder": {
+            "function": "build_sharded_database",
+            "seqkit_threads": threads,
+            "source_policy": policy,
+            "cpu": [0.125, 32.125],
+            "memory_mib": list(BUILD_MEMORY_MIB),
+            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
+        },
+        "coordination": [
+            "inspect-fixed-profile-manifests",
+            "submit-all-missing-profiles-concurrently",
+            "wait-for-all-builders",
+            "final-inventory-and-workspace-cleanup",
+        ],
+        "volumes": {
+            "source": "AlphaFold3-msa-db",
+            "shards": SHARDED_DB_VOLUME_NAME,
+            "evidence": CONF.output_volume_name,
+        },
+    }
+
+
 def _load_conf_from_bytes(json_bytes: bytes) -> AF3Config:
     """Load AlphaFold3 config from JSON bytes."""
     with TemporaryDirectory() as temp_dir:
@@ -588,6 +793,84 @@ def predict_structures(
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
+@app.local_entrypoint()
+def setup_sharded_databases(
+    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+    source_policy: str = "keep",
+    submit: bool = False,
+) -> None:
+    """Plan or build every missing fixed sharded database profile.
+
+    Args:
+        seqkit_threads: SeqKit/native-helper threads per builder, default 8.
+        source_policy: Post-publication source action: keep, compress, or delete.
+        submit: Submit Modal work. Defaults to false and only prints the plan.
+    """
+    plan = _sharded_database_setup_plan(seqkit_threads, source_policy)
+    print(
+        orjson.dumps(
+            plan,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+        ).decode()
+    )
+    if not submit:
+        print("🧬 Plan only; no Modal function was submitted.")
+        return
+
+    print("🧬 Inspecting fixed sharded database profiles...")
+    inventory = inspect_sharded_database_profiles.remote()
+    inputs = plan_missing_profile_builds(
+        inventory,
+        seqkit_threads,
+        source_policy,
+    )
+    missing = [database_id for database_id, _, _ in inputs]
+
+    results: list[dict[str, object] | BaseException] = []
+    if missing:
+        print(
+            "🧬 Submitting missing database profiles concurrently: "
+            f"{', '.join(missing)}"
+        )
+        results = list(
+            build_sharded_database.starmap(
+                inputs,
+                return_exceptions=True,
+            )
+        )
+        failures = [
+            {
+                "database_id": database_id,
+                "error_type": type(result).__name__,
+                "message": str(result),
+            }
+            for database_id, result in zip(missing, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise RuntimeError(
+                "One or more sharded database builders failed after all "
+                f"submitted builders completed: {failures}"
+            )
+    else:
+        print("🧬 All fixed profiles are already valid; no builders submitted.")
+
+    print("🧬 Running final inventory and workspace cleanup...")
+    final_inventory = finalize_sharded_database_setup.remote()
+    summary = {
+        "status": "complete",
+        "initial_inventory": inventory,
+        "builder_results": results,
+        "final_inventory": final_inventory,
+    }
+    print(
+        orjson.dumps(
+            summary,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+        ).decode()
+    )
+
+
 @app.local_entrypoint()
 def submit_alphafold3_task(
     input_json: str,

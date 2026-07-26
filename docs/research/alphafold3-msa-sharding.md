@@ -334,14 +334,15 @@ full-record C validator; SeqKit remains responsible for statistics and
 splitting. Full evidence and caveats are in the
 [shuffle audit](alphafold3-seqkit-two-pass-shuffle-audit.md#read-only-recipe-v5-validator-benchmark).
 
-When this builder moves into the production AlphaFold3 app, its setup
-entrypoint must first validate all seven fixed profile manifests, collect only
-the missing database IDs, and submit one builder container per missing database
-concurrently. Builders retain their per-Profile-ID claims and write only to
-distinct source, staging, profile, and evidence paths. Existing valid profiles
-are reused rather than rebuilt. The coordinator waits for every submitted
-builder before performing the one final Volume inventory and cleanup check;
-workers must not clean shared staging state while peers are still active.
+The production AlphaFold3 app's setup entrypoint first validates all seven
+fixed profile manifests, collects only the missing database IDs, and submits
+one builder container per missing database concurrently. Builders retain their
+per-Profile-ID claims and write only to distinct source, staging, profile, and
+evidence paths. Existing valid profiles are reused rather than rebuilt. The
+coordinator waits for every submitted builder before performing the one final
+Volume inventory and cleanup check; workers do not clean shared staging state
+while peers are still active. The temporary and production apps both call the
+same implementation in `alphafold3/profile_builder.py`.
 
 `split2 --by-part` does not emit AF3's required zero-based padded names by
 default, so rename and validate every output. See the official

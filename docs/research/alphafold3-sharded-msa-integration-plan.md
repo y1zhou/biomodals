@@ -681,6 +681,8 @@ failed results in research documentation before production promotion.
 
 Commit: `fold: add sharded database builder`
 
+Status: implemented locally; no production Modal work submitted.
+
 - add the separate sharded Volume and fixed registry;
 - add the pinned compact occurrence-indexed shuffle and the proven
   split/validation code;
@@ -690,6 +692,20 @@ Commit: `fold: add sharded database builder`
   concurrently, reuses valid profiles, and performs cleanup only after all
   builders finish;
 - do not import benchmark code or campaign types.
+
+The fixed contracts live in `alphafold3/profiles.py`, and the mature
+Modal-independent construction path lives in
+`alphafold3/profile_builder.py`. Both AlphaFold apps call that shared builder;
+the production app does not import the temporary app.
+
+The production `setup_sharded_databases` entrypoint is plan-only unless
+`submit=true`. On submission it performs one lightweight manifest/artifact-size
+inventory, rejects invalid publications, uses `starmap` with
+`return_exceptions=True` to wait for every missing-profile builder, and only
+then runs the final cleanup/inventory barrier. That barrier removes abandoned
+staging/orphan generations and non-selected immutable profile directories, so
+`/profiles/` contains exactly the seven code-owned selections. Setup evidence
+is committed under `msa-profile-builds/` in `AlphaFold3-outputs`.
 
 ### 4. Replace the production data-pipeline worker
 

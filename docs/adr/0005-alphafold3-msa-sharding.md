@@ -68,9 +68,14 @@ template search, and inference all use the append-only protocol in
 `generation_claims.py`; old profile-owner records are adapted in place.
 
 `search_pipeline.py` and `inference_pipeline.py` own request-level
-reconciliation behind narrow executor interfaces. The remaining modules
-separate scientific search and assembly, template search, input enrichment,
-inference identity, seed publication, and request retrieval.
+reconciliation behind narrow executor interfaces. `modal_adapters.py` owns
+Modal payload marshalling, bounded fan-out and polling, request staging, and
+the one-time profile-setup call sequence. `upstream_inference.py` owns the
+pinned AlphaFold command and upstream summary serialization. Fixed mount roots
+live on the runtime data classes that use them rather than in an app-wide
+metadata object. The remaining modules separate scientific search and
+assembly, template search, input enrichment, inference identity, seed
+publication, and request retrieval.
 `alphafold3_app.py` is the composition root: it binds these production modules
 to Modal resources and exposes only the three supported lifecycle components:
 one-time profile preparation, resumable MSA/template search, and AlphaFold

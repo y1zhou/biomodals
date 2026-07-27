@@ -56,18 +56,23 @@ Contract checks bind that adapter to the pinned AlphaFold source. An upstream
 pin change requires comparison against the new source before its results can
 reuse these scientific cache paths.
 
-Mature construction code lives under
-`src/biomodals/app/fold/alphafold3/`. `sharding.py` owns the pinned C source
-assets, source-code identities, shared file/digest/JSON/log primitives, native
-compilation and execution, record multiset parsing, scratch sizing, and
-staged-file verification. `profiles.py` owns fixed production identities, and
-`profile_builder.py` owns the Modal-independent construction, validation,
-claim, evidence, source-policy, and cleanup lifecycle.
+Production code lives under `src/biomodals/app/fold/alphafold3/`.
+`artifacts.py` owns canonical JSON, digests, and atomic publication primitives.
+`sharding.py` owns the pinned native source assets, compilation, execution,
+record-multiset parsing, scratch sizing, and staged-file verification.
+`profiles.py` owns fixed production identities, while `profile_builder.py`
+owns construction, validation, claims, source policy, and cleanup.
 
-The temporary MSA Benchmark App remains an independent scientific-validation
-harness. It and the production AlphaFold3 app bind their own Modal resources
-to the same shared builder; the production app never imports benchmark
-campaign code or the temporary app.
+The remaining modules separate search planning and assembly, template search,
+input enrichment, inference identity, seed publication, and request retrieval.
+`alphafold3_app.py` binds those pure production modules to Modal resources and
+exposes only the three supported lifecycle components: one-time profile
+preparation, resumable MSA/template search, and AlphaFold inference.
+
+The temporary MSA app and benchmark campaign code were retired after the
+protein and RNA scientific gates passed. Historical measurements and oracle
+evidence remain under `docs/research/`; production does not ship tuning,
+campaign, or profiling modes.
 
 ### Fixed database specifications
 
@@ -338,13 +343,13 @@ Its cache path is:
 /{polymer}/{prefix}/{sequence_hash}/
   raw-msa/{database_id}/{search_identity}/
     result.a3m
-    metrics.json
     run.log
     done.json
 ```
 
 `done.json` is written last and validates the database-level result and compact
-provenance. Per-shard tblout files are transient worker scratch and are not
+provenance. `run.log` is diagnostic and is not required to reuse an otherwise
+valid result. Per-shard tblout files are transient worker scratch and are not
 published in production.
 
 A preempted worker reruns that whole database. Per-shard durable scheduling and
@@ -645,6 +650,13 @@ Replacing model weights in place without changing the label can reuse old
 predictions. An intentional replacement must bump the label or explicitly
 clear affected run cache entries.
 
+The shared model Volume is mounted read-only during inference. JAX compilation
+artifacts use the separate v2 `AlphaFold3-jax-cache` Volume under a directory
+named for the pinned AlphaFold commit. JAX cache keys already include the
+`jaxlib` version, XLA flags, and device topology; the commit namespace keeps
+application revisions operationally distinct without making the compilation
+cache part of Run Identity.
+
 ### Run and request layout
 
 The AlphaFold3 output Volume stores each run directly at:
@@ -664,7 +676,6 @@ requests/{request_id}/
 .markers/seeds/{seed}.json
 .markers/summary.json
 logs/
-metrics/
 ```
 
 `run_id` identifies one enriched input and seed-independent inference
@@ -772,8 +783,8 @@ Every successful request publishes a small `requests/{request_id}/` view with:
 It does not copy seed directories or include unrelated completed seeds. No
 request archive is retained on the output Volume.
 
-The request manifest records the observed global-summary marker digest and
-global best seed.
+The request manifest records the observed global-summary marker digest, global
+best seed, and each selected artifact's byte size and SHA-256.
 
 Remote functions return compact Volume-relative metadata, never prediction
 tarballs as function-result bytes.
@@ -798,8 +809,11 @@ input copy rewrites `mmcifPath` to those archive-relative paths.
 Inline mmCIF stays inline. The request manifest prevents unrelated custom
 templates from being downloaded.
 
-An existing archive is reused only if it is non-empty and readable. An invalid
-archive causes a clear failure instead of silent overwrite.
+Each streamed artifact must match both its declared byte size and SHA-256.
+An existing archive is reused only when its exact member set and embedded
+presentation manifest match the current request. A corrupt, stale, or
+otherwise mismatched archive causes a clear failure instead of silent
+overwrite.
 
 ### Failure and retry behavior
 
@@ -822,12 +836,14 @@ potentially costly attempt.
 
 ### Validation and promotion
 
-The temporary `alphafold3_msa_app.py` remains the experimental harness until
-the generic sharding method and RNA oracle are validated.
+The generic sharding method, the four-database protein oracle, the
+three-database RNA oracle, and the integrated protein path have passed. Their
+historical evidence is retained in research documents; the temporary
+validation app itself is no longer part of the runtime.
 
-Production ports only the fixed builder, search, merge, cache, and identity
-logic. It never imports benchmark campaigns, sample identities, or retained
-per-shard evidence.
+Production contains only the fixed builder, search, merge, cache, enrichment,
+inference, and request-result paths. It contains no benchmark campaigns,
+sample identities, timing summaries, or retained per-shard evidence.
 
 No cost-incurring Modal build, search, or inference job is submitted without
 explicit user permission.

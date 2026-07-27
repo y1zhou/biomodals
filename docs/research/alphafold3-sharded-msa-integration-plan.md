@@ -1,12 +1,10 @@
 # AlphaFold3 sharded-MSA production integration plan
 
-Status: accepted.
+Status: implemented.
 
-Scope: finish the sharding method in
-`src/biomodals/app/fold/alphafold3_msa_app.py`, validate it, then integrate the
-minimal production implementation into
-`src/biomodals/app/fold/alphafold3_app.py` and its mature sibling modules under
-`src/biomodals/app/fold/alphafold3/`.
+Scope: this document records the experiments that matured the sharding method
+and its integration into `src/biomodals/app/fold/alphafold3_app.py` and the
+production modules under `src/biomodals/app/fold/alphafold3/`.
 
 This plan implements
 [ADR 0005](../adr/0005-alphafold3-msa-sharding.md). That consolidated decision
@@ -14,7 +12,7 @@ record remains authoritative when this document abbreviates a boundary.
 
 ## Outcome
 
-The production AlphaFold3 app will:
+The production AlphaFold3 app now:
 
 1. build immutable, validated sharded profiles in the separate
    `AlphaFold3-msa-db-sharded` Modal Volume;
@@ -28,8 +26,9 @@ The production AlphaFold3 app will:
 6. persist canonical seed outputs in `AlphaFold3-outputs`, safely reuse
    overlapping seed requests, and return a request-scoped local archive.
 
-The temporary MSA app remains an independent validation harness. Production
-does not import it or its benchmark-only campaign machinery.
+The temporary MSA app and its benchmark campaign machinery were removed after
+the scientific gates passed. Reproducible scientific evidence remains in this
+document and its linked research records; the installed app is production-only.
 
 ## Fixed evidence and limits
 
@@ -283,7 +282,9 @@ two-seed global summary but does not leak seed 1 artifacts into its archive.
 | Official monolithic FASTAs and fixed template store | `AlphaFold3-msa-db` | builder read/write only for explicit source retirement; template workers read-only |
 | Published database profiles | `AlphaFold3-msa-db-sharded` | builder read/write; search workers read-only |
 | Generated MSA and template cache | existing MSA cache, AlphaFold3 subpath | search workers read/write |
-| Durable inference inputs, predictions, requests, logs, and metrics | `AlphaFold3-outputs` | staging helper and inference workers read/write |
+| Immutable model parameters | `biomodals-store`, AlphaFold3 subpath | inference workers read-only |
+| JAX persistent compilation cache | `AlphaFold3-jax-cache` | inference workers read/write |
+| Durable inference inputs, predictions, requests, and logs | `AlphaFold3-outputs` | staging helper and inference workers read/write |
 
 ### Supported database specifications
 
@@ -454,7 +455,6 @@ prevent protein/RNA collisions:
     <database_id>/
       <search_identity>/
         result.a3m
-        metrics.json
         run.log
         done.json
   unpaired.a3m
@@ -471,7 +471,8 @@ count, active shard count, and container partitioning are operational and do
 not affect Search Identity.
 
 Per-shard tblout files remain transient. A database worker publishes only the
-merged A3M, compact metrics/log, and marker written last.
+merged A3M, a diagnostic log, and the marker written last. The result artifact
+and marker form the reusable boundary; the log is not required for reuse.
 
 Legacy unnamespaced MSA files are ignored. Existing unmarked combined/template
 files are not cache evidence and are replaced only after a complete validated
@@ -601,7 +602,6 @@ Enriched AlphaFold Input under its request directory:
   requests/
   .markers/
   logs/
-  metrics/
 ```
 
 ## Seed scheduling and durable inference
@@ -683,8 +683,10 @@ with the sanitized display name. The archive also contains every referenced
 `mmcifPath` values to those archive-relative files. Durable Volume inputs,
 paths, and template files remain canonical.
 
-An existing archive is reused only if it is non-empty and readable. A corrupt
-or unreadable existing archive causes a clear failure instead of silent
+Each streamed artifact must match the manifest-declared byte size and SHA-256.
+An existing archive is reused only if its exact member set and embedded
+presentation manifest match the current request. A corrupt, stale, or
+otherwise mismatched archive causes a clear failure instead of silent
 overwrite.
 
 ## Incremental implementation
@@ -695,6 +697,9 @@ every commit and stage only the named files.
 ### 1. Finish the generic method in the temporary MSA app
 
 Commit: `fold: generalize MSA profile builder`
+
+Status: completed as scientific-development work; the temporary app was later
+retired.
 
 - replace small-BFD-only builder constants with the seven fixed experimental
   specifications;
@@ -709,6 +714,9 @@ in scope.
 ### 2. Add the scientific gates
 
 Commit: `fold: add RNA sharding oracle`
+
+Status: completed; the protein and non-saturating RNA gates passed, and their
+evidence remains in the research documents.
 
 - retain the 25-nucleotide query as a rejected query-only negative control;
 - use the official RFam 14.9 record `ALWZ042362541.1/2041-2161` as the
@@ -755,8 +763,8 @@ Status: implemented locally; no production Modal work submitted.
 
 The fixed contracts live in `alphafold3/profiles.py`, and the mature
 Modal-independent construction path lives in
-`alphafold3/profile_builder.py`. Both AlphaFold apps call that shared builder;
-the production app does not import the temporary app.
+`alphafold3/profile_builder.py`. The production app binds that builder to
+Modal; the temporary app no longer exists.
 
 The production `setup_sharded_databases` entrypoint is plan-only unless
 `submit=true`. On submission it performs one lightweight manifest/artifact-size
@@ -793,12 +801,12 @@ Status: implemented; the two-chain protein production search passed on
 
 The mature scientific adapter and append-only generation-claim protocol now
 live in `alphafold3/msa_search.py` and `alphafold3/generation_claims.py`.
-Both AlphaFold apps call the shared Jackhmmer/Nhmmer execution, corrected RNA
-merge, and pinned assembly functions. Production first performs one
-lightweight marker inspection, then spends the request-wide budget only on
-missing unique sequence-by-database searches. A complete canonical
-protein/RNA assembly is published with `combined.done.json` last; mixed
-caller/generated fields remain request-local.
+The production app calls the shared Jackhmmer/Nhmmer execution, corrected RNA
+merge, and pinned assembly functions. It first performs one lightweight
+marker inspection, then spends the request-wide budget only on missing unique
+sequence-by-database searches. A complete canonical protein/RNA assembly is
+published with `combined.done.json` last; mixed caller/generated fields remain
+request-local.
 
 ### 5. Separate and resume template search
 
@@ -919,7 +927,8 @@ files, terms, and a content-addressed copy of the observed global-summary
 marker. Its `manifest.json` is written last and records submitted/normalized
 seeds, removed duplicates, reused/newly published seeds, the observed global
 best, every requested sample file, optional seed outputs, per-artifact byte
-sizes, and only the custom templates referenced by the enriched request input.
+sizes and SHA-256 digests, and only the custom templates referenced by the
+enriched request input.
 Before promotion, the finalizer snapshots the observed global-summary marker
 and verifies that the copied bytes still match the loaded marker digest; a
 concurrent summary expansion causes a clear retryable failure instead of
@@ -930,8 +939,8 @@ removed.
 
 The local entrypoint streams only those Volume-relative manifest artifacts,
 rejects paths outside the hash-fanned run root, verifies each stream's declared
-size, and restores upstream's exact sanitized display-name prefix in
-downloaded basenames. The durable request input uses the canonical
+size and SHA-256, and restores upstream's exact sanitized display-name prefix
+in downloaded basenames. The durable request input uses the canonical
 `af3-{run_id[:16]}` name and content-addressed `custom-templates/{sha256}.cif`
 paths, so callers with the same scientific input and seeds upload identical
 bytes even when their display names or original inline/path template
@@ -939,15 +948,17 @@ representations differ. Only the downloaded input copy changes: it restores
 the current display name and rewrites staged `mmcifPath` values to
 archive-relative custom-template paths. The resulting
 `{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
-temporary path and promoted only after every expected member is readable. A
-non-empty readable existing archive is reused; an unreadable one causes an
-explicit error and is never overwritten.
+temporary path and promoted only after its exact member set and embedded
+presentation manifest validate. A matching existing archive is reused; a
+corrupt, stale, or mismatched one causes an explicit error and is never
+overwritten. Every streamed source artifact must first match the
+manifest-declared byte size and SHA-256.
 
 ### 9. Record validation and remove obsolete production paths
 
 Commit: `fold: document sharded MSA validation`
 
-Status: in progress. The AlphaFold3 app and sibling-module subtree contain no
+Status: completed. The AlphaFold3 app and sibling-module subtree contain no
 references to `copy_msa_to_ssd`, `search_chains_in_parallel`, or
 `max_parallel_data_pipelines`. A repository-wide scan found one separate
 production dependency: `ppiflow_workflow.py` still calls the removed
@@ -959,7 +970,8 @@ boundary.
 - record all scientific and integrated smoke results;
 - confirm no production reference remains to `copy_msa_to_ssd`,
   `search_chains_in_parallel`, or `max_parallel_data_pipelines`;
-- leave the temporary benchmark app available for evidence and future tuning.
+- retain historical benchmark evidence in documentation while removing the
+  temporary app and production-inapplicable campaign code.
 
 ## Verification gates
 
@@ -1027,8 +1039,8 @@ Not included initially:
 - app-level automatic retry loops;
 - GPU-class-specific inference cache identity;
 - post-publication seed artifact audits;
-- changes outside the two AlphaFold3 app files, their mature supporting
-  modules, and accepted documentation.
+- changes outside the AlphaFold3 app, its mature supporting modules, tests,
+  and accepted documentation.
 
 ## Definition of done
 
@@ -1044,6 +1056,6 @@ Integration is complete when:
 5. overlapping seed requests cannot duplicate a seed worker and return only
    their requested artifacts;
 6. all local checks and agreed paid smoke tests pass;
-7. the final production diff is limited to
-   the two AlphaFold3 app files, their mature `alphafold3/` supporting modules,
-   and documentation authorized by this plan.
+7. the final production diff is limited to the AlphaFold3 app, its mature
+   `alphafold3/` supporting modules, tests, and documentation authorized by
+   this plan.

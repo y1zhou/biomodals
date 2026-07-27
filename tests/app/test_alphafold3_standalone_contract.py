@@ -5,6 +5,7 @@
 from pathlib import Path
 
 import orjson
+import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold import alphafold3_app
@@ -69,6 +70,29 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     assert prepared.normalized_seeds == (11, 12)
     assert prepared.worker_config.modelSeeds == [11, 12]
     assert captured == {"recycle": 3, "sample": 2, "num_containers": 2}
+
+
+def test_submit_alphafold3_task_rejects_input_json_symlink(tmp_path: Path) -> None:
+    target_path = tmp_path / "target.json"
+    target_path.write_text(
+        AF3Config(
+            name="symlink",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+            ],
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "input.json"
+    input_path.symlink_to(target_path)
+    entrypoint_info = alphafold3_app.submit_alphafold3_task.info
+    assert entrypoint_info is not None
+    raw_entrypoint = entrypoint_info.raw_f
+    assert raw_entrypoint is not None
+
+    with pytest.raises(ValueError, match="must not be a symbolic link"):
+        raw_entrypoint(input_json=str(input_path), search_msa=False)
 
 
 def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
@@ -144,3 +168,22 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     assert not alphafold3_app.JAX_CACHE_DIR.is_relative_to(
         alphafold3_app.CONF.model_volume_mountpoint
     )
+
+
+def test_inference_worker_revalidates_numeric_limits() -> None:
+    conf = AF3Config(
+        name="invalid-worker-counts",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="between 0 and"):
+        alphafold3_app.run_inference_pipeline.get_raw_f()(
+            conf.model_dump_json().encode(),
+            run_id="a" * 64,
+            recycle=101,
+            sample=1,
+            claimed_seed_records=[],
+        )

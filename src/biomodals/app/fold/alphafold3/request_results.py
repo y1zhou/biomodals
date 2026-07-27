@@ -8,17 +8,18 @@ caller's presentation name in the local archive.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
-import string
 import subprocess as sp
+import tarfile
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Protocol, cast
+from typing import IO, Protocol, cast
 
 import orjson
 
@@ -30,7 +31,10 @@ from biomodals.app.fold.alphafold3.artifacts import (
     write_bytes_atomic,
     write_json_atomic,
 )
-from biomodals.app.fold.alphafold3.inference_inputs import hash_sequences
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    hash_sequences,
+    sanitize_af3_name,
+)
 from biomodals.app.fold.alphafold3.seed_predictions import (
     CORE_OUTPUT_SUFFIXES,
     InferenceRuntime,
@@ -48,6 +52,7 @@ from biomodals.helper.shell import run_command
 REQUEST_MANIFEST_SCHEMA_VERSION = 2
 
 _CUSTOM_TEMPLATE_PATTERN = re.compile(r"(?P<digest>[0-9a-f]{64})\.cif")
+_ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 
 
 class VolumeReader(Protocol):
@@ -70,22 +75,6 @@ class RequestPublication:
     display_name: str
     reused_seeds: tuple[int, ...]
     published_seeds: tuple[int, ...]
-
-
-def sanitize_presentation_name(display_name: str) -> str:
-    """Mirror upstream ``Input.sanitised_name`` for downloaded basenames."""
-    if not isinstance(display_name, str):
-        raise TypeError("display_name must be a string")
-    spaceless_name = display_name.replace(" ", "_")
-    allowed_chars = set(string.ascii_letters + string.digits + "_-.")
-    sanitized = "".join(char for char in spaceless_name if char in allowed_chars)
-    if not sanitized:
-        raise ValueError(
-            "Display name must contain a letter, number, dot, dash, or underscore"
-        )
-    if sanitized in {".", ".."}:
-        raise ValueError("Display name cannot resolve to a relative path component")
-    return sanitized
 
 
 def _validate_seed_tuple(
@@ -132,7 +121,7 @@ def _validate_publication(spec: RequestPublication) -> RequestPublication:
         or spec.sample_count < 1
     ):
         raise ValueError("sample_count must be a positive integer")
-    sanitize_presentation_name(spec.display_name)
+    sanitize_af3_name(spec.display_name)
     reused = _validate_seed_tuple(
         spec.reused_seeds,
         field_name="reused_seeds",
@@ -548,10 +537,10 @@ def publish_request_results(
         "request_id": spec.request_id,
         "canonical_name": canonical_name,
         "submitted_display_name": spec.display_name,
-        "presentation_name": sanitize_presentation_name(spec.display_name),
+        "presentation_name": sanitize_af3_name(spec.display_name),
         "name_mapping": {
             "canonical": canonical_name,
-            "presentation": sanitize_presentation_name(spec.display_name),
+            "presentation": sanitize_af3_name(spec.display_name),
         },
         "submitted_seeds": list(spec.submitted_seeds),
         "normalized_seeds": list(spec.normalized_seeds),
@@ -728,21 +717,6 @@ def _rewrite_downloaded_input(
     write_bytes_atomic(input_path, json_bytes(document))
 
 
-def _archive_members(path: Path) -> tuple[str, ...] | None:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
-        return None
-    try:
-        members = run_command(
-            ["tar", "-I", "zstd", "-tf", str(path)],
-            output_mode="capture",
-            show_command=False,
-            warn_on_error=False,
-        )
-    except (OSError, sp.CalledProcessError):
-        return None
-    return tuple(member for member in members if member)
-
-
 def _local_request_manifest(
     manifest: dict[str, object],
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
@@ -773,6 +747,74 @@ def _local_request_manifest(
     return local_manifest
 
 
+def _record_archive_artifacts(
+    local_manifest: dict[str, object],
+    transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
+    archive_root: Path,
+) -> None:
+    """Bind the presentation-local bytes, including the rewritten input."""
+    local_artifacts = cast(list[dict[str, object]], local_manifest["artifacts"])
+    for local_artifact, (_, transformed) in zip(
+        local_artifacts,
+        transformed_artifacts,
+        strict=True,
+    ):
+        archived_path = archive_root / Path(transformed.as_posix())
+        require_regular_file(archived_path)
+        local_artifact["archive_size_bytes"] = archived_path.stat().st_size
+        local_artifact["archive_sha256"] = sha256_file(archived_path)
+
+
+def _custom_template_archive_paths(
+    transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
+) -> dict[str, str]:
+    custom_template_paths: dict[str, str] = {}
+    for artifact, transformed in transformed_artifacts:
+        if artifact["role"] != "custom_template":
+            continue
+        worker_path = artifact.get("worker_path")
+        if not isinstance(worker_path, str) or not worker_path:
+            raise ValueError("Custom template artifact has no staged worker path")
+        custom_template_paths[worker_path] = transformed.as_posix()
+    return custom_template_paths
+
+
+def _bind_expected_archive_artifacts(
+    reader: VolumeReader,
+    local_manifest: dict[str, object],
+    transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
+    *,
+    display_name: str,
+) -> None:
+    """Derive presentation-local digests before reusing an existing archive."""
+    local_artifacts = cast(list[dict[str, object]], local_manifest["artifacts"])
+    input_pairs: list[tuple[dict[str, object], dict[str, object], PurePosixPath]] = []
+    for local_artifact, (artifact, transformed) in zip(
+        local_artifacts,
+        transformed_artifacts,
+        strict=True,
+    ):
+        if artifact["role"] == "input":
+            input_pairs.append((local_artifact, artifact, transformed))
+            continue
+        local_artifact["archive_size_bytes"] = artifact["size_bytes"]
+        local_artifact["archive_sha256"] = artifact["sha256"]
+    if len(input_pairs) != 1:
+        raise RuntimeError("Request archive requires exactly one input artifact")
+
+    local_input, input_artifact, transformed_input = input_pairs[0]
+    with TemporaryDirectory(prefix="alphafold3_archive_identity_") as directory:
+        input_path = Path(directory) / transformed_input.name
+        _download_artifact(reader, input_artifact, input_path)
+        _rewrite_downloaded_input(
+            input_path,
+            display_name=display_name,
+            custom_template_paths=_custom_template_archive_paths(transformed_artifacts),
+        )
+        local_input["archive_size_bytes"] = input_path.stat().st_size
+        local_input["archive_sha256"] = sha256_file(input_path)
+
+
 def _expected_archive_members(
     presentation_name: str,
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
@@ -791,22 +833,96 @@ def _expected_archive_members(
     return members
 
 
-def _archived_request_manifest(
+@dataclass(frozen=True, slots=True)
+class _ArchiveInspection:
+    members: frozenset[str]
+    manifest: dict[str, object]
+    files: dict[str, tuple[int, str]]
+
+
+def _read_archive_member(
+    handle: IO[bytes],
+    *,
+    capture: bool,
+) -> tuple[int, str, bytes | None]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    payload = bytearray() if capture else None
+    while chunk := handle.read(1024 * 1024):
+        size_bytes += len(chunk)
+        digest.update(chunk)
+        if payload is not None:
+            if size_bytes > _ARCHIVE_MANIFEST_MAX_BYTES:
+                raise ValueError("Archived request manifest is too large")
+            payload.extend(chunk)
+    return (
+        size_bytes,
+        digest.hexdigest(),
+        bytes(payload) if payload is not None else None,
+    )
+
+
+def _inspect_request_archive(
     path: Path,
     presentation_name: str,
-) -> dict[str, object] | None:
-    member = f"{presentation_name}/request_manifest.json"
-    try:
-        lines = run_command(
-            ["tar", "-I", "zstd", "-xOf", str(path), member],
-            output_mode="capture",
-            show_command=False,
-            warn_on_error=False,
-        )
-        value = orjson.loads("\n".join(lines))
-    except (OSError, sp.CalledProcessError, orjson.JSONDecodeError):
+) -> _ArchiveInspection | None:
+    """Stream and hash a local archive without extracting untrusted members."""
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
         return None
-    return cast(dict[str, object], value) if isinstance(value, dict) else None
+    manifest_member = f"{presentation_name}/request_manifest.json"
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        return None
+    process = sp.Popen(  # noqa: S603
+        [zstd, "-dc", "--", str(path)],
+        stdout=sp.PIPE,
+        stderr=sp.DEVNULL,
+    )
+    members: set[str] = set()
+    files: dict[str, tuple[int, str]] = {}
+    manifest_bytes: bytes | None = None
+    try:
+        if process.stdout is None:
+            raise RuntimeError("zstd archive reader has no stdout")
+        with process.stdout:
+            with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+                for member in archive:
+                    name = member.name
+                    normalized_name = f"{name.rstrip('/')}/" if member.isdir() else name
+                    if not normalized_name or normalized_name in members:
+                        raise ValueError("Archive contains an invalid duplicate member")
+                    members.add(normalized_name)
+                    if member.isdir():
+                        continue
+                    if not member.isfile():
+                        raise ValueError("Archive contains a non-regular member")
+                    handle = archive.extractfile(member)
+                    if handle is None:
+                        raise ValueError("Archive member is unreadable")
+                    with handle:
+                        size_bytes, digest, payload = _read_archive_member(
+                            handle,
+                            capture=name == manifest_member,
+                        )
+                    files[name] = (size_bytes, digest)
+                    if payload is not None:
+                        manifest_bytes = payload
+        if process.wait() != 0 or manifest_bytes is None:
+            return None
+        manifest = orjson.loads(manifest_bytes)
+        if not isinstance(manifest, dict):
+            return None
+        return _ArchiveInspection(
+            members=frozenset(members),
+            manifest=cast(dict[str, object], manifest),
+            files=files,
+        )
+    except (OSError, ValueError, tarfile.TarError, orjson.JSONDecodeError):
+        return None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
 
 
 def _archive_matches_request(
@@ -816,12 +932,39 @@ def _archive_matches_request(
     expected_members: set[str],
     expected_manifest: dict[str, object],
 ) -> bool:
-    members = _archive_members(path)
-    return (
-        members is not None
-        and set(members) == expected_members
-        and _archived_request_manifest(path, presentation_name) == expected_manifest
-    )
+    inspection = _inspect_request_archive(path, presentation_name)
+    if (
+        inspection is None
+        or inspection.members != expected_members
+        or inspection.manifest != expected_manifest
+    ):
+        return False
+    artifacts = inspection.manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        return False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            return False
+        archive_path = artifact.get("archive_path")
+        size_bytes = artifact.get("archive_size_bytes")
+        digest = artifact.get("archive_sha256")
+        if (
+            not isinstance(archive_path, str)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes <= 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            return False
+        try:
+            safe_archive_path = _safe_archive_path(archive_path)
+        except ValueError:
+            return False
+        member = f"{presentation_name}/{safe_archive_path.as_posix()}"
+        if inspection.files.get(member) != (size_bytes, digest):
+            return False
+    return True
 
 
 def create_request_archive(
@@ -833,7 +976,7 @@ def create_request_archive(
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
     request_id, canonical_name, artifacts = _validated_manifest_artifacts(manifest)
-    presentation_name = sanitize_presentation_name(display_name)
+    presentation_name = sanitize_af3_name(display_name)
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]] = []
     transformed_paths: set[PurePosixPath] = set()
     for artifact in artifacts:
@@ -864,6 +1007,12 @@ def create_request_archive(
         local_output_dir / f"{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst"
     )
     if archive_path.exists():
+        _bind_expected_archive_artifacts(
+            reader,
+            local_manifest,
+            transformed_artifacts,
+            display_name=display_name,
+        )
         if _archive_matches_request(
             archive_path,
             presentation_name=presentation_name,
@@ -885,19 +1034,11 @@ def create_request_archive(
             archive_root = work_root / presentation_name
             archive_root.mkdir()
             input_paths: list[Path] = []
-            custom_template_paths: dict[str, str] = {}
             for artifact, transformed in transformed_artifacts:
                 destination = archive_root / Path(transformed.as_posix())
                 _download_artifact(reader, artifact, destination)
                 if artifact["role"] == "input":
                     input_paths.append(destination)
-                if artifact["role"] == "custom_template":
-                    worker_path = artifact.get("worker_path")
-                    if not isinstance(worker_path, str) or not worker_path:
-                        raise ValueError(
-                            "Custom template artifact has no staged worker path"
-                        )
-                    custom_template_paths[worker_path] = transformed.as_posix()
             if len(input_paths) != 1:
                 raise RuntimeError(
                     "Request archive requires exactly one input artifact"
@@ -905,7 +1046,14 @@ def create_request_archive(
             _rewrite_downloaded_input(
                 input_paths[0],
                 display_name=display_name,
-                custom_template_paths=custom_template_paths,
+                custom_template_paths=_custom_template_archive_paths(
+                    transformed_artifacts
+                ),
+            )
+            _record_archive_artifacts(
+                local_manifest,
+                transformed_artifacts,
+                archive_root,
             )
 
             write_bytes_atomic(

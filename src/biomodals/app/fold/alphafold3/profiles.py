@@ -53,7 +53,7 @@ ORDINAL_VALIDATION_RELPATHS = (
     *LEGACY_VALIDATION_RELPATHS,
     "validation/shuffler-metrics.json",
 )
-VALIDATION_RELPATHS = (
+COMPOSABLE_LEGACY_VALIDATION_RELPATHS = (
     "validation/source-stats.tsv",
     "validation/shard-stats.tsv",
     "validation/shard-summary.parquet",
@@ -61,6 +61,14 @@ VALIDATION_RELPATHS = (
     "validation/shuffle-stderr.log",
     "validation/duplicate-recovery.jsonl",
     "validation/shuffler-metrics.json",
+)
+VALIDATION_RELPATHS = (
+    "validation/source-stats.tsv",
+    "validation/shard-stats.tsv",
+    "validation/shard-summary.parquet",
+    "validation/record-multiset.json",
+    "validation/duplicate-recovery.jsonl",
+    "validation/shuffler-evidence.json",
 )
 
 SourcePolicy = Literal["keep", "compress", "delete"]

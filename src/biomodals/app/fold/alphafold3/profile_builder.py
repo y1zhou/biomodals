@@ -19,7 +19,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from time import perf_counter, time
+from time import time
 from typing import Any, Protocol, cast
 
 import orjson
@@ -38,6 +38,7 @@ from biomodals.app.fold.alphafold3.generation_claims import ClaimStore
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
+    COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
     COMPOSABLE_MULTISET_RECIPE_VERSION,
     DATABASE_PROFILE_SPECS,
     HMMER_VERSION,
@@ -194,16 +195,16 @@ def _run_shuffle(
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Shuffle every source occurrence into a container-local FASTA."""
     shuffled_path = scratch_root / "shuffled.fasta"
-    diagnostics_path = validation_dir / "shuffle-stderr.log"
-    metrics_path = validation_dir / "shuffler-metrics.json"
+    diagnostics_path = scratch_root / "shuffle-stderr.log"
+    evidence_path = validation_dir / "shuffler-evidence.json"
     recovery_report_path = validation_dir / "duplicate-recovery.jsonl"
     validation_dir.mkdir(parents=True, exist_ok=True)
-    shuffle_result = shuffle_fasta_occurrences(
+    staged_source_path = shuffle_fasta_occurrences(
         source_path,
         shuffled_path,
         scratch_root,
         diagnostics_path,
-        metrics_path,
+        evidence_path,
         log_path,
         expected_records=expected_records,
         seed=SHARD_RANDOM_SEED,
@@ -238,9 +239,9 @@ def _run_shuffle(
         "recovery is not applicable",
     )
     return (
-        shuffle_result.staged_source_path,
+        staged_source_path,
         shuffled_path,
-        recovery_metrics | {"shuffler": shuffle_result.metrics},
+        recovery_metrics,
     )
 
 
@@ -384,7 +385,7 @@ def _validate_statistics(
 def _validate_recipe(
     recipe: dict[str, Any],
     spec: DatabaseProfileSpec,
-) -> tuple[int, tuple[str, ...]]:
+) -> tuple[int, tuple[tuple[str, ...], ...]]:
     """Validate one supported immutable sharding recipe."""
     if recipe.get("seqkit_version") != SEQKIT_VERSION:
         raise ValueError("Unexpected profile SeqKit version")
@@ -415,7 +416,7 @@ def _validate_recipe(
             "strip_after_split": True,
         }:
             raise ValueError("Unexpected legacy duplicate-recovery recipe")
-        return recipe_version, LEGACY_VALIDATION_RELPATHS
+        return recipe_version, (LEGACY_VALIDATION_RELPATHS,)
 
     if recipe_version not in {
         ORDINAL_SHUFFLER_RECIPE_VERSION,
@@ -456,12 +457,15 @@ def _validate_recipe(
     }:
         raise ValueError("Unexpected occurrence-indexed duplicate policy")
     if recipe_version == ORDINAL_SHUFFLER_RECIPE_VERSION:
-        return recipe_version, ORDINAL_VALIDATION_RELPATHS
+        return recipe_version, (ORDINAL_VALIDATION_RELPATHS,)
     if recipe.get("record_multiset") != (
         record_multiset_identity() | {"shard_threads": seqkit_threads}
     ):
         raise ValueError("Unexpected composable record-multiset validator")
-    return recipe_version, VALIDATION_RELPATHS
+    return recipe_version, (
+        VALIDATION_RELPATHS,
+        COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
+    )
 
 
 def validate_profile_manifest(
@@ -527,7 +531,7 @@ def validate_profile_manifest(
         "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
     }:
         raise ValueError("Unexpected profile compatibility pin")
-    recipe_version, expected_validation_relpaths = _validate_recipe(recipe, spec)
+    recipe_version, allowed_validation_relpaths = _validate_recipe(recipe, spec)
 
     if not isinstance(validation, dict) or validation.get("passed") is not True:
         raise ValueError("Profile does not declare passed validation")
@@ -591,9 +595,10 @@ def validate_profile_manifest(
             actual_shard_paths.append(relative)
     if actual_shard_paths != expected_shard_paths:
         raise ValueError("Profile shard order or names are invalid")
-    if [str(record["path"]) for record in validation_artifacts] != list(
-        expected_validation_relpaths
-    ):
+    actual_validation_relpaths = tuple(
+        str(record["path"]) for record in validation_artifacts
+    )
+    if actual_validation_relpaths not in allowed_validation_relpaths:
         raise ValueError("Profile validation artifact paths are invalid")
     return source, shards, validation_artifacts
 
@@ -1175,11 +1180,9 @@ def _build_and_validate_shards(
         )
         append_log(
             log_path,
-            "Verified container-local staged source against the Volume "
-            f"source SHA-256 in {staged_verification.wall_seconds:.6f}s",
+            "Verified container-local staged source against the Volume source SHA-256",
         )
         validator = compile_record_multiset_validator(scratch_root, log_path)
-        parallel_started = perf_counter()
         with ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="af3-source-validator",
@@ -1193,7 +1196,6 @@ def _build_and_validate_shards(
                 log_path,
                 threads=1,
             )
-            split_started = perf_counter()
             shard_paths = _run_split(
                 spec,
                 shuffled_path,
@@ -1202,7 +1204,6 @@ def _build_and_validate_shards(
                 log_path,
                 seqkit_threads=seqkit_threads,
             )
-            split_seconds = perf_counter() - split_started
             source_result = source_future.result() if source_future.done() else None
             shard_result = scan_record_multiset(
                 validator,
@@ -1213,7 +1214,6 @@ def _build_and_validate_shards(
             )
             if source_result is None:
                 source_result = source_future.result()
-        parallel_seconds = perf_counter() - parallel_started
         record_multiset = finalize_record_multiset_validation(
             source_result,
             shard_result,
@@ -1224,11 +1224,6 @@ def _build_and_validate_shards(
                 "source_input": "sha256-verified-container-local-staged-copy",
                 "staged_source_size_bytes": staged_verification.size_bytes,
                 "staged_source_sha256": staged_verification.sha256,
-                "staged_source_verification_seconds": (
-                    staged_verification.wall_seconds
-                ),
-                "split_seconds": split_seconds,
-                "parallel_stage_wall_seconds": parallel_seconds,
             },
         )
 

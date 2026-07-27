@@ -319,6 +319,12 @@ Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never
 discovers profiles, follows a mutable `current` pointer, or revalidates shards.
 
+Production cleanup replaced the durable `shuffler-metrics.json` artifact with
+structural `shuffler-evidence.json`; new builds no longer publish timing or
+throughput summaries or raw successful-run shuffler stderr. Raw diagnostics
+are retained only for failures. Existing composable-multiset profiles retain
+and validate their immutable legacy timing and stderr artifacts.
+
 ## Profile builder
 
 Expose one production Modal function:
@@ -371,7 +377,7 @@ One invocation handles one logical database:
    sequence and residue conservation, full-header occurrence preservation,
    filenames, shard count, balance, sizes, and artifact digests.
 10. Derive Z/domZ from the measured source, write compact validation evidence
-    including the native helper identity and metrics,
+    including the native helper identity and structural evidence,
     commit the shard payload, and publish `manifest.json` last.
 11. Deeply revalidate the published profile.
 12. Apply `source_policy` only after successful publication:
@@ -684,10 +690,11 @@ with the sanitized display name. The archive also contains every referenced
 paths, and template files remain canonical.
 
 Each streamed artifact must match the manifest-declared byte size and SHA-256.
-An existing archive is reused only if its exact member set and embedded
-presentation manifest match the current request. A corrupt, stale, or
-otherwise mismatched archive causes a clear failure instead of silent
-overwrite.
+The presentation manifest additionally binds each archive-local payload after
+input rewriting. An existing archive is reused only if one streamed pass
+validates its exact member set, embedded manifest, and all payload digests
+against the current request. A corrupt, stale, or otherwise mismatched archive
+causes a clear failure instead of silent overwrite.
 
 ## Incremental implementation
 
@@ -854,6 +861,18 @@ The local materialization and identity seam now lives in
 relative path against the input JSON, inlines protein/RNA MSA and custom CCD
 content, clears those path fields, rejects ambiguous inline/path pairs, and
 captures every path-backed custom-template byte string and SHA-256.
+It accepts only non-symlink regular files and bounds reads to 64 MiB for input
+JSON/custom mmCIF/user CCD and 512 MiB for each path-backed MSA.
+
+Before the first Modal call, the same seam mirrors upstream's structural checks
+that UniAF3 0.2.0 does not enforce: safe nonempty names, unique uppercase chain
+IDs, letter-only polymer sequences, modification-code prefix rules, at most 20
+protein templates, and nonempty unsigned 32-bit model seeds. Inference workers
+repeat this preflight before launching upstream. A request is capped at 1,000
+model seeds, while the accumulated summary may exceed that total across
+requests. Recycles, diffusion samples, and GPU workers are bounded at 0--100,
+1--100, and 1--100 respectively; the inference worker repeats the recycle and
+sample checks.
 
 After enrichment, the module validates and explicitly dumps the complete
 input, removes only `name` and `modelSeeds`, and represents inline and
@@ -949,9 +968,13 @@ the current display name and rewrites staged `mmcifPath` values to
 archive-relative custom-template paths. The resulting
 `{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after its exact member set and embedded
-presentation manifest validate. A matching existing archive is reused; a
-corrupt, stale, or mismatched one causes an explicit error and is never
-overwritten. Every streamed source artifact must first match the
+presentation manifest validate, including every archive-local payload digest.
+Before reusing an existing archive, the client derives the expected rewritten
+input digest from the current staged input and requires all other archive
+digests to equal their published source records. Updating a corrupt payload and
+its embedded digest together therefore still fails. A matching existing
+archive is reused; a corrupt, stale, or mismatched one causes an explicit error
+and is never overwritten. Every streamed source artifact must first match the
 manifest-declared byte size and SHA-256.
 
 ### 9. Record validation and remove obsolete production paths

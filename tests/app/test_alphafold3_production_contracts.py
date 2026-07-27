@@ -57,6 +57,7 @@ from biomodals.app.fold.alphafold3.profile_builder import (
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
+    COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
     COMPOSABLE_MULTISET_RECIPE_VERSION,
     DATABASE_PROFILE_SPECS,
     DEFAULT_SEQKIT_THREADS,
@@ -261,6 +262,25 @@ def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
         validate_profile_manifest(manifest, resolve_database_profile("small_bfd"))
 
 
+def test_composable_profile_accepts_legacy_timing_artifact() -> None:
+    assert "validation/shuffle-stderr.log" not in VALIDATION_RELPATHS
+    assert "validation/shuffle-stderr.log" in COMPOSABLE_LEGACY_VALIDATION_RELPATHS
+    manifest = _profile_manifest("small_bfd")
+    validation = cast(dict[str, object], manifest["validation"])
+    validation["artifacts"] = [
+        _artifact(path) for path in COMPOSABLE_LEGACY_VALIDATION_RELPATHS
+    ]
+
+    _, _, artifacts = validate_profile_manifest(
+        manifest,
+        resolve_database_profile("small_bfd"),
+    )
+
+    assert [record["path"] for record in artifacts] == list(
+        COMPOSABLE_LEGACY_VALIDATION_RELPATHS
+    )
+
+
 def test_profile_manifest_builder_preserves_the_fixed_recipe(tmp_path: Path) -> None:
     spec = resolve_database_profile("small_bfd")
     staging_root = tmp_path / "profile"
@@ -309,6 +329,8 @@ def test_profile_manifest_builder_preserves_the_fixed_recipe(tmp_path: Path) -> 
     validation = cast(dict[str, object], manifest["validation"])
     assert recipe["version"] == COMPOSABLE_MULTISET_RECIPE_VERSION
     assert validation["canonical_record_multiset_match"] is True
+    artifacts = cast(list[dict[str, object]], validation["artifacts"])
+    assert str(artifacts[-1]["path"]).endswith("shuffler-evidence.json")
 
 
 def test_msa_resolution_deduplicates_queries_across_input_chains() -> None:
@@ -680,6 +702,16 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     )
     assert orjson.loads(archived_input)["name"] == "Readable Name"
 
+    assert (
+        create_request_archive(
+            FakeVolumeReader({volume_path: input_bytes}),
+            manifest,
+            output_dir=tmp_path,
+            display_name="Readable Name",
+        )
+        == archive
+    )
+
     changed_manifest = cast(
         dict[str, object],
         orjson.loads(orjson.dumps(manifest)),
@@ -689,6 +721,57 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         create_request_archive(
             FakeVolumeReader({volume_path: input_bytes}),
             changed_manifest,
+            output_dir=tmp_path,
+            display_name="Readable Name",
+        )
+
+    unpacked_root = tmp_path / "unpacked"
+    unpacked_root.mkdir()
+    run_command(
+        [
+            "tar",
+            "-I",
+            "zstd",
+            "-xf",
+            str(archive),
+            "-C",
+            str(unpacked_root),
+        ],
+        output_mode="capture",
+        show_command=False,
+    )
+    archived_input_path = unpacked_root / "Readable_Name" / "Readable_Name_data.json"
+    corrupted_input = orjson.loads(archived_input_path.read_bytes())
+    corrupted_input["name"] = "Corrupted Name"
+    archived_input_path.write_bytes(orjson.dumps(corrupted_input))
+    embedded_manifest_path = unpacked_root / "Readable_Name" / "request_manifest.json"
+    embedded_manifest = orjson.loads(embedded_manifest_path.read_bytes())
+    embedded_artifact = embedded_manifest["artifacts"][0]
+    embedded_artifact["archive_size_bytes"] = archived_input_path.stat().st_size
+    embedded_artifact["archive_sha256"] = hashlib.sha256(
+        archived_input_path.read_bytes()
+    ).hexdigest()
+    embedded_manifest_path.write_bytes(orjson.dumps(embedded_manifest))
+    corrupted_archive = tmp_path / "corrupted.tar.zst"
+    run_command(
+        [
+            "tar",
+            "-I",
+            "zstd -T0",
+            "-cf",
+            str(corrupted_archive),
+            "--",
+            "Readable_Name",
+        ],
+        output_mode="capture",
+        show_command=False,
+        cwd=unpacked_root,
+    )
+    corrupted_archive.replace(archive)
+    with pytest.raises(RuntimeError, match="does not match the current request"):
+        create_request_archive(
+            FakeVolumeReader({volume_path: input_bytes}),
+            manifest,
             output_dir=tmp_path,
             display_name="Readable Name",
         )

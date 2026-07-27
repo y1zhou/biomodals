@@ -41,12 +41,15 @@ from biomodals.app.config import AppConfig
 from biomodals.app.fold.alphafold3.artifacts import utc_now, write_json_atomic
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
+    MAX_INFERENCE_WORKERS,
     PreparedInferenceRun,
     materialize_local_input,
     prepare_inference_run,
+    sanitize_af3_name,
     serialize_af3_input,
-    validate_af3_config,
     validate_inference_parameters,
+    validate_submitted_af3_input,
+    validate_upstream_af3_input,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
     apply_msa_resolution,
@@ -101,7 +104,6 @@ from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     create_request_archive,
     publish_request_results,
-    sanitize_presentation_name,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
@@ -640,9 +642,11 @@ def _validate_max_num_gpus(max_num_gpus: int) -> int:
     if (
         isinstance(max_num_gpus, bool)
         or not isinstance(max_num_gpus, int)
-        or max_num_gpus < 1
+        or not 1 <= max_num_gpus <= MAX_INFERENCE_WORKERS
     ):
-        raise ValueError("max_num_gpus must be a positive integer")
+        raise ValueError(
+            f"max_num_gpus must be an integer between 1 and {MAX_INFERENCE_WORKERS}"
+        )
     return max_num_gpus
 
 
@@ -687,7 +691,7 @@ def _remote_template_outcome(
 
 
 def search_msa_and_templates(
-    config: AF3Config | str | Path,
+    config: AF3Config,
     *,
     search_msa: bool = True,
     search_protein_templates: bool = True,
@@ -695,13 +699,9 @@ def search_msa_and_templates(
 ) -> AF3Config:
     """Resolve MSA fields with bounded resumable database workers."""
     worker_budget = _validate_search_worker_budget(max_parallel_search_workers)
-    conf = (
-        validate_af3_config(config)
-        if isinstance(config, AF3Config)
-        else AF3Config.from_file(config)
-    )
+    conf = validate_submitted_af3_input(config)
     if not search_msa:
-        return validate_af3_config(fill_missing_msa_for_inference(conf))
+        return validate_upstream_af3_input(fill_missing_msa_for_inference(conf))
 
     states = chain_msa_states(conf)
     plan = plan_msa_resolution(states)
@@ -778,7 +778,7 @@ def search_msa_and_templates(
     )
 
     if not search_protein_templates:
-        return validate_af3_config(conf)
+        return validate_upstream_af3_input(conf)
 
     template_plan = plan_template_searches(
         conf,
@@ -857,7 +857,7 @@ def search_msa_and_templates(
         )
 
     apply_template_results(conf, template_plan, templates_by_identity)
-    return validate_af3_config(conf)
+    return validate_upstream_af3_input(conf)
 
 
 ##########################################
@@ -959,10 +959,11 @@ def run_inference_pipeline(
     """Run one disjoint seed group and publish per-seed markers."""
     import sys
 
+    validate_inference_parameters(recycle, sample)
     claimed_seeds = tuple(
         claimed_seed_from_dict(record) for record in claimed_seed_records
     )
-    base_conf = AF3Config.model_validate_json(json_bytes)
+    base_conf = validate_upstream_af3_input(AF3Config.model_validate_json(json_bytes))
 
     def execute(
         worker_root: Path,
@@ -1022,7 +1023,7 @@ def finalize_inference_summary(
         folding_input,
     )
 
-    base_conf = AF3Config.model_validate_json(json_bytes)
+    base_conf = validate_upstream_af3_input(AF3Config.model_validate_json(json_bytes))
 
     def build_data_json(seeds: tuple[int, ...]) -> bytes:
         conf = base_conf.model_copy(deep=True)
@@ -1420,16 +1421,12 @@ def submit_alphafold3_task(
     _validate_search_worker_budget(max_parallel_search_workers)
     validate_inference_parameters(recycle, sample)
 
-    # Validate and read input
-    input_path = Path(input_json).expanduser().resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-
+    input_path = Path(input_json).expanduser()
     local_input = materialize_local_input(input_path)
     conf = local_input.config
     if run_name is None:
         run_name = conf.name
-    sanitize_presentation_name(run_name)
+    sanitize_af3_name(run_name)
     conf.name = run_name
 
     print(f"🧬 Resolving {CONF.name} MSA and template fields...")

@@ -9,7 +9,6 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
 from typing import Any
 
 import orjson
@@ -53,20 +52,11 @@ class NativeTool:
 
 
 @dataclass(frozen=True)
-class ShuffleResult:
-    """Validated outputs from the occurrence-preserving FASTA shuffler."""
-
-    staged_source_path: Path
-    metrics: dict[str, Any]
-
-
-@dataclass(frozen=True)
 class FileVerification:
     """Evidence that a file matches an expected byte identity."""
 
     size_bytes: int
     sha256: str
-    wall_seconds: float
 
 
 ORDINAL_SHUFFLER = NativeTool(
@@ -109,9 +99,7 @@ def verify_file(
         raise ValueError(
             f"File size mismatch for {path}: {actual_size} != {expected_size}"
         )
-    started = perf_counter()
     actual_sha256 = sha256_file(path)
-    elapsed = perf_counter() - started
     if actual_sha256 != expected_sha256:
         raise ValueError(
             f"File SHA-256 mismatch for {path}: {actual_sha256} != {expected_sha256}"
@@ -119,7 +107,6 @@ def verify_file(
     return FileVerification(
         size_bytes=actual_size,
         sha256=actual_sha256,
-        wall_seconds=elapsed,
     )
 
 
@@ -280,7 +267,6 @@ def scan_record_multiset(
     )
     append_log(log_path, start_message)
     print(f"🧬 validator {start_message}", flush=True)
-    started = perf_counter()
     with log_path.open("ab") as log:
         completed = subprocess.run(  # noqa: S603
             argv,
@@ -288,7 +274,6 @@ def scan_record_multiset(
             stdout=log,
             stderr=log,
         )
-    elapsed = perf_counter() - started
     if completed.returncode != 0:
         raise subprocess.CalledProcessError(completed.returncode, argv)
     require_regular_file(output_path)
@@ -298,17 +283,11 @@ def scan_record_multiset(
     if report.get("threads") != selected_threads:
         raise ValueError("Record-multiset helper reported the wrong thread count")
     record_multiset_signature(report)
-    completed_message = (
-        "Completed record-multiset helper in "
-        f"{elapsed:.6f}s at "
-        f"{input_bytes / elapsed if elapsed else 0.0:.3f} bytes/s"
-    )
+    completed_message = "Completed record-multiset helper"
     append_log(log_path, completed_message)
     print(f"🧬 validator {completed_message}", flush=True)
     return {
         "input_bytes": input_bytes,
-        "wall_seconds": elapsed,
-        "throughput_bytes_per_second": (input_bytes / elapsed if elapsed else 0.0),
         "report": report,
     }
 
@@ -344,13 +323,13 @@ def shuffle_fasta_occurrences(
     shuffled_path: Path,
     scratch_root: Path,
     diagnostics_path: Path,
-    metrics_path: Path,
+    evidence_path: Path,
     log_path: Path,
     *,
     expected_records: int,
     seed: int,
     worker_threads: int,
-) -> ShuffleResult:
+) -> Path:
     """Shuffle all FASTA occurrences through a verified local source copy."""
     for name, value in (
         ("expected_records", expected_records),
@@ -405,23 +384,24 @@ def shuffle_fasta_occurrences(
             diagnostics.flush()
             print(f"🧬 shuffler {line.decode(errors='replace')}", end="", flush=True)
         process.stderr.close()
-        metrics_bytes = process.stdout.read()
+        report_bytes = process.stdout.read()
         process.stdout.close()
         returncode = process.wait()
-    append_diagnostic_file(diagnostics_path, log_path)
     if returncode != 0:
+        append_diagnostic_file(diagnostics_path, log_path)
         raise subprocess.CalledProcessError(returncode, argv)
+    diagnostics_path.unlink()
     try:
-        metrics = orjson.loads(metrics_bytes)
+        report = orjson.loads(report_bytes)
     except orjson.JSONDecodeError as exc:
-        raise ValueError("Native shuffler returned invalid metrics JSON") from exc
-    if not isinstance(metrics, dict):
-        raise ValueError("Native shuffler metrics must be a JSON object")
+        raise ValueError("Native shuffler returned invalid JSON") from exc
+    if not isinstance(report, dict):
+        raise ValueError("Native shuffler report must be a JSON object")
     source_size = source_path.stat().st_size
     with source_path.open("rb") as source:
         source.seek(-1, os.SEEK_END)
         output_size = source_size + (source.read(1) != b"\n")
-    expected_metrics = {
+    expected_evidence = {
         "schema_version": 1,
         "version": ORDINAL_SHUFFLER_VERSION,
         "record_count": expected_records,
@@ -434,48 +414,40 @@ def shuffle_fasta_occurrences(
         "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
         "random_read_source": "container-local-staged-copy",
     }
-    for key, expected in expected_metrics.items():
-        if metrics.get(key) != expected:
+    for key, expected in expected_evidence.items():
+        if report.get(key) != expected:
             raise ValueError(
-                f"Native shuffler metric {key!r} is {metrics.get(key)!r}, "
+                f"Native shuffler field {key!r} is {report.get(key)!r}, "
                 f"expected {expected!r}"
             )
-    if metrics.get("offset_index_size_bytes") != 48 + (expected_records + 1) * 8:
+    offset_index_size = 48 + (expected_records + 1) * 8
+    permutation_size = expected_records * 4
+    if report.get("offset_index_size_bytes") != offset_index_size:
         raise ValueError("Native shuffler offset index has an unexpected size")
-    if metrics.get("permutation_size_bytes") != expected_records * 4:
+    if report.get("permutation_size_bytes") != permutation_size:
         raise ValueError("Native shuffler permutation has an unexpected size")
-    for key in (
-        "peak_batch_bytes",
-        "first_pass_seconds",
-        "permutation_seconds",
-        "second_pass_seconds",
+    peak_batch_bytes = report.get("peak_batch_bytes")
+    if (
+        isinstance(peak_batch_bytes, bool)
+        or not isinstance(peak_batch_bytes, int)
+        or peak_batch_bytes < 0
     ):
-        value = metrics.get(key)
-        if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
-            raise ValueError(f"Native shuffler metric {key!r} is invalid")
+        raise ValueError("Native shuffler peak batch size is invalid")
     require_regular_file(shuffled_path)
     if shuffled_path.stat().st_size != output_size:
         raise ValueError("Native shuffler output size is not normalized")
     require_regular_file(staged_source_path)
     if staged_source_path.stat().st_size != source_size:
         raise ValueError("Native shuffler staged source size does not match source")
-    first_pass_seconds = float(metrics["first_pass_seconds"])
-    second_pass_seconds = float(metrics["second_pass_seconds"])
-    published_metrics = metrics | {
+    published_evidence = expected_evidence | {
+        "offset_index_size_bytes": offset_index_size,
+        "permutation_size_bytes": permutation_size,
+        "peak_batch_bytes": peak_batch_bytes,
         "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
         "index_identity": "uint64-source-occurrence-offsets-v1",
         "permutation_identity": "splitmix64-fisher-yates-u32-v1",
         "staging_identity": "first-pass-tee-to-container-local-v1",
         "read_identity": "bounded-concurrent-local-pread-ordered-write-v2",
-        "first_pass_bytes_per_second": (
-            source_size / first_pass_seconds if first_pass_seconds > 0 else None
-        ),
-        "second_pass_bytes_per_second": (
-            output_size / second_pass_seconds if second_pass_seconds > 0 else None
-        ),
     }
-    write_json_atomic(metrics_path, published_metrics)
-    return ShuffleResult(
-        staged_source_path=staged_source_path,
-        metrics=published_metrics,
-    )
+    write_json_atomic(evidence_path, published_evidence)
+    return staged_source_path

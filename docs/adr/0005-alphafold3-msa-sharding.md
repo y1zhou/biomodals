@@ -130,6 +130,15 @@ mutable `current` pointer, automatic discovery, or automatic promotion.
 The manifest preserves source identity and statistics. The published profile
 does not retain a duplicate monolithic source FASTA.
 
+New builds retain structural shuffler evidence at
+`validation/shuffler-evidence.json`—record and byte counts, bounded-memory
+evidence, native source identity, and shuffle identities—but no timing or
+throughput summary. Successful new profiles also omit raw shuffler stderr;
+that diagnostic stream is retained only with failure evidence. The validator
+continues to accept the older `shuffler-metrics.json` and
+`shuffle-stderr.log` artifacts in already-published composable-multiset
+profiles so cleanup does not invalidate the selected databases.
+
 Rebuilding an identical specification reuses its valid publication and never
 overwrites it. A builder for a new Profile ID publishes beside any existing
 profile and never mutates that prior publication. After all seven selected
@@ -226,7 +235,7 @@ checks all of the following:
 - sequence and residue conservation;
 - an order-independent, multiplicity-sensitive C validation of the complete
   canonical `(header, sequence)` multiset;
-- occurrence-index construction and native shuffler metrics;
+- occurrence-index construction and structural native shuffler evidence;
 - duplicate-header occurrence preservation with no recovery prefixes;
 - exact shard names, count, balance, sizes, and digests;
 - source identity, recipe, and declared compatibility.
@@ -593,6 +602,12 @@ execution, and output writing.
 Before remote work, a local helper resolves relative input paths against the
 input JSON's directory.
 
+The helper accepts only non-symlink regular files and performs bounded reads:
+64 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
+each custom mmCIF or user CCD. A file that changes while being read is rejected.
+Large caller MSAs therefore belong in the path-backed fields rather than the
+inline JSON document.
+
 It reads protein and RNA `unpairedMsaPath` and protein `pairedMsaPath` into
 inline MSA strings, then clears those path fields.
 
@@ -601,6 +616,13 @@ not its source path, participates in inference identity.
 
 Every inline/path pair is mutually exclusive. Simultaneously populated forms
 are rejected as ambiguous.
+
+The same local preflight mirrors upstream's inexpensive structural checks that
+UniAF3 does not yet enforce: a safe nonempty name, nonempty unique uppercase
+chain IDs, letter-only protein/RNA/DNA sequences, no `CCD_` modification
+prefixes, no more than 20 protein templates, and nonempty unsigned 32-bit model
+seeds. Invalid inputs fail before the first Modal call. The worker repeats the
+preflight before invoking upstream.
 
 For each caller `mmcifPath`, the helper reads the file and computes its full
 SHA-256 before run identity.
@@ -684,6 +706,12 @@ root.
 
 The submitted seed list must be non-empty. It is normalized to a sorted unique
 set before identity, reconciliation, or scheduling.
+
+One submitted request may contain at most 1,000 model seeds. The accumulated
+summary may grow beyond that ceiling through multiple valid requests.
+Inference controls are bounded both before scheduling and again in the worker:
+recycles are 0--100, diffusion samples are 1--100, and `max_num_gpus` is
+1--100.
 
 The request manifest preserves submitted and normalized seeds and records any
 duplicates removed by normalization.
@@ -810,10 +838,14 @@ Inline mmCIF stays inline. The request manifest prevents unrelated custom
 templates from being downloaded.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
-An existing archive is reused only when its exact member set and embedded
-presentation manifest match the current request. A corrupt, stale, or
-otherwise mismatched archive causes a clear failure instead of silent
-overwrite.
+The embedded presentation manifest also records the size and SHA-256 of each
+archive-local artifact after input rewriting. Existing archives are streamed
+once and reused only when their exact member set, presentation manifest, and
+all payload digests match the current request. For the rewritten input, the
+local client derives the expected presentation digest from the current staged
+input before reuse; changing both a payload and its embedded digest therefore
+does not make a repacked archive valid. A corrupt, stale, or otherwise
+mismatched archive causes a clear failure instead of silent overwrite.
 
 ### Failure and retry behavior
 

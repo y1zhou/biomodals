@@ -494,7 +494,6 @@ def _msa_search_runtime(
         container_id=_CONTAINER_INSTANCE_ID,
         maximum_age_seconds=maximum_age_seconds,
         wait_timeout_seconds=wait_timeout_seconds,
-        function_call_id=modal.current_function_call_id(),
     )
 
 
@@ -599,7 +598,6 @@ def _template_runtime() -> TemplateRuntime:
         container_id=_CONTAINER_INSTANCE_ID,
         maximum_age_seconds=CONF.timeout + 900,
         wait_timeout_seconds=max(60, CONF.timeout - 60),
-        function_call_id=modal.current_function_call_id(),
     )
 
 
@@ -1122,7 +1120,6 @@ def _inference_runtime() -> InferenceRuntime:
         container_id=_CONTAINER_INSTANCE_ID,
         maximum_age_seconds=MAX_TIMEOUT + 900,
         wait_timeout_seconds=max(60, MAX_TIMEOUT - 60),
-        function_call_id=modal.current_function_call_id(),
     )
 
 

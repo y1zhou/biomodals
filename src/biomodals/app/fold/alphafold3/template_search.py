@@ -86,7 +86,6 @@ class TemplateRuntime:
     maximum_age_seconds: int | float
     wait_timeout_seconds: int | float
     claim_poll_seconds: float = 5.0
-    function_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,7 +502,6 @@ def run_template_search(
         task.max_template_date,
     )
     if not task.publish_canonical:
-        started = time.perf_counter()
         templates, contract = execute_template_search(
             task.sequence,
             task.unpaired_msa,
@@ -516,7 +514,6 @@ def run_template_search(
             "unpaired_msa_sha256": context.unpaired_msa_sha256,
             "template_identity": context.template_identity,
             "templates": templates,
-            "elapsed_seconds": time.perf_counter() - started,
             "contract": contract,
         }
 
@@ -539,8 +536,6 @@ def run_template_search(
     log_path = generation_root / "run.log"
     terminal_status = "failed"
     terminal_detail: dict[str, object] = {}
-    started_at = utc_now()
-    started = time.perf_counter()
     try:
         runtime.cache_volume.reload()
         if entry := load_template_entry(context):
@@ -560,11 +555,9 @@ def run_template_search(
             runtime.source_root,
             task.max_template_date,
         )
-        elapsed_seconds = time.perf_counter() - started
         append_log(
             log_path,
-            f"Completed template search with {len(templates)} hits in "
-            f"{elapsed_seconds:.3f} seconds",
+            f"Completed template search with {len(templates)} hits",
         )
         templates_path = generation_root / "templates.json"
         write_json_atomic(templates_path, templates)
@@ -582,9 +575,7 @@ def run_template_search(
             {
                 "schema_version": TEMPLATE_RESULT_SCHEMA_VERSION,
                 "status": "complete",
-                "started_at": started_at,
                 "completed_at": utc_now(),
-                "elapsed_seconds": elapsed_seconds,
                 "generation_id": claim.generation_id,
                 "provenance": context.provenance,
                 "contract": contract,

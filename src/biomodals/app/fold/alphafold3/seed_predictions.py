@@ -97,7 +97,6 @@ class InferenceRuntime:
     maximum_age_seconds: int | float
     wait_timeout_seconds: int | float
     claim_poll_seconds: float = 5.0
-    function_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,7 +759,6 @@ def run_seed_prediction_worker(
     worker_root.mkdir(parents=True, exist_ok=True)
     job_root = worker_root / canonical_name
     outputs_root = run_root / "outputs"
-    started = time.perf_counter()
     published: list[int] = []
     try:
         execute(
@@ -838,24 +836,11 @@ def run_seed_prediction_worker(
             terminal_generations.add(item.claim.generation_id)
             published.append(item.seed)
 
-        elapsed_seconds = time.perf_counter() - started
         log_source = worker_root / "run.log"
         logs_root = run_root / "logs" / "workers"
         logs_root.mkdir(parents=True, exist_ok=True)
         if log_source.is_file():
             shutil.copy2(log_source, logs_root / f"{worker_id}.log")
-        write_json_atomic(
-            run_root / "metrics" / "workers" / f"{worker_id}.json",
-            {
-                "status": "complete",
-                "run_id": selected_run,
-                "worker_id": worker_id,
-                "seeds": [item.seed for item in pending],
-                "elapsed_seconds": elapsed_seconds,
-                "completed_at": utc_now(),
-                "function_call_id": runtime.function_call_id,
-            },
-        )
         shutil.rmtree(worker_root, ignore_errors=True)
         runtime.volume.commit()
         return {
@@ -864,7 +849,6 @@ def run_seed_prediction_worker(
             "worker_id": worker_id,
             "published_seeds": published,
             "reused_seeds": reused,
-            "elapsed_seconds": elapsed_seconds,
         }
     except Exception as exc:
         write_json_atomic(

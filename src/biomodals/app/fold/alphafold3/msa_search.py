@@ -110,7 +110,6 @@ class SearchRuntime:
     maximum_age_seconds: int | float
     wait_timeout_seconds: int | float
     claim_poll_seconds: float = 5.0
-    function_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,14 +255,6 @@ def scientific_search_parameters(
         "alphabet": "rna",
         "short_sequence_filter_f3": NHMMER_SHORT_SEQUENCE_FILTER_F3,
         "sharded_merge_order": NHMMER_SHARDED_MERGE_ORDER,
-    }
-
-
-def operational_search_parameters(spec: DatabaseProfileSpec) -> dict[str, object]:
-    """Return scientific parameters plus non-identity worker topology."""
-    return scientific_search_parameters(spec) | {
-        "n_cpu": SEARCH_N_CPU,
-        "max_parallel_shards": SEARCH_MAX_PARALLEL_SHARDS,
     }
 
 
@@ -483,17 +474,7 @@ def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
         artifacts.get("result"),
         "result.a3m",
     )
-    metrics_bytes = _load_artifact(
-        context.result_root,
-        artifacts.get("metrics"),
-        "metrics.json",
-    )
-    log_bytes = _load_artifact(
-        context.result_root,
-        artifacts.get("log"),
-        "run.log",
-    )
-    if result_bytes is None or metrics_bytes is None or log_bytes is None:
+    if result_bytes is None:
         return None
     try:
         a3m = result_bytes.decode()
@@ -886,8 +867,6 @@ def run_database_search(
     log_path = generation_root / "run.log"
     terminal_status = "failed"
     terminal_detail: dict[str, object] = {}
-    started_at = utc_now()
-    search_started = time.perf_counter()
     try:
         runtime.cache_volume.reload()
         if entry := load_raw_msa(context):
@@ -912,38 +891,18 @@ def run_database_search(
             context.sequence,
             raw_a3m,
         )
-        elapsed_seconds = time.perf_counter() - search_started
-        append_log(
-            log_path,
-            f"Completed search in {elapsed_seconds:.3f} seconds",
-        )
+        append_log(log_path, "Completed search")
         result_path = generation_root / "result.a3m"
         _write_bytes_atomic(result_path, a3m.encode())
-        metrics = {
-            "schema_version": RAW_RESULT_SCHEMA_VERSION,
-            "status": "published",
-            "started_at": started_at,
-            "completed_at": utc_now(),
-            "elapsed_seconds": elapsed_seconds,
-            "provenance": context.provenance,
-            "operational_parameters": operational_search_parameters(context.spec),
-            "container": {
-                "container_id": runtime.container_id,
-                "function_call_id": runtime.function_call_id,
-            },
-        }
-        metrics_path = generation_root / "metrics.json"
-        write_json_atomic(metrics_path, metrics)
         artifacts = {
             "result": _artifact_record(result_path, generation_root),
-            "metrics": _artifact_record(metrics_path, generation_root),
             "log": _artifact_record(log_path, generation_root),
         }
         runtime.cache_volume.commit()
         assert_generation_current(runtime.claims, claim)
 
         context.result_root.mkdir(parents=True, exist_ok=True)
-        for filename in ("result.a3m", "metrics.json", "run.log"):
+        for filename in ("result.a3m", "run.log"):
             os.replace(generation_root / filename, context.result_root / filename)
         runtime.cache_volume.commit()
         done = {

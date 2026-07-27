@@ -367,11 +367,7 @@ def test_raw_msa_cache_requires_a_valid_completion_marker(tmp_path: Path) -> Non
         provenance=provenance,
         result_root=result_root,
     )
-    files = {
-        "result": ("result.a3m", b">query\nACDE\n"),
-        "metrics": ("metrics.json", b"{}\n"),
-        "log": ("run.log", b"complete\n"),
-    }
+    files = {"result": ("result.a3m", b">query\nACDE\n")}
     artifacts = {}
     for role, (name, content) in files.items():
         (result_root / name).write_bytes(content)

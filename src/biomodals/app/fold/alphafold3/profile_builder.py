@@ -1017,8 +1017,6 @@ def _write_success_evidence(
     evidence_root: Path,
     result: dict[str, object],
 ) -> None:
-    write_json_atomic(evidence_root / "metrics.json", result)
-    runtime.output_volume.commit()
     write_json_atomic(
         evidence_root / "done.json",
         result | {"completed_at": utc_now()},

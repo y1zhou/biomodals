@@ -30,14 +30,24 @@ from tempfile import TemporaryDirectory
 import modal
 import orjson
 from uniaf3.schema.alphafold3 import (
-    AF3RNA,
     AF3Config,
-    AF3Protein,
-    AF3SequenceEntry,
-    AF3Template,
 )
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.msa_search import (
+    MSA_SEARCH_CLAIM_DICT_NAME,
+    ChainMsaState,
+    MsaAssemblyTask,
+    Polymer,
+    RawSearchTask,
+    SearchRuntime,
+    assemble_and_publish_msas,
+    field_is_populated,
+    inspect_raw_searches,
+    plan_msa_resolution,
+    run_database_search,
+    sequence_hash,
+)
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
     build_profile,
@@ -66,7 +76,7 @@ from biomodals.app.fold.alphafold3.sharding import (
     utc_now,
     write_json_atomic,
 )
-from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
@@ -79,7 +89,6 @@ from biomodals.helper.io import (
     write_local_tarball,
 )
 from biomodals.helper.shell import (
-    copy_files,
     package_outputs,
     run_command,
 )
@@ -130,6 +139,10 @@ PROFILE_BUILD_CLAIMS = modal.Dict.from_name(
     PROFILE_BUILD_CLAIM_DICT_NAME,
     create_if_missing=True,
 )
+MSA_SEARCH_CLAIMS = modal.Dict.from_name(
+    MSA_SEARCH_CLAIM_DICT_NAME,
+    create_if_missing=True,
+)
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
 runtime_image = (
@@ -176,6 +189,7 @@ runtime_image = (
     .run_commands("build_data")  # installed in the previous step
     .env({"PATH": "/hmmer/bin:$PATH"})
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.alphafold3")
 )
 
 # Database preparation does not need the AlphaFold runtime or model stack.
@@ -367,260 +381,352 @@ def _load_conf_from_bytes(json_bytes: bytes) -> AF3Config:
         return AF3Config.from_file(f)
 
 
-def _load_msa_cache(seq: AF3Protein | AF3RNA, msa_cache_dir: Path) -> Path:
-    """Fetch MSA from cache if available."""
-    seq_hash = hash_string(seq.sequence)
-    seq_msa_cache_dir = msa_cache_dir / seq_hash[:2] / seq_hash
-    unpaired_msa_path = seq_msa_cache_dir / "unpaired.a3m"
-    if isinstance(seq, AF3Protein):
-        # If either MSA path is not empty, skip cache lookup because the
-        # data likely does not come from AF3 query data_pipeline
-        if seq.pairedMsaPath is not None or seq.unpairedMsaPath is not None:
-            return seq_msa_cache_dir
-
-        # When the config does not contain MSA, and cache file exists,
-        # add the MSA from cache
-        if unpaired_msa_path.exists() and seq.unpairedMsa is None:
-            seq.unpairedMsa = unpaired_msa_path.read_text()
-
-        paired_msa_path = seq_msa_cache_dir / "paired.a3m"
-        if paired_msa_path.exists() and seq.pairedMsa is None:
-            seq.pairedMsa = paired_msa_path.read_text()
-
-        template_json_path = seq_msa_cache_dir / "templates.json"
-        if template_json_path.exists() and seq.templates is None:
-            templates = orjson.loads(template_json_path.read_bytes())
-            seq.templates = [AF3Template(**t) for t in templates]
-
-        # https://github.com/google-deepmind/alphafold3/blob/main/docs/input.md#multiple-sequence-alignment
-        # If only one of the MSA is set, remove them as a rerun is needed anyway
-        # We only check for None cases because it's ok to have unpaired MSA filled,
-        # and paired MSA being explicitly empty ("")
-        if not (seq.unpairedMsa is not None and seq.pairedMsa is not None):
-            seq.unpairedMsa = None
-            seq.pairedMsa = None
-    elif isinstance(seq, AF3RNA):
-        # RNA does not have paired MSA, so checking unpaired MSA is sufficient
-        if seq.unpairedMsaPath is not None:
-            return seq_msa_cache_dir
-        if unpaired_msa_path.exists() and seq.unpairedMsa is None:
-            seq.unpairedMsa = unpaired_msa_path.read_text()
-    else:
-        raise TypeError(f"Expected AF3Protein or AF3RNA, got {type(seq)}")
-
-    return seq_msa_cache_dir
-
-
-def _save_msa_cache(seq: AF3Protein | AF3RNA, seq_msa_cache_dir: Path) -> None:
-    """Save MSA results to cache files."""
-    seq_msa_cache_dir.mkdir(parents=True, exist_ok=True)
-    unpaired_msa_path = seq_msa_cache_dir / "unpaired.a3m"
-    if not unpaired_msa_path.exists() and seq.unpairedMsa is not None:
-        unpaired_msa_path.write_text(seq.unpairedMsa)
-    if isinstance(seq, AF3Protein):
-        if seq.pairedMsa is not None:
-            paired_msa_path = seq_msa_cache_dir / "paired.a3m"
-            paired_msa_path.write_text(seq.pairedMsa)
-        if (tmpl := seq.templates) is not None and tmpl:
-            import orjson
-
-            templates_path = seq_msa_cache_dir / "templates.json"
-            templates_path.write_bytes(orjson.dumps(tmpl))
-
-
-def _cache_conf_unpaired_msa(conf: AF3Config, msa_cache_dir: Path) -> AF3Config:
-    """Cache MSA results in separate files for future reuse.
-
-    If cache files are found, read and add them to the config object.
-    """
-    for seq in conf.sequences:
-        if (prot_chain := seq.protein) is not None:
-            prot_msa_dir = _load_msa_cache(prot_chain, msa_cache_dir)
-            # When the config is from the data pipeline, cache MSA results
-            _save_msa_cache(prot_chain, prot_msa_dir)
-        elif (rna_chain := seq.rna) is not None:
-            rna_msa_dir = _load_msa_cache(rna_chain, msa_cache_dir)
-            _save_msa_cache(rna_chain, rna_msa_dir)
-    return conf
-
-
-def _af3_sanitised_name(name: str) -> str:
-    """Return sanitised version of the name that can be used as a filename."""
-    import string
-
-    spaceless_name = name.replace(" ", "_")
-    allowed_chars = set(string.ascii_letters + string.digits + "_-.")
-    return "".join(x for x in spaceless_name if x in allowed_chars)
-
-
 def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
     """Mark bare sequences as single-sequence inference inputs."""
     for seq in conf.sequences:
         if (protein := seq.protein) is not None:
-            if protein.unpairedMsa is None and protein.unpairedMsaPath is None:
+            if not field_is_populated(
+                protein.unpairedMsa,
+                protein.unpairedMsaPath,
+            ):
                 protein.unpairedMsa = ""
-            if protein.pairedMsa is None and protein.pairedMsaPath is None:
+            if not field_is_populated(
+                protein.pairedMsa,
+                protein.pairedMsaPath,
+            ):
                 protein.pairedMsa = ""
-            if protein.templates is None:
+            if not protein.templates:
                 protein.templates = []
         elif (rna := seq.rna) is not None:
-            if rna.unpairedMsa is None and rna.unpairedMsaPath is None:
+            if not field_is_populated(rna.unpairedMsa, rna.unpairedMsaPath):
                 rna.unpairedMsa = ""
     return conf
 
 
 ##########################################
-# Inference functions
+# MSA search functions
 ##########################################
 @app.function(
-    cpu=(0.125, 32.125),  # 8c per database searched with HMMER
-    memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
-    # Protein sequences: 304.8GiB
-    # RNA sequences: 88.6GiB
-    # mmCIF templates .tar.zst: 57.6GiB
-    # ephemeral_disk=1024 * round(304.8 + 5),  # MiB, billed by memory at 20:1 ratio
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        APP_INFO.sharded_msa_db_dir: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(read_only=True)
+        ),
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
+        ),
+    },
+)
+def inspect_msa_search_cache(
+    inputs: list[tuple[str, str]],
+) -> list[dict[str, object]]:
+    """Inspect raw markers so cache hits consume no HMMER workers."""
+    SHARDED_MSA_DB_VOLUME.reload()
+    MSA_CACHE_VOLUME.reload()
+    tasks = tuple(
+        RawSearchTask(database_id=database_id, sequence=sequence)
+        for database_id, sequence in inputs
+    )
+    return inspect_raw_searches(
+        Path(APP_INFO.sharded_msa_db_dir),
+        Path(APP_INFO.msa_cache_dir),
+        tasks,
+    )
+
+
+def _msa_search_runtime(
+    *,
+    maximum_age_seconds: int | float,
+    wait_timeout_seconds: int | float,
+) -> SearchRuntime:
+    """Bind shared search code to production mounts and persistence objects."""
+    return SearchRuntime(
+        sharded_root=Path(APP_INFO.sharded_msa_db_dir),
+        cache_root=Path(APP_INFO.msa_cache_dir),
+        sharded_volume=SHARDED_MSA_DB_VOLUME,
+        cache_volume=MSA_CACHE_VOLUME,
+        claims=MSA_SEARCH_CLAIMS,
+        container_id=_CONTAINER_INSTANCE_ID,
+        maximum_age_seconds=maximum_age_seconds,
+        wait_timeout_seconds=wait_timeout_seconds,
+        function_call_id=modal.current_function_call_id(),
+    )
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 131_072),
     timeout=CONF.timeout,
-    volumes=CONF.mounts(model_volume=True)
-    | {
-        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
+    volumes={
+        APP_INFO.sharded_msa_db_dir: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(read_only=True)
+        ),
         APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
             sub_path=APP_INFO.msa_cache_volume_subdir
         ),
     },
 )
-def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
-    """Run AlphaFold3 data pipeline (CPU-only)."""
-    import sys
-    from tempfile import mkdtemp
-
-    # Try to fill config with cached MSA
-    msa_cache_dir = Path(APP_INFO.msa_cache_dir)
-    conf = _load_conf_from_bytes(json_bytes)
-    MSA_CACHE_VOLUME.reload()
-    conf = _cache_conf_unpaired_msa(conf, msa_cache_dir)
-    MSA_CACHE_VOLUME.commit()
-
-    # Check if all protein/RNA sequences have MSA results
-    temp_dir: Path = Path(mkdtemp(prefix="alphafold3_data_"))
-    run_name = _af3_sanitised_name(conf.name)
-    input_json_path = temp_dir / f"{run_name}.json"
-    conf.to_files(temp_dir, run_name)
-    all_protein_msa_filled = all(
-        prot_seq.unpairedMsa is not None and prot_seq.pairedMsa is not None
-        for seq in conf.sequences
-        if (prot_seq := seq.protein) is not None
+def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
+    """Search one fixed sharded database with database-level resume."""
+    return run_database_search(
+        _msa_search_runtime(
+            maximum_age_seconds=CONF.timeout + 900,
+            wait_timeout_seconds=max(60, CONF.timeout - 60),
+        ),
+        database_id,
+        sequence,
     )
-    all_rna_msa_filled = all(
-        rna_seq.unpairedMsa is not None
-        for seq in conf.sequences
-        if (rna_seq := seq.rna) is not None
+
+
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=(1024, 32_768),
+    timeout=1800,
+    volumes={
+        APP_INFO.sharded_msa_db_dir: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(read_only=True)
+        ),
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        ),
+    },
+)
+def assemble_sequence_msas(
+    polymer: Polymer,
+    sequence: str,
+    include_unpaired: bool,
+    include_paired: bool,
+) -> dict[str, object]:
+    """Assemble requested fields with pinned upstream deduplication."""
+    if polymer not in {"protein", "rna"}:
+        raise ValueError(f"Unsupported polymer: {polymer!r}")
+    return assemble_and_publish_msas(
+        _msa_search_runtime(
+            maximum_age_seconds=2700,
+            wait_timeout_seconds=1740,
+        ),
+        MsaAssemblyTask(
+            polymer=polymer,
+            sequence=sequence,
+            include_unpaired=include_unpaired,
+            include_paired=include_paired,
+        ),
     )
-    if all_protein_msa_filled and all_rna_msa_filled:
-        print("💊 MSA cache hit, returning results...")
-        return input_json_path.read_bytes()
 
-    # TODO: test sharded DB
-    # https://github.com/google-deepmind/alphafold3/blob/main/docs/performance.md
-    # Copy volume db files to /tmp for faster access (~651.7GiB)
-    print("💊 MSA cache not hit, running data pipeline...")
-    msa_db_dir: list[str] = []
-    if copy_msa_to_ssd:
-        db_dir = temp_dir / "db"
-        db_dir.mkdir()
-        msa_db_path = Path(APP_INFO.msa_db_dir)
-        db_files = [
-            # Protein sequence databases
-            "bfd-first_non_consensus_sequences.fasta",
-            "uniref90_2022_05.fa",
-            "uniprot_all_2021_04.fa",
-            "mgy_clusters_2022_05.fa",
-            "pdb_seqres_2022_09_28.fasta",
-            # RNA sequence databases
-            # "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
-            # "rnacentral_active_seq_id_90_cov_80_linclust.fasta",
-            # "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
-        ]
 
-        print(f"💊 Copying database files to local SSD {db_dir}")
-        # p = run_background_command(
-        #     f"tar -I zstd -xf {msa_db_path / 'pdb_2022_09_28_mmcif_files.tar.zst'} -C {db_dir}"
-        # )
-        copy_files({msa_db_path / db_file: db_dir / db_file for db_file in db_files})
-        # p.wait()
-        # if p.returncode != 0:
-        #     raise RuntimeError("Failed to extract mmCIF template files")
-        msa_db_dir.append(str(db_dir))
-    msa_db_dir.append(APP_INFO.msa_db_dir)  # fallback for mmCIF templates and RNA
+def _validate_search_worker_budget(max_parallel_search_workers: int) -> int:
+    """Validate the request-wide remote-worker budget."""
+    if (
+        isinstance(max_parallel_search_workers, bool)
+        or not isinstance(max_parallel_search_workers, int)
+        or not 1 <= max_parallel_search_workers <= 32
+    ):
+        raise ValueError("max_parallel_search_workers must be between 1 and 32")
+    return max_parallel_search_workers
 
-    cmd = [
-        sys.executable,
-        str(CONF.git_clone_dir / "run_alphafold.py"),
-        "--run_inference=false",
-        f"--json_path={input_json_path}",
-        f"--output_dir={temp_dir}",
-        f"--model_dir={CONF.model_volume_mountpoint}",
-        *(f"--db_dir={d}" for d in msa_db_dir),
-        "--jackhmmer_n_cpu=8",
-        "--nhmmer_n_cpu=8",
-    ]
-    run_command(cmd)
 
-    # Cache unpaired MSA files in separate directories for future use
-    msa_json_path = temp_dir / run_name / f"{run_name}_data.json"
-    if not msa_json_path.exists():
-        print([x.relative_to(temp_dir) for x in temp_dir.rglob("*")])
-        raise FileNotFoundError(f"MSA JSON file not found: {msa_json_path}")
-    _ = _cache_conf_unpaired_msa(AF3Config.from_file(msa_json_path), msa_cache_dir)
-    MSA_CACHE_VOLUME.commit()
-    return msa_json_path.read_bytes()
+def _chain_msa_states(conf: AF3Config) -> tuple[ChainMsaState, ...]:
+    """Describe caller-supplied MSA fields without sharing caller evidence."""
+    states: list[ChainMsaState] = []
+    for index, entry in enumerate(conf.sequences):
+        if (protein := entry.protein) is not None:
+            states.append(
+                ChainMsaState(
+                    chain_index=index,
+                    polymer="protein",
+                    sequence=protein.sequence,
+                    unpaired_present=field_is_populated(
+                        protein.unpairedMsa,
+                        protein.unpairedMsaPath,
+                    ),
+                    paired_present=field_is_populated(
+                        protein.pairedMsa,
+                        protein.pairedMsaPath,
+                    ),
+                )
+            )
+        elif (rna := entry.rna) is not None:
+            states.append(
+                ChainMsaState(
+                    chain_index=index,
+                    polymer="rna",
+                    sequence=rna.sequence,
+                    unpaired_present=field_is_populated(
+                        rna.unpairedMsa,
+                        rna.unpairedMsaPath,
+                    ),
+                    paired_present=False,
+                )
+            )
+    return tuple(states)
+
+
+def _remote_search_outcome(
+    task: RawSearchTask,
+) -> dict[str, object] | Exception:
+    """Return a remote search result or its surfaced exception."""
+    try:
+        return search_database_msa.remote(task.database_id, task.sequence)
+    except Exception as exc:
+        return exc
+
+
+def _remote_assembly_outcome(
+    task: MsaAssemblyTask,
+) -> dict[str, object] | Exception:
+    """Return a remote assembly result or its surfaced exception."""
+    try:
+        return assemble_sequence_msas.remote(
+            task.polymer,
+            task.sequence,
+            task.include_unpaired,
+            task.include_paired,
+        )
+    except Exception as exc:
+        return exc
+
+
+def _serialize_validated_config(conf: AF3Config) -> bytes:
+    """Round-trip the enriched input through its schema."""
+    json_bytes = conf.to_json(exclude_unset=False).encode()
+    validated = AF3Config.model_validate_json(json_bytes)
+    return validated.to_json(exclude_unset=False).encode()
 
 
 def search_msa_and_templates(
     config_path: str | Path,
-    search_chains_in_parallel: bool,
-    max_parallel_data_pipelines: int | None = None,
+    *,
+    search_msa: bool = True,
+    search_protein_templates: bool = True,
+    max_parallel_search_workers: int = 4,
 ) -> bytes:
-    """Manage AlphaFold3 data pipeline(s)."""
+    """Resolve MSA fields with bounded resumable database workers."""
+    worker_budget = _validate_search_worker_budget(max_parallel_search_workers)
     conf = AF3Config.from_file(config_path)
-    msa_chains: list[tuple[int, AF3SequenceEntry]] = [
-        (i, chain)
-        for i, chain in enumerate(conf.sequences)
-        if chain.protein is not None or chain.rna is not None
+    if not search_msa:
+        return _serialize_validated_config(_fill_missing_msa_for_inference(conf))
+
+    missing_template_chains = [
+        index
+        for index, entry in enumerate(conf.sequences)
+        if (protein := entry.protein) is not None and not protein.templates
     ]
-
-    if not search_chains_in_parallel:
-        msa_json_bytes = run_data_pipeline.remote(
-            json_bytes=Path(config_path).read_bytes(),
-            copy_msa_to_ssd=len(msa_chains) > 1,
+    if search_protein_templates and missing_template_chains:
+        raise NotImplementedError(
+            "Protein template search is the next integration stage and is not "
+            "yet available in the sharded-MSA coordinator. No Modal search was "
+            "submitted. Use --no-search-protein-templates only when empty "
+            "template lists are scientifically intended. Missing chain "
+            f"indices: {missing_template_chains}"
         )
-        return msa_json_bytes
 
-    # Parallelize MSA search by chains
-    with TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        data_pipeline_inputs: list[tuple[int, bytes]] = []
-        for i, msa_chain in msa_chains:
-            input_conf = conf.model_copy(update={"sequences": [msa_chain]})
-            input_conf.to_files(tmp_path, str(i))
-            data_pipeline_inputs.append((i, (tmp_path / f"{i}.json").read_bytes()))
-    msa_bytes = bounded_map(
-        data_pipeline_inputs,
-        lambda item: run_data_pipeline.remote(
-            json_bytes=item[1],
-            copy_msa_to_ssd=False,
-        ),
-        max_parallel=max_parallel_data_pipelines,
+    states = _chain_msa_states(conf)
+    plan = plan_msa_resolution(states)
+    raw_inputs = [(task.database_id, task.sequence) for task in plan.raw_searches]
+    cache_statuses = inspect_msa_search_cache.remote(raw_inputs) if raw_inputs else []
+    if len(cache_statuses) != len(plan.raw_searches):
+        raise RuntimeError("MSA cache inspection returned the wrong result count")
+    missing_raw: list[RawSearchTask] = []
+    for task, status in zip(plan.raw_searches, cache_statuses, strict=True):
+        if (
+            status.get("database_id") != task.database_id
+            or status.get("sequence_sha256") != task.sequence_hash
+            or status.get("status") not in {"missing", "reused"}
+        ):
+            raise RuntimeError(f"Invalid MSA cache inspection result: {status}")
+        if status["status"] == "missing":
+            missing_raw.append(task)
+
+    print(
+        "🧬 Sharded MSA search plan: "
+        f"{len(cache_statuses) - len(missing_raw)} cached, "
+        f"{len(missing_raw)} missing, worker cap {worker_budget}."
     )
+    search_outcomes = bounded_map(
+        missing_raw,
+        _remote_search_outcome,
+        max_parallel=worker_budget,
+    )
+    search_failures = [
+        {
+            "database_id": task.database_id,
+            "polymer": task.polymer,
+            "sequence_sha256": task.sequence_hash,
+            "error_type": type(outcome).__name__,
+            "message": str(outcome),
+        }
+        for task, outcome in zip(missing_raw, search_outcomes, strict=True)
+        if isinstance(outcome, Exception)
+    ]
+    if search_failures:
+        raise RuntimeError(
+            "Incomplete Raw Database MSA tasks; rerun to reuse successful "
+            f"siblings: {search_failures}"
+        )
 
-    # Merge into one AF3Config
-    for (i, _), data in zip(data_pipeline_inputs, msa_bytes, strict=True):
-        msa_conf = _load_conf_from_bytes(data)
-        conf.sequences[i] = msa_conf.sequences[0]
+    assembly_outcomes = bounded_map(
+        plan.assemblies,
+        _remote_assembly_outcome,
+        max_parallel=worker_budget,
+    )
+    assembly_failures = [
+        {
+            "polymer": task.polymer,
+            "sequence_sha256": sequence_hash(task.sequence),
+            "error_type": type(outcome).__name__,
+            "message": str(outcome),
+        }
+        for task, outcome in zip(
+            plan.assemblies,
+            assembly_outcomes,
+            strict=True,
+        )
+        if isinstance(outcome, Exception)
+    ]
+    if assembly_failures:
+        raise RuntimeError(
+            "Incomplete MSA assembly tasks; raw database results remain "
+            f"reusable: {assembly_failures}"
+        )
 
-    with TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        conf.to_files(tmp_path, conf.name)
-        return (tmp_path / f"{conf.name}.json").read_bytes()
+    assembly_by_sequence: dict[tuple[str, str], dict[str, str]] = {}
+    for task, outcome in zip(plan.assemblies, assembly_outcomes, strict=True):
+        if not isinstance(outcome, dict):
+            raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
+        raw_fields = outcome.get("fields")
+        if not isinstance(raw_fields, dict):
+            raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
+        fields: dict[str, str] = {}
+        for field, value in raw_fields.items():
+            if not isinstance(field, str) or not isinstance(value, str):
+                raise RuntimeError(f"Invalid MSA assembly fields: {raw_fields!r}")
+            fields[field] = value
+        assembly_by_sequence[(task.polymer, task.sequence)] = fields
+
+    for state in states:
+        fields = assembly_by_sequence.get((state.polymer, state.sequence), {})
+        entry = conf.sequences[state.chain_index]
+        if (protein := entry.protein) is not None:
+            if not state.unpaired_present:
+                protein.unpairedMsa = fields["unpairedMsa"]
+                protein.unpairedMsaPath = None
+            if not state.paired_present:
+                protein.pairedMsa = fields["pairedMsa"]
+                protein.pairedMsaPath = None
+            if not protein.templates:
+                protein.templates = []
+        elif (rna := entry.rna) is not None and not state.unpaired_present:
+            rna.unpairedMsa = fields["unpairedMsa"]
+            rna.unpairedMsaPath = None
+    return _serialize_validated_config(conf)
+
+
+##########################################
+# Inference functions
+##########################################
 
 
 @app.function(
@@ -896,8 +1002,8 @@ def submit_alphafold3_task(
     out_dir: str | None = None,
     run_name: str | None = None,
     search_msa: bool = True,
-    search_chains_in_parallel: bool = True,
-    max_parallel_data_pipelines: int | None = None,
+    search_protein_templates: bool = True,
+    max_parallel_search_workers: int = 4,
     max_num_gpus: int = 1,
     recycle: int = 10,
     sample: int = 5,
@@ -908,13 +1014,12 @@ def submit_alphafold3_task(
         input_json: Path to input JSON file.
         out_dir: Optional output directory (defaults to $CWD)
         run_name: Optional run name (defaults to `name` in the AF3 JSON config)
-        search_msa: Whether to run MSA and template search data pipeline.
-        search_chains_in_parallel: Whether to spawn multiple `data_pipeline`
-            jobs when there is more than one protein/RNA chain to query MSA.
-            If True, a 32-core job will be spawned for *each* chain. If False,
-            a single container will be used for all chains sequentially.
-        max_parallel_data_pipelines: Maximum number of data-pipeline containers
-            to run at once when `search_chains_in_parallel` is true.
+        search_msa: Populate missing protein and RNA MSA fields.
+        search_protein_templates: Populate missing protein templates after MSA
+            resolution. Non-empty caller fields are always preserved.
+        max_parallel_search_workers: Request-wide cap for database and template
+            workers. Database workers internally use 16 shards by two HMMER
+            CPUs.
         max_num_gpus: Maximum number of GPUs to use during inference. If >1,
             multiple `model_inference` jobs will be spawned in parallel based
             on the number of model seeds in the JSON config.
@@ -932,16 +1037,13 @@ def submit_alphafold3_task(
         run_name = conf.name
     conf.name = run_name
 
-    # Run inference
-    if search_msa:
-        print(f"🧬 Running {CONF.name} data pipeline...")
-        json_bytes = search_msa_and_templates(
-            input_path,
-            search_chains_in_parallel,
-            max_parallel_data_pipelines,
-        )
-    else:
-        json_bytes = input_path.read_bytes()
+    print(f"🧬 Resolving {CONF.name} MSA and template fields...")
+    json_bytes = search_msa_and_templates(
+        input_path,
+        search_msa=search_msa,
+        search_protein_templates=search_protein_templates,
+        max_parallel_search_workers=max_parallel_search_workers,
+    )
 
     local_out_dir = resolve_local_output_dir(out_dir)
 

@@ -722,11 +722,22 @@ digest.
 
 Commit: `fold: add resumable sharded MSA search`
 
+Status: implemented locally; no production Modal search submitted.
+
 - add raw-result identities, markers, claims, and cache paths;
 - add generic protein/RNA database workers with the selected topology;
 - add upstream-compatible assembly and RNA deduplication;
 - add independent field resolution and the request-wide worker budget;
 - remove monolithic `run_data_pipeline` and all MSA-to-SSD copying.
+
+The mature scientific adapter and append-only generation-claim protocol now
+live in `alphafold3/msa_search.py` and `alphafold3/generation_claims.py`.
+Both AlphaFold apps call the shared Jackhmmer/Nhmmer execution, corrected RNA
+merge, and pinned assembly functions. Production first performs one
+lightweight marker inspection, then spends the request-wide budget only on
+missing unique sequence-by-database searches. A complete canonical
+protein/RNA assembly is published with `combined.done.json` last; mixed
+caller/generated fields remain request-local.
 
 ### 5. Separate and resume template search
 

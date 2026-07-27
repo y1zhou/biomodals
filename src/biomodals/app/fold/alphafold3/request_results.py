@@ -336,6 +336,41 @@ def _replace_staged_file(source: Path, destination: Path) -> None:
     os.replace(source, destination)
 
 
+def _record_publication_failure(
+    runtime: InferenceRuntime,
+    *,
+    request_root: Path,
+    run_id: str,
+    request_id: str,
+    generation_id: str,
+    error: Exception,
+) -> None:
+    """Commit compact request failure evidence before staging cleanup."""
+    failure_path = request_root / "failures" / f"{generation_id}.json"
+    message = str(error)
+    try:
+        write_json_atomic(
+            failure_path,
+            {
+                "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
+                "status": "failed",
+                "failed_at": utc_now(),
+                "run_id": run_id,
+                "request_id": request_id,
+                "generation_id": generation_id,
+                "error_type": type(error).__name__,
+                "message": message[:4096],
+                "message_truncated": len(message) > 4096,
+            },
+        )
+        runtime.volume.commit()
+    except Exception as evidence_error:
+        error.add_note(
+            "Failed to persist request publication evidence: "
+            f"{type(evidence_error).__name__}: {evidence_error}"
+        )
+
+
 def publish_request_results(
     runtime: InferenceRuntime,
     publication: RequestPublication,
@@ -409,6 +444,16 @@ def publish_request_results(
         for name in generated_names:
             _replace_staged_file(staging_root / name, request_root / name)
         runtime.volume.commit()
+    except Exception as exc:
+        _record_publication_failure(
+            runtime,
+            request_root=request_root,
+            run_id=spec.run_id,
+            request_id=spec.request_id,
+            generation_id=generation_id,
+            error=exc,
+        )
+        raise
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 

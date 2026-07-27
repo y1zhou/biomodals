@@ -860,7 +860,9 @@ Before promotion, the finalizer snapshots the observed global-summary marker
 and verifies that the copied bytes still match the loaded marker digest; a
 concurrent summary expansion causes a clear retryable failure instead of
 publishing a mixed request view. It never copies seed directories or declares
-an unrelated completed seed.
+an unrelated completed seed. A failed publication commits compact evidence
+under `requests/{request_id}/failures/` before its private staging directory is
+removed.
 
 The local entrypoint streams only those Volume-relative manifest artifacts,
 rejects paths outside the hash-fanned run root, verifies each stream's declared

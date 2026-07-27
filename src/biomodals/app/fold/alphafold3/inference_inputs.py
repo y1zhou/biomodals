@@ -61,7 +61,6 @@ class PreparedInferenceRun:
     display_name: str
     submitted_seeds: tuple[int, ...]
     normalized_seeds: tuple[int, ...]
-    identity_view: dict[str, object]
     worker_config: AF3Config
     uploads: tuple[VolumeUpload, ...]
 
@@ -389,7 +388,6 @@ def prepare_inference_run(
         display_name=display_name,
         submitted_seeds=submitted_seeds,
         normalized_seeds=normalized_seeds,
-        identity_view=identity_view,
         worker_config=staged_conf,
         uploads=tuple(
             VolumeUpload(relative_path=relative_path, content=content)

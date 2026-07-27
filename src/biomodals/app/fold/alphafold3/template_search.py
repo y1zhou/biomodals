@@ -119,7 +119,6 @@ class TemplateContext:
     sequence: str
     sequence_hash: str
     unpaired_msa_sha256: str
-    max_template_date: str
     template_identity: str
     provenance: dict[str, object]
     sequence_root: Path
@@ -132,7 +131,6 @@ class TemplateEntry:
     context: TemplateContext
     templates: list[dict[str, object]]
     done_sha256: str
-    artifact: dict[str, object]
 
     def summary(self, status: str) -> dict[str, object]:
         """Return a reusable result for the local coordinator."""
@@ -143,7 +141,6 @@ class TemplateEntry:
             "template_identity": self.context.template_identity,
             "done_sha256": self.done_sha256,
             "templates": self.templates,
-            "artifact": self.artifact,
         }
 
 
@@ -238,7 +235,6 @@ def build_template_context(
         sequence=query,
         sequence_hash=query_hash,
         unpaired_msa_sha256=unpaired_msa_sha256,
-        max_template_date=selected_date,
         template_identity=template_identity,
         provenance=provenance,
         sequence_root=cache_root / sequence_cache_relpath("protein", query),
@@ -282,7 +278,6 @@ def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
         context=context,
         templates=cast(list[dict[str, object]], templates),
         done_sha256=sha256_bytes(done_bytes),
-        artifact=cast(dict[str, object], artifact),
     )
 
 

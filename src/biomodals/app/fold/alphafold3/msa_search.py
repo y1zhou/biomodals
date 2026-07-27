@@ -174,7 +174,6 @@ class SearchContext:
     sequence: str
     sequence_hash: str
     profile_root: Path
-    manifest_sha256: str
     search_identity: str
     provenance: dict[str, object]
     result_root: Path
@@ -413,7 +412,6 @@ def load_search_context(
         sequence=query,
         sequence_hash=query_hash,
         profile_root=selected_profile_root,
-        manifest_sha256=manifest_sha256,
         search_identity=search_identity,
         provenance=provenance,
         result_root=cache_root / raw_result_relpath(spec, query, search_identity),

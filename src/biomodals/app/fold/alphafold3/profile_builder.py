@@ -34,6 +34,7 @@ from biomodals.app.fold.alphafold3.artifacts import (
     utc_now,
     write_json_atomic,
 )
+from biomodals.app.fold.alphafold3.generation_claims import ClaimStore
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
@@ -93,24 +94,6 @@ class VolumeHandle(Protocol):
         ...
 
 
-class ClaimStore(Protocol):
-    """Minimal Modal Dict surface used for single-profile build claims."""
-
-    def put(
-        self,
-        key: str,
-        value: object,
-        *,
-        skip_if_exists: bool = False,
-    ) -> bool:
-        """Store a value and report whether an insert-only write succeeded."""
-        ...
-
-    def get(self, key: str, default: object = None) -> object:
-        """Return a stored value or the supplied default."""
-        ...
-
-
 @dataclass(frozen=True, slots=True)
 class ProfileBuilderRuntime:
     """Mounted paths and persistence handles for one builder container."""
@@ -124,6 +107,26 @@ class ProfileBuilderRuntime:
     output_volume: VolumeHandle
     claims: ClaimStore
     container_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceProfileEvidence:
+    """Validated source FASTA identity and SeqKit statistics."""
+
+    size_bytes: int
+    sha256: str
+    num_seqs: int
+    stats_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ShardBuildEvidence:
+    """Validated shard paths and manifest-relevant scientific evidence."""
+
+    shard_paths: tuple[Path, ...]
+    statistics: dict[str, int | float]
+    recovery_metrics: dict[str, Any]
+    record_multiset_signature_sha256: str
 
 
 def run_to_file(argv: list[str], output_path: Path, log_path: Path) -> None:
@@ -1043,6 +1046,346 @@ def _reuse_published_profile(
     return result
 
 
+def _prepare_source_evidence(
+    spec: DatabaseProfileSpec,
+    source_path: Path,
+    validation_dir: Path,
+    log_path: Path,
+    *,
+    seqkit_threads: int,
+) -> tuple[SourceProfileEvidence, str]:
+    """Validate one source FASTA, its fixed counts, and local scratch budget."""
+    if not source_path.is_file():
+        archive_path = source_path.with_name(f"{source_path.name}.zst")
+        if archive_path.is_file():
+            raise FileNotFoundError(
+                f"{source_path} is archived as {archive_path}. Restore the "
+                "plain FASTA manually in a Modal Sandbox before rebuilding."
+            )
+        raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
+    require_regular_file(source_path)
+    source_size = source_path.stat().st_size
+
+    validation_dir.mkdir(parents=True)
+    seqkit = require_executable("seqkit")
+    version_output = subprocess.run(  # noqa: S603
+        [seqkit, "version"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if SEQKIT_VERSION not in version_output:
+        raise RuntimeError(
+            f"Expected SeqKit {SEQKIT_VERSION}, observed {version_output!r}"
+        )
+    append_log(log_path, f"Using {version_output}")
+
+    source_stats_path = validation_dir / "source-stats.tsv"
+    run_to_file(
+        [
+            seqkit,
+            "stats",
+            "-j",
+            str(seqkit_threads),
+            "--all",
+            "--tabular",
+            str(source_path),
+        ],
+        source_stats_path,
+        log_path,
+    )
+
+    import polars as pl
+
+    source_stats = pl.read_csv(source_stats_path, separator="\t")
+    if source_stats.height != 1:
+        raise ValueError(f"Expected one source stats row, got {source_stats.height}")
+    source_num_seqs = int(source_stats.item(0, "num_seqs"))
+    source_sum_len = int(source_stats.item(0, "sum_len"))
+    if spec.expected_num_seqs is not None and source_num_seqs != spec.expected_num_seqs:
+        raise ValueError(
+            f"{spec.database_id} sequence count {source_num_seqs} does not "
+            f"match expected {spec.expected_num_seqs}"
+        )
+    if spec.expected_sum_len is not None and source_sum_len != spec.expected_sum_len:
+        raise ValueError(
+            f"{spec.database_id} residue count {source_sum_len} does not "
+            f"match expected {spec.expected_sum_len}"
+        )
+    scratch_free = shutil.disk_usage(SCRATCH_ROOT).free
+    scratch_required = required_ordinal_shuffler_scratch_bytes(
+        source_size,
+        source_num_seqs,
+    )
+    if scratch_free < scratch_required:
+        raise OSError(
+            f"Insufficient /tmp space for {spec.database_id}: need at least "
+            f"{scratch_required} bytes, found {scratch_free}"
+        )
+    append_log(
+        log_path,
+        f"Reserved scratch budget {scratch_required} bytes for local source "
+        "staging, shuffled FASTA, and occurrence index",
+    )
+    return (
+        SourceProfileEvidence(
+            size_bytes=source_size,
+            sha256=sha256_file(source_path),
+            num_seqs=source_num_seqs,
+            stats_path=source_stats_path,
+        ),
+        seqkit,
+    )
+
+
+def _build_and_validate_shards(
+    spec: DatabaseProfileSpec,
+    source_path: Path,
+    source: SourceProfileEvidence,
+    raw_shard_dir: Path,
+    shard_dir: Path,
+    validation_dir: Path,
+    log_path: Path,
+    seqkit: str,
+    *,
+    seqkit_threads: int,
+) -> ShardBuildEvidence:
+    """Shuffle, split, and prove source/shard record-multiset equivalence."""
+    shard_stats_path = validation_dir / "shard-stats.tsv"
+    shard_summary_path = validation_dir / "shard-summary.parquet"
+    record_multiset_path = validation_dir / "record-multiset.json"
+    with tempfile.TemporaryDirectory(
+        prefix=f"af3-{spec.database_id}-",
+        dir=SCRATCH_ROOT,
+    ) as scratch_dir:
+        scratch_root = Path(scratch_dir)
+        staged_source_path, shuffled_path, recovery_metrics = _run_shuffle(
+            spec,
+            source_path,
+            scratch_root,
+            validation_dir,
+            log_path,
+            expected_records=source.num_seqs,
+            seqkit_threads=seqkit_threads,
+        )
+        staged_verification = verify_file(
+            staged_source_path,
+            expected_size=source.size_bytes,
+            expected_sha256=source.sha256,
+        )
+        append_log(
+            log_path,
+            "Verified container-local staged source against the Volume "
+            f"source SHA-256 in {staged_verification.wall_seconds:.6f}s",
+        )
+        validator = compile_record_multiset_validator(scratch_root, log_path)
+        parallel_started = perf_counter()
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="af3-source-validator",
+        ) as source_validator_pool:
+            # The worker waits on native C; Python does not perform the scan.
+            source_future = source_validator_pool.submit(
+                scan_record_multiset,
+                validator,
+                (staged_source_path,),
+                scratch_root / "source-record-multiset.json",
+                log_path,
+                threads=1,
+            )
+            split_started = perf_counter()
+            shard_paths = _run_split(
+                spec,
+                shuffled_path,
+                raw_shard_dir,
+                shard_dir,
+                log_path,
+                seqkit_threads=seqkit_threads,
+            )
+            split_seconds = perf_counter() - split_started
+            source_result = source_future.result() if source_future.done() else None
+            shard_result = scan_record_multiset(
+                validator,
+                shard_paths,
+                scratch_root / "shard-record-multiset.json",
+                log_path,
+                threads=seqkit_threads,
+            )
+            if source_result is None:
+                source_result = source_future.result()
+        parallel_seconds = perf_counter() - parallel_started
+        record_multiset = finalize_record_multiset_validation(
+            source_result,
+            shard_result,
+            record_multiset_path,
+            execution={
+                "strategy": "native-source-scan-overlaps-split-and-shard-scan-v1",
+                "python_role": "subprocess-orchestration-only",
+                "source_input": "sha256-verified-container-local-staged-copy",
+                "staged_source_size_bytes": staged_verification.size_bytes,
+                "staged_source_sha256": staged_verification.sha256,
+                "staged_source_verification_seconds": (
+                    staged_verification.wall_seconds
+                ),
+                "split_seconds": split_seconds,
+                "parallel_stage_wall_seconds": parallel_seconds,
+            },
+        )
+
+    run_to_file(
+        [
+            seqkit,
+            "stats",
+            "-j",
+            str(seqkit_threads),
+            "--all",
+            "--tabular",
+            *(str(path) for path in shard_paths),
+        ],
+        shard_stats_path,
+        log_path,
+    )
+    statistics = _validate_statistics(
+        spec,
+        source.stats_path,
+        shard_stats_path,
+        shard_summary_path,
+    )
+    multiset_signature = record_multiset.get("signature")
+    if not isinstance(multiset_signature, dict):
+        raise TypeError("Record-multiset validation lost its signature")
+    if multiset_signature.get("records") != statistics["num_seqs"]:
+        raise ValueError("Record-multiset count does not match SeqKit statistics")
+    if multiset_signature.get("sequence_bytes") != statistics["sum_len"]:
+        raise ValueError(
+            "Record-multiset sequence bytes do not match SeqKit statistics"
+        )
+    signature_sha256 = record_multiset.get("signature_sha256")
+    if (
+        not isinstance(signature_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", signature_sha256) is None
+    ):
+        raise ValueError("Record-multiset signature SHA-256 is invalid")
+    if recovery_metrics.get("temporary_namespace") is not None:
+        raise RuntimeError("Occurrence shuffling must not create recovery headers")
+    return ShardBuildEvidence(
+        shard_paths=shard_paths,
+        statistics=statistics,
+        recovery_metrics=recovery_metrics,
+        record_multiset_signature_sha256=signature_sha256,
+    )
+
+
+def build_profile_manifest(
+    spec: DatabaseProfileSpec,
+    generation_id: str,
+    source: SourceProfileEvidence,
+    shards: ShardBuildEvidence,
+    staging_root: Path,
+    *,
+    seqkit_threads: int,
+) -> dict[str, object]:
+    """Construct and validate one immutable profile manifest."""
+    statistics = shards.statistics
+    recovery_metrics = shards.recovery_metrics
+    shard_records = [
+        artifact_record(shard_path, staging_root) for shard_path in shards.shard_paths
+    ]
+    validation_records = [
+        artifact_record(staging_root / relative, staging_root)
+        for relative in VALIDATION_RELPATHS
+    ]
+    manifest: dict[str, object] = {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "profile_id": spec.profile_id,
+        "database_id": spec.database_id,
+        "polymer": spec.polymer,
+        "created_at": utc_now(),
+        "generation_id": generation_id,
+        "source": {
+            "volume": SOURCE_DB_VOLUME_NAME,
+            "path": spec.source_filename,
+            "size_bytes": source.size_bytes,
+            "sha256": source.sha256,
+            "num_seqs": statistics["num_seqs"],
+            "sum_len": statistics["sum_len"],
+        },
+        "shard_count": spec.shard_count,
+        "shard_prefix": f"shards/{spec.source_filename}",
+        "shards": shard_records,
+        "search_space_value": (
+            statistics["num_seqs"]
+            if spec.polymer == "protein"
+            else statistics["sum_len"] / 1_000_000
+        ),
+        "search_space_unit": spec.search_space_unit,
+        "compatibility": {
+            "alphafold_repository": ALPHAFOLD3_REPOSITORY,
+            "alphafold_commit": ALPHAFOLD3_COMMIT,
+            "hmmer_version": HMMER_VERSION,
+            "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+        },
+        "recipe": {
+            "version": COMPOSABLE_MULTISET_RECIPE_VERSION,
+            "seqkit_version": SEQKIT_VERSION,
+            "seqkit_threads": seqkit_threads,
+            "random_seed": SHARD_RANDOM_SEED,
+            "shuffle": [
+                "two-pass",
+                "first-pass-stage-local-source",
+                "source-occurrence-offset-index",
+                "splitmix64-fisher-yates-u32",
+                "bounded-concurrent-local-pread",
+                "ordered-write",
+            ],
+            "shuffler": {
+                "version": ORDINAL_SHUFFLER_VERSION,
+                "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
+                "record_identity": "source-occurrence",
+                "offset_index": "uint64-source-occurrence-offsets-v1",
+                "permutation": "splitmix64-fisher-yates-u32-v1",
+                "staging": "first-pass-tee-to-container-local-v1",
+                "read": "bounded-concurrent-local-pread-ordered-write-v2",
+                "ordered_output": True,
+            },
+            "execution": {
+                "worker_threads": seqkit_threads,
+                "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+                "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+            },
+            "duplicate_recovery": {
+                "warning_source": None,
+                "record_identity": "source-occurrence",
+                "append_after_shuffle": False,
+                "strip_after_split": False,
+            },
+            "record_multiset": record_multiset_identity()
+            | {"shard_threads": seqkit_threads},
+            "split": ["--by-part", spec.shard_count],
+        },
+        "validation": {
+            "passed": True,
+            "num_seqs": statistics["num_seqs"],
+            "sum_len": statistics["sum_len"],
+            "maximum_residue_imbalance": statistics["maximum_residue_imbalance"],
+            "maximum_allowed_residue_imbalance": MAX_PROFILE_IMBALANCE,
+            "recovered_records": recovery_metrics["recovered_records"],
+            "recovered_residues": recovery_metrics["recovered_residues"],
+            "first_recovered_byte_offset": recovery_metrics["first_byte_offset"],
+            "last_recovered_byte_offset": recovery_metrics["last_byte_offset"],
+            "temporary_recovery_prefix_absent": True,
+            "record_occurrences_preserved": True,
+            "canonical_record_multiset_match": True,
+            "record_multiset_signature_sha256": (
+                shards.record_multiset_signature_sha256
+            ),
+            "artifacts": validation_records,
+        },
+    }
+    validate_profile_manifest(cast(dict[str, Any], manifest), spec)
+    return manifest
+
+
 def build_profile(
     runtime: ProfileBuilderRuntime,
     database_id: str,
@@ -1118,300 +1461,35 @@ def build_profile(
             )
             runtime.sharded_volume.commit()
 
-        if not source_path.is_file():
-            archive_path = source_path.with_name(f"{source_path.name}.zst")
-            if archive_path.is_file():
-                raise FileNotFoundError(
-                    f"{source_path} is archived as {archive_path}. Restore the "
-                    "plain FASTA manually in a Modal Sandbox before rebuilding."
-                )
-            raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
-        require_regular_file(source_path)
-        source_size = source_path.stat().st_size
-
-        shard_dir.mkdir(parents=True)
-        validation_dir.mkdir(parents=True)
-        seqkit = require_executable("seqkit")
-        version_output = subprocess.run(  # noqa: S603
-            [seqkit, "version"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if SEQKIT_VERSION not in version_output:
-            raise RuntimeError(
-                f"Expected SeqKit {SEQKIT_VERSION}, observed {version_output!r}"
-            )
-        append_log(log_path, f"Using {version_output}")
-
-        source_stats_path = validation_dir / "source-stats.tsv"
-        shard_stats_path = validation_dir / "shard-stats.tsv"
-        shard_summary_path = validation_dir / "shard-summary.parquet"
-        record_multiset_path = validation_dir / "record-multiset.json"
-        run_to_file(
-            [
-                seqkit,
-                "stats",
-                "-j",
-                str(threads),
-                "--all",
-                "--tabular",
-                str(source_path),
-            ],
-            source_stats_path,
-            log_path,
-        )
-
-        import polars as pl
-
-        source_stats = pl.read_csv(source_stats_path, separator="\t")
-        if source_stats.height != 1:
-            raise ValueError(
-                f"Expected one source stats row, got {source_stats.height}"
-            )
-        source_num_seqs = int(source_stats.item(0, "num_seqs"))
-        source_sum_len = int(source_stats.item(0, "sum_len"))
-        if (
-            spec.expected_num_seqs is not None
-            and source_num_seqs != spec.expected_num_seqs
-        ):
-            raise ValueError(
-                f"{spec.database_id} sequence count {source_num_seqs} does not "
-                f"match expected {spec.expected_num_seqs}"
-            )
-        if (
-            spec.expected_sum_len is not None
-            and source_sum_len != spec.expected_sum_len
-        ):
-            raise ValueError(
-                f"{spec.database_id} residue count {source_sum_len} does not "
-                f"match expected {spec.expected_sum_len}"
-            )
-        scratch_free = shutil.disk_usage(SCRATCH_ROOT).free
-        scratch_required = required_ordinal_shuffler_scratch_bytes(
-            source_size,
-            source_num_seqs,
-        )
-        if scratch_free < scratch_required:
-            raise OSError(
-                f"Insufficient /tmp space for {spec.database_id}: need at least "
-                f"{scratch_required} bytes, found {scratch_free}"
-            )
-        append_log(
-            log_path,
-            f"Reserved scratch budget {scratch_required} bytes for local source "
-            "staging, shuffled FASTA, and occurrence index",
-        )
-        source_sha256 = sha256_file(source_path)
-
-        with tempfile.TemporaryDirectory(
-            prefix=f"af3-{spec.database_id}-",
-            dir=SCRATCH_ROOT,
-        ) as scratch_dir:
-            scratch_root = Path(scratch_dir)
-            staged_source_path, shuffled_path, recovery_metrics = _run_shuffle(
-                spec,
-                source_path,
-                scratch_root,
-                validation_dir,
-                log_path,
-                expected_records=source_num_seqs,
-                seqkit_threads=threads,
-            )
-            staged_verification = verify_file(
-                staged_source_path,
-                expected_size=source_size,
-                expected_sha256=source_sha256,
-            )
-            append_log(
-                log_path,
-                "Verified container-local staged source against the Volume "
-                f"source SHA-256 in {staged_verification.wall_seconds:.6f}s",
-            )
-            validator = compile_record_multiset_validator(scratch_root, log_path)
-            parallel_started = perf_counter()
-            with ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="af3-source-validator",
-            ) as source_validator_pool:
-                # The worker waits on native C; Python does not perform the scan.
-                source_future = source_validator_pool.submit(
-                    scan_record_multiset,
-                    validator,
-                    (staged_source_path,),
-                    scratch_root / "source-record-multiset.json",
-                    log_path,
-                    threads=1,
-                )
-                split_started = perf_counter()
-                shard_paths = _run_split(
-                    spec,
-                    shuffled_path,
-                    raw_shard_dir,
-                    shard_dir,
-                    log_path,
-                    seqkit_threads=threads,
-                )
-                split_seconds = perf_counter() - split_started
-                source_result = source_future.result() if source_future.done() else None
-                shard_result = scan_record_multiset(
-                    validator,
-                    shard_paths,
-                    scratch_root / "shard-record-multiset.json",
-                    log_path,
-                    threads=threads,
-                )
-                if source_result is None:
-                    source_result = source_future.result()
-            parallel_seconds = perf_counter() - parallel_started
-            record_multiset = finalize_record_multiset_validation(
-                source_result,
-                shard_result,
-                record_multiset_path,
-                execution={
-                    "strategy": "native-source-scan-overlaps-split-and-shard-scan-v1",
-                    "python_role": "subprocess-orchestration-only",
-                    "source_input": "sha256-verified-container-local-staged-copy",
-                    "staged_source_size_bytes": staged_verification.size_bytes,
-                    "staged_source_sha256": staged_verification.sha256,
-                    "staged_source_verification_seconds": (
-                        staged_verification.wall_seconds
-                    ),
-                    "split_seconds": split_seconds,
-                    "parallel_stage_wall_seconds": parallel_seconds,
-                },
-            )
-
-        run_to_file(
-            [
-                seqkit,
-                "stats",
-                "-j",
-                str(threads),
-                "--all",
-                "--tabular",
-                *(str(path) for path in shard_paths),
-            ],
-            shard_stats_path,
-            log_path,
-        )
-        statistics = _validate_statistics(
+        source, seqkit = _prepare_source_evidence(
             spec,
-            source_stats_path,
-            shard_stats_path,
-            shard_summary_path,
+            source_path,
+            validation_dir,
+            log_path,
+            seqkit_threads=threads,
         )
-        multiset_signature = record_multiset.get("signature")
-        if not isinstance(multiset_signature, dict):
-            raise TypeError("Record-multiset validation lost its signature")
-        if multiset_signature.get("records") != statistics["num_seqs"]:
-            raise ValueError("Record-multiset count does not match SeqKit statistics")
-        if multiset_signature.get("sequence_bytes") != statistics["sum_len"]:
-            raise ValueError(
-                "Record-multiset sequence bytes do not match SeqKit statistics"
-            )
-        signature_sha256 = record_multiset.get("signature_sha256")
-        if (
-            not isinstance(signature_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", signature_sha256) is None
-        ):
-            raise ValueError("Record-multiset signature SHA-256 is invalid")
+        shard_dir.mkdir(parents=True)
 
-        if recovery_metrics.get("temporary_namespace") is not None:
-            raise RuntimeError("Occurrence shuffling must not create recovery headers")
-        shard_records = [
-            artifact_record(shard_path, staging_root) for shard_path in shard_paths
-        ]
-        validation_records = [
-            artifact_record(staging_root / relative, staging_root)
-            for relative in VALIDATION_RELPATHS
-        ]
-        manifest: dict[str, object] = {
-            "schema_version": PROFILE_SCHEMA_VERSION,
-            "profile_id": spec.profile_id,
-            "database_id": spec.database_id,
-            "polymer": spec.polymer,
-            "created_at": utc_now(),
-            "generation_id": generation_id,
-            "source": {
-                "volume": SOURCE_DB_VOLUME_NAME,
-                "path": spec.source_filename,
-                "size_bytes": source_size,
-                "sha256": source_sha256,
-                "num_seqs": statistics["num_seqs"],
-                "sum_len": statistics["sum_len"],
-            },
-            "shard_count": spec.shard_count,
-            "shard_prefix": f"shards/{spec.source_filename}",
-            "shards": shard_records,
-            "search_space_value": (
-                statistics["num_seqs"]
-                if spec.polymer == "protein"
-                else statistics["sum_len"] / 1_000_000
-            ),
-            "search_space_unit": spec.search_space_unit,
-            "compatibility": {
-                "alphafold_repository": ALPHAFOLD3_REPOSITORY,
-                "alphafold_commit": ALPHAFOLD3_COMMIT,
-                "hmmer_version": HMMER_VERSION,
-                "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
-            },
-            "recipe": {
-                "version": COMPOSABLE_MULTISET_RECIPE_VERSION,
-                "seqkit_version": SEQKIT_VERSION,
-                "seqkit_threads": threads,
-                "random_seed": SHARD_RANDOM_SEED,
-                "shuffle": [
-                    "two-pass",
-                    "first-pass-stage-local-source",
-                    "source-occurrence-offset-index",
-                    "splitmix64-fisher-yates-u32",
-                    "bounded-concurrent-local-pread",
-                    "ordered-write",
-                ],
-                "shuffler": {
-                    "version": ORDINAL_SHUFFLER_VERSION,
-                    "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
-                    "record_identity": "source-occurrence",
-                    "offset_index": "uint64-source-occurrence-offsets-v1",
-                    "permutation": "splitmix64-fisher-yates-u32-v1",
-                    "staging": "first-pass-tee-to-container-local-v1",
-                    "read": "bounded-concurrent-local-pread-ordered-write-v2",
-                    "ordered_output": True,
-                },
-                "execution": {
-                    "worker_threads": threads,
-                    "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-                    "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
-                },
-                "duplicate_recovery": {
-                    "warning_source": None,
-                    "record_identity": "source-occurrence",
-                    "append_after_shuffle": False,
-                    "strip_after_split": False,
-                },
-                "record_multiset": record_multiset_identity()
-                | {"shard_threads": threads},
-                "split": ["--by-part", spec.shard_count],
-            },
-            "validation": {
-                "passed": True,
-                "num_seqs": statistics["num_seqs"],
-                "sum_len": statistics["sum_len"],
-                "maximum_residue_imbalance": statistics["maximum_residue_imbalance"],
-                "maximum_allowed_residue_imbalance": MAX_PROFILE_IMBALANCE,
-                "recovered_records": recovery_metrics["recovered_records"],
-                "recovered_residues": recovery_metrics["recovered_residues"],
-                "first_recovered_byte_offset": recovery_metrics["first_byte_offset"],
-                "last_recovered_byte_offset": recovery_metrics["last_byte_offset"],
-                "temporary_recovery_prefix_absent": True,
-                "record_occurrences_preserved": True,
-                "canonical_record_multiset_match": True,
-                "record_multiset_signature_sha256": signature_sha256,
-                "artifacts": validation_records,
-            },
-        }
-        validate_profile_manifest(cast(dict[str, Any], manifest), spec)
+        shards = _build_and_validate_shards(
+            spec,
+            source_path,
+            source,
+            raw_shard_dir,
+            shard_dir,
+            validation_dir,
+            log_path,
+            seqkit,
+            seqkit_threads=threads,
+        )
+
+        manifest = build_profile_manifest(
+            spec,
+            generation_id,
+            source,
+            shards,
+            staging_root,
+            seqkit_threads=threads,
+        )
 
         # Commit the payload before moving it into its immutable public path.
         runtime.sharded_volume.commit()
@@ -1442,15 +1520,15 @@ def build_profile(
             "generation_id": generation_id,
             "profile_path": str(published_root),
             "manifest_sha256": sha256_file(published_root / "manifest.json"),
-            "source_size_bytes": source_size,
-            "source_sha256": source_sha256,
-            "num_seqs": statistics["num_seqs"],
-            "sum_len": statistics["sum_len"],
+            "source_size_bytes": source.size_bytes,
+            "source_sha256": source.sha256,
+            "num_seqs": shards.statistics["num_seqs"],
+            "sum_len": shards.statistics["sum_len"],
             "search_space_value": manifest["search_space_value"],
             "search_space_unit": spec.search_space_unit,
-            "maximum_residue_imbalance": statistics["maximum_residue_imbalance"],
-            "recovered_records": recovery_metrics["recovered_records"],
-            "recovered_residues": recovery_metrics["recovered_residues"],
+            "maximum_residue_imbalance": shards.statistics["maximum_residue_imbalance"],
+            "recovered_records": shards.recovery_metrics["recovered_records"],
+            "recovered_residues": shards.recovery_metrics["recovered_residues"],
             **source_result,
         }
         _write_success_evidence(runtime, evidence_root, result)

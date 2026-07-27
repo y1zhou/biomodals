@@ -35,10 +35,7 @@ from typing import cast
 
 import modal
 import orjson
-from uniaf3.schema.alphafold3 import (
-    AF3Config,
-    AF3Template,
-)
+from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.config import AppConfig
 from biomodals.app.fold.alphafold3.artifacts import utc_now, write_json_atomic
@@ -51,17 +48,26 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     validate_af3_config,
     validate_inference_parameters,
 )
+from biomodals.app.fold.alphafold3.input_enrichment import (
+    apply_msa_resolution,
+    apply_template_results,
+    chain_msa_states,
+    fill_missing_msa_for_inference,
+    missing_raw_searches,
+    plan_template_searches,
+    reduce_msa_assembly_results,
+    reduce_template_cache_results,
+    validate_template_result,
+)
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
     SEARCH_MAX_PARALLEL_SHARDS,
     SEARCH_N_CPU,
-    ChainMsaState,
     MsaAssemblyTask,
     Polymer,
     RawSearchTask,
     SearchRuntime,
     assemble_and_publish_msas,
-    field_is_populated,
     inspect_raw_searches,
     plan_msa_resolution,
     run_database_search,
@@ -419,28 +425,6 @@ def _sharded_database_setup_plan(
     }
 
 
-def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
-    """Mark bare sequences as single-sequence inference inputs."""
-    for seq in conf.sequences:
-        if (protein := seq.protein) is not None:
-            if not field_is_populated(
-                protein.unpairedMsa,
-                protein.unpairedMsaPath,
-            ):
-                protein.unpairedMsa = ""
-            if not field_is_populated(
-                protein.pairedMsa,
-                protein.pairedMsaPath,
-            ):
-                protein.pairedMsa = ""
-            if not protein.templates:
-                protein.templates = []
-        elif (rna := seq.rna) is not None:
-            if not field_is_populated(rna.unpairedMsa, rna.unpairedMsaPath):
-                rna.unpairedMsa = ""
-    return conf
-
-
 ##########################################
 # MSA search functions
 ##########################################
@@ -654,42 +638,6 @@ def _validate_max_num_gpus(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
-def _chain_msa_states(conf: AF3Config) -> tuple[ChainMsaState, ...]:
-    """Describe caller-supplied MSA fields without sharing caller evidence."""
-    states: list[ChainMsaState] = []
-    for index, entry in enumerate(conf.sequences):
-        if (protein := entry.protein) is not None:
-            states.append(
-                ChainMsaState(
-                    chain_index=index,
-                    polymer="protein",
-                    sequence=protein.sequence,
-                    unpaired_present=field_is_populated(
-                        protein.unpairedMsa,
-                        protein.unpairedMsaPath,
-                    ),
-                    paired_present=field_is_populated(
-                        protein.pairedMsa,
-                        protein.pairedMsaPath,
-                    ),
-                )
-            )
-        elif (rna := entry.rna) is not None:
-            states.append(
-                ChainMsaState(
-                    chain_index=index,
-                    polymer="rna",
-                    sequence=rna.sequence,
-                    unpaired_present=field_is_populated(
-                        rna.unpairedMsa,
-                        rna.unpairedMsaPath,
-                    ),
-                    paired_present=False,
-                )
-            )
-    return tuple(states)
-
-
 def _remote_search_outcome(
     task: RawSearchTask,
 ) -> dict[str, object] | Exception:
@@ -730,100 +678,6 @@ def _remote_template_outcome(
         return exc
 
 
-def _resolved_msa_text(
-    inline_value: str | None,
-    path_value: str | None,
-    *,
-    field_name: str,
-) -> str:
-    """Read one resolved MSA field for downstream template search."""
-    if inline_value and path_value:
-        raise ValueError(f"{field_name} cannot set both inline and path forms")
-    if inline_value:
-        return inline_value
-    if path_value:
-        value = Path(path_value).read_text()
-        if not value:
-            raise ValueError(f"{field_name} path is empty: {path_value}")
-        return value
-    raise ValueError(f"{field_name} is unresolved")
-
-
-def _plan_template_tasks(
-    conf: AF3Config,
-    states: tuple[ChainMsaState, ...],
-    canonical_combined_sequences: set[tuple[Polymer, str]],
-) -> tuple[tuple[TemplateTask, ...], dict[str, tuple[int, ...]]]:
-    """Deduplicate missing templates without publishing caller MSA evidence."""
-    tasks: dict[str, TemplateTask] = {}
-    chain_indices: dict[str, list[int]] = {}
-    for state in states:
-        if state.polymer != "protein":
-            continue
-        protein = conf.sequences[state.chain_index].protein
-        if protein is None:
-            raise RuntimeError("Protein MSA state no longer matches its chain")
-        if protein.templates:
-            continue
-        unpaired_msa = _resolved_msa_text(
-            protein.unpairedMsa,
-            protein.unpairedMsaPath,
-            field_name=f"sequences[{state.chain_index}].protein.unpairedMsa",
-        )
-        publish_canonical = (
-            not state.unpaired_present
-            and ("protein", state.sequence) in canonical_combined_sequences
-        )
-        candidate = TemplateTask(
-            sequence=state.sequence,
-            unpaired_msa=unpaired_msa,
-            publish_canonical=publish_canonical,
-        )
-        identity = candidate.template_identity
-        if existing := tasks.get(identity):
-            if (
-                existing.sequence != candidate.sequence
-                or existing.unpaired_msa != candidate.unpaired_msa
-            ):
-                raise RuntimeError("Protein template identity collision")
-            if publish_canonical and not existing.publish_canonical:
-                tasks[identity] = TemplateTask(
-                    sequence=existing.sequence,
-                    unpaired_msa=existing.unpaired_msa,
-                    publish_canonical=True,
-                    max_template_date=existing.max_template_date,
-                )
-        else:
-            tasks[identity] = candidate
-        chain_indices.setdefault(identity, []).append(state.chain_index)
-    return (
-        tuple(tasks.values()),
-        {identity: tuple(indices) for identity, indices in chain_indices.items()},
-    )
-
-
-def _validated_template_result(
-    task: TemplateTask,
-    outcome: dict[str, object],
-    *,
-    allowed_statuses: frozenset[str],
-) -> tuple[AF3Template, ...]:
-    """Validate a cache or worker result before applying it to input chains."""
-    if (
-        outcome.get("status") not in allowed_statuses
-        or outcome.get("sequence_sha256") != sequence_hash(task.sequence)
-        or outcome.get("unpaired_msa_sha256") != task.unpaired_msa_sha256
-        or outcome.get("template_identity") != task.template_identity
-    ):
-        raise RuntimeError(f"Invalid protein template result: {outcome!r}")
-    raw_templates = outcome.get("templates")
-    if not isinstance(raw_templates, list) or not all(
-        isinstance(template, dict) for template in raw_templates
-    ):
-        raise RuntimeError(f"Invalid protein template payload: {outcome!r}")
-    return tuple(AF3Template.model_validate(template) for template in raw_templates)
-
-
 def search_msa_and_templates(
     config: AF3Config | str | Path,
     *,
@@ -839,24 +693,13 @@ def search_msa_and_templates(
         else AF3Config.from_file(config)
     )
     if not search_msa:
-        return validate_af3_config(_fill_missing_msa_for_inference(conf))
+        return validate_af3_config(fill_missing_msa_for_inference(conf))
 
-    states = _chain_msa_states(conf)
+    states = chain_msa_states(conf)
     plan = plan_msa_resolution(states)
     raw_inputs = [(task.database_id, task.sequence) for task in plan.raw_searches]
     cache_statuses = inspect_msa_search_cache.remote(raw_inputs) if raw_inputs else []
-    if len(cache_statuses) != len(plan.raw_searches):
-        raise RuntimeError("MSA cache inspection returned the wrong result count")
-    missing_raw: list[RawSearchTask] = []
-    for task, status in zip(plan.raw_searches, cache_statuses, strict=True):
-        if (
-            status.get("database_id") != task.database_id
-            or status.get("sequence_sha256") != task.sequence_hash
-            or status.get("status") not in {"missing", "reused"}
-        ):
-            raise RuntimeError(f"Invalid MSA cache inspection result: {status}")
-        if status["status"] == "missing":
-            missing_raw.append(task)
+    missing_raw = missing_raw_searches(plan.raw_searches, cache_statuses)
 
     print(
         "🧬 Sharded MSA search plan: "
@@ -915,75 +758,26 @@ def search_msa_and_templates(
             f"reusable: {assembly_failures}"
         )
 
-    assembly_by_sequence: dict[tuple[Polymer, str], dict[str, str]] = {}
-    canonical_combined_sequences: set[tuple[Polymer, str]] = set()
-    for task, outcome in zip(plan.assemblies, assembly_outcomes, strict=True):
-        if not isinstance(outcome, dict):
-            raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
-        status = outcome.get("status")
-        if (
-            status not in {"published", "reused", "request-local"}
-            or outcome.get("polymer") != task.polymer
-            or outcome.get("sequence_sha256") != sequence_hash(task.sequence)
-        ):
-            raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
-        raw_fields = outcome.get("fields")
-        if not isinstance(raw_fields, dict):
-            raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
-        expected_fields = {
-            field
-            for field, include in (
-                ("unpairedMsa", task.include_unpaired),
-                ("pairedMsa", task.include_paired),
-            )
-            if include
-        }
-        if set(raw_fields) != expected_fields:
-            raise RuntimeError(f"Invalid MSA assembly fields: {raw_fields!r}")
-        fields: dict[str, str] = {}
-        for field, value in raw_fields.items():
-            if not isinstance(field, str) or not isinstance(value, str) or not value:
-                raise RuntimeError(f"Invalid MSA assembly fields: {raw_fields!r}")
-            fields[field] = value
-        if status in {"published", "reused"}:
-            combined_identity = outcome.get("combined_identity")
-            if (
-                not isinstance(combined_identity, str)
-                or len(combined_identity) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in combined_identity
-                )
-            ):
-                raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
-            canonical_combined_sequences.add((task.polymer, task.sequence))
-        assembly_by_sequence[(task.polymer, task.sequence)] = fields
-
-    for state in states:
-        fields = assembly_by_sequence.get((state.polymer, state.sequence), {})
-        entry = conf.sequences[state.chain_index]
-        if (protein := entry.protein) is not None:
-            if not state.unpaired_present:
-                protein.unpairedMsa = fields["unpairedMsa"]
-                protein.unpairedMsaPath = None
-            if not state.paired_present:
-                protein.pairedMsa = fields["pairedMsa"]
-                protein.pairedMsaPath = None
-            if not search_protein_templates and not protein.templates:
-                protein.templates = []
-        elif (rna := entry.rna) is not None and not state.unpaired_present:
-            rna.unpairedMsa = fields["unpairedMsa"]
-            rna.unpairedMsaPath = None
+    assembly_resolution = reduce_msa_assembly_results(
+        plan.assemblies,
+        tuple(outcome for outcome in assembly_outcomes if isinstance(outcome, dict)),
+    )
+    apply_msa_resolution(
+        conf,
+        states,
+        assembly_resolution,
+        search_protein_templates=search_protein_templates,
+    )
 
     if not search_protein_templates:
         return validate_af3_config(conf)
 
-    template_tasks, template_chain_indices = _plan_template_tasks(
+    template_plan = plan_template_searches(
         conf,
         states,
-        canonical_combined_sequences,
+        assembly_resolution.canonical_sequences,
     )
-    canonical_tasks = tuple(task for task in template_tasks if task.publish_canonical)
+    canonical_tasks = template_plan.canonical_tasks
     cache_inputs = [
         (
             task.sequence,
@@ -995,37 +789,14 @@ def search_msa_and_templates(
     template_statuses = (
         inspect_protein_template_cache.remote(cache_inputs) if cache_inputs else []
     )
-    if len(template_statuses) != len(canonical_tasks):
-        raise RuntimeError(
-            "Protein template cache inspection returned the wrong result count"
-        )
-
-    templates_by_identity: dict[str, tuple[AF3Template, ...]] = {}
-    missing_canonical: list[TemplateTask] = []
-    for task, status in zip(
+    cache_resolution = reduce_template_cache_results(
         canonical_tasks,
         template_statuses,
-        strict=True,
-    ):
-        if status.get("status") == "missing":
-            if (
-                status.get("sequence_sha256") != sequence_hash(task.sequence)
-                or status.get("unpaired_msa_sha256") != task.unpaired_msa_sha256
-                or status.get("template_identity") != task.template_identity
-            ):
-                raise RuntimeError(f"Invalid protein template cache result: {status!r}")
-            missing_canonical.append(task)
-        else:
-            templates_by_identity[task.template_identity] = _validated_template_result(
-                task,
-                status,
-                allowed_statuses=frozenset({"reused"}),
-            )
-
-    request_local_tasks = tuple(
-        task for task in template_tasks if not task.publish_canonical
     )
-    worker_tasks = tuple(missing_canonical) + request_local_tasks
+    templates_by_identity = cache_resolution.templates_by_identity
+    missing_canonical = cache_resolution.missing_tasks
+    request_local_tasks = template_plan.request_local_tasks
+    worker_tasks = missing_canonical + request_local_tasks
     print(
         "🧬 Protein template search plan: "
         f"{len(canonical_tasks) - len(missing_canonical)} cached, "
@@ -1049,49 +820,35 @@ def search_msa_and_templates(
                 "message": str(outcome),
             })
             continue
-        if not isinstance(outcome, dict):
-            error = RuntimeError(f"Invalid protein template result: {outcome!r}")
+        try:
+            if not isinstance(outcome, dict):
+                raise RuntimeError(f"Invalid protein template result: {outcome!r}")
+            templates_by_identity[task.template_identity] = validate_template_result(
+                task,
+                outcome,
+                allowed_statuses=(
+                    frozenset({"published", "reused"})
+                    if task.publish_canonical
+                    else frozenset({"request-local"})
+                ),
+            )
+        except Exception as error:
+            template_failures.append({
+                "sequence_sha256": sequence_hash(task.sequence),
+                "unpaired_msa_sha256": task.unpaired_msa_sha256,
+                "publish_canonical": task.publish_canonical,
+                "error_type": type(error).__name__,
+                "message": str(error),
+            })
         else:
-            try:
-                templates_by_identity[task.template_identity] = (
-                    _validated_template_result(
-                        task,
-                        outcome,
-                        allowed_statuses=(
-                            frozenset({"published", "reused"})
-                            if task.publish_canonical
-                            else frozenset({"request-local"})
-                        ),
-                    )
-                )
-            except Exception as exc:
-                error = exc
-            else:
-                continue
-        template_failures.append({
-            "sequence_sha256": sequence_hash(task.sequence),
-            "unpaired_msa_sha256": task.unpaired_msa_sha256,
-            "publish_canonical": task.publish_canonical,
-            "error_type": type(error).__name__,
-            "message": str(error),
-        })
+            continue
     if template_failures:
         raise RuntimeError(
             "Incomplete protein template tasks; completed canonical results "
             f"remain reusable: {template_failures}"
         )
 
-    for identity, chain_indices in template_chain_indices.items():
-        templates = templates_by_identity.get(identity)
-        if templates is None:
-            raise RuntimeError(f"Protein template task produced no result: {identity}")
-        for chain_index in chain_indices:
-            protein = conf.sequences[chain_index].protein
-            if protein is None:
-                raise RuntimeError("Protein template plan no longer matches its chain")
-            protein.templates = [
-                template.model_copy(deep=True) for template in templates
-            ]
+    apply_template_results(conf, template_plan, templates_by_identity)
     return validate_af3_config(conf)
 
 
@@ -1206,7 +963,7 @@ def run_inference_pipeline(
         conf = base_conf.model_copy(deep=True)
         conf.name = canonical_name
         conf.modelSeeds = list(seeds)
-        conf = _fill_missing_msa_for_inference(conf)
+        conf = fill_missing_msa_for_inference(conf)
         input_json_path = worker_root / "input.json"
         input_json_path.write_bytes(serialize_af3_input(conf))
         print(f"💊 Running inference for {canonical_name} with seeds {list(seeds)}")
@@ -1305,17 +1062,6 @@ def finalize_inference_request(
     )
 
 
-def _claimed_seed_record(item: ClaimedSeed) -> dict[str, object]:
-    return {
-        "seed": item.seed,
-        "claim": {
-            "scope_key": item.claim.scope_key,
-            "generation_id": item.claim.generation_id,
-            "owner": item.claim.owner,
-        },
-    }
-
-
 def _completed_seed_set(
     run_id: str,
     seeds: tuple[int, ...],
@@ -1358,7 +1104,7 @@ def _run_claimed_seed_batches(
                 prepared.run_id,
                 recycle,
                 sample,
-                [_claimed_seed_record(item) for item in batch],
+                [item.to_dict() for item in batch],
             ),
             batch,
         )

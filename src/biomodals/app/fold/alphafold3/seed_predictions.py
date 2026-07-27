@@ -146,6 +146,17 @@ class ClaimedSeed:
     seed: int
     claim: GenerationClaim
 
+    def to_dict(self) -> dict[str, object]:
+        """Return the Modal-serializable claim record."""
+        return {
+            "seed": self.seed,
+            "claim": {
+                "scope_key": self.claim.scope_key,
+                "generation_id": self.claim.generation_id,
+                "owner": self.claim.owner,
+            },
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ActiveSeed:
@@ -167,17 +178,7 @@ class SeedClaimPlan:
         """Return a Modal-serializable claim plan."""
         return {
             "reused_seeds": list(self.reused_seeds),
-            "owned": [
-                {
-                    "seed": item.seed,
-                    "claim": {
-                        "scope_key": item.claim.scope_key,
-                        "generation_id": item.claim.generation_id,
-                        "owner": item.claim.owner,
-                    },
-                }
-                for item in self.owned
-            ],
+            "owned": [item.to_dict() for item in self.owned],
             "active": [
                 {
                     "seed": item.seed,

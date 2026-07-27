@@ -8,7 +8,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import orjson
 import pytest
@@ -30,6 +30,12 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     hash_sequences,
     serialize_af3_input,
 )
+from biomodals.app.fold.alphafold3.input_enrichment import (
+    apply_msa_resolution,
+    chain_msa_states,
+    plan_template_searches,
+    reduce_msa_assembly_results,
+)
 from biomodals.app.fold.alphafold3.msa_search import (
     RAW_RESULT_SCHEMA_VERSION,
     ChainMsaState,
@@ -42,6 +48,9 @@ from biomodals.app.fold.alphafold3.msa_search import (
     sequence_hash,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
+    ShardBuildEvidence,
+    SourceProfileEvidence,
+    build_profile_manifest,
     plan_missing_profile_builds,
     validate_profile_manifest,
 )
@@ -252,6 +261,56 @@ def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
         validate_profile_manifest(manifest, resolve_database_profile("small_bfd"))
 
 
+def test_profile_manifest_builder_preserves_the_fixed_recipe(tmp_path: Path) -> None:
+    spec = resolve_database_profile("small_bfd")
+    staging_root = tmp_path / "profile"
+    for name in shard_names(spec):
+        path = staging_root / "shards" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"shard")
+    for relative in VALIDATION_RELPATHS:
+        path = staging_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"validation")
+    source = SourceProfileEvidence(
+        size_bytes=1,
+        sha256="a" * 64,
+        num_seqs=spec.expected_num_seqs or 1,
+        stats_path=staging_root / "validation" / "source-stats.tsv",
+    )
+    shards = ShardBuildEvidence(
+        shard_paths=tuple(staging_root / "shards" / name for name in shard_names(spec)),
+        statistics={
+            "num_seqs": spec.expected_num_seqs or 1,
+            "sum_len": spec.expected_sum_len or 1,
+            "maximum_residue_imbalance": 0.01,
+        },
+        recovery_metrics={
+            "recovered_records": 0,
+            "recovered_residues": 0,
+            "first_byte_offset": None,
+            "last_byte_offset": None,
+            "temporary_namespace": None,
+        },
+        record_multiset_signature_sha256="b" * 64,
+    )
+
+    manifest = build_profile_manifest(
+        spec,
+        "generation",
+        source,
+        shards,
+        staging_root,
+        seqkit_threads=8,
+    )
+
+    validate_profile_manifest(manifest, spec)
+    recipe = cast(dict[str, object], manifest["recipe"])
+    validation = cast(dict[str, object], manifest["validation"])
+    assert recipe["version"] == COMPOSABLE_MULTISET_RECIPE_VERSION
+    assert validation["canonical_record_multiset_match"] is True
+
+
 def test_msa_resolution_deduplicates_queries_across_input_chains() -> None:
     sequence = "ACDEFG"
     plan = plan_msa_resolution((
@@ -299,6 +358,50 @@ def test_msa_resolution_deduplicates_queries_across_input_chains() -> None:
         ("protein", sequence, True, True),
         ("rna", "ACGU", True, False),
     ]
+
+
+def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
+    config = AF3Config(
+        name="homodimer",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+            AF3SequenceEntry(protein=AF3Protein(id="B", sequence="ACDE")),
+        ],
+    )
+    states = chain_msa_states(config)
+    assembly_task = plan_msa_resolution(states).assemblies[0]
+    resolution = reduce_msa_assembly_results(
+        (assembly_task,),
+        (
+            {
+                "status": "published",
+                "polymer": "protein",
+                "sequence_sha256": sequence_hash("ACDE"),
+                "combined_identity": "c" * 64,
+                "fields": {
+                    "unpairedMsa": ">query\nACDE\n",
+                    "pairedMsa": ">query\nACDE\n",
+                },
+            },
+        ),
+    )
+
+    apply_msa_resolution(
+        config,
+        states,
+        resolution,
+        search_protein_templates=True,
+    )
+    template_plan = plan_template_searches(
+        config, states, resolution.canonical_sequences
+    )
+
+    assert len(template_plan.tasks) == 1
+    assert template_plan.tasks[0].publish_canonical is True
+    assert template_plan.chain_indices_by_identity == {
+        template_plan.tasks[0].template_identity: (0, 1)
+    }
 
 
 def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
@@ -381,7 +484,6 @@ def test_raw_msa_cache_requires_a_valid_completion_marker(tmp_path: Path) -> Non
         sequence="ACDE",
         sequence_hash=sequence_hash("ACDE"),
         profile_root=tmp_path / "profile",
-        manifest_sha256="a" * 64,
         search_identity="b" * 64,
         provenance=provenance,
         result_root=result_root,

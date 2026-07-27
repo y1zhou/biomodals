@@ -28,6 +28,10 @@ from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
     RawSearchTask,
 )
+from biomodals.app.fold.alphafold3.profile_builder import (
+    plan_missing_profile_builds,
+)
+from biomodals.app.fold.alphafold3.profiles import profile_build_slot_budget
 from biomodals.app.fold.alphafold3.search_pipeline import SearchExecutor
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
@@ -37,6 +41,68 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
 from biomodals.helper.task_budget import bounded_map
+
+
+def execute_profile_setup(
+    inspect_function: modal.Function,
+    build_function: modal.Function,
+    finalize_function: modal.Function,
+    *,
+    seqkit_threads: int,
+    source_policy: str,
+) -> dict[str, object]:
+    """Build all missing profiles concurrently, then finalize their registry."""
+    print("🧬 Inspecting fixed sharded database profiles...")
+    inventory = inspect_function.remote()
+    inputs = plan_missing_profile_builds(
+        inventory,
+        seqkit_threads,
+        source_policy,
+    )
+    missing = [database_id for database_id, _, _ in inputs]
+    budget = profile_build_slot_budget(len(inputs), seqkit_threads)
+    print(
+        "🧬 Effective profile-build fanout: "
+        f"{budget['builder_containers']} containers, "
+        f"{budget['maximum_effective_worker_slots']} configured worker slots."
+    )
+
+    results: list[dict[str, object] | BaseException] = []
+    if missing:
+        print(
+            "🧬 Submitting missing database profiles concurrently: "
+            f"{', '.join(missing)}"
+        )
+        results = list(
+            build_function.starmap(
+                inputs,
+                return_exceptions=True,
+            )
+        )
+        failures = [
+            {
+                "database_id": database_id,
+                "error_type": type(result).__name__,
+                "message": str(result),
+            }
+            for database_id, result in zip(missing, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise RuntimeError(
+                "One or more sharded database builders failed after all "
+                f"submitted builders completed: {failures}"
+            )
+    else:
+        print("🧬 All fixed profiles are already valid; no builders submitted.")
+
+    print("🧬 Running final inventory and workspace cleanup...")
+    return {
+        "status": "complete",
+        "initial_inventory": inventory,
+        "builder_results": results,
+        "final_inventory": finalize_function.remote(),
+    }
 
 
 def _bounded_remote_outcomes[TaskT](

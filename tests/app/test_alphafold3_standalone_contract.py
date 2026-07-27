@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103
 
+import ast
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -21,16 +23,69 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 from biomodals.app.fold.alphafold3.modal_adapters import (
     ModalInferenceExecutor,
     ModalSearchExecutor,
+    execute_profile_setup,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
     RawSearchTask,
 )
+from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     SeedClaimPlan,
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
+
+
+def test_app_public_functions_are_modal_endpoints() -> None:
+    tree = ast.parse(inspect.getsource(alphafold3_app))
+    violations: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+            continue
+        decorator_names = {
+            decorator.func.attr
+            for decorator in node.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and isinstance(decorator.func.value, ast.Name)
+            and decorator.func.value.id == "app"
+        }
+        if not decorator_names.intersection({"function", "local_entrypoint"}):
+            violations.append(node.name)
+    assert violations == []
+
+
+def test_profile_setup_adapter_fans_out_missing_profiles() -> None:
+    spec = DATABASE_PROFILE_SPECS[0]
+    inventory: dict[str, object] = {
+        "invalid_profiles": {},
+        "missing_database_ids": [spec.database_id],
+    }
+    build_result = {"database_id": spec.database_id, "status": "published"}
+    final_inventory = {"missing_database_ids": []}
+    inspect_remote = Mock(return_value=inventory)
+    build_starmap = Mock(return_value=[build_result])
+    finalize_remote = Mock(return_value=final_inventory)
+
+    result = execute_profile_setup(
+        SimpleNamespace(remote=inspect_remote),
+        SimpleNamespace(starmap=build_starmap),
+        SimpleNamespace(remote=finalize_remote),
+        seqkit_threads=8,
+        source_policy="keep",
+    )
+
+    assert result == {
+        "status": "complete",
+        "initial_inventory": inventory,
+        "builder_results": [build_result],
+        "final_inventory": final_inventory,
+    }
+    build_starmap.assert_called_once_with(
+        ((spec.database_id, 8, "keep"),),
+        return_exceptions=True,
+    )
 
 
 def test_modal_search_executor_marshals_remote_fanout(

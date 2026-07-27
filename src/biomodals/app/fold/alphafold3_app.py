@@ -28,7 +28,6 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 import os
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import cast
 
 import modal
 import orjson
@@ -48,6 +47,7 @@ from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_pre
 from biomodals.app.fold.alphafold3.modal_adapters import (
     ModalInferenceExecutor,
     ModalSearchExecutor,
+    execute_profile_setup,
     stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
@@ -65,7 +65,6 @@ from biomodals.app.fold.alphafold3.profile_builder import (
     build_profile,
     finalize_profile_setup,
     inspect_profile_registry,
-    plan_missing_profile_builds,
 )
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
@@ -80,12 +79,12 @@ from biomodals.app.fold.alphafold3.profiles import (
     SHARDED_DB_VOLUME_NAME,
     SourcePolicy,
     plan_profile_setup,
-    profile_build_slot_budget,
 )
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     create_request_archive,
     publish_request_results,
+    request_manifest_from_result,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
     resolve_msa_and_templates,
@@ -742,58 +741,13 @@ def setup_sharded_databases(
         print("🧬 Plan only; no Modal function was submitted.")
         return
 
-    print("🧬 Inspecting fixed sharded database profiles...")
-    inventory = inspect_sharded_database_profiles.remote()
-    inputs = plan_missing_profile_builds(
-        inventory,
-        seqkit_threads,
-        source_policy,
+    summary = execute_profile_setup(
+        inspect_sharded_database_profiles,
+        build_sharded_database,
+        finalize_sharded_database_setup,
+        seqkit_threads=seqkit_threads,
+        source_policy=source_policy,
     )
-    missing = [database_id for database_id, _, _ in inputs]
-    budget = profile_build_slot_budget(len(inputs), seqkit_threads)
-    print(
-        "🧬 Effective profile-build fanout: "
-        f"{budget['builder_containers']} containers, "
-        f"{budget['maximum_effective_worker_slots']} configured worker slots."
-    )
-
-    results: list[dict[str, object] | BaseException] = []
-    if missing:
-        print(
-            "🧬 Submitting missing database profiles concurrently: "
-            f"{', '.join(missing)}"
-        )
-        results = list(
-            build_sharded_database.starmap(
-                inputs,
-                return_exceptions=True,
-            )
-        )
-        failures = [
-            {
-                "database_id": database_id,
-                "error_type": type(result).__name__,
-                "message": str(result),
-            }
-            for database_id, result in zip(missing, results, strict=True)
-            if isinstance(result, BaseException)
-        ]
-        if failures:
-            raise RuntimeError(
-                "One or more sharded database builders failed after all "
-                f"submitted builders completed: {failures}"
-            )
-    else:
-        print("🧬 All fixed profiles are already valid; no builders submitted.")
-
-    print("🧬 Running final inventory and workspace cleanup...")
-    final_inventory = finalize_sharded_database_setup.remote()
-    summary = {
-        "status": "complete",
-        "initial_inventory": inventory,
-        "builder_results": results,
-        "final_inventory": final_inventory,
-    }
     print(
         orjson.dumps(
             summary,
@@ -883,14 +837,9 @@ def submit_alphafold3_task(
         sample,
         num_containers,
     )
-    request_manifest = result.get("request")
-    if not isinstance(request_manifest, dict):
-        raise RuntimeError(
-            f"AlphaFold3 request publication returned invalid metadata: {result!r}"
-        )
     archive_path = create_request_archive(
         CONF.output_volume,
-        cast(dict[str, object], request_manifest),
+        request_manifest_from_result(result),
         output_dir=resolve_local_output_dir(out_dir),
         display_name=run_name,
     )

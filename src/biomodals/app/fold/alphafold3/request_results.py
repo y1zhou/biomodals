@@ -69,6 +69,18 @@ class RequestPublication:
     published_seeds: tuple[int, ...]
 
 
+def request_manifest_from_result(value: object) -> dict[str, object]:
+    """Extract a request manifest from the inference coordinator result."""
+    if not isinstance(value, dict) or not isinstance(
+        request := value.get("request"),
+        dict,
+    ):
+        raise RuntimeError(
+            f"AlphaFold3 request publication returned invalid metadata: {value!r}"
+        )
+    return cast(dict[str, object], request)
+
+
 def _validate_seed_tuple(
     value: tuple[int, ...],
     *,

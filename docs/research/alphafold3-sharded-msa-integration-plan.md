@@ -770,8 +770,10 @@ Status: implemented locally; no production Modal work submitted.
 
 The fixed contracts live in `alphafold3/profiles.py`, and the mature
 Modal-independent construction path lives in
-`alphafold3/profile_builder.py`. The production app binds that builder to
-Modal; the temporary app no longer exists.
+`alphafold3/profile_builder.py`. Immutable manifest parsing and publication
+validation live in `alphafold3/profile_manifest.py`, so runtime search does not
+depend on builder internals. The production app binds the builder to Modal; the
+temporary app no longer exists.
 
 The production `setup_sharded_databases` entrypoint is plan-only unless
 `submit=true`. On submission it performs one lightweight manifest/artifact-size
@@ -808,12 +810,14 @@ Status: implemented; the two-chain protein production search passed on
 
 The mature scientific adapter and append-only generation-claim protocol now
 live in `alphafold3/msa_search.py` and `alphafold3/generation_claims.py`.
-The production app calls the shared Jackhmmer/Nhmmer execution, corrected RNA
-merge, and pinned assembly functions. It first performs one lightweight
-marker inspection, then spends the request-wide budget only on missing unique
-sequence-by-database searches. A complete canonical protein/RNA assembly is
-published with `combined.done.json` last; mixed caller/generated fields remain
-request-local.
+Request-level phase ordering, cache reconciliation, and failure policy live
+behind the executor interface in `alphafold3/search_pipeline.py`; the
+production app supplies the Modal adapter. It calls the shared
+Jackhmmer/Nhmmer execution, corrected RNA merge, and pinned assembly functions.
+The coordinator first performs one lightweight marker inspection, then spends
+the request-wide budget only on missing unique sequence-by-database searches.
+A complete canonical protein/RNA assembly is published with
+`combined.done.json` last; mixed caller/generated fields remain request-local.
 
 ### 5. Separate and resume template search
 
@@ -904,10 +908,13 @@ seed reuse passed on 2026-07-27.
 - add deterministic global rankings and a serialized accumulated summary.
 
 The durable inference boundary now lives in
-`alphafold3/seed_predictions.py`. A lightweight coordinator trusts matching
-seed markers without rescanning their artifacts, atomically claims only
-unmarked `(run_id, seed)` work, and partitions owned seeds into disjoint,
-balanced GPU-worker lists. Thus overlapping requests such as
+`alphafold3/seed_predictions.py`. Request-level reconciliation, active-owner
+waiting, summary rebuilding, and request publication live behind the executor
+interface in `alphafold3/inference_pipeline.py`; the production app supplies
+the Modal spawn/poll adapter. The coordinator trusts matching seed markers
+without rescanning their artifacts, atomically claims only unmarked
+`(run_id, seed)` work, and partitions owned seeds into disjoint, balanced
+GPU-worker lists. Thus overlapping requests such as
 `[1, ..., 20, 8080, ..., 8090]` reuse the first marked seeds and schedule only
 the missing suffix.
 

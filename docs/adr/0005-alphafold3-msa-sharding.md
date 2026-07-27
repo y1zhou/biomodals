@@ -57,17 +57,24 @@ pin change requires comparison against the new source before its results can
 reuse these scientific cache paths.
 
 Production code lives under `src/biomodals/app/fold/alphafold3/`.
-`artifacts.py` owns canonical JSON, digests, and atomic publication primitives.
+`artifacts.py` owns canonical JSON, digests, atomic publication, durable
+operation logging, and the shared Modal Volume persistence interfaces.
 `sharding.py` owns the pinned native source assets, compilation, execution,
 record-multiset parsing, scratch sizing, and staged-file verification.
-`profiles.py` owns fixed production identities, while `profile_builder.py`
-owns construction, validation, claims, source policy, and cleanup.
+`profiles.py` owns fixed production identities, `profile_manifest.py` owns the
+immutable manifest and publication contract, and `profile_builder.py` owns
+construction, source policy, and cleanup. Profile preparation, MSA search,
+template search, and inference all use the append-only protocol in
+`generation_claims.py`; old profile-owner records are adapted in place.
 
-The remaining modules separate search planning and assembly, template search,
-input enrichment, inference identity, seed publication, and request retrieval.
-`alphafold3_app.py` binds those pure production modules to Modal resources and
-exposes only the three supported lifecycle components: one-time profile
-preparation, resumable MSA/template search, and AlphaFold inference.
+`search_pipeline.py` and `inference_pipeline.py` own request-level
+reconciliation behind narrow executor interfaces. The remaining modules
+separate scientific search and assembly, template search, input enrichment,
+inference identity, seed publication, and request retrieval.
+`alphafold3_app.py` is the composition root: it binds these production modules
+to Modal resources and exposes only the three supported lifecycle components:
+one-time profile preparation, resumable MSA/template search, and AlphaFold
+inference.
 
 The temporary MSA app and benchmark campaign code were retired after the
 protein and RNA scientific gates passed. Historical measurements and oracle

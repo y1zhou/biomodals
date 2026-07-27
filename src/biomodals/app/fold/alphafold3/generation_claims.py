@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from time import time
 from typing import Protocol, cast
 
-from biomodals.app.fold.alphafold3.sharding import utc_now
+from biomodals.app.fold.alphafold3.artifacts import utc_now
 
 _TERMINAL_STATUSES = frozenset({"complete", "failed", "abandoned"})
 

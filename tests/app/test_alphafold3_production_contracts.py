@@ -14,6 +14,12 @@ import orjson
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    artifact_record,
+    load_artifact_bytes,
+    validate_artifact_record,
+    write_bytes_atomic,
+)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     acquire_generation_claim,
@@ -85,6 +91,19 @@ def _artifact(path: str, content: bytes = b"x") -> dict[str, object]:
         "size_bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
+
+
+def test_durable_artifact_helpers_detect_changed_bytes(tmp_path: Path) -> None:
+    payload_path = tmp_path / "nested" / "payload.txt"
+    write_bytes_atomic(payload_path, b"expected")
+    record = artifact_record(payload_path, tmp_path)
+
+    assert load_artifact_bytes(tmp_path, record, "nested/payload.txt") == b"expected"
+    assert validate_artifact_record(tmp_path, record) == record
+
+    payload_path.write_bytes(b"changed!")
+    assert load_artifact_bytes(tmp_path, record, "nested/payload.txt") is None
+    assert validate_artifact_record(tmp_path, record) is None
 
 
 def _profile_manifest(database_id: str) -> dict[str, Any]:

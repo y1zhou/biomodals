@@ -6,7 +6,6 @@ Modal decorators and named resources remain in the app composition roots.
 
 from __future__ import annotations
 
-import hashlib
 import heapq
 import inspect
 import itertools
@@ -23,6 +22,18 @@ from typing import Any, Literal, Protocol, cast
 
 import orjson
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    load_json_object,
+    require_regular_file,
+    sha256_bytes,
+    sha256_file,
+    utc_now,
+    write_bytes_atomic,
+    write_json_atomic,
+)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -43,14 +54,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     resolve_database_profile,
     shard_names,
 )
-from biomodals.app.fold.alphafold3.sharding import (
-    append_log,
-    load_json_object,
-    require_regular_file,
-    sha256_file,
-    utc_now,
-    write_json_atomic,
-)
+from biomodals.app.fold.alphafold3.sharding import append_log
 
 Polymer = Literal["protein", "rna"]
 
@@ -81,8 +85,6 @@ SEARCH_MAX_PARALLEL_SHARDS = 16
 PROTEIN_UNPAIRED_DATABASES = ("uniref90", "small_bfd", "mgnify")
 PROTEIN_PAIRED_DATABASES = ("uniprot",)
 RNA_UNPAIRED_DATABASES = ("rfam", "rnacentral", "ntrna")
-
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
 class VolumeHandle(Protocol):
@@ -201,19 +203,11 @@ class RawMsaEntry:
         }
 
 
-def _json_bytes(value: object) -> bytes:
-    return orjson.dumps(value, option=_JSON_OPTIONS)
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
 def sequence_hash(sequence: str) -> str:
     """Hash sequence text only for the shared cache namespace."""
     if not isinstance(sequence, str):
         raise TypeError("sequence must be a string")
-    return _sha256_bytes(sequence.encode())
+    return sha256_bytes(sequence.encode())
 
 
 def validate_query(spec: DatabaseProfileSpec, sequence: str) -> str:
@@ -267,8 +261,8 @@ def production_search_identity(
     query = validate_query(spec, sequence)
     if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
         raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest")
-    return _sha256_bytes(
-        _json_bytes({
+    return sha256_bytes(
+        json_bytes({
             "schema_version": SEARCH_IDENTITY_SCHEMA_VERSION,
             "adapter_version": SEARCH_ADAPTER_VERSION,
             "profile_id": spec.profile_id,
@@ -426,29 +420,6 @@ def load_search_context(
     )
 
 
-def _load_artifact(
-    root: Path,
-    record: object,
-    expected_path: str,
-) -> bytes | None:
-    if not isinstance(record, dict) or record.get("path") != expected_path:
-        return None
-    path = root / expected_path
-    if not path.is_file():
-        return None
-    try:
-        value = path.read_bytes()
-    except OSError:
-        return None
-    if (
-        isinstance(record.get("size_bytes"), bool)
-        or record.get("size_bytes") != len(value)
-        or record.get("sha256") != _sha256_bytes(value)
-    ):
-        return None
-    return value
-
-
 def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
     """Validate and load one marker-complete Raw Database MSA."""
     done_path = context.result_root / "done.json"
@@ -469,7 +440,7 @@ def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
     artifacts = done.get("artifacts")
     if not isinstance(artifacts, dict):
         return None
-    result_bytes = _load_artifact(
+    result_bytes = load_artifact_bytes(
         context.result_root,
         artifacts.get("result"),
         "result.a3m",
@@ -483,7 +454,7 @@ def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
     return RawMsaEntry(
         context=context,
         a3m=a3m,
-        done_sha256=_sha256_bytes(done_bytes),
+        done_sha256=sha256_bytes(done_bytes),
         result_record=cast(dict[str, object], artifacts["result"]),
     )
 
@@ -724,9 +695,9 @@ def assert_pinned_msa_assembly_contract() -> dict[str, str]:
     ):
         raise RuntimeError("Pinned per-database MSA deduplication contract changed")
     return {
-        "protein_function_sha256": _sha256_bytes(protein_source.encode()),
-        "rna_function_sha256": _sha256_bytes(rna_source.encode()),
-        "get_msa_function_sha256": _sha256_bytes(get_msa_source.encode()),
+        "protein_function_sha256": sha256_bytes(protein_source.encode()),
+        "rna_function_sha256": sha256_bytes(rna_source.encode()),
+        "get_msa_function_sha256": sha256_bytes(get_msa_source.encode()),
     }
 
 
@@ -773,22 +744,6 @@ def assemble_msa_fields(
             deduplicate=False,
         ).to_a3m()
     return fields
-
-
-def _artifact_record(path: Path, root: Path) -> dict[str, object]:
-    require_regular_file(path)
-    return {
-        "path": path.relative_to(root).as_posix(),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
-    }
-
-
-def _write_bytes_atomic(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_bytes(value)
-    os.replace(temporary, path)
 
 
 def _raw_claim_scope(context: SearchContext) -> str:
@@ -893,10 +848,10 @@ def run_database_search(
         )
         append_log(log_path, "Completed search")
         result_path = generation_root / "result.a3m"
-        _write_bytes_atomic(result_path, a3m.encode())
+        write_bytes_atomic(result_path, a3m.encode())
         artifacts = {
-            "result": _artifact_record(result_path, generation_root),
-            "log": _artifact_record(log_path, generation_root),
+            "result": artifact_record(result_path, generation_root),
+            "log": artifact_record(log_path, generation_root),
         }
         runtime.cache_volume.commit()
         assert_generation_current(runtime.claims, claim)
@@ -992,7 +947,7 @@ def _combined_provenance(
         "assembly_contract": assembly_contract,
     }
     return identity_view | {
-        "combined_identity": _sha256_bytes(_json_bytes(identity_view))
+        "combined_identity": sha256_bytes(json_bytes(identity_view))
     }
 
 
@@ -1025,7 +980,7 @@ def _load_combined_msa(
     if task.include_paired:
         expected.append(("pairedMsa", "paired.a3m"))
     for field, filename in expected:
-        value = _load_artifact(sequence_root, artifacts.get(field), filename)
+        value = load_artifact_bytes(sequence_root, artifacts.get(field), filename)
         if value is None:
             return None
         try:
@@ -1152,9 +1107,9 @@ def assemble_and_publish_msas(
             "pairedMsa": "paired.a3m",
         }
         for field, value in fields.items():
-            _write_bytes_atomic(generation_root / filenames[field], value.encode())
+            write_bytes_atomic(generation_root / filenames[field], value.encode())
         artifacts = {
-            field: _artifact_record(generation_root / filenames[field], generation_root)
+            field: artifact_record(generation_root / filenames[field], generation_root)
             for field in fields
         }
         runtime.cache_volume.commit()

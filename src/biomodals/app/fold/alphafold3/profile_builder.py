@@ -24,6 +24,16 @@ from typing import Any, Protocol, cast
 
 import orjson
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    artifact_record,
+    json_bytes,
+    load_json_object,
+    require_regular_file,
+    sha256_bytes,
+    sha256_file,
+    utc_now,
+    write_json_atomic,
+)
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
@@ -59,21 +69,15 @@ from biomodals.app.fold.alphafold3.sharding import (
     ORDINAL_SHUFFLER_VERSION,
     append_log,
     compile_record_multiset_validator,
-    load_json_object,
     record_multiset_identity,
     record_multiset_signature,
     require_executable,
-    require_regular_file,
     required_ordinal_shuffler_scratch_bytes,
     scan_record_multiset,
-    sha256_file,
     shuffle_fasta_occurrences,
-    utc_now,
     verify_file,
-    write_json_atomic,
 )
 
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 _JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
@@ -122,10 +126,6 @@ class ProfileBuilderRuntime:
     container_id: str
 
 
-def _json_bytes(value: object) -> bytes:
-    return orjson.dumps(value, option=_JSON_OPTIONS)
-
-
 def run_to_file(argv: list[str], output_path: Path, log_path: Path) -> None:
     """Run a fixed argv command with separate data and diagnostic streams."""
     append_log(log_path, f"Running command: {shlex.join(argv)}")
@@ -139,25 +139,6 @@ def run_to_file(argv: list[str], output_path: Path, log_path: Path) -> None:
         )
     if completed.returncode != 0:
         raise subprocess.CalledProcessError(completed.returncode, argv)
-
-
-def artifact_record(
-    path: Path,
-    root: Path,
-    *,
-    forbidden_bytes: bytes | None = None,
-) -> dict[str, str | int]:
-    """Build one manifest artifact record below a profile root."""
-    require_regular_file(path)
-    resolved_root = root.resolve()
-    resolved_path = path.resolve()
-    if not resolved_path.is_relative_to(resolved_root):
-        raise ValueError(f"Artifact escapes profile root: {path}")
-    return {
-        "path": resolved_path.relative_to(resolved_root).as_posix(),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path, forbidden_bytes=forbidden_bytes),
-    }
 
 
 def finalize_record_multiset_validation(
@@ -174,8 +155,8 @@ def finalize_record_multiset_validation(
         raise TypeError("Record-multiset helper result lost its report")
     source_signature = record_multiset_signature(cast(dict[str, Any], source_report))
     shard_signature = record_multiset_signature(cast(dict[str, Any], shard_report))
-    source_signature_sha256 = hashlib.sha256(_json_bytes(source_signature)).hexdigest()
-    shard_signature_sha256 = hashlib.sha256(_json_bytes(shard_signature)).hexdigest()
+    source_signature_sha256 = sha256_bytes(json_bytes(source_signature))
+    shard_signature_sha256 = sha256_bytes(json_bytes(shard_signature))
     match = source_signature == shard_signature
     result: dict[str, object] = {
         "match": match,

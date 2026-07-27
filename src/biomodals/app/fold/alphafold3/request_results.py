@@ -22,6 +22,13 @@ from typing import Protocol, cast
 
 import orjson
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    json_bytes,
+    require_regular_file,
+    sha256_file,
+    utc_now,
+    write_json_atomic,
+)
 from biomodals.app.fold.alphafold3.inference_inputs import hash_sequences
 from biomodals.app.fold.alphafold3.seed_predictions import (
     CORE_OUTPUT_SUFFIXES,
@@ -35,17 +42,10 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     validate_run_id,
     write_ranking_table,
 )
-from biomodals.app.fold.alphafold3.sharding import (
-    require_regular_file,
-    sha256_file,
-    utc_now,
-    write_json_atomic,
-)
 from biomodals.helper.shell import run_command
 
 REQUEST_MANIFEST_SCHEMA_VERSION = 1
 
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 _CUSTOM_TEMPLATE_PATTERN = re.compile(r"(?P<digest>[0-9a-f]{64})\.cif")
 
 
@@ -69,10 +69,6 @@ class RequestPublication:
     display_name: str
     reused_seeds: tuple[int, ...]
     published_seeds: tuple[int, ...]
-
-
-def _json_bytes(value: object) -> bytes:
-    return orjson.dumps(value, option=_JSON_OPTIONS)
 
 
 def sanitize_presentation_name(display_name: str) -> str:
@@ -717,7 +713,7 @@ def _rewrite_downloaded_input(
                     f"Downloaded input references undeclared template: {worker_path}"
                 )
             raw_template["mmcifPath"] = archive_path
-    input_path.write_bytes(_json_bytes(document))
+    input_path.write_bytes(json_bytes(document))
 
 
 def _archive_members(path: Path) -> tuple[str, ...] | None:
@@ -822,7 +818,7 @@ def create_request_archive(
                 local_artifact["archive_path"] = transformed.as_posix()
                 local_artifact.pop("worker_path", None)
             (archive_root / "request_manifest.json").write_bytes(
-                _json_bytes(local_manifest)
+                json_bytes(local_manifest)
             )
 
             run_command(

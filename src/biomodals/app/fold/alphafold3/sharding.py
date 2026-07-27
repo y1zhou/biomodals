@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
-import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import orjson
+
+from biomodals.app.fold.alphafold3.artifacts import (
+    load_json_object,
+    require_regular_file,
+    sha256_file,
+    utc_now,
+    write_json_atomic,
+)
 
 ORDINAL_SHUFFLER_VERSION = "af3-fasta-two-pass-v2"
 ORDINAL_SHUFFLER_PREFETCH_RECORDS = 65_536
@@ -36,7 +41,6 @@ SHUFFLER_SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024
 NATIVE_SOURCE_DIR_ENV = "BIOMODALS_AF3_NATIVE_SOURCE_DIR"
 CONTAINER_NATIVE_SOURCE_DIR = Path("/opt/biomodals/alphafold3/native")
 _LOCAL_NATIVE_SOURCE_DIR = Path(__file__).parent / "native"
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
 @dataclass(frozen=True)
@@ -77,48 +81,11 @@ RECORD_MULTISET_VALIDATOR = NativeTool(
 )
 
 
-def utc_now() -> str:
-    """Return an RFC 3339-compatible UTC timestamp."""
-    return datetime.now(UTC).isoformat()
-
-
 def append_log(path: Path, message: str) -> None:
     """Append one timestamped line to a durable operation log."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(f"{utc_now()} {message}\n")
-
-
-def require_regular_file(path: Path) -> None:
-    """Require a non-symlink regular file with at least one byte."""
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"Expected regular file: {path}")
-    if path.stat().st_size <= 0:
-        raise ValueError(f"Expected nonempty file: {path}")
-
-
-def sha256_file(
-    path: Path,
-    *,
-    chunk_size: int = 16 * 1024 * 1024,
-    forbidden_bytes: bytes | None = None,
-) -> str:
-    """Compute a digest and optionally reject a byte marker while streaming."""
-    require_regular_file(path)
-    if forbidden_bytes == b"":
-        raise ValueError("forbidden_bytes must be nonempty")
-    digest = hashlib.sha256()
-    overlap = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-            if forbidden_bytes is not None:
-                searchable = overlap + chunk
-                if forbidden_bytes in searchable:
-                    raise ValueError(f"Forbidden byte marker remains in {path}")
-                overlap_size = len(forbidden_bytes) - 1
-                overlap = searchable[-overlap_size:] if overlap_size else b""
-    return digest.hexdigest()
 
 
 def verify_file(
@@ -282,14 +249,6 @@ def record_multiset_signature(report: dict[str, Any]) -> dict[str, object]:
     return signature
 
 
-def load_json_object(path: Path) -> dict[str, Any]:
-    """Read a JSON object, rejecting all other top-level values."""
-    value = orjson.loads(path.read_bytes())
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected a JSON object in {path}")
-    return value
-
-
 def scan_record_multiset(
     executable: Path,
     input_paths: tuple[Path, ...],
@@ -370,20 +329,6 @@ def required_ordinal_shuffler_scratch_bytes(
             raise ValueError(f"{name} must be a positive integer")
     index_size = 48 + (record_count + 1) * 8
     return source_size + source_size + 1 + index_size + headroom_bytes
-
-
-def write_json_atomic(path: Path, value: object) -> None:
-    """Atomically publish one small JSON artifact."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(orjson.dumps(value, option=_JSON_OPTIONS))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def append_diagnostic_file(source_path: Path, log_path: Path) -> None:

@@ -41,6 +41,7 @@ from uniaf3.schema.alphafold3 import (
 )
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.artifacts import utc_now, write_json_atomic
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     PreparedInferenceRun,
@@ -113,8 +114,6 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 from biomodals.app.fold.alphafold3.sharding import (
     CONTAINER_NATIVE_SOURCE_DIR,
     NATIVE_SOURCE_DIR_ENV,
-    utc_now,
-    write_json_atomic,
 )
 from biomodals.app.fold.alphafold3.template_search import (
     DEFAULT_MAX_TEMPLATE_DATE,

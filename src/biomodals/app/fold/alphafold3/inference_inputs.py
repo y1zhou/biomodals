@@ -15,6 +15,7 @@ from typing import cast
 import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
+from biomodals.app.fold.alphafold3.artifacts import json_bytes, sha256_bytes
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
@@ -23,8 +24,6 @@ from biomodals.app.fold.alphafold3.profiles import (
 ALPHAFOLD3_APP_VERSION = "3.0.2"
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v1"
-
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,10 +66,6 @@ class PreparedInferenceRun:
     uploads: tuple[VolumeUpload, ...]
 
 
-def _json_bytes(value: object) -> bytes:
-    return orjson.dumps(value, option=_JSON_OPTIONS)
-
-
 def validate_af3_config(config: AF3Config) -> AF3Config:
     """Return a fully validated copy with explicit default field semantics."""
     return AF3Config.model_validate(
@@ -81,10 +76,6 @@ def validate_af3_config(config: AF3Config) -> AF3Config:
 def serialize_af3_input(config: AF3Config) -> bytes:
     """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
     return validate_af3_config(config).to_json(exclude_unset=False).encode()
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def hash_sequences(*fragments: object) -> str:
@@ -183,7 +174,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
                     LocalTemplateFile(
                         source_path=template_path,
                         content=content,
-                        sha256=_sha256_bytes(content),
+                        sha256=sha256_bytes(content),
                     )
                 )
         elif (rna := entry.rna) is not None:
@@ -217,7 +208,7 @@ def _template_files_by_source(
 ) -> dict[str, LocalTemplateFile]:
     by_source: dict[str, LocalTemplateFile] = {}
     for artifact in custom_templates:
-        expected_digest = _sha256_bytes(artifact.content)
+        expected_digest = sha256_bytes(artifact.content)
         if artifact.sha256 != expected_digest:
             raise ValueError(f"Custom template digest mismatch: {artifact.source_path}")
         source = str(artifact.source_path.resolve())
@@ -287,7 +278,7 @@ def build_inference_identity_view(
                 raise RuntimeError("Validated AlphaFold template is invalid")
             template_view = cast(dict[str, object], raw_template)
             identity_templates.append({
-                "mmcifSha256": _sha256_bytes(
+                "mmcifSha256": sha256_bytes(
                     _template_content(template_view, template_files)
                 ),
                 "queryIndices": template_view.get("queryIndices"),
@@ -376,7 +367,7 @@ def prepare_inference_run(
                 template.model_dump(mode="python", exclude_unset=False),
             )
             content = _template_content(template_view, template_files)
-            digest = _sha256_bytes(content)
+            digest = sha256_bytes(content)
             relative_path = run_root / "custom-templates" / f"{digest}.cif"
             existing = uploads.get(relative_path)
             if existing is not None and existing != content:
@@ -386,7 +377,7 @@ def prepare_inference_run(
             template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
 
     staged_conf = validate_af3_config(staged_conf)
-    uploads[run_root / "inputs" / "identity.json"] = _json_bytes(identity_document)
+    uploads[run_root / "inputs" / "identity.json"] = json_bytes(identity_document)
     uploads[run_root / "requests" / request_id / "input.json"] = serialize_af3_input(
         staged_conf
     )

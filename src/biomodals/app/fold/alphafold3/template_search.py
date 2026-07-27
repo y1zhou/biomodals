@@ -8,7 +8,6 @@ sequence-plus-unpaired-MSA results.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import inspect
 import os
 import re
@@ -21,6 +20,15 @@ from typing import Protocol, cast
 
 import orjson
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    write_json_atomic,
+)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -39,13 +47,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     HMMER_VERSION,
     resolve_database_profile,
 )
-from biomodals.app.fold.alphafold3.sharding import (
-    append_log,
-    require_regular_file,
-    sha256_file,
-    utc_now,
-    write_json_atomic,
-)
+from biomodals.app.fold.alphafold3.sharding import append_log
 
 DEFAULT_MAX_TEMPLATE_DATE = "2021-09-30"
 PDB_SEQRES_FILENAME = "pdb_seqres_2022_09_28.fasta"
@@ -57,8 +59,6 @@ HMMSEARCH_N_CPU = 8
 TEMPLATE_RESULT_SCHEMA_VERSION = 1
 TEMPLATE_IDENTITY_SCHEMA_VERSION = 1
 TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
-
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 
 
 class VolumeHandle(Protocol):
@@ -100,7 +100,7 @@ class TemplateTask:
     @property
     def unpaired_msa_sha256(self) -> str:
         """Return the content identity of the resolved unpaired MSA."""
-        return _sha256_bytes(self.unpaired_msa.encode())
+        return sha256_bytes(self.unpaired_msa.encode())
 
     @property
     def template_identity(self) -> str:
@@ -145,14 +145,6 @@ class TemplateEntry:
             "templates": self.templates,
             "artifact": self.artifact,
         }
-
-
-def _json_bytes(value: object) -> bytes:
-    return orjson.dumps(value, option=_JSON_OPTIONS)
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def validate_max_template_date(value: str) -> str:
@@ -204,8 +196,8 @@ def template_search_identity(
     validate_query(resolve_database_profile("uniref90"), sequence)
     if re.fullmatch(r"[0-9a-f]{64}", unpaired_msa_sha256) is None:
         raise ValueError("unpaired_msa_sha256 must be a lowercase SHA-256 digest")
-    return _sha256_bytes(
-        _json_bytes({
+    return sha256_bytes(
+        json_bytes({
             "schema_version": TEMPLATE_IDENTITY_SCHEMA_VERSION,
             "adapter_version": TEMPLATE_ADAPTER_VERSION,
             "sequence": sequence,
@@ -253,29 +245,6 @@ def build_template_context(
     )
 
 
-def _load_artifact(
-    root: Path,
-    record: object,
-    expected_path: str,
-) -> bytes | None:
-    if not isinstance(record, dict) or record.get("path") != expected_path:
-        return None
-    path = root / expected_path
-    if not path.is_file():
-        return None
-    try:
-        value = path.read_bytes()
-    except OSError:
-        return None
-    if (
-        isinstance(record.get("size_bytes"), bool)
-        or record.get("size_bytes") != len(value)
-        or record.get("sha256") != _sha256_bytes(value)
-    ):
-        return None
-    return value
-
-
 def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
     """Validate and load one marker-complete template publication."""
     done_path = context.sequence_root / "templates.done.json"
@@ -294,7 +263,7 @@ def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
     ):
         return None
     artifact = done.get("templates")
-    templates_bytes = _load_artifact(
+    templates_bytes = load_artifact_bytes(
         context.sequence_root,
         artifact,
         "templates.json",
@@ -312,7 +281,7 @@ def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
     return TemplateEntry(
         context=context,
         templates=cast(list[dict[str, object]], templates),
-        done_sha256=_sha256_bytes(done_bytes),
+        done_sha256=sha256_bytes(done_bytes),
         artifact=cast(dict[str, object], artifact),
     )
 
@@ -365,8 +334,8 @@ def assert_pinned_template_contract() -> dict[str, str]:
         templates_module.Templates.get_hits_with_structures
     )
     return {
-        "get_protein_templates_sha256": _sha256_bytes(pipeline_source.encode()),
-        "get_hits_with_structures_sha256": _sha256_bytes(structures_source.encode()),
+        "get_protein_templates_sha256": sha256_bytes(pipeline_source.encode()),
+        "get_hits_with_structures_sha256": sha256_bytes(structures_source.encode()),
     }
 
 
@@ -438,15 +407,6 @@ def execute_template_search(
             "templateIndices": [template_index for _, template_index in mapping],
         })
     return templates, contract
-
-
-def _artifact_record(path: Path, root: Path) -> dict[str, object]:
-    require_regular_file(path)
-    return {
-        "path": path.relative_to(root).as_posix(),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
-    }
 
 
 def _template_claim_scope(context: TemplateContext) -> str:
@@ -561,7 +521,7 @@ def run_template_search(
         )
         templates_path = generation_root / "templates.json"
         write_json_atomic(templates_path, templates)
-        artifact = _artifact_record(templates_path, generation_root)
+        artifact = artifact_record(templates_path, generation_root)
         runtime.cache_volume.commit()
         assert_generation_current(runtime.claims, claim)
         context.sequence_root.mkdir(parents=True, exist_ok=True)

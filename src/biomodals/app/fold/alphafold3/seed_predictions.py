@@ -22,6 +22,14 @@ from typing import Protocol, cast
 import orjson
 import polars as pl
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    artifact_record,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    validate_artifact_record,
+    write_json_atomic,
+)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -31,12 +39,6 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     finish_generation_claim,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import hash_sequences
-from biomodals.app.fold.alphafold3.sharding import (
-    require_regular_file,
-    sha256_file,
-    utc_now,
-    write_json_atomic,
-)
 
 SEED_PREDICTION_CLAIM_DICT_NAME = "AlphaFold3-inference-claims"
 
@@ -45,7 +47,6 @@ SUMMARY_MARKER_SCHEMA_VERSION = 1
 SEED_CLAIM_SCHEMA_VERSION = 1
 SUMMARY_CLAIM_SCHEMA_VERSION = 1
 
-_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 CORE_OUTPUT_SUFFIXES = (
     "model.cif",
     "confidences.json",
@@ -218,16 +219,6 @@ class SummaryEntry:
         }
 
 
-def _json_bytes(value: object) -> bytes:
-    return orjson.dumps(value, option=_JSON_OPTIONS)
-
-
-def _sha256_bytes(value: bytes) -> str:
-    import hashlib
-
-    return hashlib.sha256(value).hexdigest()
-
-
 def validate_run_id(run_id: str) -> str:
     """Validate one full seed-independent inference run digest."""
     if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{64}", run_id) is None:
@@ -353,7 +344,7 @@ def load_seed_marker(
         seed=selected_seed,
         generation_id=cast(str, marker["generation_id"]),
         rankings=rankings,
-        marker_sha256=_sha256_bytes(marker_bytes),
+        marker_sha256=sha256_bytes(marker_bytes),
     )
 
 
@@ -897,36 +888,6 @@ def run_seed_prediction_worker(
         raise
 
 
-def _load_artifact(
-    run_root: Path,
-    value: object,
-) -> dict[str, object] | None:
-    if not isinstance(value, dict):
-        return None
-    path_value = value.get("path")
-    size_value = value.get("size_bytes")
-    digest_value = value.get("sha256")
-    if (
-        not isinstance(path_value, str)
-        or path_value.startswith("/")
-        or ".." in Path(path_value).parts
-        or isinstance(size_value, bool)
-        or not isinstance(size_value, int)
-        or size_value <= 0
-        or not isinstance(digest_value, str)
-        or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None
-    ):
-        return None
-    path = run_root / path_value
-    try:
-        require_regular_file(path)
-    except (FileNotFoundError, ValueError):
-        return None
-    if path.stat().st_size != size_value or sha256_file(path) != digest_value:
-        return None
-    return cast(dict[str, object], value)
-
-
 def _ranking_from_dict(value: object) -> RankingRow | None:
     rows = _parse_ranking_rows([value])
     return rows[0] if rows is not None else None
@@ -968,7 +929,7 @@ def load_summary_entry(run_root: Path, run_id: str) -> SummaryEntry | None:
         return None
     artifacts: dict[str, dict[str, object]] = {}
     for role in _SUMMARY_ARTIFACT_FILENAMES:
-        artifact = _load_artifact(run_root, raw_artifacts.get(role))
+        artifact = validate_artifact_record(run_root, raw_artifacts.get(role))
         if artifact is None:
             return None
         artifacts[role] = artifact
@@ -977,7 +938,7 @@ def load_summary_entry(run_root: Path, run_id: str) -> SummaryEntry | None:
         included_seeds=tuple(cast(list[int], raw_seeds)),
         best=best,
         artifacts=artifacts,
-        marker_sha256=_sha256_bytes(marker_bytes),
+        marker_sha256=sha256_bytes(marker_bytes),
     )
 
 
@@ -1034,18 +995,6 @@ def _summary_claim_identity(run_id: str) -> dict[str, object]:
     return {
         "schema_version": SUMMARY_CLAIM_SCHEMA_VERSION,
         "run_id": validate_run_id(run_id),
-    }
-
-
-def _summary_artifact_record(
-    path: Path,
-    run_root: Path,
-) -> dict[str, object]:
-    require_regular_file(path)
-    return {
-        "path": path.relative_to(run_root).as_posix(),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
     }
 
 
@@ -1204,7 +1153,7 @@ def finalize_run_summary(
             os.replace(source, destination)
         runtime.volume.commit()
         artifacts = {
-            role: _summary_artifact_record(destination, run_root)
+            role: artifact_record(destination, run_root)
             for role, destination in role_to_destination.items()
         }
         assert_generation_current(runtime.claims, claim)

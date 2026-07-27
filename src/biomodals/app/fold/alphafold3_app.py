@@ -27,6 +27,7 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 
 import os
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -636,6 +637,23 @@ def _validate_max_num_gpus(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
+def _bounded_remote_outcomes[TaskT](
+    tasks: tuple[TaskT, ...],
+    invoke: Callable[[TaskT], dict[str, object]],
+    *,
+    max_parallel: int,
+) -> tuple[dict[str, object] | Exception, ...]:
+    """Run blocking remote calls while preserving task order and failures."""
+
+    def capture(task: TaskT) -> dict[str, object] | Exception:
+        try:
+            return invoke(task)
+        except Exception as exc:
+            return exc
+
+    return tuple(bounded_map(tasks, capture, max_parallel=max_parallel))
+
+
 class _ModalSearchExecutor(SearchExecutor):
     """Bind the request-level search coordinator to Modal functions."""
 
@@ -652,13 +670,14 @@ class _ModalSearchExecutor(SearchExecutor):
         *,
         max_parallel: int,
     ) -> tuple[dict[str, object] | Exception, ...]:
-        def run(task: RawSearchTask) -> dict[str, object] | Exception:
-            try:
-                return search_database_msa.remote(task.database_id, task.sequence)
-            except Exception as exc:
-                return exc
-
-        return tuple(bounded_map(tasks, run, max_parallel=max_parallel))
+        return _bounded_remote_outcomes(
+            tasks,
+            lambda task: search_database_msa.remote(
+                task.database_id,
+                task.sequence,
+            ),
+            max_parallel=max_parallel,
+        )
 
     def run_assemblies(
         self,
@@ -666,18 +685,16 @@ class _ModalSearchExecutor(SearchExecutor):
         *,
         max_parallel: int,
     ) -> tuple[dict[str, object] | Exception, ...]:
-        def run(task: MsaAssemblyTask) -> dict[str, object] | Exception:
-            try:
-                return assemble_sequence_msas.remote(
-                    task.polymer,
-                    task.sequence,
-                    task.include_unpaired,
-                    task.include_paired,
-                )
-            except Exception as exc:
-                return exc
-
-        return tuple(bounded_map(tasks, run, max_parallel=max_parallel))
+        return _bounded_remote_outcomes(
+            tasks,
+            lambda task: assemble_sequence_msas.remote(
+                task.polymer,
+                task.sequence,
+                task.include_unpaired,
+                task.include_paired,
+            ),
+            max_parallel=max_parallel,
+        )
 
     def inspect_templates(
         self,
@@ -699,18 +716,16 @@ class _ModalSearchExecutor(SearchExecutor):
         *,
         max_parallel: int,
     ) -> tuple[dict[str, object] | Exception, ...]:
-        def run(task: TemplateTask) -> dict[str, object] | Exception:
-            try:
-                return search_protein_templates.remote(
-                    task.sequence,
-                    task.unpaired_msa,
-                    task.publish_canonical,
-                    task.max_template_date,
-                )
-            except Exception as exc:
-                return exc
-
-        return tuple(bounded_map(tasks, run, max_parallel=max_parallel))
+        return _bounded_remote_outcomes(
+            tasks,
+            lambda task: search_protein_templates.remote(
+                task.sequence,
+                task.unpaired_msa,
+                task.publish_canonical,
+                task.max_template_date,
+            ),
+            max_parallel=max_parallel,
+        )
 
 
 def search_msa_and_templates(

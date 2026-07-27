@@ -781,17 +781,18 @@ def test_generation_claims_adapt_legacy_owners() -> None:
         value: object,
     ) -> dict[str, object]:
         assert isinstance(value, dict)
+        legacy = cast(dict[str, object], value)
         return {
             "scope_key": selected_scope,
-            "generation_id": value["generation_id"],
+            "generation_id": legacy["generation_id"],
             "identity": {
-                "profile_id": value["profile_id"],
-                "database_id": value["database_id"],
+                "profile_id": legacy["profile_id"],
+                "database_id": legacy["database_id"],
             },
-            "container_id": value["container_id"],
-            "started_at": value["started_at"],
-            "started_at_epoch_seconds": value["started_at_epoch_seconds"],
-            "maximum_age_seconds": value["maximum_age_seconds"],
+            "container_id": legacy["container_id"],
+            "started_at": legacy["started_at"],
+            "started_at_epoch_seconds": legacy["started_at_epoch_seconds"],
+            "maximum_age_seconds": legacy["maximum_age_seconds"],
         }
 
     successor = acquire_generation_claim(

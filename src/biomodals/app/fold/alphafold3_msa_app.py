@@ -29,9 +29,7 @@ a manifest-last publication remain on the sharded Volume.
 from __future__ import annotations
 
 import hashlib
-import heapq
 import io
-import itertools
 import os
 import re
 import shlex
@@ -41,19 +39,42 @@ import subprocess
 import tempfile
 import uuid
 from collections import Counter
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from statistics import median
 from threading import Event, Lock, Thread
 from time import perf_counter
-from typing import Any, BinaryIO, cast
+from typing import Any, BinaryIO, Literal, cast
 
 import modal
 import orjson
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.msa_search import (
+    assemble_msa_fields as _shared_assemble_msa_fields,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    assert_pinned_msa_assembly_contract as _shared_assert_msa_assembly_contract,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    execute_profile_database_search as _shared_execute_profile_database_search,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    materialize_upstream_profile_msa as _shared_materialize_profile_msa,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    merge_nhmmer_results_by_reported_score as _shared_merge_nhmmer_results,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    nhmmer_reported_score_sort_key as _shared_nhmmer_sort_key,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    scientific_search_parameters as _shared_scientific_search_parameters,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    validate_query as _shared_validate_query,
+)
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
 )
@@ -5526,43 +5547,19 @@ def _validate_profile_query(
     sequence: str,
 ) -> str:
     """Validate a query before it reaches an upstream command wrapper."""
-    if not isinstance(sequence, str):
-        raise TypeError("sequence must be a string")
-    if not 1 <= len(sequence) <= 10_000:
-        raise ValueError("sequence length must be between 1 and 10,000")
-    pattern = r"[A-Z]+" if spec.polymer == "protein" else r"[ACGU]+"
-    if re.fullmatch(pattern, sequence) is None:
-        raise ValueError(f"sequence contains invalid {spec.polymer} characters")
-    return sequence
+    return _shared_validate_query(spec, sequence)
 
 
 def _production_scientific_search_parameters(
     spec: DatabaseProfileSpec,
 ) -> dict[str, object]:
     """Return result-affecting parameters from the pinned data pipeline."""
-    common: dict[str, object] = {
-        "database_id": spec.database_id,
-        "polymer": spec.polymer,
-        "max_sequences": spec.max_sequences,
-        "z_value": spec.search_space_value,
-    }
-    if spec.polymer == "protein":
-        return common | {
-            "tool": "jackhmmer",
-            "n_iter": 1,
-            "e_value": JACKHMMER_E_VALUE,
-            "dom_z_value": spec.search_space_value,
-            "filter_f1": JACKHMMER_FILTER_F1,
-            "filter_f2": JACKHMMER_FILTER_F2,
-            "filter_f3": JACKHMMER_FILTER_F3,
-        }
-    return common | {
-        "tool": "nhmmer",
-        "e_value": 1e-3,
-        "filter_f3": 1e-5,
-        "alphabet": "rna",
-        "short_sequence_filter_f3": 0.02,
-    }
+    # Keep the historical benchmark identity stable. Production additionally
+    # binds the validated RNA merge adapter in its new cache namespace.
+    return _shared_scientific_search_parameters(
+        spec,
+        include_rna_merge_semantics=False,
+    )
 
 
 def _production_search_parameters(
@@ -5786,11 +5783,7 @@ def _nhmmer_reported_score_sort_key(
     row: tuple[str, str, str, str],
 ) -> tuple[float, float, str]:
     """Rank one Nhmmer hit by its reported E-value, score, and name."""
-    _, _, tblout_line, name = row
-    fields = tblout_line.split(maxsplit=15)
-    if len(fields) < 14:
-        raise ValueError(f"Invalid Nhmmer tblout row: {tblout_line!r}")
-    return float(fields[12]), -float(fields[13]), name
+    return _shared_nhmmer_sort_key(row)
 
 
 def _merge_nhmmer_results_by_reported_score(
@@ -5807,53 +5800,7 @@ def _merge_nhmmer_results_by_reported_score(
     side of a capped MSA. The reported score is the strongest available
     secondary key without maintaining a patched HMMER binary.
     """
-    if max_sequences <= 1:
-        raise ValueError("max_sequences must be greater than one")
-    if not results:
-        raise ValueError("At least one Nhmmer result is required")
-    if len({result.target_sequence for result in results}) != 1:
-        raise ValueError("Nhmmer shard results have different target sequences")
-    if len({result.e_value for result in results}) != 1:
-        raise ValueError("Nhmmer shard results have different E-value thresholds")
-
-    tblout_by_id: dict[str, str] = {}
-    for result in results:
-        if result.tblout is None:
-            raise ValueError("Nhmmer shard result is missing tblout")
-        for line in result.tblout.splitlines():
-            if not line or line.startswith("#"):
-                continue
-            fields = line.split(maxsplit=15)
-            if len(fields) < 14:
-                raise ValueError(f"Invalid Nhmmer tblout row: {line!r}")
-            hit_id = f"{fields[0]}/{fields[6]}-{fields[7]}"
-            tblout_by_id[hit_id] = line
-
-    def iter_shard_rows(a3m: str) -> Iterator[tuple[str, str, str, str]]:
-        records = iter(module.parsers.lazy_parse_fasta_string(a3m))
-        next(records)
-        for sequence, description in records:
-            name = description.partition(" ")[0]
-            if tblout_line := tblout_by_id.get(name):
-                yield sequence, description, tblout_line, name
-
-    top_rows = heapq.nsmallest(
-        max_sequences - 1,
-        itertools.chain.from_iterable(
-            iter_shard_rows(result.a3m) for result in results
-        ),
-        key=_nhmmer_reported_score_sort_key,
-    )
-    merged_a3m = [f">query\n{results[0].target_sequence}"]
-    merged_a3m.extend(
-        f">{description}\n{sequence}" for sequence, description, _, _ in top_rows
-    )
-    return module.msa_tool.MsaToolResult(
-        target_sequence=results[0].target_sequence,
-        a3m="\n".join(merged_a3m),
-        e_value=results[0].e_value,
-        tblout=None,
-    )
+    return _shared_merge_nhmmer_results(module, results, max_sequences)
 
 
 def _execute_profile_database_search(
@@ -5863,100 +5810,20 @@ def _execute_profile_database_search(
     profile_root: Path,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Run a monolithic or sharded pinned search while retaining tblout."""
-    from importlib import import_module
-
     selected_layout = _validate_profile_search_layout(layout)
-    if selected_layout == "monolith":
-        database_path = str(Path(APP_INFO.source_db_dir) / spec.source_filename)
-        search_paths = (Path(database_path),)
-    else:
-        database_path = (
-            profile_root / "shards" / spec.source_filename
-        ).as_posix() + f"@{spec.shard_count}"
-        search_paths = tuple(
-            profile_root / "shards" / name for name in _production_shard_names(spec)
-        )
-    n_cpu = (
-        ORACLE_MONOLITH_N_CPU
-        if selected_layout == "monolith"
-        else PRODUCTION_SEARCH_N_CPU
+    return _shared_execute_profile_database_search(
+        spec,
+        sequence,
+        layout=cast(
+            Literal["monolith", "sharded"],
+            selected_layout,
+        ),
+        selected_profile_root=profile_root,
+        source_root=Path(APP_INFO.source_db_dir),
+        monolith_n_cpu=ORACLE_MONOLITH_N_CPU,
+        sharded_n_cpu=PRODUCTION_SEARCH_N_CPU,
+        max_parallel_shards=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
     )
-
-    if spec.polymer == "protein":
-        module = import_module("alphafold3.data.tools.jackhmmer")
-        tool = module.Jackhmmer(
-            binary_path=JACKHMMER_BINARY_PATH,
-            database_path=database_path,
-            n_cpu=n_cpu,
-            n_iter=1,
-            e_value=JACKHMMER_E_VALUE,
-            z_value=spec.search_space_value,
-            dom_z_value=spec.search_space_value,
-            max_sequences=spec.max_sequences,
-            filter_f1=JACKHMMER_FILTER_F1,
-            filter_f2=JACKHMMER_FILTER_F2,
-            filter_f3=JACKHMMER_FILTER_F3,
-            max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
-        )
-    else:
-        module = import_module("alphafold3.data.tools.nhmmer")
-        tool = module.Nhmmer(
-            binary_path=NHMMER_BINARY_PATH,
-            hmmalign_binary_path=HMMALIGN_BINARY_PATH,
-            hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
-            database_path=database_path,
-            n_cpu=n_cpu,
-            e_value=1e-3,
-            z_value=spec.search_space_value,
-            max_sequences=spec.max_sequences,
-            filter_f3=1e-5,
-            alphabet="rna",
-            max_threads=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS,
-        )
-
-    global_temp_dir = tempfile.mkdtemp(
-        prefix=f"af3-{spec.database_id}-{selected_layout}-",
-        dir=PRODUCTION_SCRATCH_ROOT,
-    )
-
-    def query_one(search_path: Path) -> Any:
-        return tool._query_db_shard(  # noqa: SLF001
-            target_sequence=sequence,
-            db_shard_path=str(search_path),
-            get_tblout=True,
-            global_temp_dir=global_temp_dir,
-        )
-
-    try:
-        if selected_layout == "monolith":
-            results = (query_one(search_paths[0]),)
-        else:
-            with ThreadPoolExecutor(
-                max_workers=PRODUCTION_SEARCH_MAX_PARALLEL_SHARDS
-            ) as executor:
-                results = tuple(executor.map(query_one, search_paths))
-    finally:
-        shutil.rmtree(global_temp_dir, ignore_errors=True)
-
-    raw_tblouts: list[tuple[str, str]] = []
-    for search_path, result in zip(search_paths, results, strict=True):
-        if result.tblout is None:
-            raise ValueError(f"{search_path.name} search did not return tblout")
-        raw_tblouts.append((search_path.name, result.tblout))
-    if selected_layout == "monolith":
-        merged = results[0]
-    elif spec.polymer == "protein":
-        merged = module._merge_jackhmmer_results(  # noqa: SLF001
-            results,
-            spec.max_sequences,
-        )
-    else:
-        merged = _merge_nhmmer_results_by_reported_score(
-            module,
-            results,
-            spec.max_sequences,
-        )
-    return merged.a3m, raw_tblouts
 
 
 def _materialize_upstream_profile_msa(
@@ -5965,23 +5832,7 @@ def _materialize_upstream_profile_msa(
     raw_a3m: str,
 ) -> str:
     """Apply the pinned ``get_msa`` empty-result and query-row behavior."""
-    if not isinstance(raw_a3m, str):
-        raise ValueError("Pinned MSA wrapper returned a non-string A3M")
-    from importlib import import_module
-
-    msa = import_module("alphafold3.data.msa")
-    mmcif_names = import_module("alphafold3.constants.mmcif_names")
-    chain_poly_type = (
-        mmcif_names.PROTEIN_CHAIN
-        if spec.polymer == "protein"
-        else mmcif_names.RNA_CHAIN
-    )
-    return msa.Msa.from_a3m(
-        query_sequence=sequence,
-        chain_poly_type=chain_poly_type,
-        a3m=raw_a3m,
-        deduplicate=False,
-    ).to_a3m()
+    return _shared_materialize_profile_msa(spec, sequence, raw_a3m)
 
 
 def _run_profile_search(
@@ -6522,41 +6373,7 @@ def _compare_final_a3m(oracle: str, candidate: str) -> dict[str, object]:
 
 def _assert_pinned_msa_assembly_contract() -> dict[str, str]:
     """Bind the local assembly adapter to the pinned upstream function bodies."""
-    import inspect
-    from importlib import import_module
-
-    pipeline = import_module("alphafold3.data.pipeline")
-    msa_module = import_module("alphafold3.data.msa")
-    protein_source = inspect.getsource(
-        pipeline._get_protein_msa_and_templates  # noqa: SLF001
-    )
-    rna_source = inspect.getsource(pipeline._get_rna_msa)  # noqa: SLF001
-    compact_protein = re.sub(r"\s+", "", protein_source)
-    compact_rna = re.sub(r"\s+", "", rna_source)
-    required_protein = (
-        "msas=[uniref90_msa,small_bfd_msa,mgnify_msa],deduplicate=True",
-        "msas=[uniprot_msa],deduplicate=False",
-    )
-    required_rna = "msas=[rfam_msa,rnacentral_msa,nt_rna_msa],deduplicate=True"
-    if not all(pattern in compact_protein for pattern in required_protein):
-        raise RuntimeError("Pinned protein MSA assembly contract changed")
-    if required_rna not in compact_rna:
-        raise RuntimeError("Pinned RNA MSA assembly contract changed")
-    get_msa_source = inspect.getsource(msa_module.get_msa)
-    deduplicate_parameter = inspect.signature(msa_module.get_msa).parameters.get(
-        "deduplicate"
-    )
-    if (
-        deduplicate_parameter is None
-        or deduplicate_parameter.default is not False
-        or "deduplicate=deduplicate" not in re.sub(r"\s+", "", get_msa_source)
-    ):
-        raise RuntimeError("Pinned per-database MSA deduplication contract changed")
-    return {
-        "protein_function_sha256": hashlib.sha256(protein_source.encode()).hexdigest(),
-        "rna_function_sha256": hashlib.sha256(rna_source.encode()).hexdigest(),
-        "get_msa_function_sha256": hashlib.sha256(get_msa_source.encode()).hexdigest(),
-    }
+    return _shared_assert_msa_assembly_contract()
 
 
 def _assemble_current_pipeline_msas(
@@ -6564,36 +6381,12 @@ def _assemble_current_pipeline_msas(
     database_a3ms: dict[str, str],
 ) -> dict[str, str]:
     """Apply the exact pinned upstream database order and deduplication."""
-    from importlib import import_module
-
-    msa = import_module("alphafold3.data.msa")
-    mmcif_names = import_module("alphafold3.constants.mmcif_names")
-    if case.polymer == "protein":
-        unpaired = msa.Msa.from_multiple_a3ms(
-            a3ms=[
-                database_a3ms["uniref90"],
-                database_a3ms["small_bfd"],
-                database_a3ms["mgnify"],
-            ],
-            chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-            deduplicate=True,
-        ).to_a3m()
-        paired = msa.Msa.from_multiple_a3ms(
-            a3ms=[database_a3ms["uniprot"]],
-            chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-            deduplicate=False,
-        ).to_a3m()
-        return {"unpairedMsa": unpaired, "pairedMsa": paired}
-    unpaired = msa.Msa.from_multiple_a3ms(
-        a3ms=[
-            database_a3ms["rfam"],
-            database_a3ms["rnacentral"],
-            database_a3ms["ntrna"],
-        ],
-        chain_poly_type=mmcif_names.RNA_CHAIN,
-        deduplicate=True,
-    ).to_a3m()
-    return {"unpairedMsa": unpaired}
+    return _shared_assemble_msa_fields(
+        cast(Literal["protein", "rna"], case.polymer),
+        database_a3ms,
+        include_unpaired=True,
+        include_paired=case.polymer == "protein",
+    )
 
 
 def _oracle_fold_input(

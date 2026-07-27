@@ -8,6 +8,7 @@ import orjson
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold import alphafold3_app
+from biomodals.app.fold.alphafold3.inference_inputs import PreparedInferenceRun
 
 
 def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
@@ -26,21 +27,26 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     captured = {}
 
     def fake_predict_structures(
-        prediction_conf,
-        local_out_dir: Path,
+        prepared: PreparedInferenceRun,
         recycle: int,
         sample: int,
         num_containers: int,
-    ) -> Path:
-        captured["name"] = prediction_conf.name
-        captured["model_seeds"] = list(prediction_conf.modelSeeds)
-        captured["local_out_dir"] = local_out_dir
+    ) -> dict[str, object]:
+        captured["prepared"] = prepared
         captured["recycle"] = recycle
         captured["sample"] = sample
         captured["num_containers"] = num_containers
-        return local_out_dir / f"{prediction_conf.name}.tar.zst"
+        return {"request": {"status": "complete"}}
 
+    monkeypatch.setattr(alphafold3_app, "_stage_inference_run", lambda prepared: None)
     monkeypatch.setattr(alphafold3_app, "predict_structures", fake_predict_structures)
+    monkeypatch.setattr(
+        alphafold3_app,
+        "create_request_archive",
+        lambda reader, manifest, *, output_dir, display_name: (
+            Path(output_dir) / f"{display_name}.tar.zst"
+        ),
+    )
 
     submit_task_info = alphafold3_app.submit_alphafold3_task.info
     assert submit_task_info is not None
@@ -56,17 +62,17 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
         sample=2,
     )
 
-    assert captured == {
-        "name": "renamed",
-        "model_seeds": [11, 12],
-        "local_out_dir": tmp_path,
-        "recycle": 3,
-        "sample": 2,
-        "num_containers": 2,
-    }
+    prepared = captured.pop("prepared")
+    assert isinstance(prepared, PreparedInferenceRun)
+    assert prepared.display_name == "renamed"
+    assert prepared.submitted_seeds == (11, 12)
+    assert prepared.normalized_seeds == (11, 12)
+    assert prepared.worker_config.modelSeeds == [11, 12]
+    assert captured == {"recycle": 3, "sample": 2, "num_containers": 2}
 
 
 def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
+    tmp_path: Path,
     monkeypatch,
 ) -> None:
     conf = AF3Config(
@@ -87,26 +93,43 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
                 if str(arg).startswith("--json_path=")
             )
         )
-        output_dir = Path(
-            next(
-                arg.removeprefix("--output_dir=")
-                for arg in cmd
-                if str(arg).startswith("--output_dir=")
-            )
-        )
         captured["input"] = orjson.loads(json_path.read_bytes())
-        (output_dir / conf.name).mkdir(parents=True)
-        (output_dir / conf.name / "done.txt").write_text("ok", encoding="utf-8")
+
+    def fake_run_seed_prediction_worker(runtime, task, execute):
+        del runtime
+        captured["task"] = task
+        worker_root = tmp_path / "worker"
+        worker_root.mkdir()
+        execute(worker_root, "af3-test", (1,))
+        return {"status": "published"}
 
     monkeypatch.setattr(alphafold3_app, "run_command", fake_run_command)
-
-    alphafold3_app.run_inference_pipeline.get_raw_f()(
-        conf.model_dump_json().encode("utf-8"),
-        recycle=1,
-        sample=1,
-        model_seeds=[1],
+    monkeypatch.setattr(
+        alphafold3_app,
+        "run_seed_prediction_worker",
+        fake_run_seed_prediction_worker,
     )
 
+    result = alphafold3_app.run_inference_pipeline.get_raw_f()(
+        conf.model_dump_json().encode("utf-8"),
+        run_id="a" * 64,
+        recycle=1,
+        sample=1,
+        claimed_seed_records=[
+            {
+                "seed": 1,
+                "claim": {
+                    "scope_key": f"seed:{'a' * 64}:1",
+                    "generation_id": "generation",
+                    "owner": {},
+                },
+            }
+        ],
+    )
+
+    assert result == {"status": "published"}
+    assert captured["task"].run_id == "a" * 64
+    assert tuple(item.seed for item in captured["task"].claimed_seeds) == (1,)
     protein = captured["input"]["sequences"][0]["protein"]
     assert protein["unpairedMsa"] == ""
     assert protein["pairedMsa"] == ""

@@ -1,0 +1,606 @@
+"""Production contracts for AlphaFold3 preparation, search, and inference."""
+
+# ruff: noqa: D101,D102,D103,D107
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import orjson
+import pytest
+from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
+
+from biomodals.app.fold.alphafold3.generation_claims import (
+    ActiveGenerationError,
+    acquire_generation_claim,
+    finish_generation_claim,
+    latest_generation_owner,
+)
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    hash_sequences,
+    serialize_af3_input,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    RAW_RESULT_SCHEMA_VERSION,
+    ChainMsaState,
+    RawMsaEntry,
+    SearchContext,
+    load_raw_msa,
+    merge_nhmmer_results_by_reported_score,
+    plan_msa_resolution,
+    sequence_hash,
+)
+from biomodals.app.fold.alphafold3.profile_builder import (
+    plan_missing_profile_builds,
+    validate_profile_manifest,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    ALPHAFOLD3_COMMIT,
+    ALPHAFOLD3_REPOSITORY,
+    COMPOSABLE_MULTISET_RECIPE_VERSION,
+    DATABASE_PROFILE_SPECS,
+    DEFAULT_SEQKIT_THREADS,
+    HMMER_VERSION,
+    JACKHMMER_PATCH_SHA256,
+    PROFILE_SCHEMA_VERSION,
+    SEQKIT_VERSION,
+    SHARD_RANDOM_SEED,
+    SOURCE_DB_VOLUME_NAME,
+    VALIDATION_RELPATHS,
+    resolve_database_profile,
+    shard_names,
+)
+from biomodals.app.fold.alphafold3.request_results import (
+    REQUEST_MANIFEST_SCHEMA_VERSION,
+    create_request_archive,
+)
+from biomodals.app.fold.alphafold3.seed_predictions import (
+    SEED_MARKER_SCHEMA_VERSION,
+    canonical_output_name,
+    load_seed_marker,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    ORDINAL_SHUFFLER_PREFETCH_BYTES,
+    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+    ORDINAL_SHUFFLER_SOURCE_SHA256,
+    ORDINAL_SHUFFLER_VERSION,
+    record_multiset_identity,
+)
+from biomodals.app.fold.alphafold3.template_search import (
+    TEMPLATE_RESULT_SCHEMA_VERSION,
+    build_template_context,
+    load_template_entry,
+)
+from biomodals.helper.shell import run_command
+
+
+def _artifact(path: str, content: bytes = b"x") -> dict[str, object]:
+    return {
+        "path": path,
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _profile_manifest(database_id: str) -> dict[str, Any]:
+    spec = resolve_database_profile(database_id)
+    num_seqs = spec.expected_num_seqs or 1
+    sum_len = spec.expected_sum_len or 1
+    return {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "profile_id": spec.profile_id,
+        "database_id": spec.database_id,
+        "polymer": spec.polymer,
+        "shard_count": spec.shard_count,
+        "shard_prefix": f"shards/{spec.source_filename}",
+        "search_space_value": spec.search_space_value,
+        "search_space_unit": spec.search_space_unit,
+        "source": {
+            "volume": SOURCE_DB_VOLUME_NAME,
+            "path": spec.source_filename,
+            "size_bytes": 1,
+            "sha256": "a" * 64,
+            "num_seqs": num_seqs,
+            "sum_len": sum_len,
+        },
+        "shards": [_artifact(f"shards/{name}") for name in shard_names(spec)],
+        "compatibility": {
+            "alphafold_repository": ALPHAFOLD3_REPOSITORY,
+            "alphafold_commit": ALPHAFOLD3_COMMIT,
+            "hmmer_version": HMMER_VERSION,
+            "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+        },
+        "recipe": {
+            "version": COMPOSABLE_MULTISET_RECIPE_VERSION,
+            "seqkit_version": SEQKIT_VERSION,
+            "seqkit_threads": DEFAULT_SEQKIT_THREADS,
+            "random_seed": SHARD_RANDOM_SEED,
+            "shuffle": [
+                "two-pass",
+                "first-pass-stage-local-source",
+                "source-occurrence-offset-index",
+                "splitmix64-fisher-yates-u32",
+                "bounded-concurrent-local-pread",
+                "ordered-write",
+            ],
+            "shuffler": {
+                "version": ORDINAL_SHUFFLER_VERSION,
+                "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
+                "record_identity": "source-occurrence",
+                "offset_index": "uint64-source-occurrence-offsets-v1",
+                "permutation": "splitmix64-fisher-yates-u32-v1",
+                "staging": "first-pass-tee-to-container-local-v1",
+                "read": "bounded-concurrent-local-pread-ordered-write-v2",
+                "ordered_output": True,
+            },
+            "execution": {
+                "worker_threads": DEFAULT_SEQKIT_THREADS,
+                "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+                "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+            },
+            "duplicate_recovery": {
+                "warning_source": None,
+                "record_identity": "source-occurrence",
+                "append_after_shuffle": False,
+                "strip_after_split": False,
+            },
+            "record_multiset": record_multiset_identity()
+            | {"shard_threads": DEFAULT_SEQKIT_THREADS},
+            "split": ["--by-part", spec.shard_count],
+        },
+        "validation": {
+            "passed": True,
+            "temporary_recovery_prefix_absent": True,
+            "num_seqs": num_seqs,
+            "sum_len": sum_len,
+            "record_occurrences_preserved": True,
+            "recovered_records": 0,
+            "recovered_residues": 0,
+            "first_recovered_byte_offset": None,
+            "last_recovered_byte_offset": None,
+            "canonical_record_multiset_match": True,
+            "record_multiset_signature_sha256": "b" * 64,
+            "artifacts": [_artifact(path) for path in VALIDATION_RELPATHS],
+        },
+    }
+
+
+class FakeClaimStore:
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+
+    def put(
+        self,
+        key: str,
+        value: object,
+        *,
+        skip_if_exists: bool = False,
+    ) -> bool:
+        if skip_if_exists and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.values.get(key, default)
+
+
+class FakeVolumeReader:
+    def __init__(self, files: dict[str, bytes]) -> None:
+        self.files = files
+
+    def read_file(self, path: str):
+        value = self.files[path]
+        midpoint = len(value) // 2
+        yield value[:midpoint]
+        yield value[midpoint:]
+
+
+def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
+    manifest = _profile_manifest("small_bfd")
+    source, shards, validation = validate_profile_manifest(
+        manifest,
+        resolve_database_profile("small_bfd"),
+    )
+
+    assert source["num_seqs"] == 65_984_053
+    assert len(shards) == 64
+    assert [record["path"] for record in validation] == list(VALIDATION_RELPATHS)
+
+    inventory: dict[str, object] = {
+        "invalid_profiles": {},
+        "missing_database_ids": ["uniref90", "small_bfd"],
+    }
+    assert plan_missing_profile_builds(
+        inventory,
+        seqkit_threads=4,
+        source_policy="compress",
+    ) == (
+        ("small_bfd", 4, "compress"),
+        ("uniref90", 4, "compress"),
+    )
+
+    manifest["shards"][0], manifest["shards"][1] = (
+        manifest["shards"][1],
+        manifest["shards"][0],
+    )
+    with pytest.raises(ValueError, match="shard order"):
+        validate_profile_manifest(manifest, resolve_database_profile("small_bfd"))
+
+
+def test_msa_resolution_deduplicates_queries_across_input_chains() -> None:
+    sequence = "ACDEFG"
+    plan = plan_msa_resolution((
+        ChainMsaState(
+            chain_index=0,
+            polymer="protein",
+            sequence=sequence,
+            unpaired_present=False,
+            paired_present=False,
+        ),
+        ChainMsaState(
+            chain_index=1,
+            polymer="protein",
+            sequence=sequence,
+            unpaired_present=True,
+            paired_present=False,
+        ),
+        ChainMsaState(
+            chain_index=2,
+            polymer="rna",
+            sequence="ACGU",
+            unpaired_present=False,
+            paired_present=False,
+        ),
+    ))
+
+    assert [(task.database_id, task.sequence) for task in plan.raw_searches] == [
+        ("uniref90", sequence),
+        ("small_bfd", sequence),
+        ("mgnify", sequence),
+        ("uniprot", sequence),
+        ("rfam", "ACGU"),
+        ("rnacentral", "ACGU"),
+        ("ntrna", "ACGU"),
+    ]
+    assert [
+        (
+            task.polymer,
+            task.sequence,
+            task.include_unpaired,
+            task.include_paired,
+        )
+        for task in plan.assemblies
+    ] == [
+        ("protein", sequence, True, True),
+        ("rna", "ACGU", True, False),
+    ]
+
+
+def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
+    @dataclass
+    class Result:
+        target_sequence: str
+        a3m: str
+        e_value: float
+        tblout: str | None
+
+    def lazy_parse_fasta_string(value: str):
+        header: str | None = None
+        sequence_parts: list[str] = []
+        for line in value.splitlines():
+            if line.startswith(">"):
+                if header is not None:
+                    yield "".join(sequence_parts), header
+                header = line[1:]
+                sequence_parts = []
+            else:
+                sequence_parts.append(line)
+        if header is not None:
+            yield "".join(sequence_parts), header
+
+    def tblout(name: str, score: float, e_value: str = "1e-5") -> str:
+        return f"{name} x x x x x 1 4 x x x x {e_value} {score} x x"
+
+    module = SimpleNamespace(
+        parsers=SimpleNamespace(lazy_parse_fasta_string=lazy_parse_fasta_string),
+        msa_tool=SimpleNamespace(MsaToolResult=Result),
+    )
+    results = (
+        Result(
+            target_sequence="ACGU",
+            a3m=">query\nACGU\n>hitB/1-4 second\nACGU\n",
+            e_value=1e-3,
+            tblout=tblout("hitB", 50.0),
+        ),
+        Result(
+            target_sequence="ACGU",
+            a3m=(">query\nACGU\n>hitC/1-4 third\nACGU\n>hitA/1-4 first\nACGU\n"),
+            e_value=1e-3,
+            tblout="\n".join((
+                tblout("hitC", 10.0, "1e-2"),
+                tblout("hitA", 50.0),
+            )),
+        ),
+    )
+
+    merged = merge_nhmmer_results_by_reported_score(
+        module,
+        results,
+        max_sequences=3,
+    )
+
+    assert merged.a3m.splitlines() == [
+        ">query",
+        "ACGU",
+        ">hitA/1-4 first",
+        "ACGU",
+        ">hitB/1-4 second",
+        "ACGU",
+    ]
+
+
+def test_raw_msa_cache_requires_a_valid_completion_marker(tmp_path: Path) -> None:
+    result_root = tmp_path / "raw"
+    result_root.mkdir()
+    spec = resolve_database_profile("small_bfd")
+    provenance: dict[str, object] = {"identity": "fixture"}
+    context = SearchContext(
+        spec=spec,
+        sequence="ACDE",
+        sequence_hash=sequence_hash("ACDE"),
+        profile_root=tmp_path / "profile",
+        manifest_sha256="a" * 64,
+        search_identity="b" * 64,
+        provenance=provenance,
+        result_root=result_root,
+    )
+    files = {
+        "result": ("result.a3m", b">query\nACDE\n"),
+        "metrics": ("metrics.json", b"{}\n"),
+        "log": ("run.log", b"complete\n"),
+    }
+    artifacts = {}
+    for role, (name, content) in files.items():
+        (result_root / name).write_bytes(content)
+        artifacts[role] = _artifact(name, content)
+    (result_root / "done.json").write_bytes(
+        orjson.dumps({
+            "schema_version": RAW_RESULT_SCHEMA_VERSION,
+            "status": "complete",
+            "provenance": provenance,
+            "artifacts": artifacts,
+        })
+    )
+
+    entry = load_raw_msa(context)
+    assert isinstance(entry, RawMsaEntry)
+    assert entry.a3m == ">query\nACDE\n"
+
+    (result_root / "result.a3m").write_bytes(b">query\nCHANGED\n")
+    assert load_raw_msa(context) is None
+
+
+def test_template_cache_rejects_changed_template_bytes(tmp_path: Path) -> None:
+    context = build_template_context(
+        tmp_path,
+        "ACDE",
+        "a" * 64,
+        "2021-09-30",
+    )
+    context.sequence_root.mkdir(parents=True)
+    templates = [
+        {
+            "mmcif": "data_template\n#\n",
+            "queryIndices": [0],
+            "templateIndices": [0],
+        }
+    ]
+    template_bytes = orjson.dumps(templates)
+    (context.sequence_root / "templates.json").write_bytes(template_bytes)
+    (context.sequence_root / "templates.done.json").write_bytes(
+        orjson.dumps({
+            "schema_version": TEMPLATE_RESULT_SCHEMA_VERSION,
+            "status": "complete",
+            "provenance": context.provenance,
+            "templates": _artifact("templates.json", template_bytes),
+        })
+    )
+
+    entry = load_template_entry(context)
+    assert entry is not None
+    assert entry.templates == templates
+
+    (context.sequence_root / "templates.json").write_bytes(b"[]")
+    assert load_template_entry(context) is None
+
+
+def test_generation_claims_fence_active_and_terminal_writers() -> None:
+    store = FakeClaimStore()
+    first = acquire_generation_claim(
+        store,
+        scope_key="raw:Protein:sequence:small_bfd",
+        generation_id="first",
+        identity={"search": "one"},
+        container_id="container-a",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_000,
+        now_text="first-start",
+    )
+    with pytest.raises(ActiveGenerationError):
+        acquire_generation_claim(
+            store,
+            scope_key=first.scope_key,
+            generation_id="second",
+            identity={"search": "one"},
+            container_id="container-b",
+            maximum_age_seconds=100,
+            now_epoch_seconds=1_001,
+            now_text="second-start",
+        )
+
+    finish_generation_claim(
+        store,
+        first,
+        status="complete",
+        detail={"publication": "published"},
+        now_text="first-finish",
+    )
+    second = acquire_generation_claim(
+        store,
+        scope_key=first.scope_key,
+        generation_id="second",
+        identity={"search": "one"},
+        container_id="container-b",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_002,
+        now_text="second-start",
+    )
+
+    assert latest_generation_owner(store, first.scope_key) == second.owner
+    assert second.owner["predecessor_status"] == "complete"
+
+
+def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:
+    run_id = "c" * 64
+    marker_path = tmp_path / ".markers" / "seeds" / "42.json"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(
+        orjson.dumps({
+            "schema_version": SEED_MARKER_SCHEMA_VERSION,
+            "status": "complete",
+            "run_id": run_id,
+            "seed": 42,
+            "sample_count": 2,
+            "generation_id": "generation",
+            "rankings": [
+                {"seed": 42, "sample_index": 1, "ranking_score": 0.7},
+                {"seed": 42, "sample_index": 0, "ranking_score": 0.9},
+            ],
+        })
+    )
+
+    marker = load_seed_marker(tmp_path, run_id, 42, sample_count=2)
+    assert marker is not None
+    assert [row.sample_index for row in marker.rankings] == [0, 1]
+    assert load_seed_marker(tmp_path, run_id, 42, sample_count=1) is None
+
+
+def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
+    run_id = "d" * 64
+    normalized_seeds = [7]
+    request_id = hash_sequences(run_id, normalized_seeds)
+    canonical_name = canonical_output_name(run_id)
+    input_bytes = serialize_af3_input(
+        AF3Config(
+            name=canonical_name,
+            modelSeeds=normalized_seeds,
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        )
+    )
+    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+    manifest: dict[str, object] = {
+        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
+        "status": "complete",
+        "run_id": run_id,
+        "request_id": request_id,
+        "canonical_name": canonical_name,
+        "normalized_seeds": normalized_seeds,
+        "artifacts": [
+            {
+                "role": "input",
+                "volume_path": volume_path,
+                "archive_path": f"{canonical_name}_data.json",
+                "size_bytes": len(input_bytes),
+            }
+        ],
+    }
+
+    archive = create_request_archive(
+        FakeVolumeReader({volume_path: input_bytes}),
+        manifest,
+        output_dir=tmp_path,
+        display_name="Readable Name",
+    )
+
+    assert archive.name == f"Readable_Name_{request_id[:12]}_AlphaFold3.tar.zst"
+    archived_input = "\n".join(
+        run_command(
+            [
+                "tar",
+                "-I",
+                "zstd",
+                "-xOf",
+                str(archive),
+                "Readable_Name/Readable_Name_data.json",
+            ],
+            output_mode="capture",
+            show_command=False,
+        )
+    )
+    assert orjson.loads(archived_input)["name"] == "Readable Name"
+
+
+def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> None:
+    run_id = "e" * 64
+    normalized_seeds = [9]
+    request_id = hash_sequences(run_id, normalized_seeds)
+    canonical_name = canonical_output_name(run_id)
+    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+    manifest: dict[str, object] = {
+        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
+        "status": "complete",
+        "run_id": run_id,
+        "request_id": request_id,
+        "canonical_name": canonical_name,
+        "normalized_seeds": normalized_seeds,
+        "artifacts": [
+            {
+                "role": "input",
+                "volume_path": volume_path,
+                "archive_path": f"{canonical_name}_data.json",
+                "size_bytes": 10,
+            }
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="Downloaded size mismatch"):
+        create_request_archive(
+            FakeVolumeReader({volume_path: b"partial"}),
+            manifest,
+            output_dir=tmp_path,
+            display_name="partial",
+        )
+
+
+def test_every_fixed_profile_has_one_missing_build_input() -> None:
+    inventory: dict[str, object] = {
+        "invalid_profiles": {},
+        "missing_database_ids": [
+            spec.database_id for spec in reversed(DATABASE_PROFILE_SPECS)
+        ],
+    }
+
+    planned = plan_missing_profile_builds(
+        inventory,
+        seqkit_threads=DEFAULT_SEQKIT_THREADS,
+        source_policy="keep",
+    )
+
+    assert [database_id for database_id, _, _ in planned] == [
+        spec.database_id for spec in DATABASE_PROFILE_SPECS
+    ]

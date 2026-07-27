@@ -79,7 +79,7 @@ source paths, shard counts, polymer types, Z values, or profile IDs.
 | `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
 | `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
 | `uniprot` | `uniprot-384-v1` | `uniprot_all_2021_04.fa` | 384 | protein |
-| `uniref90` | `uniref90-128-v1` | `uniref90_2022_05.fa` | 128 | protein |
+| `uniref90` | `uniref90-256-v1` | `uniref90_2022_05.fa` | 256 | protein |
 | `ntrna` | `nt-rna-256-v1` | `nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta` | 256 | RNA |
 | `rfam` | `rfam-16-v1` | `rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta` | 16 | RNA |
 | `rnacentral` | `rnacentral-64-v1` | `rnacentral_active_seq_id_90_cov_80_linclust.fasta` | 64 | RNA |
@@ -95,9 +95,13 @@ candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
 Scientifically validated alternatives `uniprot-384-v1` and
 `uniref90-256-v1` were compared with the earlier profiles. The selection
 promotes UniProt 384 because its observed 16x2 search was materially faster
-while retaining scientific equivalence, and keeps UniRef90 128 because the
-256-shard observation was slower. `uniprot-256-v1` and `uniref90-256-v1`
-remain immutable experimental evidence but are not production selections.
+while retaining scientific equivalence. The 2026-07-27 production
+end-to-end-test decision explicitly selects UniRef90 256 as well. This
+supersedes the earlier Checklist 3 preference for UniRef90 128 despite the
+single 16x2 comparison finding the 256-shard profile slower; the 256-shard
+profile had already passed the scientific oracle, and production telemetry
+will measure the selected behavior. `uniprot-256-v1` and `uniref90-128-v1`
+remain immutable experimental evidence rather than production selections.
 
 `seqkit_threads` controls SeqKit statistics/splitting and the native shuffler
 and validator workers. It is operational: changing it does not select a

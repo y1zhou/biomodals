@@ -113,8 +113,7 @@ The two-call critical path fell from 605.2 to 218.5 seconds and the summed
 successful-search estimate fell from $0.2063 to $0.1247. Those aggregates
 should not hide the opposite per-database outcomes. At fixed active fanout,
 UniRef90 doubled from eight to sixteen waves and became correspondingly
-slower, so `uniref90-256-v1` is not a production candidate for the 16x2
-topology.
+slower in this observation.
 
 The UniProt result is promising but does not isolate shard count. The baseline
 ran in a four-database concurrent batch on GCP `europe-west1`; the candidate
@@ -124,11 +123,13 @@ combination has one sample, by design. The measured outcomes are valid, but
 provider, region, concurrent Volume load, and profile warmth prevent treating
 the 4.09x UniProt difference as shard-count-only causality.
 
-The Checklist 3 production decision keeps `uniref90-128-v1`, because its
-finer candidate was scientifically equivalent but slower, and selects
-`uniprot-384-v1`. The latter remains scientifically equivalent and was
-materially faster in the one-shot observation; the fixed identity makes the
-choice reversible if later production telemetry contradicts it.
+Checklist 3 initially kept `uniref90-128-v1`, because its finer candidate was
+scientifically equivalent but slower, and selected `uniprot-384-v1`. On
+2026-07-27 the user explicitly superseded that operational choice and selected
+`uniref90-256-v1` for production end-to-end testing. Both selected profiles
+remain scientifically equivalent to their monoliths. The fixed identities
+preserve the measured tradeoff and make either choice reversible if production
+telemetry warrants it.
 
 The durable machine-readable summary is stored in
 `AlphaFold3-MSA-Benchmark-outputs` at
@@ -236,7 +237,7 @@ value, or polymer type.
 | `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
 | `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
 | `uniprot` | `uniprot-384-v1` | `uniprot_all_2021_04.fa` | 384 | protein |
-| `uniref90` | `uniref90-128-v1` | `uniref90_2022_05.fa` | 128 | protein |
+| `uniref90` | `uniref90-256-v1` | `uniref90_2022_05.fa` | 256 | protein |
 | `ntrna` | `nt-rna-256-v1` | `nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta` | 256 | RNA |
 | `rfam` | `rfam-16-v1` | `rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta` | 16 | RNA |
 | `rnacentral` | `rnacentral-64-v1` | `rnacentral_active_seq_id_90_cov_80_linclust.fasta` | 64 | RNA |
@@ -251,9 +252,9 @@ The completed `small-bfd-64-v1` profile was a benchmark-only predecessor to
 whose shuffled FASTA stays under `/tmp`. After all seven production candidates
 passed validation, a read-only Sandbox inventory on 2026-07-24 confirmed the
 then-fixed seven directories. That inventory predates the shard-count A/B.
-The Volume now also contains the validated immutable experimental profiles
-`uniprot-384-v1` and `uniref90-256-v1`; Checklist 3 promotes the former and
-keeps the latter as non-production evidence.
+The Volume now contains the validated immutable profiles `uniprot-384-v1` and
+`uniref90-256-v1`. The 2026-07-27 production decision selects both; the
+earlier profiles and one-shot timing comparison remain immutable evidence.
 
 Runtime search reads a fixed `/profiles/{profile_id}/manifest.json` only to
 obtain and bind the trusted profile identity and search-space value. It never

@@ -45,16 +45,13 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.profile_manifest import (
+    current_profile_recipe,
+    profile_compatibility_identity,
     validate_profile_manifest,
     validate_published_profile,
 )
 from biomodals.app.fold.alphafold3.profiles import (
-    ALPHAFOLD3_COMMIT,
-    ALPHAFOLD3_REPOSITORY,
-    COMPOSABLE_MULTISET_RECIPE_VERSION,
     DATABASE_PROFILE_SPECS,
-    HMMER_VERSION,
-    JACKHMMER_PATCH_SHA256,
     MAX_PROFILE_IMBALANCE,
     PROFILE_SCHEMA_VERSION,
     PROFILE_STALE_SECONDS,
@@ -66,6 +63,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     DatabaseProfileSpec,
     SourcePolicy,
     profile_root,
+    record_multiset_identity,
     resolve_database_profile,
     shard_filename,
     shard_names,
@@ -73,12 +71,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     validate_source_policy,
 )
 from biomodals.app.fold.alphafold3.sharding import (
-    ORDINAL_SHUFFLER_PREFETCH_BYTES,
-    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-    ORDINAL_SHUFFLER_SOURCE_SHA256,
-    ORDINAL_SHUFFLER_VERSION,
     compile_record_multiset_validator,
-    record_multiset_identity,
     record_multiset_signature,
     require_executable,
     required_ordinal_shuffler_scratch_bytes,
@@ -939,50 +932,8 @@ def build_profile_manifest(
             else statistics["sum_len"] / 1_000_000
         ),
         "search_space_unit": spec.search_space_unit,
-        "compatibility": {
-            "alphafold_repository": ALPHAFOLD3_REPOSITORY,
-            "alphafold_commit": ALPHAFOLD3_COMMIT,
-            "hmmer_version": HMMER_VERSION,
-            "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
-        },
-        "recipe": {
-            "version": COMPOSABLE_MULTISET_RECIPE_VERSION,
-            "seqkit_version": SEQKIT_VERSION,
-            "seqkit_threads": seqkit_threads,
-            "random_seed": SHARD_RANDOM_SEED,
-            "shuffle": [
-                "two-pass",
-                "first-pass-stage-local-source",
-                "source-occurrence-offset-index",
-                "splitmix64-fisher-yates-u32",
-                "bounded-concurrent-local-pread",
-                "ordered-write",
-            ],
-            "shuffler": {
-                "version": ORDINAL_SHUFFLER_VERSION,
-                "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
-                "record_identity": "source-occurrence",
-                "offset_index": "uint64-source-occurrence-offsets-v1",
-                "permutation": "splitmix64-fisher-yates-u32-v1",
-                "staging": "first-pass-tee-to-container-local-v1",
-                "read": "bounded-concurrent-local-pread-ordered-write-v2",
-                "ordered_output": True,
-            },
-            "execution": {
-                "worker_threads": seqkit_threads,
-                "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-                "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
-            },
-            "duplicate_recovery": {
-                "warning_source": None,
-                "record_identity": "source-occurrence",
-                "append_after_shuffle": False,
-                "strip_after_split": False,
-            },
-            "record_multiset": record_multiset_identity()
-            | {"shard_threads": seqkit_threads},
-            "split": ["--by-part", spec.shard_count],
-        },
+        "compatibility": profile_compatibility_identity(),
+        "recipe": current_profile_recipe(spec, seqkit_threads),
         "validation": {
             "passed": True,
             "num_seqs": statistics["num_seqs"],

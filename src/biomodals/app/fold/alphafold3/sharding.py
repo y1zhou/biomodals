@@ -20,21 +20,16 @@ from biomodals.app.fold.alphafold3.artifacts import (
     sha256_file,
     write_json_atomic,
 )
+from biomodals.app.fold.alphafold3.profiles import (
+    ORDINAL_SHUFFLER_PREFETCH_BYTES,
+    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+    ORDINAL_SHUFFLER_SOURCE_SHA256,
+    ORDINAL_SHUFFLER_VERSION,
+    RECORD_MULTISET_SOURCE_SHA256,
+    RECORD_MULTISET_VERSION,
+    record_multiset_identity,
+)
 
-ORDINAL_SHUFFLER_VERSION = "af3-fasta-two-pass-v2"
-ORDINAL_SHUFFLER_PREFETCH_RECORDS = 65_536
-ORDINAL_SHUFFLER_PREFETCH_BYTES = 256 * 1024 * 1024
-ORDINAL_SHUFFLER_SOURCE_SHA256 = (
-    "ea9318fd9382d54321081cc1862fa636cd5a2868d1f1ee40a5d211106c8b6f9c"
-)
-RECORD_MULTISET_VERSION = "af3-fasta-record-multiset-v1"
-RECORD_MULTISET_SOURCE_SHA256 = (
-    "52556f6181a42d17a9db19d0ca745b371bf84e57349075c65ce8a911f8ad722e"
-)
-RECORD_MULTISET_CANONICALIZATION = (
-    "full-header-and-sequence-case-sensitive-line-ending-independent-v1"
-)
-RECORD_MULTISET_AGGREGATE = "sha256-lane-sum-xor-and-square-sum-with-counts-v1"
 SHUFFLER_SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024
 
 NATIVE_SOURCE_DIR_ENV = "BIOMODALS_AF3_NATIVE_SOURCE_DIR"
@@ -177,17 +172,6 @@ def compile_record_multiset_validator(
 ) -> Path:
     """Compile the pinned composable FASTA-record validator."""
     return _compile_native_tool(RECORD_MULTISET_VALIDATOR, scratch_root, log_path)
-
-
-def record_multiset_identity() -> dict[str, str]:
-    """Return the canonical-record multiset algorithm identity."""
-    return {
-        "version": RECORD_MULTISET_VERSION,
-        "source_code_sha256": RECORD_MULTISET_SOURCE_SHA256,
-        "canonicalization": RECORD_MULTISET_CANONICALIZATION,
-        "digest": "sha256",
-        "aggregate": RECORD_MULTISET_AGGREGATE,
-    }
 
 
 def record_multiset_signature(report: dict[str, Any]) -> dict[str, object]:

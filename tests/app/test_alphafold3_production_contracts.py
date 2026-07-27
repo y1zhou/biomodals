@@ -73,11 +73,16 @@ from biomodals.app.fold.alphafold3.profiles import (
     DEFAULT_SEQKIT_THREADS,
     HMMER_VERSION,
     JACKHMMER_PATCH_SHA256,
+    ORDINAL_SHUFFLER_PREFETCH_BYTES,
+    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+    ORDINAL_SHUFFLER_SOURCE_SHA256,
+    ORDINAL_SHUFFLER_VERSION,
     PROFILE_SCHEMA_VERSION,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
+    record_multiset_identity,
     resolve_database_profile,
     shard_names,
 )
@@ -94,13 +99,6 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SeedClaimPlan,
     canonical_output_name,
     load_seed_marker,
-)
-from biomodals.app.fold.alphafold3.sharding import (
-    ORDINAL_SHUFFLER_PREFETCH_BYTES,
-    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-    ORDINAL_SHUFFLER_SOURCE_SHA256,
-    ORDINAL_SHUFFLER_VERSION,
-    record_multiset_identity,
 )
 from biomodals.app.fold.alphafold3.template_search import (
     TEMPLATE_RESULT_SCHEMA_VERSION,
@@ -343,6 +341,7 @@ def test_profile_manifest_builder_preserves_the_fixed_recipe(tmp_path: Path) -> 
     validate_profile_manifest(manifest, spec)
     recipe = cast(dict[str, object], manifest["recipe"])
     validation = cast(dict[str, object], manifest["validation"])
+    assert recipe == _profile_manifest("small_bfd")["recipe"]
     assert recipe["version"] == COMPOSABLE_MULTISET_RECIPE_VERSION
     assert validation["canonical_record_multiset_match"] is True
     artifacts = cast(list[dict[str, object]], validation["artifacts"])

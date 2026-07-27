@@ -25,7 +25,11 @@ from biomodals.app.fold.alphafold3.profiles import (
     JACKHMMER_PATCH_SHA256,
     LEGACY_PROFILE_RECIPE_VERSION,
     LEGACY_VALIDATION_RELPATHS,
+    ORDINAL_SHUFFLER_PREFETCH_BYTES,
+    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
     ORDINAL_SHUFFLER_RECIPE_VERSION,
+    ORDINAL_SHUFFLER_SOURCE_SHA256,
+    ORDINAL_SHUFFLER_VERSION,
     ORDINAL_VALIDATION_RELPATHS,
     PROFILE_SCHEMA_VERSION,
     SEQKIT_VERSION,
@@ -33,16 +37,65 @@ from biomodals.app.fold.alphafold3.profiles import (
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
+    record_multiset_identity,
     shard_names,
     validate_seqkit_threads,
 )
-from biomodals.app.fold.alphafold3.sharding import (
-    ORDINAL_SHUFFLER_PREFETCH_BYTES,
-    ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-    ORDINAL_SHUFFLER_SOURCE_SHA256,
-    ORDINAL_SHUFFLER_VERSION,
-    record_multiset_identity,
-)
+
+
+def profile_compatibility_identity() -> dict[str, str]:
+    """Return the exact upstream and adapter identity accepted by profiles."""
+    return {
+        "alphafold_repository": ALPHAFOLD3_REPOSITORY,
+        "alphafold_commit": ALPHAFOLD3_COMMIT,
+        "hmmer_version": HMMER_VERSION,
+        "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
+    }
+
+
+def current_profile_recipe(
+    spec: DatabaseProfileSpec,
+    seqkit_threads: int,
+) -> dict[str, object]:
+    """Return the one recipe emitted for newly built database profiles."""
+    threads = validate_seqkit_threads(seqkit_threads)
+    return {
+        "version": COMPOSABLE_MULTISET_RECIPE_VERSION,
+        "seqkit_version": SEQKIT_VERSION,
+        "seqkit_threads": threads,
+        "random_seed": SHARD_RANDOM_SEED,
+        "shuffle": [
+            "two-pass",
+            "first-pass-stage-local-source",
+            "source-occurrence-offset-index",
+            "splitmix64-fisher-yates-u32",
+            "bounded-concurrent-local-pread",
+            "ordered-write",
+        ],
+        "shuffler": {
+            "version": ORDINAL_SHUFFLER_VERSION,
+            "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
+            "record_identity": "source-occurrence",
+            "offset_index": "uint64-source-occurrence-offsets-v1",
+            "permutation": "splitmix64-fisher-yates-u32-v1",
+            "staging": "first-pass-tee-to-container-local-v1",
+            "read": "bounded-concurrent-local-pread-ordered-write-v2",
+            "ordered_output": True,
+        },
+        "execution": {
+            "worker_threads": threads,
+            "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
+            "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
+        },
+        "duplicate_recovery": {
+            "warning_source": None,
+            "record_identity": "source-occurrence",
+            "append_after_shuffle": False,
+            "strip_after_split": False,
+        },
+        "record_multiset": record_multiset_identity() | {"shard_threads": threads},
+        "split": ["--by-part", spec.shard_count],
+    }
 
 
 def _validate_recipe(
@@ -86,44 +139,18 @@ def _validate_recipe(
         COMPOSABLE_MULTISET_RECIPE_VERSION,
     }:
         raise ValueError("Unexpected profile recipe version")
-    if recipe.get("shuffle") != [
-        "two-pass",
-        "first-pass-stage-local-source",
-        "source-occurrence-offset-index",
-        "splitmix64-fisher-yates-u32",
-        "bounded-concurrent-local-pread",
-        "ordered-write",
-    ]:
+    current_recipe = current_profile_recipe(spec, seqkit_threads)
+    if recipe.get("shuffle") != current_recipe["shuffle"]:
         raise ValueError("Unexpected occurrence-indexed shuffle recipe")
-    if recipe.get("shuffler") != {
-        "version": ORDINAL_SHUFFLER_VERSION,
-        "source_code_sha256": ORDINAL_SHUFFLER_SOURCE_SHA256,
-        "record_identity": "source-occurrence",
-        "offset_index": "uint64-source-occurrence-offsets-v1",
-        "permutation": "splitmix64-fisher-yates-u32-v1",
-        "staging": "first-pass-tee-to-container-local-v1",
-        "read": "bounded-concurrent-local-pread-ordered-write-v2",
-        "ordered_output": True,
-    }:
+    if recipe.get("shuffler") != current_recipe["shuffler"]:
         raise ValueError("Unexpected native shuffler identity")
-    if recipe.get("execution") != {
-        "worker_threads": seqkit_threads,
-        "prefetch_records": ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-        "prefetch_bytes": ORDINAL_SHUFFLER_PREFETCH_BYTES,
-    }:
+    if recipe.get("execution") != current_recipe["execution"]:
         raise ValueError("Unexpected native shuffler execution plan")
-    if recipe.get("duplicate_recovery") != {
-        "warning_source": None,
-        "record_identity": "source-occurrence",
-        "append_after_shuffle": False,
-        "strip_after_split": False,
-    }:
+    if recipe.get("duplicate_recovery") != current_recipe["duplicate_recovery"]:
         raise ValueError("Unexpected occurrence-indexed duplicate policy")
     if recipe_version == ORDINAL_SHUFFLER_RECIPE_VERSION:
         return recipe_version, (ORDINAL_VALIDATION_RELPATHS,)
-    if recipe.get("record_multiset") != (
-        record_multiset_identity() | {"shard_threads": seqkit_threads}
-    ):
+    if recipe.get("record_multiset") != current_recipe["record_multiset"]:
         raise ValueError("Unexpected composable record-multiset validator")
     return recipe_version, (
         VALIDATION_RELPATHS,
@@ -187,12 +214,7 @@ def validate_profile_manifest(
         raise ValueError(f"Profile must declare {spec.shard_count} shards")
     if not isinstance(recipe, dict):
         raise ValueError("Profile recipe must be an object")
-    if compatibility != {
-        "alphafold_repository": ALPHAFOLD3_REPOSITORY,
-        "alphafold_commit": ALPHAFOLD3_COMMIT,
-        "hmmer_version": HMMER_VERSION,
-        "jackhmmer_patch_sha256": JACKHMMER_PATCH_SHA256,
-    }:
+    if compatibility != profile_compatibility_identity():
         raise ValueError("Unexpected profile compatibility pin")
     recipe_version, allowed_validation_relpaths = _validate_recipe(recipe, spec)
 

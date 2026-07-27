@@ -1,0 +1,630 @@
+"""Resumable AlphaFold 3 protein-template search.
+
+Template search is deliberately separate from the sharded MSA phase. It reads
+the fixed PDB sequence/mmCIF store directly and publishes only canonical
+sequence-plus-unpaired-MSA results.
+"""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import inspect
+import os
+import re
+import shutil
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol, cast
+
+import orjson
+
+from biomodals.app.fold.alphafold3.generation_claims import (
+    ActiveGenerationError,
+    ClaimStore,
+    GenerationClaim,
+    acquire_generation_claim,
+    assert_generation_current,
+    finish_generation_claim,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    sequence_cache_relpath,
+    sequence_hash,
+    validate_query,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    ALPHAFOLD3_COMMIT,
+    HMMER_VERSION,
+    resolve_database_profile,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    append_log,
+    require_regular_file,
+    sha256_file,
+    utc_now,
+    write_json_atomic,
+)
+
+DEFAULT_MAX_TEMPLATE_DATE = "2021-09-30"
+PDB_SEQRES_FILENAME = "pdb_seqres_2022_09_28.fasta"
+MMCIF_DIRECTORY_NAME = "mmcif_files"
+HMMSEARCH_BINARY_PATH = "/hmmer/bin/hmmsearch"
+HMMBUILD_BINARY_PATH = "/hmmer/bin/hmmbuild"
+HMMSEARCH_N_CPU = 8
+
+TEMPLATE_RESULT_SCHEMA_VERSION = 1
+TEMPLATE_IDENTITY_SCHEMA_VERSION = 1
+TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
+
+_JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
+
+
+class VolumeHandle(Protocol):
+    """Persistence barriers required from a mounted Modal Volume."""
+
+    def reload(self) -> None:
+        """Reload commits made by other containers."""
+        ...
+
+    def commit(self) -> None:
+        """Commit this container's changes."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateRuntime:
+    """Mounted resources and coordination state for one template worker."""
+
+    source_root: Path
+    cache_root: Path
+    source_volume: VolumeHandle
+    cache_volume: VolumeHandle
+    claims: ClaimStore
+    container_id: str
+    maximum_age_seconds: int | float
+    wait_timeout_seconds: int | float
+    claim_poll_seconds: float = 5.0
+    function_call_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateTask:
+    """One deduplicated protein template-search input."""
+
+    sequence: str
+    unpaired_msa: str
+    publish_canonical: bool
+    max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE
+
+    @property
+    def unpaired_msa_sha256(self) -> str:
+        """Return the content identity of the resolved unpaired MSA."""
+        return _sha256_bytes(self.unpaired_msa.encode())
+
+    @property
+    def template_identity(self) -> str:
+        """Return the scientific identity of this template search."""
+        return template_search_identity(
+            self.sequence,
+            self.unpaired_msa_sha256,
+            self.max_template_date,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateContext:
+    """Expected identity and flat cache location for one template result."""
+
+    sequence: str
+    sequence_hash: str
+    unpaired_msa_sha256: str
+    max_template_date: str
+    template_identity: str
+    provenance: dict[str, object]
+    sequence_root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateEntry:
+    """One validated canonical template publication."""
+
+    context: TemplateContext
+    templates: list[dict[str, object]]
+    done_sha256: str
+    artifact: dict[str, object]
+
+    def summary(self, status: str) -> dict[str, object]:
+        """Return a reusable result for the local coordinator."""
+        return {
+            "status": status,
+            "sequence_sha256": self.context.sequence_hash,
+            "unpaired_msa_sha256": self.context.unpaired_msa_sha256,
+            "template_identity": self.context.template_identity,
+            "done_sha256": self.done_sha256,
+            "templates": self.templates,
+            "artifact": self.artifact,
+        }
+
+
+def _json_bytes(value: object) -> bytes:
+    return orjson.dumps(value, option=_JSON_OPTIONS)
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def validate_max_template_date(value: str) -> str:
+    """Validate and normalize an ISO template-date cutoff."""
+    if not isinstance(value, str):
+        raise TypeError("max_template_date must be a string")
+    try:
+        parsed = datetime.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("max_template_date must use YYYY-MM-DD") from exc
+    return parsed.isoformat()
+
+
+def template_search_parameters(max_template_date: str) -> dict[str, object]:
+    """Return every result-affecting upstream template parameter."""
+    selected_date = validate_max_template_date(max_template_date)
+    return {
+        "tool": "hmmsearch",
+        "hmmsearch_n_cpu": HMMSEARCH_N_CPU,
+        "max_template_date": selected_date,
+        "max_a3m_query_sequences": None,
+        "hmmsearch": {
+            "filter_f1": 0.1,
+            "filter_f2": 0.1,
+            "filter_f3": 0.1,
+            "e_value": 100,
+            "inc_e": 100,
+            "dom_e": 100,
+            "incdom_e": 100,
+            "alphabet": "amino",
+            "filter_max": False,
+        },
+        "filter": {
+            "max_subsequence_ratio": 0.95,
+            "min_align_ratio": 0.1,
+            "min_hit_length": 10,
+            "deduplicate_sequences": True,
+            "max_hits": 4,
+        },
+    }
+
+
+def template_search_identity(
+    sequence: str,
+    unpaired_msa_sha256: str,
+    max_template_date: str,
+) -> str:
+    """Hash the scientific identity of one protein template search."""
+    validate_query(resolve_database_profile("uniref90"), sequence)
+    if re.fullmatch(r"[0-9a-f]{64}", unpaired_msa_sha256) is None:
+        raise ValueError("unpaired_msa_sha256 must be a lowercase SHA-256 digest")
+    return _sha256_bytes(
+        _json_bytes({
+            "schema_version": TEMPLATE_IDENTITY_SCHEMA_VERSION,
+            "adapter_version": TEMPLATE_ADAPTER_VERSION,
+            "sequence": sequence,
+            "unpaired_msa_sha256": unpaired_msa_sha256,
+            "parameters": template_search_parameters(max_template_date),
+            "alphafold_commit": ALPHAFOLD3_COMMIT,
+            "hmmer_version": HMMER_VERSION,
+        })
+    )
+
+
+def build_template_context(
+    cache_root: Path,
+    sequence: str,
+    unpaired_msa_sha256: str,
+    max_template_date: str,
+) -> TemplateContext:
+    """Build one expected flat template-cache identity."""
+    selected_date = validate_max_template_date(max_template_date)
+    query = validate_query(resolve_database_profile("uniref90"), sequence)
+    template_identity = template_search_identity(
+        query,
+        unpaired_msa_sha256,
+        selected_date,
+    )
+    query_hash = sequence_hash(query)
+    provenance: dict[str, object] = {
+        "sequence_sha256": query_hash,
+        "sequence_length": len(query),
+        "unpaired_msa_sha256": unpaired_msa_sha256,
+        "template_identity": template_identity,
+        "parameters": template_search_parameters(selected_date),
+        "adapter_version": TEMPLATE_ADAPTER_VERSION,
+        "alphafold_commit": ALPHAFOLD3_COMMIT,
+        "hmmer_version": HMMER_VERSION,
+    }
+    return TemplateContext(
+        sequence=query,
+        sequence_hash=query_hash,
+        unpaired_msa_sha256=unpaired_msa_sha256,
+        max_template_date=selected_date,
+        template_identity=template_identity,
+        provenance=provenance,
+        sequence_root=cache_root / sequence_cache_relpath("protein", query),
+    )
+
+
+def _load_artifact(
+    root: Path,
+    record: object,
+    expected_path: str,
+) -> bytes | None:
+    if not isinstance(record, dict) or record.get("path") != expected_path:
+        return None
+    path = root / expected_path
+    if not path.is_file():
+        return None
+    try:
+        value = path.read_bytes()
+    except OSError:
+        return None
+    if (
+        isinstance(record.get("size_bytes"), bool)
+        or record.get("size_bytes") != len(value)
+        or record.get("sha256") != _sha256_bytes(value)
+    ):
+        return None
+    return value
+
+
+def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
+    """Validate and load one marker-complete template publication."""
+    done_path = context.sequence_root / "templates.done.json"
+    if not done_path.is_file():
+        return None
+    try:
+        done_bytes = done_path.read_bytes()
+        done = orjson.loads(done_bytes)
+    except (OSError, orjson.JSONDecodeError):
+        return None
+    if (
+        not isinstance(done, dict)
+        or done.get("schema_version") != TEMPLATE_RESULT_SCHEMA_VERSION
+        or done.get("status") != "complete"
+        or done.get("provenance") != context.provenance
+    ):
+        return None
+    artifact = done.get("templates")
+    templates_bytes = _load_artifact(
+        context.sequence_root,
+        artifact,
+        "templates.json",
+    )
+    if templates_bytes is None:
+        return None
+    try:
+        templates = orjson.loads(templates_bytes)
+    except orjson.JSONDecodeError:
+        return None
+    if not isinstance(templates, list) or not all(
+        isinstance(template, dict) for template in templates
+    ):
+        return None
+    return TemplateEntry(
+        context=context,
+        templates=cast(list[dict[str, object]], templates),
+        done_sha256=_sha256_bytes(done_bytes),
+        artifact=cast(dict[str, object], artifact),
+    )
+
+
+def inspect_template_entries(
+    cache_root: Path,
+    inputs: tuple[tuple[str, str, str], ...],
+) -> list[dict[str, object]]:
+    """Inspect canonical template markers and return reusable payloads."""
+    statuses: list[dict[str, object]] = []
+    for sequence, unpaired_msa_sha256, max_template_date in inputs:
+        context = build_template_context(
+            cache_root,
+            sequence,
+            unpaired_msa_sha256,
+            max_template_date,
+        )
+        entry = load_template_entry(context)
+        if entry is None:
+            statuses.append({
+                "status": "missing",
+                "sequence_sha256": context.sequence_hash,
+                "unpaired_msa_sha256": context.unpaired_msa_sha256,
+                "template_identity": context.template_identity,
+            })
+        else:
+            statuses.append(entry.summary("reused"))
+    return statuses
+
+
+def assert_pinned_template_contract() -> dict[str, str]:
+    """Bind the adapter to the pinned upstream template call and conversion."""
+    from importlib import import_module
+
+    pipeline = import_module("alphafold3.data.pipeline")
+    templates_module = import_module("alphafold3.data.templates")
+    pipeline_source = inspect.getsource(pipeline._get_protein_templates)  # noqa: SLF001
+    compact_pipeline = re.sub(r"\s+", "", pipeline_source)
+    required_pipeline = (
+        "Templates.from_seq_and_a3m(",
+        "max_a3m_query_sequences=None",
+        "chain_poly_type=mmcif_names.PROTEIN_CHAIN",
+        "structure_store=structure_stores.StructureStore(pdb_database_path)",
+    )
+    if not all(
+        pattern.replace(" ", "") in compact_pipeline for pattern in required_pipeline
+    ):
+        raise RuntimeError("Pinned protein template-search contract changed")
+    structures_source = inspect.getsource(
+        templates_module.Templates.get_hits_with_structures
+    )
+    return {
+        "get_protein_templates_sha256": _sha256_bytes(pipeline_source.encode()),
+        "get_hits_with_structures_sha256": _sha256_bytes(structures_source.encode()),
+    }
+
+
+def execute_template_search(
+    sequence: str,
+    unpaired_msa: str,
+    source_root: Path,
+    max_template_date: str,
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    """Run the exact pinned eight-CPU template search and serialize its hits."""
+    from importlib import import_module
+
+    query = validate_query(resolve_database_profile("uniref90"), sequence)
+    if not isinstance(unpaired_msa, str) or not unpaired_msa:
+        raise ValueError("unpaired_msa must be a non-empty A3M string")
+    selected_date = datetime.date.fromisoformat(
+        validate_max_template_date(max_template_date)
+    )
+    seqres_path = source_root / PDB_SEQRES_FILENAME
+    mmcif_path = source_root / MMCIF_DIRECTORY_NAME
+    require_regular_file(seqres_path)
+    if not mmcif_path.is_dir():
+        raise FileNotFoundError(f"Expected mmCIF directory: {mmcif_path}")
+
+    contract = assert_pinned_template_contract()
+    msa_config = import_module("alphafold3.data.msa_config")
+    mmcif_names = import_module("alphafold3.constants.mmcif_names")
+    pipeline = import_module("alphafold3.data.pipeline")
+    template_config = msa_config.TemplatesConfig(
+        template_tool_config=msa_config.TemplateToolConfig(
+            database_path=str(seqres_path),
+            chain_poly_type=mmcif_names.PROTEIN_CHAIN,
+            hmmsearch_config=msa_config.HmmsearchConfig(
+                hmmsearch_binary_path=HMMSEARCH_BINARY_PATH,
+                hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
+                filter_f1=0.1,
+                filter_f2=0.1,
+                filter_f3=0.1,
+                e_value=100,
+                inc_e=100,
+                dom_e=100,
+                incdom_e=100,
+                alphabet="amino",
+                filter_max=False,
+            ),
+        ),
+        filter_config=msa_config.TemplateFilterConfig(
+            max_subsequence_ratio=0.95,
+            min_align_ratio=0.1,
+            min_hit_length=10,
+            deduplicate_sequences=True,
+            max_hits=4,
+            max_template_date=selected_date,
+        ),
+    )
+    template_hits = pipeline._get_protein_templates(  # noqa: SLF001
+        sequence=query,
+        input_msa_a3m=unpaired_msa,
+        run_template_search=True,
+        templates_config=template_config,
+        pdb_database_path=str(mmcif_path),
+    )
+    templates: list[dict[str, object]] = []
+    for hit, structure in template_hits.get_hits_with_structures():
+        mapping = list(hit.query_to_hit_mapping.items())
+        templates.append({
+            "mmcif": structure.to_mmcif(),
+            "queryIndices": [query_index for query_index, _ in mapping],
+            "templateIndices": [template_index for _, template_index in mapping],
+        })
+    return templates, contract
+
+
+def _artifact_record(path: Path, root: Path) -> dict[str, object]:
+    require_regular_file(path)
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def _template_claim_scope(context: TemplateContext) -> str:
+    return f"template:Protein:{context.sequence_hash}"
+
+
+def _wait_for_template_claim(
+    runtime: TemplateRuntime,
+    context: TemplateContext,
+) -> tuple[TemplateEntry | None, GenerationClaim | None]:
+    generation_id = uuid.uuid4().hex
+    deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
+    while True:
+        runtime.cache_volume.reload()
+        if entry := load_template_entry(context):
+            return entry, None
+        try:
+            claim = acquire_generation_claim(
+                runtime.claims,
+                scope_key=_template_claim_scope(context),
+                generation_id=generation_id,
+                identity=context.provenance,
+                container_id=runtime.container_id,
+                maximum_age_seconds=runtime.maximum_age_seconds,
+            )
+            return None, claim
+        except ActiveGenerationError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                owner = exc.owner["generation_id"]
+                raise TimeoutError(
+                    f"Timed out waiting for template owner {owner!r}: "
+                    f"{context.sequence_hash}"
+                ) from exc
+            time.sleep(min(runtime.claim_poll_seconds, remaining))
+
+
+def run_template_search(
+    runtime: TemplateRuntime,
+    task: TemplateTask,
+) -> dict[str, object]:
+    """Run a request-local search or publish one canonical template result."""
+    if not isinstance(task.publish_canonical, bool):
+        raise TypeError("publish_canonical must be a boolean")
+    validate_query(resolve_database_profile("uniref90"), task.sequence)
+    if not isinstance(task.unpaired_msa, str) or not task.unpaired_msa:
+        raise ValueError("unpaired_msa must be a non-empty A3M string")
+    runtime.source_volume.reload()
+    context = build_template_context(
+        runtime.cache_root,
+        task.sequence,
+        task.unpaired_msa_sha256,
+        task.max_template_date,
+    )
+    if not task.publish_canonical:
+        started = time.perf_counter()
+        templates, contract = execute_template_search(
+            task.sequence,
+            task.unpaired_msa,
+            runtime.source_root,
+            task.max_template_date,
+        )
+        return {
+            "status": "request-local",
+            "sequence_sha256": context.sequence_hash,
+            "unpaired_msa_sha256": context.unpaired_msa_sha256,
+            "template_identity": context.template_identity,
+            "templates": templates,
+            "elapsed_seconds": time.perf_counter() - started,
+            "contract": contract,
+        }
+
+    runtime.cache_volume.reload()
+    if entry := load_template_entry(context):
+        return entry.summary("reused")
+    raced_entry, claim = _wait_for_template_claim(runtime, context)
+    if raced_entry is not None:
+        return raced_entry.summary("reused")
+    if claim is None:
+        raise RuntimeError("Template claim election returned no owner")
+
+    generation_root = (
+        context.sequence_root
+        / ".staging"
+        / "templates"
+        / context.template_identity
+        / claim.generation_id
+    )
+    log_path = generation_root / "run.log"
+    terminal_status = "failed"
+    terminal_detail: dict[str, object] = {}
+    started_at = utc_now()
+    started = time.perf_counter()
+    try:
+        runtime.cache_volume.reload()
+        if entry := load_template_entry(context):
+            terminal_status = "complete"
+            terminal_detail = {
+                "publication": "raced",
+                "done_sha256": entry.done_sha256,
+            }
+            return entry.summary("reused")
+        append_log(
+            log_path,
+            f"Searching protein templates for {context.sequence_hash}",
+        )
+        templates, contract = execute_template_search(
+            task.sequence,
+            task.unpaired_msa,
+            runtime.source_root,
+            task.max_template_date,
+        )
+        elapsed_seconds = time.perf_counter() - started
+        append_log(
+            log_path,
+            f"Completed template search with {len(templates)} hits in "
+            f"{elapsed_seconds:.3f} seconds",
+        )
+        templates_path = generation_root / "templates.json"
+        write_json_atomic(templates_path, templates)
+        artifact = _artifact_record(templates_path, generation_root)
+        runtime.cache_volume.commit()
+        assert_generation_current(runtime.claims, claim)
+        context.sequence_root.mkdir(parents=True, exist_ok=True)
+        os.replace(
+            templates_path,
+            context.sequence_root / "templates.json",
+        )
+        runtime.cache_volume.commit()
+        write_json_atomic(
+            context.sequence_root / "templates.done.json",
+            {
+                "schema_version": TEMPLATE_RESULT_SCHEMA_VERSION,
+                "status": "complete",
+                "started_at": started_at,
+                "completed_at": utc_now(),
+                "elapsed_seconds": elapsed_seconds,
+                "generation_id": claim.generation_id,
+                "provenance": context.provenance,
+                "contract": contract,
+                "templates": artifact,
+            },
+        )
+        runtime.cache_volume.commit()
+        entry = load_template_entry(context)
+        if entry is None:
+            raise RuntimeError("Published template result failed validation")
+        shutil.rmtree(generation_root, ignore_errors=True)
+        runtime.cache_volume.commit()
+        terminal_status = "complete"
+        terminal_detail = {
+            "publication": "published",
+            "done_sha256": entry.done_sha256,
+        }
+        return entry.summary("published")
+    except Exception as exc:
+        append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
+        write_json_atomic(
+            generation_root / "failure.json",
+            {
+                "failed_at": utc_now(),
+                "sequence_sha256": context.sequence_hash,
+                "template_identity": context.template_identity,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        runtime.cache_volume.commit()
+        terminal_detail = {
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        raise
+    finally:
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status=terminal_status,
+            detail=terminal_detail,
+        )

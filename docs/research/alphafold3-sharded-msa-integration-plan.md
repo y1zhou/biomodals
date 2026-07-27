@@ -743,10 +743,28 @@ caller/generated fields remain request-local.
 
 Commit: `fold: add resumable template search`
 
+Status: implemented locally; no production Modal template search submitted.
+
 - add the post-MSA template phase and flat validated publication;
 - preserve caller evidence locally;
 - use the immutable template store directly;
 - make incomplete search failures explicit and non-retrying.
+
+The pinned template adapter now lives in `alphafold3/template_search.py`. It
+reconstructs upstream's fixed eight-CPU HMMsearch and template filters, reads
+PDB seqres plus only selected mmCIF files from the immutable source Volume, and
+serializes the same query-to-template mappings used by the upstream data
+pipeline. A canonical result is keyed by the protein sequence, resolved
+unpaired-MSA digest, maximum template date, pinned AlphaFold/HMMER versions,
+and result-affecting parameters. It replaces `templates.json` and publishes
+`templates.done.json` last under the sequence cache root.
+
+Production runs the template phase only after every MSA assembly has
+completed. Canonical generated MSAs inspect and reuse the shared template
+cache; caller-supplied or mixed MSA evidence remains request-local. Missing
+unique template tasks share `max_parallel_search_workers` with the earlier MSA
+phase without overlapping it. Any failed worker is reported with its sequence
+and unpaired-MSA digests, and the coordinator adds no retry loop.
 
 ### 6. Materialize inputs and establish run identity
 

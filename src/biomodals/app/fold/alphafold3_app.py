@@ -31,6 +31,7 @@ import modal
 import orjson
 from uniaf3.schema.alphafold3 import (
     AF3Config,
+    AF3Template,
 )
 
 from biomodals.app.config import AppConfig
@@ -75,6 +76,15 @@ from biomodals.app.fold.alphafold3.sharding import (
     NATIVE_SOURCE_DIR_ENV,
     utc_now,
     write_json_atomic,
+)
+from biomodals.app.fold.alphafold3.template_search import (
+    DEFAULT_MAX_TEMPLATE_DATE,
+    TemplateRuntime,
+    TemplateTask,
+    inspect_template_entries,
+)
+from biomodals.app.fold.alphafold3.template_search import (
+    run_template_search as run_resumable_template_search,
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
@@ -517,6 +527,73 @@ def assemble_sequence_msas(
     )
 
 
+@app.function(
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path=APP_INFO.msa_cache_volume_subdir,
+        ),
+    },
+)
+def inspect_protein_template_cache(
+    inputs: list[tuple[str, str, str]],
+) -> list[dict[str, object]]:
+    """Inspect canonical template markers without consuming search workers."""
+    MSA_CACHE_VOLUME.reload()
+    return inspect_template_entries(
+        Path(APP_INFO.msa_cache_dir),
+        tuple(inputs),
+    )
+
+
+def _template_runtime() -> TemplateRuntime:
+    """Bind shared template search to production mounts and claims."""
+    return TemplateRuntime(
+        source_root=Path(APP_INFO.msa_db_dir),
+        cache_root=Path(APP_INFO.msa_cache_dir),
+        source_volume=AF3_MSA_DB_VOLUME,
+        cache_volume=MSA_CACHE_VOLUME,
+        claims=MSA_SEARCH_CLAIMS,
+        container_id=_CONTAINER_INSTANCE_ID,
+        maximum_age_seconds=CONF.timeout + 900,
+        wait_timeout_seconds=max(60, CONF.timeout - 60),
+        function_call_id=modal.current_function_call_id(),
+    )
+
+
+@app.function(
+    cpu=(0.125, 8.125),
+    memory=(1024, 32_768),
+    timeout=CONF.timeout,
+    volumes={
+        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME.with_mount_options(read_only=True),
+        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        ),
+    },
+)
+def search_protein_templates(
+    sequence: str,
+    unpaired_msa: str,
+    publish_canonical: bool,
+    max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
+) -> dict[str, object]:
+    """Search templates from one resolved protein unpaired MSA."""
+    return run_resumable_template_search(
+        _template_runtime(),
+        TemplateTask(
+            sequence=sequence,
+            unpaired_msa=unpaired_msa,
+            publish_canonical=publish_canonical,
+            max_template_date=max_template_date,
+        ),
+    )
+
+
 def _validate_search_worker_budget(max_parallel_search_workers: int) -> int:
     """Validate the request-wide remote-worker budget."""
     if (
@@ -589,6 +666,115 @@ def _remote_assembly_outcome(
         return exc
 
 
+def _remote_template_outcome(
+    task: TemplateTask,
+) -> dict[str, object] | Exception:
+    """Return a remote template result or its surfaced exception."""
+    try:
+        return search_protein_templates.remote(
+            task.sequence,
+            task.unpaired_msa,
+            task.publish_canonical,
+            task.max_template_date,
+        )
+    except Exception as exc:
+        return exc
+
+
+def _resolved_msa_text(
+    inline_value: str | None,
+    path_value: str | None,
+    *,
+    field_name: str,
+) -> str:
+    """Read one resolved MSA field for downstream template search."""
+    if inline_value and path_value:
+        raise ValueError(f"{field_name} cannot set both inline and path forms")
+    if inline_value:
+        return inline_value
+    if path_value:
+        value = Path(path_value).read_text()
+        if not value:
+            raise ValueError(f"{field_name} path is empty: {path_value}")
+        return value
+    raise ValueError(f"{field_name} is unresolved")
+
+
+def _plan_template_tasks(
+    conf: AF3Config,
+    states: tuple[ChainMsaState, ...],
+    canonical_combined_sequences: set[tuple[Polymer, str]],
+) -> tuple[tuple[TemplateTask, ...], dict[str, tuple[int, ...]]]:
+    """Deduplicate missing templates without publishing caller MSA evidence."""
+    tasks: dict[str, TemplateTask] = {}
+    chain_indices: dict[str, list[int]] = {}
+    for state in states:
+        if state.polymer != "protein":
+            continue
+        protein = conf.sequences[state.chain_index].protein
+        if protein is None:
+            raise RuntimeError("Protein MSA state no longer matches its chain")
+        if protein.templates:
+            continue
+        unpaired_msa = _resolved_msa_text(
+            protein.unpairedMsa,
+            protein.unpairedMsaPath,
+            field_name=f"sequences[{state.chain_index}].protein.unpairedMsa",
+        )
+        publish_canonical = (
+            not state.unpaired_present
+            and ("protein", state.sequence) in canonical_combined_sequences
+        )
+        candidate = TemplateTask(
+            sequence=state.sequence,
+            unpaired_msa=unpaired_msa,
+            publish_canonical=publish_canonical,
+        )
+        identity = candidate.template_identity
+        if existing := tasks.get(identity):
+            if (
+                existing.sequence != candidate.sequence
+                or existing.unpaired_msa != candidate.unpaired_msa
+            ):
+                raise RuntimeError("Protein template identity collision")
+            if publish_canonical and not existing.publish_canonical:
+                tasks[identity] = TemplateTask(
+                    sequence=existing.sequence,
+                    unpaired_msa=existing.unpaired_msa,
+                    publish_canonical=True,
+                    max_template_date=existing.max_template_date,
+                )
+        else:
+            tasks[identity] = candidate
+        chain_indices.setdefault(identity, []).append(state.chain_index)
+    return (
+        tuple(tasks.values()),
+        {identity: tuple(indices) for identity, indices in chain_indices.items()},
+    )
+
+
+def _validated_template_result(
+    task: TemplateTask,
+    outcome: dict[str, object],
+    *,
+    allowed_statuses: frozenset[str],
+) -> tuple[AF3Template, ...]:
+    """Validate a cache or worker result before applying it to input chains."""
+    if (
+        outcome.get("status") not in allowed_statuses
+        or outcome.get("sequence_sha256") != sequence_hash(task.sequence)
+        or outcome.get("unpaired_msa_sha256") != task.unpaired_msa_sha256
+        or outcome.get("template_identity") != task.template_identity
+    ):
+        raise RuntimeError(f"Invalid protein template result: {outcome!r}")
+    raw_templates = outcome.get("templates")
+    if not isinstance(raw_templates, list) or not all(
+        isinstance(template, dict) for template in raw_templates
+    ):
+        raise RuntimeError(f"Invalid protein template payload: {outcome!r}")
+    return tuple(AF3Template.model_validate(template) for template in raw_templates)
+
+
 def _serialize_validated_config(conf: AF3Config) -> bytes:
     """Round-trip the enriched input through its schema."""
     json_bytes = conf.to_json(exclude_unset=False).encode()
@@ -608,20 +794,6 @@ def search_msa_and_templates(
     conf = AF3Config.from_file(config_path)
     if not search_msa:
         return _serialize_validated_config(_fill_missing_msa_for_inference(conf))
-
-    missing_template_chains = [
-        index
-        for index, entry in enumerate(conf.sequences)
-        if (protein := entry.protein) is not None and not protein.templates
-    ]
-    if search_protein_templates and missing_template_chains:
-        raise NotImplementedError(
-            "Protein template search is the next integration stage and is not "
-            "yet available in the sharded-MSA coordinator. No Modal search was "
-            "submitted. Use --no-search-protein-templates only when empty "
-            "template lists are scientifically intended. Missing chain "
-            f"indices: {missing_template_chains}"
-        )
 
     states = _chain_msa_states(conf)
     plan = plan_msa_resolution(states)
@@ -692,18 +864,48 @@ def search_msa_and_templates(
             f"reusable: {assembly_failures}"
         )
 
-    assembly_by_sequence: dict[tuple[str, str], dict[str, str]] = {}
+    assembly_by_sequence: dict[tuple[Polymer, str], dict[str, str]] = {}
+    canonical_combined_sequences: set[tuple[Polymer, str]] = set()
     for task, outcome in zip(plan.assemblies, assembly_outcomes, strict=True):
         if not isinstance(outcome, dict):
+            raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
+        status = outcome.get("status")
+        if (
+            status not in {"published", "reused", "request-local"}
+            or outcome.get("polymer") != task.polymer
+            or outcome.get("sequence_sha256") != sequence_hash(task.sequence)
+        ):
             raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
         raw_fields = outcome.get("fields")
         if not isinstance(raw_fields, dict):
             raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
+        expected_fields = {
+            field
+            for field, include in (
+                ("unpairedMsa", task.include_unpaired),
+                ("pairedMsa", task.include_paired),
+            )
+            if include
+        }
+        if set(raw_fields) != expected_fields:
+            raise RuntimeError(f"Invalid MSA assembly fields: {raw_fields!r}")
         fields: dict[str, str] = {}
         for field, value in raw_fields.items():
-            if not isinstance(field, str) or not isinstance(value, str):
+            if not isinstance(field, str) or not isinstance(value, str) or not value:
                 raise RuntimeError(f"Invalid MSA assembly fields: {raw_fields!r}")
             fields[field] = value
+        if status in {"published", "reused"}:
+            combined_identity = outcome.get("combined_identity")
+            if (
+                not isinstance(combined_identity, str)
+                or len(combined_identity) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in combined_identity
+                )
+            ):
+                raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
+            canonical_combined_sequences.add((task.polymer, task.sequence))
         assembly_by_sequence[(task.polymer, task.sequence)] = fields
 
     for state in states:
@@ -716,11 +918,129 @@ def search_msa_and_templates(
             if not state.paired_present:
                 protein.pairedMsa = fields["pairedMsa"]
                 protein.pairedMsaPath = None
-            if not protein.templates:
+            if not search_protein_templates and not protein.templates:
                 protein.templates = []
         elif (rna := entry.rna) is not None and not state.unpaired_present:
             rna.unpairedMsa = fields["unpairedMsa"]
             rna.unpairedMsaPath = None
+
+    if not search_protein_templates:
+        return _serialize_validated_config(conf)
+
+    template_tasks, template_chain_indices = _plan_template_tasks(
+        conf,
+        states,
+        canonical_combined_sequences,
+    )
+    canonical_tasks = tuple(task for task in template_tasks if task.publish_canonical)
+    cache_inputs = [
+        (
+            task.sequence,
+            task.unpaired_msa_sha256,
+            task.max_template_date,
+        )
+        for task in canonical_tasks
+    ]
+    template_statuses = (
+        inspect_protein_template_cache.remote(cache_inputs) if cache_inputs else []
+    )
+    if len(template_statuses) != len(canonical_tasks):
+        raise RuntimeError(
+            "Protein template cache inspection returned the wrong result count"
+        )
+
+    templates_by_identity: dict[str, tuple[AF3Template, ...]] = {}
+    missing_canonical: list[TemplateTask] = []
+    for task, status in zip(
+        canonical_tasks,
+        template_statuses,
+        strict=True,
+    ):
+        if status.get("status") == "missing":
+            if (
+                status.get("sequence_sha256") != sequence_hash(task.sequence)
+                or status.get("unpaired_msa_sha256") != task.unpaired_msa_sha256
+                or status.get("template_identity") != task.template_identity
+            ):
+                raise RuntimeError(f"Invalid protein template cache result: {status!r}")
+            missing_canonical.append(task)
+        else:
+            templates_by_identity[task.template_identity] = _validated_template_result(
+                task,
+                status,
+                allowed_statuses=frozenset({"reused"}),
+            )
+
+    request_local_tasks = tuple(
+        task for task in template_tasks if not task.publish_canonical
+    )
+    worker_tasks = tuple(missing_canonical) + request_local_tasks
+    print(
+        "🧬 Protein template search plan: "
+        f"{len(canonical_tasks) - len(missing_canonical)} cached, "
+        f"{len(missing_canonical)} missing canonical, "
+        f"{len(request_local_tasks)} request-local, "
+        f"worker cap {worker_budget}."
+    )
+    template_outcomes = bounded_map(
+        worker_tasks,
+        _remote_template_outcome,
+        max_parallel=worker_budget,
+    )
+    template_failures: list[dict[str, object]] = []
+    for task, outcome in zip(worker_tasks, template_outcomes, strict=True):
+        if isinstance(outcome, Exception):
+            template_failures.append({
+                "sequence_sha256": sequence_hash(task.sequence),
+                "unpaired_msa_sha256": task.unpaired_msa_sha256,
+                "publish_canonical": task.publish_canonical,
+                "error_type": type(outcome).__name__,
+                "message": str(outcome),
+            })
+            continue
+        if not isinstance(outcome, dict):
+            error = RuntimeError(f"Invalid protein template result: {outcome!r}")
+        else:
+            try:
+                templates_by_identity[task.template_identity] = (
+                    _validated_template_result(
+                        task,
+                        outcome,
+                        allowed_statuses=(
+                            frozenset({"published", "reused"})
+                            if task.publish_canonical
+                            else frozenset({"request-local"})
+                        ),
+                    )
+                )
+            except Exception as exc:
+                error = exc
+            else:
+                continue
+        template_failures.append({
+            "sequence_sha256": sequence_hash(task.sequence),
+            "unpaired_msa_sha256": task.unpaired_msa_sha256,
+            "publish_canonical": task.publish_canonical,
+            "error_type": type(error).__name__,
+            "message": str(error),
+        })
+    if template_failures:
+        raise RuntimeError(
+            "Incomplete protein template tasks; completed canonical results "
+            f"remain reusable: {template_failures}"
+        )
+
+    for identity, chain_indices in template_chain_indices.items():
+        templates = templates_by_identity.get(identity)
+        if templates is None:
+            raise RuntimeError(f"Protein template task produced no result: {identity}")
+        for chain_index in chain_indices:
+            protein = conf.sequences[chain_index].protein
+            if protein is None:
+                raise RuntimeError("Protein template plan no longer matches its chain")
+            protein.templates = [
+                template.model_copy(deep=True) for template in templates
+            ]
     return _serialize_validated_config(conf)
 
 

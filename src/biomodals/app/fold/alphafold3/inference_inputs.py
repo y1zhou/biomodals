@@ -71,28 +71,16 @@ def _json_bytes(value: object) -> bytes:
     return orjson.dumps(value, option=_JSON_OPTIONS)
 
 
-def serialize_af3_input(config: AF3Config) -> bytes:
-    """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
-    validated = AF3Config.model_validate(
+def validate_af3_config(config: AF3Config) -> AF3Config:
+    """Return a fully validated copy with explicit default field semantics."""
+    return AF3Config.model_validate(
         config.model_dump(mode="python", exclude_unset=False)
     )
-    raw_document = validated.model_dump(
-        mode="json",
-        exclude_unset=False,
-        exclude_defaults=False,
-        exclude_none=True,
-    )
-    document = cast(dict[str, object], raw_document)
-    raw_sequences = document.get("sequences")
-    if not isinstance(raw_sequences, list):
-        raise RuntimeError("Validated AlphaFold input has no sequence list")
-    for index, raw_entry in enumerate(raw_sequences):
-        if not isinstance(raw_entry, dict) or len(raw_entry) != 1:
-            raise RuntimeError(
-                "Validated AlphaFold sequence entry must contain exactly one "
-                f"chain type: sequences[{index}]"
-            )
-    return _json_bytes(document)
+
+
+def serialize_af3_input(config: AF3Config) -> bytes:
+    """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
+    return validate_af3_config(config).to_json(exclude_unset=False).encode()
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -218,11 +206,8 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
         conf.userCCD = ccd_path.read_text()
         conf.userCCDPath = None
 
-    validated = AF3Config.model_validate(
-        conf.model_dump(mode="python", exclude_unset=False)
-    )
     return MaterializedLocalInput(
-        config=validated,
+        config=validate_af3_config(conf),
         custom_templates=tuple(custom_templates),
     )
 
@@ -268,9 +253,7 @@ def build_inference_identity_view(
     custom_templates: tuple[LocalTemplateFile, ...],
 ) -> dict[str, object]:
     """Return the explicit-default, seed/name-neutral biological identity."""
-    validated = AF3Config.model_validate(
-        conf.model_dump(mode="python", exclude_unset=False)
-    )
+    validated = validate_af3_config(conf)
     raw_view = validated.model_dump(
         mode="json",
         exclude_unset=False,
@@ -344,9 +327,7 @@ def prepare_inference_run(
     mount_root = Path(output_mount_root)
     if not mount_root.is_absolute():
         raise ValueError("output_mount_root must be absolute")
-    conf = AF3Config.model_validate(
-        enriched_config.model_dump(mode="python", exclude_unset=False)
-    )
+    conf = validate_af3_config(enriched_config)
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
     display_name = conf.name
@@ -404,9 +385,7 @@ def prepare_inference_run(
             template.mmcif = None
             template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
 
-    staged_conf = AF3Config.model_validate(
-        staged_conf.model_dump(mode="python", exclude_unset=False)
-    )
+    staged_conf = validate_af3_config(staged_conf)
     uploads[run_root / "inputs" / "identity.json"] = _json_bytes(identity_document)
     uploads[run_root / "requests" / request_id / "input.json"] = serialize_af3_input(
         staged_conf

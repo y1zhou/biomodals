@@ -31,7 +31,6 @@ import uuid
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import cast
 
 import modal
@@ -48,6 +47,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     materialize_local_input,
     prepare_inference_run,
     serialize_af3_input,
+    validate_af3_config,
     validate_inference_parameters,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
@@ -418,14 +418,6 @@ def _sharded_database_setup_plan(
             "remove_unselected_profile_directories": True,
         },
     }
-
-
-def _load_conf_from_bytes(json_bytes: bytes) -> AF3Config:
-    """Load AlphaFold3 config from JSON bytes."""
-    with TemporaryDirectory() as temp_dir:
-        f = Path(temp_dir) / "config.json"
-        f.write_bytes(json_bytes)
-        return AF3Config.from_file(f)
 
 
 def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
@@ -835,29 +827,22 @@ def _validated_template_result(
     return tuple(AF3Template.model_validate(template) for template in raw_templates)
 
 
-def _serialize_validated_config(conf: AF3Config) -> bytes:
-    """Round-trip the enriched input through its schema."""
-    json_bytes = conf.to_json(exclude_unset=False).encode()
-    validated = AF3Config.model_validate_json(json_bytes)
-    return validated.to_json(exclude_unset=False).encode()
-
-
 def search_msa_and_templates(
     config: AF3Config | str | Path,
     *,
     search_msa: bool = True,
     search_protein_templates: bool = True,
     max_parallel_search_workers: int = 4,
-) -> bytes:
+) -> AF3Config:
     """Resolve MSA fields with bounded resumable database workers."""
     worker_budget = _validate_search_worker_budget(max_parallel_search_workers)
     conf = (
-        AF3Config.model_validate(config.model_dump(mode="python", exclude_unset=False))
+        validate_af3_config(config)
         if isinstance(config, AF3Config)
         else AF3Config.from_file(config)
     )
     if not search_msa:
-        return _serialize_validated_config(_fill_missing_msa_for_inference(conf))
+        return validate_af3_config(_fill_missing_msa_for_inference(conf))
 
     states = _chain_msa_states(conf)
     plan = plan_msa_resolution(states)
@@ -994,7 +979,7 @@ def search_msa_and_templates(
             rna.unpairedMsaPath = None
 
     if not search_protein_templates:
-        return _serialize_validated_config(conf)
+        return validate_af3_config(conf)
 
     template_tasks, template_chain_indices = _plan_template_tasks(
         conf,
@@ -1110,7 +1095,7 @@ def search_msa_and_templates(
             protein.templates = [
                 template.model_copy(deep=True) for template in templates
             ]
-    return _serialize_validated_config(conf)
+    return validate_af3_config(conf)
 
 
 ##########################################
@@ -1281,13 +1266,8 @@ def finalize_inference_summary(
         conf = base_conf.model_copy(deep=True)
         conf.name = canonical_output_name(run_id)
         conf.modelSeeds = list(seeds)
-        with TemporaryDirectory(prefix="alphafold3_summary_") as temp_dir:
-            input_path = Path(temp_dir) / "input.json"
-            input_path.write_bytes(serialize_af3_input(conf))
-            fold_inputs = list(folding_input.load_fold_inputs_from_path(input_path))
-        if len(fold_inputs) != 1:
-            raise RuntimeError("Expected exactly one AlphaFold input")
-        return fold_inputs[0].to_json().encode()
+        fold_input = folding_input.Input.from_json(serialize_af3_input(conf).decode())
+        return fold_input.to_json().encode()
 
     return finalize_run_summary(
         _inference_runtime(),
@@ -1702,14 +1682,13 @@ def submit_alphafold3_task(
     conf.name = run_name
 
     print(f"🧬 Resolving {CONF.name} MSA and template fields...")
-    json_bytes = search_msa_and_templates(
+    enriched_conf = search_msa_and_templates(
         conf,
         search_msa=search_msa,
         search_protein_templates=search_protein_templates,
         max_parallel_search_workers=max_parallel_search_workers,
     )
 
-    enriched_conf = _load_conf_from_bytes(json_bytes)
     enriched_conf.name = run_name
     enriched_conf.modelSeeds = conf.modelSeeds
     prepared = prepare_inference_run(

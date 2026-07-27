@@ -26,7 +26,6 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 # ruff: noqa: PLC0415
 
 import os
-import time
 import uuid
 from dataclasses import dataclass
 from io import BytesIO
@@ -49,6 +48,11 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     serialize_af3_input,
     validate_inference_parameters,
     validate_upstream_af3_input,
+)
+from biomodals.app.fold.alphafold3.inference_pipeline import (
+    InferenceBatchOutcome,
+    InferenceExecutor,
+    coordinate_seed_predictions,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
     fill_missing_msa_for_inference,
@@ -101,6 +105,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
     ClaimedSeed,
     InferenceRuntime,
+    SeedClaimPlan,
     SeedWorkerTask,
     canonical_output_name,
     claim_seed_predictions,
@@ -937,29 +942,6 @@ def finalize_inference_request(
     )
 
 
-def _completed_seed_set(
-    run_id: str,
-    seeds: tuple[int, ...],
-    sample_count: int,
-) -> set[int]:
-    statuses = inspect_seed_prediction_cache.remote(
-        run_id,
-        list(seeds),
-        sample_count,
-    )
-    if len(statuses) != len(seeds):
-        raise RuntimeError("Seed marker inspection returned the wrong result count")
-    completed: set[int] = set()
-    for seed, status in zip(seeds, statuses, strict=True):
-        if status.get("run_id") != run_id or status.get("seed") != seed:
-            raise RuntimeError(f"Invalid seed marker inspection result: {status!r}")
-        if status.get("status") == "reused":
-            completed.add(seed)
-        elif status.get("status") != "missing":
-            raise RuntimeError(f"Invalid seed marker inspection result: {status!r}")
-    return completed
-
-
 def _run_claimed_seed_batches(
     prepared: PreparedInferenceRun,
     claimed_seeds: tuple[ClaimedSeed, ...],
@@ -968,7 +950,7 @@ def _run_claimed_seed_batches(
     sample: int,
     max_workers: int,
     poll_timeout: int,
-) -> tuple[set[int], set[int], list[dict[str, object]]]:
+) -> InferenceBatchOutcome:
     batches = partition_claimed_seeds(claimed_seeds, max_workers)
     json_bytes = serialize_af3_input(prepared.worker_config)
     calls: dict[int, tuple[modal.FunctionCall, tuple[ClaimedSeed, ...]]] = {}
@@ -1030,7 +1012,94 @@ def _run_claimed_seed_batches(
                     published.update(raw_published)
                     reused.update(raw_reused)
             del calls[index]
-    return published, reused, failures
+    return InferenceBatchOutcome(
+        published_seeds=frozenset(published),
+        reused_seeds=frozenset(reused),
+        failures=tuple(failures),
+    )
+
+
+class _ModalInferenceExecutor(InferenceExecutor):
+    """Bind the request-level inference coordinator to Modal functions."""
+
+    def claim_seeds(
+        self,
+        run_id: str,
+        seeds: tuple[int, ...],
+        *,
+        sample_count: int,
+    ) -> SeedClaimPlan:
+        raw_plan = claim_seed_prediction_work.remote(
+            run_id,
+            list(seeds),
+            sample_count,
+        )
+        return seed_claim_plan_from_dict(raw_plan)
+
+    def inspect_seeds(
+        self,
+        run_id: str,
+        seeds: tuple[int, ...],
+        *,
+        sample_count: int,
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            inspect_seed_prediction_cache.remote(
+                run_id,
+                list(seeds),
+                sample_count,
+            )
+        )
+
+    def run_claimed(
+        self,
+        prepared: PreparedInferenceRun,
+        claimed_seeds: tuple[ClaimedSeed, ...],
+        *,
+        recycle: int,
+        sample_count: int,
+        max_workers: int,
+        poll_timeout_seconds: int,
+    ) -> InferenceBatchOutcome:
+        return _run_claimed_seed_batches(
+            prepared,
+            claimed_seeds,
+            recycle=recycle,
+            sample=sample_count,
+            max_workers=max_workers,
+            poll_timeout=poll_timeout_seconds,
+        )
+
+    def finalize_summary(
+        self,
+        prepared: PreparedInferenceRun,
+        *,
+        sample_count: int,
+    ) -> dict[str, object]:
+        return finalize_inference_summary.remote(
+            serialize_af3_input(prepared.worker_config),
+            prepared.run_id,
+            sample_count,
+        )
+
+    def finalize_request(
+        self,
+        prepared: PreparedInferenceRun,
+        *,
+        sample_count: int,
+        reused_seeds: tuple[int, ...],
+        published_seeds: tuple[int, ...],
+    ) -> dict[str, object]:
+        return finalize_inference_request.remote(
+            prepared.run_id,
+            prepared.request_id,
+            list(prepared.submitted_seeds),
+            list(prepared.normalized_seeds),
+            sample_count,
+            prepared.display_name,
+            list(reused_seeds),
+            list(published_seeds),
+        )
 
 
 def predict_structures(
@@ -1041,127 +1110,16 @@ def predict_structures(
     *,
     poll_timeout: int = 30,
 ) -> dict[str, object]:
-    """Reconcile, run once, and summarize the requested seed predictions."""
-    if (
-        isinstance(num_containers, bool)
-        or not isinstance(num_containers, int)
-        or num_containers < 1
-    ):
-        raise ValueError("num_containers must be a positive integer")
-    requested = prepared.normalized_seeds
-    pending = set(requested)
-    reused: set[int] = set()
-    published: set[int] = set()
-    failures: list[dict[str, object]] = []
-    attempted: set[int] = set()
-    deadline = time.monotonic() + MAX_TIMEOUT + 900
-
-    while pending:
-        raw_plan = claim_seed_prediction_work.remote(
-            prepared.run_id,
-            sorted(pending),
-            sample,
-        )
-        plan = seed_claim_plan_from_dict(raw_plan)
-        reused.update(plan.reused_seeds)
-        pending.difference_update(plan.reused_seeds)
-        if plan.owned:
-            owned_seeds = {item.seed for item in plan.owned}
-            if attempted.intersection(owned_seeds):
-                raise RuntimeError("Refusing to retry a surfaced seed failure")
-            attempted.update(owned_seeds)
-            (
-                batch_published,
-                batch_reused,
-                batch_failures,
-            ) = _run_claimed_seed_batches(
-                prepared,
-                plan.owned,
-                recycle=recycle,
-                sample=sample,
-                max_workers=num_containers,
-                poll_timeout=poll_timeout,
-            )
-            completed_owned = _completed_seed_set(
-                prepared.run_id,
-                tuple(sorted(owned_seeds)),
-                sample,
-            )
-            published.update(batch_published)
-            published.update(completed_owned - batch_reused)
-            reused.update(batch_reused)
-            pending.difference_update(owned_seeds)
-            failures.extend(batch_failures)
-            for seed in sorted(owned_seeds - completed_owned):
-                if not any(
-                    isinstance(
-                        failure_seeds := failure.get("seeds"),
-                        list,
-                    )
-                    and seed in failure_seeds
-                    for failure in batch_failures
-                ):
-                    failures.append({
-                        "seeds": [seed],
-                        "error_type": "IncompleteSeedPrediction",
-                        "message": "Worker returned without a valid seed marker",
-                    })
-
-        active_seeds = {item.seed for item in plan.active}
-        if pending and pending != active_seeds:
-            raise RuntimeError("Seed claim plan did not account for every pending seed")
-        if pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                failures.append({
-                    "seeds": sorted(pending),
-                    "error_type": "ActiveSeedTimeout",
-                    "message": "Timed out waiting for concurrent seed owners",
-                })
-                break
-            time.sleep(min(30, remaining))
-
-    completed = _completed_seed_set(
-        prepared.run_id,
-        requested,
-        sample,
+    """Reconcile predictions through the production Modal adapter."""
+    return coordinate_seed_predictions(
+        prepared,
+        _ModalInferenceExecutor(),
+        recycle=recycle,
+        sample=sample,
+        num_containers=num_containers,
+        active_wait_timeout_seconds=MAX_TIMEOUT + 900,
+        worker_poll_timeout_seconds=poll_timeout,
     )
-    reused.update(completed.difference(reused, published))
-    incomplete = set(requested) - completed
-    summary: dict[str, object] | None = None
-    if completed:
-        summary = finalize_inference_summary.remote(
-            serialize_af3_input(prepared.worker_config),
-            prepared.run_id,
-            sample,
-        )
-    result: dict[str, object] = {
-        "run_id": prepared.run_id,
-        "request_id": prepared.request_id,
-        "requested_seeds": list(requested),
-        "reused_seeds": sorted(reused),
-        "published_seeds": sorted(published),
-        "completed_seeds": sorted(completed),
-        "incomplete_seeds": sorted(incomplete),
-        "failures": failures,
-        "summary": summary,
-    }
-    if incomplete:
-        raise RuntimeError(
-            "Incomplete AlphaFold3 seed predictions; completed siblings remain "
-            f"reusable and no failed seed was retried: {result}"
-        )
-    result["request"] = finalize_inference_request.remote(
-        prepared.run_id,
-        prepared.request_id,
-        list(prepared.submitted_seeds),
-        list(prepared.normalized_seeds),
-        sample,
-        prepared.display_name,
-        sorted(reused),
-        sorted(published),
-    )
-    return result
 
 
 ##########################################

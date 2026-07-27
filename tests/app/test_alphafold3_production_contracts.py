@@ -22,6 +22,7 @@ from biomodals.app.fold.alphafold3.artifacts import (
 )
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
+    GenerationClaim,
     abandon_generation_claim,
     acquire_generation_claim,
     finish_generation_claim,
@@ -30,7 +31,12 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     hash_sequences,
+    prepare_inference_run,
     serialize_af3_input,
+)
+from biomodals.app.fold.alphafold3.inference_pipeline import (
+    InferenceBatchOutcome,
+    coordinate_seed_predictions,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
     apply_msa_resolution,
@@ -84,6 +90,8 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_MARKER_SCHEMA_VERSION,
+    ClaimedSeed,
+    SeedClaimPlan,
     canonical_output_name,
     load_seed_marker,
 )
@@ -833,6 +841,146 @@ def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:
     assert marker is not None
     assert [row.sample_index for row in marker.rankings] == [0, 1]
     assert load_seed_marker(tmp_path, run_id, 42, sample_count=1) is None
+
+
+def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
+    """The deep inference seam should expose one request-level operation."""
+
+    class FakeInferenceExecutor:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def claim_seeds(
+            self,
+            run_id: str,
+            seeds: tuple[int, ...],
+            *,
+            sample_count: int,
+        ) -> SeedClaimPlan:
+            del run_id, sample_count
+            self.calls.append("claim")
+            assert seeds == (1, 2)
+            return SeedClaimPlan(
+                reused_seeds=(1,),
+                owned=(
+                    ClaimedSeed(
+                        seed=2,
+                        claim=GenerationClaim(
+                            scope_key="seed:test:2",
+                            generation_id="generation",
+                            owner={},
+                        ),
+                    ),
+                ),
+                active=(),
+            )
+
+        def inspect_seeds(
+            self,
+            run_id: str,
+            seeds: tuple[int, ...],
+            *,
+            sample_count: int,
+        ) -> tuple[dict[str, object], ...]:
+            del sample_count
+            self.calls.append(f"inspect:{','.join(map(str, seeds))}")
+            return tuple(
+                {
+                    "status": "reused",
+                    "run_id": run_id,
+                    "seed": seed,
+                }
+                for seed in seeds
+            )
+
+        def run_claimed(
+            self,
+            prepared,
+            claimed_seeds: tuple[ClaimedSeed, ...],
+            *,
+            recycle: int,
+            sample_count: int,
+            max_workers: int,
+            poll_timeout_seconds: int,
+        ) -> InferenceBatchOutcome:
+            del prepared, recycle, sample_count, max_workers, poll_timeout_seconds
+            self.calls.append("run")
+            assert tuple(item.seed for item in claimed_seeds) == (2,)
+            return InferenceBatchOutcome(
+                published_seeds=frozenset({2}),
+                reused_seeds=frozenset(),
+                failures=(),
+            )
+
+        def finalize_summary(
+            self,
+            prepared,
+            *,
+            sample_count: int,
+        ) -> dict[str, object]:
+            del prepared, sample_count
+            self.calls.append("summary")
+            return {"status": "complete"}
+
+        def finalize_request(
+            self,
+            prepared,
+            *,
+            sample_count: int,
+            reused_seeds: tuple[int, ...],
+            published_seeds: tuple[int, ...],
+        ) -> dict[str, object]:
+            del prepared, sample_count
+            self.calls.append("request")
+            assert reused_seeds == (1,)
+            assert published_seeds == (2,)
+            return {"status": "complete"}
+
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="coordinated-inference",
+            modelSeeds=[1, 2],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=Path("/outputs"),
+        recycle=1,
+        sample=1,
+    )
+    executor = FakeInferenceExecutor()
+
+    result = coordinate_seed_predictions(
+        prepared,
+        executor,
+        recycle=1,
+        sample=1,
+        num_containers=2,
+        active_wait_timeout_seconds=60,
+    )
+
+    assert result["reused_seeds"] == [1]
+    assert result["published_seeds"] == [2]
+    assert result["completed_seeds"] == [1, 2]
+    assert result["summary"] == {"status": "complete"}
+    assert result["request"] == {"status": "complete"}
+    assert executor.calls == [
+        "claim",
+        "run",
+        "inspect:2",
+        "inspect:1,2",
+        "summary",
+        "request",
+    ]
 
 
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:

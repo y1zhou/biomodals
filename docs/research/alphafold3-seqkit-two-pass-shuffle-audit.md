@@ -7,7 +7,7 @@ Scope: SeqKit `v2.13.0` at commit
 its pinned `github.com/shenwei356/bio v0.13.9` dependency at commit
 [`d4c578a`](https://github.com/shenwei356/bio/commit/d4c578a731dbc713fe144e06b7c64a702e5cd9a2),
 and the production-profile command in
-[`alphafold3_msa_app.py`](../../src/biomodals/app/fold/alphafold3_msa_app.py).
+[`alphafold3_msa_app.py`](https://github.com/y1zhou/biomodals/blob/1f28563627ef088228f2c2916fd7b8f641c6a97c/src/biomodals/app/fold/alphafold3_msa_app.py)
 
 ## Verdict
 

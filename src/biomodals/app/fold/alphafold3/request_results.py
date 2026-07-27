@@ -371,8 +371,6 @@ def publish_request_results(
         raise RuntimeError("The accumulated summary does not cover this request")
     summary_marker_path = run_root / ".markers" / "summary.json"
     require_regular_file(summary_marker_path)
-    if sha256_file(summary_marker_path) != summary.marker_sha256:
-        raise RuntimeError("The observed summary marker changed during publication")
 
     canonical_name = canonical_output_name(spec.run_id)
     outputs_root = run_root / "outputs"
@@ -387,6 +385,12 @@ def publish_request_results(
         f"global-summary-{summary.marker_sha256[:16]}.json",
     )
     try:
+        observed_summary = (
+            staging_root / f"global-summary-{summary.marker_sha256[:16]}.json"
+        )
+        shutil.copy2(summary_marker_path, observed_summary)
+        if sha256_file(observed_summary) != summary.marker_sha256:
+            raise RuntimeError("The observed summary marker changed during publication")
         write_ranking_table(
             staging_root / f"{canonical_name}_ranking_scores.csv",
             rows,
@@ -401,10 +405,6 @@ def publish_request_results(
         shutil.copy2(
             outputs_root / "TERMS_OF_USE.md",
             staging_root / "TERMS_OF_USE.md",
-        )
-        shutil.copy2(
-            summary_marker_path,
-            staging_root / f"global-summary-{summary.marker_sha256[:16]}.json",
         )
         for name in generated_names:
             _replace_staged_file(staging_root / name, request_root / name)

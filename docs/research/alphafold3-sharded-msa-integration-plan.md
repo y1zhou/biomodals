@@ -5,7 +5,8 @@ Status: accepted.
 Scope: finish the sharding method in
 `src/biomodals/app/fold/alphafold3_msa_app.py`, validate it, then integrate the
 minimal production implementation into
-`src/biomodals/app/fold/alphafold3_app.py`.
+`src/biomodals/app/fold/alphafold3_app.py` and its mature sibling modules under
+`src/biomodals/app/fold/alphafold3/`.
 
 This plan implements
 [ADR 0005](../adr/0005-alphafold3-msa-sharding.md). That consolidated decision
@@ -853,16 +854,24 @@ finalizer publishes the deterministic requested-seed ranking, request-best
 files, terms, and a content-addressed copy of the observed global-summary
 marker. Its `manifest.json` is written last and records submitted/normalized
 seeds, removed duplicates, reused/newly published seeds, the observed global
-best, every requested sample file, optional seed outputs, and only the custom
-templates referenced by the enriched request input. It never copies seed
-directories or declares an unrelated completed seed.
+best, every requested sample file, optional seed outputs, per-artifact byte
+sizes, and only the custom templates referenced by the enriched request input.
+Before promotion, the finalizer snapshots the observed global-summary marker
+and verifies that the copied bytes still match the loaded marker digest; a
+concurrent summary expansion causes a clear retryable failure instead of
+publishing a mixed request view. It never copies seed directories or declares
+an unrelated completed seed.
 
 The local entrypoint streams only those Volume-relative manifest artifacts,
-rejects paths outside the hash-fanned run root, and restores upstream's exact
-sanitized display-name prefix in downloaded basenames. Only the downloaded
-input copy changes: it restores the current display name and rewrites staged
-`mmcifPath` values to archive-relative `custom-templates/{sha256}.cif` paths.
-The resulting
+rejects paths outside the hash-fanned run root, verifies each stream's declared
+size, and restores upstream's exact sanitized display-name prefix in
+downloaded basenames. The durable request input uses the canonical
+`af3-{run_id[:16]}` name and content-addressed `custom-templates/{sha256}.cif`
+paths, so callers with the same scientific input and seeds upload identical
+bytes even when their display names or original inline/path template
+representations differ. Only the downloaded input copy changes: it restores
+the current display name and rewrites staged `mmcifPath` values to
+archive-relative custom-template paths. The resulting
 `{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after every expected member is readable. A
 non-empty readable existing archive is reused; an unreadable one causes an
@@ -871,6 +880,14 @@ explicit error and is never overwritten.
 ### 9. Record validation and remove obsolete production paths
 
 Commit: `fold: document sharded MSA validation`
+
+Status: in progress. The AlphaFold3 app and sibling-module subtree contain no
+references to `copy_msa_to_ssd`, `search_chains_in_parallel`, or
+`max_parallel_data_pipelines`. A repository-wide scan found one separate
+production dependency that still requires an explicit scope decision:
+`ppiflow_workflow.py` calls the removed `run_data_pipeline` interface with
+`copy_msa_to_ssd=True` and expects the old tarball-returning inference
+signature. It has not been changed under this plan's AlphaFold3-only boundary.
 
 - record all scientific and integrated smoke results;
 - confirm no production reference remains to `copy_msa_to_ssd`,
@@ -943,7 +960,8 @@ Not included initially:
 - app-level automatic retry loops;
 - GPU-class-specific inference cache identity;
 - post-publication seed artifact audits;
-- changes outside the two AlphaFold3 app files and accepted documentation.
+- changes outside the two AlphaFold3 app files, their mature supporting
+  modules, and accepted documentation.
 
 ## Definition of done
 
@@ -960,5 +978,5 @@ Integration is complete when:
    their requested artifacts;
 6. all local checks and agreed paid smoke tests pass;
 7. the final production diff is limited to
-   `alphafold3_app.py` plus the separately retained experimental work and
-   documentation authorized by this plan.
+   the two AlphaFold3 app files, their mature `alphafold3/` supporting modules,
+   and documentation authorized by this plan.

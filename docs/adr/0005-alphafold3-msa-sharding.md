@@ -122,8 +122,14 @@ The manifest preserves source identity and statistics. The published profile
 does not retain a duplicate monolithic source FASTA.
 
 Rebuilding an identical specification reuses its valid publication and never
-overwrites it. A new Profile ID leaves the previous profile available so old
-Search Identities retain their provenance.
+overwrites it. A builder for a new Profile ID publishes beside any existing
+profile and never mutates that prior publication. After all seven selected
+profiles validate and no builder claims remain active, the setup
+coordinator's finalization barrier removes non-selected profile directories so
+the Volume contains exactly one selected profile per logical database. This
+intentional garbage collection preserves old Search Identity and manifest
+evidence in the MSA cache, but recomputing an old Search Identity requires its
+profile to be rebuilt or manually restored first.
 
 ### Profile builder
 

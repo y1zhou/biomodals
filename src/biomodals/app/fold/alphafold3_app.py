@@ -2,13 +2,18 @@
 
 ## Additional notes
 
-This script only provides a runtime for AlphaFold3.
-To acquire the model weights and MSA databases, please follow instructions at:
+This app provides the AlphaFold3 runtime and a separate, plan-only-by-default
+entrypoint for building its fixed sharded genetic-database profiles. Follow
+upstream's instructions to acquire the model weights and source databases:
 
 <https://github.com/google-deepmind/alphafold3#obtaining-model-parameters>
 
-Make sure the model checkpoint is available at `/AlphaFold3/af3.bin` in the `biomodals-store` volume,
-and the MSA databases are available at the `AlphaFold3-msa-db` volume.
+<https://github.com/google-deepmind/alphafold3/blob/main/docs/installation.md#obtaining-genetic-databases>
+
+The model checkpoint must be available at `/AlphaFold3/af3.bin` in the
+`biomodals-store` Volume. Put the upstream genetic database files in
+`AlphaFold3-msa-db`, then use `setup_sharded_databases` to populate the
+separate `AlphaFold3-msa-db-sharded` Volume before running searches.
 
 See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general docs.
 
@@ -42,9 +47,12 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
     materialize_local_input,
     prepare_inference_run,
+    validate_inference_parameters,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
+    SEARCH_MAX_PARALLEL_SHARDS,
+    SEARCH_N_CPU,
     ChainMsaState,
     MsaAssemblyTask,
     Polymer,
@@ -305,7 +313,8 @@ def build_sharded_database(
     max_containers=1,
     volumes={
         APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
-            read_only=True
+            read_only=True,
+            sub_path="/",
         ),
     },
 )
@@ -450,7 +459,10 @@ def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
     max_containers=1,
     volumes={
         APP_INFO.sharded_msa_db_dir: (
-            SHARDED_MSA_DB_VOLUME.with_mount_options(read_only=True)
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
         ),
         APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
             read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
@@ -499,10 +511,13 @@ def _msa_search_runtime(
     timeout=CONF.timeout,
     volumes={
         APP_INFO.sharded_msa_db_dir: (
-            SHARDED_MSA_DB_VOLUME.with_mount_options(read_only=True)
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
         ),
         APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            sub_path=APP_INFO.msa_cache_volume_subdir
+            read_only=False, sub_path=APP_INFO.msa_cache_volume_subdir
         ),
     },
 )
@@ -524,10 +539,13 @@ def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
     timeout=1800,
     volumes={
         APP_INFO.sharded_msa_db_dir: (
-            SHARDED_MSA_DB_VOLUME.with_mount_options(read_only=True)
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
         ),
         APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            sub_path=APP_INFO.msa_cache_volume_subdir
+            read_only=False, sub_path=APP_INFO.msa_cache_volume_subdir
         ),
     },
 )
@@ -597,9 +615,12 @@ def _template_runtime() -> TemplateRuntime:
     memory=(1024, 32_768),
     timeout=CONF.timeout,
     volumes={
-        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME.with_mount_options(read_only=True),
+        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path="/",
+        ),
         APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            sub_path=APP_INFO.msa_cache_volume_subdir
+            read_only=False, sub_path=APP_INFO.msa_cache_volume_subdir
         ),
     },
 )
@@ -630,6 +651,17 @@ def _validate_search_worker_budget(max_parallel_search_workers: int) -> int:
     ):
         raise ValueError("max_parallel_search_workers must be between 1 and 32")
     return max_parallel_search_workers
+
+
+def _validate_max_num_gpus(max_num_gpus: int) -> int:
+    """Validate the GPU-worker cap before any cost-incurring remote work."""
+    if (
+        isinstance(max_num_gpus, bool)
+        or not isinstance(max_num_gpus, int)
+        or max_num_gpus < 1
+    ):
+        raise ValueError("max_num_gpus must be a positive integer")
+    return max_num_gpus
 
 
 def _chain_msa_states(conf: AF3Config) -> tuple[ChainMsaState, ...]:
@@ -846,7 +878,12 @@ def search_msa_and_templates(
     print(
         "🧬 Sharded MSA search plan: "
         f"{len(cache_statuses) - len(missing_raw)} cached, "
-        f"{len(missing_raw)} missing, worker cap {worker_budget}."
+        f"{len(missing_raw)} missing, worker cap {worker_budget}; each database "
+        f"worker runs at most {SEARCH_MAX_PARALLEL_SHARDS} shard searches "
+        f"with {SEARCH_N_CPU} HMMER CPUs each (request-wide theoretical cap "
+        f"{worker_budget * SEARCH_MAX_PARALLEL_SHARDS} shard searches / "
+        f"{worker_budget * SEARCH_MAX_PARALLEL_SHARDS * SEARCH_N_CPU} HMMER "
+        "CPU slots)."
     )
     search_outcomes = bounded_map(
         missing_raw,
@@ -1109,7 +1146,8 @@ def _inference_runtime() -> InferenceRuntime:
     timeout=600,
     volumes={
         CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
-            read_only=True
+            read_only=True,
+            sub_path="/",
         )
     },
 )
@@ -1133,7 +1171,8 @@ def inspect_seed_prediction_cache(
     timeout=600,
     volumes={
         CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
-            read_only=True
+            read_only=True,
+            sub_path="/",
         )
     },
 )
@@ -1520,7 +1559,7 @@ def predict_structures(
         list(prepared.submitted_seeds),
         list(prepared.normalized_seeds),
         sample,
-        prepared.worker_config.name,
+        prepared.display_name,
         sorted(reused),
         sorted(published),
     )
@@ -1645,6 +1684,10 @@ def submit_alphafold3_task(
         sample: Number of diffusion samples to generate per seed.
 
     """
+    max_num_gpus = _validate_max_num_gpus(max_num_gpus)
+    _validate_search_worker_budget(max_parallel_search_workers)
+    validate_inference_parameters(recycle, sample)
+
     # Validate and read input
     input_path = Path(input_json).expanduser().resolve()
     if not input_path.exists():
@@ -1688,7 +1731,7 @@ def submit_alphafold3_task(
     )
 
     num_seeds = len(prepared.normalized_seeds)
-    num_containers = max(1, min(max_num_gpus, num_seeds))
+    num_containers = min(max_num_gpus, num_seeds)
     print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
     result = predict_structures(
         prepared,

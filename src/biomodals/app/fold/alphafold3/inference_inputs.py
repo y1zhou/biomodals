@@ -59,6 +59,7 @@ class PreparedInferenceRun:
     run_id: str
     request_id: str
     run_root: PurePosixPath
+    display_name: str
     submitted_seeds: tuple[int, ...]
     normalized_seeds: tuple[int, ...]
     identity_view: dict[str, object]
@@ -298,7 +299,8 @@ def normalize_model_seeds(seeds: list[int]) -> tuple[int, ...]:
     return tuple(sorted(set(seeds)))
 
 
-def _validate_inference_counts(recycle: int, sample: int) -> None:
+def validate_inference_parameters(recycle: int, sample: int) -> None:
+    """Validate inference counts before any cost-incurring remote work."""
     if isinstance(recycle, bool) or not isinstance(recycle, int) or recycle < 0:
         raise ValueError("recycle must be a non-negative integer")
     if isinstance(sample, bool) or not isinstance(sample, int) or sample < 1:
@@ -314,7 +316,7 @@ def prepare_inference_run(
     sample: int,
 ) -> PreparedInferenceRun:
     """Build run/request identities and every required Volume upload."""
-    _validate_inference_counts(recycle, sample)
+    validate_inference_parameters(recycle, sample)
     mount_root = Path(output_mount_root)
     if not mount_root.is_absolute():
         raise ValueError("output_mount_root must be absolute")
@@ -323,6 +325,7 @@ def prepare_inference_run(
     )
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
+    display_name = conf.name
     identity_view = build_inference_identity_view(conf, custom_templates)
 
     inference_parameters = {
@@ -356,27 +359,25 @@ def prepare_inference_run(
 
     template_files = _template_files_by_source(custom_templates)
     staged_conf = conf.model_copy(deep=True)
+    staged_conf.name = f"af3-{run_id[:16]}"
     staged_conf.modelSeeds = list(normalized_seeds)
     uploads: dict[PurePosixPath, bytes] = {}
     for entry in staged_conf.sequences:
         if (protein := entry.protein) is None:
             continue
         for template in protein.templates:
-            if template.mmcifPath is None:
-                continue
-            source = str(Path(template.mmcifPath).resolve())
-            artifact = template_files.get(source)
-            if artifact is None:
-                raise ValueError(
-                    f"Template path was not materialized locally: {source}"
-                )
-            relative_path = run_root / "custom-templates" / f"{artifact.sha256}.cif"
+            template_view = cast(
+                dict[str, object],
+                template.model_dump(mode="python", exclude_unset=False),
+            )
+            content = _template_content(template_view, template_files)
+            digest = _sha256_bytes(content)
+            relative_path = run_root / "custom-templates" / f"{digest}.cif"
             existing = uploads.get(relative_path)
-            if existing is not None and existing != artifact.content:
-                raise RuntimeError(
-                    f"Custom template digest collision: {artifact.sha256}"
-                )
-            uploads[relative_path] = artifact.content
+            if existing is not None and existing != content:
+                raise RuntimeError(f"Custom template digest collision: {digest}")
+            uploads[relative_path] = content
+            template.mmcif = None
             template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
 
     staged_conf = AF3Config.model_validate(
@@ -391,6 +392,7 @@ def prepare_inference_run(
         run_id=run_id,
         request_id=request_id,
         run_root=run_root,
+        display_name=display_name,
         submitted_seeds=submitted_seeds,
         normalized_seeds=normalized_seeds,
         identity_view=identity_view,

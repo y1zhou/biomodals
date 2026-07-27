@@ -18,7 +18,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import orjson
 
@@ -51,6 +51,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     HMMER_VERSION,
     JACKHMMER_PATCH_SHA256,
+    SHARDED_DB_VOLUME_NAME,
     DatabaseProfileSpec,
     profile_root,
     resolve_database_profile,
@@ -92,8 +93,10 @@ RNA_UNPAIRED_DATABASES = ("rfam", "rnacentral", "ntrna")
 class SearchRuntime:
     """Mounted resources and scheduling state for one search worker."""
 
-    sharded_root: Path
-    cache_root: Path
+    SHARDED_MOUNT: ClassVar[str] = f"/{SHARDED_DB_VOLUME_NAME}"
+    CACHE_MOUNT: ClassVar[str] = "/biomodals-msa-cache"
+    CACHE_VOLUME_SUBPATH: ClassVar[str] = "/AlphaFold3"
+
     sharded_volume: VolumeHandle
     cache_volume: VolumeHandle
     claims: ClaimStore
@@ -101,6 +104,8 @@ class SearchRuntime:
     maximum_age_seconds: int | float
     wait_timeout_seconds: int | float
     claim_poll_seconds: float = 5.0
+    sharded_root: Path = Path(SHARDED_MOUNT)
+    cache_root: Path = Path(CACHE_MOUNT)
 
 
 @dataclass(frozen=True, slots=True)

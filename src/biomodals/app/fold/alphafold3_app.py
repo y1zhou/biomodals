@@ -28,7 +28,6 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 import os
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -38,7 +37,6 @@ import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.config import AppConfig
-from biomodals.app.fold.alphafold3.artifacts import utc_now, write_json_atomic
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     MAX_INFERENCE_WORKERS,
@@ -71,7 +69,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
     build_profile,
-    cleanup_profile_workspace,
+    finalize_profile_setup,
     inspect_profile_registry,
     plan_missing_profile_builds,
 )
@@ -80,17 +78,15 @@ from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_REPOSITORY,
     BUILD_MEMORY_MIB,
     BUILD_TIMEOUT_SECONDS,
-    DATABASE_PROFILE_SPECS,
     DEFAULT_SEQKIT_THREADS,
     PROFILE_BUILD_CLAIM_DICT_NAME,
+    PROFILE_BUILD_CPU,
     PROFILE_BUILD_MAX_CONTAINERS,
     SEQKIT_VERSION,
     SHARDED_DB_VOLUME_NAME,
-    SOURCE_DB_VOLUME_NAME,
     SourcePolicy,
+    plan_profile_setup,
     profile_build_slot_budget,
-    validate_seqkit_threads,
-    validate_source_policy,
 )
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
@@ -135,7 +131,6 @@ from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
     MSA_CACHE_VOLUME,
-    MSA_CACHE_VOLUME_NAME,
 )
 from biomodals.helper.io import resolve_local_output_dir
 from biomodals.helper.shell import run_command
@@ -157,26 +152,9 @@ CONF = AppConfig(
     timeout=int(os.environ.get("TIMEOUT", "21600")),
 )
 
-
-@dataclass
-class AppInfo:
-    """Container for AlphaFold3-specific information and configurations."""
-
-    # Volume mount path for genetic search databases
-    msa_db_dir: str = f"/{CONF.name}-msa-db"
-    # Volume mount path for immutable sharded genetic databases
-    sharded_msa_db_dir: str = f"/{SHARDED_DB_VOLUME_NAME}"
-    # Volume mount path for MSA output cache
-    msa_cache_dir: str = f"/{MSA_CACHE_VOLUME_NAME}"
-    msa_cache_volume_subdir: str = f"/{CONF.name}"
-    # Durable setup evidence below the app's output Volume
-    profile_build_evidence_dir: str = "msa-profile-builds"
-
-
 ##########################################
 # Image and app definitions
 ##########################################
-APP_INFO = AppInfo()
 SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     SHARDED_DB_VOLUME_NAME,
     create_if_missing=True,
@@ -281,10 +259,7 @@ _CONTAINER_INSTANCE_ID = uuid.uuid4().hex
 def _profile_builder_runtime() -> ProfileBuilderRuntime:
     """Bind the shared builder to production mounts and persistence objects."""
     return ProfileBuilderRuntime(
-        source_root=Path(APP_INFO.msa_db_dir),
-        sharded_root=Path(APP_INFO.sharded_msa_db_dir),
         output_root=Path(CONF.output_volume_mountpoint),
-        evidence_relpath=APP_INFO.profile_build_evidence_dir,
         source_volume=AF3_MSA_DB_VOLUME,
         sharded_volume=SHARDED_MSA_DB_VOLUME,
         output_volume=CONF.output_volume,
@@ -295,13 +270,13 @@ def _profile_builder_runtime() -> ProfileBuilderRuntime:
 
 @app.function(
     image=sharding_image,
-    cpu=(0.125, 32.125),
+    cpu=PROFILE_BUILD_CPU,
     memory=BUILD_MEMORY_MIB,
     timeout=BUILD_TIMEOUT_SECONDS,
     max_containers=PROFILE_BUILD_MAX_CONTAINERS,
     volumes={
-        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
-        APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME,
+        ProfileBuilderRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME,
+        ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
         CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
@@ -326,16 +301,18 @@ def build_sharded_database(
     timeout=600,
     max_containers=1,
     volumes={
-        APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME.with_mount_options(
-            read_only=True,
-            sub_path="/",
+        ProfileBuilderRuntime.SHARDED_MOUNT: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
         ),
     },
 )
 def inspect_sharded_database_profiles() -> dict[str, object]:
     """Inspect all fixed profile manifests without expensive digest scans."""
     SHARDED_MSA_DB_VOLUME.reload()
-    return inspect_profile_registry(Path(APP_INFO.sharded_msa_db_dir))
+    return inspect_profile_registry(Path(ProfileBuilderRuntime.SHARDED_MOUNT))
 
 
 @app.function(
@@ -345,92 +322,13 @@ def inspect_sharded_database_profiles() -> dict[str, object]:
     timeout=600,
     max_containers=1,
     volumes={
-        APP_INFO.sharded_msa_db_dir: SHARDED_MSA_DB_VOLUME,
+        ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
         CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
 def finalize_sharded_database_setup() -> dict[str, object]:
     """Clean abandoned and unselected profiles after all builders complete."""
-    SHARDED_MSA_DB_VOLUME.reload()
-    CONF.output_volume.reload()
-    result = cleanup_profile_workspace(
-        Path(APP_INFO.sharded_msa_db_dir),
-        PROFILE_BUILD_CLAIMS,
-    )
-    SHARDED_MSA_DB_VOLUME.commit()
-    setup_id = uuid.uuid4().hex
-    evidence_root = (
-        Path(CONF.output_volume_mountpoint)
-        / APP_INFO.profile_build_evidence_dir
-        / "setup"
-        / setup_id
-    )
-    completed = result | {
-        "setup_id": setup_id,
-        "completed_at": utc_now(),
-    }
-    write_json_atomic(evidence_root / "inventory.json", completed)
-    CONF.output_volume.commit()
-    write_json_atomic(
-        evidence_root / "done.json",
-        {
-            "status": "complete",
-            "setup_id": setup_id,
-            "completed_at": utc_now(),
-        },
-    )
-    CONF.output_volume.commit()
-    return completed
-
-
-def _sharded_database_setup_plan(
-    seqkit_threads: int,
-    source_policy: str,
-) -> dict[str, object]:
-    """Build the cost-free plan for production profile setup."""
-    threads = validate_seqkit_threads(seqkit_threads)
-    policy = validate_source_policy(source_policy)
-    return {
-        "operation": "setup-sharded-databases",
-        "profiles": [
-            {
-                "database_id": spec.database_id,
-                "profile_id": spec.profile_id,
-                "source_filename": spec.source_filename,
-                "shard_count": spec.shard_count,
-                "polymer": spec.polymer,
-            }
-            for spec in DATABASE_PROFILE_SPECS
-        ],
-        "builder": {
-            "function": "build_sharded_database",
-            "seqkit_threads": threads,
-            "source_policy": policy,
-            "cpu": [0.125, 32.125],
-            "memory_mib": list(BUILD_MEMORY_MIB),
-            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
-        },
-        "fanout_budget": profile_build_slot_budget(
-            len(DATABASE_PROFILE_SPECS),
-            threads,
-        ),
-        "coordination": [
-            "inspect-fixed-profile-manifests",
-            "submit-all-missing-profiles-concurrently",
-            "wait-for-all-builders",
-            "final-inventory-and-workspace-cleanup",
-        ],
-        "volumes": {
-            "source": SOURCE_DB_VOLUME_NAME,
-            "shards": SHARDED_DB_VOLUME_NAME,
-            "evidence": CONF.output_volume_name,
-        },
-        "cleanup": {
-            "barrier": "all-selected-profiles-valid-and-no-active-claims",
-            "remove_generation_workspaces": [".staging", ".orphaned"],
-            "remove_unselected_profile_directories": True,
-        },
-    }
+    return finalize_profile_setup(_profile_builder_runtime())
 
 
 ##########################################
@@ -442,14 +340,15 @@ def _sharded_database_setup_plan(
     timeout=600,
     max_containers=1,
     volumes={
-        APP_INFO.sharded_msa_db_dir: (
+        SearchRuntime.SHARDED_MOUNT: (
             SHARDED_MSA_DB_VOLUME.with_mount_options(
                 read_only=True,
                 sub_path="/",
             )
         ),
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
     },
 )
@@ -464,8 +363,8 @@ def inspect_msa_search_cache(
         for database_id, sequence in inputs
     )
     return inspect_raw_searches(
-        Path(APP_INFO.sharded_msa_db_dir),
-        Path(APP_INFO.msa_cache_dir),
+        Path(SearchRuntime.SHARDED_MOUNT),
+        Path(SearchRuntime.CACHE_MOUNT),
         tasks,
     )
 
@@ -477,8 +376,6 @@ def _msa_search_runtime(
 ) -> SearchRuntime:
     """Bind shared search code to production mounts and persistence objects."""
     return SearchRuntime(
-        sharded_root=Path(APP_INFO.sharded_msa_db_dir),
-        cache_root=Path(APP_INFO.msa_cache_dir),
         sharded_volume=SHARDED_MSA_DB_VOLUME,
         cache_volume=MSA_CACHE_VOLUME,
         claims=MSA_SEARCH_CLAIMS,
@@ -493,14 +390,15 @@ def _msa_search_runtime(
     memory=(1024, 131_072),
     timeout=CONF.timeout,
     volumes={
-        APP_INFO.sharded_msa_db_dir: (
+        SearchRuntime.SHARDED_MOUNT: (
             SHARDED_MSA_DB_VOLUME.with_mount_options(
                 read_only=True,
                 sub_path="/",
             )
         ),
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=False, sub_path=APP_INFO.msa_cache_volume_subdir
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
     },
 )
@@ -521,14 +419,15 @@ def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
     memory=(1024, 32_768),
     timeout=1800,
     volumes={
-        APP_INFO.sharded_msa_db_dir: (
+        SearchRuntime.SHARDED_MOUNT: (
             SHARDED_MSA_DB_VOLUME.with_mount_options(
                 read_only=True,
                 sub_path="/",
             )
         ),
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=False, sub_path=APP_INFO.msa_cache_volume_subdir
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
     },
 )
@@ -561,9 +460,9 @@ def assemble_sequence_msas(
     timeout=600,
     max_containers=1,
     volumes={
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
+        TemplateRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
             read_only=True,
-            sub_path=APP_INFO.msa_cache_volume_subdir,
+            sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
         ),
     },
 )
@@ -573,7 +472,7 @@ def inspect_protein_template_cache(
     """Inspect canonical template markers without consuming search workers."""
     MSA_CACHE_VOLUME.reload()
     return inspect_template_entries(
-        Path(APP_INFO.msa_cache_dir),
+        Path(TemplateRuntime.CACHE_MOUNT),
         tuple(inputs),
     )
 
@@ -581,8 +480,6 @@ def inspect_protein_template_cache(
 def _template_runtime() -> TemplateRuntime:
     """Bind shared template search to production mounts and claims."""
     return TemplateRuntime(
-        source_root=Path(APP_INFO.msa_db_dir),
-        cache_root=Path(APP_INFO.msa_cache_dir),
         source_volume=AF3_MSA_DB_VOLUME,
         cache_volume=MSA_CACHE_VOLUME,
         claims=MSA_SEARCH_CLAIMS,
@@ -597,12 +494,13 @@ def _template_runtime() -> TemplateRuntime:
     memory=(1024, 32_768),
     timeout=CONF.timeout,
     volumes={
-        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME.with_mount_options(
+        TemplateRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME.with_mount_options(
             read_only=True,
             sub_path="/",
         ),
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=False, sub_path=APP_INFO.msa_cache_volume_subdir
+        TemplateRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
         ),
     },
 )
@@ -1153,7 +1051,11 @@ def setup_sharded_databases(
         source_policy: Post-publication source action: keep, compress, or delete.
         submit: Submit Modal work. Defaults to false and only prints the plan.
     """
-    plan = _sharded_database_setup_plan(seqkit_threads, source_policy)
+    plan = plan_profile_setup(
+        seqkit_threads,
+        source_policy,
+        evidence_volume_name=CONF.output_volume_name,
+    )
     print(
         orjson.dumps(
             plan,

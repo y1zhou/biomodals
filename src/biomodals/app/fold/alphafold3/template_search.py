@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import orjson
 
@@ -40,6 +40,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     finish_generation_claim,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
+    SearchRuntime,
     sequence_cache_relpath,
     sequence_hash,
     validate_query,
@@ -47,6 +48,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     HMMER_VERSION,
+    SOURCE_DB_VOLUME_NAME,
     resolve_database_profile,
 )
 
@@ -66,8 +68,10 @@ TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
 class TemplateRuntime:
     """Mounted resources and coordination state for one template worker."""
 
-    source_root: Path
-    cache_root: Path
+    SOURCE_MOUNT: ClassVar[str] = f"/{SOURCE_DB_VOLUME_NAME}"
+    CACHE_MOUNT: ClassVar[str] = SearchRuntime.CACHE_MOUNT
+    CACHE_VOLUME_SUBPATH: ClassVar[str] = SearchRuntime.CACHE_VOLUME_SUBPATH
+
     source_volume: VolumeHandle
     cache_volume: VolumeHandle
     claims: ClaimStore
@@ -75,6 +79,8 @@ class TemplateRuntime:
     maximum_age_seconds: int | float
     wait_timeout_seconds: int | float
     claim_poll_seconds: float = 5.0
+    source_root: Path = Path(SOURCE_MOUNT)
+    cache_root: Path = Path(CACHE_MOUNT)
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import orjson
 
@@ -58,6 +58,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     SCRATCH_ROOT,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
+    SHARDED_DB_VOLUME_NAME,
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
@@ -87,15 +88,19 @@ _JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 class ProfileBuilderRuntime:
     """Mounted paths and persistence handles for one builder container."""
 
-    source_root: Path
-    sharded_root: Path
+    SOURCE_MOUNT: ClassVar[str] = f"/{SOURCE_DB_VOLUME_NAME}"
+    SHARDED_MOUNT: ClassVar[str] = f"/{SHARDED_DB_VOLUME_NAME}"
+    EVIDENCE_RELPATH: ClassVar[str] = "msa-profile-builds"
+
     output_root: Path
-    evidence_relpath: str
     source_volume: VolumeHandle
     sharded_volume: VolumeHandle
     output_volume: VolumeHandle
     claims: ClaimStore
     container_id: str
+    source_root: Path = Path(SOURCE_MOUNT)
+    sharded_root: Path = Path(SHARDED_MOUNT)
+    evidence_relpath: str = EVIDENCE_RELPATH
 
 
 @dataclass(frozen=True, slots=True)
@@ -1315,3 +1320,30 @@ def cleanup_profile_workspace(
         "removed_unselected_profile_paths": removed_profiles,
         "inventory": inspect_profile_registry(sharded_root),
     }
+
+
+def finalize_profile_setup(runtime: ProfileBuilderRuntime) -> dict[str, object]:
+    """Clean the fixed profile registry and publish durable setup evidence."""
+    runtime.sharded_volume.reload()
+    runtime.output_volume.reload()
+    result = cleanup_profile_workspace(runtime.sharded_root, runtime.claims)
+    runtime.sharded_volume.commit()
+
+    setup_id = uuid.uuid4().hex
+    evidence_root = runtime.output_root / runtime.evidence_relpath / "setup" / setup_id
+    completed = result | {
+        "setup_id": setup_id,
+        "completed_at": utc_now(),
+    }
+    write_json_atomic(evidence_root / "inventory.json", completed)
+    runtime.output_volume.commit()
+    write_json_atomic(
+        evidence_root / "done.json",
+        {
+            "status": "complete",
+            "setup_id": setup_id,
+            "completed_at": utc_now(),
+        },
+    )
+    runtime.output_volume.commit()
+    return completed

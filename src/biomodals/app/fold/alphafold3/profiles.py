@@ -30,6 +30,7 @@ SEQKIT_VERSION = "2.13.0"
 SHARD_RANDOM_SEED = 23
 MAX_PROFILE_IMBALANCE = 0.05
 BUILD_TIMEOUT_SECONDS = 86_400
+PROFILE_BUILD_CPU = (0.125, 32.125)
 BUILD_MEMORY_MIB = (1024, 262_144)
 PROFILE_STALE_SECONDS = BUILD_TIMEOUT_SECONDS + 900
 SCRATCH_ROOT = Path(tempfile.gettempdir())
@@ -272,6 +273,60 @@ def profile_build_slot_budget(
         "overlapping_source_validator_threads_per_builder": (source_validator_threads),
         "maximum_effective_worker_slots": builder_count
         * (threads + source_validator_threads),
+    }
+
+
+def plan_profile_setup(
+    seqkit_threads: int,
+    source_policy: str,
+    *,
+    evidence_volume_name: str,
+) -> dict[str, object]:
+    """Build the cost-free plan for every fixed production profile."""
+    threads = validate_seqkit_threads(seqkit_threads)
+    policy = validate_source_policy(source_policy)
+    if not isinstance(evidence_volume_name, str) or not evidence_volume_name:
+        raise ValueError("evidence_volume_name must be a non-empty string")
+    return {
+        "operation": "setup-sharded-databases",
+        "profiles": [
+            {
+                "database_id": spec.database_id,
+                "profile_id": spec.profile_id,
+                "source_filename": spec.source_filename,
+                "shard_count": spec.shard_count,
+                "polymer": spec.polymer,
+            }
+            for spec in DATABASE_PROFILE_SPECS
+        ],
+        "builder": {
+            "function": "build_sharded_database",
+            "seqkit_threads": threads,
+            "source_policy": policy,
+            "cpu": list(PROFILE_BUILD_CPU),
+            "memory_mib": list(BUILD_MEMORY_MIB),
+            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
+        },
+        "fanout_budget": profile_build_slot_budget(
+            len(DATABASE_PROFILE_SPECS),
+            threads,
+        ),
+        "coordination": [
+            "inspect-fixed-profile-manifests",
+            "submit-all-missing-profiles-concurrently",
+            "wait-for-all-builders",
+            "final-inventory-and-workspace-cleanup",
+        ],
+        "volumes": {
+            "source": SOURCE_DB_VOLUME_NAME,
+            "shards": SHARDED_DB_VOLUME_NAME,
+            "evidence": evidence_volume_name,
+        },
+        "cleanup": {
+            "barrier": "all-selected-profiles-valid-and-no-active-claims",
+            "remove_generation_workspaces": [".staging", ".orphaned"],
+            "remove_unselected_profile_directories": True,
+        },
     }
 
 

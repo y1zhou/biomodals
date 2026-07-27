@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import cast
 
 import modal
 import orjson
@@ -80,6 +81,12 @@ from biomodals.app.fold.alphafold3.profiles import (
     validate_seqkit_threads,
     validate_source_policy,
 )
+from biomodals.app.fold.alphafold3.request_results import (
+    RequestPublication,
+    create_request_archive,
+    publish_request_results,
+    sanitize_presentation_name,
+)
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
     ClaimedSeed,
@@ -116,6 +123,7 @@ from biomodals.helper.constant import (
     MSA_CACHE_VOLUME,
     MSA_CACHE_VOLUME_NAME,
 )
+from biomodals.helper.io import resolve_local_output_dir
 from biomodals.helper.shell import run_command
 from biomodals.helper.task_budget import bounded_map
 
@@ -1249,6 +1257,38 @@ def finalize_inference_summary(
     )
 
 
+@app.function(
+    cpu=(0.125, 2.125),
+    memory=(1024, 16384),
+    timeout=3600,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_inference_request(
+    run_id: str,
+    request_id: str,
+    submitted_seeds: list[int],
+    normalized_seeds: list[int],
+    sample_count: int,
+    display_name: str,
+    reused_seeds: list[int],
+    published_seeds: list[int],
+) -> dict[str, object]:
+    """Publish one manifest-last view over the request's completed seeds."""
+    return publish_request_results(
+        _inference_runtime(),
+        RequestPublication(
+            run_id=run_id,
+            request_id=request_id,
+            submitted_seeds=tuple(submitted_seeds),
+            normalized_seeds=tuple(normalized_seeds),
+            sample_count=sample_count,
+            display_name=display_name,
+            reused_seeds=tuple(reused_seeds),
+            published_seeds=tuple(published_seeds),
+        ),
+    )
+
+
 def _claimed_seed_record(item: ClaimedSeed) -> dict[str, object]:
     return {
         "seed": item.seed,
@@ -1449,6 +1489,7 @@ def predict_structures(
         requested,
         sample,
     )
+    reused.update(completed.difference(reused, published))
     incomplete = set(requested) - completed
     summary: dict[str, object] | None = None
     if completed:
@@ -1473,6 +1514,16 @@ def predict_structures(
             "Incomplete AlphaFold3 seed predictions; completed siblings remain "
             f"reusable and no failed seed was retried: {result}"
         )
+    result["request"] = finalize_inference_request.remote(
+        prepared.run_id,
+        prepared.request_id,
+        list(prepared.submitted_seeds),
+        list(prepared.normalized_seeds),
+        sample,
+        prepared.worker_config.name,
+        sorted(reused),
+        sorted(published),
+    )
     return result
 
 
@@ -1579,17 +1630,17 @@ def submit_alphafold3_task(
 
     Args:
         input_json: Path to input JSON file.
-        out_dir: Optional output directory (defaults to $CWD)
-        run_name: Optional run name (defaults to `name` in the AF3 JSON config)
+        out_dir: Optional local archive directory (defaults to $CWD).
+        run_name: Optional display name used in downloaded output basenames.
+            Defaults to `name` in the AF3 JSON config.
         search_msa: Populate missing protein and RNA MSA fields.
         search_protein_templates: Populate missing protein templates after MSA
             resolution. Non-empty caller fields are always preserved.
         max_parallel_search_workers: Request-wide cap for database and template
             workers. Database workers internally use 16 shards by two HMMER
             CPUs.
-        max_num_gpus: Maximum number of GPUs to use during inference. If >1,
-            multiple `model_inference` jobs will be spawned in parallel based
-            on the number of model seeds in the JSON config.
+        max_num_gpus: Maximum number of disjoint seed workers to run during
+            inference.
         recycle: Number of Pairformer recycles to use during inference.
         sample: Number of diffusion samples to generate per seed.
 
@@ -1603,6 +1654,7 @@ def submit_alphafold3_task(
     conf = local_input.config
     if run_name is None:
         run_name = conf.name
+    sanitize_presentation_name(run_name)
     conf.name = run_name
 
     print(f"🧬 Resolving {CONF.name} MSA and template fields...")
@@ -1644,8 +1696,18 @@ def submit_alphafold3_task(
         sample,
         num_containers,
     )
+    request_manifest = result.get("request")
+    if not isinstance(request_manifest, dict):
+        raise RuntimeError(
+            f"AlphaFold3 request publication returned invalid metadata: {result!r}"
+        )
+    archive_path = create_request_archive(
+        CONF.output_volume,
+        cast(dict[str, object], request_manifest),
+        output_dir=resolve_local_output_dir(out_dir),
+        display_name=run_name,
+    )
     print(
-        f"🧬 {CONF.name} seed predictions are durable in "
-        f"{CONF.output_volume_name}:/{prepared.run_root}. "
-        f"Request retrieval metadata: {result}"
+        f"🧬 {CONF.name} results saved to {archive_path}. Durable seed "
+        f"predictions remain in {CONF.output_volume_name}:/{prepared.run_root}."
     )

@@ -839,11 +839,34 @@ committed. Request-specific rankings and presentation files remain Checklist
 
 Commit: `fold: retrieve request-scoped outputs`
 
+Status: implemented locally; no Modal inference or Volume download submitted.
+
 - publish request manifests and request-best files;
 - download only requested canonical artifacts;
 - restore presentation prefixes locally;
 - create and validate request-qualified `.tar.zst` archives;
 - update the entrypoint flags and help text.
+
+The request boundary now lives in `alphafold3/request_results.py`. After all
+requested seed markers and the accumulated summary are complete, one CPU
+finalizer publishes the deterministic requested-seed ranking, request-best
+files, terms, and a content-addressed copy of the observed global-summary
+marker. Its `manifest.json` is written last and records submitted/normalized
+seeds, removed duplicates, reused/newly published seeds, the observed global
+best, every requested sample file, optional seed outputs, and only the custom
+templates referenced by the enriched request input. It never copies seed
+directories or declares an unrelated completed seed.
+
+The local entrypoint streams only those Volume-relative manifest artifacts,
+rejects paths outside the hash-fanned run root, and restores upstream's exact
+sanitized display-name prefix in downloaded basenames. Only the downloaded
+input copy changes: it restores the current display name and rewrites staged
+`mmcifPath` values to archive-relative `custom-templates/{sha256}.cif` paths.
+The resulting
+`{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
+temporary path and promoted only after every expected member is readable. A
+non-empty readable existing archive is reused; an unreadable one causes an
+explicit error and is never overwritten.
 
 ### 9. Record validation and remove obsolete production paths
 

@@ -46,7 +46,7 @@ SEED_CLAIM_SCHEMA_VERSION = 1
 SUMMARY_CLAIM_SCHEMA_VERSION = 1
 
 _JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
-_CORE_OUTPUT_SUFFIXES = (
+CORE_OUTPUT_SUFFIXES = (
     "model.cif",
     "confidences.json",
     "summary_confidences.json",
@@ -642,7 +642,7 @@ def _validate_seed_output(
         if not sample_root.is_dir() or sample_root.is_symlink():
             raise FileNotFoundError(f"Expected sample directory: {sample_root}")
         prefix = f"{canonical_name}_seed-{seed}_sample-{sample_index}"
-        for suffix in _CORE_OUTPUT_SUFFIXES:
+        for suffix in CORE_OUTPUT_SUFFIXES:
             require_regular_file(sample_root / f"{prefix}_{suffix}")
     embeddings_root = job_root / f"seed-{seed}_embeddings"
     if embeddings_root.exists():
@@ -1065,21 +1065,23 @@ def _summary_artifact_record(
     }
 
 
-def _copy_best_outputs(
+def copy_best_outputs(
     staging_root: Path,
     outputs_root: Path,
     canonical_name: str,
     best: RankingRow,
 ) -> None:
+    """Copy one ranked sample into upstream's top-level best-file shape."""
     sample_root = outputs_root / f"seed-{best.seed}_sample-{best.sample_index}"
     source_prefix = f"{canonical_name}_seed-{best.seed}_sample-{best.sample_index}"
-    for suffix in _CORE_OUTPUT_SUFFIXES:
+    for suffix in CORE_OUTPUT_SUFFIXES:
         source = sample_root / f"{source_prefix}_{suffix}"
         require_regular_file(source)
         shutil.copy2(source, staging_root / f"{canonical_name}_{suffix}")
 
 
-def _write_ranking_table(path: Path, rows: tuple[RankingRow, ...]) -> None:
+def write_ranking_table(path: Path, rows: tuple[RankingRow, ...]) -> None:
+    """Write upstream's stable seed/sample ranking CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame({
         "seed": [row.seed for row in rows],
@@ -1171,7 +1173,7 @@ def finalize_run_summary(
         if staging_root.exists():
             shutil.rmtree(staging_root)
         staging_root.mkdir(parents=True)
-        _write_ranking_table(
+        write_ranking_table(
             staging_root / f"{canonical_name}_ranking_scores.csv",
             rows,
         )
@@ -1179,7 +1181,7 @@ def finalize_run_summary(
         if not isinstance(data_json, bytes) or not data_json:
             raise ValueError("build_data_json must return non-empty bytes")
         (staging_root / f"{canonical_name}_data.json").write_bytes(data_json)
-        _copy_best_outputs(
+        copy_best_outputs(
             staging_root,
             outputs_root,
             canonical_name,

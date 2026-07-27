@@ -16,11 +16,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 
 import orjson
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    VolumeHandle,
+    append_log,
     artifact_record,
     json_bytes,
     load_artifact_bytes,
@@ -47,7 +49,6 @@ from biomodals.app.fold.alphafold3.profiles import (
     HMMER_VERSION,
     resolve_database_profile,
 )
-from biomodals.app.fold.alphafold3.sharding import append_log
 
 DEFAULT_MAX_TEMPLATE_DATE = "2021-09-30"
 PDB_SEQRES_FILENAME = "pdb_seqres_2022_09_28.fasta"
@@ -59,18 +60,6 @@ HMMSEARCH_N_CPU = 8
 TEMPLATE_RESULT_SCHEMA_VERSION = 1
 TEMPLATE_IDENTITY_SCHEMA_VERSION = 1
 TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
-
-
-class VolumeHandle(Protocol):
-    """Persistence barriers required from a mounted Modal Volume."""
-
-    def reload(self) -> None:
-        """Reload commits made by other containers."""
-        ...
-
-    def commit(self) -> None:
-        """Commit this container's changes."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)

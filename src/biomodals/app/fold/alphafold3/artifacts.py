@@ -6,14 +6,35 @@ import hashlib
 import os
 import re
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import orjson
 
 _JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+class VolumeHandle(Protocol):
+    """Persistence barriers shared by mounted Modal Volume adapters."""
+
+    def reload(self) -> None:
+        """Reload commits made by other containers."""
+        ...
+
+    def commit(self) -> None:
+        """Commit this container's writes."""
+        ...
+
+
+class VolumeReader(Protocol):
+    """Chunked read interface exposed by a local Modal Volume handle."""
+
+    def read_file(self, path: str) -> Iterable[bytes]:
+        """Yield a Volume file as byte chunks."""
+        ...
 
 
 def json_bytes(value: object) -> bytes:
@@ -29,6 +50,13 @@ def sha256_bytes(value: bytes) -> str:
 def utc_now() -> str:
     """Return an RFC 3339-compatible UTC timestamp."""
     return datetime.now(UTC).isoformat()
+
+
+def append_log(path: Path, message: str) -> None:
+    """Append one timestamped line to a durable operation log."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{utc_now()} {message}\n")
 
 
 def require_regular_file(path: Path) -> None:

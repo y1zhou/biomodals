@@ -23,6 +23,7 @@ import orjson
 import polars as pl
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    VolumeHandle,
     artifact_record,
     require_regular_file,
     sha256_bytes,
@@ -60,18 +61,6 @@ _SUMMARY_ARTIFACT_FILENAMES = {
     "summary_confidences": "summary_confidences.json",
     "terms": "TERMS_OF_USE.md",
 }
-
-
-class VolumeHandle(Protocol):
-    """Persistence barriers required from a mounted Modal Volume."""
-
-    def reload(self) -> None:
-        """Reload commits made by other containers."""
-        ...
-
-    def commit(self) -> None:
-        """Commit this container's changes."""
-        ...
 
 
 class PredictionExecutor(Protocol):

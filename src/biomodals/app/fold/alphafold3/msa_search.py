@@ -18,11 +18,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, cast
 
 import orjson
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    VolumeHandle,
+    append_log,
     artifact_record,
     json_bytes,
     load_artifact_bytes,
@@ -54,7 +56,6 @@ from biomodals.app.fold.alphafold3.profiles import (
     resolve_database_profile,
     shard_names,
 )
-from biomodals.app.fold.alphafold3.sharding import append_log
 
 Polymer = Literal["protein", "rna"]
 
@@ -85,18 +86,6 @@ SEARCH_MAX_PARALLEL_SHARDS = 16
 PROTEIN_UNPAIRED_DATABASES = ("uniref90", "small_bfd", "mgnify")
 PROTEIN_PAIRED_DATABASES = ("uniprot",)
 RNA_UNPAIRED_DATABASES = ("rfam", "rnacentral", "ntrna")
-
-
-class VolumeHandle(Protocol):
-    """Persistence barriers required from a mounted Modal Volume."""
-
-    def reload(self) -> None:
-        """Reload commits made by other containers."""
-        ...
-
-    def commit(self) -> None:
-        """Commit this container's changes."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)

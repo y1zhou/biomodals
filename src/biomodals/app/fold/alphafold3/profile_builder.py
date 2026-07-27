@@ -20,11 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from time import time
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 import orjson
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    VolumeHandle,
+    append_log,
     artifact_record,
     json_bytes,
     load_json_object,
@@ -69,7 +71,6 @@ from biomodals.app.fold.alphafold3.sharding import (
     ORDINAL_SHUFFLER_PREFETCH_RECORDS,
     ORDINAL_SHUFFLER_SOURCE_SHA256,
     ORDINAL_SHUFFLER_VERSION,
-    append_log,
     compile_record_multiset_validator,
     record_multiset_identity,
     record_multiset_signature,
@@ -81,18 +82,6 @@ from biomodals.app.fold.alphafold3.sharding import (
 )
 
 _JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
-
-
-class VolumeHandle(Protocol):
-    """Persistence barrier methods required from a mounted Modal Volume."""
-
-    def reload(self) -> None:
-        """Reload changes committed by other containers."""
-        ...
-
-    def commit(self) -> None:
-        """Commit this container's writes."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)

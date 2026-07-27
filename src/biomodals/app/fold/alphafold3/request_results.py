@@ -15,15 +15,15 @@ import shutil
 import subprocess as sp
 import tarfile
 import uuid
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import IO, Protocol, cast
+from typing import IO, cast
 
 import orjson
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    VolumeReader,
     json_bytes,
     require_regular_file,
     sha256_file,
@@ -53,14 +53,6 @@ REQUEST_MANIFEST_SCHEMA_VERSION = 2
 
 _CUSTOM_TEMPLATE_PATTERN = re.compile(r"(?P<digest>[0-9a-f]{64})\.cif")
 _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
-
-
-class VolumeReader(Protocol):
-    """Local read interface exposed by ``modal.Volume``."""
-
-    def read_file(self, path: str) -> Iterable[bytes]:
-        """Yield a Volume file as byte chunks."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,10 +14,10 @@ from typing import Any
 import orjson
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    append_log,
     load_json_object,
     require_regular_file,
     sha256_file,
-    utc_now,
     write_json_atomic,
 )
 
@@ -69,13 +69,6 @@ RECORD_MULTISET_VALIDATOR = NativeTool(
     source_filename="af3-fasta-record-multiset.c",
     source_sha256=RECORD_MULTISET_SOURCE_SHA256,
 )
-
-
-def append_log(path: Path, message: str) -> None:
-    """Append one timestamped line to a durable operation log."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(f"{utc_now()} {message}\n")
 
 
 def verify_file(

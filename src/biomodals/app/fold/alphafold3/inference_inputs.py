@@ -580,6 +580,19 @@ def validate_inference_parameters(recycle: int, sample: int) -> None:
         )
 
 
+def validate_inference_worker_budget(max_num_gpus: int) -> int:
+    """Validate the GPU-worker cap before any cost-incurring remote work."""
+    if (
+        isinstance(max_num_gpus, bool)
+        or not isinstance(max_num_gpus, int)
+        or not 1 <= max_num_gpus <= MAX_INFERENCE_WORKERS
+    ):
+        raise ValueError(
+            f"max_num_gpus must be an integer between 1 and {MAX_INFERENCE_WORKERS}"
+        )
+    return max_num_gpus
+
+
 def prepare_inference_run(
     enriched_config: AF3Config,
     custom_templates: tuple[LocalTemplateFile, ...],

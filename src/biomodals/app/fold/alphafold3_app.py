@@ -37,19 +37,14 @@ from uniaf3.schema.alphafold3 import AF3Config
 from biomodals.app.config import AppConfig
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
-    MAX_INFERENCE_WORKERS,
     PreparedInferenceRun,
     materialize_local_input,
     prepare_inference_run,
     sanitize_af3_name,
-    serialize_af3_input,
     validate_inference_parameters,
-    validate_upstream_af3_input,
+    validate_inference_worker_budget,
 )
 from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
-from biomodals.app.fold.alphafold3.input_enrichment import (
-    fill_missing_msa_for_inference,
-)
 from biomodals.app.fold.alphafold3.modal_adapters import (
     ModalInferenceExecutor,
     ModalSearchExecutor,
@@ -99,13 +94,8 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
     InferenceRuntime,
-    SeedWorkerTask,
-    canonical_output_name,
     claim_seed_predictions,
-    claimed_seed_from_dict,
-    finalize_run_summary,
     inspect_seed_predictions,
-    run_seed_prediction_worker,
 )
 from biomodals.app.fold.alphafold3.sharding import (
     CONTAINER_NATIVE_SOURCE_DIR,
@@ -120,6 +110,11 @@ from biomodals.app.fold.alphafold3.template_search import (
 from biomodals.app.fold.alphafold3.template_search import (
     run_template_search as run_resumable_template_search,
 )
+from biomodals.app.fold.alphafold3.upstream_inference import (
+    UpstreamInferenceRuntime,
+    finalize_upstream_run_summary,
+    run_upstream_seed_worker,
+)
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
@@ -127,7 +122,6 @@ from biomodals.helper.constant import (
     MSA_CACHE_VOLUME,
 )
 from biomodals.helper.io import resolve_local_output_dir
-from biomodals.helper.shell import run_command
 
 ##########################################
 # Modal configs
@@ -153,14 +147,7 @@ SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     create_if_missing=True,
     version=2,
 )
-JAX_CACHE_VOLUME_NAME = f"{CONF.name}-jax-cache"
-JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{JAX_CACHE_VOLUME_NAME}")
-JAX_CACHE_DIR = JAX_CACHE_MOUNTPOINT / ALPHAFOLD3_COMMIT
-JAX_CACHE_VOLUME = modal.Volume.from_name(
-    JAX_CACHE_VOLUME_NAME,
-    create_if_missing=True,
-    version=2,
-)
+_JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
 PROFILE_BUILD_CLAIMS = modal.Dict.from_name(
     PROFILE_BUILD_CLAIM_DICT_NAME,
     create_if_missing=True,
@@ -515,19 +502,6 @@ def search_protein_templates(
     )
 
 
-def _validate_max_num_gpus(max_num_gpus: int) -> int:
-    """Validate the GPU-worker cap before any cost-incurring remote work."""
-    if (
-        isinstance(max_num_gpus, bool)
-        or not isinstance(max_num_gpus, int)
-        or not 1 <= max_num_gpus <= MAX_INFERENCE_WORKERS
-    ):
-        raise ValueError(
-            f"max_num_gpus must be an integer between 1 and {MAX_INFERENCE_WORKERS}"
-        )
-    return max_num_gpus
-
-
 def _search_msa_and_templates(
     config: AF3Config,
     *,
@@ -628,7 +602,13 @@ def claim_seed_prediction_work(
         model_volume=True,
         model_ro=True,
     )
-    | {JAX_CACHE_MOUNTPOINT: JAX_CACHE_VOLUME},
+    | {
+        _JAX_CACHE_MOUNTPOINT: modal.Volume.from_name(
+            _JAX_CACHE_MOUNTPOINT.name,
+            create_if_missing=True,
+            version=2,
+        )
+    },
 )
 def run_inference_pipeline(
     json_bytes: bytes,
@@ -638,53 +618,18 @@ def run_inference_pipeline(
     claimed_seed_records: list[dict[str, object]],
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
-    import sys
-
-    validate_inference_parameters(recycle, sample)
-    claimed_seeds = tuple(
-        claimed_seed_from_dict(record) for record in claimed_seed_records
-    )
-    base_conf = validate_upstream_af3_input(AF3Config.model_validate_json(json_bytes))
-
-    def execute(
-        worker_root: Path,
-        canonical_name: str,
-        seeds: tuple[int, ...],
-    ) -> None:
-        conf = base_conf.model_copy(deep=True)
-        conf.name = canonical_name
-        conf.modelSeeds = list(seeds)
-        conf = fill_missing_msa_for_inference(conf)
-        input_json_path = worker_root / "input.json"
-        input_json_path.write_bytes(serialize_af3_input(conf))
-        print(f"💊 Running inference for {canonical_name} with seeds {list(seeds)}")
-        model_dir = Path(CONF.model_volume_mountpoint)
-        cmd = [
-            sys.executable,
-            str(CONF.git_clone_dir / "run_alphafold.py"),
-            "--run_inference=true",
-            "--run_data_pipeline=false",
-            f"--json_path={input_json_path}",
-            f"--output_dir={worker_root}",
-            f"--model_dir={model_dir}",
-            f"--jax_compilation_cache_dir={JAX_CACHE_DIR}",
-            f"--num_recycles={recycle}",
-            f"--num_diffusion_samples={sample}",
-        ]
-        run_command(
-            cmd,
-            output_mode="tee",
-            log_file=worker_root / "run.log",
-        )
-
-    return run_seed_prediction_worker(
-        _inference_runtime(),
-        SeedWorkerTask(
-            run_id=run_id,
-            sample_count=sample,
-            claimed_seeds=claimed_seeds,
+    return run_upstream_seed_worker(
+        UpstreamInferenceRuntime(
+            predictions=_inference_runtime(),
+            source_root=CONF.git_clone_dir,
+            model_root=Path(CONF.model_volume_mountpoint),
+            jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
         ),
-        execute,
+        json_bytes,
+        run_id,
+        recycle,
+        sample,
+        claimed_seed_records,
     )
 
 
@@ -700,24 +645,11 @@ def finalize_inference_summary(
     sample_count: int,
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
-    from alphafold3.common import (  # type: ignore[ty:unresolved-import]
-        folding_input,
-    )
-
-    base_conf = validate_upstream_af3_input(AF3Config.model_validate_json(json_bytes))
-
-    def build_data_json(seeds: tuple[int, ...]) -> bytes:
-        conf = base_conf.model_copy(deep=True)
-        conf.name = canonical_output_name(run_id)
-        conf.modelSeeds = list(seeds)
-        fold_input = folding_input.Input.from_json(serialize_af3_input(conf).decode())
-        return fold_input.to_json().encode()
-
-    return finalize_run_summary(
+    return finalize_upstream_run_summary(
         _inference_runtime(),
+        json_bytes,
         run_id,
-        sample_count=sample_count,
-        build_data_json=build_data_json,
+        sample_count,
     )
 
 
@@ -901,7 +833,7 @@ def submit_alphafold3_task(
         sample: Number of diffusion samples to generate per seed.
 
     """
-    max_num_gpus = _validate_max_num_gpus(max_num_gpus)
+    max_num_gpus = validate_inference_worker_budget(max_num_gpus)
     validate_search_worker_budget(max_parallel_search_workers)
     validate_inference_parameters(recycle, sample)
 

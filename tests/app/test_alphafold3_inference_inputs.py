@@ -16,6 +16,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     normalize_model_seeds,
     serialize_af3_input,
     validate_inference_parameters,
+    validate_inference_worker_budget,
     validate_upstream_af3_input,
 )
 
@@ -207,7 +208,7 @@ def test_inference_parameters_are_resource_bounded() -> None:
     with pytest.raises(ValueError, match="between 1 and"):
         validate_inference_parameters(1, 101)
     with pytest.raises(ValueError, match="between 1 and"):
-        alphafold3_app._validate_max_num_gpus(101)
+        validate_inference_worker_budget(101)
 
 
 def test_seed_cap_applies_to_requests_not_accumulated_serialization() -> None:

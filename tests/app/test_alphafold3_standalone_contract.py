@@ -11,7 +11,7 @@ import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold import alphafold3_app
-from biomodals.app.fold.alphafold3 import modal_adapters
+from biomodals.app.fold.alphafold3 import modal_adapters, upstream_inference
 from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
 from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
@@ -390,9 +390,9 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
         execute(worker_root, "af3-test", (1,))
         return {"status": "published"}
 
-    monkeypatch.setattr(alphafold3_app, "run_command", fake_run_command)
+    monkeypatch.setattr(upstream_inference, "run_command", fake_run_command)
     monkeypatch.setattr(
-        alphafold3_app,
+        upstream_inference,
         "run_seed_prediction_worker",
         fake_run_seed_prediction_worker,
     )
@@ -424,12 +424,12 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     assert (
         f"--model_dir={alphafold3_app.CONF.model_volume_mountpoint}" in captured["cmd"]
     )
-    assert (
-        f"--jax_compilation_cache_dir={alphafold3_app.JAX_CACHE_DIR}" in captured["cmd"]
+    jax_cache_arg = next(
+        arg for arg in captured["cmd"] if arg.startswith("--jax_compilation_cache_dir=")
     )
-    assert not alphafold3_app.JAX_CACHE_DIR.is_relative_to(
-        alphafold3_app.CONF.model_volume_mountpoint
-    )
+    jax_cache_dir = Path(jax_cache_arg.partition("=")[2])
+    assert jax_cache_dir.name == alphafold3_app.ALPHAFOLD3_COMMIT
+    assert not jax_cache_dir.is_relative_to(alphafold3_app.CONF.model_volume_mountpoint)
 
 
 def test_inference_worker_revalidates_numeric_limits() -> None:

@@ -216,6 +216,64 @@ Modal's closed 21:00--22:00 billing interval attributed $0.11562 to the app;
 the final partial interval is intentionally not inferred from telemetry and
 must be read from the next closed hourly report.
 
+### Production protein end-to-end evidence
+
+A two-chain protein production smoke test passed on 2026-07-27 after two
+operational fixes. The input contained a 118-residue chain A and a 128-residue
+chain H. The first preflight expected the superseded
+`uniref90-128-v1` profile; production now selects the user-approved
+`uniref90-256-v1`. The first inference attempt then exposed that
+`model_dump_json(exclude_unset=False)` retained null sibling chain types in
+each sequence entry. Upstream AlphaFold requires each entry object to have
+exactly one key. The shared inference serializer now excludes null fields
+while preserving empty MSA strings and template lists. A focused regression
+test and the original remote reproduction both pass.
+
+All eight cold sharded searches used 16 active shards with two HMMER CPUs.
+The database tasks shared a four-worker request budget, so the per-call times
+below must not be summed as wall time:
+
+| Chain | Length | small BFD | MGnify | UniProt | UniRef90 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A | 118 | 29.08 s | 356.24 s | 165.13 s | 100.18 s |
+| H | 128 | 27.22 s | 189.92 s | 138.25 s | 97.50 s |
+
+MGnify was the cold MSA critical path. From the earliest raw-search start to
+the final raw-search completion, the batch took about 357.83 seconds. The two
+subsequent eight-CPU template searches ran concurrently and took 83.45
+seconds for A and 28.63 seconds for H.
+
+The enriched upstream data JSON preserved both input sequences and contained:
+
+| Chain | Unpaired rows | Unpaired bytes | Paired rows | Paired bytes | Templates |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A | 4,345 | 1,116,700 | 4,357 | 1,099,827 | 4 |
+| H | 10,587 | 2,768,685 | 23,607 | 6,165,794 | 4 |
+
+Upstream inference ran with `--run_data_pipeline=false`, produced both A and H
+in every model, and published five valid sample directories per seed. Seed 1
+featurization took 11.24 seconds and model inference took 26.93 seconds.
+Seed 2 featurization took 10.13 seconds and model inference took 23.50
+seconds. Exact platform cost is intentionally deferred to a closed Modal
+billing interval rather than inferred from wall time.
+
+The stable run ID was
+`387616514785bd74d7429b67c0d3664f5cf87c14a2bbafcc7136a7140c25868a`.
+The request sequence verified marker reuse, accumulated summaries, and
+request-only retrieval:
+
+| Request | MSA/template work | GPU work | Seed outcome | Archive contents | Shell elapsed |
+| --- | --- | --- | --- | --- | ---: |
+| `[1]` corrected baseline | 8/8 and 2/2 reused after the cold attempt | seed 1 only | published `[1]` | five seed-1 samples | 3m16s |
+| `[1]` exact repeat | all reused | none | existing seed 1 reused | five seed-1 samples | 1m53s |
+| `[1, 2]` overlap | all reused | seed 2 only | reused `[1]`, published `[2]` | ten requested samples | 4m31s |
+| `[2]` subset | all reused | none | reused `[2]` | five seed-2 samples only | 2m25s |
+
+The accumulated summary covers seeds `{1, 2}`. Seed 2/sample 1 is the current
+global best with ranking score `0.32454750520095166`; the earlier seed-1-only
+request archive remains a five-sample snapshot. The subset request embeds the
+two-seed global summary but does not leak seed 1 artifacts into its archive.
+
 ## Stores and immutable database registry
 
 ### Volumes
@@ -724,7 +782,8 @@ digest.
 
 Commit: `fold: add resumable sharded MSA search`
 
-Status: implemented locally; no production Modal search submitted.
+Status: implemented; the two-chain protein production search passed on
+2026-07-27. The integrated RNA production case remains deferred.
 
 - add raw-result identities, markers, claims, and cache paths;
 - add generic protein/RNA database workers with the selected topology;
@@ -745,7 +804,8 @@ caller/generated fields remain request-local.
 
 Commit: `fold: add resumable template search`
 
-Status: implemented locally; no production Modal template search submitted.
+Status: implemented; both protein template searches and their cache reuse
+passed on 2026-07-27.
 
 - add the post-MSA template phase and flat validated publication;
 - preserve caller evidence locally;
@@ -772,7 +832,8 @@ and unpaired-MSA digests, and the coordinator adds no retry loop.
 
 Commit: `fold: stage enriched AlphaFold inputs`
 
-Status: implemented locally; no Modal Volume upload or inference submitted.
+Status: implemented; Volume staging, stable identity, custom-template
+retrieval, and strict upstream JSON parsing passed on 2026-07-27.
 
 - inline caller MSA and CCD path inputs;
 - hash/upload custom templates;
@@ -807,7 +868,8 @@ readable; canonical seed-output publication remains Checklist 7.
 
 Commit: `fold: persist seed predictions`
 
-Status: implemented locally; no Modal inference submitted.
+Status: implemented; seed 1, the overlapping `[1, 2]` request, and marker-only
+seed reuse passed on 2026-07-27.
 
 - replace function-result tarball bytes with output-Volume worker staging;
 - add per-seed claims, disjoint multi-seed workers, seed markers, and explicit
@@ -841,7 +903,8 @@ committed. Request-specific rankings and presentation files remain Checklist
 
 Commit: `fold: retrieve request-scoped outputs`
 
-Status: implemented locally; no Modal inference or Volume download submitted.
+Status: implemented; one-seed, overlapping two-seed, and seed-2-only archives
+passed content and manifest inspection on 2026-07-27.
 
 - publish request manifests and request-best files;
 - download only requested canonical artifacts;
@@ -887,10 +950,11 @@ Commit: `fold: document sharded MSA validation`
 Status: in progress. The AlphaFold3 app and sibling-module subtree contain no
 references to `copy_msa_to_ssd`, `search_chains_in_parallel`, or
 `max_parallel_data_pipelines`. A repository-wide scan found one separate
-production dependency that still requires an explicit scope decision:
-`ppiflow_workflow.py` calls the removed `run_data_pipeline` interface with
-`copy_msa_to_ssd=True` and expects the old tarball-returning inference
-signature. It has not been changed under this plan's AlphaFold3-only boundary.
+production dependency: `ppiflow_workflow.py` still calls the removed
+`run_data_pipeline` interface with `copy_msa_to_ssd=True` and expects the old
+tarball-returning inference signature. A focused TODO now records that
+follow-up without changing PPIflow behavior under this plan's AlphaFold3-only
+boundary.
 
 - record all scientific and integrated smoke results;
 - confirm no production reference remains to `copy_msa_to_ssd`,

@@ -4,6 +4,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import orjson
 import pytest
@@ -26,77 +27,43 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
 
 
+def _patch_modal_method(
+    monkeypatch: pytest.MonkeyPatch,
+    function_name: str,
+    method_name: str,
+    operation: Mock,
+) -> None:
+    monkeypatch.setattr(
+        alphafold3_app,
+        function_name,
+        SimpleNamespace(**{method_name: operation}),
+    )
+
+
 def test_modal_search_executor_marshals_remote_fanout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The production adapter should preserve task payloads and worker caps."""
-    calls: list[tuple[object, ...]] = []
     budgets: list[int] = []
 
     def fake_bounded_map(items, worker, *, max_parallel):
         budgets.append(max_parallel)
         return [worker(item) for item in items]
 
-    def inspect_raw(inputs):
-        calls.append(("inspect-raw", inputs))
-        return [{"status": "missing"} for _ in inputs]
-
-    def run_raw(database_id, sequence):
-        calls.append(("run-raw", database_id, sequence))
-        if database_id == "uniref90":
-            raise RuntimeError("search failed")
-        return {"status": "published"}
-
-    def run_assembly(polymer, sequence, include_unpaired, include_paired):
-        calls.append((
-            "assemble",
-            polymer,
-            sequence,
-            include_unpaired,
-            include_paired,
-        ))
-        return {"status": "published"}
-
-    def inspect_templates(inputs):
-        calls.append(("inspect-templates", inputs))
-        return [{"status": "missing"} for _ in inputs]
-
-    def run_template(sequence, unpaired_msa, publish_canonical, max_template_date):
-        calls.append((
-            "search-template",
-            sequence,
-            unpaired_msa,
-            publish_canonical,
-            max_template_date,
-        ))
-        return {"status": "published"}
-
+    inspect_raw = Mock(return_value=[{"status": "missing"}, {"status": "missing"}])
+    run_raw = Mock(side_effect=({"status": "published"}, RuntimeError("search failed")))
+    run_assembly = Mock(return_value={"status": "published"})
+    inspect_templates = Mock(return_value=[{"status": "missing"}])
+    run_template = Mock(return_value={"status": "published"})
     monkeypatch.setattr(alphafold3_app, "bounded_map", fake_bounded_map)
-    monkeypatch.setattr(
-        alphafold3_app,
-        "inspect_msa_search_cache",
-        SimpleNamespace(remote=inspect_raw),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "search_database_msa",
-        SimpleNamespace(remote=run_raw),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "assemble_sequence_msas",
-        SimpleNamespace(remote=run_assembly),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "inspect_protein_template_cache",
-        SimpleNamespace(remote=inspect_templates),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "search_protein_templates",
-        SimpleNamespace(remote=run_template),
-    )
+    for name, operation in (
+        ("inspect_msa_search_cache", inspect_raw),
+        ("search_database_msa", run_raw),
+        ("assemble_sequence_msas", run_assembly),
+        ("inspect_protein_template_cache", inspect_templates),
+        ("search_protein_templates", run_template),
+    ):
+        _patch_modal_method(monkeypatch, name, "remote", operation)
 
     executor = alphafold3_app._ModalSearchExecutor()
     raw_tasks = (
@@ -137,29 +104,28 @@ def test_modal_search_executor_marshals_remote_fanout(
     )
 
     assert budgets == [2, 3, 4]
-    assert calls == [
-        ("inspect-raw", [("small_bfd", "ACDE"), ("uniref90", "FGHI")]),
-        ("run-raw", "small_bfd", "ACDE"),
-        ("run-raw", "uniref90", "FGHI"),
-        ("assemble", "protein", "ACDE", True, False),
-        (
-            "inspect-templates",
-            [
-                (
-                    "ACDE",
-                    template_tasks[0].unpaired_msa_sha256,
-                    "2021-09-30",
-                )
-            ],
-        ),
-        (
-            "search-template",
-            "ACDE",
-            ">query\nACDE\n",
-            True,
-            "2021-09-30",
-        ),
+    inspect_raw.assert_called_once_with([
+        ("small_bfd", "ACDE"),
+        ("uniref90", "FGHI"),
+    ])
+    assert run_raw.call_args_list == [
+        call("small_bfd", "ACDE"),
+        call("uniref90", "FGHI"),
     ]
+    run_assembly.assert_called_once_with("protein", "ACDE", True, False)
+    inspect_templates.assert_called_once_with([
+        (
+            "ACDE",
+            template_tasks[0].unpaired_msa_sha256,
+            "2021-09-30",
+        )
+    ])
+    run_template.assert_called_once_with(
+        "ACDE",
+        ">query\nACDE\n",
+        True,
+        "2021-09-30",
+    )
 
 
 def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
@@ -198,8 +164,6 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
         )
         for seed in (1, 2)
     )
-    remote_calls: list[tuple[object, ...]] = []
-    spawn_calls: list[tuple[object, ...]] = []
     spawned_seeds: list[int] = []
     poll_timeouts: list[int] = []
 
@@ -215,9 +179,17 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
                 raise TimeoutError
             return self.result
 
-    def spawn_worker(json_bytes, run_id, recycle, sample, claim_records):
-        spawn_calls.append((json_bytes, run_id, recycle, sample, claim_records))
-        seed = claim_records[0]["seed"]
+    def spawn_worker(
+        json_bytes: bytes,
+        run_id: str,
+        recycle: int,
+        sample: int,
+        claim_records: list[dict[str, object]],
+    ) -> FakeFunctionCall:
+        assert json_bytes == alphafold3_app.serialize_af3_input(prepared.worker_config)
+        assert (run_id, recycle, sample) == (prepared.run_id, 3, 2)
+        seed = claim_records[0].get("seed")
+        assert isinstance(seed, int)
         spawned_seeds.append(seed)
         return FakeFunctionCall(
             {
@@ -228,70 +200,34 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
             timeout_once=seed == 1,
         )
 
-    def claim_remote(run_id, seeds, sample_count):
-        remote_calls.append(("claim", run_id, seeds, sample_count))
-        return SeedClaimPlan(
+    claim_remote = Mock(
+        return_value=SeedClaimPlan(
             reused_seeds=(2,),
             owned=(claimed[0],),
             active=(),
         ).to_dict()
-
-    def inspect_remote(run_id, seeds, sample_count):
-        remote_calls.append(("inspect", run_id, seeds, sample_count))
-        return [{"status": "reused", "seed": seed} for seed in seeds]
-
-    def summary_remote(json_bytes, run_id, sample_count):
-        remote_calls.append(("summary", json_bytes, run_id, sample_count))
-        return {"status": "complete"}
-
-    def request_remote(
-        run_id,
-        request_id,
-        submitted_seeds,
-        normalized_seeds,
-        sample_count,
-        display_name,
-        reused_seeds,
-        published_seeds,
-    ):
-        remote_calls.append((
-            "request",
-            run_id,
-            request_id,
-            submitted_seeds,
-            normalized_seeds,
-            sample_count,
-            display_name,
-            reused_seeds,
-            published_seeds,
-        ))
-        return {"status": "complete"}
-
-    monkeypatch.setattr(
-        alphafold3_app,
+    )
+    inspect_remote = Mock(
+        side_effect=lambda _run_id, seeds, _sample: [
+            {"status": "reused", "seed": seed} for seed in seeds
+        ]
+    )
+    summary_remote = Mock(return_value={"status": "complete"})
+    request_remote = Mock(return_value={"status": "complete"})
+    spawn_remote = Mock(side_effect=spawn_worker)
+    _patch_modal_method(
+        monkeypatch,
         "run_inference_pipeline",
-        SimpleNamespace(spawn=spawn_worker),
+        "spawn",
+        spawn_remote,
     )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "claim_seed_prediction_work",
-        SimpleNamespace(remote=claim_remote),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "inspect_seed_prediction_cache",
-        SimpleNamespace(remote=inspect_remote),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "finalize_inference_summary",
-        SimpleNamespace(remote=summary_remote),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "finalize_inference_request",
-        SimpleNamespace(remote=request_remote),
-    )
+    for name, operation in (
+        ("claim_seed_prediction_work", claim_remote),
+        ("inspect_seed_prediction_cache", inspect_remote),
+        ("finalize_inference_summary", summary_remote),
+        ("finalize_inference_request", request_remote),
+    ):
+        _patch_modal_method(monkeypatch, name, "remote", operation)
 
     executor = alphafold3_app._ModalInferenceExecutor()
     assert executor.claim_seeds(
@@ -319,9 +255,7 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     assert outcome.published_seeds == frozenset({1})
     assert outcome.reused_seeds == frozenset({2})
     assert outcome.failures == ()
-    assert len(spawn_calls) == 2
     assert spawned_seeds == [1, 2]
-    assert all(call[1:4] == (prepared.run_id, 3, 2) for call in spawn_calls)
     assert poll_timeouts == [7, 7, 7]
 
     assert executor.finalize_summary(prepared, sample_count=2) == {"status": "complete"}
@@ -331,27 +265,23 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
         reused_seeds=(2,),
         published_seeds=(1,),
     ) == {"status": "complete"}
-    assert remote_calls == [
-        ("claim", prepared.run_id, [1, 2], 2),
-        ("inspect", prepared.run_id, [1, 2], 2),
-        (
-            "summary",
-            alphafold3_app.serialize_af3_input(prepared.worker_config),
-            prepared.run_id,
-            2,
-        ),
-        (
-            "request",
-            prepared.run_id,
-            prepared.request_id,
-            [1, 2],
-            [1, 2],
-            2,
-            "composition",
-            [2],
-            [1],
-        ),
-    ]
+    claim_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
+    inspect_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
+    summary_remote.assert_called_once_with(
+        alphafold3_app.serialize_af3_input(prepared.worker_config),
+        prepared.run_id,
+        2,
+    )
+    request_remote.assert_called_once_with(
+        prepared.run_id,
+        prepared.request_id,
+        [1, 2],
+        [1, 2],
+        2,
+        "composition",
+        [2],
+        [1],
+    )
 
 
 def test_submit_alphafold3_task_applies_run_name_to_prediction_config(

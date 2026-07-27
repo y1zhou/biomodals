@@ -52,8 +52,8 @@ from biomodals.app.fold.alphafold3.profile_builder import (
     SourceProfileEvidence,
     build_profile_manifest,
     plan_missing_profile_builds,
-    validate_profile_manifest,
 )
+from biomodals.app.fold.alphafold3.profile_manifest import validate_profile_manifest
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,

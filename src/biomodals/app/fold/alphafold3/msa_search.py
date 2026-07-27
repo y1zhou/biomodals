@@ -44,7 +44,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     assert_generation_current,
     finish_generation_claim,
 )
-from biomodals.app.fold.alphafold3.profile_builder import (
+from biomodals.app.fold.alphafold3.profile_manifest import (
     validate_profile_manifest,
 )
 from biomodals.app.fold.alphafold3.profiles import (

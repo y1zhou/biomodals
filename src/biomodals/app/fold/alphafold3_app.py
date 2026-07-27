@@ -47,6 +47,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
     materialize_local_input,
     prepare_inference_run,
+    serialize_af3_input,
     validate_inference_parameters,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
@@ -1226,7 +1227,7 @@ def run_inference_pipeline(
         conf.modelSeeds = list(seeds)
         conf = _fill_missing_msa_for_inference(conf)
         input_json_path = worker_root / "input.json"
-        input_json_path.write_text(conf.model_dump_json(exclude_unset=False))
+        input_json_path.write_bytes(serialize_af3_input(conf))
         print(f"💊 Running inference for {canonical_name} with seeds {list(seeds)}")
         model_dir = Path(CONF.model_volume_mountpoint)
         cmd = [
@@ -1282,7 +1283,7 @@ def finalize_inference_summary(
         conf.modelSeeds = list(seeds)
         with TemporaryDirectory(prefix="alphafold3_summary_") as temp_dir:
             input_path = Path(temp_dir) / "input.json"
-            input_path.write_text(conf.model_dump_json(exclude_unset=False))
+            input_path.write_bytes(serialize_af3_input(conf))
             fold_inputs = list(folding_input.load_fold_inputs_from_path(input_path))
         if len(fold_inputs) != 1:
             raise RuntimeError("Expected exactly one AlphaFold input")
@@ -1372,7 +1373,7 @@ def _run_claimed_seed_batches(
     poll_timeout: int,
 ) -> tuple[set[int], set[int], list[dict[str, object]]]:
     batches = partition_claimed_seeds(claimed_seeds, max_workers)
-    json_bytes = prepared.worker_config.model_dump_json(exclude_unset=False).encode()
+    json_bytes = serialize_af3_input(prepared.worker_config)
     calls: dict[int, tuple[modal.FunctionCall, tuple[ClaimedSeed, ...]]] = {}
     for index, batch in enumerate(batches):
         calls[index] = (
@@ -1533,7 +1534,7 @@ def predict_structures(
     summary: dict[str, object] | None = None
     if completed:
         summary = finalize_inference_summary.remote(
-            prepared.worker_config.model_dump_json(exclude_unset=False).encode(),
+            serialize_af3_input(prepared.worker_config),
             prepared.run_id,
             sample,
         )

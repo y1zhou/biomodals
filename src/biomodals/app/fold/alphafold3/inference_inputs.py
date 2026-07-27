@@ -71,6 +71,30 @@ def _json_bytes(value: object) -> bytes:
     return orjson.dumps(value, option=_JSON_OPTIONS)
 
 
+def serialize_af3_input(config: AF3Config) -> bytes:
+    """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
+    validated = AF3Config.model_validate(
+        config.model_dump(mode="python", exclude_unset=False)
+    )
+    raw_document = validated.model_dump(
+        mode="json",
+        exclude_unset=False,
+        exclude_defaults=False,
+        exclude_none=True,
+    )
+    document = cast(dict[str, object], raw_document)
+    raw_sequences = document.get("sequences")
+    if not isinstance(raw_sequences, list):
+        raise RuntimeError("Validated AlphaFold input has no sequence list")
+    for index, raw_entry in enumerate(raw_sequences):
+        if not isinstance(raw_entry, dict) or len(raw_entry) != 1:
+            raise RuntimeError(
+                "Validated AlphaFold sequence entry must contain exactly one "
+                f"chain type: sequences[{index}]"
+            )
+    return _json_bytes(document)
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -384,8 +408,8 @@ def prepare_inference_run(
         staged_conf.model_dump(mode="python", exclude_unset=False)
     )
     uploads[run_root / "inputs" / "identity.json"] = _json_bytes(identity_document)
-    uploads[run_root / "requests" / request_id / "input.json"] = (
-        staged_conf.model_dump_json(exclude_unset=False).encode()
+    uploads[run_root / "requests" / request_id / "input.json"] = serialize_af3_input(
+        staged_conf
     )
 
     return PreparedInferenceRun(

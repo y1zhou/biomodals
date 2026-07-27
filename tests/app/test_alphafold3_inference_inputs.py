@@ -73,7 +73,7 @@ def test_no_search_resolution_returns_a_validated_config() -> None:
         ],
     )
 
-    resolved = alphafold3_app.search_msa_and_templates(
+    resolved = alphafold3_app._search_msa_and_templates(
         config,
         search_msa=False,
     )
@@ -148,7 +148,7 @@ def test_search_preflight_rejects_invalid_input_before_remote_work() -> None:
     )
 
     with pytest.raises(ValueError, match="only letters"):
-        alphafold3_app.search_msa_and_templates(config)
+        alphafold3_app._search_msa_and_templates(config)
 
 
 def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:

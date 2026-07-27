@@ -11,10 +11,16 @@ import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold import alphafold3_app
+from biomodals.app.fold.alphafold3 import modal_adapters
 from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
 from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
     prepare_inference_run,
+    serialize_af3_input,
+)
+from biomodals.app.fold.alphafold3.modal_adapters import (
+    ModalInferenceExecutor,
+    ModalSearchExecutor,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
@@ -25,19 +31,6 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SeedClaimPlan,
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
-
-
-def _patch_modal_method(
-    monkeypatch: pytest.MonkeyPatch,
-    function_name: str,
-    method_name: str,
-    operation: Mock,
-) -> None:
-    monkeypatch.setattr(
-        alphafold3_app,
-        function_name,
-        SimpleNamespace(**{method_name: operation}),
-    )
 
 
 def test_modal_search_executor_marshals_remote_fanout(
@@ -55,17 +48,14 @@ def test_modal_search_executor_marshals_remote_fanout(
     run_assembly = Mock(return_value={"status": "published"})
     inspect_templates = Mock(return_value=[{"status": "missing"}])
     run_template = Mock(return_value={"status": "published"})
-    monkeypatch.setattr(alphafold3_app, "bounded_map", fake_bounded_map)
-    for name, operation in (
-        ("inspect_msa_search_cache", inspect_raw),
-        ("search_database_msa", run_raw),
-        ("assemble_sequence_msas", run_assembly),
-        ("inspect_protein_template_cache", inspect_templates),
-        ("search_protein_templates", run_template),
-    ):
-        _patch_modal_method(monkeypatch, name, "remote", operation)
-
-    executor = alphafold3_app._ModalSearchExecutor()
+    monkeypatch.setattr(modal_adapters, "bounded_map", fake_bounded_map)
+    executor = ModalSearchExecutor(
+        inspect_raw_function=SimpleNamespace(remote=inspect_raw),
+        raw_search_function=SimpleNamespace(remote=run_raw),
+        msa_assembly_function=SimpleNamespace(remote=run_assembly),
+        inspect_templates_function=SimpleNamespace(remote=inspect_templates),
+        template_search_function=SimpleNamespace(remote=run_template),
+    )
     raw_tasks = (
         RawSearchTask(database_id="small_bfd", sequence="ACDE"),
         RawSearchTask(database_id="uniref90", sequence="FGHI"),
@@ -186,7 +176,7 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
         sample: int,
         claim_records: list[dict[str, object]],
     ) -> FakeFunctionCall:
-        assert json_bytes == alphafold3_app.serialize_af3_input(prepared.worker_config)
+        assert json_bytes == serialize_af3_input(prepared.worker_config)
         assert (run_id, recycle, sample) == (prepared.run_id, 3, 2)
         seed = claim_records[0].get("seed")
         assert isinstance(seed, int)
@@ -215,21 +205,13 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     summary_remote = Mock(return_value={"status": "complete"})
     request_remote = Mock(return_value={"status": "complete"})
     spawn_remote = Mock(side_effect=spawn_worker)
-    _patch_modal_method(
-        monkeypatch,
-        "run_inference_pipeline",
-        "spawn",
-        spawn_remote,
+    executor = ModalInferenceExecutor(
+        claim_function=SimpleNamespace(remote=claim_remote),
+        inspect_function=SimpleNamespace(remote=inspect_remote),
+        worker_function=SimpleNamespace(spawn=spawn_remote),
+        summary_function=SimpleNamespace(remote=summary_remote),
+        request_function=SimpleNamespace(remote=request_remote),
     )
-    for name, operation in (
-        ("claim_seed_prediction_work", claim_remote),
-        ("inspect_seed_prediction_cache", inspect_remote),
-        ("finalize_inference_summary", summary_remote),
-        ("finalize_inference_request", request_remote),
-    ):
-        _patch_modal_method(monkeypatch, name, "remote", operation)
-
-    executor = alphafold3_app._ModalInferenceExecutor()
     assert executor.claim_seeds(
         prepared.run_id,
         (1, 2),
@@ -268,7 +250,7 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     claim_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     inspect_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     summary_remote.assert_called_once_with(
-        alphafold3_app.serialize_af3_input(prepared.worker_config),
+        serialize_af3_input(prepared.worker_config),
         prepared.run_id,
         2,
     )
@@ -311,8 +293,16 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
         captured["num_containers"] = num_containers
         return {"request": {"status": "complete"}}
 
-    monkeypatch.setattr(alphafold3_app, "_stage_inference_run", lambda prepared: None)
-    monkeypatch.setattr(alphafold3_app, "predict_structures", fake_predict_structures)
+    monkeypatch.setattr(
+        alphafold3_app,
+        "stage_inference_run",
+        lambda output_volume, prepared: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_predict_structures",
+        fake_predict_structures,
+    )
     monkeypatch.setattr(
         alphafold3_app,
         "create_request_archive",

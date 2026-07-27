@@ -27,8 +27,6 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 
 import os
 import uuid
-from collections.abc import Callable
-from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -48,13 +46,14 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     validate_inference_parameters,
     validate_upstream_af3_input,
 )
-from biomodals.app.fold.alphafold3.inference_pipeline import (
-    InferenceBatchOutcome,
-    InferenceExecutor,
-    coordinate_seed_predictions,
-)
+from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
 from biomodals.app.fold.alphafold3.input_enrichment import (
     fill_missing_msa_for_inference,
+)
+from biomodals.app.fold.alphafold3.modal_adapters import (
+    ModalInferenceExecutor,
+    ModalSearchExecutor,
+    stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
@@ -94,24 +93,19 @@ from biomodals.app.fold.alphafold3.request_results import (
     publish_request_results,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
-    SearchExecutor,
     resolve_msa_and_templates,
     validate_search_worker_budget,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
-    ClaimedSeed,
     InferenceRuntime,
-    SeedClaimPlan,
     SeedWorkerTask,
     canonical_output_name,
     claim_seed_predictions,
     claimed_seed_from_dict,
     finalize_run_summary,
     inspect_seed_predictions,
-    partition_claimed_seeds,
     run_seed_prediction_worker,
-    seed_claim_plan_from_dict,
 )
 from biomodals.app.fold.alphafold3.sharding import (
     CONTAINER_NATIVE_SOURCE_DIR,
@@ -134,7 +128,6 @@ from biomodals.helper.constant import (
 )
 from biomodals.helper.io import resolve_local_output_dir
 from biomodals.helper.shell import run_command
-from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -535,110 +528,25 @@ def _validate_max_num_gpus(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
-def _bounded_remote_outcomes[TaskT](
-    tasks: tuple[TaskT, ...],
-    invoke: Callable[[TaskT], dict[str, object]],
-    *,
-    max_parallel: int,
-) -> tuple[dict[str, object] | Exception, ...]:
-    """Run blocking remote calls while preserving task order and failures."""
-
-    def capture(task: TaskT) -> dict[str, object] | Exception:
-        try:
-            return invoke(task)
-        except Exception as exc:
-            return exc
-
-    return tuple(bounded_map(tasks, capture, max_parallel=max_parallel))
-
-
-class _ModalSearchExecutor(SearchExecutor):
-    """Bind the request-level search coordinator to Modal functions."""
-
-    def inspect_raw(
-        self,
-        tasks: tuple[RawSearchTask, ...],
-    ) -> tuple[dict[str, object], ...]:
-        inputs = [(task.database_id, task.sequence) for task in tasks]
-        return tuple(inspect_msa_search_cache.remote(inputs))
-
-    def run_raw(
-        self,
-        tasks: tuple[RawSearchTask, ...],
-        *,
-        max_parallel: int,
-    ) -> tuple[dict[str, object] | Exception, ...]:
-        return _bounded_remote_outcomes(
-            tasks,
-            lambda task: search_database_msa.remote(
-                task.database_id,
-                task.sequence,
-            ),
-            max_parallel=max_parallel,
-        )
-
-    def run_assemblies(
-        self,
-        tasks: tuple[MsaAssemblyTask, ...],
-        *,
-        max_parallel: int,
-    ) -> tuple[dict[str, object] | Exception, ...]:
-        return _bounded_remote_outcomes(
-            tasks,
-            lambda task: assemble_sequence_msas.remote(
-                task.polymer,
-                task.sequence,
-                task.include_unpaired,
-                task.include_paired,
-            ),
-            max_parallel=max_parallel,
-        )
-
-    def inspect_templates(
-        self,
-        tasks: tuple[TemplateTask, ...],
-    ) -> tuple[dict[str, object], ...]:
-        inputs = [
-            (
-                task.sequence,
-                task.unpaired_msa_sha256,
-                task.max_template_date,
-            )
-            for task in tasks
-        ]
-        return tuple(inspect_protein_template_cache.remote(inputs))
-
-    def run_templates(
-        self,
-        tasks: tuple[TemplateTask, ...],
-        *,
-        max_parallel: int,
-    ) -> tuple[dict[str, object] | Exception, ...]:
-        return _bounded_remote_outcomes(
-            tasks,
-            lambda task: search_protein_templates.remote(
-                task.sequence,
-                task.unpaired_msa,
-                task.publish_canonical,
-                task.max_template_date,
-            ),
-            max_parallel=max_parallel,
-        )
-
-
-def search_msa_and_templates(
+def _search_msa_and_templates(
     config: AF3Config,
     *,
     search_msa: bool = True,
-    search_protein_templates: bool = True,
+    search_templates: bool = True,
     max_parallel_search_workers: int = 4,
 ) -> AF3Config:
     """Resolve MSA/template fields through the production Modal adapter."""
     return resolve_msa_and_templates(
         config,
-        _ModalSearchExecutor(),
+        ModalSearchExecutor(
+            inspect_raw_function=inspect_msa_search_cache,
+            raw_search_function=search_database_msa,
+            msa_assembly_function=assemble_sequence_msas,
+            inspect_templates_function=inspect_protein_template_cache,
+            template_search_function=search_protein_templates,
+        ),
         search_msa=search_msa,
-        search_protein_templates=search_protein_templates,
+        search_protein_templates=search_templates,
         max_parallel_search_workers=max_parallel_search_workers,
     )
 
@@ -646,16 +554,6 @@ def search_msa_and_templates(
 ##########################################
 # Inference functions
 ##########################################
-
-
-def _stage_inference_run(prepared: PreparedInferenceRun) -> None:
-    """Upload normalized inputs and custom templates to the output Volume."""
-    with CONF.output_volume.batch_upload(force=True) as batch:
-        for upload in prepared.uploads:
-            batch.put_file(
-                BytesIO(upload.content),
-                f"/{upload.relative_path.as_posix()}",
-            )
 
 
 def _inference_runtime() -> InferenceRuntime:
@@ -855,167 +753,7 @@ def finalize_inference_request(
     )
 
 
-def _run_claimed_seed_batches(
-    prepared: PreparedInferenceRun,
-    claimed_seeds: tuple[ClaimedSeed, ...],
-    *,
-    recycle: int,
-    sample: int,
-    max_workers: int,
-    poll_timeout: int,
-) -> InferenceBatchOutcome:
-    batches = partition_claimed_seeds(claimed_seeds, max_workers)
-    json_bytes = serialize_af3_input(prepared.worker_config)
-    calls: dict[int, tuple[modal.FunctionCall, tuple[ClaimedSeed, ...]]] = {}
-    for index, batch in enumerate(batches):
-        calls[index] = (
-            run_inference_pipeline.spawn(
-                json_bytes,
-                prepared.run_id,
-                recycle,
-                sample,
-                [item.to_dict() for item in batch],
-            ),
-            batch,
-        )
-
-    published: set[int] = set()
-    reused: set[int] = set()
-    failures: list[dict[str, object]] = []
-    while calls:
-        for index, (function_call, batch) in calls.copy().items():
-            try:
-                result = function_call.get(timeout=poll_timeout)
-            except TimeoutError:
-                continue
-            except Exception as exc:
-                failures.append({
-                    "seeds": [item.seed for item in batch],
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                })
-                del calls[index]
-                continue
-            if not isinstance(result, dict) or result.get("run_id") != prepared.run_id:
-                failures.append({
-                    "seeds": [item.seed for item in batch],
-                    "error_type": "InvalidWorkerResult",
-                    "message": repr(result),
-                })
-            else:
-                raw_published = result.get("published_seeds")
-                raw_reused = result.get("reused_seeds")
-                if (
-                    not isinstance(raw_published, list)
-                    or not isinstance(raw_reused, list)
-                    or any(
-                        isinstance(seed, bool) or not isinstance(seed, int)
-                        for seed in [*raw_published, *raw_reused]
-                    )
-                    or not set([*raw_published, *raw_reused]).issubset({
-                        item.seed for item in batch
-                    })
-                ):
-                    failures.append({
-                        "seeds": [item.seed for item in batch],
-                        "error_type": "InvalidWorkerResult",
-                        "message": repr(result),
-                    })
-                else:
-                    published.update(raw_published)
-                    reused.update(raw_reused)
-            del calls[index]
-    return InferenceBatchOutcome(
-        published_seeds=frozenset(published),
-        reused_seeds=frozenset(reused),
-        failures=tuple(failures),
-    )
-
-
-class _ModalInferenceExecutor(InferenceExecutor):
-    """Bind the request-level inference coordinator to Modal functions."""
-
-    def claim_seeds(
-        self,
-        run_id: str,
-        seeds: tuple[int, ...],
-        *,
-        sample_count: int,
-    ) -> SeedClaimPlan:
-        raw_plan = claim_seed_prediction_work.remote(
-            run_id,
-            list(seeds),
-            sample_count,
-        )
-        return seed_claim_plan_from_dict(raw_plan)
-
-    def inspect_seeds(
-        self,
-        run_id: str,
-        seeds: tuple[int, ...],
-        *,
-        sample_count: int,
-    ) -> tuple[dict[str, object], ...]:
-        return tuple(
-            inspect_seed_prediction_cache.remote(
-                run_id,
-                list(seeds),
-                sample_count,
-            )
-        )
-
-    def run_claimed(
-        self,
-        prepared: PreparedInferenceRun,
-        claimed_seeds: tuple[ClaimedSeed, ...],
-        *,
-        recycle: int,
-        sample_count: int,
-        max_workers: int,
-        poll_timeout_seconds: int,
-    ) -> InferenceBatchOutcome:
-        return _run_claimed_seed_batches(
-            prepared,
-            claimed_seeds,
-            recycle=recycle,
-            sample=sample_count,
-            max_workers=max_workers,
-            poll_timeout=poll_timeout_seconds,
-        )
-
-    def finalize_summary(
-        self,
-        prepared: PreparedInferenceRun,
-        *,
-        sample_count: int,
-    ) -> dict[str, object]:
-        return finalize_inference_summary.remote(
-            serialize_af3_input(prepared.worker_config),
-            prepared.run_id,
-            sample_count,
-        )
-
-    def finalize_request(
-        self,
-        prepared: PreparedInferenceRun,
-        *,
-        sample_count: int,
-        reused_seeds: tuple[int, ...],
-        published_seeds: tuple[int, ...],
-    ) -> dict[str, object]:
-        return finalize_inference_request.remote(
-            prepared.run_id,
-            prepared.request_id,
-            list(prepared.submitted_seeds),
-            list(prepared.normalized_seeds),
-            sample_count,
-            prepared.display_name,
-            list(reused_seeds),
-            list(published_seeds),
-        )
-
-
-def predict_structures(
+def _predict_structures(
     prepared: PreparedInferenceRun,
     recycle: int,
     sample: int,
@@ -1026,7 +764,13 @@ def predict_structures(
     """Reconcile predictions through the production Modal adapter."""
     return coordinate_seed_predictions(
         prepared,
-        _ModalInferenceExecutor(),
+        ModalInferenceExecutor(
+            claim_function=claim_seed_prediction_work,
+            inspect_function=inspect_seed_prediction_cache,
+            worker_function=run_inference_pipeline,
+            summary_function=finalize_inference_summary,
+            request_function=finalize_inference_request,
+        ),
         recycle=recycle,
         sample=sample,
         num_containers=num_containers,
@@ -1170,10 +914,10 @@ def submit_alphafold3_task(
     conf.name = run_name
 
     print(f"🧬 Resolving {CONF.name} MSA and template fields...")
-    enriched_conf = search_msa_and_templates(
+    enriched_conf = _search_msa_and_templates(
         conf,
         search_msa=search_msa,
-        search_protein_templates=search_protein_templates,
+        search_templates=search_protein_templates,
         max_parallel_search_workers=max_parallel_search_workers,
     )
 
@@ -1192,7 +936,7 @@ def submit_alphafold3_task(
             f"{list(prepared.submitted_seeds)} -> "
             f"{list(prepared.normalized_seeds)}"
         )
-    _stage_inference_run(prepared)
+    stage_inference_run(CONF.output_volume, prepared)
     print(
         "🧬 Staged inference input: "
         f"run_id={prepared.run_id}, request_id={prepared.request_id}"
@@ -1201,7 +945,7 @@ def submit_alphafold3_task(
     num_seeds = len(prepared.normalized_seeds)
     num_containers = min(max_num_gpus, num_seeds)
     print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
-    result = predict_structures(
+    result = _predict_structures(
         prepared,
         recycle,
         sample,

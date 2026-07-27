@@ -770,11 +770,36 @@ and unpaired-MSA digests, and the coordinator adds no retry loop.
 
 Commit: `fold: stage enriched AlphaFold inputs`
 
+Status: implemented locally; no Modal Volume upload or inference submitted.
+
 - inline caller MSA and CCD path inputs;
 - hash/upload custom templates;
 - implement `hash_sequences`, the normalized identity view, `run_id`, and
   request ID;
 - persist inputs under the hash-fanned output-Volume run root.
+
+The local materialization and identity seam now lives in
+`alphafold3/inference_inputs.py`. Before search submission it resolves every
+relative path against the input JSON, inlines protein/RNA MSA and custom CCD
+content, clears those path fields, rejects ambiguous inline/path pairs, and
+captures every path-backed custom-template byte string and SHA-256.
+
+After enrichment, the module validates and explicitly dumps the complete
+input, removes only `name` and `modelSeeds`, and represents inline and
+path-backed templates identically by content digest plus residue mappings.
+`hash_sequences` length-frames canonical JSON fragments. The resulting
+`run_id` covers that view, recycle/sample counts, pinned app/upstream identity,
+the declared `AlphaFold3/af3.bin:v1` model label, and the run-identity schema.
+Seeds are normalized to a non-empty sorted unique tuple and only affect
+`request_id`.
+
+The prepared staging payload uses `/{run_id[:2]}/{run_id}/`, deduplicates
+custom templates at `custom-templates/{sha256}.cif`, rewrites worker paths to
+the mounted `AlphaFold3-outputs` location, and includes
+`inputs/identity.json` plus `requests/{request_id}/input.json`. The app uses
+Modal's local `Volume.batch_upload(force=True)` interface for those exact
+bytes. The output Volume is also mounted for inference so staged templates are
+readable; canonical seed-output publication remains Checklist 7.
 
 ### 7. Persist and reconcile seed predictions
 

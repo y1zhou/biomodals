@@ -24,6 +24,7 @@ import os
 import shutil
 import uuid
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -35,6 +36,12 @@ from uniaf3.schema.alphafold3 import (
 )
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    ALPHAFOLD3_APP_VERSION,
+    PreparedInferenceRun,
+    materialize_local_input,
+    prepare_inference_run,
+)
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
     ChainMsaState,
@@ -57,6 +64,8 @@ from biomodals.app.fold.alphafold3.profile_builder import (
     plan_missing_profile_builds,
 )
 from biomodals.app.fold.alphafold3.profiles import (
+    ALPHAFOLD3_COMMIT,
+    ALPHAFOLD3_REPOSITORY,
     BUILD_MEMORY_MIB,
     BUILD_TIMEOUT_SECONDS,
     DATABASE_PROFILE_SPECS,
@@ -110,10 +119,10 @@ from biomodals.helper.task_budget import bounded_map
 CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
     name="AlphaFold3",
-    repo_url="https://github.com/y1zhou/alphafold3",
-    repo_commit_hash="987ad1cb7d7028b6d35908cf63fe7d951d98d6b6",
+    repo_url=ALPHAFOLD3_REPOSITORY,
+    repo_commit_hash=ALPHAFOLD3_COMMIT,
     package_name="alphafold3",
-    version="3.0.2",
+    version=ALPHAFOLD3_APP_VERSION,
     python_version="3.12",
     cuda_version="cu130",
     gpu=os.environ.get("GPU", "L40S"),
@@ -783,7 +792,7 @@ def _serialize_validated_config(conf: AF3Config) -> bytes:
 
 
 def search_msa_and_templates(
-    config_path: str | Path,
+    config: AF3Config | str | Path,
     *,
     search_msa: bool = True,
     search_protein_templates: bool = True,
@@ -791,7 +800,11 @@ def search_msa_and_templates(
 ) -> bytes:
     """Resolve MSA fields with bounded resumable database workers."""
     worker_budget = _validate_search_worker_budget(max_parallel_search_workers)
-    conf = AF3Config.from_file(config_path)
+    conf = (
+        AF3Config.model_validate(config.model_dump(mode="python", exclude_unset=False))
+        if isinstance(config, AF3Config)
+        else AF3Config.from_file(config)
+    )
     if not search_msa:
         return _serialize_validated_config(_fill_missing_msa_for_inference(conf))
 
@@ -1049,13 +1062,27 @@ def search_msa_and_templates(
 ##########################################
 
 
+def _stage_inference_run(prepared: PreparedInferenceRun) -> None:
+    """Upload normalized inputs and custom templates to the output Volume."""
+    with CONF.output_volume.batch_upload(force=True) as batch:
+        for upload in prepared.uploads:
+            batch.put_file(
+                BytesIO(upload.content),
+                f"/{upload.relative_path.as_posix()}",
+            )
+
+
 @app.function(
     gpu=CONF.gpu,
     cpu=(0.125, 16.125),  # burst for tar compression
     memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
     timeout=MAX_TIMEOUT,
     # Writable model dir because AlphaFold3 writes its JAX cache next to weights
-    volumes=CONF.mounts(model_volume=True, model_ro=False)
+    volumes=CONF.mounts(
+        output_volume=True,
+        model_volume=True,
+        model_ro=False,
+    )
     | {
         APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
             read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
@@ -1352,14 +1379,15 @@ def submit_alphafold3_task(
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    conf = AF3Config.from_file(input_path)
+    local_input = materialize_local_input(input_path)
+    conf = local_input.config
     if run_name is None:
         run_name = conf.name
     conf.name = run_name
 
     print(f"🧬 Resolving {CONF.name} MSA and template fields...")
     json_bytes = search_msa_and_templates(
-        input_path,
+        conf,
         search_msa=search_msa,
         search_protein_templates=search_protein_templates,
         max_parallel_search_workers=max_parallel_search_workers,
@@ -1367,13 +1395,36 @@ def submit_alphafold3_task(
 
     local_out_dir = resolve_local_output_dir(out_dir)
 
-    new_conf = _load_conf_from_bytes(json_bytes)
-    new_conf.name = run_name
-    new_conf.modelSeeds = conf.modelSeeds
-    num_seeds = len(new_conf.modelSeeds)
+    enriched_conf = _load_conf_from_bytes(json_bytes)
+    enriched_conf.name = run_name
+    enriched_conf.modelSeeds = conf.modelSeeds
+    prepared = prepare_inference_run(
+        enriched_conf,
+        local_input.custom_templates,
+        output_mount_root=Path(CONF.output_volume_mountpoint),
+        recycle=recycle,
+        sample=sample,
+    )
+    if prepared.submitted_seeds != prepared.normalized_seeds:
+        print(
+            "🧬 Normalized duplicate model seeds: "
+            f"{list(prepared.submitted_seeds)} -> "
+            f"{list(prepared.normalized_seeds)}"
+        )
+    _stage_inference_run(prepared)
+    print(
+        "🧬 Staged inference input: "
+        f"run_id={prepared.run_id}, request_id={prepared.request_id}"
+    )
+
+    num_seeds = len(prepared.normalized_seeds)
     num_containers = max(1, min(max_num_gpus, num_seeds))
     print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
     out_file = predict_structures(
-        new_conf, local_out_dir, recycle, sample, num_containers
+        prepared.worker_config,
+        local_out_dir,
+        recycle,
+        sample,
+        num_containers,
     )
     print(f"🧬 {CONF.name} run complete! Results saved to {out_file}")

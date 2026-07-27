@@ -1,8 +1,7 @@
 """Fixed AlphaFold 3 genetic-database sharding profiles.
 
-This module owns the production profile identities and the pure helpers used
-by both the temporary MSA validation app and the production AlphaFold 3 app.
-It deliberately contains no Modal objects or benchmark campaign state.
+This module owns production profile identities and pure preparation helpers.
+It deliberately contains no Modal objects or application orchestration.
 """
 
 from __future__ import annotations

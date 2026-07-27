@@ -1,9 +1,8 @@
 """Build and validate immutable AlphaFold 3 database shard profiles.
 
-The implementation is shared by the temporary scientific-validation app and
-the production app. Modal decorators, named objects, and fan-out topology stay
-in those app composition roots; this module only receives the mounted roots
-and narrow persistence handles it needs at runtime.
+Modal decorators, named objects, and fan-out topology stay in the production
+app composition root. This module receives only the mounted roots and narrow
+persistence handles it needs at runtime.
 """
 
 from __future__ import annotations

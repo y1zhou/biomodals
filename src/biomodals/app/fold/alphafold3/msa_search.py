@@ -231,8 +231,6 @@ def validate_query(spec: DatabaseProfileSpec, sequence: str) -> str:
 
 def scientific_search_parameters(
     spec: DatabaseProfileSpec,
-    *,
-    include_rna_merge_semantics: bool = True,
 ) -> dict[str, object]:
     """Return only result-affecting parameters from the pinned pipeline."""
     common: dict[str, object] = {
@@ -251,16 +249,14 @@ def scientific_search_parameters(
             "filter_f2": JACKHMMER_FILTER_F2,
             "filter_f3": JACKHMMER_FILTER_F3,
         }
-    rna = common | {
+    return common | {
         "tool": "nhmmer",
         "e_value": NHMMER_E_VALUE,
         "filter_f3": NHMMER_FILTER_F3,
         "alphabet": "rna",
         "short_sequence_filter_f3": NHMMER_SHORT_SEQUENCE_FILTER_F3,
+        "sharded_merge_order": NHMMER_SHARDED_MERGE_ORDER,
     }
-    if include_rna_merge_semantics:
-        rna["sharded_merge_order"] = NHMMER_SHARDED_MERGE_ORDER
-    return rna
 
 
 def operational_search_parameters(spec: DatabaseProfileSpec) -> dict[str, object]:
@@ -608,40 +604,27 @@ def execute_profile_database_search(
     spec: DatabaseProfileSpec,
     sequence: str,
     *,
-    layout: Literal["monolith", "sharded"],
     selected_profile_root: Path,
-    source_root: Path | None = None,
-    monolith_n_cpu: int = 8,
     sharded_n_cpu: int = SEARCH_N_CPU,
     max_parallel_shards: int = SEARCH_MAX_PARALLEL_SHARDS,
-) -> tuple[str, list[tuple[str, str]]]:
-    """Run one pinned monolithic or sharded search while retaining tblout."""
+) -> str:
+    """Run one pinned search over every shard in an immutable profile."""
     from importlib import import_module
 
     query = validate_query(spec, sequence)
-    if layout == "monolith":
-        if source_root is None:
-            raise ValueError("source_root is required for a monolithic search")
-        database_path = str(source_root / spec.source_filename)
-        search_paths = (Path(database_path),)
-        n_cpu = monolith_n_cpu
-    elif layout == "sharded":
-        database_path = (
-            selected_profile_root / "shards" / spec.source_filename
-        ).as_posix() + f"@{spec.shard_count}"
-        search_paths = tuple(
-            selected_profile_root / "shards" / name for name in shard_names(spec)
-        )
-        n_cpu = sharded_n_cpu
-    else:
-        raise ValueError("layout must be 'monolith' or 'sharded'")
+    database_path = (
+        selected_profile_root / "shards" / spec.source_filename
+    ).as_posix() + f"@{spec.shard_count}"
+    search_paths = tuple(
+        selected_profile_root / "shards" / name for name in shard_names(spec)
+    )
 
     if spec.polymer == "protein":
         module = import_module("alphafold3.data.tools.jackhmmer")
         tool = module.Jackhmmer(
             binary_path=JACKHMMER_BINARY_PATH,
             database_path=database_path,
-            n_cpu=n_cpu,
+            n_cpu=sharded_n_cpu,
             n_iter=JACKHMMER_N_ITER,
             e_value=JACKHMMER_E_VALUE,
             z_value=spec.search_space_value,
@@ -659,7 +642,7 @@ def execute_profile_database_search(
             hmmalign_binary_path=HMMALIGN_BINARY_PATH,
             hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
             database_path=database_path,
-            n_cpu=n_cpu,
+            n_cpu=sharded_n_cpu,
             e_value=NHMMER_E_VALUE,
             z_value=spec.search_space_value,
             max_sequences=spec.max_sequences,
@@ -669,7 +652,7 @@ def execute_profile_database_search(
         )
 
     global_temp_dir = tempfile.mkdtemp(
-        prefix=f"af3-{spec.database_id}-{layout}-",
+        prefix=f"af3-{spec.database_id}-sharded-",
     )
 
     def query_one(search_path: Path) -> Any:
@@ -681,22 +664,15 @@ def execute_profile_database_search(
         )
 
     try:
-        if layout == "monolith":
-            results = (query_one(search_paths[0]),)
-        else:
-            with ThreadPoolExecutor(max_workers=max_parallel_shards) as executor:
-                results = tuple(executor.map(query_one, search_paths))
+        with ThreadPoolExecutor(max_workers=max_parallel_shards) as executor:
+            results = tuple(executor.map(query_one, search_paths))
     finally:
         shutil.rmtree(global_temp_dir, ignore_errors=True)
 
-    raw_tblouts: list[tuple[str, str]] = []
     for search_path, result in zip(search_paths, results, strict=True):
         if result.tblout is None:
             raise ValueError(f"{search_path.name} search did not return tblout")
-        raw_tblouts.append((search_path.name, result.tblout))
-    if layout == "monolith":
-        merged = results[0]
-    elif spec.polymer == "protein":
+    if spec.polymer == "protein":
         merged = module._merge_jackhmmer_results(  # noqa: SLF001
             results,
             spec.max_sequences,
@@ -707,7 +683,7 @@ def execute_profile_database_search(
             results,
             spec.max_sequences,
         )
-    return merged.a3m, raw_tblouts
+    return merged.a3m
 
 
 def materialize_upstream_profile_msa(
@@ -926,10 +902,9 @@ def run_database_search(
             f"Searching {context.spec.profile_id} for a "
             f"{len(context.sequence)}-residue query",
         )
-        raw_a3m, _ = execute_profile_database_search(
+        raw_a3m = execute_profile_database_search(
             context.spec,
             context.sequence,
-            layout="sharded",
             selected_profile_root=context.profile_root,
         )
         a3m = materialize_upstream_profile_msa(

@@ -32,6 +32,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
     load_raw_msa,
     merge_nhmmer_results_by_reported_score,
     plan_msa_resolution,
+    scientific_search_parameters,
     sequence_hash,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
@@ -282,6 +283,13 @@ def test_msa_resolution_deduplicates_queries_across_input_chains() -> None:
 
 
 def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
+    assert (
+        scientific_search_parameters(resolve_database_profile("rfam"))[
+            "sharded_merge_order"
+        ]
+        == "reported-evalue-descending-bit-score-name-v1"
+    )
+
     @dataclass
     class Result:
         target_sequence: str

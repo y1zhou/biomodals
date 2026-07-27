@@ -1,8 +1,9 @@
-"""Modal adapters for AlphaFold 3 request-level coordinators.
+"""Modal adapters for AlphaFold 3 production orchestration.
 
 The production app injects decorated Modal functions here. This module owns
-payload marshaling, bounded blocking calls, spawn/poll behavior, and staging;
-the scientific coordinators remain independent of Modal.
+one-time profile fan-out, payload marshaling, bounded blocking calls,
+spawn/poll behavior, and staging; scientific coordinators remain independent
+of Modal.
 """
 
 # Protocol implementations inherit their method contracts.

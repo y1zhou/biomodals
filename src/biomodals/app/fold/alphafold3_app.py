@@ -147,16 +147,8 @@ SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     version=2,
 )
 _JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
-PROFILE_BUILD_CLAIMS = modal.Dict.from_name(
-    PROFILE_BUILD_CLAIM_DICT_NAME,
-    create_if_missing=True,
-)
 MSA_SEARCH_CLAIMS = modal.Dict.from_name(
     MSA_SEARCH_CLAIM_DICT_NAME,
-    create_if_missing=True,
-)
-INFERENCE_CLAIMS = modal.Dict.from_name(
-    SEED_PREDICTION_CLAIM_DICT_NAME,
     create_if_missing=True,
 )
 
@@ -230,21 +222,28 @@ sharding_image = (
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 _CONTAINER_INSTANCE_ID = uuid.uuid4().hex
-
-
-##########################################
-# Helper functions
-##########################################
-def _profile_builder_runtime() -> ProfileBuilderRuntime:
-    """Bind the shared builder to production mounts and persistence objects."""
-    return ProfileBuilderRuntime(
-        output_root=Path(CONF.output_volume_mountpoint),
-        source_volume=AF3_MSA_DB_VOLUME,
-        sharded_volume=SHARDED_MSA_DB_VOLUME,
-        output_volume=CONF.output_volume,
-        claims=PROFILE_BUILD_CLAIMS,
-        container_id=_CONTAINER_INSTANCE_ID,
-    )
+_PROFILE_BUILDER_RUNTIME = ProfileBuilderRuntime(
+    output_root=Path(CONF.output_volume_mountpoint),
+    source_volume=AF3_MSA_DB_VOLUME,
+    sharded_volume=SHARDED_MSA_DB_VOLUME,
+    output_volume=CONF.output_volume,
+    claims=modal.Dict.from_name(
+        PROFILE_BUILD_CLAIM_DICT_NAME,
+        create_if_missing=True,
+    ),
+    container_id=_CONTAINER_INSTANCE_ID,
+)
+_INFERENCE_RUNTIME = InferenceRuntime(
+    output_root=Path(CONF.output_volume_mountpoint),
+    volume=CONF.output_volume,
+    claims=modal.Dict.from_name(
+        SEED_PREDICTION_CLAIM_DICT_NAME,
+        create_if_missing=True,
+    ),
+    container_id=_CONTAINER_INSTANCE_ID,
+    maximum_age_seconds=MAX_TIMEOUT + 900,
+    wait_timeout_seconds=max(60, MAX_TIMEOUT - 60),
+)
 
 
 @app.function(
@@ -266,7 +265,7 @@ def build_sharded_database(
 ) -> dict[str, object]:
     """Build one fixed immutable database profile."""
     return build_profile(
-        _profile_builder_runtime(),
+        _PROFILE_BUILDER_RUNTIME,
         database_id,
         seqkit_threads,
         source_policy,
@@ -307,7 +306,7 @@ def inspect_sharded_database_profiles() -> dict[str, object]:
 )
 def finalize_sharded_database_setup() -> dict[str, object]:
     """Clean abandoned and unselected profiles after all builders complete."""
-    return finalize_profile_setup(_profile_builder_runtime())
+    return finalize_profile_setup(_PROFILE_BUILDER_RUNTIME)
 
 
 ##########################################
@@ -529,18 +528,6 @@ def _search_msa_and_templates(
 ##########################################
 
 
-def _inference_runtime() -> InferenceRuntime:
-    """Bind seed publication to the app-owned output Volume and claims."""
-    return InferenceRuntime(
-        output_root=Path(CONF.output_volume_mountpoint),
-        volume=CONF.output_volume,
-        claims=INFERENCE_CLAIMS,
-        container_id=_CONTAINER_INSTANCE_ID,
-        maximum_age_seconds=MAX_TIMEOUT + 900,
-        wait_timeout_seconds=max(60, MAX_TIMEOUT - 60),
-    )
-
-
 @app.function(
     cpu=0.125,
     memory=1024,
@@ -559,7 +546,7 @@ def inspect_seed_prediction_cache(
 ) -> list[dict[str, object]]:
     """Inspect seed markers without scanning prediction directories."""
     return inspect_seed_predictions(
-        _inference_runtime(),
+        _INFERENCE_RUNTIME,
         run_id,
         tuple(seeds),
         sample_count=sample_count,
@@ -584,7 +571,7 @@ def claim_seed_prediction_work(
 ) -> dict[str, object]:
     """Reuse or atomically claim one request's currently incomplete seeds."""
     return claim_seed_predictions(
-        _inference_runtime(),
+        _INFERENCE_RUNTIME,
         run_id,
         tuple(seeds),
         sample_count=sample_count,
@@ -619,7 +606,7 @@ def run_inference_pipeline(
     """Run one disjoint seed group and publish per-seed markers."""
     return run_upstream_seed_worker(
         UpstreamInferenceRuntime(
-            predictions=_inference_runtime(),
+            predictions=_INFERENCE_RUNTIME,
             source_root=CONF.git_clone_dir,
             model_root=Path(CONF.model_volume_mountpoint),
             jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
@@ -645,7 +632,7 @@ def finalize_inference_summary(
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
     return finalize_upstream_run_summary(
-        _inference_runtime(),
+        _INFERENCE_RUNTIME,
         json_bytes,
         run_id,
         sample_count,
@@ -670,7 +657,7 @@ def finalize_inference_request(
 ) -> dict[str, object]:
     """Publish one manifest-last view over the request's completed seeds."""
     return publish_request_results(
-        _inference_runtime(),
+        _INFERENCE_RUNTIME,
         RequestPublication(
             run_id=run_id,
             request_id=request_id,
@@ -791,8 +778,7 @@ def submit_alphafold3_task(
     validate_search_worker_budget(max_parallel_search_workers)
     validate_inference_parameters(recycle, sample)
 
-    input_path = Path(input_json).expanduser()
-    local_input = materialize_local_input(input_path)
+    local_input = materialize_local_input(input_json)
     conf = local_input.config
     if run_name is None:
         run_name = conf.name

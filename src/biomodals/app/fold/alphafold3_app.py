@@ -30,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 import modal
@@ -179,6 +179,14 @@ class AppInfo:
 APP_INFO = AppInfo()
 SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     SHARDED_DB_VOLUME_NAME,
+    create_if_missing=True,
+    version=2,
+)
+JAX_CACHE_VOLUME_NAME = f"{CONF.name}-jax-cache"
+JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{JAX_CACHE_VOLUME_NAME}")
+JAX_CACHE_DIR = JAX_CACHE_MOUNTPOINT / ALPHAFOLD3_COMMIT
+JAX_CACHE_VOLUME = modal.Volume.from_name(
+    JAX_CACHE_VOLUME_NAME,
     create_if_missing=True,
     version=2,
 )
@@ -937,8 +945,9 @@ def claim_seed_prediction_work(
     volumes=CONF.mounts(
         output_volume=True,
         model_volume=True,
-        model_ro=False,
-    ),
+        model_ro=True,
+    )
+    | {JAX_CACHE_MOUNTPOINT: JAX_CACHE_VOLUME},
 )
 def run_inference_pipeline(
     json_bytes: bytes,
@@ -976,7 +985,7 @@ def run_inference_pipeline(
             f"--json_path={input_json_path}",
             f"--output_dir={worker_root}",
             f"--model_dir={model_dir}",
-            f"--jax_compilation_cache_dir={model_dir / 'jax_cache'}",
+            f"--jax_compilation_cache_dir={JAX_CACHE_DIR}",
             f"--num_recycles={recycle}",
             f"--num_diffusion_samples={sample}",
         ]

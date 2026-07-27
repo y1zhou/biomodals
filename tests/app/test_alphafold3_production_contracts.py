@@ -651,6 +651,7 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
                 "volume_path": volume_path,
                 "archive_path": f"{canonical_name}_data.json",
                 "size_bytes": len(input_bytes),
+                "sha256": hashlib.sha256(input_bytes).hexdigest(),
             }
         ],
     }
@@ -679,6 +680,19 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     )
     assert orjson.loads(archived_input)["name"] == "Readable Name"
 
+    changed_manifest = cast(
+        dict[str, object],
+        orjson.loads(orjson.dumps(manifest)),
+    )
+    changed_manifest["published_at"] = "changed"
+    with pytest.raises(RuntimeError, match="does not match the current request"):
+        create_request_archive(
+            FakeVolumeReader({volume_path: input_bytes}),
+            changed_manifest,
+            output_dir=tmp_path,
+            display_name="Readable Name",
+        )
+
 
 def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> None:
     run_id = "e" * 64
@@ -699,6 +713,7 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
                 "volume_path": volume_path,
                 "archive_path": f"{canonical_name}_data.json",
                 "size_bytes": 10,
+                "sha256": hashlib.sha256(b"expected!!").hexdigest(),
             }
         ],
     }
@@ -709,6 +724,40 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
             manifest,
             output_dir=tmp_path,
             display_name="partial",
+        )
+
+
+def test_request_archive_rejects_same_size_changed_bytes(tmp_path: Path) -> None:
+    run_id = "f" * 64
+    normalized_seeds = [10]
+    request_id = hash_sequences(run_id, normalized_seeds)
+    canonical_name = canonical_output_name(run_id)
+    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+    expected = b'{"ok":true}'
+    manifest: dict[str, object] = {
+        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
+        "status": "complete",
+        "run_id": run_id,
+        "request_id": request_id,
+        "canonical_name": canonical_name,
+        "normalized_seeds": normalized_seeds,
+        "artifacts": [
+            {
+                "role": "input",
+                "volume_path": volume_path,
+                "archive_path": f"{canonical_name}_data.json",
+                "size_bytes": len(expected),
+                "sha256": hashlib.sha256(expected).hexdigest(),
+            }
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="Downloaded SHA-256 mismatch"):
+        create_request_archive(
+            FakeVolumeReader({volume_path: b'{"ok":null}'}),
+            manifest,
+            output_dir=tmp_path,
+            display_name="changed",
         )
 
 

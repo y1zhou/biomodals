@@ -86,6 +86,7 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
 
     def fake_run_command(cmd, *, output_mode, log_file):
         del output_mode, log_file
+        captured["cmd"] = tuple(str(arg) for arg in cmd)
         json_path = Path(
             next(
                 arg.removeprefix("--json_path=")
@@ -134,3 +135,12 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     assert protein["unpairedMsa"] == ""
     assert protein["pairedMsa"] == ""
     assert protein["templates"] == []
+    assert (
+        f"--model_dir={alphafold3_app.CONF.model_volume_mountpoint}" in captured["cmd"]
+    )
+    assert (
+        f"--jax_compilation_cache_dir={alphafold3_app.JAX_CACHE_DIR}" in captured["cmd"]
+    )
+    assert not alphafold3_app.JAX_CACHE_DIR.is_relative_to(
+        alphafold3_app.CONF.model_volume_mountpoint
+    )

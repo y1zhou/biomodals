@@ -12,11 +12,20 @@ dependencies = [
     "orjson>=3.11.8",
     "polars[calamine,numpy,pandas,xlsxwriter]>=1.39.3",
     "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1,<2",
     "pyyaml>=6.0.3",
     "rich>=14.2.0",
     "tqdm>=4.67.3",
     "typer>=0.20.0",
     "uniaf3>=0.2.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.139.0,<1",
+    "pwdlib[argon2]>=0.3.0,<0.4",
+    "python-multipart>=0.0.22,<1",
+    "uvicorn>=0.51.0,<1",
 ]
 
 [project.scripts]
@@ -28,8 +37,13 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.139.0,<1",
+    "httpx>=0.28.1,<1",
     "ipykernel>=7.2.0",
+    "pwdlib[argon2]>=0.3.0,<0.4",
+    "python-multipart>=0.0.22,<1",
     "pytest>=9.0.3",
+    "uvicorn>=0.51.0,<1",
 ]
 
 [tool.ruff]

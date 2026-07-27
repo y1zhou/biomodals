@@ -2,11 +2,66 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 from biomodals.app.bioinfo import gromacs_app
+
+
+def test_analysis_csv_preserves_the_established_checkpoint_format(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "rmsf.csv"
+
+    gromacs_app.write_analysis_csv(
+        output,
+        {
+            "residue_index": [1.0, 2.0],
+            "rmsf": [0.123456, 2.0],
+        },
+    )
+
+    assert output.read_text(encoding="utf-8") == (
+        "residue_index,rmsf\n1.00000,0.12346\n2.00000,2.00000\n"
+    )
+
+
+def test_analysis_pair_invalidates_each_stale_member_independently(
+    tmp_path: Path,
+) -> None:
+    trajectory = tmp_path / "trajectory.xtc"
+    csv = tmp_path / "analysis.csv"
+    figure = tmp_path / "analysis.png"
+    for path in (trajectory, csv, figure):
+        path.write_bytes(b"data")
+    os.utime(trajectory, (20, 20))
+    os.utime(csv, (10, 10))
+    os.utime(figure, (30, 30))
+
+    gromacs_app.remove_stale_analysis_outputs(
+        csv,
+        figure,
+        trajectory,
+        make_figures=True,
+    )
+
+    assert not csv.exists()
+    assert figure.exists()
+
+    csv.write_bytes(b"new")
+    os.utime(csv, (30, 30))
+    os.utime(figure, (10, 10))
+    gromacs_app.remove_stale_analysis_outputs(
+        csv,
+        figure,
+        trajectory,
+        make_figures=True,
+    )
+
+    assert csv.exists()
+    assert not figure.exists()
 
 
 def test_gromacs_declares_workflow_expected_files() -> None:

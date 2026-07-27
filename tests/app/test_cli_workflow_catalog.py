@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from biomodals.cli import _load_entry, app
 from biomodals.helper.catalog import AppFunction
+from biomodals.helper.styling import strip_ansi
 
 runner = CliRunner()
 
@@ -53,9 +54,14 @@ def test_top_level_list_remains_app_compatibility_alias() -> None:
 
 def test_app_deploy_command_is_namespaced() -> None:
     result = runner.invoke(app, ["app", "deploy", "--help"])
+    output = strip_ansi(result.output)
 
     assert result.exit_code == 0
-    assert "Name or path of the app to deploy" in result.output
+    assert "Name or path of the app to deploy" in output
+    assert "--env" in output
+    assert "--strategy" in output
+    assert "rolling" in output
+    assert "recreate" in output
 
 
 def test_top_level_deploy_remains_app_compatibility_alias() -> None:

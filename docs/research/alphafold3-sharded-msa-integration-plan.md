@@ -805,10 +805,35 @@ readable; canonical seed-output publication remains Checklist 7.
 
 Commit: `fold: persist seed predictions`
 
+Status: implemented locally; no Modal inference submitted.
+
 - replace function-result tarball bytes with output-Volume worker staging;
 - add per-seed claims, disjoint multi-seed workers, seed markers, and explicit
   partial-failure reporting;
-- add deterministic request/global rankings and serialized global summary.
+- add deterministic global rankings and a serialized accumulated summary.
+
+The durable inference boundary now lives in
+`alphafold3/seed_predictions.py`. A lightweight coordinator trusts matching
+seed markers without rescanning their artifacts, atomically claims only
+unmarked `(run_id, seed)` work, and partitions owned seeds into disjoint,
+balanced GPU-worker lists. Thus overlapping requests such as
+`[1, ..., 20, 8080, ..., 8090]` reuse the first marked seeds and schedule only
+the missing suffix.
+
+Each GPU worker runs the pinned upstream inference process in an exclusive
+`outputs/.workers/{worker_id}` directory. It validates the complete ranking
+table and every expected sample output for all assigned seeds before promotion.
+It then promotes native per-seed directories, commits them, and writes each
+seed's completion marker last. A surfaced failure is recorded and is not
+retried within the same request; already marked siblings remain reusable.
+
+The summary finalizer serializes concurrent writers through a separate
+generation claim, rebuilds the upstream-shaped data and ranking files from the
+currently visible seed-marker union, and orders equal scores by ascending seed
+then sample index. It never replaces a valid summary with one covering fewer
+seeds and publishes the summary marker only after all declared artifacts are
+committed. Request-specific rankings and presentation files remain Checklist
+8.
 
 ### 8. Return request-scoped results
 

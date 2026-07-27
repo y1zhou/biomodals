@@ -21,7 +21,7 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 # ruff: noqa: PLC0415
 
 import os
-import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from io import BytesIO
@@ -80,6 +80,20 @@ from biomodals.app.fold.alphafold3.profiles import (
     validate_seqkit_threads,
     validate_source_policy,
 )
+from biomodals.app.fold.alphafold3.seed_predictions import (
+    SEED_PREDICTION_CLAIM_DICT_NAME,
+    ClaimedSeed,
+    InferenceRuntime,
+    SeedWorkerTask,
+    canonical_output_name,
+    claim_seed_predictions,
+    claimed_seed_from_dict,
+    finalize_run_summary,
+    inspect_seed_predictions,
+    partition_claimed_seeds,
+    run_seed_prediction_worker,
+    seed_claim_plan_from_dict,
+)
 from biomodals.app.fold.alphafold3.sharding import (
     CONTAINER_NATIVE_SOURCE_DIR,
     NATIVE_SOURCE_DIR_ENV,
@@ -102,15 +116,7 @@ from biomodals.helper.constant import (
     MSA_CACHE_VOLUME,
     MSA_CACHE_VOLUME_NAME,
 )
-from biomodals.helper.io import (
-    build_local_output_path,
-    resolve_local_output_dir,
-    write_local_tarball,
-)
-from biomodals.helper.shell import (
-    package_outputs,
-    run_command,
-)
+from biomodals.helper.shell import run_command
 from biomodals.helper.task_budget import bounded_map
 
 ##########################################
@@ -160,6 +166,10 @@ PROFILE_BUILD_CLAIMS = modal.Dict.from_name(
 )
 MSA_SEARCH_CLAIMS = modal.Dict.from_name(
     MSA_SEARCH_CLAIM_DICT_NAME,
+    create_if_missing=True,
+)
+INFERENCE_CLAIMS = modal.Dict.from_name(
+    SEED_PREDICTION_CLAIM_DICT_NAME,
     create_if_missing=True,
 )
 
@@ -1072,47 +1082,105 @@ def _stage_inference_run(prepared: PreparedInferenceRun) -> None:
             )
 
 
+def _inference_runtime() -> InferenceRuntime:
+    """Bind seed publication to the app-owned output Volume and claims."""
+    return InferenceRuntime(
+        output_root=Path(CONF.output_volume_mountpoint),
+        volume=CONF.output_volume,
+        claims=INFERENCE_CLAIMS,
+        container_id=_CONTAINER_INSTANCE_ID,
+        maximum_age_seconds=MAX_TIMEOUT + 900,
+        wait_timeout_seconds=max(60, MAX_TIMEOUT - 60),
+        function_call_id=modal.current_function_call_id(),
+    )
+
+
+@app.function(
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True
+        )
+    },
+)
+def inspect_seed_prediction_cache(
+    run_id: str,
+    seeds: list[int],
+    sample_count: int,
+) -> list[dict[str, object]]:
+    """Inspect seed markers without scanning prediction directories."""
+    return inspect_seed_predictions(
+        _inference_runtime(),
+        run_id,
+        tuple(seeds),
+        sample_count=sample_count,
+    )
+
+
+@app.function(
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True
+        )
+    },
+)
+def claim_seed_prediction_work(
+    run_id: str,
+    seeds: list[int],
+    sample_count: int,
+) -> dict[str, object]:
+    """Reuse or atomically claim one request's currently incomplete seeds."""
+    return claim_seed_predictions(
+        _inference_runtime(),
+        run_id,
+        tuple(seeds),
+        sample_count=sample_count,
+    ).to_dict()
+
+
 @app.function(
     gpu=CONF.gpu,
-    cpu=(0.125, 16.125),  # burst for tar compression
-    memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
+    cpu=(0.125, 16.125),
+    memory=(1024, 131072),
     timeout=MAX_TIMEOUT,
-    # Writable model dir because AlphaFold3 writes its JAX cache next to weights
     volumes=CONF.mounts(
         output_volume=True,
         model_volume=True,
         model_ro=False,
-    )
-    | {
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
-        )
-    },
+    ),
 )
 def run_inference_pipeline(
-    json_bytes: bytes, recycle: int, sample: int, model_seeds: list[int]
-) -> bytes:
-    """Run AlphaFold3 structure prediction.
-
-    Returns:
-        Tarball bytes of inference outputs (CIF files + confidence JSONs).
-
-    """
+    json_bytes: bytes,
+    run_id: str,
+    recycle: int,
+    sample: int,
+    claimed_seed_records: list[dict[str, object]],
+) -> dict[str, object]:
+    """Run one disjoint seed group and publish per-seed markers."""
     import sys
 
-    with TemporaryDirectory(prefix="alphafold3_inference_") as temp_dir:
-        temp_path = Path(temp_dir)
-        input_json_path = temp_path / "input.json"
-        input_json_path.write_bytes(json_bytes)
+    claimed_seeds = tuple(
+        claimed_seed_from_dict(record) for record in claimed_seed_records
+    )
+    base_conf = AF3Config.model_validate_json(json_bytes)
 
-        conf = AF3Config.from_file(input_json_path)
-        run_name = conf.name
-        conf.modelSeeds = model_seeds
+    def execute(
+        worker_root: Path,
+        canonical_name: str,
+        seeds: tuple[int, ...],
+    ) -> None:
+        conf = base_conf.model_copy(deep=True)
+        conf.name = canonical_name
+        conf.modelSeeds = list(seeds)
         conf = _fill_missing_msa_for_inference(conf)
-        conf.to_files(temp_path, "input")
-        print(f"💊 Running inference for {run_name} with seeds {model_seeds}")
-
-        out_dir = temp_path / run_name
+        input_json_path = worker_root / "input.json"
+        input_json_path.write_text(conf.model_dump_json(exclude_unset=False))
+        print(f"💊 Running inference for {canonical_name} with seeds {list(seeds)}")
         model_dir = Path(CONF.model_volume_mountpoint)
         cmd = [
             sys.executable,
@@ -1120,140 +1188,292 @@ def run_inference_pipeline(
             "--run_inference=true",
             "--run_data_pipeline=false",
             f"--json_path={input_json_path}",
-            f"--output_dir={out_dir}",
+            f"--output_dir={worker_root}",
             f"--model_dir={model_dir}",
             f"--jax_compilation_cache_dir={model_dir / 'jax_cache'}",
             f"--num_recycles={recycle}",
             f"--num_diffusion_samples={sample}",
         ]
         run_command(
-            cmd, output_mode="tee", log_file=out_dir / f"{run_name}_inference.log"
+            cmd,
+            output_mode="tee",
+            log_file=worker_root / "run.log",
         )
-        return package_outputs(out_dir / run_name)
+
+    return run_seed_prediction_worker(
+        _inference_runtime(),
+        SeedWorkerTask(
+            run_id=run_id,
+            sample_count=sample,
+            claimed_seeds=claimed_seeds,
+        ),
+        execute,
+    )
+
+
+@app.function(
+    cpu=(0.125, 2.125),
+    memory=(1024, 16384),
+    timeout=3600,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_inference_summary(
+    json_bytes: bytes,
+    run_id: str,
+    sample_count: int,
+) -> dict[str, object]:
+    """Rebuild the non-regressing accumulated run summary."""
+    from alphafold3.common import (  # type: ignore[ty:unresolved-import]
+        folding_input,
+    )
+
+    base_conf = AF3Config.model_validate_json(json_bytes)
+
+    def build_data_json(seeds: tuple[int, ...]) -> bytes:
+        conf = base_conf.model_copy(deep=True)
+        conf.name = canonical_output_name(run_id)
+        conf.modelSeeds = list(seeds)
+        with TemporaryDirectory(prefix="alphafold3_summary_") as temp_dir:
+            input_path = Path(temp_dir) / "input.json"
+            input_path.write_text(conf.model_dump_json(exclude_unset=False))
+            fold_inputs = list(folding_input.load_fold_inputs_from_path(input_path))
+        if len(fold_inputs) != 1:
+            raise RuntimeError("Expected exactly one AlphaFold input")
+        return fold_inputs[0].to_json().encode()
+
+    return finalize_run_summary(
+        _inference_runtime(),
+        run_id,
+        sample_count=sample_count,
+        build_data_json=build_data_json,
+    )
+
+
+def _claimed_seed_record(item: ClaimedSeed) -> dict[str, object]:
+    return {
+        "seed": item.seed,
+        "claim": {
+            "scope_key": item.claim.scope_key,
+            "generation_id": item.claim.generation_id,
+            "owner": item.claim.owner,
+        },
+    }
+
+
+def _completed_seed_set(
+    run_id: str,
+    seeds: tuple[int, ...],
+    sample_count: int,
+) -> set[int]:
+    statuses = inspect_seed_prediction_cache.remote(
+        run_id,
+        list(seeds),
+        sample_count,
+    )
+    if len(statuses) != len(seeds):
+        raise RuntimeError("Seed marker inspection returned the wrong result count")
+    completed: set[int] = set()
+    for seed, status in zip(seeds, statuses, strict=True):
+        if status.get("run_id") != run_id or status.get("seed") != seed:
+            raise RuntimeError(f"Invalid seed marker inspection result: {status!r}")
+        if status.get("status") == "reused":
+            completed.add(seed)
+        elif status.get("status") != "missing":
+            raise RuntimeError(f"Invalid seed marker inspection result: {status!r}")
+    return completed
+
+
+def _run_claimed_seed_batches(
+    prepared: PreparedInferenceRun,
+    claimed_seeds: tuple[ClaimedSeed, ...],
+    *,
+    recycle: int,
+    sample: int,
+    max_workers: int,
+    poll_timeout: int,
+) -> tuple[set[int], set[int], list[dict[str, object]]]:
+    batches = partition_claimed_seeds(claimed_seeds, max_workers)
+    json_bytes = prepared.worker_config.model_dump_json(exclude_unset=False).encode()
+    calls: dict[int, tuple[modal.FunctionCall, tuple[ClaimedSeed, ...]]] = {}
+    for index, batch in enumerate(batches):
+        calls[index] = (
+            run_inference_pipeline.spawn(
+                json_bytes,
+                prepared.run_id,
+                recycle,
+                sample,
+                [_claimed_seed_record(item) for item in batch],
+            ),
+            batch,
+        )
+
+    published: set[int] = set()
+    reused: set[int] = set()
+    failures: list[dict[str, object]] = []
+    while calls:
+        for index, (function_call, batch) in calls.copy().items():
+            try:
+                result = function_call.get(timeout=poll_timeout)
+            except TimeoutError:
+                continue
+            except Exception as exc:
+                failures.append({
+                    "seeds": [item.seed for item in batch],
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                })
+                del calls[index]
+                continue
+            if not isinstance(result, dict) or result.get("run_id") != prepared.run_id:
+                failures.append({
+                    "seeds": [item.seed for item in batch],
+                    "error_type": "InvalidWorkerResult",
+                    "message": repr(result),
+                })
+            else:
+                raw_published = result.get("published_seeds")
+                raw_reused = result.get("reused_seeds")
+                if (
+                    not isinstance(raw_published, list)
+                    or not isinstance(raw_reused, list)
+                    or any(
+                        isinstance(seed, bool) or not isinstance(seed, int)
+                        for seed in [*raw_published, *raw_reused]
+                    )
+                    or not set([*raw_published, *raw_reused]).issubset({
+                        item.seed for item in batch
+                    })
+                ):
+                    failures.append({
+                        "seeds": [item.seed for item in batch],
+                        "error_type": "InvalidWorkerResult",
+                        "message": repr(result),
+                    })
+                else:
+                    published.update(raw_published)
+                    reused.update(raw_reused)
+            del calls[index]
+    return published, reused, failures
 
 
 def predict_structures(
-    conf: AF3Config,
-    local_out_dir: Path,
+    prepared: PreparedInferenceRun,
     recycle: int,
     sample: int,
     num_containers: int,
     *,
-    poll_timeout: int = 5,
-) -> Path:
-    """Run AF3 inference pipeline and save outputs to .tar.zst file."""
-    run_name = conf.name
-    out_file = build_local_output_path(local_out_dir, run_name=run_name)
-    if out_file.exists():
-        print(f"🧬 File already exists, skipping inference: {out_file}")
-        return out_file
+    poll_timeout: int = 30,
+) -> dict[str, object]:
+    """Reconcile, run once, and summarize the requested seed predictions."""
+    if (
+        isinstance(num_containers, bool)
+        or not isinstance(num_containers, int)
+        or num_containers < 1
+    ):
+        raise ValueError("num_containers must be a positive integer")
+    requested = prepared.normalized_seeds
+    pending = set(requested)
+    reused: set[int] = set()
+    published: set[int] = set()
+    failures: list[dict[str, object]] = []
+    attempted: set[int] = set()
+    deadline = time.monotonic() + MAX_TIMEOUT + 900
 
-    # Directly run inference pipeline if only one container is specified
-    json_bytes = conf.to_json().encode()
-    model_seeds = conf.modelSeeds
-    if num_containers == 1:
-        fc = run_inference_pipeline.spawn(
-            json_bytes, recycle=recycle, sample=sample, model_seeds=model_seeds
+    while pending:
+        raw_plan = claim_seed_prediction_work.remote(
+            prepared.run_id,
+            sorted(pending),
+            sample,
         )
-        tarball_content = fc.get()
-        write_local_tarball(out_file, tarball_content)
-        return out_file
-
-    tar_binary = shutil.which("tar") or None
-    if tar_binary is None:
-        raise RuntimeError("🧬 tar command not found")
-    tar_cmd = [tar_binary, "-I", "zstd"]
-
-    def _part_file(i: int) -> Path:
-        return local_out_dir / f"{run_name}_part{i}.tar.zst"
-
-    def _is_good_tarball(tarball_file: Path) -> bool:
-        """Return whether an existing tarball is good enough to skip."""
-        if not tarball_file.exists() or tarball_file.stat().st_size == 0:
-            return False
-        try:
-            run_command([*tar_cmd, "-tf", str(tarball_file)], output_mode="capture")
-        except Exception as exc:
-            print(
-                f"🧬 Existing part tarball is not readable; rerunning {tarball_file}: {exc}"
+        plan = seed_claim_plan_from_dict(raw_plan)
+        reused.update(plan.reused_seeds)
+        pending.difference_update(plan.reused_seeds)
+        if plan.owned:
+            owned_seeds = {item.seed for item in plan.owned}
+            if attempted.intersection(owned_seeds):
+                raise RuntimeError("Refusing to retry a surfaced seed failure")
+            attempted.update(owned_seeds)
+            (
+                batch_published,
+                batch_reused,
+                batch_failures,
+            ) = _run_claimed_seed_batches(
+                prepared,
+                plan.owned,
+                recycle=recycle,
+                sample=sample,
+                max_workers=num_containers,
+                poll_timeout=poll_timeout,
             )
-            return False
-        return True
-
-    # Run inference in parallel for parts that are missing
-    inference_func_calls: dict[int, modal.FunctionCall] = {}
-    good_part_indices: set[int] = set()
-    for i in range(num_containers):
-        tarball_file = _part_file(i)
-        if _is_good_tarball(tarball_file):
-            good_part_indices.add(i)
-            continue
-        fc = run_inference_pipeline.spawn(
-            json_bytes,
-            recycle=recycle,
-            sample=sample,
-            model_seeds=model_seeds[i::num_containers],
-        )
-        inference_func_calls[i] = fc
-
-    # Collect results as they become available
-    failures: list[tuple[int, Exception]] = []
-    while inference_func_calls:
-        for i, fc in inference_func_calls.copy().items():
-            try:
-                tarball_content = fc.get(timeout=poll_timeout)
-            except TimeoutError:
-                print(f"🧬 Task {i} still running...")
-                continue
-            except Exception as exc:
-                failures.append((i, exc))
-                del inference_func_calls[i]
-                print(f"🧬 Task {i} failed: {exc}")
-                continue
-
-            tarball_file = _part_file(i)
-            tmp_file = tarball_file.with_suffix(".tmp")
-            write_local_tarball(tmp_file, tarball_content, overwrite=True)
-            tmp_file.replace(tarball_file)
-            del inference_func_calls[i]
-
-    # Go through all expected tarball part files
-    tarball_part_files = [_part_file(i) for i in range(num_containers)]
-    for i, tarball_part_file in enumerate(tarball_part_files):
-        if i not in good_part_indices and _is_good_tarball(tarball_part_file):
-            good_part_indices.add(i)
-    unusable_part_files = [
-        p for i, p in enumerate(tarball_part_files) if i not in good_part_indices
-    ]
-    if unusable_part_files:
-        saved = (
-            ", ".join(str(tarball_part_files[i]) for i in sorted(good_part_indices))
-            or "none"
-        )
-        failed = "; ".join(f"part {i}: {exc}" for i, exc in failures) or "unknown"
-        raise RuntimeError(
-            "Some AlphaFold3 inference parts failed or did not produce readable "
-            "tarballs. "
-            f"Saved part tarballs: {saved}. Failed parts: {failed}. "
-            "Rerun the command to resume only missing parts."
-        )
-
-    # Run local extraction after everything is saved to avoid errors
-    with TemporaryDirectory() as tmp_dir:
-        for tar_filename in tarball_part_files:
-            run_command(
-                [*tar_cmd, "-xf", str(tar_filename)],
-                output_mode="capture",
-                cwd=tmp_dir,
+            completed_owned = _completed_seed_set(
+                prepared.run_id,
+                tuple(sorted(owned_seeds)),
+                sample,
             )
+            published.update(batch_published)
+            published.update(completed_owned - batch_reused)
+            reused.update(batch_reused)
+            pending.difference_update(owned_seeds)
+            failures.extend(batch_failures)
+            for seed in sorted(owned_seeds - completed_owned):
+                if not any(
+                    isinstance(
+                        failure_seeds := failure.get("seeds"),
+                        list,
+                    )
+                    and seed in failure_seeds
+                    for failure in batch_failures
+                ):
+                    failures.append({
+                        "seeds": [seed],
+                        "error_type": "IncompleteSeedPrediction",
+                        "message": "Worker returned without a valid seed marker",
+                    })
 
-        # Combine the parts into a single .tar.zst file
-        tarball_content = package_outputs(Path(tmp_dir) / run_name)
-        write_local_tarball(out_file, tarball_content)
-    print(
-        f"🧬 Note that top-level {run_name}_*.{{cif,json,csv}} may not be correct since they are from parallel workers"
+        active_seeds = {item.seed for item in plan.active}
+        if pending and pending != active_seeds:
+            raise RuntimeError("Seed claim plan did not account for every pending seed")
+        if pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failures.append({
+                    "seeds": sorted(pending),
+                    "error_type": "ActiveSeedTimeout",
+                    "message": "Timed out waiting for concurrent seed owners",
+                })
+                break
+            time.sleep(min(30, remaining))
+
+    completed = _completed_seed_set(
+        prepared.run_id,
+        requested,
+        sample,
     )
-    return out_file
+    incomplete = set(requested) - completed
+    summary: dict[str, object] | None = None
+    if completed:
+        summary = finalize_inference_summary.remote(
+            prepared.worker_config.model_dump_json(exclude_unset=False).encode(),
+            prepared.run_id,
+            sample,
+        )
+    result: dict[str, object] = {
+        "run_id": prepared.run_id,
+        "request_id": prepared.request_id,
+        "requested_seeds": list(requested),
+        "reused_seeds": sorted(reused),
+        "published_seeds": sorted(published),
+        "completed_seeds": sorted(completed),
+        "incomplete_seeds": sorted(incomplete),
+        "failures": failures,
+        "summary": summary,
+    }
+    if incomplete:
+        raise RuntimeError(
+            "Incomplete AlphaFold3 seed predictions; completed siblings remain "
+            f"reusable and no failed seed was retried: {result}"
+        )
+    return result
 
 
 ##########################################
@@ -1393,8 +1613,6 @@ def submit_alphafold3_task(
         max_parallel_search_workers=max_parallel_search_workers,
     )
 
-    local_out_dir = resolve_local_output_dir(out_dir)
-
     enriched_conf = _load_conf_from_bytes(json_bytes)
     enriched_conf.name = run_name
     enriched_conf.modelSeeds = conf.modelSeeds
@@ -1420,11 +1638,14 @@ def submit_alphafold3_task(
     num_seeds = len(prepared.normalized_seeds)
     num_containers = max(1, min(max_num_gpus, num_seeds))
     print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
-    out_file = predict_structures(
-        prepared.worker_config,
-        local_out_dir,
+    result = predict_structures(
+        prepared,
         recycle,
         sample,
         num_containers,
     )
-    print(f"🧬 {CONF.name} run complete! Results saved to {out_file}")
+    print(
+        f"🧬 {CONF.name} seed predictions are durable in "
+        f"{CONF.output_volume_name}:/{prepared.run_root}. "
+        f"Request retrieval metadata: {result}"
+    )

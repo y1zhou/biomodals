@@ -6,6 +6,7 @@ validate their stage-specific marker before reusing a publication.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import time
 from typing import Protocol, cast
@@ -13,6 +14,8 @@ from typing import Protocol, cast
 from biomodals.app.fold.alphafold3.artifacts import utc_now
 
 _TERMINAL_STATUSES = frozenset({"complete", "failed", "abandoned"})
+
+type ClaimOwnerAdapter = Callable[[str, object], dict[str, object]]
 
 
 class ClaimStore(Protocol):
@@ -83,13 +86,22 @@ def _validate_generation_id(generation_id: str) -> str:
     return generation_id
 
 
-def _validate_owner(scope_key: str, value: object) -> dict[str, object]:
-    if not isinstance(value, dict) or value.get("scope_key") != scope_key:
+def _validate_owner(
+    scope_key: str,
+    value: object,
+    owner_adapter: ClaimOwnerAdapter | None,
+) -> dict[str, object]:
+    candidate = value
+    if (
+        not isinstance(candidate, dict) or candidate.get("scope_key") != scope_key
+    ) and owner_adapter is not None:
+        candidate = owner_adapter(scope_key, value)
+    if not isinstance(candidate, dict) or candidate.get("scope_key") != scope_key:
         raise RuntimeError(f"Claim {scope_key!r} has an invalid owner")
-    generation_id = value.get("generation_id")
+    generation_id = candidate.get("generation_id")
     _validate_generation_id(cast(str, generation_id))
-    started_at = value.get("started_at_epoch_seconds")
-    maximum_age = value.get("maximum_age_seconds")
+    started_at = candidate.get("started_at_epoch_seconds")
+    maximum_age = candidate.get("maximum_age_seconds")
     if (
         isinstance(started_at, bool)
         or not isinstance(started_at, int | float)
@@ -98,15 +110,17 @@ def _validate_owner(scope_key: str, value: object) -> dict[str, object]:
         or maximum_age <= 0
     ):
         raise RuntimeError(f"Claim {scope_key!r} has invalid timing metadata")
-    identity = value.get("identity")
+    identity = candidate.get("identity")
     if not isinstance(identity, dict):
         raise RuntimeError(f"Claim {scope_key!r} has an invalid identity")
-    return cast(dict[str, object], value)
+    return cast(dict[str, object], candidate)
 
 
 def latest_generation_owner(
     claims: ClaimStore,
     scope_key: str,
+    *,
+    owner_adapter: ClaimOwnerAdapter | None = None,
 ) -> dict[str, object] | None:
     """Follow append-only successors to the current generation owner."""
     selected_scope = _validate_scope_key(scope_key)
@@ -115,7 +129,7 @@ def latest_generation_owner(
         return None
     seen: set[str] = set()
     while True:
-        owner = _validate_owner(selected_scope, current)
+        owner = _validate_owner(selected_scope, current, owner_adapter)
         generation_id = cast(str, owner["generation_id"])
         if generation_id in seen:
             raise RuntimeError(f"Claim {selected_scope!r} contains a cycle")
@@ -158,6 +172,7 @@ def acquire_generation_claim(
     maximum_age_seconds: int | float,
     now_epoch_seconds: int | float | None = None,
     now_text: str | None = None,
+    owner_adapter: ClaimOwnerAdapter | None = None,
 ) -> GenerationClaim:
     """Elect a writer after fencing a terminal or conservatively stale owner."""
     selected_scope = _validate_scope_key(scope_key)
@@ -192,7 +207,11 @@ def acquire_generation_claim(
         return GenerationClaim(selected_scope, selected_generation, owner)
 
     while True:
-        predecessor = latest_generation_owner(claims, selected_scope)
+        predecessor = latest_generation_owner(
+            claims,
+            selected_scope,
+            owner_adapter=owner_adapter,
+        )
         if predecessor is None:
             raise RuntimeError(f"Claim {selected_scope!r} root disappeared")
         predecessor_generation = cast(str, predecessor["generation_id"])
@@ -251,9 +270,15 @@ def acquire_generation_claim(
 def assert_generation_current(
     claims: ClaimStore,
     claim: GenerationClaim,
+    *,
+    owner_adapter: ClaimOwnerAdapter | None = None,
 ) -> None:
     """Fail closed unless ``claim`` remains the live latest generation."""
-    owner = latest_generation_owner(claims, claim.scope_key)
+    owner = latest_generation_owner(
+        claims,
+        claim.scope_key,
+        owner_adapter=owner_adapter,
+    )
     if owner is None or owner.get("generation_id") != claim.generation_id:
         raise LostGenerationError(
             f"Generation {claim.generation_id!r} no longer owns "
@@ -265,7 +290,7 @@ def assert_generation_current(
         )
 
 
-def finish_generation_claim(
+def _record_terminal_status(
     claims: ClaimStore,
     claim: GenerationClaim,
     *,
@@ -273,9 +298,8 @@ def finish_generation_claim(
     detail: dict[str, object],
     now_text: str | None = None,
 ) -> None:
-    """Append a terminal status without deleting claim history."""
-    if status not in {"complete", "failed"}:
-        raise ValueError("status must be 'complete' or 'failed'")
+    if status not in _TERMINAL_STATUSES:
+        raise ValueError(f"Unsupported terminal status: {status!r}")
     if not isinstance(detail, dict):
         raise TypeError("detail must be a dictionary")
     observed_text = utc_now() if now_text is None else now_text
@@ -300,3 +324,40 @@ def finish_generation_claim(
             f"Generation {claim.generation_id!r} already has a different "
             "terminal status"
         )
+
+
+def finish_generation_claim(
+    claims: ClaimStore,
+    claim: GenerationClaim,
+    *,
+    status: str,
+    detail: dict[str, object],
+    now_text: str | None = None,
+) -> None:
+    """Append a successful or failed status without deleting claim history."""
+    if status not in {"complete", "failed"}:
+        raise ValueError("status must be 'complete' or 'failed'")
+    _record_terminal_status(
+        claims,
+        claim,
+        status=status,
+        detail=detail,
+        now_text=now_text,
+    )
+
+
+def abandon_generation_claim(
+    claims: ClaimStore,
+    claim: GenerationClaim,
+    *,
+    detail: dict[str, object],
+    now_text: str | None = None,
+) -> None:
+    """Fence a conservatively stale generation for cleanup or replacement."""
+    _record_terminal_status(
+        claims,
+        claim,
+        status="abandoned",
+        detail=detail,
+        now_text=now_text,
+    )

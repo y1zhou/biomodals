@@ -12,7 +12,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import tempfile
 import uuid
@@ -35,7 +34,16 @@ from biomodals.app.fold.alphafold3.artifacts import (
     utc_now,
     write_json_atomic,
 )
-from biomodals.app.fold.alphafold3.generation_claims import ClaimStore
+from biomodals.app.fold.alphafold3.generation_claims import (
+    ActiveGenerationError,
+    ClaimStore,
+    GenerationClaim,
+    abandon_generation_claim,
+    acquire_generation_claim,
+    finish_generation_claim,
+    generation_status,
+    latest_generation_owner,
+)
 from biomodals.app.fold.alphafold3.profile_manifest import (
     validate_profile_manifest,
     validate_published_profile,
@@ -377,204 +385,82 @@ def _profile_claim_root_key(spec: DatabaseProfileSpec) -> str:
     return f"claim:{spec.profile_id}:root"
 
 
-def _profile_successor_key(
-    spec: DatabaseProfileSpec,
-    generation_id: str,
-) -> str:
-    return f"claim:{spec.profile_id}:after:{generation_id}"
-
-
-def _profile_status_key(spec: DatabaseProfileSpec, generation_id: str) -> str:
-    return f"status:{spec.profile_id}:{generation_id}"
-
-
-def _validate_claim_owner(
-    spec: DatabaseProfileSpec,
+def _adapt_legacy_profile_owner(
+    scope_key: str,
     value: object,
 ) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise RuntimeError(f"Profile {spec.profile_id} has an invalid claim owner")
-    if (
-        value.get("profile_id") != spec.profile_id
-        or value.get("database_id") != spec.database_id
-    ):
-        raise RuntimeError(f"Profile {spec.profile_id} claim identity is invalid")
-    generation_id = value.get("generation_id")
-    if not isinstance(generation_id, str) or not generation_id or ":" in generation_id:
-        raise RuntimeError(f"Profile {spec.profile_id} claim generation is invalid")
-    started_at = value.get("started_at_epoch_seconds")
-    if not isinstance(started_at, int | float):
-        raise RuntimeError(f"Profile {spec.profile_id} claim time is invalid")
-    return cast(dict[str, object], value)
-
-
-def _latest_claim_owner(
-    claims: ClaimStore,
-    spec: DatabaseProfileSpec,
-) -> dict[str, object] | None:
-    """Follow append-only successors to the current profile generation."""
-    current = claims.get(_profile_claim_root_key(spec), None)
-    if current is None:
-        return None
-    seen: set[str] = set()
-    while True:
-        owner = _validate_claim_owner(spec, current)
-        generation_id = cast(str, owner["generation_id"])
-        if generation_id in seen:
-            raise RuntimeError(
-                f"Profile {spec.profile_id} claim chain contains a cycle"
-            )
-        seen.add(generation_id)
-        successor = claims.get(
-            _profile_successor_key(spec, generation_id),
-            None,
-        )
-        if successor is None:
-            return owner
-        current = successor
-
-
-def _claim_status(
-    claims: ClaimStore,
-    spec: DatabaseProfileSpec,
-    generation_id: str,
-) -> dict[str, object] | None:
-    value = claims.get(_profile_status_key(spec, generation_id), None)
-    if value is None:
-        return None
-    if not isinstance(value, dict) or value.get("status") not in {
-        "complete",
-        "failed",
-        "abandoned",
-    }:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} generation {generation_id} "
-            "has an invalid terminal status"
-        )
-    return cast(dict[str, object], value)
+    if not isinstance(value, dict) or value.get("profile_id") != scope_key:
+        raise RuntimeError(f"Profile {scope_key} has an invalid legacy claim owner")
+    database_id = value.get("database_id")
+    if not isinstance(database_id, str):
+        raise RuntimeError(f"Profile {scope_key} legacy claim identity is invalid")
+    spec = resolve_database_profile(database_id)
+    if spec.profile_id != scope_key:
+        raise RuntimeError(f"Profile {scope_key} legacy claim identity is invalid")
+    return {
+        "scope_key": scope_key,
+        "generation_id": value.get("generation_id"),
+        "identity": {
+            "profile_id": scope_key,
+            "database_id": database_id,
+        },
+        "container_id": value.get("container_id"),
+        "started_at": value.get("started_at"),
+        "started_at_epoch_seconds": value.get("started_at_epoch_seconds"),
+        "maximum_age_seconds": value.get("maximum_age_seconds"),
+    }
 
 
 def _adopt_legacy_claim(
     claims: ClaimStore,
     spec: DatabaseProfileSpec,
-) -> dict[str, object] | None:
+) -> None:
     """Adopt an old active-key owner as the append-only claim root."""
     legacy_claim = claims.get(_legacy_profile_claim_key(spec), None)
     if legacy_claim is None:
-        return None
-    legacy_owner = _validate_claim_owner(spec, legacy_claim)
+        return
+    legacy_owner = _adapt_legacy_profile_owner(spec.profile_id, legacy_claim)
     root_key = _profile_claim_root_key(spec)
     claims.put(root_key, legacy_owner, skip_if_exists=True)
-    root_owner = _validate_claim_owner(spec, claims.get(root_key, None))
-    if root_owner["generation_id"] != legacy_owner["generation_id"]:
+    root_owner = claims.get(root_key, None)
+    if not isinstance(root_owner, dict):
+        raise RuntimeError(f"Profile {spec.profile_id} claim root disappeared")
+    if root_owner.get("generation_id") != legacy_owner["generation_id"]:
         raise RuntimeError(
             f"Profile {spec.profile_id} legacy and append-only claims conflict"
         )
-    return legacy_owner
-
-
-def _acquire_claim(
-    runtime: ProfileBuilderRuntime,
-    spec: DatabaseProfileSpec,
-    generation_id: str,
-) -> dict[str, object]:
-    """Append one elected generation after a terminal or stale predecessor."""
-    owner = {
-        "profile_id": spec.profile_id,
-        "database_id": spec.database_id,
-        "generation_id": generation_id,
-        "container_id": runtime.container_id,
-        "hostname": socket.gethostname(),
-        "started_at": utc_now(),
-        "started_at_epoch_seconds": time(),
-        "maximum_age_seconds": PROFILE_STALE_SECONDS,
-    }
-    legacy_owner = _adopt_legacy_claim(runtime.claims, spec)
-    if legacy_owner is None:
-        if runtime.claims.put(
-            _profile_claim_root_key(spec),
-            owner,
-            skip_if_exists=True,
-        ):
-            return owner
-
-    while True:
-        predecessor = _latest_claim_owner(runtime.claims, spec)
-        if predecessor is None:
-            raise RuntimeError(f"Profile {spec.profile_id} claim root disappeared")
-        predecessor_generation = cast(str, predecessor["generation_id"])
-        predecessor_status = _claim_status(
-            runtime.claims,
-            spec,
-            predecessor_generation,
-        )
-        if predecessor_status is None:
-            started_at = cast(int | float, predecessor["started_at_epoch_seconds"])
-            age_seconds = time() - float(started_at)
-            if age_seconds <= PROFILE_STALE_SECONDS:
-                raise RuntimeError(
-                    f"Profile {spec.profile_id} is already being built by "
-                    f"generation {predecessor_generation!r}"
-                )
-            runtime.claims.put(
-                _profile_status_key(spec, predecessor_generation),
-                {
-                    "status": "abandoned",
-                    "abandoned_at": utc_now(),
-                    "age_seconds": age_seconds,
-                },
-                skip_if_exists=True,
-            )
-            predecessor_status = _claim_status(
-                runtime.claims,
-                spec,
-                predecessor_generation,
-            )
-            if predecessor_status is None:
-                raise RuntimeError(
-                    f"Profile {spec.profile_id} stale claim was not fenced"
-                )
-            predecessor_status_name = cast(str, predecessor_status["status"])
-        else:
-            predecessor_status_name = cast(str, predecessor_status["status"])
-
-        successor = owner | {
-            "predecessor_generation_id": predecessor_generation,
-            "predecessor_status": predecessor_status_name,
-        }
-        if runtime.claims.put(
-            _profile_successor_key(spec, predecessor_generation),
-            successor,
-            skip_if_exists=True,
-        ):
-            return successor
-
-
-def _finish_claim(
-    runtime: ProfileBuilderRuntime,
-    spec: DatabaseProfileSpec,
-    generation_id: str,
-    *,
-    status: str,
-    detail: dict[str, object],
-) -> None:
-    """Append terminal status, releasing this generation for a successor."""
-    created = runtime.claims.put(
-        _profile_status_key(spec, generation_id),
-        {
-            "status": status,
-            "finished_at": utc_now(),
-            **detail,
-        },
-        skip_if_exists=True,
+    latest_generation_owner(
+        claims,
+        spec.profile_id,
+        owner_adapter=_adapt_legacy_profile_owner,
     )
-    if not created:
-        existing = _claim_status(runtime.claims, spec, generation_id)
-        if existing is None or existing.get("status") != status:
-            raise RuntimeError(
-                f"Profile {spec.profile_id} generation {generation_id} "
-                "already has a different terminal status"
-            )
+
+
+def _acquire_profile_claim(
+    runtime: ProfileBuilderRuntime,
+    spec: DatabaseProfileSpec,
+    generation_id: str,
+) -> GenerationClaim:
+    """Append one elected generation after a terminal or stale predecessor."""
+    _adopt_legacy_claim(runtime.claims, spec)
+    try:
+        return acquire_generation_claim(
+            runtime.claims,
+            scope_key=spec.profile_id,
+            generation_id=generation_id,
+            identity={
+                "profile_id": spec.profile_id,
+                "database_id": spec.database_id,
+            },
+            container_id=runtime.container_id,
+            maximum_age_seconds=PROFILE_STALE_SECONDS,
+            owner_adapter=_adapt_legacy_profile_owner,
+        )
+    except ActiveGenerationError as exc:
+        raise RuntimeError(
+            f"Profile {spec.profile_id} is already being built by generation "
+            f"{exc.owner['generation_id']!r}"
+        ) from exc
 
 
 def _hash_decompressed_zstd(
@@ -1155,7 +1041,7 @@ def build_profile(
             seqkit_threads=threads,
         )
 
-    claim = _acquire_claim(runtime, spec, generation_id)
+    claim = _acquire_profile_claim(runtime, spec, generation_id)
     staging_root = (
         runtime.sharded_root / ".staging" / f"{spec.profile_id}-{generation_id}"
     )
@@ -1170,7 +1056,7 @@ def build_profile(
         "profile_published": False,
     }
     try:
-        write_json_atomic(evidence_root / "claim.json", claim)
+        write_json_atomic(evidence_root / "claim.json", claim.owner)
         runtime.output_volume.commit()
         runtime.sharded_volume.reload()
         if (published_root / "manifest.json").is_file():
@@ -1312,10 +1198,9 @@ def build_profile(
         }
         raise
     finally:
-        _finish_claim(
-            runtime,
-            spec,
-            generation_id,
+        finish_generation_claim(
+            runtime.claims,
+            claim,
             status=claim_status,
             detail=claim_detail,
         )
@@ -1413,11 +1298,15 @@ def cleanup_profile_workspace(
     active: list[str] = []
     for spec in DATABASE_PROFILE_SPECS:
         _adopt_legacy_claim(claims, spec)
-        owner = _latest_claim_owner(claims, spec)
+        owner = latest_generation_owner(
+            claims,
+            spec.profile_id,
+            owner_adapter=_adapt_legacy_profile_owner,
+        )
         if owner is None:
             continue
         generation_id = cast(str, owner["generation_id"])
-        status = _claim_status(claims, spec, generation_id)
+        status = generation_status(claims, spec.profile_id, generation_id)
         if status is not None:
             continue
         started_at = cast(int | float, owner["started_at_epoch_seconds"])
@@ -1425,17 +1314,19 @@ def cleanup_profile_workspace(
         if age_seconds <= PROFILE_STALE_SECONDS:
             active.append(spec.profile_id)
             continue
-        claims.put(
-            _profile_status_key(spec, generation_id),
-            {
-                "status": "abandoned",
-                "abandoned_at": utc_now(),
+        abandon_generation_claim(
+            claims,
+            GenerationClaim(
+                scope_key=spec.profile_id,
+                generation_id=generation_id,
+                owner=owner,
+            ),
+            detail={
                 "age_seconds": age_seconds,
                 "cleanup_recovery": True,
             },
-            skip_if_exists=True,
         )
-        if _claim_status(claims, spec, generation_id) is None:
+        if generation_status(claims, spec.profile_id, generation_id) is None:
             active.append(spec.profile_id)
     if active:
         raise RuntimeError(f"Cannot clean while profile claims are active: {active}")

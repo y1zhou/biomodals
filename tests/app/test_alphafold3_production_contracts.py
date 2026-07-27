@@ -22,8 +22,10 @@ from biomodals.app.fold.alphafold3.artifacts import (
 )
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
+    abandon_generation_claim,
     acquire_generation_claim,
     finish_generation_claim,
+    generation_status,
     latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
@@ -610,6 +612,76 @@ def test_generation_claims_fence_active_and_terminal_writers() -> None:
 
     assert latest_generation_owner(store, first.scope_key) == second.owner
     assert second.owner["predecessor_status"] == "complete"
+    abandon_generation_claim(
+        store,
+        second,
+        detail={"cleanup_recovery": True},
+        now_text="second-abandoned",
+    )
+    assert generation_status(store, second.scope_key, second.generation_id) == {
+        "status": "abandoned",
+        "finished_at": "second-abandoned",
+        "cleanup_recovery": True,
+    }
+
+
+def test_generation_claims_adapt_legacy_owners() -> None:
+    """A stage may preserve an append-only chain created before canonical owners."""
+    store = FakeClaimStore()
+    scope_key = "small-bfd-64-v2"
+    store.put(
+        f"claim:{scope_key}:root",
+        {
+            "profile_id": scope_key,
+            "database_id": "small_bfd",
+            "generation_id": "legacy",
+            "container_id": "old-container",
+            "started_at": "legacy-start",
+            "started_at_epoch_seconds": 1_000,
+            "maximum_age_seconds": 100,
+        },
+    )
+
+    def adapt_profile_owner(
+        selected_scope: str,
+        value: object,
+    ) -> dict[str, object]:
+        assert isinstance(value, dict)
+        return {
+            "scope_key": selected_scope,
+            "generation_id": value["generation_id"],
+            "identity": {
+                "profile_id": value["profile_id"],
+                "database_id": value["database_id"],
+            },
+            "container_id": value["container_id"],
+            "started_at": value["started_at"],
+            "started_at_epoch_seconds": value["started_at_epoch_seconds"],
+            "maximum_age_seconds": value["maximum_age_seconds"],
+        }
+
+    successor = acquire_generation_claim(
+        store,
+        scope_key=scope_key,
+        generation_id="canonical",
+        identity={"profile_id": scope_key, "database_id": "small_bfd"},
+        container_id="new-container",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_101,
+        now_text="canonical-start",
+        owner_adapter=adapt_profile_owner,
+    )
+
+    assert successor.owner["predecessor_generation_id"] == "legacy"
+    assert successor.owner["predecessor_status"] == "abandoned"
+    assert (
+        latest_generation_owner(
+            store,
+            scope_key,
+            owner_adapter=adapt_profile_owner,
+        )
+        == successor.owner
+    )
 
 
 def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:

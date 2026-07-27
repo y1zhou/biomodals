@@ -48,33 +48,20 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     sanitize_af3_name,
     serialize_af3_input,
     validate_inference_parameters,
-    validate_submitted_af3_input,
     validate_upstream_af3_input,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
-    apply_msa_resolution,
-    apply_template_results,
-    chain_msa_states,
     fill_missing_msa_for_inference,
-    missing_raw_searches,
-    plan_template_searches,
-    reduce_msa_assembly_results,
-    reduce_template_cache_results,
-    validate_template_result,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
-    SEARCH_MAX_PARALLEL_SHARDS,
-    SEARCH_N_CPU,
     MsaAssemblyTask,
     Polymer,
     RawSearchTask,
     SearchRuntime,
     assemble_and_publish_msas,
     inspect_raw_searches,
-    plan_msa_resolution,
     run_database_search,
-    sequence_hash,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
@@ -104,6 +91,11 @@ from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     create_request_archive,
     publish_request_results,
+)
+from biomodals.app.fold.alphafold3.search_pipeline import (
+    SearchExecutor,
+    resolve_msa_and_templates,
+    validate_search_worker_budget,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
@@ -626,17 +618,6 @@ def search_protein_templates(
     )
 
 
-def _validate_search_worker_budget(max_parallel_search_workers: int) -> int:
-    """Validate the request-wide remote-worker budget."""
-    if (
-        isinstance(max_parallel_search_workers, bool)
-        or not isinstance(max_parallel_search_workers, int)
-        or not 1 <= max_parallel_search_workers <= 32
-    ):
-        raise ValueError("max_parallel_search_workers must be between 1 and 32")
-    return max_parallel_search_workers
-
-
 def _validate_max_num_gpus(max_num_gpus: int) -> int:
     """Validate the GPU-worker cap before any cost-incurring remote work."""
     if (
@@ -650,44 +631,81 @@ def _validate_max_num_gpus(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
-def _remote_search_outcome(
-    task: RawSearchTask,
-) -> dict[str, object] | Exception:
-    """Return a remote search result or its surfaced exception."""
-    try:
-        return search_database_msa.remote(task.database_id, task.sequence)
-    except Exception as exc:
-        return exc
+class _ModalSearchExecutor(SearchExecutor):
+    """Bind the request-level search coordinator to Modal functions."""
 
+    def inspect_raw(
+        self,
+        tasks: tuple[RawSearchTask, ...],
+    ) -> tuple[dict[str, object], ...]:
+        inputs = [(task.database_id, task.sequence) for task in tasks]
+        return tuple(inspect_msa_search_cache.remote(inputs))
 
-def _remote_assembly_outcome(
-    task: MsaAssemblyTask,
-) -> dict[str, object] | Exception:
-    """Return a remote assembly result or its surfaced exception."""
-    try:
-        return assemble_sequence_msas.remote(
-            task.polymer,
-            task.sequence,
-            task.include_unpaired,
-            task.include_paired,
-        )
-    except Exception as exc:
-        return exc
+    def run_raw(
+        self,
+        tasks: tuple[RawSearchTask, ...],
+        *,
+        max_parallel: int,
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        def run(task: RawSearchTask) -> dict[str, object] | Exception:
+            try:
+                return search_database_msa.remote(task.database_id, task.sequence)
+            except Exception as exc:
+                return exc
 
+        return tuple(bounded_map(tasks, run, max_parallel=max_parallel))
 
-def _remote_template_outcome(
-    task: TemplateTask,
-) -> dict[str, object] | Exception:
-    """Return a remote template result or its surfaced exception."""
-    try:
-        return search_protein_templates.remote(
-            task.sequence,
-            task.unpaired_msa,
-            task.publish_canonical,
-            task.max_template_date,
-        )
-    except Exception as exc:
-        return exc
+    def run_assemblies(
+        self,
+        tasks: tuple[MsaAssemblyTask, ...],
+        *,
+        max_parallel: int,
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        def run(task: MsaAssemblyTask) -> dict[str, object] | Exception:
+            try:
+                return assemble_sequence_msas.remote(
+                    task.polymer,
+                    task.sequence,
+                    task.include_unpaired,
+                    task.include_paired,
+                )
+            except Exception as exc:
+                return exc
+
+        return tuple(bounded_map(tasks, run, max_parallel=max_parallel))
+
+    def inspect_templates(
+        self,
+        tasks: tuple[TemplateTask, ...],
+    ) -> tuple[dict[str, object], ...]:
+        inputs = [
+            (
+                task.sequence,
+                task.unpaired_msa_sha256,
+                task.max_template_date,
+            )
+            for task in tasks
+        ]
+        return tuple(inspect_protein_template_cache.remote(inputs))
+
+    def run_templates(
+        self,
+        tasks: tuple[TemplateTask, ...],
+        *,
+        max_parallel: int,
+    ) -> tuple[dict[str, object] | Exception, ...]:
+        def run(task: TemplateTask) -> dict[str, object] | Exception:
+            try:
+                return search_protein_templates.remote(
+                    task.sequence,
+                    task.unpaired_msa,
+                    task.publish_canonical,
+                    task.max_template_date,
+                )
+            except Exception as exc:
+                return exc
+
+        return tuple(bounded_map(tasks, run, max_parallel=max_parallel))
 
 
 def search_msa_and_templates(
@@ -697,167 +715,14 @@ def search_msa_and_templates(
     search_protein_templates: bool = True,
     max_parallel_search_workers: int = 4,
 ) -> AF3Config:
-    """Resolve MSA fields with bounded resumable database workers."""
-    worker_budget = _validate_search_worker_budget(max_parallel_search_workers)
-    conf = validate_submitted_af3_input(config)
-    if not search_msa:
-        return validate_upstream_af3_input(fill_missing_msa_for_inference(conf))
-
-    states = chain_msa_states(conf)
-    plan = plan_msa_resolution(states)
-    raw_inputs = [(task.database_id, task.sequence) for task in plan.raw_searches]
-    cache_statuses = inspect_msa_search_cache.remote(raw_inputs) if raw_inputs else []
-    missing_raw = missing_raw_searches(plan.raw_searches, cache_statuses)
-
-    print(
-        "🧬 Sharded MSA search plan: "
-        f"{len(cache_statuses) - len(missing_raw)} cached, "
-        f"{len(missing_raw)} missing, worker cap {worker_budget}; each database "
-        f"worker runs at most {SEARCH_MAX_PARALLEL_SHARDS} shard searches "
-        f"with {SEARCH_N_CPU} HMMER CPUs each (request-wide theoretical cap "
-        f"{worker_budget * SEARCH_MAX_PARALLEL_SHARDS} shard searches / "
-        f"{worker_budget * SEARCH_MAX_PARALLEL_SHARDS * SEARCH_N_CPU} HMMER "
-        "CPU slots)."
-    )
-    search_outcomes = bounded_map(
-        missing_raw,
-        _remote_search_outcome,
-        max_parallel=worker_budget,
-    )
-    search_failures = [
-        {
-            "database_id": task.database_id,
-            "polymer": task.polymer,
-            "sequence_sha256": task.sequence_hash,
-            "error_type": type(outcome).__name__,
-            "message": str(outcome),
-        }
-        for task, outcome in zip(missing_raw, search_outcomes, strict=True)
-        if isinstance(outcome, Exception)
-    ]
-    if search_failures:
-        raise RuntimeError(
-            "Incomplete Raw Database MSA tasks; rerun to reuse successful "
-            f"siblings: {search_failures}"
-        )
-
-    assembly_outcomes = bounded_map(
-        plan.assemblies,
-        _remote_assembly_outcome,
-        max_parallel=worker_budget,
-    )
-    assembly_failures = [
-        {
-            "polymer": task.polymer,
-            "sequence_sha256": sequence_hash(task.sequence),
-            "error_type": type(outcome).__name__,
-            "message": str(outcome),
-        }
-        for task, outcome in zip(
-            plan.assemblies,
-            assembly_outcomes,
-            strict=True,
-        )
-        if isinstance(outcome, Exception)
-    ]
-    if assembly_failures:
-        raise RuntimeError(
-            "Incomplete MSA assembly tasks; raw database results remain "
-            f"reusable: {assembly_failures}"
-        )
-
-    assembly_resolution = reduce_msa_assembly_results(
-        plan.assemblies,
-        tuple(outcome for outcome in assembly_outcomes if isinstance(outcome, dict)),
-    )
-    apply_msa_resolution(
-        conf,
-        states,
-        assembly_resolution,
+    """Resolve MSA/template fields through the production Modal adapter."""
+    return resolve_msa_and_templates(
+        config,
+        _ModalSearchExecutor(),
+        search_msa=search_msa,
         search_protein_templates=search_protein_templates,
+        max_parallel_search_workers=max_parallel_search_workers,
     )
-
-    if not search_protein_templates:
-        return validate_upstream_af3_input(conf)
-
-    template_plan = plan_template_searches(
-        conf,
-        states,
-        assembly_resolution.canonical_sequences,
-    )
-    canonical_tasks = template_plan.canonical_tasks
-    cache_inputs = [
-        (
-            task.sequence,
-            task.unpaired_msa_sha256,
-            task.max_template_date,
-        )
-        for task in canonical_tasks
-    ]
-    template_statuses = (
-        inspect_protein_template_cache.remote(cache_inputs) if cache_inputs else []
-    )
-    cache_resolution = reduce_template_cache_results(
-        canonical_tasks,
-        template_statuses,
-    )
-    templates_by_identity = cache_resolution.templates_by_identity
-    missing_canonical = cache_resolution.missing_tasks
-    request_local_tasks = template_plan.request_local_tasks
-    worker_tasks = missing_canonical + request_local_tasks
-    print(
-        "🧬 Protein template search plan: "
-        f"{len(canonical_tasks) - len(missing_canonical)} cached, "
-        f"{len(missing_canonical)} missing canonical, "
-        f"{len(request_local_tasks)} request-local, "
-        f"worker cap {worker_budget}."
-    )
-    template_outcomes = bounded_map(
-        worker_tasks,
-        _remote_template_outcome,
-        max_parallel=worker_budget,
-    )
-    template_failures: list[dict[str, object]] = []
-    for task, outcome in zip(worker_tasks, template_outcomes, strict=True):
-        if isinstance(outcome, Exception):
-            template_failures.append({
-                "sequence_sha256": sequence_hash(task.sequence),
-                "unpaired_msa_sha256": task.unpaired_msa_sha256,
-                "publish_canonical": task.publish_canonical,
-                "error_type": type(outcome).__name__,
-                "message": str(outcome),
-            })
-            continue
-        try:
-            if not isinstance(outcome, dict):
-                raise RuntimeError(f"Invalid protein template result: {outcome!r}")
-            templates_by_identity[task.template_identity] = validate_template_result(
-                task,
-                outcome,
-                allowed_statuses=(
-                    frozenset({"published", "reused"})
-                    if task.publish_canonical
-                    else frozenset({"request-local"})
-                ),
-            )
-        except Exception as error:
-            template_failures.append({
-                "sequence_sha256": sequence_hash(task.sequence),
-                "unpaired_msa_sha256": task.unpaired_msa_sha256,
-                "publish_canonical": task.publish_canonical,
-                "error_type": type(error).__name__,
-                "message": str(error),
-            })
-        else:
-            continue
-    if template_failures:
-        raise RuntimeError(
-            "Incomplete protein template tasks; completed canonical results "
-            f"remain reusable: {template_failures}"
-        )
-
-    apply_template_results(conf, template_plan, templates_by_identity)
-    return validate_upstream_af3_input(conf)
 
 
 ##########################################
@@ -1418,7 +1283,7 @@ def submit_alphafold3_task(
 
     """
     max_num_gpus = _validate_max_num_gpus(max_num_gpus)
-    _validate_search_worker_budget(max_parallel_search_workers)
+    validate_search_worker_budget(max_parallel_search_workers)
     validate_inference_parameters(recycle, sample)
 
     input_path = Path(input_json).expanduser()

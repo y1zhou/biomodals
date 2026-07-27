@@ -41,7 +41,9 @@ from biomodals.app.fold.alphafold3.input_enrichment import (
 from biomodals.app.fold.alphafold3.msa_search import (
     RAW_RESULT_SCHEMA_VERSION,
     ChainMsaState,
+    MsaAssemblyTask,
     RawMsaEntry,
+    RawSearchTask,
     SearchContext,
     load_raw_msa,
     merge_nhmmer_results_by_reported_score,
@@ -77,6 +79,9 @@ from biomodals.app.fold.alphafold3.request_results import (
     REQUEST_MANIFEST_SCHEMA_VERSION,
     create_request_archive,
 )
+from biomodals.app.fold.alphafold3.search_pipeline import (
+    resolve_msa_and_templates,
+)
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_MARKER_SCHEMA_VERSION,
     canonical_output_name,
@@ -91,6 +96,7 @@ from biomodals.app.fold.alphafold3.sharding import (
 )
 from biomodals.app.fold.alphafold3.template_search import (
     TEMPLATE_RESULT_SCHEMA_VERSION,
+    TemplateTask,
     build_template_context,
     load_template_entry,
 )
@@ -426,6 +432,126 @@ def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
     assert template_plan.chain_indices_by_identity == {
         template_plan.tasks[0].template_identity: (0, 1)
     }
+
+
+def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
+    """The deep search seam should hide remote topology from its caller."""
+
+    class FakeSearchExecutor:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def inspect_raw(
+            self,
+            tasks: tuple[RawSearchTask, ...],
+        ) -> tuple[dict[str, object], ...]:
+            self.calls.append("inspect-raw")
+            return tuple(
+                {
+                    "status": "reused",
+                    "database_id": task.database_id,
+                    "sequence_sha256": task.sequence_hash,
+                }
+                for task in tasks
+            )
+
+        def run_raw(
+            self,
+            tasks: tuple[RawSearchTask, ...],
+            *,
+            max_parallel: int,
+        ) -> tuple[dict[str, object] | Exception, ...]:
+            del tasks, max_parallel
+            self.calls.append("run-raw")
+            return ()
+
+        def run_assemblies(
+            self,
+            tasks: tuple[MsaAssemblyTask, ...],
+            *,
+            max_parallel: int,
+        ) -> tuple[dict[str, object] | Exception, ...]:
+            del max_parallel
+            self.calls.append("assemble")
+            return tuple(
+                {
+                    "status": "published",
+                    "polymer": task.polymer,
+                    "sequence_sha256": sequence_hash(task.sequence),
+                    "combined_identity": "a" * 64,
+                    "fields": {
+                        "unpairedMsa": ">query\nACDE\n",
+                        "pairedMsa": ">query\nACDE\n",
+                    },
+                }
+                for task in tasks
+            )
+
+        def inspect_templates(
+            self,
+            tasks: tuple[TemplateTask, ...],
+        ) -> tuple[dict[str, object], ...]:
+            self.calls.append("inspect-templates")
+            return tuple(
+                {
+                    "status": "missing",
+                    "sequence_sha256": sequence_hash(task.sequence),
+                    "unpaired_msa_sha256": task.unpaired_msa_sha256,
+                    "template_identity": task.template_identity,
+                }
+                for task in tasks
+            )
+
+        def run_templates(
+            self,
+            tasks: tuple[TemplateTask, ...],
+            *,
+            max_parallel: int,
+        ) -> tuple[dict[str, object] | Exception, ...]:
+            del max_parallel
+            self.calls.append("search-templates")
+            return tuple(
+                {
+                    "status": "published",
+                    "sequence_sha256": sequence_hash(task.sequence),
+                    "unpaired_msa_sha256": task.unpaired_msa_sha256,
+                    "template_identity": task.template_identity,
+                    "templates": [],
+                }
+                for task in tasks
+            )
+
+    config = AF3Config(
+        name="coordinated-search",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                )
+            )
+        ],
+    )
+    executor = FakeSearchExecutor()
+
+    resolved = resolve_msa_and_templates(
+        config,
+        executor,
+        max_parallel_search_workers=2,
+    )
+
+    protein = resolved.sequences[0].protein
+    assert protein is not None
+    assert protein.unpairedMsa == ">query\nACDE\n"
+    assert protein.pairedMsa == ">query\nACDE\n"
+    assert protein.templates == []
+    assert executor.calls == [
+        "inspect-raw",
+        "assemble",
+        "inspect-templates",
+        "search-templates",
+    ]
 
 
 def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:

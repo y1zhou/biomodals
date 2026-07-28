@@ -96,6 +96,23 @@ def request_manifest_from_result(value: object) -> dict[str, object]:
     return cast(dict[str, object], request)
 
 
+def request_publication_from_manifest(
+    manifest: dict[str, object],
+) -> RequestPublication:
+    """Recover and validate the request identity bound by one manifest."""
+    _validated_manifest_artifacts(manifest)
+    return _validate_publication(
+        RequestPublication(
+            run_id=cast(str, manifest["run_id"]),
+            request_id=cast(str, manifest["request_id"]),
+            submitted_seeds=tuple(cast(list[int], manifest["submitted_seeds"])),
+            normalized_seeds=tuple(cast(list[int], manifest["normalized_seeds"])),
+            sample_count=cast(int, manifest["sample_count"]),
+            display_name=cast(str, manifest["submitted_display_name"]),
+        )
+    )
+
+
 def _validate_seed_tuple(
     value: tuple[int, ...],
     *,

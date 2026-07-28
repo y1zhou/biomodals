@@ -4,7 +4,7 @@
 
 import ast
 import inspect
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -22,12 +22,14 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 from biomodals.app.fold.alphafold3.inference_inputs import (
     LoadedInferenceInput,
     PreparedInferenceRun,
+    VolumeUpload,
     prepare_inference_run,
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
     ModalInferenceExecutor,
     ModalSearchExecutor,
     execute_profile_setup,
+    publish_invocation_receipt,
     stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
@@ -561,6 +563,18 @@ def test_inference_staging_is_marker_last_and_reusable() -> None:
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_inference_run(StreamingConflictVolume(), prepared)
 
+    receipt_volume = FakeVolume()
+    receipt = VolumeUpload(
+        PurePosixPath("invocations/aa") / f"{'a' * 64}.json",
+        b'{"status":"complete"}',
+    )
+    publish_invocation_receipt(receipt_volume, receipt)
+    publish_invocation_receipt(receipt_volume, receipt)
+    assert receipt_volume.publications == [(receipt.relative_path.as_posix(),)]
+    receipt_volume.files[receipt.relative_path.as_posix()] = b"changed"
+    with pytest.raises(RuntimeError, match="receipt conflicts"):
+        publish_invocation_receipt(receipt_volume, receipt)
+
 
 def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     tmp_path: Path,
@@ -587,8 +601,23 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
 
     monkeypatch.setattr(
         alphafold3_app,
+        "load_invocation_manifest",
+        lambda output_volume, invocation: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
         "load_request_manifest",
         lambda output_volume, publication: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "publish_invocation_receipt",
+        lambda output_volume, receipt: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "build_invocation_receipt",
+        lambda invocation, prepared, manifest: SimpleNamespace(),
     )
     monkeypatch.setattr(
         alphafold3_app,
@@ -679,6 +708,21 @@ def test_submit_alphafold3_task_reuses_a_completed_request_view(
     monkeypatch.setattr(alphafold3_app, "load_request_manifest", load_manifest)
     monkeypatch.setattr(
         alphafold3_app,
+        "load_invocation_manifest",
+        lambda output_volume, invocation: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "publish_invocation_receipt",
+        lambda output_volume, receipt: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "build_invocation_receipt",
+        lambda invocation, prepared, manifest: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
         "stage_inference_run",
         lambda *args: pytest.fail("completed request was restaged"),
     )
@@ -705,6 +749,89 @@ def test_submit_alphafold3_task_reuses_a_completed_request_view(
     assert publication.submitted_seeds == (11,)
     assert captured["manifest"] is cached_manifest
     assert captured["display_name"] == "cached"
+
+
+def test_submit_alphafold3_task_reuses_an_exact_invocation_before_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invocation receipt should bypass every remote-search and inference seam."""
+    input_json = tmp_path / "input.json"
+    input_json.write_text(
+        AF3Config(
+            name="exact",
+            modelSeeds=[11],
+            sequences=[AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE"))],
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    manifest: dict[str, object] = {"status": "complete"}
+    captured: dict[str, object] = {}
+
+    def load_invocation(output_volume, invocation):
+        del output_volume
+        captured["invocation"] = invocation
+        return manifest
+
+    def create_archive(reader, selected_manifest, *, output_dir, display_name):
+        del reader, output_dir
+        captured["manifest"] = selected_manifest
+        captured["display_name"] = display_name
+        return tmp_path / "exact.tar.zst"
+
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_invocation_manifest",
+        load_invocation,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "request_publication_from_manifest",
+        lambda selected: SimpleNamespace(run_id="a" * 64, request_id="b" * 64),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_search_msa_and_templates",
+        lambda *args, **kwargs: pytest.fail("exact invocation launched search"),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_request_manifest",
+        lambda *args: pytest.fail("exact invocation needed the secondary lookup"),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "stage_inference_run",
+        lambda *args: pytest.fail("exact invocation was restaged"),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_predict_structures",
+        lambda *args: pytest.fail("exact invocation launched inference"),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "publish_invocation_receipt",
+        lambda *args: pytest.fail("existing invocation receipt was republished"),
+    )
+    monkeypatch.setattr(alphafold3_app, "create_request_archive", create_archive)
+
+    entrypoint = alphafold3_app.submit_alphafold3_task.info
+    assert entrypoint is not None and entrypoint.raw_f is not None
+    entrypoint.raw_f(
+        input_json=str(input_json),
+        out_dir=str(tmp_path),
+        recycle=1,
+        sample=1,
+    )
+
+    invocation = captured["invocation"]
+    assert invocation.identity["presentation"] == {
+        "display_name": "exact",
+        "submitted_seeds": [11],
+    }
+    assert captured["manifest"] is manifest
+    assert captured["display_name"] == "exact"
 
 
 def test_submit_alphafold3_task_rejects_input_json_symlink(tmp_path: Path) -> None:

@@ -21,6 +21,7 @@ import modal
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
+    VolumeUpload,
 )
 from biomodals.app.fold.alphafold3.inference_pipeline import (
     InferenceBatchOutcome,
@@ -340,6 +341,21 @@ def stage_inference_run(
             BytesIO(prepared.staged_input.content),
             f"/{marker_path}",
         )
+
+
+def publish_invocation_receipt(
+    output_volume: modal.Volume,
+    receipt: VolumeUpload,
+) -> None:
+    """Publish one immutable receipt after its request manifest exists."""
+    path = receipt.relative_path.as_posix()
+    state = _volume_file_state(output_volume, path, receipt.content)
+    if state == "conflict":
+        raise RuntimeError(f"Existing invocation receipt conflicts: {path}")
+    if state == "match":
+        return
+    with output_volume.batch_upload(force=True) as batch:
+        batch.put_file(BytesIO(receipt.content), f"/{path}")
 
 
 def _worker_failure(

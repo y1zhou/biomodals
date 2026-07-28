@@ -65,6 +65,11 @@ from biomodals.app.fold.alphafold3.input_enrichment import (
     plan_template_searches,
     reduce_msa_assembly_results,
 )
+from biomodals.app.fold.alphafold3.invocation_cache import (
+    build_invocation_receipt,
+    load_invocation_manifest,
+    prepare_invocation,
+)
 from biomodals.app.fold.alphafold3.msa_search import (
     RAW_RESULT_SCHEMA_VERSION,
     ChainMsaState,
@@ -2732,6 +2737,116 @@ def test_completed_request_manifest_loads_without_a_remote_worker() -> None:
         == manifest
     )
     assert load_request_manifest(FakeVolumeReader({}), publication) is None
+
+
+def test_invocation_identity_covers_result_and_presentation_options() -> None:
+    """Only an exact scientific request and presentation should share a receipt."""
+
+    def invocation(
+        *,
+        name: str = "Readable Name",
+        seeds: list[int] | None = None,
+        search_msa: bool = True,
+        search_templates: bool = True,
+        recycle: int = 1,
+        sample: int = 1,
+    ):
+        return prepare_invocation(
+            AF3Config(
+                name=name,
+                modelSeeds=seeds or [2, 1, 1],
+                sequences=[
+                    AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE"))
+                ],
+            ),
+            (),
+            search_msa=search_msa,
+            search_protein_templates=search_templates,
+            recycle=recycle,
+            sample=sample,
+        )
+
+    baseline = invocation()
+    assert invocation().invocation_id == baseline.invocation_id
+    assert (
+        len({
+            baseline.invocation_id,
+            invocation(name="Another Name").invocation_id,
+            invocation(seeds=[1, 2]).invocation_id,
+            invocation(search_msa=False).invocation_id,
+            invocation(search_templates=False).invocation_id,
+            invocation(recycle=2).invocation_id,
+            invocation(sample=2).invocation_id,
+        })
+        == 7
+    )
+
+
+def test_invocation_receipt_resolves_and_binds_the_manifest() -> None:
+    """A receipt should be deterministic and reject changed manifest bytes."""
+    submitted = AF3Config(
+        name="Readable Name",
+        modelSeeds=[2, 1, 1],
+        sequences=[AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE"))],
+    )
+    invocation = prepare_invocation(
+        submitted,
+        (),
+        search_msa=True,
+        search_protein_templates=True,
+        recycle=1,
+        sample=1,
+    )
+    enriched = submitted.model_copy(deep=True)
+    protein = enriched.sequences[0].protein
+    assert protein is not None
+    protein.unpairedMsa = ""
+    protein.pairedMsa = ""
+    protein.templates = []
+    prepared = prepare_inference_run(
+        enriched,
+        (),
+        output_mount_root=Path("/outputs"),
+        recycle=1,
+        sample=1,
+    )
+    run_id = prepared.run_id
+    input_bytes = b"input"
+    request_id = prepared.request_id
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=[2, 1, 1],
+        display_name="Readable Name",
+        artifacts=[
+            {
+                "role": "input",
+                "volume_path": (
+                    f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+                ),
+                "archive_path": f"{canonical_output_name(run_id)}_data.json",
+                "size_bytes": len(input_bytes),
+                "sha256": hashlib.sha256(input_bytes).hexdigest(),
+            }
+        ],
+    )
+    receipt = build_invocation_receipt(invocation, prepared, manifest)
+    assert build_invocation_receipt(invocation, prepared, manifest) == receipt
+    manifest_path = cast(str, manifest["manifest_volume_path"])
+    manifest_bytes = json_bytes(manifest)
+    files = {
+        receipt.relative_path.as_posix(): receipt.content,
+        manifest_path: manifest_bytes,
+    }
+
+    assert load_invocation_manifest(FakeVolumeReader({}), invocation) is None
+    assert load_invocation_manifest(FakeVolumeReader(files), invocation) == manifest
+
+    corrupted = manifest_bytes.replace(b'"complete"', b'"corruptx"', 1)
+    with pytest.raises(RuntimeError, match="digest is invalid"):
+        load_invocation_manifest(
+            FakeVolumeReader(files | {manifest_path: corrupted}),
+            invocation,
+        )
 
 
 def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> None:

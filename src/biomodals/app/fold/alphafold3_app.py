@@ -58,10 +58,16 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     validate_inference_workload,
 )
 from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
+from biomodals.app.fold.alphafold3.invocation_cache import (
+    build_invocation_receipt,
+    load_invocation_manifest,
+    prepare_invocation,
+)
 from biomodals.app.fold.alphafold3.modal_adapters import (
     ModalInferenceExecutor,
     ModalSearchExecutor,
     execute_profile_setup,
+    publish_invocation_receipt,
     stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
@@ -106,6 +112,7 @@ from biomodals.app.fold.alphafold3.request_results import (
     load_request_manifest,
     publish_request_results,
     request_manifest_from_result,
+    request_publication_from_manifest,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
     resolve_msa_and_templates,
@@ -846,6 +853,33 @@ def submit_alphafold3_task(
     sanitize_af3_name(run_name)
     conf.name = run_name
 
+    invocation = prepare_invocation(
+        conf,
+        local_input.custom_templates,
+        search_msa=search_msa,
+        search_protein_templates=search_protein_templates,
+        recycle=recycle,
+        sample=sample,
+    )
+    if manifest := load_invocation_manifest(CONF.output_volume, invocation):
+        publication = request_publication_from_manifest(manifest)
+        print(
+            "🧬 Reusing exact completed invocation: "
+            f"run_id={publication.run_id}, request_id={publication.request_id}"
+        )
+        archive_path = create_request_archive(
+            CONF.output_volume,
+            manifest,
+            output_dir=resolve_local_output_dir(out_dir),
+            display_name=run_name,
+        )
+        run_root = PurePosixPath(publication.run_id[:2]) / publication.run_id
+        print(
+            f"🧬 {CONF.name} results saved to {archive_path}. Durable seed "
+            f"predictions remain in {CONF.output_volume_name}:/{run_root}."
+        )
+        return
+
     print(f"🧬 Resolving {CONF.name} MSA and template fields...")
     enriched_conf = _search_msa_and_templates(
         conf,
@@ -892,6 +926,10 @@ def submit_alphafold3_task(
             "🧬 Reusing completed request view: "
             f"run_id={prepared.run_id}, request_id={prepared.request_id}"
         )
+    publish_invocation_receipt(
+        CONF.output_volume,
+        build_invocation_receipt(invocation, prepared, manifest),
+    )
     archive_path = create_request_archive(
         CONF.output_volume,
         manifest,

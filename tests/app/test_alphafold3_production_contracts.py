@@ -75,7 +75,11 @@ from biomodals.app.fold.alphafold3.profile_builder import (
     build_profile_manifest,
     plan_missing_profile_builds,
 )
-from biomodals.app.fold.alphafold3.profile_manifest import validate_profile_manifest
+from biomodals.app.fold.alphafold3.profile_manifest import (
+    current_profile_recipe,
+    profile_search_identity,
+    validate_profile_manifest,
+)
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
@@ -341,6 +345,34 @@ def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
     )
     with pytest.raises(ValueError, match="shard order"):
         validate_profile_manifest(manifest, resolve_database_profile("small_bfd"))
+
+
+def test_profile_search_identity_excludes_build_execution_metadata() -> None:
+    spec = resolve_database_profile("small_bfd")
+    original = _profile_manifest("small_bfd")
+    rebuilt = cast(
+        dict[str, Any],
+        orjson.loads(orjson.dumps(original)),
+    )
+    rebuilt["created_at"] = "another-time"
+    rebuilt["generation_id"] = "another-generation"
+    rebuilt["recipe"] = current_profile_recipe(spec, 4)
+
+    assert profile_search_identity(rebuilt, spec) == profile_search_identity(
+        original,
+        spec,
+    )
+
+    changed_shards = cast(
+        dict[str, Any],
+        orjson.loads(orjson.dumps(rebuilt)),
+    )
+    shards = cast(list[dict[str, object]], changed_shards["shards"])
+    shards[0]["sha256"] = "f" * 64
+    assert profile_search_identity(changed_shards, spec) != profile_search_identity(
+        original,
+        spec,
+    )
 
 
 def test_composable_profile_accepts_legacy_timing_artifact() -> None:

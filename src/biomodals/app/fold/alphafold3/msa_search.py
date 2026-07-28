@@ -31,7 +31,6 @@ from biomodals.app.fold.alphafold3.artifacts import (
     load_json_object,
     require_regular_file,
     sha256_bytes,
-    sha256_file,
     utc_now,
     write_bytes_atomic,
     write_json_atomic,
@@ -45,6 +44,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     finish_generation_claim,
 )
 from biomodals.app.fold.alphafold3.profile_manifest import (
+    profile_search_identity,
     validate_profile_manifest,
 )
 from biomodals.app.fold.alphafold3.profiles import (
@@ -257,18 +257,18 @@ def scientific_search_parameters(
 def production_search_identity(
     spec: DatabaseProfileSpec,
     sequence: str,
-    manifest_sha256: str,
+    profile_identity: str,
 ) -> str:
     """Hash the complete scientific identity of one production search."""
     query = validate_query(spec, sequence)
-    if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
-        raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest")
+    if re.fullmatch(r"[0-9a-f]{64}", profile_identity) is None:
+        raise ValueError("profile_identity must be a lowercase SHA-256 digest")
     return sha256_bytes(
         json_bytes({
             "schema_version": SEARCH_IDENTITY_SCHEMA_VERSION,
             "adapter_version": SEARCH_ADAPTER_VERSION,
             "profile_id": spec.profile_id,
-            "profile_manifest_sha256": manifest_sha256,
+            "profile_search_identity": profile_identity,
             "sequence": query,
             "parameters": scientific_search_parameters(spec),
             "alphafold_commit": ALPHAFOLD3_COMMIT,
@@ -389,11 +389,11 @@ def load_search_context(
     require_regular_file(manifest_path)
     manifest = load_json_object(manifest_path)
     validate_profile_manifest(manifest, spec)
-    manifest_sha256 = sha256_file(manifest_path)
+    profile_identity = profile_search_identity(manifest, spec)
     search_identity = production_search_identity(
         spec,
         query,
-        manifest_sha256,
+        profile_identity,
     )
     query_hash = sequence_hash(query)
     provenance: dict[str, object] = {
@@ -403,7 +403,7 @@ def load_search_context(
         "sequence_sha256": query_hash,
         "sequence_length": len(query),
         "search_identity": search_identity,
-        "profile_manifest_sha256": manifest_sha256,
+        "profile_search_identity": profile_identity,
         "parameters": scientific_search_parameters(spec),
         "adapter_version": SEARCH_ADAPTER_VERSION,
         "alphafold_commit": ALPHAFOLD3_COMMIT,

@@ -12,8 +12,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    json_bytes,
     load_json_object,
     require_regular_file,
+    sha256_bytes,
     sha256_file,
 )
 from biomodals.app.fold.alphafold3.profiles import (
@@ -286,6 +288,32 @@ def validate_profile_manifest(
     if actual_validation_relpaths not in allowed_validation_relpaths:
         raise ValueError("Profile validation artifact paths are invalid")
     return source, shards, validation_artifacts
+
+
+def profile_search_identity(
+    manifest: dict[str, Any],
+    spec: DatabaseProfileSpec,
+) -> str:
+    """Hash only profile content that can affect database-search results."""
+    source, shards, _ = validate_profile_manifest(manifest, spec)
+    return sha256_bytes(
+        json_bytes({
+            "schema_version": PROFILE_SCHEMA_VERSION,
+            "profile_id": spec.profile_id,
+            "database_id": spec.database_id,
+            "polymer": spec.polymer,
+            "source": {
+                key: source[key] for key in ("path", "sha256", "num_seqs", "sum_len")
+            },
+            "shards": [
+                {key: shard[key] for key in ("path", "size_bytes", "sha256")}
+                for shard in shards
+            ],
+            "search_space_value": manifest["search_space_value"],
+            "search_space_unit": manifest["search_space_unit"],
+            "compatibility": manifest["compatibility"],
+        })
+    )
 
 
 def validate_published_profile(

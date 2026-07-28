@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103
 
+import sys
+
 from biomodals.helper.cli_command import (
     build_app_run_command,
     build_modal_deploy_command,
@@ -115,12 +117,20 @@ def test_build_modal_deploy_command() -> None:
         app_path="src/biomodals/app/fold/demo_app.py",
         name="demo-prod",
         tag="v1",
+        env="production",
+        strategy="recreate",
     ) == (
+        sys.executable,
+        "-m",
         "modal",
         "deploy",
         "--name",
         "demo-prod",
         "--tag",
         "v1",
+        "--env",
+        "production",
+        "--strategy",
+        "recreate",
         "src/biomodals/app/fold/demo_app.py",
     )

@@ -1,6 +1,3 @@
-# UV
-uv.lock
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -153,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.biomodals/
 .venv
 env/
 venv/

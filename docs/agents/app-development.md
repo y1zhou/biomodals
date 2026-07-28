@@ -36,3 +36,6 @@ The skill routes app work to focused references under
 - [AlphaFold3 cache integrity and run layout](alphafold3-app-deviations.md)
   documents the intentionally trusted immutable stores, marker-only seed cache,
   and multi-request run layout used by `alphafold3_app.py`.
+- [GROMACS analysis checkpoints](gromacs-analysis-checkpoints.md) retain the
+  established run-directory and timestamp contract for narrow CSV/PNG restart
+  repair. Do not extend that exception to new cache stages.

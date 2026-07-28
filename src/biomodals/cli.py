@@ -24,12 +24,14 @@ from biomodals.helper.cli_command import (
     resolve_workflow_entrypoint,
 )
 from biomodals.helper.shell import run_command
+from biomodals.service.admin import app as admin_commands
 
 # ruff: noqa: S603
 
 app = typer.Typer()
 app_commands = typer.Typer(no_args_is_help=True)
 workflow_commands = typer.Typer(no_args_is_help=True)
+api_commands = typer.Typer(no_args_is_help=True)
 console = Console()
 
 
@@ -46,6 +48,42 @@ app.add_typer(app_commands, name="app", help="Discover and run Biomodals apps.")
 app.add_typer(
     workflow_commands, name="workflow", help="Discover Biomodals workflow entrypoints."
 )
+app.add_typer(api_commands, name="api", help="Run and administer the Biomodals API.")
+api_commands.add_typer(
+    admin_commands,
+    name="admin",
+    help="Manually manage Biomodals API users.",
+)
+
+
+@api_commands.command(name="serve", help="Start the local Biomodals API server.")
+def serve_api(
+    host: Annotated[
+        str,
+        typer.Option(help="Address on which to listen."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(min=1, max=65535, help="TCP port on which to listen."),
+    ] = 4144,
+) -> None:
+    """Run the deployed-app FastAPI factory with one Uvicorn worker."""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        console.print(
+            "[bold red]Error[/bold red] API dependencies are not installed. "
+            "Run '[green]uv sync --extra api[/green]'."
+        )
+        raise typer.Exit(code=1) from exc
+
+    uvicorn.run(
+        "biomodals.service.api:create_deployed_app",
+        factory=True,
+        host=host,
+        port=port,
+        workers=1,
+    )
 
 
 ##########################################
@@ -548,10 +586,24 @@ def deploy_app(
         str | None,
         typer.Option("--tag", "-t", help="Tag the deployment with a version."),
     ] = None,
+    env: Annotated[
+        str | None,
+        typer.Option("--env", "-e", help="Modal Environment to deploy into."),
+    ] = None,
+    strategy: Annotated[
+        Literal["rolling", "recreate"] | None,
+        typer.Option("--strategy", help="Deployment strategy."),
+    ] = None,
 ):
     """Deploy a biomodals application to Modal."""
     app = _load_entry("app", app_name_or_path)
-    cmd = build_modal_deploy_command(app_path=app.path, name=name, tag=tag)
+    cmd = build_modal_deploy_command(
+        app_path=app.path,
+        name=name,
+        tag=tag,
+        env=env,
+        strategy=strategy,
+    )
     run_command(list(cmd), output_mode="inherit")
 
 

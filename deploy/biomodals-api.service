@@ -1,0 +1,30 @@
+[Unit]
+Description=BioModals API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=biomodals
+Group=biomodals
+WorkingDirectory=/opt/biomodals/current/biomodals
+Environment=MODAL_TOKEN_ID=replace-with-service-token-id
+Environment=MODAL_TOKEN_SECRET=replace-with-service-token-secret
+Environment=BIOMODALS_PUBLIC_URL=https://biomodals.example.com
+Environment=BIOMODALS_SECURE_COOKIES=true
+Environment=BIOMODALS_STATE_DIR=/var/lib/biomodals/production/state
+Environment=BIOMODALS_CACHE_DIR=/var/cache/biomodals/production
+Environment=BIOMODALS_CACHE_WARNING_BYTES=1099511627776
+Environment=BIOMODALS_RECONCILE_SECONDS=10
+ExecStart=/opt/biomodals/current/biomodals/.venv/bin/biomodals api serve --host 127.0.0.1 --port 4100
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=biomodals-api
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

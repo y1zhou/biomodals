@@ -203,6 +203,25 @@ class ModalSearchExecutor(SearchExecutor):
         )
 
 
+def _volume_file_matches(
+    volume: modal.Volume,
+    path: str,
+    expected: bytes,
+) -> bool:
+    offset = 0
+    try:
+        for chunk in volume.read_file(path):
+            if not isinstance(chunk, bytes):
+                raise TypeError(f"Volume returned non-bytes for {path}")
+            end = offset + len(chunk)
+            if end > len(expected) or expected[offset:end] != chunk:
+                return False
+            offset = end
+    except FileNotFoundError:
+        return False
+    return offset == len(expected)
+
+
 def stage_inference_run(
     output_volume: modal.Volume,
     prepared: PreparedInferenceRun,
@@ -219,10 +238,18 @@ def stage_inference_run(
                 "Existing staged-input marker conflicts with the prepared request: "
                 f"{marker_path}"
             )
-        return
+        pending_uploads = []
+        for upload in prepared.payload_uploads:
+            path = upload.relative_path.as_posix()
+            if not _volume_file_matches(output_volume, path, upload.content):
+                pending_uploads.append(upload)
+        if not pending_uploads:
+            return
+    else:
+        pending_uploads = list(prepared.payload_uploads)
 
     with output_volume.batch_upload(force=True) as batch:
-        for upload in prepared.payload_uploads:
+        for upload in pending_uploads:
             batch.put_file(
                 BytesIO(upload.content),
                 f"/{upload.relative_path.as_posix()}",

@@ -383,6 +383,24 @@ def test_inference_staging_is_marker_last_and_reusable() -> None:
     stage_inference_run(volume, prepared)
     assert len(volume.publications) == 2
 
+    missing_payload = prepared.payload_uploads[0]
+    del volume.files[missing_payload.relative_path.as_posix()]
+    stage_inference_run(volume, prepared)
+    assert volume.files[missing_payload.relative_path.as_posix()] == (
+        missing_payload.content
+    )
+    assert volume.publications[-2:] == [
+        (missing_payload.relative_path.as_posix(),),
+        (prepared.staged_input.relative_path.as_posix(),),
+    ]
+
+    corrupt_payload = prepared.payload_uploads[-1]
+    volume.files[corrupt_payload.relative_path.as_posix()] = b"changed"
+    stage_inference_run(volume, prepared)
+    assert volume.files[corrupt_payload.relative_path.as_posix()] == (
+        corrupt_payload.content
+    )
+
     volume.files[prepared.staged_input.relative_path.as_posix()] = b"changed"
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_inference_run(volume, prepared)

@@ -672,8 +672,9 @@ custom-templates/{sha256}.cif
 
 The marker records the path, byte size, and SHA-256 of the run identity,
 canonical request input, and every path-backed custom template. It is committed
-last. An exact existing marker makes repeat staging a no-op; a mismatch at the
-same immutable path is an error.
+last. An exact existing marker causes repeat staging to validate every declared
+payload; missing or corrupt deterministic payloads are republished before the
+marker is reasserted. A marker mismatch at the same immutable path is an error.
 
 GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
 the staged-marker record. Each loads the marker-bound input from the output

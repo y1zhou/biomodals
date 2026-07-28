@@ -729,6 +729,9 @@ payload; missing or corrupt deterministic payloads are republished before the
 marker is reasserted. Existing payloads and the marker are compared as bounded
 streams against their expected bytes; a mismatch or extra byte stops the read.
 A marker mismatch at the same immutable path is an error.
+The app-controlled Volume mountpoint may itself be a symlink, as it can be in a
+Modal container, but staged artifact paths beneath that root may not traverse
+symlinks.
 
 GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
 the staged-marker record. Each loads the marker-bound input from the output

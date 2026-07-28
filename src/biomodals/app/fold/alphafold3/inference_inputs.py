@@ -940,8 +940,8 @@ def load_staged_inference_input(
     validated_run_id = _validate_digest(run_id, field_name="run_id")
     validated_request_id = _validate_digest(request_id, field_name="request_id")
     output_root = Path(output_mount_root)
-    if not output_root.is_absolute() or output_root.is_symlink():
-        raise ValueError("output_mount_root must be an absolute non-symlink path")
+    if not output_root.is_absolute() or not output_root.is_dir():
+        raise ValueError("output_mount_root must be an absolute directory")
 
     run_root = PurePosixPath(validated_run_id[:2]) / validated_run_id
     marker_path = run_root / "requests" / validated_request_id / "staged-input.json"

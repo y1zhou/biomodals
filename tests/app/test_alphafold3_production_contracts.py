@@ -2122,6 +2122,43 @@ def test_staged_input_rederives_identity_and_stages_inline_templates(
         )
 
 
+def test_staged_input_accepts_a_symlinked_volume_mount(tmp_path: Path) -> None:
+    volume_root = tmp_path / "volume"
+    mount_root = tmp_path / "mount"
+    mount_root.symlink_to(volume_root, target_is_directory=True)
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="symlinked-mount",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=mount_root,
+        recycle=1,
+        sample=1,
+    )
+    _materialize_prepared_run(volume_root, prepared)
+
+    loaded = load_staged_inference_input(
+        mount_root,
+        run_id=prepared.run_id,
+        request_id=prepared.request_id,
+        staged_input_record=prepared.staged_input.to_record(),
+    )
+
+    assert loaded.config.modelSeeds == [1]
+
+
 def test_staged_input_rechecks_the_serialized_input_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

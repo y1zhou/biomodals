@@ -453,6 +453,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
     )
 
     custom_templates: dict[Path, LocalTemplateFile] = {}
+    custom_template_content: dict[str, bytes] = {}
     custom_template_bytes = 0
     for chain_index, entry in enumerate(conf.sequences):
         if (protein := entry.protein) is not None:
@@ -492,12 +493,20 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
                         ),
                         max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
                     )
-                    custom_template_bytes += len(content)
-                    _validate_custom_template_total(custom_template_bytes)
+                    digest = sha256_bytes(content)
+                    canonical_content = custom_template_content.get(digest)
+                    if canonical_content is None:
+                        custom_template_bytes += len(content)
+                        _validate_custom_template_total(custom_template_bytes)
+                        custom_template_content[digest] = content
+                    elif canonical_content != content:
+                        raise RuntimeError(
+                            f"Custom template digest collision: {digest}"
+                        )
                     custom_templates[template_path] = LocalTemplateFile(
                         source_path=template_path,
-                        content=content,
-                        sha256=sha256_bytes(content),
+                        content=custom_template_content[digest],
+                        sha256=digest,
                     )
                 template.mmcifPath = str(template_path)
         elif (rna := entry.rna) is not None:

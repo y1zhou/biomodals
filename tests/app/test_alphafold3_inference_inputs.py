@@ -329,14 +329,15 @@ def test_local_materialization_rejects_path_backed_msa_symlink(
         materialize_local_input(input_path)
 
 
-def test_local_materialization_bounds_all_custom_templates(
+def _write_path_backed_template_input(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Path-backed templates should share one aggregate byte budget."""
-    template_paths = [tmp_path / f"template-{index}.cif" for index in range(2)]
-    for template_path in template_paths:
-        template_path.write_bytes(b"12345")
+    contents: tuple[bytes, ...],
+) -> Path:
+    template_paths = [
+        tmp_path / f"template-{index}.cif" for index in range(len(contents))
+    ]
+    for template_path, content in zip(template_paths, contents, strict=True):
+        template_path.write_bytes(content)
     input_path = tmp_path / "input.json"
     input_path.write_text(
         AF3Config(
@@ -361,10 +362,39 @@ def test_local_materialization_bounds_all_custom_templates(
         ).model_dump_json(exclude_none=True),
         encoding="utf-8",
     )
+    return input_path
+
+
+def test_local_materialization_bounds_all_custom_templates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unique path-backed templates should share one aggregate byte budget."""
+    input_path = _write_path_backed_template_input(
+        tmp_path,
+        (b"12345", b"67890"),
+    )
     monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
 
     with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
         materialize_local_input(input_path)
+
+
+def test_local_template_budget_counts_identical_content_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Content-identical templates should consume one canonical byte budget."""
+    input_path = _write_path_backed_template_input(
+        tmp_path,
+        (b"12345", b"12345"),
+    )
+    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+
+    materialized = materialize_local_input(input_path)
+
+    assert len(materialized.custom_templates) == 2
+    assert len({template.sha256 for template in materialized.custom_templates}) == 1
 
 
 def test_inference_parameters_are_resource_bounded() -> None:

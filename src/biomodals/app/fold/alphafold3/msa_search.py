@@ -1054,7 +1054,7 @@ def _load_combined_msa(
     sequence_root: Path,
     provenance: dict[str, object],
     task: MsaAssemblyTask,
-) -> dict[str, str] | None:
+) -> tuple[dict[str, str], MsaArtifactReference] | None:
     done_path = sequence_root / "combined.done.json"
     if not done_path.is_file():
         return None
@@ -1073,20 +1073,37 @@ def _load_combined_msa(
     if not isinstance(artifacts, dict):
         return None
     fields: dict[str, str] = {}
+    unpaired_reference: MsaArtifactReference | None = None
     expected = []
     if task.include_unpaired:
         expected.append(("unpairedMsa", "unpaired.a3m"))
     if task.include_paired:
         expected.append(("pairedMsa", "paired.a3m"))
     for field, filename in expected:
-        value = load_artifact_bytes(sequence_root, artifacts.get(field), filename)
+        record = artifacts.get(field)
+        value = load_artifact_bytes(sequence_root, record, filename)
         if value is None:
             return None
         try:
             fields[field] = value.decode()
         except UnicodeDecodeError:
             return None
-    return fields
+        if field == "unpairedMsa":
+            if not isinstance(record, dict):
+                return None
+            relative_path = (
+                sequence_cache_relpath(task.polymer, task.sequence) / filename
+            )
+            try:
+                unpaired_reference = MsaArtifactReference.from_record(
+                    record | {"path": relative_path.as_posix()},
+                    expected_path=relative_path,
+                )
+            except ValueError:
+                return None
+    if unpaired_reference is None:
+        return None
+    return fields, unpaired_reference
 
 
 def _combined_msa_result(
@@ -1094,21 +1111,15 @@ def _combined_msa_result(
     task: MsaAssemblyTask,
     provenance: dict[str, object],
     fields: dict[str, str],
+    unpaired_msa_reference: MsaArtifactReference,
 ) -> dict[str, object]:
-    sequence_root = sequence_cache_relpath(task.polymer, task.sequence)
-    unpaired_msa = fields.get("unpairedMsa")
-    if unpaired_msa is None:
-        raise RuntimeError("Canonical combined MSA has no unpaired field")
     return {
         "status": status,
         "polymer": task.polymer,
         "sequence_sha256": sequence_hash(task.sequence),
         "combined_identity": provenance["combined_identity"],
         "fields": fields,
-        "unpaired_msa_reference": MsaArtifactReference.from_content(
-            sequence_root / "unpaired.a3m",
-            unpaired_msa.encode(),
-        ).to_record(),
+        "unpaired_msa_reference": unpaired_msa_reference.to_record(),
     }
 
 
@@ -1163,13 +1174,13 @@ def inspect_msa_cache(
                 task.polymer,
                 task.sequence,
             )
-            if fields := _load_combined_msa(sequence_root, provenance, task):
+            if reusable := _load_combined_msa(sequence_root, provenance, task):
                 reusable_sequences.add((task.polymer, task.sequence))
                 status = _combined_msa_result(
                     "reused",
                     task,
                     provenance,
-                    fields,
+                    *reusable,
                 )
         combined_statuses.append(status)
 
@@ -1231,7 +1242,7 @@ def assemble_and_publish_msas(
         )
         provenance = _combined_provenance(task, metadata, assembly_contract)
         if reusable := _load_combined_msa(sequence_root, provenance, task):
-            return _combined_msa_result("reused", task, provenance, reusable)
+            return _combined_msa_result("reused", task, provenance, *reusable)
 
     entries: dict[str, RawMsaEntry] = {}
     for database_id, context in contexts.items():
@@ -1273,7 +1284,7 @@ def assemble_and_publish_msas(
     while claim is None:
         runtime.cache_volume.reload()
         if reusable := _load_combined_msa(sequence_root, provenance, task):
-            return _combined_msa_result("reused", task, provenance, reusable)
+            return _combined_msa_result("reused", task, provenance, *reusable)
         try:
             claim = acquire_generation_claim(
                 runtime.claims,
@@ -1307,7 +1318,7 @@ def assemble_and_publish_msas(
         if reusable := _load_combined_msa(sequence_root, provenance, task):
             terminal_status = "complete"
             terminal_detail = {"publication": "raced"}
-            return _combined_msa_result("reused", task, provenance, reusable)
+            return _combined_msa_result("reused", task, provenance, *reusable)
         filenames = {
             "unpairedMsa": "unpaired.a3m",
             "pairedMsa": "paired.a3m",
@@ -1347,7 +1358,7 @@ def assemble_and_publish_msas(
             "publication": "published",
             "combined_identity": provenance["combined_identity"],
         }
-        return _combined_msa_result("published", task, provenance, reusable)
+        return _combined_msa_result("published", task, provenance, *reusable)
     except Exception as exc:
         terminal_detail = {
             "error_type": type(exc).__name__,

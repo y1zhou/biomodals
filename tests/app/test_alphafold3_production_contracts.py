@@ -1201,19 +1201,35 @@ def test_cache_inspection_prefers_combined_msa_and_recovers_raw_corruption(
         "assert_pinned_msa_assembly_contract",
         lambda: {"contract": "pinned"},
     )
+    unpaired_msa = ">query\nACDE\n"
+    unpaired_reference = MsaArtifactReference.from_content(
+        msa_search.sequence_cache_relpath("protein", task.sequence) / "unpaired.a3m",
+        unpaired_msa.encode(),
+    )
     monkeypatch.setattr(
         msa_search,
         "_load_combined_msa",
-        lambda sequence_root, provenance, selected_task: {
-            "unpairedMsa": ">query\nACDE\n",
-            "pairedMsa": ">query\nACDE\n",
-        },
+        lambda sequence_root, provenance, selected_task: (
+            {
+                "unpairedMsa": unpaired_msa,
+                "pairedMsa": unpaired_msa,
+            },
+            unpaired_reference,
+        ),
     )
     monkeypatch.setattr(
         msa_search,
         "load_raw_msa",
         lambda context: pytest.fail("combined hit read a raw A3M"),
     )
+    sha256_bytes = msa_search.sha256_bytes
+
+    def reject_rehash(value: bytes) -> str:
+        if value == unpaired_msa.encode():
+            pytest.fail("combined hit re-hashed its validated unpaired MSA")
+        return sha256_bytes(value)
+
+    monkeypatch.setattr(msa_search, "sha256_bytes", reject_rehash)
 
     raw_statuses, combined_statuses = msa_search.inspect_msa_cache(
         tmp_path / "profiles",

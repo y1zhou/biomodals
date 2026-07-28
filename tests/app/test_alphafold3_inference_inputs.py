@@ -232,6 +232,54 @@ def test_inference_staging_bounds_the_serialized_input(
         )
 
 
+def test_inference_staging_bounds_the_run_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable identity document should share the staged-input ceiling."""
+    config = AF3Config(
+        name="bounded-identity",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa=">query\nACDE\n",
+                    pairedMsa="",
+                    templates=[],
+                )
+            )
+        ],
+    )
+    prepared = prepare_inference_run(
+        config,
+        (),
+        output_mount_root=tmp_path / "output",
+        recycle=1,
+        sample=1,
+    )
+    identity_upload = next(
+        upload
+        for upload in prepared.payload_uploads
+        if upload.relative_path.name == "identity.json"
+    )
+    monkeypatch.setattr(
+        inference_inputs,
+        "MAX_STAGED_INPUT_BYTES",
+        len(identity_upload.content) - 1,
+    )
+
+    with pytest.raises(ValueError, match="run identity exceeds"):
+        prepare_inference_run(
+            config,
+            (),
+            output_mount_root=tmp_path / "output",
+            recycle=1,
+            sample=1,
+        )
+
+
 def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:
     input_path = tmp_path / "input.json"
     input_path.write_text(

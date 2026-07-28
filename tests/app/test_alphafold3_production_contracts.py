@@ -1633,6 +1633,53 @@ def test_staged_input_rechecks_the_serialized_input_limit(
         )
 
 
+def test_staged_input_rechecks_the_run_identity_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "output"
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="bounded-identity-reload",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa=">query\nACDE\n",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=output_root,
+        recycle=1,
+        sample=1,
+    )
+    _materialize_prepared_run(output_root, prepared)
+    identity_upload = next(
+        upload
+        for upload in prepared.payload_uploads
+        if upload.relative_path.name == "identity.json"
+    )
+    monkeypatch.setattr(
+        inference_inputs,
+        "MAX_STAGED_INPUT_BYTES",
+        len(identity_upload.content) - 1,
+    )
+
+    with pytest.raises(ValueError, match=r"inputs/identity\.json"):
+        load_staged_inference_input(
+            output_root,
+            run_id=prepared.run_id,
+            request_id=prepared.request_id,
+            staged_input_record=prepared.staged_input.to_record(),
+        )
+
+
 def test_inference_staging_bounds_all_custom_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

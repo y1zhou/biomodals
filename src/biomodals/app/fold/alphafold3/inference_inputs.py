@@ -760,8 +760,14 @@ def prepare_inference_run(
     staged_conf = validate_upstream_af3_input(staged_conf)
     identity_path = run_root / "inputs" / "identity.json"
     input_path = run_root / "requests" / request_id / "input.json"
-    uploads[identity_path] = json_bytes(identity_document)
-    uploads[input_path] = serialize_af3_input(staged_conf)
+    input_bytes = serialize_af3_input(staged_conf)
+    identity_bytes = json_bytes(identity_document)
+    if len(identity_bytes) > MAX_STAGED_INPUT_BYTES:
+        raise ValueError(
+            f"run identity exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
+        )
+    uploads[identity_path] = identity_bytes
+    uploads[input_path] = input_bytes
     payload_uploads = tuple(
         VolumeUpload(relative_path=relative_path, content=content)
         for relative_path, content in sorted(
@@ -944,7 +950,12 @@ def load_staged_inference_input(
     identity_path = run_root / "inputs" / "identity.json"
     input_path = run_root / "requests" / validated_request_id / "input.json"
     identity_document = _json_object(
-        _load_staged_artifact(output_root, marker.get("identity"), identity_path),
+        _load_staged_artifact(
+            output_root,
+            marker.get("identity"),
+            identity_path,
+            max_bytes=MAX_STAGED_INPUT_BYTES,
+        ),
         field_name="Run identity document",
     )
     input_bytes = _load_staged_artifact(

@@ -498,6 +498,7 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
         ],
     )
     captured = {}
+    reloads: list[None] = []
 
     def fake_run_command(cmd, *, output_mode, log_file):
         del output_mode, log_file
@@ -534,6 +535,11 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
             sample_count=1,
         ),
     )
+    monkeypatch.setattr(
+        alphafold3_app.CONF.output_volume,
+        "reload",
+        lambda: reloads.append(None),
+    )
 
     result = alphafold3_app.run_inference_pipeline.get_raw_f()(
         run_id="a" * 64,
@@ -556,6 +562,7 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     )
 
     assert result == {"status": "published"}
+    assert reloads == [None]
     assert captured["task"].run_id == "a" * 64
     assert tuple(item.seed for item in captured["task"].claimed_seeds) == (1,)
     protein = captured["input"]["sequences"][0]["protein"]
@@ -590,6 +597,11 @@ def test_inference_worker_revalidates_loaded_numeric_limits(monkeypatch) -> None
             recycle=101,
             sample_count=1,
         ),
+    )
+    monkeypatch.setattr(
+        alphafold3_app.CONF.output_volume,
+        "reload",
+        lambda: None,
     )
 
     with pytest.raises(ValueError, match="between 0 and"):

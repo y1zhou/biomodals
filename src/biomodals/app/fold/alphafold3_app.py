@@ -47,6 +47,7 @@ from uniaf3.schema.alphafold3 import AF3Config
 from biomodals.app.config import AppConfig
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
+    LoadedInferenceInput,
     PreparedInferenceRun,
     load_staged_inference_input,
     materialize_local_input,
@@ -541,6 +542,21 @@ def _search_msa_and_templates(
 ##########################################
 
 
+def _load_staged_request(
+    run_id: str,
+    request_id: str,
+    staged_input_record: dict[str, object],
+) -> LoadedInferenceInput:
+    """Reload and validate one marker-bound inference request."""
+    CONF.output_volume.reload()
+    return load_staged_inference_input(
+        Path(CONF.output_volume_mountpoint),
+        run_id=run_id,
+        request_id=request_id,
+        staged_input_record=staged_input_record,
+    )
+
+
 @app.function(
     cpu=0.125,
     memory=1024,
@@ -616,12 +632,7 @@ def run_inference_pipeline(
     claimed_seed_records: list[dict[str, object]],
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
-    staged = load_staged_inference_input(
-        Path(CONF.output_volume_mountpoint),
-        run_id=run_id,
-        request_id=request_id,
-        staged_input_record=staged_input_record,
-    )
+    staged = _load_staged_request(run_id, request_id, staged_input_record)
     return run_upstream_seed_worker(
         UpstreamInferenceRuntime(
             predictions=_INFERENCE_RUNTIME,
@@ -649,12 +660,7 @@ def finalize_inference_summary(
     staged_input_record: dict[str, object],
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
-    staged = load_staged_inference_input(
-        Path(CONF.output_volume_mountpoint),
-        run_id=run_id,
-        request_id=request_id,
-        staged_input_record=staged_input_record,
-    )
+    staged = _load_staged_request(run_id, request_id, staged_input_record)
     return finalize_upstream_run_summary(
         _INFERENCE_RUNTIME,
         staged.config,

@@ -116,7 +116,6 @@ def _combined_cache_hits(
         ):
             raise RuntimeError(f"Invalid combined MSA cache result: {status}")
         if status["status"] == "reused":
-            reduce_msa_assembly_results((task,), (status,))
             hits[(task.polymer, task.sequence)] = status
     return hits
 

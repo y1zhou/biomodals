@@ -751,7 +751,9 @@ def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
     ]
 
 
-def test_search_pipeline_reuses_combined_msa_without_assembly() -> None:
+def test_search_pipeline_reuses_combined_msa_without_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class CombinedHitExecutor:
         def inspect_msa(self, raw_tasks, assembly_tasks):
             return (
@@ -778,6 +780,18 @@ def test_search_pipeline_reuses_combined_msa_without_assembly() -> None:
             AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
         ],
     )
+    matches_content = MsaArtifactReference.matches_content
+    match_calls = 0
+
+    def count_matches(
+        reference: MsaArtifactReference,
+        content: bytes,
+    ) -> bool:
+        nonlocal match_calls
+        match_calls += 1
+        return matches_content(reference, content)
+
+    monkeypatch.setattr(MsaArtifactReference, "matches_content", count_matches)
 
     resolved = resolve_msa_and_templates(
         config,
@@ -789,6 +803,7 @@ def test_search_pipeline_reuses_combined_msa_without_assembly() -> None:
     assert protein is not None
     assert protein.unpairedMsa == ">query\nACDE\n"
     assert protein.pairedMsa == ">query\nACDE\n"
+    assert match_calls == 1
 
 
 def test_search_pipeline_bounds_derived_tasks_before_remote_work(

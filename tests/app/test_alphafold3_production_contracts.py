@@ -257,14 +257,14 @@ def test_artifact_loader_rejects_size_mismatch_before_reading(
     payload_path = tmp_path / "payload.bin"
     payload_path.write_bytes(b"oversized")
     record = _artifact("payload.bin", b"x")
-    read_bytes = Path.read_bytes
+    path_open = Path.open
 
-    def reject_payload_read(path: Path) -> bytes:
+    def reject_payload_open(path: Path, *args: Any, **kwargs: Any) -> Any:
         if path == payload_path:
-            pytest.fail("size-mismatched artifact was read")
-        return read_bytes(path)
+            pytest.fail("size-mismatched artifact was opened")
+        return path_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", reject_payload_read)
+    monkeypatch.setattr(Path, "open", reject_payload_open)
 
     assert load_artifact_bytes(tmp_path, record, "payload.bin") is None
 

@@ -856,6 +856,62 @@ def test_search_pipeline_reuses_combined_msa_without_assembly(
     assert match_calls == 1
 
 
+def test_search_pipeline_validates_combined_hits_before_scheduling() -> None:
+    class MalformedHitExecutor:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def inspect_msa(self, raw_tasks, assembly_tasks):
+            outcomes = []
+            for task in assembly_tasks:
+                outcome = _combined_outcome(task, status="reused")
+                reference = cast(
+                    dict[str, object],
+                    outcome["unpaired_msa_reference"],
+                )
+                outcome["unpaired_msa_reference"] = _artifact(
+                    cast(str, reference["path"]),
+                    b">query\nCHANGED\n",
+                )
+                outcomes.append(outcome)
+            return (
+                tuple(
+                    {
+                        "status": "missing",
+                        "database_id": task.database_id,
+                        "sequence_sha256": task.sequence_hash,
+                    }
+                    for task in raw_tasks
+                ),
+                tuple(outcomes),
+            )
+
+        def run_raw(self, *args, **kwargs):
+            self.calls.append("run-raw")
+            return ()
+
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"Unexpected executor method: {name}")
+
+    executor = MalformedHitExecutor()
+    config = AF3Config(
+        name="malformed-combined-hit",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="does not match the returned field"):
+        resolve_msa_and_templates(
+            config,
+            cast(Any, executor),
+            search_protein_templates=False,
+        )
+
+    assert executor.calls == []
+
+
 def test_search_pipeline_bounds_derived_tasks_before_remote_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

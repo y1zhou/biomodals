@@ -17,6 +17,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     validate_upstream_af3_input,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
+    MsaAssemblyResolution,
     apply_msa_resolution,
     apply_template_results,
     chain_msa_states,
@@ -101,13 +102,14 @@ def validate_search_worker_budget(max_parallel_search_workers: int) -> int:
     return max_parallel_search_workers
 
 
-def _combined_cache_hits(
+def _combined_cache_resolution(
     tasks: tuple[MsaAssemblyTask, ...],
     statuses: tuple[dict[str, object], ...],
-) -> dict[tuple[str, str], dict[str, object]]:
+) -> MsaAssemblyResolution:
     if len(statuses) != len(tasks):
         raise RuntimeError("Combined MSA cache inspection returned the wrong count")
-    hits: dict[tuple[str, str], dict[str, object]] = {}
+    reused_tasks: list[MsaAssemblyTask] = []
+    reused_statuses: list[dict[str, object]] = []
     for task, status in zip(tasks, statuses, strict=True):
         if (
             status.get("polymer") != task.polymer
@@ -116,8 +118,9 @@ def _combined_cache_hits(
         ):
             raise RuntimeError(f"Invalid combined MSA cache result: {status}")
         if status["status"] == "reused":
-            hits[(task.polymer, task.sequence)] = status
-    return hits
+            reused_tasks.append(task)
+            reused_statuses.append(status)
+    return reduce_msa_assembly_results(reused_tasks, reused_statuses)
 
 
 def resolve_msa_and_templates(
@@ -157,7 +160,11 @@ def resolve_msa_and_templates(
         if plan.raw_searches
         else ((), ())
     )
-    combined_hits = _combined_cache_hits(canonical_assemblies, combined_statuses)
+    combined_resolution = _combined_cache_resolution(
+        canonical_assemblies,
+        combined_statuses,
+    )
+    combined_hits = combined_resolution.fields_by_sequence
     missing_raw = missing_raw_searches(plan.raw_searches, cache_statuses)
 
     print(
@@ -221,24 +228,23 @@ def resolve_msa_and_templates(
             f"reusable: {assembly_failures}"
         )
 
-    outcomes_by_sequence: dict[tuple[str, str], SearchOutcome] = dict(combined_hits)
-    outcomes_by_sequence.update(
-        (
-            (task.polymer, task.sequence),
-            outcome,
-        )
-        for task, outcome in zip(
-            pending_assemblies,
-            pending_assembly_outcomes,
-            strict=True,
-        )
+    pending_resolution = reduce_msa_assembly_results(
+        pending_assemblies,
+        tuple(
+            outcome
+            for outcome in pending_assembly_outcomes
+            if isinstance(outcome, dict)
+        ),
     )
-    assembly_outcomes = tuple(
-        outcomes_by_sequence[(task.polymer, task.sequence)] for task in plan.assemblies
-    )
-    assembly_resolution = reduce_msa_assembly_results(
-        plan.assemblies,
-        tuple(outcome for outcome in assembly_outcomes if isinstance(outcome, dict)),
+    assembly_resolution = MsaAssemblyResolution(
+        fields_by_sequence=(
+            combined_resolution.fields_by_sequence
+            | pending_resolution.fields_by_sequence
+        ),
+        unpaired_references=(
+            combined_resolution.unpaired_references
+            | pending_resolution.unpaired_references
+        ),
     )
     apply_msa_resolution(
         conf,

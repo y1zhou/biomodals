@@ -405,10 +405,13 @@ sizes, and digests.
 
 Cache inspection is plan-aware. It validates each complete combined publication
 before reading its potentially large raw A3M dependencies. A valid combined
-publication satisfies its raw dependencies and is returned directly. If the
-combined marker or artifacts are missing or invalid, inspection deep-validates
-the required raw A3Ms; corrupt raw results are then scheduled for repair before
-assembly is retried.
+publication satisfies its raw dependencies and is returned directly. Before any
+missing work is scheduled, the coordinator validates the complete returned
+fields and content-bound unpaired-MSA reference. It carries that validated
+resolution through enrichment, so the potentially large unpaired MSA is hashed
+only once. If the combined marker or artifacts are missing or invalid,
+inspection deep-validates the required raw A3Ms; corrupt raw results are then
+scheduled for repair before assembly is retried.
 
 Only the latest canonical combination is retained at the flat paths. Older
 combinations remain reconstructable from immutable raw results.

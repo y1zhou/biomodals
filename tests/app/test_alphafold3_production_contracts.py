@@ -19,7 +19,7 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
-from biomodals.app.fold.alphafold3 import template_search
+from biomodals.app.fold.alphafold3 import msa_search, template_search
 from biomodals.app.fold.alphafold3.artifacts import (
     artifact_record,
     json_bytes,
@@ -109,8 +109,10 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_MARKER_SCHEMA_VERSION,
     ClaimedSeed,
+    InferenceRuntime,
     SeedClaimPlan,
     canonical_output_name,
+    claim_seed_predictions,
     load_seed_marker,
 )
 from biomodals.app.fold.alphafold3.template_search import (
@@ -732,6 +734,96 @@ def test_raw_msa_cache_requires_a_valid_completion_marker(tmp_path: Path) -> Non
     assert load_raw_msa(context) is None
 
 
+def test_combined_msa_hit_skips_raw_a3m_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = MsaAssemblyTask(
+        polymer="protein",
+        sequence="ACDE",
+        include_unpaired=True,
+        include_paired=True,
+    )
+    contexts = {
+        database_id: SearchContext(
+            spec=resolve_database_profile(database_id),
+            sequence=task.sequence,
+            sequence_hash=sequence_hash(task.sequence),
+            profile_root=tmp_path / "profiles" / database_id,
+            search_identity=hashlib.sha256(database_id.encode()).hexdigest(),
+            provenance={},
+            result_root=tmp_path / "raw" / database_id,
+        )
+        for database_id in (
+            *msa_search.PROTEIN_UNPAIRED_DATABASES,
+            *msa_search.PROTEIN_PAIRED_DATABASES,
+        )
+    }
+    metadata = {
+        database_id: msa_search.RawMsaMetadata(
+            context=context,
+            done_sha256=hashlib.sha256(f"done:{database_id}".encode()).hexdigest(),
+            result_record={
+                "path": "result.a3m",
+                "size_bytes": 10,
+                "sha256": hashlib.sha256(f"result:{database_id}".encode()).hexdigest(),
+            },
+        )
+        for database_id, context in contexts.items()
+    }
+    runtime = msa_search.SearchRuntime(
+        sharded_volume=SimpleNamespace(reload=lambda: None),
+        cache_volume=SimpleNamespace(reload=lambda: None),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+        sharded_root=tmp_path / "profiles",
+        cache_root=tmp_path / "cache",
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "load_search_context",
+        lambda sharded_root, cache_root, database_id, sequence: contexts[database_id],
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "load_raw_msa_metadata",
+        lambda context: metadata[context.spec.database_id],
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "assert_pinned_msa_assembly_contract",
+        lambda: {"contract": "pinned"},
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "_load_combined_msa",
+        lambda sequence_root, provenance, selected_task: {
+            "unpairedMsa": ">query\nACDE\n",
+            "pairedMsa": ">query\nACDE\n",
+        },
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "load_raw_msa",
+        lambda context: pytest.fail("combined hit read a raw A3M"),
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "assemble_msa_fields",
+        lambda *args, **kwargs: pytest.fail("combined hit rebuilt MSA fields"),
+    )
+
+    result = msa_search.assemble_and_publish_msas(runtime, task)
+
+    assert result["status"] == "reused"
+    assert result["fields"] == {
+        "unpairedMsa": ">query\nACDE\n",
+        "pairedMsa": ">query\nACDE\n",
+    }
+
+
 def test_template_cache_rejects_changed_template_bytes(tmp_path: Path) -> None:
     context = build_template_context(
         tmp_path,
@@ -927,6 +1019,39 @@ def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:
     assert marker is not None
     assert [row.sample_index for row in marker.rankings] == [0, 1]
     assert load_seed_marker(tmp_path, run_id, 42, sample_count=1) is None
+
+
+def test_seed_claims_reload_the_volume_once_per_reconciliation(
+    tmp_path: Path,
+) -> None:
+    class CountingVolume:
+        def __init__(self) -> None:
+            self.reload_count = 0
+
+        def reload(self) -> None:
+            self.reload_count += 1
+
+        def commit(self) -> None:
+            pass
+
+    volume = CountingVolume()
+    plan = claim_seed_predictions(
+        InferenceRuntime(
+            output_root=tmp_path,
+            volume=volume,
+            claims=FakeClaimStore(),
+            container_id="test",
+            maximum_age_seconds=100,
+            summary_maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+        ),
+        "a" * 64,
+        (1, 2, 3),
+        sample_count=1,
+    )
+
+    assert tuple(item.seed for item in plan.owned) == (1, 2, 3)
+    assert volume.reload_count == 2
 
 
 def test_staged_input_rederives_identity_and_preserves_inline_templates(

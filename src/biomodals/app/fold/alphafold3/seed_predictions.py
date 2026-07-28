@@ -402,7 +402,7 @@ def claim_seed_predictions(
     runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
     reused: list[int] = []
-    owned: list[ClaimedSeed] = []
+    claimed: list[ClaimedSeed] = []
     active: list[ActiveSeed] = []
     for seed in selected_seeds:
         if (
@@ -434,26 +434,31 @@ def claim_seed_predictions(
             )
             continue
 
+        claimed.append(ClaimedSeed(seed=seed, claim=claim))
+
+    owned: list[ClaimedSeed] = []
+    if claimed:
         runtime.volume.reload()
+    for item in claimed:
         raced_marker = load_seed_marker(
             run_root,
             selected_run,
-            seed,
+            item.seed,
             sample_count=selected_samples,
         )
         if raced_marker is not None:
             finish_generation_claim(
                 runtime.claims,
-                claim,
+                item.claim,
                 status="complete",
                 detail={
                     "publication": "raced",
                     "marker_sha256": raced_marker.marker_sha256,
                 },
             )
-            reused.append(seed)
+            reused.append(item.seed)
         else:
-            owned.append(ClaimedSeed(seed=seed, claim=claim))
+            owned.append(item)
     return SeedClaimPlan(
         reused_seeds=tuple(reused),
         owned=tuple(owned),

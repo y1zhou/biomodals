@@ -196,6 +196,15 @@ class RawMsaEntry:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RawMsaMetadata:
+    """Marker-only dependency identity for a complete raw database MSA."""
+
+    context: SearchContext
+    done_sha256: str
+    result_record: dict[str, object]
+
+
 def sequence_hash(sequence: str) -> str:
     """Hash sequence text only for the shared cache namespace."""
     if not isinstance(sequence, str):
@@ -412,8 +421,8 @@ def load_search_context(
     )
 
 
-def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
-    """Validate and load one marker-complete Raw Database MSA."""
+def load_raw_msa_metadata(context: SearchContext) -> RawMsaMetadata | None:
+    """Load one raw MSA dependency without reading its potentially large A3M."""
     done_path = context.result_root / "done.json"
     if not done_path.is_file():
         return None
@@ -432,9 +441,36 @@ def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
     artifacts = done.get("artifacts")
     if not isinstance(artifacts, dict):
         return None
+    result_record = artifacts.get("result")
+    if not isinstance(result_record, dict):
+        return None
+    result_path = result_record.get("path")
+    result_size = result_record.get("size_bytes")
+    result_sha256 = result_record.get("sha256")
+    if (
+        result_path != "result.a3m"
+        or isinstance(result_size, bool)
+        or not isinstance(result_size, int)
+        or result_size <= 0
+        or not isinstance(result_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
+    ):
+        return None
+    return RawMsaMetadata(
+        context=context,
+        done_sha256=sha256_bytes(done_bytes),
+        result_record=cast(dict[str, object], result_record),
+    )
+
+
+def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
+    """Validate and load one marker-complete Raw Database MSA."""
+    metadata = load_raw_msa_metadata(context)
+    if metadata is None:
+        return None
     result_bytes = load_artifact_bytes(
         context.result_root,
-        artifacts.get("result"),
+        metadata.result_record,
         "result.a3m",
     )
     if result_bytes is None:
@@ -446,8 +482,8 @@ def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
     return RawMsaEntry(
         context=context,
         a3m=a3m,
-        done_sha256=sha256_bytes(done_bytes),
-        result_record=cast(dict[str, object], artifacts["result"]),
+        done_sha256=metadata.done_sha256,
+        result_record=metadata.result_record,
     )
 
 
@@ -916,7 +952,7 @@ def _required_database_ids(task: MsaAssemblyTask) -> tuple[str, ...]:
 
 def _combined_provenance(
     task: MsaAssemblyTask,
-    entries: dict[str, RawMsaEntry],
+    entries: dict[str, RawMsaMetadata],
     assembly_contract: dict[str, str],
 ) -> dict[str, object]:
     dependencies = {
@@ -993,22 +1029,62 @@ def assemble_and_publish_msas(
     """Assemble requested fields and publish complete canonical combinations."""
     runtime.sharded_volume.reload()
     runtime.cache_volume.reload()
-    entries: dict[str, RawMsaEntry] = {}
-    for database_id in _required_database_ids(task):
-        context = load_search_context(
+    contexts = {
+        database_id: load_search_context(
             runtime.sharded_root,
             runtime.cache_root,
             database_id,
             task.sequence,
         )
+        for database_id in _required_database_ids(task)
+    }
+    complete_canonical = task.include_unpaired and (
+        task.polymer == "rna" or task.include_paired
+    )
+    assembly_contract = assert_pinned_msa_assembly_contract()
+    metadata: dict[str, RawMsaMetadata] = {}
+    sequence_root: Path | None = None
+    provenance: dict[str, object] | None = None
+    if complete_canonical:
+        for database_id, context in contexts.items():
+            dependency = load_raw_msa_metadata(context)
+            if dependency is None:
+                raise RuntimeError(
+                    "Required Raw Database MSA is incomplete: "
+                    f"{database_id} {context.sequence_hash}"
+                )
+            metadata[database_id] = dependency
+        sequence_root = runtime.cache_root / sequence_cache_relpath(
+            task.polymer,
+            task.sequence,
+        )
+        provenance = _combined_provenance(task, metadata, assembly_contract)
+        if reusable := _load_combined_msa(sequence_root, provenance, task):
+            return {
+                "status": "reused",
+                "polymer": task.polymer,
+                "sequence_sha256": sequence_hash(task.sequence),
+                "combined_identity": provenance["combined_identity"],
+                "fields": reusable,
+            }
+
+    entries: dict[str, RawMsaEntry] = {}
+    for database_id, context in contexts.items():
         entry = load_raw_msa(context)
         if entry is None:
             raise RuntimeError(
                 "Required Raw Database MSA is incomplete: "
                 f"{database_id} {context.sequence_hash}"
             )
+        dependency = metadata.get(database_id)
+        if dependency is not None and (
+            entry.done_sha256 != dependency.done_sha256
+            or entry.result_record != dependency.result_record
+        ):
+            raise RuntimeError(
+                f"Raw Database MSA changed during assembly: {database_id}"
+            )
         entries[database_id] = entry
-    assembly_contract = assert_pinned_msa_assembly_contract()
     fields = assemble_msa_fields(
         task.polymer,
         {database_id: entry.a3m for database_id, entry in entries.items()},
@@ -1016,9 +1092,6 @@ def assemble_and_publish_msas(
         include_paired=task.include_paired,
     )
 
-    complete_canonical = task.include_unpaired and (
-        task.polymer == "rna" or task.include_paired
-    )
     if not complete_canonical:
         return {
             "status": "request-local",
@@ -1026,20 +1099,8 @@ def assemble_and_publish_msas(
             "sequence_sha256": sequence_hash(task.sequence),
             "fields": fields,
         }
-
-    sequence_root = runtime.cache_root / sequence_cache_relpath(
-        task.polymer,
-        task.sequence,
-    )
-    provenance = _combined_provenance(task, entries, assembly_contract)
-    if reusable := _load_combined_msa(sequence_root, provenance, task):
-        return {
-            "status": "reused",
-            "polymer": task.polymer,
-            "sequence_sha256": sequence_hash(task.sequence),
-            "combined_identity": provenance["combined_identity"],
-            "fields": reusable,
-        }
+    if sequence_root is None or provenance is None:
+        raise RuntimeError("Canonical MSA assembly identity was not initialized")
 
     generation_id = uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)

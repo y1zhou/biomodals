@@ -126,18 +126,33 @@ def _bounded_remote_outcomes[TaskT](
 class ModalSearchExecutor(SearchExecutor):
     """Bind the search coordinator to decorated Modal functions."""
 
-    inspect_raw_function: modal.Function
+    inspect_msa_function: modal.Function
     raw_search_function: modal.Function
     msa_assembly_function: modal.Function
     inspect_templates_function: modal.Function
     template_search_function: modal.Function
 
-    def inspect_raw(
+    def inspect_msa(
         self,
-        tasks: tuple[RawSearchTask, ...],
-    ) -> tuple[dict[str, object], ...]:
-        inputs = [(task.database_id, task.sequence) for task in tasks]
-        return tuple(self.inspect_raw_function.remote(inputs))
+        raw_tasks: tuple[RawSearchTask, ...],
+        assembly_tasks: tuple[MsaAssemblyTask, ...],
+    ) -> tuple[
+        tuple[dict[str, object], ...],
+        tuple[dict[str, object], ...],
+    ]:
+        raw_statuses, combined_statuses = self.inspect_msa_function.remote(
+            [(task.database_id, task.sequence) for task in raw_tasks],
+            [
+                (
+                    task.polymer,
+                    task.sequence,
+                    task.include_unpaired,
+                    task.include_paired,
+                )
+                for task in assembly_tasks
+            ],
+        )
+        return tuple(raw_statuses), tuple(combined_statuses)
 
     def run_raw(
         self,

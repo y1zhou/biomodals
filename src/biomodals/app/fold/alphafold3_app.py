@@ -71,7 +71,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
     RawSearchTask,
     SearchRuntime,
     assemble_and_publish_msas,
-    inspect_raw_searches,
+    inspect_msa_cache,
     run_database_search,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
@@ -328,7 +328,7 @@ def finalize_sharded_database_setup() -> dict[str, object]:
 ##########################################
 @app.function(
     cpu=0.125,
-    memory=1024,
+    memory=16384,
     timeout=600,
     max_containers=1,
     volumes={
@@ -345,19 +345,30 @@ def finalize_sharded_database_setup() -> dict[str, object]:
     },
 )
 def inspect_msa_search_cache(
-    inputs: list[tuple[str, str]],
-) -> list[dict[str, object]]:
-    """Inspect raw markers so cache hits consume no HMMER workers."""
+    raw_inputs: list[tuple[str, str]],
+    assembly_inputs: list[tuple[Polymer, str, bool, bool]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Prefer complete combined MSAs, then deep-check uncovered raw results."""
     SHARDED_MSA_DB_VOLUME.reload()
     MSA_CACHE_VOLUME.reload()
-    tasks = tuple(
+    raw_tasks = tuple(
         RawSearchTask(database_id=database_id, sequence=sequence)
-        for database_id, sequence in inputs
+        for database_id, sequence in raw_inputs
     )
-    return inspect_raw_searches(
+    assembly_tasks = tuple(
+        MsaAssemblyTask(
+            polymer=polymer,
+            sequence=sequence,
+            include_unpaired=include_unpaired,
+            include_paired=include_paired,
+        )
+        for polymer, sequence, include_unpaired, include_paired in assembly_inputs
+    )
+    return inspect_msa_cache(
         Path(SearchRuntime.SHARDED_MOUNT),
         Path(SearchRuntime.CACHE_MOUNT),
-        tasks,
+        raw_tasks,
+        assembly_tasks,
     )
 
 
@@ -525,7 +536,7 @@ def _search_msa_and_templates(
     return resolve_msa_and_templates(
         config,
         ModalSearchExecutor(
-            inspect_raw_function=inspect_msa_search_cache,
+            inspect_msa_function=inspect_msa_search_cache,
             raw_search_function=search_database_msa,
             msa_assembly_function=assemble_sequence_msas,
             inspect_templates_function=inspect_protein_template_cache,

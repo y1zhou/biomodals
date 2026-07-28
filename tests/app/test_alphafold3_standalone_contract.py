@@ -108,14 +108,19 @@ def test_modal_search_executor_marshals_remote_fanout(
         budgets.append(max_parallel)
         return [worker(item) for item in items]
 
-    inspect_raw = Mock(return_value=[{"status": "missing"}, {"status": "missing"}])
+    inspect_msa = Mock(
+        return_value=(
+            [{"status": "missing"}, {"status": "missing"}],
+            [{"status": "missing"}],
+        )
+    )
     run_raw = Mock(side_effect=({"status": "published"}, RuntimeError("search failed")))
     run_assembly = Mock(return_value={"status": "published"})
     inspect_templates = Mock(return_value=[{"status": "missing"}])
     run_template = Mock(return_value={"status": "published"})
     monkeypatch.setattr(modal_adapters, "bounded_map", fake_bounded_map)
     executor = ModalSearchExecutor(
-        inspect_raw_function=SimpleNamespace(remote=inspect_raw),
+        inspect_msa_function=SimpleNamespace(remote=inspect_msa),
         raw_search_function=SimpleNamespace(remote=run_raw),
         msa_assembly_function=SimpleNamespace(remote=run_assembly),
         inspect_templates_function=SimpleNamespace(remote=inspect_templates),
@@ -125,14 +130,6 @@ def test_modal_search_executor_marshals_remote_fanout(
         RawSearchTask(database_id="small_bfd", sequence="ACDE"),
         RawSearchTask(database_id="uniref90", sequence="FGHI"),
     )
-    assert executor.inspect_raw(raw_tasks) == (
-        {"status": "missing"},
-        {"status": "missing"},
-    )
-    raw_outcomes = executor.run_raw(raw_tasks, max_parallel=2)
-    assert raw_outcomes[0] == {"status": "published"}
-    assert isinstance(raw_outcomes[1], RuntimeError)
-
     assembly_tasks = (
         MsaAssemblyTask(
             polymer="protein",
@@ -141,6 +138,16 @@ def test_modal_search_executor_marshals_remote_fanout(
             include_paired=False,
         ),
     )
+    assert executor.inspect_msa(raw_tasks, assembly_tasks) == (
+        (
+            {"status": "missing"},
+            {"status": "missing"},
+        ),
+        ({"status": "missing"},),
+    )
+    raw_outcomes = executor.run_raw(raw_tasks, max_parallel=2)
+    assert raw_outcomes[0] == {"status": "published"}
+    assert isinstance(raw_outcomes[1], RuntimeError)
     assert executor.run_assemblies(assembly_tasks, max_parallel=3) == (
         {"status": "published"},
     )
@@ -159,10 +166,13 @@ def test_modal_search_executor_marshals_remote_fanout(
     )
 
     assert budgets == [2, 3, 4]
-    inspect_raw.assert_called_once_with([
-        ("small_bfd", "ACDE"),
-        ("uniref90", "FGHI"),
-    ])
+    inspect_msa.assert_called_once_with(
+        [
+            ("small_bfd", "ACDE"),
+            ("uniref90", "FGHI"),
+        ],
+        [("protein", "ACDE", True, False)],
+    )
     assert run_raw.call_args_list == [
         call("small_bfd", "ACDE"),
         call("uniref90", "FGHI"),

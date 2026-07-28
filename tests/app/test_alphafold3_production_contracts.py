@@ -552,19 +552,32 @@ def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
         def __init__(self) -> None:
             self.calls: list[str] = []
 
-        def inspect_raw(
+        def inspect_msa(
             self,
-            tasks: tuple[RawSearchTask, ...],
-        ) -> tuple[dict[str, object], ...]:
-            self.calls.append("inspect-raw")
-            return tuple(
+            raw_tasks: tuple[RawSearchTask, ...],
+            assembly_tasks: tuple[MsaAssemblyTask, ...],
+        ) -> tuple[
+            tuple[dict[str, object], ...],
+            tuple[dict[str, object], ...],
+        ]:
+            self.calls.append("inspect-msa")
+            raw_statuses = tuple(
                 {
                     "status": "reused",
                     "database_id": task.database_id,
                     "sequence_sha256": task.sequence_hash,
                 }
-                for task in tasks
+                for task in raw_tasks
             )
+            combined_statuses = tuple(
+                {
+                    "status": "missing",
+                    "polymer": task.polymer,
+                    "sequence_sha256": sequence_hash(task.sequence),
+                }
+                for task in assembly_tasks
+            )
+            return raw_statuses, combined_statuses
 
         def run_raw(
             self,
@@ -658,11 +671,61 @@ def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
     assert protein.pairedMsa == ">query\nACDE\n"
     assert protein.templates == []
     assert executor.calls == [
-        "inspect-raw",
+        "inspect-msa",
         "assemble",
         "inspect-templates",
         "search-templates",
     ]
+
+
+def test_search_pipeline_reuses_combined_msa_without_assembly() -> None:
+    class CombinedHitExecutor:
+        def inspect_msa(self, raw_tasks, assembly_tasks):
+            return (
+                tuple(
+                    {
+                        "status": "reused",
+                        "database_id": task.database_id,
+                        "sequence_sha256": task.sequence_hash,
+                    }
+                    for task in raw_tasks
+                ),
+                tuple(
+                    {
+                        "status": "reused",
+                        "polymer": task.polymer,
+                        "sequence_sha256": sequence_hash(task.sequence),
+                        "combined_identity": "a" * 64,
+                        "fields": {
+                            "unpairedMsa": ">query\nACDE\n",
+                            "pairedMsa": ">query\nACDE\n",
+                        },
+                    }
+                    for task in assembly_tasks
+                ),
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"Unexpected executor method: {name}")
+
+    config = AF3Config(
+        name="combined-hit",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+        ],
+    )
+
+    resolved = resolve_msa_and_templates(
+        config,
+        cast(Any, CombinedHitExecutor()),
+        search_protein_templates=False,
+    )
+
+    protein = resolved.sequences[0].protein
+    assert protein is not None
+    assert protein.unpairedMsa == ">query\nACDE\n"
+    assert protein.pairedMsa == ">query\nACDE\n"
 
 
 def test_search_pipeline_bounds_derived_tasks_before_remote_work(
@@ -816,7 +879,7 @@ def test_raw_msa_cache_requires_a_valid_completion_marker(tmp_path: Path) -> Non
     assert load_raw_msa(context) is None
 
 
-def test_combined_msa_hit_skips_raw_a3m_reads(
+def test_cache_inspection_prefers_combined_msa_and_recovers_raw_corruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -853,15 +916,9 @@ def test_combined_msa_hit_skips_raw_a3m_reads(
         )
         for database_id, context in contexts.items()
     }
-    runtime = msa_search.SearchRuntime(
-        sharded_volume=SimpleNamespace(reload=lambda: None),
-        cache_volume=SimpleNamespace(reload=lambda: None),
-        claims=FakeClaimStore(),
-        container_id="test",
-        maximum_age_seconds=100,
-        wait_timeout_seconds=100,
-        sharded_root=tmp_path / "profiles",
-        cache_root=tmp_path / "cache",
+    raw_tasks = tuple(
+        RawSearchTask(database_id=database_id, sequence=task.sequence)
+        for database_id in contexts
     )
     monkeypatch.setattr(
         msa_search,
@@ -891,19 +948,52 @@ def test_combined_msa_hit_skips_raw_a3m_reads(
         "load_raw_msa",
         lambda context: pytest.fail("combined hit read a raw A3M"),
     )
-    monkeypatch.setattr(
-        msa_search,
-        "assemble_msa_fields",
-        lambda *args, **kwargs: pytest.fail("combined hit rebuilt MSA fields"),
+
+    raw_statuses, combined_statuses = msa_search.inspect_msa_cache(
+        tmp_path / "profiles",
+        tmp_path / "cache",
+        raw_tasks,
+        (task,),
     )
 
-    result = msa_search.assemble_and_publish_msas(runtime, task)
-
-    assert result["status"] == "reused"
-    assert result["fields"] == {
+    assert {status["status"] for status in raw_statuses} == {"reused"}
+    assert combined_statuses[0]["status"] == "reused"
+    assert combined_statuses[0]["polymer"] == "protein"
+    assert combined_statuses[0]["sequence_sha256"] == sequence_hash("ACDE")
+    assert combined_statuses[0]["fields"] == {
         "unpairedMsa": ">query\nACDE\n",
         "pairedMsa": ">query\nACDE\n",
     }
+    assert len(cast(str, combined_statuses[0]["combined_identity"])) == 64
+
+    monkeypatch.setattr(msa_search, "_load_combined_msa", lambda *args: None)
+    monkeypatch.setattr(
+        msa_search,
+        "load_raw_msa",
+        lambda context: (
+            None if context.spec.database_id == "small_bfd" else cast(Any, object())
+        ),
+    )
+    raw_statuses, combined_statuses = msa_search.inspect_msa_cache(
+        tmp_path / "profiles",
+        tmp_path / "cache",
+        raw_tasks,
+        (task,),
+    )
+
+    assert [status["status"] for status in raw_statuses] == [
+        "reused",
+        "missing",
+        "reused",
+        "reused",
+    ]
+    assert combined_statuses == [
+        {
+            "status": "missing",
+            "polymer": "protein",
+            "sequence_sha256": sequence_hash("ACDE"),
+        }
+    ]
 
 
 def test_template_cache_rejects_changed_template_bytes(tmp_path: Path) -> None:

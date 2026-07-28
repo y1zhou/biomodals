@@ -152,6 +152,11 @@ class MsaAssemblyTask:
     include_unpaired: bool
     include_paired: bool
 
+    @property
+    def publishes_canonical(self) -> bool:
+        """Return whether this task can publish the complete canonical MSA."""
+        return self.include_unpaired and (self.polymer == "rna" or self.include_paired)
+
 
 @dataclass(frozen=True, slots=True)
 class MsaResolutionPlan:
@@ -503,32 +508,6 @@ def load_raw_msa(context: SearchContext) -> RawMsaEntry | None:
         done_sha256=metadata.done_sha256,
         result_record=metadata.result_record,
     )
-
-
-def inspect_raw_searches(
-    sharded_root: Path,
-    cache_root: Path,
-    tasks: tuple[RawSearchTask, ...],
-) -> list[dict[str, object]]:
-    """Inspect fixed manifests and marker-valid cache entries without searching."""
-    statuses: list[dict[str, object]] = []
-    for task in tasks:
-        context = load_search_context(
-            sharded_root,
-            cache_root,
-            task.database_id,
-            task.sequence,
-        )
-        entry = load_raw_msa(context)
-        statuses.append({
-            "status": "reused" if entry is not None else "missing",
-            "database_id": context.spec.database_id,
-            "profile_id": context.spec.profile_id,
-            "polymer": context.spec.polymer,
-            "sequence_sha256": context.sequence_hash,
-            "search_identity": context.search_identity,
-        })
-    return statuses
 
 
 def nhmmer_reported_score_sort_key(
@@ -1026,6 +1005,80 @@ def _load_combined_msa(
     return fields
 
 
+def inspect_msa_cache(
+    sharded_root: Path,
+    cache_root: Path,
+    raw_tasks: tuple[RawSearchTask, ...],
+    assembly_tasks: tuple[MsaAssemblyTask, ...],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Inspect combined publications before deep-reading raw dependencies."""
+    contexts = {
+        (task.database_id, task.sequence): load_search_context(
+            sharded_root,
+            cache_root,
+            task.database_id,
+            task.sequence,
+        )
+        for task in raw_tasks
+    }
+    assembly_contract = assert_pinned_msa_assembly_contract() if assembly_tasks else {}
+    reusable_sequences: set[tuple[Polymer, str]] = set()
+    combined_statuses: list[dict[str, object]] = []
+    for task in assembly_tasks:
+        if not task.publishes_canonical:
+            raise ValueError("Only complete canonical MSAs may be cache-inspected")
+        metadata: dict[str, RawMsaMetadata] = {}
+        for database_id in _required_database_ids(task):
+            context = contexts.get((database_id, task.sequence))
+            if context is None:
+                raise ValueError(
+                    f"MSA inspection plan omits {database_id} for "
+                    f"{task.polymer} {sequence_hash(task.sequence)}"
+                )
+            dependency = load_raw_msa_metadata(context)
+            if dependency is None:
+                break
+            metadata[database_id] = dependency
+
+        status: dict[str, object] = {
+            "status": "missing",
+            "polymer": task.polymer,
+            "sequence_sha256": sequence_hash(task.sequence),
+        }
+        if len(metadata) == len(_required_database_ids(task)):
+            provenance = _combined_provenance(task, metadata, assembly_contract)
+            sequence_root = cache_root / sequence_cache_relpath(
+                task.polymer,
+                task.sequence,
+            )
+            if fields := _load_combined_msa(sequence_root, provenance, task):
+                reusable_sequences.add((task.polymer, task.sequence))
+                status = {
+                    "status": "reused",
+                    "polymer": task.polymer,
+                    "sequence_sha256": sequence_hash(task.sequence),
+                    "combined_identity": provenance["combined_identity"],
+                    "fields": fields,
+                }
+        combined_statuses.append(status)
+
+    raw_statuses: list[dict[str, object]] = []
+    for task in raw_tasks:
+        context = contexts[(task.database_id, task.sequence)]
+        reused = (task.polymer, task.sequence) in reusable_sequences
+        if not reused:
+            reused = load_raw_msa(context) is not None
+        raw_statuses.append({
+            "status": "reused" if reused else "missing",
+            "database_id": context.spec.database_id,
+            "profile_id": context.spec.profile_id,
+            "polymer": context.spec.polymer,
+            "sequence_sha256": context.sequence_hash,
+            "search_identity": context.search_identity,
+        })
+    return raw_statuses, combined_statuses
+
+
 def _combined_claim_scope(task: MsaAssemblyTask) -> str:
     return f"combined:{polymer_cache_dir(task.polymer)}:{sequence_hash(task.sequence)}"
 
@@ -1046,9 +1099,7 @@ def assemble_and_publish_msas(
         )
         for database_id in _required_database_ids(task)
     }
-    complete_canonical = task.include_unpaired and (
-        task.polymer == "rna" or task.include_paired
-    )
+    complete_canonical = task.publishes_canonical
     assembly_contract = assert_pinned_msa_assembly_contract()
     metadata: dict[str, RawMsaMetadata] = {}
     sequence_root: Path | None = None

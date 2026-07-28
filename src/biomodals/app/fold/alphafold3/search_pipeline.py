@@ -45,11 +45,15 @@ MAX_REMOTE_SEARCH_TASKS = 512
 class SearchExecutor(Protocol):
     """Remote-call interface required by the request-level coordinator."""
 
-    def inspect_raw(
+    def inspect_msa(
         self,
-        tasks: tuple[RawSearchTask, ...],
-    ) -> tuple[dict[str, object], ...]:
-        """Return cache status for every raw database search."""
+        raw_tasks: tuple[RawSearchTask, ...],
+        assembly_tasks: tuple[MsaAssemblyTask, ...],
+    ) -> tuple[
+        tuple[dict[str, object], ...],
+        tuple[dict[str, object], ...],
+    ]:
+        """Return raw and complete-combined MSA cache statuses."""
         ...
 
     def run_raw(
@@ -98,6 +102,26 @@ def validate_search_worker_budget(max_parallel_search_workers: int) -> int:
     return max_parallel_search_workers
 
 
+def _combined_cache_hits(
+    tasks: tuple[MsaAssemblyTask, ...],
+    statuses: tuple[dict[str, object], ...],
+) -> dict[tuple[str, str], dict[str, object]]:
+    if len(statuses) != len(tasks):
+        raise RuntimeError("Combined MSA cache inspection returned the wrong count")
+    hits: dict[tuple[str, str], dict[str, object]] = {}
+    for task, status in zip(tasks, statuses, strict=True):
+        if (
+            status.get("polymer") != task.polymer
+            or status.get("sequence_sha256") != sequence_hash(task.sequence)
+            or status.get("status") not in {"missing", "reused"}
+        ):
+            raise RuntimeError(f"Invalid combined MSA cache result: {status}")
+        if status["status"] == "reused":
+            reduce_msa_assembly_results((task,), (status,))
+            hits[(task.polymer, task.sequence)] = status
+    return hits
+
+
 def resolve_msa_and_templates(
     config: AF3Config,
     executor: SearchExecutor,
@@ -131,13 +155,20 @@ def resolve_msa_and_templates(
             "Request may derive no more than "
             f"{MAX_REMOTE_SEARCH_TASKS} remote search tasks, got {task_count}"
         )
-    cache_statuses = (
-        executor.inspect_raw(plan.raw_searches) if plan.raw_searches else ()
+    canonical_assemblies = tuple(
+        task for task in plan.assemblies if task.publishes_canonical
     )
+    cache_statuses, combined_statuses = (
+        executor.inspect_msa(plan.raw_searches, canonical_assemblies)
+        if plan.raw_searches
+        else ((), ())
+    )
+    combined_hits = _combined_cache_hits(canonical_assemblies, combined_statuses)
     missing_raw = missing_raw_searches(plan.raw_searches, cache_statuses)
 
     print(
         "🧬 Sharded MSA search plan: "
+        f"{len(combined_hits)} combined cached, "
         f"{len(cache_statuses) - len(missing_raw)} cached, "
         f"{len(missing_raw)} missing, worker cap {worker_budget}; each database "
         f"worker runs at most {SEARCH_MAX_PARALLEL_SHARDS} shard searches "
@@ -166,9 +197,14 @@ def resolve_msa_and_templates(
             f"siblings: {search_failures}"
         )
 
-    assembly_outcomes = (
-        executor.run_assemblies(plan.assemblies, max_parallel=worker_budget)
-        if plan.assemblies
+    pending_assemblies = tuple(
+        task
+        for task in plan.assemblies
+        if (task.polymer, task.sequence) not in combined_hits
+    )
+    pending_assembly_outcomes = (
+        executor.run_assemblies(pending_assemblies, max_parallel=worker_budget)
+        if pending_assemblies
         else ()
     )
     assembly_failures = [
@@ -179,8 +215,8 @@ def resolve_msa_and_templates(
             "message": str(outcome),
         }
         for task, outcome in zip(
-            plan.assemblies,
-            assembly_outcomes,
+            pending_assemblies,
+            pending_assembly_outcomes,
             strict=True,
         )
         if isinstance(outcome, Exception)
@@ -191,6 +227,21 @@ def resolve_msa_and_templates(
             f"reusable: {assembly_failures}"
         )
 
+    outcomes_by_sequence: dict[tuple[str, str], SearchOutcome] = dict(combined_hits)
+    outcomes_by_sequence.update(
+        (
+            (task.polymer, task.sequence),
+            outcome,
+        )
+        for task, outcome in zip(
+            pending_assemblies,
+            pending_assembly_outcomes,
+            strict=True,
+        )
+    )
+    assembly_outcomes = tuple(
+        outcomes_by_sequence[(task.polymer, task.sequence)] for task in plan.assemblies
+    )
     assembly_resolution = reduce_msa_assembly_results(
         plan.assemblies,
         tuple(outcome for outcome in assembly_outcomes if isinstance(outcome, dict)),

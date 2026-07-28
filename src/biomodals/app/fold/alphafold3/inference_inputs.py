@@ -8,6 +8,7 @@ returns every byte that the app must stage in its output Volume.
 from __future__ import annotations
 
 import hashlib
+import re
 import string
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -23,7 +24,11 @@ from uniaf3.schema.alphafold3 import (
     AF3SequenceEntry,
 )
 
-from biomodals.app.fold.alphafold3.artifacts import json_bytes, sha256_bytes
+from biomodals.app.fold.alphafold3.artifacts import (
+    json_bytes,
+    load_artifact_bytes,
+    sha256_bytes,
+)
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
@@ -32,6 +37,7 @@ from biomodals.app.fold.alphafold3.profiles import (
 ALPHAFOLD3_APP_VERSION = "3.0.2"
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v1"
+STAGED_INPUT_SCHEMA_VERSION = 1
 MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = 512 * 1024 * 1024
 MAX_CUSTOM_TEMPLATE_BYTES = 64 * 1024 * 1024
@@ -70,6 +76,16 @@ class VolumeUpload:
     relative_path: PurePosixPath
     content: bytes
 
+    def to_record(self) -> dict[str, object]:
+        """Describe the immutable upload for staging and remote loading."""
+        if not self.content:
+            raise ValueError(f"Volume upload must be nonempty: {self.relative_path}")
+        return {
+            "path": self.relative_path.as_posix(),
+            "size_bytes": len(self.content),
+            "sha256": sha256_bytes(self.content),
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedInferenceRun:
@@ -81,8 +97,19 @@ class PreparedInferenceRun:
     display_name: str
     submitted_seeds: tuple[int, ...]
     normalized_seeds: tuple[int, ...]
-    worker_config: AF3Config
-    uploads: tuple[VolumeUpload, ...]
+    recycle: int
+    sample_count: int
+    payload_uploads: tuple[VolumeUpload, ...]
+    staged_input: VolumeUpload
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedInferenceInput:
+    """A staged request whose complete run identity has been re-derived."""
+
+    config: AF3Config
+    recycle: int
+    sample_count: int
 
 
 def sanitize_af3_name(name: str) -> str:
@@ -477,6 +504,10 @@ def _template_files_by_source(
 ) -> dict[str, LocalTemplateFile]:
     by_source: dict[str, LocalTemplateFile] = {}
     for artifact in custom_templates:
+        if not artifact.content:
+            raise ValueError(
+                f"Custom template must be nonempty: {artifact.source_path}"
+            )
         expected_digest = sha256_bytes(artifact.content)
         if artifact.sha256 != expected_digest:
             raise ValueError(f"Custom template digest mismatch: {artifact.source_path}")
@@ -593,6 +624,39 @@ def validate_inference_worker_budget(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
+def _run_identity(
+    identity_view: dict[str, object],
+    *,
+    recycle: int,
+    sample_count: int,
+) -> tuple[str, dict[str, object]]:
+    inference_parameters = {
+        "num_recycles": recycle,
+        "num_diffusion_samples": sample_count,
+    }
+    app_identity = {
+        "app_name": "AlphaFold3",
+        "app_version": ALPHAFOLD3_APP_VERSION,
+        "alphafold_repository": ALPHAFOLD3_REPOSITORY,
+        "alphafold_commit": ALPHAFOLD3_COMMIT,
+    }
+    run_id = hash_sequences(
+        identity_view,
+        inference_parameters,
+        app_identity,
+        DECLARED_MODEL_IDENTITY,
+        RUN_IDENTITY_SCHEMA,
+    )
+    return run_id, {
+        "schema": RUN_IDENTITY_SCHEMA,
+        "run_id": run_id,
+        "input": identity_view,
+        "inference": inference_parameters,
+        "app": app_identity,
+        "declared_model_identity": DECLARED_MODEL_IDENTITY,
+    }
+
+
 def prepare_inference_run(
     enriched_config: AF3Config,
     custom_templates: tuple[LocalTemplateFile, ...],
@@ -612,44 +676,26 @@ def prepare_inference_run(
     display_name = conf.name
     identity_view = build_inference_identity_view(conf, custom_templates)
 
-    inference_parameters = {
-        "num_recycles": recycle,
-        "num_diffusion_samples": sample,
-    }
-    app_identity = {
-        "app_name": "AlphaFold3",
-        "app_version": ALPHAFOLD3_APP_VERSION,
-        "alphafold_repository": ALPHAFOLD3_REPOSITORY,
-        "alphafold_commit": ALPHAFOLD3_COMMIT,
-    }
-    run_id = hash_sequences(
+    run_id, identity_document = _run_identity(
         identity_view,
-        inference_parameters,
-        app_identity,
-        DECLARED_MODEL_IDENTITY,
-        RUN_IDENTITY_SCHEMA,
+        recycle=recycle,
+        sample_count=sample,
     )
     request_id = hash_sequences(run_id, list(normalized_seeds))
     run_root = PurePosixPath(run_id[:2]) / run_id
-
-    identity_document = {
-        "schema": RUN_IDENTITY_SCHEMA,
-        "run_id": run_id,
-        "input": identity_view,
-        "inference": inference_parameters,
-        "app": app_identity,
-        "declared_model_identity": DECLARED_MODEL_IDENTITY,
-    }
 
     template_files = _template_files_by_source(custom_templates)
     staged_conf = conf.model_copy(deep=True)
     staged_conf.name = f"af3-{run_id[:16]}"
     staged_conf.modelSeeds = list(normalized_seeds)
     uploads: dict[PurePosixPath, bytes] = {}
+    template_paths: set[PurePosixPath] = set()
     for entry in staged_conf.sequences:
         if (protein := entry.protein) is None:
             continue
         for template in protein.templates:
+            if template.mmcifPath is None:
+                continue
             template_view = cast(
                 dict[str, object],
                 template.model_dump(mode="python", exclude_unset=False),
@@ -661,13 +707,36 @@ def prepare_inference_run(
             if existing is not None and existing != content:
                 raise RuntimeError(f"Custom template digest collision: {digest}")
             uploads[relative_path] = content
+            template_paths.add(relative_path)
             template.mmcif = None
             template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
 
     staged_conf = validate_upstream_af3_input(staged_conf)
-    uploads[run_root / "inputs" / "identity.json"] = json_bytes(identity_document)
-    uploads[run_root / "requests" / request_id / "input.json"] = serialize_af3_input(
-        staged_conf
+    identity_path = run_root / "inputs" / "identity.json"
+    input_path = run_root / "requests" / request_id / "input.json"
+    uploads[identity_path] = json_bytes(identity_document)
+    uploads[input_path] = serialize_af3_input(staged_conf)
+    payload_uploads = tuple(
+        VolumeUpload(relative_path=relative_path, content=content)
+        for relative_path, content in sorted(
+            uploads.items(),
+            key=lambda item: item[0].as_posix(),
+        )
+    )
+    uploads_by_path = {upload.relative_path: upload for upload in payload_uploads}
+    staged_input = VolumeUpload(
+        relative_path=run_root / "requests" / request_id / "staged-input.json",
+        content=json_bytes({
+            "schema_version": STAGED_INPUT_SCHEMA_VERSION,
+            "status": "complete",
+            "run_id": run_id,
+            "request_id": request_id,
+            "identity": uploads_by_path[identity_path].to_record(),
+            "input": uploads_by_path[input_path].to_record(),
+            "custom_templates": [
+                uploads_by_path[path].to_record() for path in sorted(template_paths)
+            ],
+        }),
     )
 
     return PreparedInferenceRun(
@@ -677,12 +746,202 @@ def prepare_inference_run(
         display_name=display_name,
         submitted_seeds=submitted_seeds,
         normalized_seeds=normalized_seeds,
-        worker_config=staged_conf,
-        uploads=tuple(
-            VolumeUpload(relative_path=relative_path, content=content)
-            for relative_path, content in sorted(
-                uploads.items(),
-                key=lambda item: item[0].as_posix(),
+        recycle=recycle,
+        sample_count=sample,
+        payload_uploads=payload_uploads,
+        staged_input=staged_input,
+    )
+
+
+def _validate_digest(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _load_staged_artifact(
+    output_root: Path,
+    record: object,
+    expected_path: PurePosixPath,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
+    if max_bytes is not None:
+        if not isinstance(record, dict):
+            raise ValueError(f"Invalid staged artifact record: {expected_path}")
+        size_bytes = record.get("size_bytes")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes > max_bytes
+        ):
+            raise ValueError(f"Staged artifact is too large: {expected_path}")
+    value = load_artifact_bytes(output_root, record, expected_path.as_posix())
+    if value is None:
+        raise RuntimeError(f"Staged artifact failed validation: {expected_path}")
+    return value
+
+
+def _json_object(value: bytes, *, field_name: str) -> dict[str, object]:
+    try:
+        parsed = orjson.loads(value)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must contain a JSON object")
+    return cast(dict[str, object], parsed)
+
+
+def _staged_template_files(
+    config: AF3Config,
+    raw_records: object,
+    *,
+    output_root: Path,
+    run_root: PurePosixPath,
+) -> tuple[LocalTemplateFile, ...]:
+    if not isinstance(raw_records, list):
+        raise ValueError("Staged custom_templates must be a list")
+    template_root = run_root / "custom-templates"
+    files_by_path: dict[PurePosixPath, LocalTemplateFile] = {}
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            raise ValueError("Invalid staged custom-template record")
+        raw_path = raw_record.get("path")
+        if not isinstance(raw_path, str):
+            raise ValueError("Invalid staged custom-template path")
+        relative_path = PurePosixPath(raw_path)
+        if (
+            relative_path.parent != template_root
+            or re.fullmatch(r"[0-9a-f]{64}\.cif", relative_path.name) is None
+        ):
+            raise ValueError(
+                f"Staged custom template escapes its run directory: {raw_path}"
             )
+        digest = relative_path.stem
+        if raw_record.get("sha256") != digest or relative_path in files_by_path:
+            raise ValueError(f"Invalid staged custom-template identity: {raw_path}")
+        content = _load_staged_artifact(
+            output_root,
+            raw_record,
+            relative_path,
+            max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
+        )
+        files_by_path[relative_path] = LocalTemplateFile(
+            source_path=output_root / Path(relative_path.as_posix()),
+            content=content,
+            sha256=digest,
+        )
+
+    referenced_paths: set[PurePosixPath] = set()
+    for entry in config.sequences:
+        if (protein := entry.protein) is None:
+            continue
+        for template in protein.templates:
+            if template.mmcifPath is None:
+                continue
+            if template.mmcif is not None:
+                raise ValueError("Staged template sets both mmcif and mmcifPath")
+            path = Path(template.mmcifPath)
+            if not path.is_absolute():
+                raise ValueError("Staged template path must be absolute")
+            try:
+                relative_path = PurePosixPath(path.relative_to(output_root).as_posix())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Staged template path escapes the output Volume: {path}"
+                ) from exc
+            expected_path = output_root / Path(relative_path.as_posix())
+            if path != expected_path or relative_path not in files_by_path:
+                raise ValueError(f"Staged template path is not marker-bound: {path}")
+            referenced_paths.add(relative_path)
+    if referenced_paths != set(files_by_path):
+        raise ValueError("Staged custom-template records do not match the input")
+    return tuple(files_by_path[path] for path in sorted(files_by_path))
+
+
+def load_staged_inference_input(
+    output_mount_root: Path,
+    *,
+    run_id: str,
+    request_id: str,
+    staged_input_record: object,
+) -> LoadedInferenceInput:
+    """Load and re-derive one marker-bound inference request from a Volume."""
+    validated_run_id = _validate_digest(run_id, field_name="run_id")
+    validated_request_id = _validate_digest(request_id, field_name="request_id")
+    output_root = Path(output_mount_root)
+    if not output_root.is_absolute() or output_root.is_symlink():
+        raise ValueError("output_mount_root must be an absolute non-symlink path")
+
+    run_root = PurePosixPath(validated_run_id[:2]) / validated_run_id
+    marker_path = run_root / "requests" / validated_request_id / "staged-input.json"
+    marker = _json_object(
+        _load_staged_artifact(
+            output_root,
+            staged_input_record,
+            marker_path,
+            max_bytes=MAX_INPUT_JSON_BYTES,
         ),
+        field_name="Staged input marker",
+    )
+    if (
+        marker.get("schema_version") != STAGED_INPUT_SCHEMA_VERSION
+        or marker.get("status") != "complete"
+        or marker.get("run_id") != validated_run_id
+        or marker.get("request_id") != validated_request_id
+    ):
+        raise ValueError("Staged input marker identity is invalid")
+
+    identity_path = run_root / "inputs" / "identity.json"
+    input_path = run_root / "requests" / validated_request_id / "input.json"
+    identity_document = _json_object(
+        _load_staged_artifact(output_root, marker.get("identity"), identity_path),
+        field_name="Run identity document",
+    )
+    input_bytes = _load_staged_artifact(
+        output_root,
+        marker.get("input"),
+        input_path,
+    )
+    config = validate_upstream_af3_input(AF3Config.model_validate_json(input_bytes))
+    if config.name != f"af3-{validated_run_id[:16]}":
+        raise ValueError("Staged input canonical name does not match run_id")
+    normalized_seeds = normalize_model_seeds(config.modelSeeds)
+    if tuple(config.modelSeeds) != normalized_seeds:
+        raise ValueError("Staged input modelSeeds must be sorted and unique")
+    if hash_sequences(validated_run_id, list(normalized_seeds)) != validated_request_id:
+        raise ValueError("Staged input request_id does not match its modelSeeds")
+
+    template_files = _staged_template_files(
+        config,
+        marker.get("custom_templates"),
+        output_root=output_root,
+        run_root=run_root,
+    )
+    raw_inference = identity_document.get("inference")
+    if not isinstance(raw_inference, dict):
+        raise ValueError("Run identity inference parameters are invalid")
+    recycle = raw_inference.get("num_recycles")
+    sample_count = raw_inference.get("num_diffusion_samples")
+    if (
+        isinstance(recycle, bool)
+        or not isinstance(recycle, int)
+        or isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+    ):
+        raise ValueError("Run identity inference parameters are invalid")
+    validate_inference_parameters(recycle, sample_count)
+
+    identity_view = build_inference_identity_view(config, template_files)
+    expected_run_id, expected_document = _run_identity(
+        identity_view,
+        recycle=recycle,
+        sample_count=sample_count,
+    )
+    if expected_run_id != validated_run_id or identity_document != expected_document:
+        raise ValueError("Staged input does not match its run identity")
+    return LoadedInferenceInput(
+        config=config,
+        recycle=recycle,
+        sample_count=sample_count,
     )

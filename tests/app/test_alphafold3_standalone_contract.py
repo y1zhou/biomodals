@@ -16,14 +16,15 @@ from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import modal_adapters, upstream_inference
 from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    LoadedInferenceInput,
     PreparedInferenceRun,
     prepare_inference_run,
-    serialize_af3_input,
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
     ModalInferenceExecutor,
     ModalSearchExecutor,
     execute_profile_setup,
+    stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
@@ -225,14 +226,13 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
             return self.result
 
     def spawn_worker(
-        json_bytes: bytes,
         run_id: str,
-        recycle: int,
-        sample: int,
+        request_id: str,
+        staged_input_record: dict[str, object],
         claim_records: list[dict[str, object]],
     ) -> FakeFunctionCall:
-        assert json_bytes == serialize_af3_input(prepared.worker_config)
-        assert (run_id, recycle, sample) == (prepared.run_id, 3, 2)
+        assert (run_id, request_id) == (prepared.run_id, prepared.request_id)
+        assert staged_input_record == prepared.staged_input.to_record()
         seed = claim_records[0].get("seed")
         assert isinstance(seed, int)
         spawned_seeds.append(seed)
@@ -303,9 +303,9 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     claim_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     inspect_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     summary_remote.assert_called_once_with(
-        serialize_af3_input(prepared.worker_config),
         prepared.run_id,
-        2,
+        prepared.request_id,
+        prepared.staged_input.to_record(),
     )
     request_remote.assert_called_once_with(
         prepared.run_id,
@@ -315,6 +315,68 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
         2,
         "composition",
     )
+
+
+def test_inference_staging_is_marker_last_and_reusable() -> None:
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="staging",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+            ],
+        ),
+        (),
+        output_mount_root=Path("/outputs"),
+        recycle=1,
+        sample=1,
+    )
+
+    class FakeBatchUpload:
+        def __init__(self, volume) -> None:
+            self.volume = volume
+            self.pending: dict[str, bytes] = {}
+
+        def __enter__(self):
+            return self
+
+        def put_file(self, source, remote_path: str) -> None:
+            self.pending[remote_path.lstrip("/")] = source.read()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+            self.volume.files.update(self.pending)
+            self.volume.publications.append(tuple(self.pending))
+
+    class FakeVolume:
+        def __init__(self) -> None:
+            self.files: dict[str, bytes] = {}
+            self.publications: list[tuple[str, ...]] = []
+
+        def read_file(self, path: str):
+            if path not in self.files:
+                raise FileNotFoundError(path)
+            yield self.files[path]
+
+        def batch_upload(self, *, force: bool):
+            assert force is True
+            return FakeBatchUpload(self)
+
+    volume = FakeVolume()
+    stage_inference_run(volume, prepared)
+
+    assert len(volume.publications) == 2
+    assert set(volume.publications[0]) == {
+        upload.relative_path.as_posix() for upload in prepared.payload_uploads
+    }
+    assert volume.publications[1] == (prepared.staged_input.relative_path.as_posix(),)
+
+    stage_inference_run(volume, prepared)
+    assert len(volume.publications) == 2
+
+    volume.files[prepared.staged_input.relative_path.as_posix()] = b"changed"
+    with pytest.raises(RuntimeError, match="conflicts"):
+        stage_inference_run(volume, prepared)
 
 
 def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
@@ -381,7 +443,14 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     assert prepared.display_name == "renamed"
     assert prepared.submitted_seeds == (11, 12)
     assert prepared.normalized_seeds == (11, 12)
-    assert prepared.worker_config.modelSeeds == [11, 12]
+    assert prepared.recycle == 3
+    assert prepared.sample_count == 2
+    input_upload = next(
+        upload
+        for upload in prepared.payload_uploads
+        if upload.relative_path.name == "input.json"
+    )
+    assert AF3Config.model_validate_json(input_upload.content).modelSeeds == [11, 12]
     assert captured == {"recycle": 3, "sample": 2, "num_containers": 2}
 
 
@@ -447,12 +516,24 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
         "run_seed_prediction_worker",
         fake_run_seed_prediction_worker,
     )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_staged_inference_input",
+        lambda output_root, **identity: LoadedInferenceInput(
+            config=conf,
+            recycle=1,
+            sample_count=1,
+        ),
+    )
 
     result = alphafold3_app.run_inference_pipeline.get_raw_f()(
-        conf.model_dump_json().encode("utf-8"),
         run_id="a" * 64,
-        recycle=1,
-        sample=1,
+        request_id="b" * 64,
+        staged_input_record={
+            "path": "staged-input.json",
+            "size_bytes": 1,
+            "sha256": "c" * 64,
+        },
         claimed_seed_records=[
             {
                 "seed": 1,
@@ -483,7 +564,7 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     assert not jax_cache_dir.is_relative_to(alphafold3_app.CONF.model_volume_mountpoint)
 
 
-def test_inference_worker_revalidates_numeric_limits() -> None:
+def test_inference_worker_revalidates_loaded_numeric_limits(monkeypatch) -> None:
     conf = AF3Config(
         name="invalid-worker-counts",
         modelSeeds=[1],
@@ -492,11 +573,24 @@ def test_inference_worker_revalidates_numeric_limits() -> None:
         ],
     )
 
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_staged_inference_input",
+        lambda output_root, **identity: LoadedInferenceInput(
+            config=conf,
+            recycle=101,
+            sample_count=1,
+        ),
+    )
+
     with pytest.raises(ValueError, match="between 0 and"):
         alphafold3_app.run_inference_pipeline.get_raw_f()(
-            conf.model_dump_json().encode(),
             run_id="a" * 64,
-            recycle=101,
-            sample=1,
+            request_id="b" * 64,
+            staged_input_record={
+                "path": "staged-input.json",
+                "size_bytes": 1,
+                "sha256": "c" * 64,
+            },
             claimed_seed_records=[],
         )

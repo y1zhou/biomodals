@@ -19,7 +19,6 @@ import modal
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
-    serialize_af3_input,
 )
 from biomodals.app.fold.alphafold3.inference_pipeline import (
     InferenceBatchOutcome,
@@ -208,13 +207,31 @@ def stage_inference_run(
     output_volume: modal.Volume,
     prepared: PreparedInferenceRun,
 ) -> None:
-    """Upload normalized inputs and custom templates to the output Volume."""
+    """Publish immutable payloads once, with the staged-input marker last."""
+    marker_path = prepared.staged_input.relative_path.as_posix()
+    try:
+        existing_marker = b"".join(output_volume.read_file(marker_path))
+    except FileNotFoundError:
+        existing_marker = None
+    if existing_marker is not None:
+        if existing_marker != prepared.staged_input.content:
+            raise RuntimeError(
+                "Existing staged-input marker conflicts with the prepared request: "
+                f"{marker_path}"
+            )
+        return
+
     with output_volume.batch_upload(force=True) as batch:
-        for upload in prepared.uploads:
+        for upload in prepared.payload_uploads:
             batch.put_file(
                 BytesIO(upload.content),
                 f"/{upload.relative_path.as_posix()}",
             )
+    with output_volume.batch_upload(force=True) as batch:
+        batch.put_file(
+            BytesIO(prepared.staged_input.content),
+            f"/{marker_path}",
+        )
 
 
 def _worker_failure(
@@ -253,15 +270,15 @@ def _run_claimed_seed_batches(
     max_workers: int,
     poll_timeout_seconds: int,
 ) -> InferenceBatchOutcome:
+    if recycle != prepared.recycle or sample_count != prepared.sample_count:
+        raise ValueError("Worker parameters do not match the staged inference input")
     batches = partition_claimed_seeds(claimed_seeds, max_workers)
-    json_bytes = serialize_af3_input(prepared.worker_config)
     calls = [
         (
             worker_function.spawn(
-                json_bytes,
                 prepared.run_id,
-                recycle,
-                sample_count,
+                prepared.request_id,
+                prepared.staged_input.to_record(),
                 [item.to_dict() for item in batch],
             ),
             batch,
@@ -363,10 +380,12 @@ class ModalInferenceExecutor(InferenceExecutor):
         *,
         sample_count: int,
     ) -> dict[str, object]:
+        if sample_count != prepared.sample_count:
+            raise ValueError("Summary parameters do not match the staged input")
         return self.summary_function.remote(
-            serialize_af3_input(prepared.worker_config),
             prepared.run_id,
-            sample_count,
+            prepared.request_id,
+            prepared.staged_input.to_record(),
         )
 
     def finalize_request(
@@ -375,6 +394,8 @@ class ModalInferenceExecutor(InferenceExecutor):
         *,
         sample_count: int,
     ) -> dict[str, object]:
+        if sample_count != prepared.sample_count:
+            raise ValueError("Request parameters do not match the staged input")
         return self.request_function.remote(
             prepared.run_id,
             prepared.request_id,

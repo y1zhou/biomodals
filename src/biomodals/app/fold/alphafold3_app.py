@@ -37,6 +37,7 @@ from biomodals.app.config import AppConfig
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     PreparedInferenceRun,
+    load_staged_inference_input,
     materialize_local_input,
     prepare_inference_run,
     sanitize_af3_name,
@@ -597,13 +598,18 @@ def claim_seed_prediction_work(
     },
 )
 def run_inference_pipeline(
-    json_bytes: bytes,
     run_id: str,
-    recycle: int,
-    sample: int,
+    request_id: str,
+    staged_input_record: dict[str, object],
     claimed_seed_records: list[dict[str, object]],
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
+    staged = load_staged_inference_input(
+        Path(CONF.output_volume_mountpoint),
+        run_id=run_id,
+        request_id=request_id,
+        staged_input_record=staged_input_record,
+    )
     return run_upstream_seed_worker(
         UpstreamInferenceRuntime(
             predictions=_INFERENCE_RUNTIME,
@@ -611,10 +617,10 @@ def run_inference_pipeline(
             model_root=Path(CONF.model_volume_mountpoint),
             jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
         ),
-        json_bytes,
+        staged.config,
         run_id,
-        recycle,
-        sample,
+        staged.recycle,
+        staged.sample_count,
         claimed_seed_records,
     )
 
@@ -626,16 +632,22 @@ def run_inference_pipeline(
     volumes=CONF.mounts(output_volume=True),
 )
 def finalize_inference_summary(
-    json_bytes: bytes,
     run_id: str,
-    sample_count: int,
+    request_id: str,
+    staged_input_record: dict[str, object],
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
+    staged = load_staged_inference_input(
+        Path(CONF.output_volume_mountpoint),
+        run_id=run_id,
+        request_id=request_id,
+        staged_input_record=staged_input_record,
+    )
     return finalize_upstream_run_summary(
         _INFERENCE_RUNTIME,
-        json_bytes,
+        staged.config,
         run_id,
-        sample_count,
+        staged.sample_count,
     )
 
 

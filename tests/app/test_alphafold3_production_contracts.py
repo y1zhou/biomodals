@@ -12,10 +12,16 @@ from typing import Any, cast
 
 import orjson
 import pytest
-from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
+from uniaf3.schema.alphafold3 import (
+    AF3Config,
+    AF3Protein,
+    AF3SequenceEntry,
+    AF3Template,
+)
 
 from biomodals.app.fold.alphafold3.artifacts import (
     artifact_record,
+    json_bytes,
     load_artifact_bytes,
     validate_artifact_record,
     write_bytes_atomic,
@@ -30,7 +36,11 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    LocalTemplateFile,
+    PreparedInferenceRun,
+    VolumeUpload,
     hash_sequences,
+    load_staged_inference_input,
     prepare_inference_run,
     sanitize_af3_name,
     serialize_af3_input,
@@ -158,6 +168,17 @@ def _request_manifest(
             f"{run_id[:2]}/{run_id}/requests/{request_id}/views/{view_id}/manifest.json"
         ),
     }
+
+
+def _materialize_prepared_run(
+    output_root: Path,
+    prepared: PreparedInferenceRun,
+) -> None:
+    output_root.mkdir()
+    for upload in (*prepared.payload_uploads, prepared.staged_input):
+        path = output_root / Path(upload.relative_path.as_posix())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(upload.content)
 
 
 def test_durable_artifact_helpers_detect_changed_bytes(tmp_path: Path) -> None:
@@ -884,6 +905,153 @@ def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:
     assert marker is not None
     assert [row.sample_index for row in marker.rankings] == [0, 1]
     assert load_seed_marker(tmp_path, run_id, 42, sample_count=1) is None
+
+
+def test_staged_input_rederives_identity_and_preserves_inline_templates(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="inline-template",
+            modelSeeds=[2, 1, 2],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        templates=[
+                            AF3Template(
+                                mmcif="data_inline\n#\n",
+                                queryIndices=[0],
+                                templateIndices=[0],
+                            )
+                        ],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=output_root,
+        recycle=3,
+        sample=2,
+    )
+    _materialize_prepared_run(output_root, prepared)
+
+    loaded = load_staged_inference_input(
+        output_root,
+        run_id=prepared.run_id,
+        request_id=prepared.request_id,
+        staged_input_record=prepared.staged_input.to_record(),
+    )
+
+    assert loaded.recycle == 3
+    assert loaded.sample_count == 2
+    assert loaded.config.modelSeeds == [1, 2]
+    template = loaded.config.sequences[0].protein.templates[0]
+    assert template.mmcif == "data_inline\n#\n"
+    assert template.mmcifPath is None
+    assert not any(
+        upload.relative_path.parent.name == "custom-templates"
+        for upload in prepared.payload_uploads
+    )
+
+    marker = orjson.loads(prepared.staged_input.content)
+    marker["request_id"] = "f" * 64
+    marker_bytes = json_bytes(marker)
+    marker_path = output_root / Path(prepared.staged_input.relative_path.as_posix())
+    marker_path.write_bytes(marker_bytes)
+    with pytest.raises(ValueError, match="marker identity"):
+        load_staged_inference_input(
+            output_root,
+            run_id=prepared.run_id,
+            request_id=prepared.request_id,
+            staged_input_record=VolumeUpload(
+                prepared.staged_input.relative_path,
+                marker_bytes,
+            ).to_record(),
+        )
+
+
+def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:
+    template_path = tmp_path / "template.cif"
+    template_content = b"data_path_backed\n#\n"
+    template_path.write_bytes(template_content)
+    output_root = tmp_path / "output"
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="path-template",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        templates=[
+                            AF3Template(
+                                mmcifPath=str(template_path),
+                                queryIndices=[0],
+                                templateIndices=[0],
+                            )
+                        ],
+                    )
+                )
+            ],
+        ),
+        (
+            LocalTemplateFile(
+                source_path=template_path,
+                content=template_content,
+                sha256=hashlib.sha256(template_content).hexdigest(),
+            ),
+        ),
+        output_mount_root=output_root,
+        recycle=1,
+        sample=1,
+    )
+    _materialize_prepared_run(output_root, prepared)
+
+    loaded = load_staged_inference_input(
+        output_root,
+        run_id=prepared.run_id,
+        request_id=prepared.request_id,
+        staged_input_record=prepared.staged_input.to_record(),
+    )
+    template = loaded.config.sequences[0].protein.templates[0]
+    assert template.mmcif is None
+    assert Path(template.mmcifPath).is_relative_to(output_root)
+
+    input_upload = next(
+        upload
+        for upload in prepared.payload_uploads
+        if upload.relative_path.name == "input.json"
+    )
+    escaped_config = AF3Config.model_validate_json(input_upload.content)
+    escaped_config.sequences[0].protein.templates[0].mmcifPath = str(
+        tmp_path / "escape.cif"
+    )
+    escaped_input = serialize_af3_input(escaped_config)
+    input_path = output_root / Path(input_upload.relative_path.as_posix())
+    input_path.write_bytes(escaped_input)
+
+    marker = orjson.loads(prepared.staged_input.content)
+    marker["input"] = VolumeUpload(
+        input_upload.relative_path,
+        escaped_input,
+    ).to_record()
+    marker_bytes = json_bytes(marker)
+    marker_path = output_root / Path(prepared.staged_input.relative_path.as_posix())
+    marker_path.write_bytes(marker_bytes)
+    with pytest.raises(ValueError, match="escapes the output Volume"):
+        load_staged_inference_input(
+            output_root,
+            run_id=prepared.run_id,
+            request_id=prepared.request_id,
+            staged_input_record=VolumeUpload(
+                prepared.staged_input.relative_path,
+                marker_bytes,
+            ).to_record(),
+        )
 
 
 def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:

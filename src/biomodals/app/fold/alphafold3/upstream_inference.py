@@ -44,7 +44,7 @@ class UpstreamInferenceRuntime:
 
 def run_upstream_seed_worker(
     runtime: UpstreamInferenceRuntime,
-    json_bytes: bytes,
+    config: AF3Config,
     run_id: str,
     recycle: int,
     sample_count: int,
@@ -55,7 +55,7 @@ def run_upstream_seed_worker(
     claimed_seeds = tuple(
         claimed_seed_from_dict(record) for record in claimed_seed_records
     )
-    base_config = validate_upstream_af3_input(AF3Config.model_validate_json(json_bytes))
+    base_config = validate_upstream_af3_input(config)
 
     def execute(
         worker_root: Path,
@@ -99,7 +99,7 @@ def run_upstream_seed_worker(
 
 def finalize_upstream_run_summary(
     runtime: InferenceRuntime,
-    json_bytes: bytes,
+    config: AF3Config,
     run_id: str,
     sample_count: int,
 ) -> dict[str, object]:
@@ -108,7 +108,7 @@ def finalize_upstream_run_summary(
         folding_input,
     )
 
-    base_config = validate_upstream_af3_input(AF3Config.model_validate_json(json_bytes))
+    base_config = validate_upstream_af3_input(config)
 
     def build_data_json(seeds: tuple[int, ...]) -> bytes:
         config = base_config.model_copy(deep=True)

@@ -45,6 +45,7 @@ MAX_USER_CCD_BYTES = 64 * 1024 * 1024
 MAX_MODEL_SEEDS = 1000
 MAX_NUM_RECYCLES = 100
 MAX_DIFFUSION_SAMPLES = 100
+MAX_SEED_SAMPLE_PAIRS = 1000
 MAX_INFERENCE_WORKERS = 100
 MAX_PROTEIN_TEMPLATES = 20
 _TEXT_SIZE_CHUNK_CHARS = 1024 * 1024
@@ -624,6 +625,18 @@ def validate_inference_worker_budget(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
+def validate_inference_workload(seeds: list[int], sample_count: int) -> int:
+    """Bound the number of durable seed/sample prediction directories."""
+    validate_inference_parameters(0, sample_count)
+    prediction_count = len(normalize_model_seeds(seeds)) * sample_count
+    if prediction_count > MAX_SEED_SAMPLE_PAIRS:
+        raise ValueError(
+            "modelSeeds × sample must not exceed "
+            f"{MAX_SEED_SAMPLE_PAIRS}, got {prediction_count}"
+        )
+    return prediction_count
+
+
 def _run_identity(
     identity_view: dict[str, object],
     *,
@@ -671,6 +684,7 @@ def prepare_inference_run(
     if not mount_root.is_absolute():
         raise ValueError("output_mount_root must be absolute")
     conf = validate_submitted_af3_input(enriched_config)
+    validate_inference_workload(conf.modelSeeds, sample)
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
     display_name = conf.name

@@ -43,6 +43,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     sanitize_af3_name,
     validate_inference_parameters,
     validate_inference_worker_budget,
+    validate_inference_workload,
 )
 from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
 from biomodals.app.fold.alphafold3.modal_adapters import (
@@ -148,6 +149,7 @@ SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     version=2,
 )
 _JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
+_SUMMARY_TIMEOUT_SECONDS = 3600
 MSA_SEARCH_CLAIMS = modal.Dict.from_name(
     MSA_SEARCH_CLAIM_DICT_NAME,
     create_if_missing=True,
@@ -243,6 +245,7 @@ _INFERENCE_RUNTIME = InferenceRuntime(
     ),
     container_id=_CONTAINER_INSTANCE_ID,
     maximum_age_seconds=MAX_TIMEOUT + 900,
+    summary_maximum_age_seconds=_SUMMARY_TIMEOUT_SECONDS + 900,
     wait_timeout_seconds=max(60, MAX_TIMEOUT - 60),
 )
 
@@ -628,7 +631,7 @@ def run_inference_pipeline(
 @app.function(
     cpu=(0.125, 2.125),
     memory=(1024, 16384),
-    timeout=3600,
+    timeout=_SUMMARY_TIMEOUT_SECONDS,
     volumes=CONF.mounts(output_volume=True),
 )
 def finalize_inference_summary(
@@ -788,6 +791,7 @@ def submit_alphafold3_task(
 
     local_input = materialize_local_input(input_json)
     conf = local_input.config
+    validate_inference_workload(conf.modelSeeds, sample)
     if run_name is None:
         run_name = conf.name
     sanitize_af3_name(run_name)

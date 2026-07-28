@@ -85,6 +85,7 @@ class InferenceRuntime:
     claims: ClaimStore
     container_id: str
     maximum_age_seconds: int | float
+    summary_maximum_age_seconds: int | float
     wait_timeout_seconds: int | float
     claim_poll_seconds: float = 5.0
 
@@ -1049,7 +1050,7 @@ def finalize_run_summary(
                 generation_id=generation_id,
                 identity=_summary_claim_identity(selected_run),
                 container_id=runtime.container_id,
-                maximum_age_seconds=runtime.maximum_age_seconds,
+                maximum_age_seconds=runtime.summary_maximum_age_seconds,
             )
         except ActiveGenerationError as exc:
             remaining = deadline - time.monotonic()

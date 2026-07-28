@@ -57,6 +57,15 @@ def test_app_public_functions_are_modal_endpoints() -> None:
     assert violations == []
 
 
+def test_summary_claim_lifetime_matches_its_shorter_function_timeout() -> None:
+    runtime = alphafold3_app._INFERENCE_RUNTIME
+
+    assert runtime.summary_maximum_age_seconds == (
+        alphafold3_app._SUMMARY_TIMEOUT_SECONDS + 900
+    )
+    assert runtime.summary_maximum_age_seconds < runtime.maximum_age_seconds
+
+
 def test_profile_setup_adapter_fans_out_missing_profiles() -> None:
     spec = DATABASE_PROFILE_SPECS[0]
     inventory: dict[str, object] = {

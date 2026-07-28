@@ -1,0 +1,326 @@
+"""Request-level AlphaFold 3 MSA and protein-template coordination.
+
+The coordinator owns phase ordering, cache reconciliation, validation, and
+failure policy. Its executor interface hides Modal calls so the same production
+behavior can be exercised synchronously in local tests.
+"""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+from uniaf3.schema.alphafold3 import AF3Config
+
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    serialize_af3_input,
+    validate_submitted_af3_input,
+    validate_upstream_af3_input,
+)
+from biomodals.app.fold.alphafold3.input_enrichment import (
+    MsaAssemblyResolution,
+    apply_msa_resolution,
+    apply_template_results,
+    chain_msa_states,
+    fill_missing_msa_for_inference,
+    missing_raw_searches,
+    plan_template_searches,
+    reduce_msa_assembly_results,
+    reduce_template_cache_results,
+    validate_template_result,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    SEARCH_MAX_PARALLEL_SHARDS,
+    SEARCH_N_CPU,
+    MsaAssemblyTask,
+    RawSearchTask,
+    plan_msa_resolution,
+    sequence_hash,
+    validate_remote_search_task_count,
+)
+from biomodals.app.fold.alphafold3.template_search import TemplateTask
+
+type SearchOutcome = dict[str, object] | Exception
+
+
+class SearchExecutor(Protocol):
+    """Remote-call interface required by the request-level coordinator."""
+
+    def inspect_msa(
+        self,
+        raw_tasks: tuple[RawSearchTask, ...],
+        assembly_tasks: tuple[MsaAssemblyTask, ...],
+    ) -> tuple[
+        tuple[dict[str, object], ...],
+        tuple[dict[str, object], ...],
+    ]:
+        """Return raw and complete-combined MSA cache statuses."""
+        ...
+
+    def run_raw(
+        self,
+        tasks: tuple[RawSearchTask, ...],
+        *,
+        max_parallel: int,
+    ) -> tuple[SearchOutcome, ...]:
+        """Run missing raw searches with bounded request-level fanout."""
+        ...
+
+    def run_assemblies(
+        self,
+        tasks: tuple[MsaAssemblyTask, ...],
+        *,
+        max_parallel: int,
+    ) -> tuple[SearchOutcome, ...]:
+        """Assemble requested MSA fields from durable raw results."""
+        ...
+
+    def inspect_templates(
+        self,
+        tasks: tuple[TemplateTask, ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Return canonical protein-template cache status."""
+        ...
+
+    def run_templates(
+        self,
+        tasks: tuple[TemplateTask, ...],
+        *,
+        max_parallel: int,
+    ) -> tuple[SearchOutcome, ...]:
+        """Run missing canonical and request-local template searches."""
+        ...
+
+
+def validate_search_worker_budget(max_parallel_search_workers: int) -> int:
+    """Validate the request-wide remote-worker budget."""
+    if (
+        isinstance(max_parallel_search_workers, bool)
+        or not isinstance(max_parallel_search_workers, int)
+        or not 1 <= max_parallel_search_workers <= 32
+    ):
+        raise ValueError("max_parallel_search_workers must be between 1 and 32")
+    return max_parallel_search_workers
+
+
+def _combined_cache_resolution(
+    tasks: tuple[MsaAssemblyTask, ...],
+    statuses: tuple[dict[str, object], ...],
+) -> MsaAssemblyResolution:
+    if len(statuses) != len(tasks):
+        raise RuntimeError("Combined MSA cache inspection returned the wrong count")
+    reused_tasks: list[MsaAssemblyTask] = []
+    reused_statuses: list[dict[str, object]] = []
+    for task, status in zip(tasks, statuses, strict=True):
+        if (
+            status.get("polymer") != task.polymer
+            or status.get("sequence_sha256") != sequence_hash(task.sequence)
+            or status.get("status") not in {"missing", "reused"}
+        ):
+            raise RuntimeError(f"Invalid combined MSA cache result: {status}")
+        if status["status"] == "reused":
+            reused_tasks.append(task)
+            reused_statuses.append(status)
+    return reduce_msa_assembly_results(reused_tasks, reused_statuses)
+
+
+def resolve_msa_and_templates(
+    config: AF3Config,
+    executor: SearchExecutor,
+    *,
+    search_msa: bool = True,
+    search_protein_templates: bool = True,
+    max_parallel_search_workers: int = 4,
+) -> AF3Config:
+    """Populate missing MSA/template fields through one validated deep seam."""
+    worker_budget = validate_search_worker_budget(max_parallel_search_workers)
+    conf = validate_submitted_af3_input(config)
+    serialize_af3_input(conf)
+    if not search_msa:
+        return validate_upstream_af3_input(fill_missing_msa_for_inference(conf))
+
+    states = chain_msa_states(conf)
+    plan = plan_msa_resolution(states)
+    possible_template_tasks = 0
+    if search_protein_templates:
+        for state in states:
+            if state.polymer != "protein":
+                continue
+            protein = conf.sequences[state.chain_index].protein
+            if protein is None:
+                raise RuntimeError("Protein MSA state no longer matches its chain")
+            if not protein.templates:
+                possible_template_tasks += 1
+    task_count = len(plan.raw_searches) + len(plan.assemblies) + possible_template_tasks
+    validate_remote_search_task_count(task_count)
+    canonical_assemblies = tuple(
+        task for task in plan.assemblies if task.publishes_canonical
+    )
+    cache_statuses, combined_statuses = (
+        executor.inspect_msa(plan.raw_searches, canonical_assemblies)
+        if plan.raw_searches
+        else ((), ())
+    )
+    combined_resolution = _combined_cache_resolution(
+        canonical_assemblies,
+        combined_statuses,
+    )
+    combined_hits = combined_resolution.fields_by_sequence
+    missing_raw = missing_raw_searches(plan.raw_searches, cache_statuses)
+
+    print(
+        "🧬 Sharded MSA search plan: "
+        f"{len(combined_hits)} combined cached, "
+        f"{len(cache_statuses) - len(missing_raw)} cached, "
+        f"{len(missing_raw)} missing, worker cap {worker_budget}; each database "
+        f"worker runs at most {SEARCH_MAX_PARALLEL_SHARDS} shard searches "
+        f"with {SEARCH_N_CPU} HMMER CPUs each (request-wide theoretical cap "
+        f"{worker_budget * SEARCH_MAX_PARALLEL_SHARDS} shard searches / "
+        f"{worker_budget * SEARCH_MAX_PARALLEL_SHARDS * SEARCH_N_CPU} HMMER "
+        "CPU slots)."
+    )
+    search_outcomes = (
+        executor.run_raw(missing_raw, max_parallel=worker_budget) if missing_raw else ()
+    )
+    search_failures = [
+        {
+            "database_id": task.database_id,
+            "polymer": task.polymer,
+            "sequence_sha256": task.sequence_hash,
+            "error_type": type(outcome).__name__,
+            "message": str(outcome),
+        }
+        for task, outcome in zip(missing_raw, search_outcomes, strict=True)
+        if isinstance(outcome, Exception)
+    ]
+    if search_failures:
+        raise RuntimeError(
+            "Incomplete Raw Database MSA tasks; rerun to reuse successful "
+            f"siblings: {search_failures}"
+        )
+
+    pending_assemblies = tuple(
+        task
+        for task in plan.assemblies
+        if (task.polymer, task.sequence) not in combined_hits
+    )
+    pending_assembly_outcomes = (
+        executor.run_assemblies(pending_assemblies, max_parallel=worker_budget)
+        if pending_assemblies
+        else ()
+    )
+    assembly_failures = [
+        {
+            "polymer": task.polymer,
+            "sequence_sha256": sequence_hash(task.sequence),
+            "error_type": type(outcome).__name__,
+            "message": str(outcome),
+        }
+        for task, outcome in zip(
+            pending_assemblies,
+            pending_assembly_outcomes,
+            strict=True,
+        )
+        if isinstance(outcome, Exception)
+    ]
+    if assembly_failures:
+        raise RuntimeError(
+            "Incomplete MSA assembly tasks; raw database results remain "
+            f"reusable: {assembly_failures}"
+        )
+
+    pending_resolution = reduce_msa_assembly_results(
+        pending_assemblies,
+        tuple(
+            outcome
+            for outcome in pending_assembly_outcomes
+            if isinstance(outcome, dict)
+        ),
+    )
+    assembly_resolution = MsaAssemblyResolution(
+        fields_by_sequence=(
+            combined_resolution.fields_by_sequence
+            | pending_resolution.fields_by_sequence
+        ),
+        unpaired_references=(
+            combined_resolution.unpaired_references
+            | pending_resolution.unpaired_references
+        ),
+    )
+    apply_msa_resolution(
+        conf,
+        states,
+        assembly_resolution,
+        search_protein_templates=search_protein_templates,
+    )
+
+    if not search_protein_templates:
+        return validate_upstream_af3_input(conf)
+
+    template_plan = plan_template_searches(
+        conf,
+        states,
+        assembly_resolution,
+    )
+    canonical_tasks = template_plan.canonical_tasks
+    template_statuses = (
+        executor.inspect_templates(canonical_tasks) if canonical_tasks else ()
+    )
+    cache_resolution = reduce_template_cache_results(
+        canonical_tasks,
+        template_statuses,
+    )
+    templates_by_identity = cache_resolution.templates_by_identity
+    missing_canonical = cache_resolution.missing_tasks
+    request_local_tasks = template_plan.request_local_tasks
+    worker_tasks = missing_canonical + request_local_tasks
+    print(
+        "🧬 Protein template search plan: "
+        f"{len(canonical_tasks) - len(missing_canonical)} cached, "
+        f"{len(missing_canonical)} missing canonical, "
+        f"{len(request_local_tasks)} request-local, "
+        f"worker cap {worker_budget}."
+    )
+    template_outcomes = (
+        executor.run_templates(worker_tasks, max_parallel=worker_budget)
+        if worker_tasks
+        else ()
+    )
+    template_failures: list[dict[str, object]] = []
+    for task, outcome in zip(worker_tasks, template_outcomes, strict=True):
+        if isinstance(outcome, Exception):
+            template_failures.append({
+                "sequence_sha256": sequence_hash(task.sequence),
+                "unpaired_msa_sha256": task.unpaired_msa_sha256,
+                "publish_canonical": task.publish_canonical,
+                "error_type": type(outcome).__name__,
+                "message": str(outcome),
+            })
+            continue
+        try:
+            if not isinstance(outcome, dict):
+                raise RuntimeError(f"Invalid protein template result: {outcome!r}")
+            templates_by_identity[task.template_identity] = validate_template_result(
+                task,
+                outcome,
+                allowed_statuses=(
+                    frozenset({"published", "reused"})
+                    if task.publish_canonical
+                    else frozenset({"request-local"})
+                ),
+            )
+        except Exception as error:
+            template_failures.append({
+                "sequence_sha256": sequence_hash(task.sequence),
+                "unpaired_msa_sha256": task.unpaired_msa_sha256,
+                "publish_canonical": task.publish_canonical,
+                "error_type": type(error).__name__,
+                "message": str(error),
+            })
+    if template_failures:
+        raise RuntimeError(
+            "Incomplete protein template tasks; completed canonical results "
+            f"remain reusable: {template_failures}"
+        )
+
+    apply_template_results(conf, template_plan, templates_by_identity)
+    return validate_upstream_af3_input(conf)

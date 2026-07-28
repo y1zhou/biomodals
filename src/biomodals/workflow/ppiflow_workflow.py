@@ -2296,6 +2296,11 @@ def _run_one_refold_candidate(
         config=config,
     )
     json_bytes = conf.model_dump_json().encode("utf-8")
+    # TODO(af3-sharded-msa): Migrate this refold stage to a workflow-compatible
+    # adapter for AlphaFold3's request-scoped API. `run_data_pipeline` was
+    # removed, and `run_inference_pipeline` now publishes seed-addressed Volume
+    # artifacts instead of returning tarball bytes. The legacy calls below are
+    # intentionally retained until that migration is implemented.
     if bool(config.get("search_msa", False)):
         json_bytes = alphafold3_app.run_data_pipeline.remote(
             json_bytes=json_bytes,

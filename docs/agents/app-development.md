@@ -31,8 +31,11 @@ The skill routes app work to focused references under
 - Keep local entrypoints CLI-only. Workflow reuse should happen through remote
   app functions that return shared schemas from `biomodals.schema`.
 
-## Approved legacy deviations
+## Approved App-Specific Deviations
 
+- [AlphaFold3 cache integrity and run layout](alphafold3-app-deviations.md)
+  documents the intentionally trusted immutable stores, marker-only seed cache,
+  and multi-request run layout used by `alphafold3_app.py`.
 - [GROMACS analysis checkpoints](gromacs-analysis-checkpoints.md) retain the
   established run-directory and timestamp contract for narrow CSV/PNG restart
   repair. Do not extend that exception to new cache stages.

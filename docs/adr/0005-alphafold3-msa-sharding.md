@@ -1,0 +1,1074 @@
+# AlphaFold3 MSA sharding and resumable inference
+
+Status: accepted.
+
+This record consolidates and supersedes ADRs 0005–0048 as they appeared in
+branch history. It is the authoritative architecture decision for the
+AlphaFold3 sharded-MSA integration.
+
+## Context
+
+The existing production app runs AlphaFold's full data pipeline in coarse
+containers. A preemption can discard successful database searches, and cold
+workers may copy hundreds of gigabytes of databases to local SSD.
+
+AlphaFold's pinned Jackhmmer and Nhmmer wrappers support sharded FASTA paths.
+Correct sharding requires the full-database HMMER search space and the pinned
+global merge behavior.
+
+The Phase 1 small-BFD campaign validated 64 shards for the tested protein
+queries. Equal-score hit permutations were scientifically equivalent; target,
+score, alignment, and non-tied ordering mismatches were not.
+
+The selected worker topology was 16 active shard searches with two HMMER CPUs
+each in a Modal container allocated `(0.125, 32.125)` CPUs. It completed the
+medium query in about 49.05 seconds, roughly 5.1 times faster than the baseline.
+
+The campaign did not show Modal Volume bandwidth to be the primary bottleneck
+for HMMER search. Prediction workers therefore read uncompressed shards
+directly from the Volume and do not copy sequence databases to ephemeral SSD.
+
+Stock SeqKit shuffling exposed a different access pattern. Its serialized
+random reads from the monolithic source produced only about 1.9 MB/s for
+UniProt, so the one-time profile builder stages that source on ephemeral SSD
+before randomized output.
+
+The original aggregate `seqkit sum --all` validation also ignored FASTA
+headers and turned the shard union into one serial input with a global
+per-sequence hash sort. The replacement C validator's measured source scan was
+slower than the source-side SeqKit checksum, but its complete UniProt
+source-plus-256-shard scan took 10m 02s and compared the multiplicity-sensitive
+full `(header, sequence)` multiset.
+
+## Decision
+
+### Ownership and upstream compatibility
+
+Biomodals owns profile selection, cache lookup, missing-work scheduling,
+publication, and resume behavior. The pinned AlphaFold source remains unaware
+of Modal Volumes, claims, and completion markers.
+
+The app does not patch `_get_protein_msa_and_templates` to discover persistent
+cache entries. A narrow app-owned adapter preserves the pinned upstream search,
+merge, deduplication, and template semantics.
+
+Contract checks bind that adapter to the pinned AlphaFold source. An upstream
+pin change requires comparison against the new source before its results can
+reuse these scientific cache paths.
+
+Production code lives under `src/biomodals/app/fold/alphafold3/`.
+`artifacts.py` owns canonical JSON, digests, atomic publication, durable
+operation logging, and the shared Modal Volume persistence interfaces.
+`sharding.py` owns the pinned native source assets, compilation, execution,
+record-multiset parsing, scratch sizing, and staged-file verification.
+`profiles.py` owns fixed production identities, `profile_manifest.py` owns the
+immutable manifest and publication contract, and `profile_builder.py` owns
+construction, source policy, and cleanup. Profile preparation, MSA search,
+template search, and inference all use the append-only protocol in
+`generation_claims.py`; old profile-owner records are adapted in place.
+
+`search_pipeline.py` and `inference_pipeline.py` own request-level
+reconciliation behind narrow executor interfaces. `modal_adapters.py` owns
+Modal payload marshalling, bounded fan-out and polling, request staging, and
+the one-time profile-setup call sequence. `upstream_inference.py` owns the
+pinned AlphaFold command and upstream summary serialization. Fixed mount roots
+live on the runtime data classes that use them rather than in an app-wide
+metadata object. The remaining modules separate scientific search and
+assembly, template search, input enrichment, inference identity, seed
+publication, and request retrieval.
+`alphafold3_app.py` is the composition root: it binds these production modules
+to Modal resources and exposes only the three supported lifecycle components:
+one-time profile preparation, resumable MSA/template search, and AlphaFold
+inference.
+
+The temporary MSA app and benchmark campaign code were retired after the
+protein and RNA scientific gates passed. Historical measurements and oracle
+evidence remain under `docs/research/`; production does not ship tuning,
+campaign, or profiling modes.
+
+### Fixed database specifications
+
+Production accepts one code-owned `database_id`. It does not accept arbitrary
+source paths, shard counts, polymer types, Z values, or profile IDs.
+
+| Database ID | Profile ID | Source FASTA | Shards | Polymer |
+| --- | --- | --- | ---: | --- |
+| `small_bfd` | `small-bfd-64-v2` | `bfd-first_non_consensus_sequences.fasta` | 64 | protein |
+| `mgnify` | `mgnify-512-v1` | `mgy_clusters_2022_05.fa` | 512 | protein |
+| `uniprot` | `uniprot-384-v1` | `uniprot_all_2021_04.fa` | 384 | protein |
+| `uniref90` | `uniref90-256-v1` | `uniref90_2022_05.fa` | 256 | protein |
+| `ntrna` | `nt-rna-256-v1` | `nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta` | 256 | RNA |
+| `rfam` | `rfam-16-v1` | `rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta` | 16 | RNA |
+| `rnacentral` | `rnacentral-64-v1` | `rnacentral_active_seq_id_90_cov_80_linclust.fasta` | 64 | RNA |
+
+Each specification also fixes the source snapshot guards, construction recipe,
+SeqKit version and seed, and AlphaFold compatibility pin. A scientific change
+requires a new Profile ID and a reviewed app deployment.
+
+`small-bfd-64-v1` remains immutable benchmark evidence. The production
+candidate uses `small-bfd-64-v2` because it stages shuffle/index data under
+`/tmp` and does not retain the monolithic FASTA inside the profile.
+
+Scientifically validated alternatives `uniprot-384-v1` and
+`uniref90-256-v1` were compared with the earlier profiles. The selection
+promotes UniProt 384 because its observed 16x2 search was materially faster
+while retaining scientific equivalence. The 2026-07-27 production
+end-to-end-test decision explicitly selects UniRef90 256 as well. This
+supersedes the earlier Checklist 3 preference for UniRef90 128 despite the
+single 16x2 comparison finding the 256-shard profile slower; the 256-shard
+profile had already passed the scientific oracle, and production telemetry
+will measure the selected behavior. `uniprot-256-v1` and `uniref90-128-v1`
+remain immutable experimental evidence rather than production selections.
+
+`seqkit_threads` controls SeqKit statistics/splitting and the native shuffler
+and validator workers. It is operational: changing it does not select a
+different scientific specification or Profile ID, and ordered output makes the
+permutation independent of worker completion order.
+
+### Immutable profile layout
+
+Sharded profiles live in the separate `AlphaFold3-msa-db-sharded` Modal Volume:
+
+```text
+/profiles/{profile_id}/
+  shards/
+  validation/
+  manifest.json
+```
+
+`manifest.json` is the readiness marker and is always written last. There is no
+mutable `current` pointer, automatic discovery, or automatic promotion.
+
+The manifest preserves source identity and statistics. The published profile
+does not retain a duplicate monolithic source FASTA.
+
+New builds retain structural shuffler evidence at
+`validation/shuffler-evidence.json`—record and byte counts, bounded-memory
+evidence, native source identity, and shuffle identities—but no timing or
+throughput summary. Successful new profiles also omit raw shuffler stderr;
+that diagnostic stream is retained only with failure evidence. The validator
+continues to accept the older `shuffler-metrics.json` and
+`shuffle-stderr.log` artifacts in already-published composable-multiset
+profiles so cleanup does not invalidate the selected databases.
+
+Rebuilding an identical specification reuses its valid publication and never
+overwrites it. A builder for a new Profile ID publishes beside any existing
+profile and never mutates that prior publication. After all seven selected
+profiles validate and no builder claims remain active, the setup
+coordinator's finalization barrier removes non-selected profile directories so
+the Volume contains exactly one selected profile per logical database. This
+intentional garbage collection preserves old Search Identity and manifest
+evidence in the MSA cache, but recomputing an old Search Identity requires its
+profile to be rebuilt or manually restored first.
+
+### Profile builder
+
+The production app exposes one builder operation:
+
+```python
+build_sharded_database(
+    database_id: str,
+    seqkit_threads: int = 8,
+    source_policy: Literal["keep", "compress", "delete"] = "keep",
+) -> dict[str, object]
+```
+
+One invocation builds one logical database. It uses `(0.125, 32.125)` CPUs,
+`(1024, 262144)` MiB requested/maximum memory, and the default 512 GiB
+ephemeral disk without requesting a larger disk.
+
+The builder reads the official monolithic FASTA from `AlphaFold3-msa-db`. It
+writes an ephemeral source copy, the two-pass shuffled FASTA, and a compact
+occurrence-offset index under `/tmp`. It never copies the monolithic source
+into the sharded Volume.
+
+Source `seqkit stats` remains serialized before shuffling. Its observed record
+count is a data dependency for exact scratch sizing and the native shuffler's
+`--expected-records` guard, so running it concurrently would not shorten the
+critical path without weakening those checks.
+
+The first pass scans the source sequentially, tees the exact bytes into the
+container-local copy, and indexes every record by source occurrence in a
+fixed-width `uint64` offset array. The helper syncs the local copy, closes the
+Volume file, and creates a seed-23, SplitMix64 Fisher--Yates permutation of
+`uint32` ordinals. The second pass uses bounded concurrent `pread` calls
+against only the local copy, but buffers and writes each batch in permutation
+order. The helper normalizes a missing final newline so moving the last source
+record cannot merge it with the next header.
+
+Before work starts, the builder requires scratch for the exact source copy,
+normalized shuffled output, occurrence index, and 1 GiB headroom. This is
+about 204.68 GiB for UniProt and 245.15 GiB for MGnify, both below Modal's
+default 512 GiB per-container disk quota.
+
+Occurrence identity preserves duplicate full headers without FAI lookup,
+temporary header prefixes, or recovery. The manifest pins the helper source
+digest, offset representation, permutation, and ordered-read behavior.
+
+After shuffling, the builder checks the staged source's size and SHA-256 against
+the source identity already read from the database Volume. Only that
+cryptographically verified local copy can serve as the source-side validation
+oracle.
+
+The builder then starts the source-side C record-multiset scan on the local SSD
+copy and runs `seqkit split2` on the main path. After splitting, it starts the
+shard-side C scan. The source scan may overlap both operations, but the two
+signatures are joined before comparison and publication. A one-worker Python
+thread pool only launches and waits for the native C subprocess; the scans do
+not execute Python bytecode and are not serialized by the Python GIL.
+
+```mermaid
+flowchart TD
+    A["Source seqkit stats"] --> B["Scratch sizing and record-count guard"]
+    B --> C["Source SHA-256 on database Volume"]
+    C --> D["C shuffle pass 1: stage source and index occurrences"]
+    D --> E["C shuffle pass 2: local random reads, ordered output"]
+    E --> F["Verify staged-source size and SHA-256"]
+    F --> G["Start native source multiset scan on /tmp"]
+    F --> H["seqkit split2 to generation-scoped Volume paths"]
+    H --> I["Native shard multiset scan"]
+    G --> J["Join and compare canonical signatures"]
+    I --> J
+    J --> K["Shard seqkit stats and balance checks"]
+    K --> L["Commit payload, then publish manifest last"]
+```
+
+Generation-scoped raw shards are written to the sharded Volume; the ephemeral
+source copy, occurrence index, and shuffled FASTA are never written to a
+persistent Volume.
+
+After splitting, the builder deletes the shuffled payload and renames each
+generation-scoped raw shard to its exact AlphaFold-compatible filename.
+
+Construction is the scientific trust boundary. Before publication, the builder
+checks all of the following:
+
+- source and aggregate-shard `seqkit stats`;
+- sequence and residue conservation;
+- an order-independent, multiplicity-sensitive C validation of the complete
+  canonical `(header, sequence)` multiset;
+- occurrence-index construction and structural native shuffler evidence;
+- duplicate-header occurrence preservation with no recovery prefixes;
+- exact shard names, count, balance, sizes, and digests;
+- source identity, recipe, and declared compatibility.
+
+The validator hashes each full header, concatenated sequence, and explicit
+header and sequence lengths with SHA-256. Header and sequence case are
+significant; line endings and sequence wrapping are not. It combines all four
+64-bit digest lanes with modular sums, XORs, and sums of squares, plus exact
+record, header-byte, and sequence-byte totals. The source and aggregate shard
+signatures must match. SeqKit is not used for aggregate checksums in new
+profiles; it remains responsible for `stats` and `split2`.
+
+For protein profiles, HMMER Z and domZ equal the exact source sequence count.
+For RNA profiles, Nhmmer Z equals the exact nucleotide count divided by
+1,000,000 and has megabase units.
+
+The manifest records integer source statistics, the derived search-space value
+and unit, source digests, shard artifacts, and recipe. Code-owned expected
+statistics are guards; a mismatch fails publication for inspection.
+
+After the shard payload is committed, the builder writes the manifest last and
+deeply revalidates the published profile. On failure, it commits compact
+diagnostics before removing only that generation's partial shards.
+
+Profiles already published with the earlier SeqKit FAI recipe remain accepted
+under recipe version 3. Occurrence-indexed profiles published with the C
+shuffler and SeqKit sequence checksum remain accepted under recipe version 4.
+New builds use recipe version 5: the occurrence-indexed C shuffler and
+full-record C validator together. Existing immutable profiles are not rebuilt
+solely to revise their validation recipe; every selected profile must still
+pass the same database-search oracle before production promotion.
+
+Normal search workers trust the published profile. They may read its small
+manifest for identity and Z, but they never stat, hash, walk, or run SeqKit over
+shards before searching.
+
+A missing or unreadable shard fails that database search. Full profile
+revalidation is an explicit audit operation, not part of query execution.
+
+### Profile build claims
+
+Before building, the app reuses a matching published profile or elects one
+builder per Profile ID with atomic Modal Dict insertion.
+
+The minimal claim uses append-only owner and terminal-status records by
+generation. It has no polling loop or heartbeat.
+
+An active conflict fails immediately. Normal failure records `failed`; work
+older than the maximum function lifetime plus a margin may be marked
+`abandoned`, allowing one later generation to take ownership. Claims form an
+append-only chain: terminal status fences the predecessor, and atomic insertion
+of its single successor elects the next generation. No takeover deletes or
+replaces another owner's record, so interruption at any point leaves a chain
+that a later invocation can continue. Terminal status is written from the
+builder's `finally` path. A legacy `active:{profile_id}` owner is adopted as
+the chain root on first access; it is not deleted, and a stale legacy owner can
+therefore be fenced and succeeded by the same protocol. Rollout must not
+overlap an actively starting pre-chain builder, because insertion of the old
+`active:` key and the new root are separate Dict operations; persisted legacy
+owners are supported once old-code submissions have stopped.
+
+Claims are never publication evidence and owner records are never deleted.
+Only a validated manifest proves completion. Different Profile IDs may build
+concurrently.
+
+The production batch entrypoint will therefore submit every missing Supported
+Database Specification concurrently. Each child invocation still builds one
+logical database and is independently bounded by its Profile Build Claim.
+The plan and submission log expose the seven-container cap, configured local
+workers, and maximum effective worker slots for the selected missing set.
+
+### Source FASTA policy
+
+`source_policy="keep"` is the default. The source is never changed before the
+profile is committed and deeply revalidated.
+
+`compress` writes `<complete-source-filename>.zst` beside the source. It checks
+that decompression reproduces the recorded byte count and SHA-256 before it
+commits the archive and removes the plain FASTA. If that archive already
+exists, both the archive and the current plain source must match the published
+source identity before the plain source can be removed.
+
+`delete` removes the plain source only after the explicit request and successful
+profile publication.
+
+Compression or verification failure leaves the plain source intact. Source
+retirement is recorded and does not alter the immutable profile identity.
+
+The builder accepts only the uncompressed official source. If only its `.zst`
+archive exists, it fails with instructions to restore the source manually in a
+Modal Sandbox or equivalent environment.
+
+The app does not implement automatic restoration or an implicit full-database
+decompression.
+
+### MSA cache namespace and retry boundary
+
+`sequence_hash` hashes validated sequence text only. Protein and RNA use
+separate top-level namespaces:
+
+```text
+/Protein/{sequence_hash[:2]}/{sequence_hash}/
+/RNA/{sequence_hash[:2]}/{sequence_hash}/
+```
+
+Legacy unnamespaced entries are ignored rather than migrated.
+
+The durable retry boundary is one Raw Database MSA: one unique polymer and
+sequence searched against one immutable database profile.
+
+Its cache path is:
+
+```text
+/{polymer}/{prefix}/{sequence_hash}/
+  raw-msa/{database_id}/{search_identity}/
+    result.a3m
+    run.log
+    done.json
+```
+
+`done.json` is written last and validates the database-level result and compact
+provenance. `run.log` is diagnostic and is not required to reuse an otherwise
+valid result. Per-shard tblout files are transient worker scratch and are not
+published in production.
+
+A preempted worker reruns that whole database. Per-shard durable scheduling and
+repair remain outside the initial design.
+
+Search Identity covers polymer and sequence, a semantic view of the immutable
+profile, pinned AlphaFold and HMMER behavior, and every result-affecting search
+parameter. The profile view includes source and ordered-shard content,
+full-database search space, and compatibility pins. It excludes build
+timestamps, claim generations, builder thread counts, and other operational
+provenance, so rebuilding byte-identical shards preserves scientific cache
+reuse.
+
+CPU allocation, HMMER CPU count, active shard count, and container topology are
+operational settings outside Search Identity.
+
+### Combined MSA and template publications
+
+Canonical combined files remain flat at the sequence root:
+
+```text
+unpaired.a3m
+paired.a3m
+combined.done.json
+templates.json
+templates.done.json
+```
+
+RNA has no `paired.a3m` or template files. `combined.done.json` binds the
+combined files to exact Raw Database MSA markers, upstream merge semantics,
+sizes, and digests.
+
+Cache inspection is plan-aware. It validates each complete combined publication
+before reading its potentially large raw A3M dependencies. A valid combined
+publication satisfies its raw dependencies and is returned directly. Before any
+missing work is scheduled, the coordinator validates the complete returned
+fields and content-bound unpaired-MSA reference. It carries that validated
+resolution through enrichment, so the potentially large unpaired MSA is hashed
+only once. If the combined marker or artifacts are missing or invalid,
+inspection deep-validates the required raw A3Ms; corrupt raw results are then
+scheduled for repair before assembly is retried.
+
+Each combined MSA field is limited to 512 MiB before publication and before a
+marked artifact is read. One assembly result and one aggregate cache-inspection
+response are limited to 1 GiB. Oversized legacy publications are cache misses,
+and newly assembled oversized fields fail before their completion marker can
+be published.
+
+Only the latest canonical combination is retained at the flat paths. Older
+combinations remain reconstructable from immutable raw results.
+
+Unmarked legacy combined or template files are not cache hits. They remain
+untouched until a complete canonical replacement is ready, then its marker is
+written last.
+
+Protein template search is a separate durable stage after unpaired-MSA
+resolution. It always publishes `templates.json`, including a valid empty list,
+then writes `templates.done.json` last.
+
+Only the latest validated template publication is retained at the flat path. A
+marker mismatch or oversized existing result reruns template search without
+invalidating raw MSAs. Newly generated template JSON must satisfy the supported
+size envelope before either the flat artifact or its completion marker is
+published.
+
+Template identity binds the resolved unpaired-A3M digest, maximum template date,
+pinned tool behavior, and result-affecting parameters.
+
+The HMMER and template-filter parameter mappings used in cache identity are the
+same mappings expanded into the pinned upstream constructors. Contract tests
+capture the actual Jackhmmer, Nhmmer, Hmmsearch, and template-filter arguments
+so a runtime-only or identity-only scientific change cannot pass silently.
+
+The fixed `pdb_seqres_2022_09_28.fasta` and `mmcif_files/` paths are an immutable
+operator-controlled template store. Their inventory and digests are excluded
+from cache identity.
+
+Changing those files in place is unsupported and requires explicit template
+cache removal or a future identity-policy revision.
+
+The template worker reads PDB seqres and selected mmCIF files directly from the
+source database Volume. It does not copy the reference store into the MSA cache
+or local SSD.
+
+The pinned pipeline limits selected templates to four. The cache stores only
+their AlphaFold records, mappings, and serialized structures.
+
+### Search claims and publication safety
+
+Expensive search publications use append-only generation claims. A claim is
+scheduling state; only its validating completion marker proves reuse.
+
+Raw-result claims use:
+
+```text
+(polymer, sequence_hash, database_id, search_identity)
+```
+
+Combined-MSA claims are path-scoped by `(polymer, sequence_hash)`. Template
+claims are path-scoped by protein `sequence_hash`.
+
+The desired dependency identity lives in the claim generation and completion
+marker, not in the flat-path claim key.
+
+A writer publishes only while it owns the current generation. Other requests
+wait, reload, and validate the marker rather than duplicating expensive work.
+
+Failed or conservatively expired work advances to another generation. Claims
+are not blindly deleted, so a superseded writer cannot replace a newer
+publication.
+
+### Caller evidence and deduplication
+
+Canonical database work is deduplicated by `(polymer, sequence)`. Generated
+canonical results may populate missing fields on identical-sequence chains.
+
+Caller-supplied MSAs and templates remain attached to their original chain.
+They are never copied to an identical sibling and never published into the
+shared sequence cache.
+
+A canonical combined MSA is published only when every constituent came from
+validated canonical raw results.
+
+A canonical template result is published only when its input was the canonical
+combined unpaired MSA. Mixed caller/generated assemblies and templates stay
+request-local.
+
+Canonical assembly results carry a content-bound reference to their flat
+`unpaired.a3m` publication. The coordinator verifies that the reference digest
+and size match the MSA text used to enrich the inference input. Cache loading
+reuses the digest and size from the completion marker after validating the
+artifact bytes, rather than hashing a large A3M a second time. The coordinator
+sends that small reference—not the A3M text—to a canonical template worker,
+which reloads the MSA cache Volume and validates the referenced path, size, and
+digest before searching. Caller-supplied MSA evidence remains inline and
+request-local.
+
+Request-local template work may be deduplicated only when both the protein
+sequence and resolved unpaired-MSA digest match.
+
+### Search policy
+
+The production entrypoint exposes `search_msa` and
+`search_protein_templates`, both defaulting to true.
+
+| MSA search | Template search | Field behavior |
+| --- | --- | --- |
+| On | On | Preserve non-empty fields and populate every missing MSA and protein template field. |
+| On | Off | Populate missing MSAs, preserve non-empty templates, and set missing or null protein templates to `[]`. |
+| Off | Either | Run no searches, preserve supplied fields, set missing MSAs to `""`, and set missing or null protein templates to `[]`. |
+
+With MSA search enabled, fields resolve independently:
+
+- missing protein unpaired MSA uses UniRef90, small BFD, and MGnify;
+- missing protein paired MSA uses UniProt only;
+- missing RNA unpaired MSA uses RFam, RNAcentral, and NT-RNA;
+- requested missing protein templates run after unpaired-MSA resolution.
+
+A non-empty field suppresses only the searches needed for that field. The app
+does not run unnecessary canonical searches merely to populate the cache.
+
+### Search worker topology
+
+The entrypoint replaces `search_chains_in_parallel` and
+`max_parallel_data_pipelines` with:
+
+```python
+max_parallel_search_workers: int = 4
+```
+
+This request-wide limit applies after duplicate sequences and valid cache hits
+are removed.
+
+The MSA phase schedules one Modal worker per missing
+sequence-by-database result. The worker owns all internal shard fanout and uses:
+
+- Modal CPU `(0.125, 32.125)`;
+- HMMER `n_cpu=2`;
+- at most 16 active shards;
+- direct read-only access to `AlphaFold3-msa-db-sharded`.
+
+The CPU floor may rise after measurements if non-search phases are starved.
+Such an operational change does not invalidate scientific cache entries.
+
+After all required MSAs finish, the template phase schedules one worker per
+unique required protein. It uses upstream's fixed eight-CPU hmmsearch and is
+not sharded.
+
+Both phases share the same worker budget and never overlap. There is no
+separate template-concurrency control initially.
+
+Read-only cache inspection is limited to four concurrent containers. Each
+inspector has 16 GiB of memory and can scale from 0.125 to 4.125 CPUs for large
+artifact validation and serialization. A template-cache inspection response is
+also capped at 1 GiB, both per stored result and in aggregate, before it crosses
+the Modal boundary.
+
+### Upstream assembly and RNA gate
+
+The app-owned adapter constructs combined alignments in pinned upstream order:
+
+- protein unpaired: UniRef90, small BFD, then MGnify with deduplication;
+- protein paired: UniProt without cross-database deduplication;
+- RNA unpaired: RFam, RNAcentral, then NT-RNA with deduplication.
+
+The first RNA fixture was the 25-nucleotide query:
+
+```text
+GGCCCGAUAGCUCAGUCGGUAGAGC
+```
+
+It returned no non-query hit from RFam, RNAcentral, or NT-RNA. Its monolithic
+and sharded query-only A3Ms matched, but that result does not exercise hit
+merging or deduplication and therefore cannot promote the RNA profiles.
+
+The first hit-bearing stress gate uses the following 121-nucleotide sequence
+from the official RFam 14.9 source record
+`ALWZ042362541.1/2041-2161` (with `T` represented as `U` for the AlphaFold RNA
+alphabet):
+
+```text
+GUGCAUGCCUAUAGCAUAUCAUUAAUGCACCAGAUCCCAUUAUAACUCCUCAUGUAAGCGUGCUCGAGAUAGAUUAGUACUGGGAUGGUUGACUGCAAAGGAAGUCUUAGUGUUUUACAUG
+```
+
+Because this is an exact member of the source database, the monolithic RFam
+result must contain at least one non-query hit. The gate still fails if it
+does not.
+
+That query produced 27,240 monolithic non-query hits. After the sharded Nhmmer
+merge was corrected to sort by printed E-value, descending printed bit score,
+and target ID, RFam and NT-RNA matched the monolith modulo equal-score
+permutations. RNAcentral saturated the 9,999-hit limit and retained one
+different cutoff row. The two alternatives have the same printed E-value and
+bit score but different identities and aligned sequences. HMMER's internal
+full-precision ranking value is rounded in `tblout`, so an exact monolithic
+cutoff cannot be reconstructed from stock shard outputs. A substituted row is
+not a permutation and does not pass this decision's scientific gate.
+
+The non-saturating promotion gate uses the following 119-nucleotide sequence
+from the exact official RFam 14.9 RAGATH-1 hammerhead ribozyme record
+`URS0000D698D3_12908/1-119`:
+
+```text
+AACUCAGCUAGGGAGAGUAGCGAGCAUUACGUAAUACUACGUAUUACUCCAAUAACAUUGUCACUGAUGAGACCUAGACGAAACUACGGUAAACAUUUGCAUCAUACUGUAGUCUGAUA
+```
+
+It must contain at least one monolithic RFam hit and must not rely on a
+saturated cutoff to pass.
+
+The RAGATH-1 oracle passed on 2026-07-24. Monolithic and sharded hit rows were
+exactly equal, including order, for RFam (three hits), RNAcentral (one hit),
+and NT-RNA (zero hits). The final deduplicated `unpairedMsa` was byte-exact at
+depth 4. This result promotes the fixed RNA profile search and merge method;
+it does not make the saturated Picea cutoff substitution equivalent.
+
+For RFam, RNAcentral, and NT-RNA separately, the oracle compares monolithic and
+sharded identities, scores, E-values, and aligned-sequence multisets using the
+same full-database Z.
+
+It also compares the final deduplicated RNA unpaired A3M. Only permutations
+inside exact equal-score groups are scientifically equivalent.
+
+Every selected RNA profile must pass against the exact pinned AlphaFold and
+HMMER behavior before production uses it.
+
+### Enriched input boundary
+
+The Biomodals coordinator is the complete CPU data stage. It fails closed when
+requested search evidence is incomplete.
+
+After all required MSAs and templates exist, it validates an Enriched AlphaFold
+Input and invokes upstream with:
+
+```text
+--run_data_pipeline=false
+--run_inference=true
+```
+
+The old `run_data_pipeline` subprocess and `copy_msa_to_ssd` path are removed.
+Upstream inference still performs input processing, featurization, model
+execution, and output writing.
+
+### Local path materialization
+
+Before remote work, a local helper resolves relative input paths against the
+input JSON's directory.
+
+The helper accepts only non-symlink regular files and performs bounded reads:
+64 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
+each custom mmCIF or user CCD. A file that changes while being read is rejected.
+Template counts are checked before any referenced template is opened, and the
+aggregate template ceiling is enforced after each read. Large caller MSAs
+therefore belong in the path-backed fields rather than the inline JSON
+document.
+
+It reads protein and RNA `unpairedMsaPath`, protein `pairedMsaPath`, and
+template `mmcifPath` fields into inline strings, then clears every path field.
+All templates are therefore self-contained before the input leaves the local
+machine.
+
+It reads `userCCDPath` into inline `userCCD` and clears the path. CCD content,
+not its source path, participates in inference identity.
+
+Every inline/path pair is mutually exclusive. Simultaneously populated forms
+are rejected as ambiguous.
+
+The same local preflight mirrors upstream's inexpensive structural checks that
+UniAF3 does not yet enforce: a safe nonempty name, nonempty unique uppercase
+chain IDs, letter-only protein/RNA/DNA sequences, no `CCD_` modification
+prefixes, no more than 20 protein templates, and nonempty unsigned 32-bit model
+seeds. Template mmCIF strings must also be nonempty. Invalid inputs fail before
+the first Modal call. The worker repeats the preflight before invoking upstream.
+
+The supported request envelope is also explicit: at most 5,120 expanded
+entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
+tasks, 1 GiB across inline template fields, and 1 GiB each for the serialized
+staged input and run-identity document. The 5,120 bounds align with the largest
+default AlphaFold 3 compilation bucket documented by the pinned upstream
+revision. The CPU coordinator checks the conservative task upper bound before
+cache inspection. The directly callable MSA/template workers repeat the
+5,120-residue query, 512-task inspection, and canonical assembly-shape checks
+before accessing mounted Volumes. Inference workers likewise repeat all
+staged-artifact byte checks when loading from the output Volume.
+
+For each mmCIF, the identity representation substitutes the full content digest
+while retaining `queryIndices` and `templateIndices`. Caller inline and
+path-backed submissions therefore produce the same scientific `run_id` and
+canonical staged input. Database-search templates already use the same inline
+representation. No template mmCIF is copied into the output Volume as a
+standalone file; source database files remain only in the read-only MSA
+database Volume.
+
+### Staged inference input
+
+Input staging publishes deterministic payloads before a compact completion
+marker:
+
+```text
+inputs/identity.json
+requests/{request_id}/input.json
+requests/{request_id}/staged-input.json
+```
+
+`inputs/identity.json` is compact identity evidence: large MSA, `userCCD`, and
+template mmCIF strings are represented by byte size and SHA-256 rather than
+duplicated. `requests/{request_id}/input.json` remains the complete runnable
+enriched input, including every template mmCIF. The marker records the path,
+byte size, and SHA-256 of both documents and is committed last. An exact
+existing marker causes repeat staging to validate every declared payload;
+missing or corrupt deterministic payloads are republished before the marker is
+reasserted. Existing payloads and the marker are compared as bounded streams
+against their expected bytes; a mismatch or extra byte stops the read. A marker
+mismatch at the same immutable path is an error.
+
+The app-controlled Volume mountpoint may itself be a symlink, as it can be in a
+Modal container, but staged artifact paths beneath that root may not traverse
+symlinks.
+
+GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
+the staged-marker record. Each loads the marker-bound input from the output
+Volume, validates every payload, requires every template to be inline with no
+`mmcifPath`, recomputes the request identity, and re-derives the run identity
+before using the input. Before reading a staged artifact, the loader requires
+its filesystem size to match the marker and then reads at most the declared
+size plus one byte, so a corrupt marker or changing file cannot bypass the byte
+ceilings. A caller therefore cannot publish outputs under one run while
+supplying another run's input.
+
+This canonical inline representation is staged-input schema version 2 and
+run-identity schema v3. The versioned invocation/run identities prevent older
+path-backed staged inputs from colliding with this layout.
+
+After preparation, recycle and diffusion-sample counts are read only from the
+prepared/staged request. Coordinator and executor APIs do not accept duplicate
+copies of those parameters, eliminating representational mismatch states.
+
+### Inference identity
+
+An app-local `hash_sequences` helper derives `run_id` from the normalized
+Inference Identity View and seed-independent inference fragments.
+
+The view validates through `AF3Config`, dumps defaults explicitly, removes only
+`name` and `modelSeeds`, and replaces large MSA, mmCIF, and custom CCD strings
+with content digests and byte sizes.
+
+It retains the content identity of sequence order, chain IDs, descriptions,
+modifications, bonds, MSAs, templates and mappings, custom CCD, dialect, schema
+version, and every other validated input field.
+
+Additional fragments cover recycle count, diffusion-sample count, pinned app
+and upstream identity, a code-owned model checkpoint label, and the
+run-identity schema label.
+
+Run identity excludes display name, model seeds, GPU accelerator class and
+count, worker counts, container partitioning, search policy, and local or
+remote paths.
+
+The GPU class may be recorded as provenance. Cache reuse accepts small
+hardware-dependent floating-point differences and does not promise bitwise
+reproducibility across supported accelerators.
+
+The app does not hash `af3.bin`. The declared checkpoint label and pinned app
+identity treat the model file as immutable in place.
+
+Replacing model weights in place without changing the label can reuse old
+predictions. An intentional replacement must bump the label or explicitly
+clear affected run cache entries.
+
+The shared model Volume is mounted read-only during inference. JAX compilation
+artifacts use the separate v2 `AlphaFold3-jax-cache` Volume under a directory
+named for the pinned AlphaFold commit. JAX cache keys already include the
+`jaxlib` version, XLA flags, and device topology; the commit namespace keeps
+application revisions operationally distinct without making the compilation
+cache part of Run Identity.
+
+### Run and request layout
+
+The AlphaFold3 output Volume stores each run directly at:
+
+```text
+/{run_id[:2]}/{run_id}/
+```
+
+There is no top-level `runs/` directory. The run root contains:
+
+```text
+inputs/identity.json
+outputs/
+outputs/.workers/{claim-generation}/
+requests/{request_id}/input.json
+requests/{request_id}/staged-input.json
+requests/{request_id}/views/{view_id}/manifest.json
+.markers/seeds/{seed}.json
+.markers/summary.json
+logs/
+```
+
+The Volume root also contains exact-invocation receipts outside run roots:
+
+```text
+/invocations/{invocation_id[:2]}/{invocation_id}.json
+```
+
+`run_id` identifies one enriched input and seed-independent inference
+configuration. Different seed requests and display names share the same run
+root.
+
+The submitted seed list must be non-empty. It is normalized to a sorted unique
+set before computation identity, reconciliation, or scheduling. One invocation
+may produce at most 1,000 seed/sample pairs after normalization. The
+accumulated summary may grow beyond that ceiling through multiple valid
+requests. Inference controls are bounded both before scheduling and again in
+the worker: model seeds are unsigned 32-bit integers, recycles are 0--100,
+diffusion samples are 1--100, and `max_num_gpus` is 1--100. Seed-cache
+inspection, seed claiming, and request publication independently repeat the
+seed, sample, and per-request workload checks before touching the output
+Volume.
+
+`request_id` is derived with `hash_sequences` from `run_id` and the canonical
+normalized seed list. It identifies one computational seed request, not a seed
+cache entry.
+
+`view_id` is separately derived from `request_id`, the submitted seed list
+including order and duplicates, and the caller display name. It identifies one
+stable durable presentation of that request. Exact reruns therefore select the
+same immutable manifest, while different presentations of the same normalized
+seed set do not overwrite one another.
+
+`invocation_id` is available before enrichment. It hashes the compact submitted
+input identity, display name and submitted seed order, search switches and
+scientific search contracts, inference parameters, publication schemas, pinned
+application/upstream identity, and declared model identity. Operational
+scheduling knobs such as search-worker and GPU-worker limits are excluded.
+After a request manifest has been published, a deterministic immutable receipt
+binds this exact invocation to that manifest's path, byte size, and SHA-256.
+The manifest is always durable before its receipt. Receipt publication and
+loading enforce the same 64 MiB manifest ceiling, and manifest validation
+applies the seed/sample workload limit before expanding expected ranking rows.
+
+An exact receipt hit is the earliest fast path: the local entrypoint validates
+the receipt and referenced manifest directly through the output Volume, skips
+MSA/template resolution, input staging, seed inspection, GPU workers, summary
+finalization, and request publication, then builds or reuses the local archive.
+If no receipt exists, enrichment proceeds. Once enrichment yields `run_id` and
+`request_id`, a valid existing request manifest is the second fast path: it
+skips staging and all inference-side remote calls. That invocation then
+publishes its missing receipt for future pre-enrichment hits.
+
+### Seed claims and inference workers
+
+Before scheduling, the coordinator trusts each matching Seed Completion Marker.
+Directory existence or an earlier request manifest is not completion evidence.
+
+Requested marked seeds are reused. Each unmarked `(run_id, seed)` is elected
+through an append-only Seed Build Claim using atomic Dict insertion.
+
+Claims are acquired per seed before owned seeds are grouped into at most
+`max_num_gpus` disjoint, balanced worker lists. The same seed is never assigned
+to two workers.
+
+A GPU invocation validates its serialized claim identities before loading the
+staged input. From that point, an outer claim guard covers staged-input loading,
+worker preflight, and prediction publication. Any catchable failure appends a
+failed terminal status for each still-active generation without changing claims
+already completed by the marker-last worker. A hard container loss still relies
+on conservative age-based abandonment.
+
+A GPU container may receive multiple seeds, matching upstream
+`process_fold_input` behavior.
+
+Each worker writes upstream output into exclusive
+`outputs/.workers/{claim-generation}/` staging. Concurrent upstream processes
+never share an output directory.
+
+The worker input uses the Canonical Output Name:
+
+```text
+af3-{run_id[:16]}
+```
+
+The pinned model discards that target name before inference, so it does not
+change scientific computation. It does make every durable output basename
+independent of the caller's display name.
+
+After upstream exits successfully, the wrapper promotes only assigned
+seed-specific sample, embedding, and distogram directories into shared
+`outputs/`.
+
+It checks the complete expected output for every assigned seed before
+promotion.
+
+It commits those directories, then writes one Seed Completion Marker per seed
+last. Worker-local shared ranking and best files are not canonical.
+
+The marker binds run, seed, and owning claim generation. It also stores
+`(sample_index, ranking_score)` rows for summary reconstruction.
+
+The marker is deliberately not an artifact inventory. Reconciliation trusts it
+without scanning sample files, recomputing digests, or parsing confidence
+outputs.
+
+A directory without a marker is incomplete and that whole seed reruns later.
+Post-publication artifact corruption is an accepted risk.
+
+### Global and request summaries
+
+The Inference Run Summary covers the accumulated union of every marked Seed
+Prediction under the run root. Later requests may add seeds but never remove
+previously summarized seeds.
+
+A path-scoped Summary Build Claim serializes finalization. The finalizer reloads
+markers after taking ownership and builds from that exact completed-seed union.
+Summary claims use a lease bounded slightly above the one-hour summary
+function, independently of the longer GPU-seed claim lifetime, so a preempted
+summary cannot block recovery for nearly a full inference timeout.
+
+It publishes ranking and global-best files before writing the summary marker
+last. It may publish only if its seed set contains every seed in the current
+summary marker.
+
+The summary also publishes the canonical enriched data JSON. Its marker binds
+the exact included seed set and the summary artifact digests.
+
+The finalizer does not wait for unrelated in-flight seeds. A later owner
+incorporates additional markers.
+
+Request and global rankings use the same deterministic order:
+
+1. descending `ranking_score`;
+2. ascending model seed;
+3. ascending sample index.
+
+The first row supplies the corresponding best files. Equal-score samples remain
+scientifically equivalent; the tie-breakers only stabilize presentation.
+
+### Request-scoped results
+
+Every successful presentation publishes one stable manifest at
+`requests/{request_id}/views/{view_id}/manifest.json` with:
+
+- a manifest referencing the canonical enriched input;
+- request-seed ranking rows and direct references to canonical best files;
+- submitted and normalized seeds plus duplicates removed;
+- references to all requested canonical Seed Predictions;
+- the canonical-to-presentation name mapping.
+
+It does not copy seed directories, ranking CSVs, best aliases, terms, or
+database template files, and it does not include unrelated completed seeds. No
+request archive is retained on the output Volume.
+
+The manifest contains only identity-stable fields and each selected artifact's
+byte size and SHA-256. It deliberately excludes publication timestamps,
+new-versus-reused execution outcomes, and the mutable accumulated run summary.
+An exact rerun validates and returns the existing manifest without rescanning
+or republishing prediction artifacts.
+
+Remote functions return compact Volume-relative metadata, never prediction
+tarballs as function-result bytes.
+
+The local entrypoint downloads only manifest-declared canonical artifacts,
+generates the request ranking CSV and best aliases locally, and constructs:
+
+```text
+{presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst
+```
+
+The presentation name is the sanitized caller display name. Downloaded
+basenames replace the canonical run prefix with this presentation prefix;
+durable Volume files remain unchanged.
+
+Downloads hash each chunk while writing and stop before a chunk would exceed
+the manifest-declared size. Unchanged archive members reuse that verified
+source size and digest; only the locally rewritten input is read again for its
+presentation-specific identity.
+
+The archive includes every requested seed/sample directory, optional embeddings
+and distograms, locally generated request ranking and best aliases, enriched
+input, and manifest. Caller and database-search template mmCIF content remains
+inline in that enriched input; the archive has no `custom-templates/`
+directory.
+
+Each streamed artifact must match both its declared byte size and SHA-256.
+The embedded presentation manifest also records the size and SHA-256 of each
+archive-local artifact after input rewriting. The durable request-view manifest
+records the rewritten input's expected size and digest when the view is
+published. Existing archives are therefore streamed locally once and reused
+only when their exact member set, presentation manifest, and all payload
+digests match the current request; the staged input is not reread from the
+Modal Volume. Changing both a payload and its embedded digest therefore does
+not make a repacked archive valid. A corrupt, stale, or otherwise mismatched
+archive causes a clear failure instead of silent overwrite.
+
+### Failure and retry behavior
+
+Modal may reschedule infrastructure and container failures. The app adds no
+retry loop for surfaced HMMER, template, upstream, timeout, or deterministic
+failures.
+
+A failed search request reports exact incomplete database and template tasks.
+It does not build dependent combined MSAs, enrich the input, or start inference.
+
+A failed inference request reports marked and unmarked requested seeds. It may
+refresh the global summary for successful siblings but does not publish a
+successful request result or local archive.
+
+A later explicit invocation reuses valid raw searches, template results, and
+seed markers, then claims only missing work.
+
+This preserves partial progress while requiring the caller to authorize another
+potentially costly attempt.
+
+### Validation and promotion
+
+The generic sharding method, the four-database protein oracle, the
+three-database RNA oracle, and the integrated protein path have passed. Their
+historical evidence is retained in research documents; the temporary
+validation app itself is no longer part of the runtime.
+
+Production contains only the fixed builder, search, merge, cache, enrichment,
+inference, and request-result paths. It contains no benchmark campaigns,
+sample identities, timing summaries, or retained per-shard evidence.
+
+No cost-incurring Modal build, search, or inference job is submitted without
+explicit user permission.
+
+Production uses a profile directly after successful publication and required
+scientific gates. Normal searches do not revalidate it.
+
+## Consequences
+
+Successful database searches, template results, and seed predictions survive
+later explicit reruns at useful scientific boundaries.
+
+Prediction-time direct Volume reads avoid a full database copy for every query.
+The one-time profile builder accepts ephemeral SSD capacity as the tradeoff for
+tractable shuffling. Fixed immutable profiles make search provenance
+reviewable.
+
+The design adds app-owned orchestration, completion markers, claims, and
+upstream contract coupling. It intentionally keeps that state above the pinned
+AlphaFold implementation.
+
+The following risks are accepted:
+
+- a preempted database worker reruns all shards for that database;
+- an unmarked partial seed reruns in full;
+- trusted seed markers do not detect later artifact corruption;
+- model weights and template reference files rely on operator immutability;
+- supported GPU classes may produce non-bitwise-identical cached seeds;
+- surfaced failures require another explicit request.
+
+The initial implementation does not include:
+
+- per-shard durable retries;
+- compressed runtime shards or prediction-time SSD staging;
+- automatic source-archive restoration;
+- mutable profile aliases or automatic database upgrades;
+- normal-search shard audits;
+- automatic app-level retry loops;
+- GPU-specific run identities;
+- post-publication seed artifact inventories.

@@ -2,13 +2,32 @@
 
 ## Additional notes
 
-This script only provides a runtime for AlphaFold3.
-To acquire the model weights and MSA databases, please follow instructions at:
+This app provides the AlphaFold3 runtime and a separate, plan-only-by-default
+entrypoint for building its fixed sharded genetic-database profiles. Follow
+upstream's instructions to acquire the model weights and source databases:
 
 <https://github.com/google-deepmind/alphafold3#obtaining-model-parameters>
 
-Make sure the model checkpoint is available at `/AlphaFold3/af3.bin` in the `biomodals-store` volume,
-and the MSA databases are available at the `AlphaFold3-msa-db` volume.
+<https://github.com/google-deepmind/alphafold3/blob/main/docs/installation.md#obtaining-genetic-databases>
+
+The model checkpoint must be available at `/AlphaFold3/af3.bin` in the
+`biomodals-store` Volume. Put the upstream genetic database files in
+`AlphaFold3-msa-db`, then use `setup_sharded_databases` to populate the
+separate `AlphaFold3-msa-db-sharded` Volume before running searches.
+
+## Examples
+
+Inspect the database-build plan without submitting paid work:
+
+`uv run biomodals app run alphafold3::setup_sharded_databases`
+
+After reviewing that plan, build all missing profiles explicitly:
+
+`uv run biomodals app run alphafold3::setup_sharded_databases --submit`
+
+Run prediction and download the request-scoped archive:
+
+`uv run biomodals app run alphafold3::submit_alphafold3_task --input-json input.json --out-dir outputs`
 
 See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general docs.
 
@@ -17,44 +36,118 @@ See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general d
 See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 """
 
-# Ignore ruff warnings about import location
-# ruff: noqa: PLC0415
-
 import os
-import shutil
-from dataclasses import dataclass
-from pathlib import Path
-from tempfile import TemporaryDirectory
+import uuid
+from pathlib import Path, PurePosixPath
 
 import modal
 import orjson
-from uniaf3.schema.alphafold3 import (
-    AF3RNA,
-    AF3Config,
-    AF3Protein,
-    AF3SequenceEntry,
-    AF3Template,
-)
+from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.config import AppConfig
-from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    ALPHAFOLD3_APP_VERSION,
+    LoadedInferenceInput,
+    PreparedInferenceRun,
+    load_staged_inference_input,
+    materialize_local_input,
+    prepare_inference_run,
+    sanitize_af3_name,
+    validate_inference_parameters,
+    validate_inference_worker_budget,
+    validate_inference_workload,
+)
+from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
+from biomodals.app.fold.alphafold3.invocation_cache import (
+    build_invocation_receipt,
+    load_invocation_manifest,
+    prepare_invocation,
+)
+from biomodals.app.fold.alphafold3.modal_adapters import (
+    ModalInferenceExecutor,
+    ModalSearchExecutor,
+    execute_profile_setup,
+    publish_invocation_receipt,
+    stage_inference_run,
+)
+from biomodals.app.fold.alphafold3.msa_search import (
+    MSA_SEARCH_CLAIM_DICT_NAME,
+    MsaArtifactReference,
+    MsaAssemblyTask,
+    Polymer,
+    RawSearchTask,
+    SearchRuntime,
+    assemble_and_publish_msas,
+    inspect_msa_cache,
+    run_database_search,
+    sequence_cache_relpath,
+    validate_msa_assembly_task,
+    validate_polymer_query,
+    validate_query,
+    validate_remote_search_task_count,
+)
+from biomodals.app.fold.alphafold3.profile_builder import (
+    ProfileBuilderRuntime,
+    build_profile,
+    finalize_profile_setup,
+    inspect_profile_registry,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    ALPHAFOLD3_COMMIT,
+    ALPHAFOLD3_REPOSITORY,
+    BUILD_MEMORY_MIB,
+    BUILD_TIMEOUT_SECONDS,
+    DEFAULT_SEQKIT_THREADS,
+    PROFILE_BUILD_CLAIM_DICT_NAME,
+    PROFILE_BUILD_CPU,
+    PROFILE_BUILD_MAX_CONTAINERS,
+    SEQKIT_VERSION,
+    SHARDED_DB_VOLUME_NAME,
+    SourcePolicy,
+    plan_profile_setup,
+)
+from biomodals.app.fold.alphafold3.request_results import (
+    RequestPublication,
+    create_request_archive,
+    load_request_manifest,
+    publish_request_results,
+    request_manifest_from_result,
+    request_publication_from_manifest,
+)
+from biomodals.app.fold.alphafold3.search_pipeline import (
+    resolve_msa_and_templates,
+    validate_search_worker_budget,
+)
+from biomodals.app.fold.alphafold3.seed_predictions import (
+    SEED_PREDICTION_CLAIM_DICT_NAME,
+    InferenceRuntime,
+    claim_seed_predictions,
+    guard_seed_prediction_claims,
+    inspect_seed_predictions,
+)
+from biomodals.app.fold.alphafold3.sharding import (
+    CONTAINER_NATIVE_SOURCE_DIR,
+    NATIVE_SOURCE_DIR_ENV,
+)
+from biomodals.app.fold.alphafold3.template_search import (
+    DEFAULT_MAX_TEMPLATE_DATE,
+    TemplateRuntime,
+    TemplateTask,
+    inspect_template_entries,
+    run_template_search,
+)
+from biomodals.app.fold.alphafold3.upstream_inference import (
+    UpstreamInferenceRuntime,
+    finalize_upstream_run_summary,
+    run_upstream_seed_worker,
+)
+from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
     MSA_CACHE_VOLUME,
-    MSA_CACHE_VOLUME_NAME,
 )
-from biomodals.helper.io import (
-    build_local_output_path,
-    resolve_local_output_dir,
-    write_local_tarball,
-)
-from biomodals.helper.shell import (
-    copy_files,
-    package_outputs,
-    run_command,
-)
-from biomodals.helper.task_budget import bounded_map
+from biomodals.helper.io import resolve_local_output_dir
 
 ##########################################
 # Modal configs
@@ -62,32 +155,30 @@ from biomodals.helper.task_budget import bounded_map
 CONF = AppConfig(
     tags={"group": Path(__file__).parent.name},
     name="AlphaFold3",
-    repo_url="https://github.com/y1zhou/alphafold3",
-    repo_commit_hash="987ad1cb7d7028b6d35908cf63fe7d951d98d6b6",
+    repo_url=ALPHAFOLD3_REPOSITORY,
+    repo_commit_hash=ALPHAFOLD3_COMMIT,
     package_name="alphafold3",
-    version="3.0.2",
+    version=ALPHAFOLD3_APP_VERSION,
     python_version="3.12",
     cuda_version="cu130",
     gpu=os.environ.get("GPU", "L40S"),
     timeout=int(os.environ.get("TIMEOUT", "21600")),
 )
 
-
-@dataclass
-class AppInfo:
-    """Container for AlphaFold3-specific information and configurations."""
-
-    # Volume mount path for genetic search databases
-    msa_db_dir: str = f"/{CONF.name}-msa-db"
-    # Volume mount path for MSA output cache
-    msa_cache_dir: str = f"/{MSA_CACHE_VOLUME_NAME}"
-    msa_cache_volume_subdir: str = f"/{CONF.name}"
-
-
 ##########################################
 # Image and app definitions
 ##########################################
-APP_INFO = AppInfo()
+SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
+    SHARDED_DB_VOLUME_NAME,
+    create_if_missing=True,
+    version=2,
+)
+_JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
+_SUMMARY_TIMEOUT_SECONDS = 3600
+MSA_SEARCH_CLAIMS = modal.Dict.from_name(
+    MSA_SEARCH_CLAIM_DICT_NAME,
+    create_if_missing=True,
+)
 
 # Ref: https://github.com/google-deepmind/alphafold3/blob/main/docker/Dockerfile
 runtime_image = (
@@ -134,468 +225,599 @@ runtime_image = (
     .run_commands("build_data")  # installed in the previous step
     .env({"PATH": "/hmmer/bin:$PATH"})
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.alphafold3")
 )
+
+# Database preparation does not need the AlphaFold runtime or model stack.
+sharding_image = (
+    modal.Image
+    .micromamba(python_version=CONF.python_version)
+    .apt_install("build-essential", "zstd")
+    .micromamba_install(
+        f"seqkit={SEQKIT_VERSION}",
+        channels=["conda-forge", "bioconda"],
+    )
+    .run_commands("seqkit version")
+    .add_local_dir(
+        Path(__file__).parent / "alphafold3" / "native",
+        str(CONTAINER_NATIVE_SOURCE_DIR),
+        copy=True,
+    )
+    .env({NATIVE_SOURCE_DIR_ENV: str(CONTAINER_NATIVE_SOURCE_DIR)})
+    .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.alphafold3")
+)
+
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+_CONTAINER_INSTANCE_ID = uuid.uuid4().hex
+_PROFILE_BUILDER_RUNTIME = ProfileBuilderRuntime(
+    output_root=Path(CONF.output_volume_mountpoint),
+    source_volume=AF3_MSA_DB_VOLUME,
+    sharded_volume=SHARDED_MSA_DB_VOLUME,
+    output_volume=CONF.output_volume,
+    claims=modal.Dict.from_name(
+        PROFILE_BUILD_CLAIM_DICT_NAME,
+        create_if_missing=True,
+    ),
+    container_id=_CONTAINER_INSTANCE_ID,
+)
+_INFERENCE_RUNTIME = InferenceRuntime(
+    output_root=Path(CONF.output_volume_mountpoint),
+    volume=CONF.output_volume,
+    claims=modal.Dict.from_name(
+        SEED_PREDICTION_CLAIM_DICT_NAME,
+        create_if_missing=True,
+    ),
+    container_id=_CONTAINER_INSTANCE_ID,
+    maximum_age_seconds=MAX_TIMEOUT + 900,
+    summary_maximum_age_seconds=_SUMMARY_TIMEOUT_SECONDS + 900,
+    wait_timeout_seconds=max(60, MAX_TIMEOUT - 60),
+)
+
+
+@app.function(
+    image=sharding_image,
+    cpu=PROFILE_BUILD_CPU,
+    memory=BUILD_MEMORY_MIB,
+    timeout=BUILD_TIMEOUT_SECONDS,
+    max_containers=PROFILE_BUILD_MAX_CONTAINERS,
+    volumes={
+        ProfileBuilderRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME,
+        ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
+        CONF.output_volume_mountpoint: CONF.output_volume,
+    },
+)
+def build_sharded_database(
+    database_id: str,
+    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+    source_policy: SourcePolicy = "keep",
+) -> dict[str, object]:
+    """Build one fixed immutable database profile."""
+    return build_profile(
+        _PROFILE_BUILDER_RUNTIME,
+        database_id,
+        seqkit_threads,
+        source_policy,
+    )
+
+
+@app.function(
+    image=sharding_image,
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        ProfileBuilderRuntime.SHARDED_MOUNT: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
+        ),
+    },
+)
+def inspect_sharded_database_profiles() -> dict[str, object]:
+    """Inspect all fixed profile manifests without expensive digest scans."""
+    SHARDED_MSA_DB_VOLUME.reload()
+    return inspect_profile_registry(Path(ProfileBuilderRuntime.SHARDED_MOUNT))
+
+
+@app.function(
+    image=sharding_image,
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
+        CONF.output_volume_mountpoint: CONF.output_volume,
+    },
+)
+def finalize_sharded_database_setup() -> dict[str, object]:
+    """Clean abandoned and unselected profiles after all builders complete."""
+    return finalize_profile_setup(_PROFILE_BUILDER_RUNTIME)
 
 
 ##########################################
-# Helper functions
+# MSA search functions
 ##########################################
-def _load_conf_from_bytes(json_bytes: bytes) -> AF3Config:
-    """Load AlphaFold3 config from JSON bytes."""
-    with TemporaryDirectory() as temp_dir:
-        f = Path(temp_dir) / "config.json"
-        f.write_bytes(json_bytes)
-        return AF3Config.from_file(f)
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=16384,
+    timeout=600,
+    max_containers=4,
+    volumes={
+        SearchRuntime.SHARDED_MOUNT: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
+        ),
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
+        ),
+    },
+)
+def inspect_msa_search_cache(
+    raw_inputs: list[tuple[str, str]],
+    assembly_inputs: list[tuple[Polymer, str, bool, bool]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Prefer complete combined MSAs, then deep-check uncovered raw results."""
+    validate_remote_search_task_count(len(raw_inputs) + len(assembly_inputs))
+    raw_tasks = tuple(
+        RawSearchTask(database_id=database_id, sequence=sequence)
+        for database_id, sequence in raw_inputs
+    )
+    assembly_tasks = tuple(
+        MsaAssemblyTask(
+            polymer=polymer,
+            sequence=sequence,
+            include_unpaired=include_unpaired,
+            include_paired=include_paired,
+        )
+        for polymer, sequence, include_unpaired, include_paired in assembly_inputs
+    )
+    for task in raw_tasks:
+        validate_query(task.spec, task.sequence)
+    for task in assembly_tasks:
+        validate_msa_assembly_task(task, require_canonical=True)
+    SHARDED_MSA_DB_VOLUME.reload()
+    MSA_CACHE_VOLUME.reload()
+    return inspect_msa_cache(
+        Path(SearchRuntime.SHARDED_MOUNT),
+        Path(SearchRuntime.CACHE_MOUNT),
+        raw_tasks,
+        assembly_tasks,
+    )
 
 
-def _load_msa_cache(seq: AF3Protein | AF3RNA, msa_cache_dir: Path) -> Path:
-    """Fetch MSA from cache if available."""
-    seq_hash = hash_string(seq.sequence)
-    seq_msa_cache_dir = msa_cache_dir / seq_hash[:2] / seq_hash
-    unpaired_msa_path = seq_msa_cache_dir / "unpaired.a3m"
-    if isinstance(seq, AF3Protein):
-        # If either MSA path is not empty, skip cache lookup because the
-        # data likely does not come from AF3 query data_pipeline
-        if seq.pairedMsaPath is not None or seq.unpairedMsaPath is not None:
-            return seq_msa_cache_dir
-
-        # When the config does not contain MSA, and cache file exists,
-        # add the MSA from cache
-        if unpaired_msa_path.exists() and seq.unpairedMsa is None:
-            seq.unpairedMsa = unpaired_msa_path.read_text()
-
-        paired_msa_path = seq_msa_cache_dir / "paired.a3m"
-        if paired_msa_path.exists() and seq.pairedMsa is None:
-            seq.pairedMsa = paired_msa_path.read_text()
-
-        template_json_path = seq_msa_cache_dir / "templates.json"
-        if template_json_path.exists() and seq.templates is None:
-            templates = orjson.loads(template_json_path.read_bytes())
-            seq.templates = [AF3Template(**t) for t in templates]
-
-        # https://github.com/google-deepmind/alphafold3/blob/main/docs/input.md#multiple-sequence-alignment
-        # If only one of the MSA is set, remove them as a rerun is needed anyway
-        # We only check for None cases because it's ok to have unpaired MSA filled,
-        # and paired MSA being explicitly empty ("")
-        if not (seq.unpairedMsa is not None and seq.pairedMsa is not None):
-            seq.unpairedMsa = None
-            seq.pairedMsa = None
-    elif isinstance(seq, AF3RNA):
-        # RNA does not have paired MSA, so checking unpaired MSA is sufficient
-        if seq.unpairedMsaPath is not None:
-            return seq_msa_cache_dir
-        if unpaired_msa_path.exists() and seq.unpairedMsa is None:
-            seq.unpairedMsa = unpaired_msa_path.read_text()
-    else:
-        raise TypeError(f"Expected AF3Protein or AF3RNA, got {type(seq)}")
-
-    return seq_msa_cache_dir
+def _msa_search_runtime(
+    *,
+    maximum_age_seconds: int | float,
+    wait_timeout_seconds: int | float,
+) -> SearchRuntime:
+    """Bind shared search code to production mounts and persistence objects."""
+    return SearchRuntime(
+        sharded_volume=SHARDED_MSA_DB_VOLUME,
+        cache_volume=MSA_CACHE_VOLUME,
+        claims=MSA_SEARCH_CLAIMS,
+        container_id=_CONTAINER_INSTANCE_ID,
+        maximum_age_seconds=maximum_age_seconds,
+        wait_timeout_seconds=wait_timeout_seconds,
+    )
 
 
-def _save_msa_cache(seq: AF3Protein | AF3RNA, seq_msa_cache_dir: Path) -> None:
-    """Save MSA results to cache files."""
-    seq_msa_cache_dir.mkdir(parents=True, exist_ok=True)
-    unpaired_msa_path = seq_msa_cache_dir / "unpaired.a3m"
-    if not unpaired_msa_path.exists() and seq.unpairedMsa is not None:
-        unpaired_msa_path.write_text(seq.unpairedMsa)
-    if isinstance(seq, AF3Protein):
-        if seq.pairedMsa is not None:
-            paired_msa_path = seq_msa_cache_dir / "paired.a3m"
-            paired_msa_path.write_text(seq.pairedMsa)
-        if (tmpl := seq.templates) is not None and tmpl:
-            import orjson
-
-            templates_path = seq_msa_cache_dir / "templates.json"
-            templates_path.write_bytes(orjson.dumps(tmpl))
-
-
-def _cache_conf_unpaired_msa(conf: AF3Config, msa_cache_dir: Path) -> AF3Config:
-    """Cache MSA results in separate files for future reuse.
-
-    If cache files are found, read and add them to the config object.
-    """
-    for seq in conf.sequences:
-        if (prot_chain := seq.protein) is not None:
-            prot_msa_dir = _load_msa_cache(prot_chain, msa_cache_dir)
-            # When the config is from the data pipeline, cache MSA results
-            _save_msa_cache(prot_chain, prot_msa_dir)
-        elif (rna_chain := seq.rna) is not None:
-            rna_msa_dir = _load_msa_cache(rna_chain, msa_cache_dir)
-            _save_msa_cache(rna_chain, rna_msa_dir)
-    return conf
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 131_072),
+    timeout=CONF.timeout,
+    volumes={
+        SearchRuntime.SHARDED_MOUNT: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
+        ),
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
+        ),
+    },
+)
+def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
+    """Search one fixed sharded database with database-level resume."""
+    return run_database_search(
+        _msa_search_runtime(
+            maximum_age_seconds=CONF.timeout + 900,
+            wait_timeout_seconds=max(60, CONF.timeout - 60),
+        ),
+        database_id,
+        sequence,
+    )
 
 
-def _af3_sanitised_name(name: str) -> str:
-    """Return sanitised version of the name that can be used as a filename."""
-    import string
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=(1024, 32_768),
+    timeout=1800,
+    volumes={
+        SearchRuntime.SHARDED_MOUNT: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
+        ),
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
+        ),
+    },
+)
+def assemble_sequence_msas(
+    polymer: Polymer,
+    sequence: str,
+    include_unpaired: bool,
+    include_paired: bool,
+) -> dict[str, object]:
+    """Assemble requested fields with pinned upstream deduplication."""
+    if polymer not in {"protein", "rna"}:
+        raise ValueError(f"Unsupported polymer: {polymer!r}")
+    return assemble_and_publish_msas(
+        _msa_search_runtime(
+            maximum_age_seconds=2700,
+            wait_timeout_seconds=1740,
+        ),
+        MsaAssemblyTask(
+            polymer=polymer,
+            sequence=sequence,
+            include_unpaired=include_unpaired,
+            include_paired=include_paired,
+        ),
+    )
 
-    spaceless_name = name.replace(" ", "_")
-    allowed_chars = set(string.ascii_letters + string.digits + "_-.")
-    return "".join(x for x in spaceless_name if x in allowed_chars)
+
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=16384,
+    timeout=600,
+    max_containers=4,
+    volumes={
+        TemplateRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
+        ),
+    },
+)
+def inspect_protein_template_cache(
+    inputs: list[tuple[str, str, str]],
+) -> list[dict[str, object]]:
+    """Inspect canonical template markers without consuming search workers."""
+    validate_remote_search_task_count(len(inputs))
+    for sequence, _, _ in inputs:
+        validate_polymer_query("protein", sequence)
+    MSA_CACHE_VOLUME.reload()
+    return inspect_template_entries(
+        Path(TemplateRuntime.CACHE_MOUNT),
+        tuple(inputs),
+    )
 
 
-def _fill_missing_msa_for_inference(conf: AF3Config) -> AF3Config:
-    """Mark bare sequences as single-sequence inference inputs."""
-    for seq in conf.sequences:
-        if (protein := seq.protein) is not None:
-            if protein.unpairedMsa is None and protein.unpairedMsaPath is None:
-                protein.unpairedMsa = ""
-            if protein.pairedMsa is None and protein.pairedMsaPath is None:
-                protein.pairedMsa = ""
-            if protein.templates is None:
-                protein.templates = []
-        elif (rna := seq.rna) is not None:
-            if rna.unpairedMsa is None and rna.unpairedMsaPath is None:
-                rna.unpairedMsa = ""
-    return conf
+@app.function(
+    cpu=(0.125, 8.125),
+    memory=(1024, 32_768),
+    timeout=CONF.timeout,
+    volumes={
+        TemplateRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path="/",
+        ),
+        TemplateRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
+        ),
+    },
+)
+def search_protein_templates(
+    sequence: str,
+    unpaired_msa: str | None,
+    unpaired_msa_reference: dict[str, object] | None,
+    publish_canonical: bool,
+    max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
+) -> dict[str, object]:
+    """Search templates from one resolved protein unpaired MSA."""
+    return run_template_search(
+        TemplateRuntime(
+            source_volume=AF3_MSA_DB_VOLUME,
+            cache_volume=MSA_CACHE_VOLUME,
+            claims=MSA_SEARCH_CLAIMS,
+            container_id=_CONTAINER_INSTANCE_ID,
+            maximum_age_seconds=CONF.timeout + 900,
+            wait_timeout_seconds=max(60, CONF.timeout - 60),
+        ),
+        TemplateTask(
+            sequence=sequence,
+            unpaired_msa=unpaired_msa,
+            unpaired_msa_reference=(
+                MsaArtifactReference.from_record(
+                    unpaired_msa_reference,
+                    expected_path=(
+                        sequence_cache_relpath("protein", sequence) / "unpaired.a3m"
+                    ),
+                )
+                if unpaired_msa_reference is not None
+                else None
+            ),
+            publish_canonical=publish_canonical,
+            max_template_date=max_template_date,
+        ),
+    )
+
+
+def _search_msa_and_templates(
+    config: AF3Config,
+    *,
+    search_msa: bool = True,
+    search_templates: bool = True,
+    max_parallel_search_workers: int = 4,
+) -> AF3Config:
+    """Resolve MSA/template fields through the production Modal adapter."""
+    return resolve_msa_and_templates(
+        config,
+        ModalSearchExecutor(
+            inspect_msa_function=inspect_msa_search_cache,
+            raw_search_function=search_database_msa,
+            msa_assembly_function=assemble_sequence_msas,
+            inspect_templates_function=inspect_protein_template_cache,
+            template_search_function=search_protein_templates,
+        ),
+        search_msa=search_msa,
+        search_protein_templates=search_templates,
+        max_parallel_search_workers=max_parallel_search_workers,
+    )
 
 
 ##########################################
 # Inference functions
 ##########################################
+
+
+def _load_staged_request(
+    run_id: str,
+    request_id: str,
+    staged_input_record: dict[str, object],
+) -> LoadedInferenceInput:
+    """Reload and validate one marker-bound inference request."""
+    CONF.output_volume.reload()
+    return load_staged_inference_input(
+        Path(CONF.output_volume_mountpoint),
+        run_id=run_id,
+        request_id=request_id,
+        staged_input_record=staged_input_record,
+    )
+
+
 @app.function(
-    cpu=(0.125, 32.125),  # 8c per database searched with HMMER
-    memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
-    # Protein sequences: 304.8GiB
-    # RNA sequences: 88.6GiB
-    # mmCIF templates .tar.zst: 57.6GiB
-    # ephemeral_disk=1024 * round(304.8 + 5),  # MiB, billed by memory at 20:1 ratio
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(model_volume=True)
-    | {
-        APP_INFO.msa_db_dir: AF3_MSA_DB_VOLUME,
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            sub_path=APP_INFO.msa_cache_volume_subdir
-        ),
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True,
+            sub_path="/",
+        )
     },
 )
-def run_data_pipeline(json_bytes: bytes, copy_msa_to_ssd: bool = True) -> bytes:
-    """Run AlphaFold3 data pipeline (CPU-only)."""
-    import sys
-    from tempfile import mkdtemp
-
-    # Try to fill config with cached MSA
-    msa_cache_dir = Path(APP_INFO.msa_cache_dir)
-    conf = _load_conf_from_bytes(json_bytes)
-    MSA_CACHE_VOLUME.reload()
-    conf = _cache_conf_unpaired_msa(conf, msa_cache_dir)
-    MSA_CACHE_VOLUME.commit()
-
-    # Check if all protein/RNA sequences have MSA results
-    temp_dir: Path = Path(mkdtemp(prefix="alphafold3_data_"))
-    run_name = _af3_sanitised_name(conf.name)
-    input_json_path = temp_dir / f"{run_name}.json"
-    conf.to_files(temp_dir, run_name)
-    all_protein_msa_filled = all(
-        prot_seq.unpairedMsa is not None and prot_seq.pairedMsa is not None
-        for seq in conf.sequences
-        if (prot_seq := seq.protein) is not None
+def inspect_seed_prediction_cache(
+    run_id: str,
+    seeds: list[int],
+    sample_count: int,
+) -> list[dict[str, object]]:
+    """Inspect seed markers without scanning prediction directories."""
+    return inspect_seed_predictions(
+        _INFERENCE_RUNTIME,
+        run_id,
+        tuple(seeds),
+        sample_count=sample_count,
     )
-    all_rna_msa_filled = all(
-        rna_seq.unpairedMsa is not None
-        for seq in conf.sequences
-        if (rna_seq := seq.rna) is not None
-    )
-    if all_protein_msa_filled and all_rna_msa_filled:
-        print("💊 MSA cache hit, returning results...")
-        return input_json_path.read_bytes()
-
-    # TODO: test sharded DB
-    # https://github.com/google-deepmind/alphafold3/blob/main/docs/performance.md
-    # Copy volume db files to /tmp for faster access (~651.7GiB)
-    print("💊 MSA cache not hit, running data pipeline...")
-    msa_db_dir: list[str] = []
-    if copy_msa_to_ssd:
-        db_dir = temp_dir / "db"
-        db_dir.mkdir()
-        msa_db_path = Path(APP_INFO.msa_db_dir)
-        db_files = [
-            # Protein sequence databases
-            "bfd-first_non_consensus_sequences.fasta",
-            "uniref90_2022_05.fa",
-            "uniprot_all_2021_04.fa",
-            "mgy_clusters_2022_05.fa",
-            "pdb_seqres_2022_09_28.fasta",
-            # RNA sequence databases
-            # "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
-            # "rnacentral_active_seq_id_90_cov_80_linclust.fasta",
-            # "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
-        ]
-
-        print(f"💊 Copying database files to local SSD {db_dir}")
-        # p = run_background_command(
-        #     f"tar -I zstd -xf {msa_db_path / 'pdb_2022_09_28_mmcif_files.tar.zst'} -C {db_dir}"
-        # )
-        copy_files({msa_db_path / db_file: db_dir / db_file for db_file in db_files})
-        # p.wait()
-        # if p.returncode != 0:
-        #     raise RuntimeError("Failed to extract mmCIF template files")
-        msa_db_dir.append(str(db_dir))
-    msa_db_dir.append(APP_INFO.msa_db_dir)  # fallback for mmCIF templates and RNA
-
-    cmd = [
-        sys.executable,
-        str(CONF.git_clone_dir / "run_alphafold.py"),
-        "--run_inference=false",
-        f"--json_path={input_json_path}",
-        f"--output_dir={temp_dir}",
-        f"--model_dir={CONF.model_volume_mountpoint}",
-        *(f"--db_dir={d}" for d in msa_db_dir),
-        "--jackhmmer_n_cpu=8",
-        "--nhmmer_n_cpu=8",
-    ]
-    run_command(cmd)
-
-    # Cache unpaired MSA files in separate directories for future use
-    msa_json_path = temp_dir / run_name / f"{run_name}_data.json"
-    if not msa_json_path.exists():
-        print([x.relative_to(temp_dir) for x in temp_dir.rglob("*")])
-        raise FileNotFoundError(f"MSA JSON file not found: {msa_json_path}")
-    _ = _cache_conf_unpaired_msa(AF3Config.from_file(msa_json_path), msa_cache_dir)
-    MSA_CACHE_VOLUME.commit()
-    return msa_json_path.read_bytes()
 
 
-def search_msa_and_templates(
-    config_path: str | Path,
-    search_chains_in_parallel: bool,
-    max_parallel_data_pipelines: int | None = None,
-) -> bytes:
-    """Manage AlphaFold3 data pipeline(s)."""
-    conf = AF3Config.from_file(config_path)
-    msa_chains: list[tuple[int, AF3SequenceEntry]] = [
-        (i, chain)
-        for i, chain in enumerate(conf.sequences)
-        if chain.protein is not None or chain.rna is not None
-    ]
-
-    if not search_chains_in_parallel:
-        msa_json_bytes = run_data_pipeline.remote(
-            json_bytes=Path(config_path).read_bytes(),
-            copy_msa_to_ssd=len(msa_chains) > 1,
+@app.function(
+    cpu=0.125,
+    memory=1024,
+    timeout=600,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True,
+            sub_path="/",
         )
-        return msa_json_bytes
-
-    # Parallelize MSA search by chains
-    with TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        data_pipeline_inputs: list[tuple[int, bytes]] = []
-        for i, msa_chain in msa_chains:
-            input_conf = conf.model_copy(update={"sequences": [msa_chain]})
-            input_conf.to_files(tmp_path, str(i))
-            data_pipeline_inputs.append((i, (tmp_path / f"{i}.json").read_bytes()))
-    msa_bytes = bounded_map(
-        data_pipeline_inputs,
-        lambda item: run_data_pipeline.remote(
-            json_bytes=item[1],
-            copy_msa_to_ssd=False,
-        ),
-        max_parallel=max_parallel_data_pipelines,
-    )
-
-    # Merge into one AF3Config
-    for (i, _), data in zip(data_pipeline_inputs, msa_bytes, strict=True):
-        msa_conf = _load_conf_from_bytes(data)
-        conf.sequences[i] = msa_conf.sequences[0]
-
-    with TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        conf.to_files(tmp_path, conf.name)
-        return (tmp_path / f"{conf.name}.json").read_bytes()
+    },
+)
+def claim_seed_prediction_work(
+    run_id: str,
+    seeds: list[int],
+    sample_count: int,
+) -> dict[str, object]:
+    """Reuse or atomically claim one request's currently incomplete seeds."""
+    return claim_seed_predictions(
+        _INFERENCE_RUNTIME,
+        run_id,
+        tuple(seeds),
+        sample_count=sample_count,
+    ).to_dict()
 
 
 @app.function(
     gpu=CONF.gpu,
-    cpu=(0.125, 16.125),  # burst for tar compression
-    memory=(1024, 131072),  # reserve 1GB, OOM at 128GB
+    cpu=(0.125, 16.125),
+    memory=(1024, 131072),
     timeout=MAX_TIMEOUT,
-    # Writable model dir because AlphaFold3 writes its JAX cache next to weights
-    volumes=CONF.mounts(model_volume=True, model_ro=False)
+    volumes=CONF.mounts(
+        output_volume=True,
+        model_volume=True,
+        model_ro=True,
+    )
     | {
-        APP_INFO.msa_cache_dir: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=True, sub_path=APP_INFO.msa_cache_volume_subdir
+        _JAX_CACHE_MOUNTPOINT: modal.Volume.from_name(
+            _JAX_CACHE_MOUNTPOINT.name,
+            create_if_missing=True,
+            version=2,
         )
     },
 )
 def run_inference_pipeline(
-    json_bytes: bytes, recycle: int, sample: int, model_seeds: list[int]
-) -> bytes:
-    """Run AlphaFold3 structure prediction.
-
-    Returns:
-        Tarball bytes of inference outputs (CIF files + confidence JSONs).
-
-    """
-    import sys
-
-    with TemporaryDirectory(prefix="alphafold3_inference_") as temp_dir:
-        temp_path = Path(temp_dir)
-        input_json_path = temp_path / "input.json"
-        input_json_path.write_bytes(json_bytes)
-
-        conf = AF3Config.from_file(input_json_path)
-        run_name = conf.name
-        conf.modelSeeds = model_seeds
-        conf = _fill_missing_msa_for_inference(conf)
-        conf.to_files(temp_path, "input")
-        print(f"💊 Running inference for {run_name} with seeds {model_seeds}")
-
-        out_dir = temp_path / run_name
-        model_dir = Path(CONF.model_volume_mountpoint)
-        cmd = [
-            sys.executable,
-            str(CONF.git_clone_dir / "run_alphafold.py"),
-            "--run_inference=true",
-            "--run_data_pipeline=false",
-            f"--json_path={input_json_path}",
-            f"--output_dir={out_dir}",
-            f"--model_dir={model_dir}",
-            f"--jax_compilation_cache_dir={model_dir / 'jax_cache'}",
-            f"--num_recycles={recycle}",
-            f"--num_diffusion_samples={sample}",
-        ]
-        run_command(
-            cmd, output_mode="tee", log_file=out_dir / f"{run_name}_inference.log"
+    run_id: str,
+    request_id: str,
+    staged_input_record: dict[str, object],
+    claimed_seed_records: list[dict[str, object]],
+) -> dict[str, object]:
+    """Run one disjoint seed group and publish per-seed markers."""
+    with guard_seed_prediction_claims(
+        _INFERENCE_RUNTIME,
+        run_id,
+        claimed_seed_records,
+    ) as claimed_seeds:
+        staged = _load_staged_request(run_id, request_id, staged_input_record)
+        return run_upstream_seed_worker(
+            UpstreamInferenceRuntime(
+                predictions=_INFERENCE_RUNTIME,
+                source_root=CONF.git_clone_dir,
+                model_root=Path(CONF.model_volume_mountpoint),
+                jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
+            ),
+            staged.config,
+            run_id,
+            staged.recycle,
+            staged.sample_count,
+            claimed_seeds,
         )
-        return package_outputs(out_dir / run_name)
 
 
-def predict_structures(
-    conf: AF3Config,
-    local_out_dir: Path,
-    recycle: int,
-    sample: int,
+@app.function(
+    cpu=(0.125, 2.125),
+    memory=(1024, 16384),
+    timeout=_SUMMARY_TIMEOUT_SECONDS,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_inference_summary(
+    run_id: str,
+    request_id: str,
+    staged_input_record: dict[str, object],
+) -> dict[str, object]:
+    """Rebuild the non-regressing accumulated run summary."""
+    staged = _load_staged_request(run_id, request_id, staged_input_record)
+    return finalize_upstream_run_summary(
+        _INFERENCE_RUNTIME,
+        staged.config,
+        run_id,
+        staged.sample_count,
+    )
+
+
+@app.function(
+    cpu=(0.125, 2.125),
+    memory=(1024, 16384),
+    timeout=3600,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_inference_request(
+    run_id: str,
+    request_id: str,
+    submitted_seeds: list[int],
+    normalized_seeds: list[int],
+    sample_count: int,
+    display_name: str,
+) -> dict[str, object]:
+    """Publish one manifest-last view over the request's completed seeds."""
+    return publish_request_results(
+        _INFERENCE_RUNTIME,
+        RequestPublication(
+            run_id=run_id,
+            request_id=request_id,
+            submitted_seeds=tuple(submitted_seeds),
+            normalized_seeds=tuple(normalized_seeds),
+            sample_count=sample_count,
+            display_name=display_name,
+        ),
+    )
+
+
+def _predict_structures(
+    prepared: PreparedInferenceRun,
     num_containers: int,
     *,
-    poll_timeout: int = 5,
-) -> Path:
-    """Run AF3 inference pipeline and save outputs to .tar.zst file."""
-    run_name = conf.name
-    out_file = build_local_output_path(local_out_dir, run_name=run_name)
-    if out_file.exists():
-        print(f"🧬 File already exists, skipping inference: {out_file}")
-        return out_file
-
-    # Directly run inference pipeline if only one container is specified
-    json_bytes = conf.to_json().encode()
-    model_seeds = conf.modelSeeds
-    if num_containers == 1:
-        fc = run_inference_pipeline.spawn(
-            json_bytes, recycle=recycle, sample=sample, model_seeds=model_seeds
-        )
-        tarball_content = fc.get()
-        write_local_tarball(out_file, tarball_content)
-        return out_file
-
-    tar_binary = shutil.which("tar") or None
-    if tar_binary is None:
-        raise RuntimeError("🧬 tar command not found")
-    tar_cmd = [tar_binary, "-I", "zstd"]
-
-    def _part_file(i: int) -> Path:
-        return local_out_dir / f"{run_name}_part{i}.tar.zst"
-
-    def _is_good_tarball(tarball_file: Path) -> bool:
-        """Return whether an existing tarball is good enough to skip."""
-        if not tarball_file.exists() or tarball_file.stat().st_size == 0:
-            return False
-        try:
-            run_command([*tar_cmd, "-tf", str(tarball_file)], output_mode="capture")
-        except Exception as exc:
-            print(
-                f"🧬 Existing part tarball is not readable; rerunning {tarball_file}: {exc}"
-            )
-            return False
-        return True
-
-    # Run inference in parallel for parts that are missing
-    inference_func_calls: dict[int, modal.FunctionCall] = {}
-    good_part_indices: set[int] = set()
-    for i in range(num_containers):
-        tarball_file = _part_file(i)
-        if _is_good_tarball(tarball_file):
-            good_part_indices.add(i)
-            continue
-        fc = run_inference_pipeline.spawn(
-            json_bytes,
-            recycle=recycle,
-            sample=sample,
-            model_seeds=model_seeds[i::num_containers],
-        )
-        inference_func_calls[i] = fc
-
-    # Collect results as they become available
-    failures: list[tuple[int, Exception]] = []
-    while inference_func_calls:
-        for i, fc in inference_func_calls.copy().items():
-            try:
-                tarball_content = fc.get(timeout=poll_timeout)
-            except TimeoutError:
-                print(f"🧬 Task {i} still running...")
-                continue
-            except Exception as exc:
-                failures.append((i, exc))
-                del inference_func_calls[i]
-                print(f"🧬 Task {i} failed: {exc}")
-                continue
-
-            tarball_file = _part_file(i)
-            tmp_file = tarball_file.with_suffix(".tmp")
-            write_local_tarball(tmp_file, tarball_content, overwrite=True)
-            tmp_file.replace(tarball_file)
-            del inference_func_calls[i]
-
-    # Go through all expected tarball part files
-    tarball_part_files = [_part_file(i) for i in range(num_containers)]
-    for i, tarball_part_file in enumerate(tarball_part_files):
-        if i not in good_part_indices and _is_good_tarball(tarball_part_file):
-            good_part_indices.add(i)
-    unusable_part_files = [
-        p for i, p in enumerate(tarball_part_files) if i not in good_part_indices
-    ]
-    if unusable_part_files:
-        saved = (
-            ", ".join(str(tarball_part_files[i]) for i in sorted(good_part_indices))
-            or "none"
-        )
-        failed = "; ".join(f"part {i}: {exc}" for i, exc in failures) or "unknown"
-        raise RuntimeError(
-            "Some AlphaFold3 inference parts failed or did not produce readable "
-            "tarballs. "
-            f"Saved part tarballs: {saved}. Failed parts: {failed}. "
-            "Rerun the command to resume only missing parts."
-        )
-
-    # Run local extraction after everything is saved to avoid errors
-    with TemporaryDirectory() as tmp_dir:
-        for tar_filename in tarball_part_files:
-            run_command(
-                [*tar_cmd, "-xf", str(tar_filename)],
-                output_mode="capture",
-                cwd=tmp_dir,
-            )
-
-        # Combine the parts into a single .tar.zst file
-        tarball_content = package_outputs(Path(tmp_dir) / run_name)
-        write_local_tarball(out_file, tarball_content)
-    print(
-        f"🧬 Note that top-level {run_name}_*.{{cif,json,csv}} may not be correct since they are from parallel workers"
+    poll_timeout: int = 30,
+) -> dict[str, object]:
+    """Reconcile predictions through the production Modal adapter."""
+    return coordinate_seed_predictions(
+        prepared,
+        ModalInferenceExecutor(
+            claim_function=claim_seed_prediction_work,
+            inspect_function=inspect_seed_prediction_cache,
+            worker_function=run_inference_pipeline,
+            summary_function=finalize_inference_summary,
+            request_function=finalize_inference_request,
+        ),
+        num_containers=num_containers,
+        active_wait_timeout_seconds=MAX_TIMEOUT + 900,
+        worker_poll_timeout_seconds=poll_timeout,
     )
-    return out_file
 
 
 ##########################################
 # Entrypoint for ephemeral usage
 ##########################################
 @app.local_entrypoint()
+def setup_sharded_databases(
+    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
+    source_policy: str = "keep",
+    submit: bool = False,
+) -> None:
+    """Plan or build every missing fixed sharded database profile.
+
+    Args:
+        seqkit_threads: SeqKit/native-helper threads per builder, default 8.
+        source_policy: Post-publication source action: keep, compress, or delete.
+        submit: Submit Modal work. Defaults to false and only prints the plan.
+    """
+    plan = plan_profile_setup(
+        seqkit_threads,
+        source_policy,
+        evidence_volume_name=CONF.output_volume_name,
+    )
+    print(
+        orjson.dumps(
+            plan,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+        ).decode()
+    )
+    if not submit:
+        print("🧬 Plan only; no Modal function was submitted.")
+        return
+
+    summary = execute_profile_setup(
+        inspect_sharded_database_profiles,
+        build_sharded_database,
+        finalize_sharded_database_setup,
+        seqkit_threads=seqkit_threads,
+        source_policy=source_policy,
+    )
+    print(
+        orjson.dumps(
+            summary,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+        ).decode()
+    )
+
+
+@app.local_entrypoint()
 def submit_alphafold3_task(
     input_json: str,
     out_dir: str | None = None,
     run_name: str | None = None,
     search_msa: bool = True,
-    search_chains_in_parallel: bool = True,
-    max_parallel_data_pipelines: int | None = None,
+    search_protein_templates: bool = True,
+    max_parallel_search_workers: int = 4,
     max_num_gpus: int = 1,
     recycle: int = 10,
     sample: int = 5,
@@ -604,52 +826,113 @@ def submit_alphafold3_task(
 
     Args:
         input_json: Path to input JSON file.
-        out_dir: Optional output directory (defaults to $CWD)
-        run_name: Optional run name (defaults to `name` in the AF3 JSON config)
-        search_msa: Whether to run MSA and template search data pipeline.
-        search_chains_in_parallel: Whether to spawn multiple `data_pipeline`
-            jobs when there is more than one protein/RNA chain to query MSA.
-            If True, a 32-core job will be spawned for *each* chain. If False,
-            a single container will be used for all chains sequentially.
-        max_parallel_data_pipelines: Maximum number of data-pipeline containers
-            to run at once when `search_chains_in_parallel` is true.
-        max_num_gpus: Maximum number of GPUs to use during inference. If >1,
-            multiple `model_inference` jobs will be spawned in parallel based
-            on the number of model seeds in the JSON config.
+        out_dir: Optional local archive directory (defaults to $CWD).
+        run_name: Optional display name used in downloaded output basenames.
+            Defaults to `name` in the AF3 JSON config.
+        search_msa: Populate missing protein and RNA MSA fields.
+        search_protein_templates: Populate missing protein templates after MSA
+            resolution. Non-empty caller fields are always preserved.
+        max_parallel_search_workers: Request-wide cap for database and template
+            workers. Database workers internally use 16 shards by two HMMER
+            CPUs.
+        max_num_gpus: Maximum number of disjoint seed workers to run during
+            inference.
         recycle: Number of Pairformer recycles to use during inference.
         sample: Number of diffusion samples to generate per seed.
 
     """
-    # Validate and read input
-    input_path = Path(input_json).expanduser().resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+    max_num_gpus = validate_inference_worker_budget(max_num_gpus)
+    validate_search_worker_budget(max_parallel_search_workers)
+    validate_inference_parameters(recycle, sample)
 
-    conf = AF3Config.from_file(input_path)
+    conf = materialize_local_input(input_json)
+    validate_inference_workload(conf.modelSeeds, sample)
     if run_name is None:
         run_name = conf.name
+    sanitize_af3_name(run_name)
     conf.name = run_name
 
-    # Run inference
-    if search_msa:
-        print(f"🧬 Running {CONF.name} data pipeline...")
-        json_bytes = search_msa_and_templates(
-            input_path,
-            search_chains_in_parallel,
-            max_parallel_data_pipelines,
+    invocation = prepare_invocation(
+        conf,
+        search_msa=search_msa,
+        search_protein_templates=search_protein_templates,
+        recycle=recycle,
+        sample=sample,
+    )
+    if manifest := load_invocation_manifest(CONF.output_volume, invocation):
+        publication = request_publication_from_manifest(manifest)
+        print(
+            "🧬 Reusing exact completed invocation: "
+            f"run_id={publication.run_id}, request_id={publication.request_id}"
+        )
+        archive_path = create_request_archive(
+            CONF.output_volume,
+            manifest,
+            output_dir=resolve_local_output_dir(out_dir),
+            display_name=run_name,
+        )
+        run_root = PurePosixPath(publication.run_id[:2]) / publication.run_id
+        print(
+            f"🧬 {CONF.name} results saved to {archive_path}. Durable seed "
+            f"predictions remain in {CONF.output_volume_name}:/{run_root}."
+        )
+        return
+
+    print(f"🧬 Resolving {CONF.name} MSA and template fields...")
+    enriched_conf = _search_msa_and_templates(
+        conf,
+        search_msa=search_msa,
+        search_templates=search_protein_templates,
+        max_parallel_search_workers=max_parallel_search_workers,
+    )
+
+    enriched_conf.name = run_name
+    enriched_conf.modelSeeds = conf.modelSeeds
+    prepared = prepare_inference_run(
+        enriched_conf,
+        recycle=recycle,
+        sample=sample,
+    )
+    if prepared.submitted_seeds != prepared.normalized_seeds:
+        print(
+            "🧬 Normalized duplicate model seeds: "
+            f"{list(prepared.submitted_seeds)} -> "
+            f"{list(prepared.normalized_seeds)}"
+        )
+    publication = RequestPublication.from_prepared(prepared)
+    manifest = load_request_manifest(CONF.output_volume, publication)
+    if manifest is None:
+        stage_inference_run(CONF.output_volume, prepared)
+        print(
+            "🧬 Staged inference input: "
+            f"run_id={prepared.run_id}, request_id={prepared.request_id}"
+        )
+
+        num_seeds = len(prepared.normalized_seeds)
+        num_containers = min(max_num_gpus, num_seeds)
+        print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
+        manifest = request_manifest_from_result(
+            _predict_structures(
+                prepared,
+                num_containers,
+            )
         )
     else:
-        json_bytes = input_path.read_bytes()
-
-    local_out_dir = resolve_local_output_dir(out_dir)
-
-    new_conf = _load_conf_from_bytes(json_bytes)
-    new_conf.name = run_name
-    new_conf.modelSeeds = conf.modelSeeds
-    num_seeds = len(new_conf.modelSeeds)
-    num_containers = max(1, min(max_num_gpus, num_seeds))
-    print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
-    out_file = predict_structures(
-        new_conf, local_out_dir, recycle, sample, num_containers
+        print(
+            "🧬 Reusing completed request view: "
+            f"run_id={prepared.run_id}, request_id={prepared.request_id}"
+        )
+    publish_invocation_receipt(
+        CONF.output_volume,
+        build_invocation_receipt(invocation, prepared, manifest),
     )
-    print(f"🧬 {CONF.name} run complete! Results saved to {out_file}")
+    archive_path = create_request_archive(
+        CONF.output_volume,
+        manifest,
+        output_dir=resolve_local_output_dir(out_dir),
+        display_name=run_name,
+    )
+    print(
+        f"🧬 {CONF.name} results saved to {archive_path}. Durable seed "
+        f"predictions remain in {CONF.output_volume_name}:/{prepared.run_root}."
+    )

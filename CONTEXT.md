@@ -30,6 +30,178 @@ _Avoid_: final node, last node
 A deployed Modal app that owns tool runtime, images, volumes, and exported app functions.
 _Avoid_: workflow node, app node
 
+**Shard Build Recipe**:
+A versioned deterministic transformation from a reference-database monolith into the shard layout of a Sharded Database Profile.
+_Avoid_: ad hoc split, shard command
+
+**Sharded Database Profile**:
+An immutable, manifest-validated publication of every shard for one logical MSA database. Its manifest preserves the source FASTA identity and construction recipe, but the published profile does not retain a duplicate source FASTA.
+_Avoid_: source database directory, incomplete shard staging, arbitrary shard set
+
+**Profile ID**:
+A code-owned identifier for one immutable Sharded Database Profile, fixing its source database generation, shard count, and build recipe. It is selected by the Supported Database Specification rather than through a mutable runtime alias.
+_Avoid_: current profile, database ID, manifest digest
+
+**Profile Build Claim**:
+A minimal, append-only Modal Dict election record allowing one invocation to construct one Profile ID. Conflicts fail fast; a later explicit invocation may advance beyond a failed or conservatively stale generation.
+_Avoid_: published profile, search build claim, polling lock service
+
+**Source FASTA Policy**:
+The explicit post-publication choice to keep, round-trip-verify and archivally compress, or delete an original database FASTA after its Sharded Database Profile is durably validated. A compressed source must be restored manually before another profile build.
+_Avoid_: temporary builder cleanup, shard compression, implicit retention, automatic source restore
+
+**Database Search Space**:
+The full unsharded database size used by HMMER to scale hit E-values across a Sharded Database Profile. It is the exact sequence count for protein searches and the exact nucleotide count expressed in megabases for RNA searches.
+_Avoid_: shard count, FASTA byte size, per-shard record count
+
+**Supported Database Specification**:
+The code-owned production definition of one official AlphaFold MSA database, including its logical identifier, source filename and molecule type, accepted shard count, and expected source statistics.
+_Avoid_: runtime override, profile manifest, arbitrary FASTA
+
+**MSA Search Subject**:
+A unique biological sequence that requires database-generated MSA evidence and may be referenced by one or more input chains.
+_Avoid_: chain identifier, duplicate homomer chain
+
+**Polymer Cache Namespace**:
+The top-level `Protein/` or `RNA/` directory that separates MSA cache entries for identical sequence hashes interpreted as different polymer types.
+_Avoid_: database ID, polymer-aware sequence hash, chain type suffix
+
+**Raw Database MSA**:
+A validated result of searching one MSA Search Subject against one reference database profile. It is independently complete and reusable before AlphaFold constructs combined unpaired or paired MSAs.
+_Avoid_: combined unpaired MSA, paired MSA, search log
+
+**Combined Unpaired MSA**:
+The AlphaFold-ready unpaired alignment assembled from validated Raw Database MSAs in pinned upstream order, with duplicate aligned sequences removed after ignoring lowercase insertions. Protein order is UniRef90, small BFD, then MGnify; RNA order is RFam, RNAcentral, then NT-RNA.
+_Avoid_: raw database MSA, simple FASTA concatenation
+
+**Combined Paired MSA**:
+The AlphaFold-ready paired protein alignment assembled from the UniProt Raw Database MSA without deduplication. RNA inputs have no paired MSA.
+_Avoid_: combined unpaired MSA, RNA MSA
+
+**Combined MSA Publication**:
+The latest validated sequence-root `unpaired.a3m` and, for protein, `paired.a3m` derived from the currently selected Raw Database MSAs. Its completion manifest, not file existence, proves which raw results and merge semantics it represents.
+_Avoid_: raw database MSA, unmarked legacy file, versioned assembly archive
+
+**Template Search Result**:
+A validated AlphaFold-ready list of selected protein templates derived from one Combined Unpaired MSA and the Immutable Template Store. The sequence root retains only the latest publication, and an empty list is a complete result distinct from an unfinished search.
+_Avoid_: PDB/mmCIF reference store, raw database MSA, missing result
+
+**Immutable Template Store**:
+The fixed upstream PDB seqres file and `mmcif_files/` directory used for protein template search. Their contents are treated as immutable infrastructure and do not receive a separate cache identity or digest.
+_Avoid_: sharded database profile, template search result, versioned reference
+
+**Enriched AlphaFold Input**:
+An AlphaFold input whose protein and RNA search fields are all explicit, using searched evidence, non-empty caller-supplied values, or deliberate empty sentinels according to the selected search policy. It is ready for inference without rerunning AlphaFold's data pipeline.
+_Avoid_: raw input, model features, partially populated search fields
+
+**Caller-Supplied Search Evidence**:
+Non-empty MSA or template data supplied for one chain in one request, either inline or materialized from a caller path. It may contribute to that chain's Enriched AlphaFold Input but is neither propagated to identical sibling chains nor made shared canonical search evidence.
+_Avoid_: raw database MSA, combined MSA publication, template search result
+
+**Staged Custom Template**:
+A caller-supplied mmCIF made remotely accessible at a content-addressed path beneath one AlphaFold Run Root. Its content digest and residue mappings define biological identity; its original and staged paths do not.
+_Avoid_: template search result, local template path, shared template cache
+
+**Staged Inference Input**:
+The marker-complete canonical request input, run identity, and path-backed custom templates stored beneath one AlphaFold Run Root. GPU workers and summary finalizers load and re-derive its run and request identities instead of accepting caller-supplied inference JSON.
+_Avoid_: unchecked worker payload, enriched local input, seed prediction
+
+**Search Field Resolution**:
+The request-scoped selection or generation of each MSA and template field independently. A populated field neither authorizes its replacement nor implies that a missing sibling field is resolved.
+_Avoid_: chain-wide search, all-or-nothing data pipeline
+
+**Partial Search Resolution**:
+A Search Field Resolution with reusable canonical database or template results but at least one required field still incomplete after a surfaced CPU-task failure. It cannot produce an Enriched AlphaFold Input.
+_Avoid_: empty search result, enriched input, failed request cache
+
+**AlphaFold Run Root**:
+The seed-independent `/{run_id[:2]}/{run_id}/` directory at the AlphaFold3 output-Volume root. It makes staged caller inputs available to remote functions and durably owns inference outputs, requests, logs, and completion state.
+_Avoid_: MSA cache root, database Volume, local download directory
+
+**Inference Run Identity**:
+The stable digest that groups predictions for one Enriched AlphaFold Input and one set of seed-independent scientific inference settings. Model seeds and accelerator class are deliberately excluded so additional seeds and operationally different GPU deployments can share the same AlphaFold Run Root.
+_Avoid_: sequence hash, model seed, GPU accelerator class, display name
+
+**Inference Identity View**:
+The normalized Enriched AlphaFold Input used to derive Inference Run Identity after removing display name and seeds and replacing operational template paths with content digests. It conservatively retains every other validated input field.
+_Avoid_: request input, selected-field whitelist, upstream worker JSON
+
+**Declared Model Identity**:
+The code-owned checkpoint label and pinned AlphaFold/app version used in Inference Run Identity without hashing the model file. It assumes the checkpoint is not replaced in place.
+_Avoid_: checkpoint digest, model Volume path alone, model seed
+
+**Canonical Output Name**:
+The deterministic, run-derived name given to upstream inference so every durable output filename is stable across caller display names. It uses `af3-{run_id[:16]}` and is not a user-facing run label.
+_Avoid_: display name, run ID, local archive name
+
+**Presentation Output Name**:
+The sanitized caller display name applied to filenames only while creating a Request Retrieval Archive. It never renames or identifies durable prediction artifacts.
+_Avoid_: canonical output name, inference run identity, Volume path
+
+**Seed Prediction**:
+The independently complete inference output for one model seed beneath an AlphaFold Run Root. Its diffusion samples use upstream's `seed-{seed}_sample-{sample_index}` directories; optional embeddings and distogram directories belong to the same Seed Prediction.
+_Avoid_: inference run identity, container part, combined top-level output
+
+**Seed Completion Marker**:
+The minimal authoritative record that a Seed Prediction's upstream process succeeded and its promoted output was committed. It carries sample ranking scores for summary derivation, while readers trust completion without revalidating individual prediction artifacts.
+_Avoid_: artifact inventory, worker exit alone, seed build claim
+
+**Inference Worker Staging**:
+An exclusive, temporary subtree on the AlphaFold3 output Volume where one GPU container lets upstream write results for its disjoint seed list without colliding with another container's shared files.
+_Avoid_: seed prediction, canonical output tree, local scratch directory
+
+**Inference Run Summary**:
+The single finalized set of upstream-style top-level data, ranking, and best-prediction files derived from the accumulated union of every validated Seed Prediction beneath one AlphaFold Run Root.
+_Avoid_: worker-local ranking, seed sample directory, completion marker
+
+**Prediction Ranking Order**:
+The deterministic ordering shared by request-scoped and global prediction summaries: descending ranking score, then ascending model seed, then ascending sample index. It makes equal-score best-sample selection independent of worker completion order.
+_Avoid_: worker completion order, submission order, arbitrary equal-score winner
+
+**Inference Request**:
+The normalized model-seed set requested against an Inference Run Identity. Its request ID ignores submitted order, duplicate seeds, and display name, and it may reuse existing Seed Predictions without changing the shared run identity.
+_Avoid_: inference run identity, request view, GPU worker assignment
+
+**Inference Request View**:
+An identity-stable durable presentation of one Inference Request, identified from its request ID, submitted seed order and duplicates, and display name. It references all requested canonical Seed Predictions plus request-specific ranking and best files without recording mutable invocation outcomes or duplicating seed artifacts.
+_Avoid_: inference request, complete run archive, accumulated run summary
+
+**Partial Inference Request**:
+An Inference Request for which at least one normalized requested seed has a Seed Completion Marker and at least one remains unmarked after a surfaced failure. It retains reusable seeds and diagnostics but has no successful Inference Request View.
+_Avoid_: failed seed prediction, completed request, empty run
+
+**Request Retrieval Archive**:
+A self-contained local `.tar.zst` materialization of one Inference Request View, assembled by downloading only its manifest-declared canonical artifacts and referenced Staged Custom Templates. Its input copy uses archive-relative template paths, and its filename combines the Presentation Output Name with a view-ID prefix.
+_Avoid_: inference request view, global run archive, remote function payload
+
+**Seed Build Claim**:
+An atomic, generation-scoped coordination record granting one request ownership of computing one missing Seed Prediction. It is never evidence that the prediction completed; only the validated seed publication is authoritative.
+_Avoid_: seed completion marker, inference request, cache entry
+
+**Summary Build Claim**:
+An atomic, generation-scoped coordination record granting one finalizer ownership of rebuilding the mutable Inference Run Summary. It serializes publication but never proves which seeds the current summary contains.
+_Avoid_: seed build claim, run-summary marker, inference request
+
+**Search Build Claim**:
+An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or publishing one sequence-root combined-MSA or template result. Claims follow the exclusive output path they protect; the validated publication, not the claim, is the reusable scientific evidence.
+_Avoid_: search identity, completion marker, database shard
+
+**Search Worker Budget**:
+The request-wide maximum number of active CPU search containers across database-MSA and protein-template phases. It bounds operational fanout independently of shard concurrency inside a database worker.
+_Avoid_: MSA-only worker limit, shard count, HMMER thread count, number of input chains
+
+**Search Identity**:
+A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes semantic source/shard profile content, scientific search parameters, and pinned tool versions, but excludes build timestamps, thread counts, CPU allocation, and container layout.
+_Avoid_: sequence hash, full profile-manifest digest, resource configuration
+
+**Canonical Search Result**:
+The immutable production-cache publication for one Raw Database MSA, stored at its Search Identity root only after validation. It preserves the merged database alignment and compact provenance needed for reuse; per-shard merge evidence is transient execution data.
+_Avoid_: arbitrary search output, unvalidated sample, shard tblout
+
+**Sequence Hash Prefix**:
+The first two hexadecimal characters of the full sequence hash, used only to fan out directories. It is not a sequence identifier by itself.
+_Avoid_: sequence hash, search identity
+
 **App Function**:
 A callable Modal remote function exposed by a Biomodals app or another Modal app and invoked by a workflow node.
 _Avoid_: workflow node

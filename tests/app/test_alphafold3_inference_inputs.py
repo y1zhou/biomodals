@@ -417,14 +417,38 @@ def test_local_materialization_bounds_all_path_backed_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Path-backed templates should fit one aggregate inline byte budget."""
+    """Aggregate limits should stop before reading a later template file."""
     input_path = _write_path_backed_template_input(
         tmp_path,
-        (b"12345", b"67890"),
+        (b"12345", b"67890", b"unread"),
     )
+    (tmp_path / "template-2.cif").unlink()
     monkeypatch.setattr(inference_inputs, "MAX_TEMPLATE_TOTAL_BYTES", 8)
 
     with pytest.raises(ValueError, match="templates exceed the 8-byte limit"):
+        materialize_local_input(input_path)
+
+
+def test_local_materialization_checks_template_count_before_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Template-count rejection should precede referenced-file reads."""
+    input_path = _write_path_backed_template_input(tmp_path, (b"first", b"second"))
+    (tmp_path / "template-0.cif").unlink()
+    monkeypatch.setattr(inference_inputs, "MAX_PROTEIN_TEMPLATES", 1)
+
+    with pytest.raises(ValueError, match="1-template limit"):
+        materialize_local_input(input_path)
+
+
+def test_local_materialization_rejects_empty_template_files(
+    tmp_path: Path,
+) -> None:
+    """Empty template files should fail at the local trust boundary."""
+    input_path = _write_path_backed_template_input(tmp_path, (b"",))
+
+    with pytest.raises(ValueError, match="must contain nonempty inline mmcif"):
         materialize_local_input(input_path)
 
 

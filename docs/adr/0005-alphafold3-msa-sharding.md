@@ -661,8 +661,10 @@ input JSON's directory.
 The helper accepts only non-symlink regular files and performs bounded reads:
 64 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
 each custom mmCIF or user CCD. A file that changes while being read is rejected.
-Large caller MSAs therefore belong in the path-backed fields rather than the
-inline JSON document.
+Template counts are checked before any referenced template is opened, and the
+aggregate template ceiling is enforced after each read. Large caller MSAs
+therefore belong in the path-backed fields rather than the inline JSON
+document.
 
 It reads protein and RNA `unpairedMsaPath`, protein `pairedMsaPath`, and
 template `mmcifPath` fields into inline strings, then clears every path field.
@@ -679,8 +681,8 @@ The same local preflight mirrors upstream's inexpensive structural checks that
 UniAF3 does not yet enforce: a safe nonempty name, nonempty unique uppercase
 chain IDs, letter-only protein/RNA/DNA sequences, no `CCD_` modification
 prefixes, no more than 20 protein templates, and nonempty unsigned 32-bit model
-seeds. Invalid inputs fail before the first Modal call. The worker repeats the
-preflight before invoking upstream.
+seeds. Template mmCIF strings must also be nonempty. Invalid inputs fail before
+the first Modal call. The worker repeats the preflight before invoking upstream.
 
 The supported request envelope is also explicit: at most 5,120 expanded
 entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
@@ -722,6 +724,7 @@ missing or corrupt deterministic payloads are republished before the marker is
 reasserted. Existing payloads and the marker are compared as bounded streams
 against their expected bytes; a mismatch or extra byte stops the read. A marker
 mismatch at the same immutable path is an error.
+
 The app-controlled Volume mountpoint may itself be a symlink, as it can be in a
 Modal container, but staged artifact paths beneath that root may not traverse
 symlinks.

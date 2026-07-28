@@ -2447,7 +2447,7 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
 
 
 def test_inference_staging_rejects_unmaterialized_template_paths() -> None:
-    with pytest.raises(ValueError, match="must contain inline mmcif"):
+    with pytest.raises(ValueError, match="must contain nonempty inline mmcif"):
         prepare_inference_run(
             AF3Config(
                 name="path-template",
@@ -2460,6 +2460,33 @@ def test_inference_staging_rejects_unmaterialized_template_paths() -> None:
                             templates=[
                                 AF3Template(
                                     mmcifPath="template.cif",
+                                    queryIndices=[0],
+                                    templateIndices=[0],
+                                )
+                            ],
+                        )
+                    )
+                ],
+            ),
+            recycle=1,
+            sample=1,
+        )
+
+
+def test_inference_staging_rejects_empty_inline_templates() -> None:
+    with pytest.raises(ValueError, match="must contain nonempty inline mmcif"):
+        prepare_inference_run(
+            AF3Config(
+                name="empty-template",
+                modelSeeds=[1],
+                sequences=[
+                    AF3SequenceEntry(
+                        protein=AF3Protein(
+                            id="A",
+                            sequence="ACDE",
+                            templates=[
+                                AF3Template(
+                                    mmcif="",
                                     queryIndices=[0],
                                     templateIndices=[0],
                                 )

@@ -22,6 +22,7 @@ from uniaf3.schema.alphafold3 import (
     AF3Ligand,
     AF3Protein,
     AF3SequenceEntry,
+    AF3Template,
 )
 
 from biomodals.app.fold.alphafold3.artifacts import (
@@ -189,6 +190,14 @@ def _validate_polymer(entity_name: str, entity: AF3Protein | AF3RNA | AF3DNA) ->
         )
 
 
+def _validate_template_count(protein: AF3Protein, chain_index: int) -> None:
+    if len(protein.templates) > MAX_PROTEIN_TEMPLATES:
+        raise ValueError(
+            f"sequences[{chain_index}].protein.templates exceeds "
+            f"AlphaFold 3's {MAX_PROTEIN_TEMPLATES}-template limit"
+        )
+
+
 def _validate_inline_inputs(config: AF3Config) -> None:
     template_bytes = 0
     for chain_index, entry in enumerate(config.sequences):
@@ -201,18 +210,15 @@ def _validate_inline_inputs(config: AF3Config) -> None:
                         field_name=f"sequences[{chain_index}].protein.{field_name}",
                         max_bytes=MAX_LOCAL_MSA_BYTES,
                     )
-            if len(protein.templates) > MAX_PROTEIN_TEMPLATES:
-                raise ValueError(
-                    f"sequences[{chain_index}].protein.templates exceeds "
-                    f"AlphaFold 3's {MAX_PROTEIN_TEMPLATES}-template limit"
-                )
+            _validate_template_count(protein, chain_index)
             for template_index, template in enumerate(protein.templates):
                 field_name = (
                     f"sequences[{chain_index}].protein.templates[{template_index}]"
                 )
-                if template.mmcifPath is not None or template.mmcif is None:
+                if template.mmcifPath is not None or not template.mmcif:
                     raise ValueError(
-                        f"{field_name} must contain inline mmcif and no mmcifPath"
+                        f"{field_name} must contain nonempty inline mmcif "
+                        "and no mmcifPath"
                     )
                 template_bytes += _field_bytes(
                     template.mmcif,
@@ -424,6 +430,31 @@ def _materialize_text_pair(
     setattr(owner, path_field, None)
 
 
+def _materialize_template(
+    template: AF3Template,
+    *,
+    input_root: Path,
+    field_name: str,
+) -> int:
+    _materialize_text_pair(
+        template,
+        inline_field="mmcif",
+        path_field="mmcifPath",
+        input_root=input_root,
+        field_name=field_name,
+        max_bytes=MAX_TEMPLATE_BYTES,
+    )
+    if not template.mmcif:
+        raise ValueError(
+            f"{field_name} must contain nonempty inline mmcif and no mmcifPath"
+        )
+    return _field_bytes(
+        template.mmcif,
+        field_name=f"{field_name}.mmcif",
+        max_bytes=MAX_TEMPLATE_BYTES,
+    )
+
+
 def _validate_template_total(size_bytes: int) -> None:
     if size_bytes > MAX_TEMPLATE_TOTAL_BYTES:
         raise ValueError(f"templates exceed the {MAX_TEMPLATE_TOTAL_BYTES}-byte limit")
@@ -446,6 +477,11 @@ def materialize_local_input(config_path: str | Path) -> AF3Config:
     )
 
     for chain_index, entry in enumerate(conf.sequences):
+        if entry.protein is not None:
+            _validate_template_count(entry.protein, chain_index)
+
+    template_bytes = 0
+    for chain_index, entry in enumerate(conf.sequences):
         if (protein := entry.protein) is not None:
             _materialize_text_pair(
                 protein,
@@ -464,16 +500,14 @@ def materialize_local_input(config_path: str | Path) -> AF3Config:
                 max_bytes=MAX_LOCAL_MSA_BYTES,
             )
             for template_index, template in enumerate(protein.templates):
-                _materialize_text_pair(
+                template_bytes += _materialize_template(
                     template,
-                    inline_field="mmcif",
-                    path_field="mmcifPath",
                     input_root=input_root,
                     field_name=(
                         f"sequences[{chain_index}].protein.templates[{template_index}]"
                     ),
-                    max_bytes=MAX_TEMPLATE_BYTES,
                 )
+                _validate_template_total(template_bytes)
         elif (rna := entry.rna) is not None:
             _materialize_text_pair(
                 rna,
@@ -670,7 +704,6 @@ def prepare_inference_run(
     """Build run/request identities and every required Volume upload."""
     validate_inference_parameters(recycle, sample)
     conf = validate_submitted_af3_input(enriched_config)
-    _validate_inline_inputs(conf)
     validate_inference_workload(conf.modelSeeds, sample)
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
@@ -688,7 +721,6 @@ def prepare_inference_run(
     staged_conf = conf.model_copy(deep=True)
     staged_conf.name = f"af3-{run_id[:16]}"
     staged_conf.modelSeeds = list(normalized_seeds)
-    uploads: dict[PurePosixPath, bytes] = {}
     staged_conf = validate_upstream_af3_input(staged_conf)
     identity_path = run_root / "inputs" / "identity.json"
     input_path = run_root / "requests" / request_id / "input.json"
@@ -698,16 +730,14 @@ def prepare_inference_run(
         raise ValueError(
             f"run identity exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
         )
-    uploads[identity_path] = identity_bytes
-    uploads[input_path] = input_bytes
-    payload_uploads = tuple(
-        VolumeUpload(relative_path=relative_path, content=content)
-        for relative_path, content in sorted(
-            uploads.items(),
-            key=lambda item: item[0].as_posix(),
-        )
+    identity_upload = VolumeUpload(
+        relative_path=identity_path,
+        content=identity_bytes,
     )
-    uploads_by_path = {upload.relative_path: upload for upload in payload_uploads}
+    input_upload = VolumeUpload(
+        relative_path=input_path,
+        content=input_bytes,
+    )
     staged_input = VolumeUpload(
         relative_path=run_root / "requests" / request_id / "staged-input.json",
         content=json_bytes({
@@ -715,8 +745,8 @@ def prepare_inference_run(
             "status": "complete",
             "run_id": run_id,
             "request_id": request_id,
-            "identity": uploads_by_path[identity_path].to_record(),
-            "input": uploads_by_path[input_path].to_record(),
+            "identity": identity_upload.to_record(),
+            "input": input_upload.to_record(),
         }),
     )
 
@@ -729,7 +759,7 @@ def prepare_inference_run(
         normalized_seeds=normalized_seeds,
         recycle=recycle,
         sample_count=sample,
-        payload_uploads=payload_uploads,
+        payload_uploads=(identity_upload, input_upload),
         staged_input=staged_input,
     )
 
@@ -824,7 +854,6 @@ def load_staged_inference_input(
         max_bytes=MAX_STAGED_INPUT_BYTES,
     )
     config = validate_upstream_af3_input(AF3Config.model_validate_json(input_bytes))
-    _validate_inline_inputs(config)
     if config.name != f"af3-{validated_run_id[:16]}":
         raise ValueError("Staged input canonical name does not match run_id")
     normalized_seeds = normalize_model_seeds(config.modelSeeds)

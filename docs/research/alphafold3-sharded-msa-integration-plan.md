@@ -861,7 +861,9 @@ relative path against the input JSON, inlines protein/RNA MSA, custom CCD, and
 template mmCIF content, clears those path fields, and rejects ambiguous
 inline/path pairs.
 It accepts only non-symlink regular files and bounds reads to 64 MiB for input
-JSON/custom mmCIF/user CCD and 512 MiB for each path-backed MSA.
+JSON/custom mmCIF/user CCD and 512 MiB for each path-backed MSA. It checks the
+template count before opening referenced files, enforces the aggregate limit
+after each read, and rejects empty template content.
 
 Before the first Modal call, the same seam mirrors upstream's structural checks
 that UniAF3 0.2.0 does not enforce: safe nonempty names, unique uppercase chain

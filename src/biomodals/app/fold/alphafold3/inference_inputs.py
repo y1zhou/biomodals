@@ -40,8 +40,11 @@ RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v1"
 STAGED_INPUT_SCHEMA_VERSION = 1
 MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = 512 * 1024 * 1024
+MAX_STAGED_INPUT_BYTES = 1024 * 1024 * 1024
 MAX_CUSTOM_TEMPLATE_BYTES = 64 * 1024 * 1024
 MAX_USER_CCD_BYTES = 64 * 1024 * 1024
+MAX_EXPANDED_ENTITIES = 5_120
+MAX_TOTAL_POLYMER_RESIDUES = 5_120
 MAX_MODEL_SEEDS = 1000
 MAX_NUM_RECYCLES = 100
 MAX_DIFFUSION_SAMPLES = 100
@@ -156,7 +159,7 @@ def _validate_entity_ids(
     entity: _AF3Entity,
     *,
     seen_ids: set[str],
-) -> None:
+) -> int:
     entity_ids = [entity.id] if isinstance(entity.id, str) else entity.id
     if not entity_ids or any(not entity_id for entity_id in entity_ids):
         raise ValueError("Input JSON contains sequences with unset IDs")
@@ -178,6 +181,7 @@ def _validate_entity_ids(
             f"Input JSON contains sequences with duplicate IDs: {sorted(duplicate_ids)}"
         )
     seen_ids.update(entry_ids)
+    return len(entity_ids)
 
 
 def _validate_polymer(entity_name: str, entity: AF3Protein | AF3RNA | AF3DNA) -> None:
@@ -269,11 +273,25 @@ def validate_upstream_af3_input(config: AF3Config) -> AF3Config:
         raise ValueError("AlphaFold input must contain at least one sequence")
 
     seen_ids: set[str] = set()
+    expanded_entities = 0
+    total_polymer_residues = 0
     for entry in validated.sequences:
         entity_name, entity = _entry_entity(entry)
-        _validate_entity_ids(entity, seen_ids=seen_ids)
+        copies = _validate_entity_ids(entity, seen_ids=seen_ids)
+        expanded_entities += copies
+        if expanded_entities > MAX_EXPANDED_ENTITIES:
+            raise ValueError(
+                "Input must contain no more than "
+                f"{MAX_EXPANDED_ENTITIES:,} expanded entities"
+            )
         if isinstance(entity, (AF3Protein, AF3RNA, AF3DNA)):
             _validate_polymer(entity_name, entity)
+            total_polymer_residues += copies * len(entity.sequence)
+            if total_polymer_residues > MAX_TOTAL_POLYMER_RESIDUES:
+                raise ValueError(
+                    "Input must contain no more than "
+                    f"{MAX_TOTAL_POLYMER_RESIDUES:,} total polymer residues"
+                )
     return validated
 
 
@@ -286,7 +304,12 @@ def validate_submitted_af3_input(config: AF3Config) -> AF3Config:
 
 def serialize_af3_input(config: AF3Config) -> bytes:
     """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
-    return validate_upstream_af3_input(config).to_json(exclude_unset=False).encode()
+    content = validate_upstream_af3_input(config).to_json(exclude_unset=False).encode()
+    if len(content) > MAX_STAGED_INPUT_BYTES:
+        raise ValueError(
+            f"staged input exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
+        )
+    return content
 
 
 def hash_sequences(*fragments: object) -> str:
@@ -914,6 +937,7 @@ def load_staged_inference_input(
         output_root,
         marker.get("input"),
         input_path,
+        max_bytes=MAX_STAGED_INPUT_BYTES,
     )
     config = validate_upstream_af3_input(AF3Config.model_validate_json(input_bytes))
     if config.name != f"af3-{validated_run_id[:16]}":

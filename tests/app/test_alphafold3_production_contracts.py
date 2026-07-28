@@ -19,7 +19,12 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
-from biomodals.app.fold.alphafold3 import msa_search, template_search
+from biomodals.app.fold.alphafold3 import (
+    inference_inputs,
+    msa_search,
+    search_pipeline,
+    template_search,
+)
 from biomodals.app.fold.alphafold3.artifacts import (
     artifact_record,
     json_bytes,
@@ -660,6 +665,26 @@ def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
     ]
 
 
+def test_search_pipeline_bounds_derived_tasks_before_remote_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NeverCalledExecutor:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"Remote executor method was accessed: {name}")
+
+    monkeypatch.setattr(search_pipeline, "MAX_REMOTE_SEARCH_TASKS", 1)
+    config = AF3Config(
+        name="bounded-search",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="1 remote search tasks"):
+        resolve_msa_and_templates(config, cast(Any, NeverCalledExecutor()))
+
+
 @pytest.mark.parametrize("database_id", ["uniref90", "rfam"])
 def test_search_identity_uses_runtime_hmmer_parameters(database_id: str) -> None:
     spec = resolve_database_profile(database_id)
@@ -1178,6 +1203,53 @@ def test_staged_input_rederives_identity_and_stages_inline_templates(
                 prepared.staged_input.relative_path,
                 marker_bytes,
             ).to_record(),
+        )
+
+
+def test_staged_input_rechecks_the_serialized_input_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "output"
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="bounded-reload",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa=">query\nACDE\n",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=output_root,
+        recycle=1,
+        sample=1,
+    )
+    _materialize_prepared_run(output_root, prepared)
+    input_upload = next(
+        upload
+        for upload in prepared.payload_uploads
+        if upload.relative_path.name == "input.json"
+    )
+    monkeypatch.setattr(
+        inference_inputs,
+        "MAX_STAGED_INPUT_BYTES",
+        len(input_upload.content) - 1,
+    )
+
+    with pytest.raises(ValueError, match="Staged artifact is too large"):
+        load_staged_inference_input(
+            output_root,
+            run_id=prepared.run_id,
+            request_id=prepared.request_id,
+            staged_input_record=prepared.staged_input.to_record(),
         )
 
 

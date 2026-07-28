@@ -640,6 +640,14 @@ prefixes, no more than 20 protein templates, and nonempty unsigned 32-bit model
 seeds. Invalid inputs fail before the first Modal call. The worker repeats the
 preflight before invoking upstream.
 
+The supported request envelope is also explicit: at most 5,120 expanded
+entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
+tasks, and a 1 GiB serialized staged input. The 5,120 bounds align with the
+largest default AlphaFold 3 compilation bucket documented by the pinned
+upstream revision. The CPU coordinator checks the conservative task upper bound
+before cache inspection, and inference workers repeat the staged-input byte
+check when loading from the output Volume.
+
 For each custom mmCIF, the helper reads inline content or the caller's
 `mmcifPath` and computes its full SHA-256 before run identity.
 

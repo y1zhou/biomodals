@@ -12,6 +12,7 @@ from typing import Protocol
 from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    serialize_af3_input,
     validate_submitted_af3_input,
     validate_upstream_af3_input,
 )
@@ -37,6 +38,8 @@ from biomodals.app.fold.alphafold3.msa_search import (
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
 
 type SearchOutcome = dict[str, object] | Exception
+
+MAX_REMOTE_SEARCH_TASKS = 512
 
 
 class SearchExecutor(Protocol):
@@ -106,11 +109,28 @@ def resolve_msa_and_templates(
     """Populate missing MSA/template fields through one validated deep seam."""
     worker_budget = validate_search_worker_budget(max_parallel_search_workers)
     conf = validate_submitted_af3_input(config)
+    serialize_af3_input(conf)
     if not search_msa:
         return validate_upstream_af3_input(fill_missing_msa_for_inference(conf))
 
     states = chain_msa_states(conf)
     plan = plan_msa_resolution(states)
+    possible_template_tasks = 0
+    if search_protein_templates:
+        for state in states:
+            if state.polymer != "protein":
+                continue
+            protein = conf.sequences[state.chain_index].protein
+            if protein is None:
+                raise RuntimeError("Protein MSA state no longer matches its chain")
+            if not protein.templates:
+                possible_template_tasks += 1
+    task_count = len(plan.raw_searches) + len(plan.assemblies) + possible_template_tasks
+    if task_count > MAX_REMOTE_SEARCH_TASKS:
+        raise ValueError(
+            "Request may derive no more than "
+            f"{MAX_REMOTE_SEARCH_TASKS} remote search tasks, got {task_count}"
+        )
     cache_statuses = (
         executor.inspect_raw(plan.raw_searches) if plan.raw_searches else ()
     )

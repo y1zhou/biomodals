@@ -6,7 +6,12 @@ from pathlib import Path
 
 import orjson
 import pytest
-from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
+from uniaf3.schema.alphafold3 import (
+    AF3Config,
+    AF3Ligand,
+    AF3Protein,
+    AF3SequenceEntry,
+)
 
 from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import inference_inputs
@@ -15,12 +20,24 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_SEED_SAMPLE_PAIRS,
     materialize_local_input,
     normalize_model_seeds,
+    prepare_inference_run,
     serialize_af3_input,
     validate_inference_parameters,
     validate_inference_worker_budget,
     validate_inference_workload,
     validate_upstream_af3_input,
 )
+
+
+def _chain_id(index: int) -> str:
+    """Return an Excel-style uppercase chain ID."""
+    value = ""
+    while True:
+        index, remainder = divmod(index, 26)
+        value = chr(ord("A") + remainder) + value
+        if index == 0:
+            return value
+        index -= 1
 
 
 def test_serialize_af3_input_emits_one_chain_type_per_sequence() -> None:
@@ -152,6 +169,66 @@ def test_search_preflight_rejects_invalid_input_before_remote_work() -> None:
 
     with pytest.raises(ValueError, match="only letters"):
         alphafold3_app._search_msa_and_templates(config)
+
+
+def test_upstream_preflight_bounds_expanded_entities_and_polymer_residues() -> None:
+    """Entity expansion and polymer tokens should have explicit support limits."""
+    entity_ids = [_chain_id(index) for index in range(5_121)]
+    too_many_entities = AF3Config(
+        name="too-many-entities",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                ligand=AF3Ligand(id=entity_ids, ccdCodes=["ATP"]),
+            )
+        ],
+    )
+    too_many_residues = AF3Config(
+        name="too-many-residues",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(id="A", sequence="A" * 5_121),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="5,120 expanded entities"):
+        validate_upstream_af3_input(too_many_entities)
+    with pytest.raises(ValueError, match="5,120 total polymer residues"):
+        validate_upstream_af3_input(too_many_residues)
+
+
+def test_inference_staging_bounds_the_serialized_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final request JSON should be bounded before Volume publication."""
+    monkeypatch.setattr(inference_inputs, "MAX_STAGED_INPUT_BYTES", 128)
+    config = AF3Config(
+        name="bounded-staging",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa=">query\nACDE\n",
+                    pairedMsa="",
+                    templates=[],
+                )
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="staged input exceeds the 128-byte limit"):
+        prepare_inference_run(
+            config,
+            (),
+            output_mount_root=tmp_path / "output",
+            recycle=1,
+            sample=1,
+        )
 
 
 def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:

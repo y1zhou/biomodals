@@ -15,6 +15,7 @@ import shutil
 import subprocess as sp
 import tarfile
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -810,10 +811,7 @@ def _local_request_manifest(
     presentation_name: str,
 ) -> dict[str, object]:
     """Build the presentation-local manifest embedded in the archive."""
-    local_manifest = cast(
-        dict[str, object],
-        orjson.loads(orjson.dumps(manifest)),
-    )
+    local_manifest = deepcopy(manifest)
     local_manifest["submitted_display_name"] = display_name
     local_manifest["presentation_name"] = presentation_name
     local_manifest["name_mapping"] = {

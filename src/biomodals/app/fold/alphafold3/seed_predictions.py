@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 
 import orjson
 import polars as pl
@@ -63,17 +63,7 @@ _SUMMARY_ARTIFACT_FILENAMES = {
 }
 
 
-class PredictionExecutor(Protocol):
-    """Production/test adapter for one pinned upstream inference process."""
-
-    def __call__(
-        self,
-        worker_root: Path,
-        canonical_name: str,
-        seeds: tuple[int, ...],
-    ) -> None:
-        """Write one complete upstream job tree below ``worker_root``."""
-        ...
+type PredictionExecutor = Callable[[Path, str, tuple[int, ...]], None]
 
 
 @dataclass(frozen=True, slots=True)

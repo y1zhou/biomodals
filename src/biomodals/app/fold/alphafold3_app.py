@@ -22,9 +22,6 @@ See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general d
 See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 """
 
-# Ignore ruff warnings about import location
-# ruff: noqa: PLC0415
-
 import os
 import uuid
 from pathlib import Path, PurePosixPath
@@ -107,9 +104,7 @@ from biomodals.app.fold.alphafold3.template_search import (
     TemplateRuntime,
     TemplateTask,
     inspect_template_entries,
-)
-from biomodals.app.fold.alphafold3.template_search import (
-    run_template_search as run_resumable_template_search,
+    run_template_search,
 )
 from biomodals.app.fold.alphafold3.upstream_inference import (
     UpstreamInferenceRuntime,
@@ -493,7 +488,7 @@ def search_protein_templates(
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
-    return run_resumable_template_search(
+    return run_template_search(
         _template_runtime(),
         TemplateTask(
             sequence=sequence,

@@ -14,7 +14,11 @@ from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import modal_adapters, upstream_inference
-from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
+from biomodals.app.fold.alphafold3.generation_claims import (
+    GenerationClaim,
+    finish_generation_claim,
+    generation_status,
+)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     LoadedInferenceInput,
     PreparedInferenceRun,
@@ -35,9 +39,90 @@ from biomodals.app.fold.alphafold3.msa_search import (
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
+    InferenceRuntime,
     SeedClaimPlan,
+    guard_seed_prediction_claims,
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
+
+
+class _ClaimStore:
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+
+    def put(
+        self,
+        key: str,
+        value: object,
+        *,
+        skip_if_exists: bool = False,
+    ) -> bool:
+        if skip_if_exists and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.values.get(key, default)
+
+
+class _Volume:
+    def reload(self) -> None:
+        pass
+
+    def commit(self) -> None:
+        pass
+
+
+def _claimed_seed(run_id: str, seed: int) -> ClaimedSeed:
+    scope_key = f"seed:{run_id}:{seed}"
+    owner = {
+        "scope_key": scope_key,
+        "generation_id": "generation",
+        "identity": {
+            "schema_version": 1,
+            "run_id": run_id,
+            "seed": seed,
+        },
+        "container_id": "claim-container",
+        "started_at": "2026-07-28T00:00:00Z",
+        "started_at_epoch_seconds": 1.0,
+        "maximum_age_seconds": 100.0,
+    }
+    return ClaimedSeed(
+        seed=seed,
+        claim=GenerationClaim(
+            scope_key=scope_key,
+            generation_id="generation",
+            owner=owner,
+        ),
+    )
+
+
+def _install_claim_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    claimed_seed: ClaimedSeed,
+) -> _ClaimStore:
+    claims = _ClaimStore()
+    claims.put(
+        f"claim:{claimed_seed.claim.scope_key}:root",
+        claimed_seed.claim.owner,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_INFERENCE_RUNTIME",
+        InferenceRuntime(
+            output_root=tmp_path,
+            volume=_Volume(),
+            claims=claims,
+            container_id="worker-container",
+            maximum_age_seconds=100,
+            summary_maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+        ),
+    )
+    return claims
 
 
 def test_app_public_functions_are_modal_endpoints() -> None:
@@ -633,16 +718,7 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
             "size_bytes": 1,
             "sha256": "c" * 64,
         },
-        claimed_seed_records=[
-            {
-                "seed": 1,
-                "claim": {
-                    "scope_key": f"seed:{'a' * 64}:1",
-                    "generation_id": "generation",
-                    "owner": {},
-                },
-            }
-        ],
+        claimed_seed_records=[_claimed_seed("a" * 64, 1).to_dict()],
     )
 
     assert result == {"status": "published"}
@@ -664,7 +740,12 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     assert not jax_cache_dir.is_relative_to(alphafold3_app.CONF.model_volume_mountpoint)
 
 
-def test_inference_worker_revalidates_loaded_numeric_limits(monkeypatch) -> None:
+def test_inference_worker_revalidates_loaded_numeric_limits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    claimed_seed = _claimed_seed("a" * 64, 1)
+    _install_claim_runtime(monkeypatch, tmp_path, claimed_seed)
     conf = AF3Config(
         name="invalid-worker-counts",
         modelSeeds=[1],
@@ -697,11 +778,92 @@ def test_inference_worker_revalidates_loaded_numeric_limits(monkeypatch) -> None
                 "size_bytes": 1,
                 "sha256": "c" * 64,
             },
-            claimed_seed_records=[],
+            claimed_seed_records=[claimed_seed.to_dict()],
         )
 
 
-def test_inference_worker_rejects_seed_outside_staged_request(monkeypatch) -> None:
+def test_inference_worker_fails_claim_when_staged_input_loading_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_id = "a" * 64
+    seed = 42
+    claimed_seed = _claimed_seed(run_id, seed)
+    claims = _install_claim_runtime(monkeypatch, tmp_path, claimed_seed)
+    monkeypatch.setattr(
+        alphafold3_app.CONF.output_volume,
+        "reload",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_staged_inference_input",
+        Mock(side_effect=ValueError("staged input is invalid")),
+    )
+
+    with pytest.raises(ValueError, match="staged input is invalid"):
+        alphafold3_app.run_inference_pipeline.get_raw_f()(
+            run_id=run_id,
+            request_id="b" * 64,
+            staged_input_record={
+                "path": "staged-input.json",
+                "size_bytes": 1,
+                "sha256": "c" * 64,
+            },
+            claimed_seed_records=[claimed_seed.to_dict()],
+        )
+
+    status = generation_status(
+        claims,
+        claimed_seed.claim.scope_key,
+        claimed_seed.claim.generation_id,
+    )
+    assert status is not None
+    assert status["status"] == "failed"
+    assert isinstance(status["finished_at"], str)
+    assert status["error_type"] == "ValueError"
+    assert status["message"] == "staged input is invalid"
+    assert status["phase"] == "inference-worker"
+
+
+def test_inference_worker_preserves_claim_already_completed_by_inner_worker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_id = "a" * 64
+    claimed_seed = _claimed_seed(run_id, 42)
+    claims = _install_claim_runtime(monkeypatch, tmp_path, claimed_seed)
+
+    with pytest.raises(RuntimeError, match="after publication"):
+        with guard_seed_prediction_claims(
+            alphafold3_app._INFERENCE_RUNTIME,
+            run_id,
+            [claimed_seed.to_dict()],
+        ):
+            finish_generation_claim(
+                claims,
+                claimed_seed.claim,
+                status="complete",
+                detail={"publication": "published"},
+            )
+            raise RuntimeError("after publication")
+
+    status = generation_status(
+        claims,
+        claimed_seed.claim.scope_key,
+        claimed_seed.claim.generation_id,
+    )
+    assert status is not None
+    assert status["status"] == "complete"
+    assert status["publication"] == "published"
+
+
+def test_inference_worker_rejects_seed_outside_staged_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    claimed_seed = _claimed_seed("a" * 64, 2)
+    _install_claim_runtime(monkeypatch, tmp_path, claimed_seed)
     conf = AF3Config(
         name="request-bound-worker",
         modelSeeds=[1],
@@ -735,16 +897,7 @@ def test_inference_worker_rejects_seed_outside_staged_request(monkeypatch) -> No
                 "size_bytes": 1,
                 "sha256": "c" * 64,
             },
-            claimed_seed_records=[
-                {
-                    "seed": 2,
-                    "claim": {
-                        "scope_key": f"seed:{'a' * 64}:2",
-                        "generation_id": "generation",
-                        "owner": {},
-                    },
-                }
-            ],
+            claimed_seed_records=[claimed_seed.to_dict()],
         )
 
     worker.assert_not_called()

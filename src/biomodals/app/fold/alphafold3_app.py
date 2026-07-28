@@ -114,6 +114,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
     InferenceRuntime,
     claim_seed_predictions,
+    guard_seed_prediction_claims,
     inspect_seed_predictions,
 )
 from biomodals.app.fold.alphafold3.sharding import (
@@ -663,20 +664,25 @@ def run_inference_pipeline(
     claimed_seed_records: list[dict[str, object]],
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
-    staged = _load_staged_request(run_id, request_id, staged_input_record)
-    return run_upstream_seed_worker(
-        UpstreamInferenceRuntime(
-            predictions=_INFERENCE_RUNTIME,
-            source_root=CONF.git_clone_dir,
-            model_root=Path(CONF.model_volume_mountpoint),
-            jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
-        ),
-        staged.config,
+    with guard_seed_prediction_claims(
+        _INFERENCE_RUNTIME,
         run_id,
-        staged.recycle,
-        staged.sample_count,
         claimed_seed_records,
-    )
+    ) as claimed_seeds:
+        staged = _load_staged_request(run_id, request_id, staged_input_record)
+        return run_upstream_seed_worker(
+            UpstreamInferenceRuntime(
+                predictions=_INFERENCE_RUNTIME,
+                source_root=CONF.git_clone_dir,
+                model_root=Path(CONF.model_volume_mountpoint),
+                jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
+            ),
+            staged.config,
+            run_id,
+            staged.recycle,
+            staged.sample_count,
+            claimed_seeds,
+        )
 
 
 @app.function(

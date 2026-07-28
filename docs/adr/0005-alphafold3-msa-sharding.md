@@ -846,6 +846,13 @@ Claims are acquired per seed before owned seeds are grouped into at most
 `max_num_gpus` disjoint, balanced worker lists. The same seed is never assigned
 to two workers.
 
+A GPU invocation validates its serialized claim identities before loading the
+staged input. From that point, an outer claim guard covers staged-input loading,
+worker preflight, and prediction publication. Any catchable failure appends a
+failed terminal status for each still-active generation without changing claims
+already completed by the marker-last worker. A hard container loss still relies
+on conservative age-based abandonment.
+
 A GPU container may receive multiple seeds, matching upstream
 `process_fold_input` behavior.
 

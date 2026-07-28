@@ -14,7 +14,8 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -38,6 +39,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     acquire_generation_claim,
     assert_generation_current,
     finish_generation_claim,
+    generation_status,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     hash_sequences,
@@ -483,6 +485,71 @@ def claimed_seed_from_dict(value: object) -> ClaimedSeed:
     )
 
 
+def _validate_claimed_seeds(
+    run_id: str,
+    claimed_seeds: tuple[ClaimedSeed, ...],
+) -> tuple[ClaimedSeed, ...]:
+    selected_run = validate_run_id(run_id)
+    if not claimed_seeds:
+        raise ValueError("Seed worker requires at least one claimed seed")
+    selected = tuple(sorted(claimed_seeds, key=lambda item: item.seed))
+    if len({item.seed for item in selected}) != len(selected):
+        raise ValueError("Seed worker claims must be unique")
+    for item in selected:
+        if item.claim.scope_key != _seed_claim_scope(selected_run, item.seed):
+            raise ValueError(f"Seed {item.seed} claim scope does not match")
+        if item.claim.owner.get("identity") != _seed_claim_identity(
+            selected_run,
+            item.seed,
+        ):
+            raise ValueError(f"Seed {item.seed} claim identity does not match")
+    return selected
+
+
+@contextmanager
+def guard_seed_prediction_claims(
+    runtime: InferenceRuntime,
+    run_id: str,
+    claimed_seed_records: list[dict[str, object]],
+) -> Iterator[tuple[ClaimedSeed, ...]]:
+    """Make every valid worker claim terminal when its invocation fails."""
+    claimed_seeds = _validate_claimed_seeds(
+        run_id,
+        tuple(claimed_seed_from_dict(record) for record in claimed_seed_records),
+    )
+    try:
+        yield claimed_seeds
+    except BaseException as exc:
+        for item in claimed_seeds:
+            try:
+                if (
+                    generation_status(
+                        runtime.claims,
+                        item.claim.scope_key,
+                        item.claim.generation_id,
+                    )
+                    is not None
+                ):
+                    continue
+                assert_generation_current(runtime.claims, item.claim)
+                finish_generation_claim(
+                    runtime.claims,
+                    item.claim,
+                    status="failed",
+                    detail={
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        "phase": "inference-worker",
+                    },
+                )
+            except Exception as claim_exc:
+                exc.add_note(
+                    f"Failed to terminalize seed {item.seed} claim "
+                    f"{item.claim.generation_id}: {claim_exc}"
+                )
+        raise
+
+
 def seed_claim_plan_from_dict(value: object) -> SeedClaimPlan:
     """Parse a claim plan returned by the lightweight Modal coordinator."""
     if not isinstance(value, dict):
@@ -669,18 +736,7 @@ def run_seed_prediction_worker(
     """Execute, validate, and marker-last publish one disjoint seed group."""
     selected_run = validate_run_id(task.run_id)
     sample_count = _validate_sample_count(task.sample_count)
-    if not task.claimed_seeds:
-        raise ValueError("Seed worker requires at least one claimed seed")
-    claimed_seeds = tuple(sorted(task.claimed_seeds, key=lambda item: item.seed))
-    if len({item.seed for item in claimed_seeds}) != len(claimed_seeds):
-        raise ValueError("Seed worker claims must be unique")
-    for item in claimed_seeds:
-        if item.claim.scope_key != _seed_claim_scope(selected_run, item.seed):
-            raise ValueError(f"Seed {item.seed} claim scope does not match")
-        if item.claim.owner.get("identity") != _seed_claim_identity(
-            selected_run, item.seed
-        ):
-            raise ValueError(f"Seed {item.seed} claim identity does not match")
+    claimed_seeds = _validate_claimed_seeds(selected_run, task.claimed_seeds)
 
     run_root = inference_run_root(runtime.output_root, selected_run)
     runtime.volume.reload()

@@ -23,10 +23,10 @@ from biomodals.app.fold.alphafold3.input_enrichment import (
     fill_missing_msa_for_inference,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
+    ClaimedSeed,
     InferenceRuntime,
     SeedWorkerTask,
     canonical_output_name,
-    claimed_seed_from_dict,
     finalize_run_summary,
     run_seed_prediction_worker,
 )
@@ -49,13 +49,10 @@ def run_upstream_seed_worker(
     run_id: str,
     recycle: int,
     sample_count: int,
-    claimed_seed_records: list[dict[str, object]],
+    claimed_seeds: tuple[ClaimedSeed, ...],
 ) -> dict[str, object]:
     """Run and marker-last publish one disjoint upstream seed group."""
     validate_inference_parameters(recycle, sample_count)
-    claimed_seeds = tuple(
-        claimed_seed_from_dict(record) for record in claimed_seed_records
-    )
     base_config = validate_upstream_af3_input(config)
     claimed_seed_values = [item.seed for item in claimed_seeds]
     if not claimed_seed_values or not set(claimed_seed_values).issubset(

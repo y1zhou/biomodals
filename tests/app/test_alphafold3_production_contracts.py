@@ -1111,7 +1111,7 @@ def test_seed_claims_reload_the_volume_once_per_reconciliation(
     assert volume.reload_count == 2
 
 
-def test_staged_input_rederives_identity_and_preserves_inline_templates(
+def test_staged_input_rederives_identity_and_stages_inline_templates(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "output"
@@ -1153,11 +1153,15 @@ def test_staged_input_rederives_identity_and_preserves_inline_templates(
     assert loaded.sample_count == 2
     assert loaded.config.modelSeeds == [1, 2]
     template = loaded.config.sequences[0].protein.templates[0]
-    assert template.mmcif == "data_inline\n#\n"
-    assert template.mmcifPath is None
-    assert not any(
-        upload.relative_path.parent.name == "custom-templates"
-        for upload in prepared.payload_uploads
+    assert template.mmcif is None
+    assert Path(template.mmcifPath).is_relative_to(output_root)
+    assert (
+        len([
+            upload
+            for upload in prepared.payload_uploads
+            if upload.relative_path.parent.name == "custom-templates"
+        ])
+        == 1
     )
 
     marker = orjson.loads(prepared.staged_input.content)
@@ -1175,6 +1179,67 @@ def test_staged_input_rederives_identity_and_preserves_inline_templates(
                 marker_bytes,
             ).to_record(),
         )
+
+
+def test_staging_canonicalizes_equivalent_inline_and_path_templates(
+    tmp_path: Path,
+) -> None:
+    template_path = tmp_path / "template.cif"
+    template_content = b"data_equivalent\n#\n"
+    template_path.write_bytes(template_content)
+
+    def config(template: AF3Template) -> AF3Config:
+        return AF3Config(
+            name="equivalent-template",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        templates=[template],
+                    )
+                )
+            ],
+        )
+
+    inline = prepare_inference_run(
+        config(
+            AF3Template(
+                mmcif=template_content.decode(),
+                queryIndices=[0],
+                templateIndices=[0],
+            )
+        ),
+        (),
+        output_mount_root=tmp_path / "output",
+        recycle=1,
+        sample=1,
+    )
+    path_backed = prepare_inference_run(
+        config(
+            AF3Template(
+                mmcifPath=str(template_path),
+                queryIndices=[0],
+                templateIndices=[0],
+            )
+        ),
+        (
+            LocalTemplateFile(
+                source_path=template_path,
+                content=template_content,
+                sha256=hashlib.sha256(template_content).hexdigest(),
+            ),
+        ),
+        output_mount_root=tmp_path / "output",
+        recycle=1,
+        sample=1,
+    )
+
+    assert inline.run_id == path_backed.run_id
+    assert inline.request_id == path_backed.request_id
+    assert inline.payload_uploads == path_backed.payload_uploads
+    assert inline.staged_input == path_backed.staged_input
 
 
 def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:

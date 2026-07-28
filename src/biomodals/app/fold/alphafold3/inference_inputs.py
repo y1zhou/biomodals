@@ -708,8 +708,6 @@ def prepare_inference_run(
         if (protein := entry.protein) is None:
             continue
         for template in protein.templates:
-            if template.mmcifPath is None:
-                continue
             template_view = cast(
                 dict[str, object],
                 template.model_dump(mode="python", exclude_unset=False),

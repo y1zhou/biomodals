@@ -640,21 +640,23 @@ prefixes, no more than 20 protein templates, and nonempty unsigned 32-bit model
 seeds. Invalid inputs fail before the first Modal call. The worker repeats the
 preflight before invoking upstream.
 
-For each caller `mmcifPath`, the helper reads the file and computes its full
-SHA-256 before run identity.
+For each custom mmCIF, the helper reads inline content or the caller's
+`mmcifPath` and computes its full SHA-256 before run identity.
 
 The identity representation substitutes that digest for the path while
 retaining `queryIndices` and `templateIndices`. Inline mmCIF uses the same
 content-digest representation.
 
-After `run_id` is known, each path-backed template is uploaded once to:
+After `run_id` is known, every inline or path-backed custom template is
+canonicalized and uploaded once to:
 
 ```text
 <run-root>/custom-templates/{sha256}.cif
 ```
 
-The worker input rewrites `mmcifPath` to the mounted path. Identical content is
-deduplicated within the run, while inline mmCIF remains inline.
+The worker input uses only the mounted `mmcifPath` representation. Identical
+content is deduplicated within the run, so equivalent inline and path-backed
+submissions produce identical staged inputs.
 
 ### Staged inference input
 
@@ -885,8 +887,8 @@ referenced Staged Custom Templates.
 Custom templates appear at `custom-templates/{sha256}.cif`. Only the downloaded
 input copy rewrites `mmcifPath` to those archive-relative paths.
 
-Inline mmCIF stays inline. The request manifest prevents unrelated custom
-templates from being downloaded.
+Inline and path-backed custom mmCIF both use archive-relative paths. The request
+manifest prevents unrelated custom templates from being downloaded.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each

@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Literal, cast
 import orjson
 
 from biomodals.app.fold.alphafold3.artifacts import (
+    MAX_MSA_FIELD_BYTES,
     VolumeHandle,
     append_log,
     artifact_record,
@@ -86,6 +87,7 @@ SEARCH_N_CPU = 2
 SEARCH_MAX_PARALLEL_SHARDS = 16
 MAX_QUERY_RESIDUES = 5_120
 MAX_REMOTE_SEARCH_TASKS = 512
+MAX_MSA_INSPECTION_BYTES = 1024 * 1024 * 1024
 
 PROTEIN_UNPAIRED_DATABASES = ("uniref90", "small_bfd", "mgnify")
 PROTEIN_PAIRED_DATABASES = ("uniprot",)
@@ -1100,18 +1102,29 @@ def _load_combined_msa(
         expected.append(("unpairedMsa", "unpaired.a3m"))
     if task.include_paired:
         expected.append(("pairedMsa", "paired.a3m"))
+    declared_size = 0
     for field, filename in expected:
         record = artifacts.get(field)
+        if not isinstance(record, dict):
+            return None
+        field_size = record.get("size_bytes")
+        if (
+            isinstance(field_size, bool)
+            or not isinstance(field_size, int)
+            or field_size <= 0
+            or field_size > MAX_MSA_FIELD_BYTES
+            or declared_size + field_size > MAX_MSA_INSPECTION_BYTES
+        ):
+            return None
+        declared_size += field_size
         value = load_artifact_bytes(sequence_root, record, filename)
         if value is None:
             return None
         try:
-            fields[field] = value.decode()
+            fields[field] = value.decode("ascii")
         except UnicodeDecodeError:
             return None
         if field == "unpairedMsa":
-            if not isinstance(record, dict):
-                return None
             relative_path = (
                 sequence_cache_relpath(task.polymer, task.sequence) / filename
             )
@@ -1125,6 +1138,22 @@ def _load_combined_msa(
     if unpaired_reference is None:
         return None
     return fields, unpaired_reference
+
+
+def _validated_msa_fields_size(fields: dict[str, str]) -> int:
+    total_size = 0
+    for value in fields.values():
+        if not isinstance(value, str) or not value or not value.isascii():
+            raise ValueError("MSA fields must contain nonempty ASCII text")
+        field_size = len(value)
+        if field_size > MAX_MSA_FIELD_BYTES:
+            raise ValueError(f"MSA field exceeds the {MAX_MSA_FIELD_BYTES}-byte limit")
+        total_size += field_size
+    if total_size > MAX_MSA_INSPECTION_BYTES:
+        raise ValueError(
+            f"MSA result exceeds the {MAX_MSA_INSPECTION_BYTES}-byte response limit"
+        )
+    return total_size
 
 
 def _combined_msa_result(
@@ -1168,6 +1197,7 @@ def inspect_msa_cache(
     assembly_contract = assert_pinned_msa_assembly_contract() if assembly_tasks else {}
     reusable_sequences: set[tuple[Polymer, str]] = set()
     combined_statuses: list[dict[str, object]] = []
+    response_size = 0
     for task in assembly_tasks:
         metadata: dict[str, RawMsaMetadata] = {}
         for database_id in _required_database_ids(task):
@@ -1194,6 +1224,12 @@ def inspect_msa_cache(
                 task.sequence,
             )
             if reusable := _load_combined_msa(sequence_root, provenance, task):
+                response_size += _validated_msa_fields_size(reusable[0])
+                if response_size > MAX_MSA_INSPECTION_BYTES:
+                    raise ValueError(
+                        "Combined MSA cache inspection exceeds the "
+                        f"{MAX_MSA_INSPECTION_BYTES}-byte response limit"
+                    )
                 reusable_sequences.add((task.polymer, task.sequence))
                 status = _combined_msa_result(
                     "reused",
@@ -1286,6 +1322,7 @@ def assemble_and_publish_msas(
         include_unpaired=task.include_unpaired,
         include_paired=task.include_paired,
     )
+    _validated_msa_fields_size(fields)
 
     if not complete_canonical:
         return {

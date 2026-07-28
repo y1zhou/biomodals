@@ -413,6 +413,12 @@ only once. If the combined marker or artifacts are missing or invalid,
 inspection deep-validates the required raw A3Ms; corrupt raw results are then
 scheduled for repair before assembly is retried.
 
+Each combined MSA field is limited to 512 MiB before publication and before a
+marked artifact is read. One assembly result and one aggregate cache-inspection
+response are limited to 1 GiB. Oversized legacy publications are cache misses,
+and newly assembled oversized fields fail before their completion marker can
+be published.
+
 Only the latest canonical combination is retained at the flat paths. Older
 combinations remain reconstructable from immutable raw results.
 

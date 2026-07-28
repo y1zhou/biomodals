@@ -1398,6 +1398,18 @@ def test_cache_inspection_prefers_combined_msa_and_recovers_raw_corruption(
         "pairedMsa": ">query\nACDE\n",
     }
     assert len(cast(str, combined_statuses[0]["combined_identity"])) == 64
+    monkeypatch.setattr(
+        msa_search,
+        "MAX_MSA_INSPECTION_BYTES",
+        len(unpaired_msa) * 2 + 1,
+    )
+    with pytest.raises(ValueError, match="MSA cache inspection exceeds"):
+        msa_search.inspect_msa_cache(
+            tmp_path / "profiles",
+            tmp_path / "cache",
+            raw_tasks,
+            (task, task),
+        )
 
     monkeypatch.setattr(msa_search, "_load_combined_msa", lambda *args: None)
     monkeypatch.setattr(
@@ -1427,6 +1439,137 @@ def test_cache_inspection_prefers_combined_msa_and_recovers_raw_corruption(
             "sequence_sha256": sequence_hash("ACDE"),
         }
     ]
+
+
+def test_combined_msa_cache_bounds_declared_fields_before_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = MsaAssemblyTask(
+        polymer="protein",
+        sequence="ACDE",
+        include_unpaired=True,
+        include_paired=True,
+    )
+    provenance = {"combined_identity": "a" * 64}
+    (tmp_path / "combined.done.json").write_bytes(
+        orjson.dumps({
+            "schema_version": msa_search.COMBINED_RESULT_SCHEMA_VERSION,
+            "status": "complete",
+            "provenance": provenance,
+            "artifacts": {
+                "unpairedMsa": _artifact("unpaired.a3m", b"12345"),
+                "pairedMsa": _artifact("paired.a3m", b"x"),
+            },
+        })
+    )
+    monkeypatch.setattr(msa_search, "MAX_MSA_FIELD_BYTES", 4)
+    monkeypatch.setattr(
+        msa_search,
+        "load_artifact_bytes",
+        lambda *args, **kwargs: pytest.fail("oversized MSA field was read"),
+    )
+
+    assert msa_search._load_combined_msa(tmp_path, provenance, task) is None
+
+
+def test_combined_msa_rejects_oversized_fields_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = MsaAssemblyTask(
+        polymer="protein",
+        sequence="ACDE",
+        include_unpaired=True,
+        include_paired=True,
+    )
+    contexts = {
+        database_id: SearchContext(
+            spec=resolve_database_profile(database_id),
+            sequence=task.sequence,
+            sequence_hash=sequence_hash(task.sequence),
+            profile_root=tmp_path / "profiles" / database_id,
+            search_identity=hashlib.sha256(database_id.encode()).hexdigest(),
+            provenance={},
+            result_root=tmp_path / "raw" / database_id,
+        )
+        for database_id in (
+            *msa_search.PROTEIN_UNPAIRED_DATABASES,
+            *msa_search.PROTEIN_PAIRED_DATABASES,
+        )
+    }
+    metadata = {
+        database_id: msa_search.RawMsaMetadata(
+            context=context,
+            done_sha256=hashlib.sha256(f"done:{database_id}".encode()).hexdigest(),
+            result_record=_artifact("result.a3m"),
+        )
+        for database_id, context in contexts.items()
+    }
+    entries = {
+        database_id: RawMsaEntry(
+            context=context,
+            a3m=">query\nACDE\n",
+            done_sha256=metadata[database_id].done_sha256,
+            result_record=metadata[database_id].result_record,
+        )
+        for database_id, context in contexts.items()
+    }
+    monkeypatch.setattr(
+        msa_search,
+        "load_search_context",
+        lambda sharded_root, cache_root, database_id, sequence: contexts[database_id],
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "load_raw_msa_metadata",
+        lambda context: metadata[context.spec.database_id],
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "load_raw_msa",
+        lambda context: entries[context.spec.database_id],
+    )
+    monkeypatch.setattr(
+        msa_search,
+        "assert_pinned_msa_assembly_contract",
+        lambda: {"contract": "pinned"},
+    )
+    monkeypatch.setattr(msa_search, "_load_combined_msa", lambda *args: None)
+    monkeypatch.setattr(
+        msa_search,
+        "assemble_msa_fields",
+        lambda *args, **kwargs: {
+            "unpairedMsa": "12345",
+            "pairedMsa": "x",
+        },
+    )
+    monkeypatch.setattr(msa_search, "MAX_MSA_FIELD_BYTES", 4)
+    runtime = msa_search.SearchRuntime(
+        sharded_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        cache_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+        sharded_root=tmp_path / "profiles",
+        cache_root=tmp_path / "cache",
+    )
+
+    with pytest.raises(ValueError, match="MSA field exceeds"):
+        msa_search.assemble_and_publish_msas(runtime, task)
+
+    sequence_root = runtime.cache_root / msa_search.sequence_cache_relpath(
+        task.polymer,
+        task.sequence,
+    )
+    assert not (sequence_root / "combined.done.json").exists()
 
 
 def test_template_cache_rejects_changed_template_bytes(tmp_path: Path) -> None:

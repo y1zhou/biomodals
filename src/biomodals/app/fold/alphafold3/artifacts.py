@@ -15,6 +15,7 @@ import orjson
 
 _JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024
 
 
 class VolumeHandle(Protocol):

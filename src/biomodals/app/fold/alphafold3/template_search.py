@@ -14,7 +14,7 @@ import re
 import shutil
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, cast
 
@@ -95,6 +95,8 @@ class TemplateTask:
     publish_canonical: bool
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE
     unpaired_msa_reference: MsaArtifactReference | None = None
+    _unpaired_msa_sha256: str = field(init=False, repr=False, compare=False)
+    _template_identity: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Require canonical references or request-local inline evidence."""
@@ -108,24 +110,31 @@ class TemplateTask:
             raise ValueError(
                 "Only canonical template tasks may use an MSA artifact reference"
             )
+        digest = (
+            self.unpaired_msa_reference.sha256
+            if self.unpaired_msa_reference is not None
+            else sha256_bytes(cast(str, self.unpaired_msa).encode())
+        )
+        object.__setattr__(self, "_unpaired_msa_sha256", digest)
+        object.__setattr__(
+            self,
+            "_template_identity",
+            template_search_identity(
+                self.sequence,
+                digest,
+                self.max_template_date,
+            ),
+        )
 
     @property
     def unpaired_msa_sha256(self) -> str:
         """Return the content identity of the resolved unpaired MSA."""
-        if self.unpaired_msa_reference is not None:
-            return self.unpaired_msa_reference.sha256
-        if self.unpaired_msa is None:
-            raise RuntimeError("Template task has no unpaired MSA")
-        return sha256_bytes(self.unpaired_msa.encode())
+        return self._unpaired_msa_sha256
 
     @property
     def template_identity(self) -> str:
         """Return the scientific identity of this template search."""
-        return template_search_identity(
-            self.sequence,
-            self.unpaired_msa_sha256,
-            self.max_template_date,
-        )
+        return self._template_identity
 
 
 @dataclass(frozen=True, slots=True)

@@ -597,6 +597,32 @@ def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
     }
 
 
+def test_template_task_computes_immutable_identities_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unpaired_msa = ">query\nACDE\n"
+    hashed_values: list[bytes] = []
+    sha256_bytes = template_search.sha256_bytes
+
+    def count_hash(value: bytes) -> str:
+        hashed_values.append(value)
+        return sha256_bytes(value)
+
+    monkeypatch.setattr(template_search, "sha256_bytes", count_hash)
+    task = TemplateTask(
+        sequence="ACDE",
+        unpaired_msa=unpaired_msa,
+        publish_canonical=False,
+    )
+
+    for _ in range(3):
+        assert task.unpaired_msa_sha256
+        assert task.template_identity
+
+    assert hashed_values.count(unpaired_msa.encode()) == 1
+    assert len(hashed_values) == 2
+
+
 def test_msa_resolution_binds_references_to_returned_fields() -> None:
     task = MsaAssemblyTask(
         polymer="protein",

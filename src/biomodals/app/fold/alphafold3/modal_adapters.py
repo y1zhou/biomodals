@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
+from time import monotonic
 from typing import Literal
 
 import modal
@@ -111,16 +112,60 @@ def _bounded_remote_outcomes[TaskT](
     invoke: Callable[[TaskT], dict[str, object]],
     *,
     max_parallel: int,
+    on_complete: (
+        Callable[[TaskT, dict[str, object] | Exception, float], None] | None
+    ) = None,
 ) -> tuple[dict[str, object] | Exception, ...]:
     """Run blocking remote calls while preserving task order and failures."""
 
     def capture(task: TaskT) -> dict[str, object] | Exception:
+        started_at = monotonic()
         try:
-            return invoke(task)
+            outcome: dict[str, object] | Exception = invoke(task)
         except Exception as exc:
-            return exc
+            outcome = exc
+        if on_complete is not None:
+            on_complete(task, outcome, monotonic() - started_at)
+        return outcome
 
     return tuple(bounded_map(tasks, capture, max_parallel=max_parallel))
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, round(seconds))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {remaining_minutes}m {remaining_seconds}s"
+    if minutes:
+        return f"{minutes}m {remaining_seconds}s"
+    return f"{remaining_seconds}s"
+
+
+def _query_preview(sequence: str) -> str:
+    suffix = "…" if len(sequence) > 16 else ""
+    return f"{sequence[:16]}{suffix} ({len(sequence)} residues)"
+
+
+def _log_search_completion(
+    operation: str,
+    sequence: str,
+    database: str,
+    outcome: dict[str, object] | Exception,
+    elapsed_seconds: float,
+) -> None:
+    task = f"query={_query_preview(sequence)}, database={database}"
+    elapsed = _format_elapsed(elapsed_seconds)
+    if isinstance(outcome, Exception):
+        print(
+            f"🧬 {operation} failed: {task}, "
+            f"error={type(outcome).__name__}, elapsed={elapsed}."
+        )
+        return
+    print(
+        f"🧬 {operation} finished: {task}, "
+        f"status={outcome.get('status', 'complete')}, elapsed={elapsed}."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +213,13 @@ class ModalSearchExecutor(SearchExecutor):
                 task.sequence,
             ),
             max_parallel=max_parallel,
+            on_complete=lambda task, outcome, elapsed: _log_search_completion(
+                "MSA query",
+                task.sequence,
+                task.database_id,
+                outcome,
+                elapsed,
+            ),
         )
 
     def run_assemblies(
@@ -221,6 +273,13 @@ class ModalSearchExecutor(SearchExecutor):
                 task.max_template_date,
             ),
             max_parallel=max_parallel,
+            on_complete=lambda task, outcome, elapsed: _log_search_completion(
+                "Protein template search",
+                task.sequence,
+                "pdb_seqres",
+                outcome,
+                elapsed,
+            ),
         )
 
 

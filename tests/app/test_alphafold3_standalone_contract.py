@@ -202,6 +202,52 @@ def test_modal_search_executor_marshals_remote_fanout(
     )
 
 
+def test_modal_search_executor_logs_worker_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_bounded_map(items, worker, *, max_parallel):
+        del max_parallel
+        return [worker(item) for item in items]
+
+    times = iter((0.0, 168.0, 200.0, 262.0))
+    monkeypatch.setattr(modal_adapters, "bounded_map", fake_bounded_map)
+    monkeypatch.setattr(modal_adapters, "monotonic", lambda: next(times))
+    executor = ModalSearchExecutor(
+        inspect_msa_function=SimpleNamespace(),
+        raw_search_function=SimpleNamespace(
+            remote=Mock(return_value={"status": "published"})
+        ),
+        msa_assembly_function=SimpleNamespace(),
+        inspect_templates_function=SimpleNamespace(),
+        template_search_function=SimpleNamespace(
+            remote=Mock(return_value={"status": "published", "templates": []})
+        ),
+    )
+    sequence = "ACDEFGHIKLMNPQRSTVWYACDE"
+    template = TemplateTask(
+        sequence=sequence,
+        unpaired_msa=f">query\n{sequence}\n",
+        unpaired_msa_reference=None,
+        publish_canonical=False,
+    )
+
+    executor.run_raw(
+        (RawSearchTask(database_id="uniref90", sequence=sequence),),
+        max_parallel=1,
+    )
+    executor.run_templates((template,), max_parallel=1)
+
+    assert capsys.readouterr().out.splitlines() == [
+        "🧬 MSA query finished: "
+        "query=ACDEFGHIKLMNPQRS… (24 residues), database=uniref90, "
+        "status=published, elapsed=2m 48s.",
+        "🧬 Protein template search finished: "
+        "query=ACDEFGHIKLMNPQRS… (24 residues), database=pdb_seqres, "
+        "status=published, elapsed=1m 2s.",
+    ]
+
+
 def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

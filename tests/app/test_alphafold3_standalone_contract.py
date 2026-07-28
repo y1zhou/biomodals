@@ -615,3 +615,52 @@ def test_inference_worker_revalidates_loaded_numeric_limits(monkeypatch) -> None
             },
             claimed_seed_records=[],
         )
+
+
+def test_inference_worker_rejects_seed_outside_staged_request(monkeypatch) -> None:
+    conf = AF3Config(
+        name="request-bound-worker",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
+        ],
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_staged_inference_input",
+        lambda output_root, **identity: LoadedInferenceInput(
+            config=conf,
+            recycle=1,
+            sample_count=1,
+        ),
+    )
+    monkeypatch.setattr(
+        alphafold3_app.CONF.output_volume,
+        "reload",
+        lambda: None,
+    )
+    worker = Mock(side_effect=AssertionError("worker must not run"))
+    monkeypatch.setattr(upstream_inference, "run_seed_prediction_worker", worker)
+
+    with pytest.raises(ValueError, match="staged request"):
+        alphafold3_app.run_inference_pipeline.get_raw_f()(
+            run_id="a" * 64,
+            request_id="b" * 64,
+            staged_input_record={
+                "path": "staged-input.json",
+                "size_bytes": 1,
+                "sha256": "c" * 64,
+            },
+            claimed_seed_records=[
+                {
+                    "seed": 2,
+                    "claim": {
+                        "scope_key": f"seed:{'a' * 64}:2",
+                        "generation_id": "generation",
+                        "owner": {},
+                    },
+                }
+            ],
+        )
+
+    worker.assert_not_called()

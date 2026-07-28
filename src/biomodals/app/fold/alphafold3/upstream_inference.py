@@ -16,6 +16,7 @@ from uniaf3.schema.alphafold3 import AF3Config
 from biomodals.app.fold.alphafold3.inference_inputs import (
     serialize_af3_input,
     validate_inference_parameters,
+    validate_inference_workload,
     validate_upstream_af3_input,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
@@ -56,6 +57,12 @@ def run_upstream_seed_worker(
         claimed_seed_from_dict(record) for record in claimed_seed_records
     )
     base_config = validate_upstream_af3_input(config)
+    claimed_seed_values = [item.seed for item in claimed_seeds]
+    if not claimed_seed_values or not set(claimed_seed_values).issubset(
+        base_config.modelSeeds
+    ):
+        raise ValueError("Claimed seeds must belong to the staged request")
+    validate_inference_workload(claimed_seed_values, sample_count)
 
     def execute(
         worker_root: Path,

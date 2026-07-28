@@ -943,6 +943,11 @@ The presentation name is the sanitized caller display name. Downloaded
 basenames replace the canonical run prefix with this presentation prefix;
 durable Volume files remain unchanged.
 
+Downloads hash each chunk while writing and stop before a chunk would exceed
+the manifest-declared size. Unchanged archive members reuse that verified
+source size and digest; only the locally rewritten input is read again for its
+presentation-specific identity.
+
 The archive includes every requested seed/sample directory, optional embeddings
 and distograms, request ranking and best files, enriched input, manifest, and
 referenced Staged Custom Templates.

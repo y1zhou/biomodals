@@ -737,17 +737,25 @@ def _download_artifact(
     expected_sha256 = cast(str, artifact["sha256"])
     destination.parent.mkdir(parents=True, exist_ok=True)
     written = 0
+    digest = hashlib.sha256()
     with destination.open("xb") as handle:
         for chunk in reader.read_file(volume_path):
             if not isinstance(chunk, bytes):
                 raise TypeError(f"Volume reader returned non-bytes for {volume_path}")
+            next_size = written + len(chunk)
+            if next_size > expected_size:
+                raise RuntimeError(
+                    "Downloaded size mismatch for "
+                    f"{volume_path}: more than {expected_size}"
+                )
             handle.write(chunk)
-            written += len(chunk)
+            digest.update(chunk)
+            written = next_size
     if written != expected_size:
         raise RuntimeError(
             f"Downloaded size mismatch for {volume_path}: {written} != {expected_size}"
         )
-    observed_sha256 = sha256_file(destination)
+    observed_sha256 = digest.hexdigest()
     if observed_sha256 != expected_sha256:
         raise RuntimeError(
             "Downloaded SHA-256 mismatch for "
@@ -831,17 +839,21 @@ def _record_archive_artifacts(
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
     archive_root: Path,
 ) -> None:
-    """Bind the presentation-local bytes, including the rewritten input."""
+    """Bind downloaded source identities and the rewritten input bytes."""
     local_artifacts = cast(list[dict[str, object]], local_manifest["artifacts"])
-    for local_artifact, (_, transformed) in zip(
+    for local_artifact, (artifact, transformed) in zip(
         local_artifacts,
         transformed_artifacts,
         strict=True,
     ):
         archived_path = archive_root / Path(transformed.as_posix())
         require_regular_file(archived_path)
-        local_artifact["archive_size_bytes"] = archived_path.stat().st_size
-        local_artifact["archive_sha256"] = sha256_file(archived_path)
+        if artifact["role"] == "input":
+            local_artifact["archive_size_bytes"] = archived_path.stat().st_size
+            local_artifact["archive_sha256"] = sha256_file(archived_path)
+        else:
+            local_artifact["archive_size_bytes"] = artifact["size_bytes"]
+            local_artifact["archive_sha256"] = artifact["sha256"]
 
 
 def _custom_template_archive_paths(

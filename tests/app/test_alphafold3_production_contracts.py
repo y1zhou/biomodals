@@ -8,7 +8,7 @@ import datetime
 import hashlib
 import importlib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -25,6 +25,7 @@ from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import (
     inference_inputs,
     msa_search,
+    request_results,
     template_search,
 )
 from biomodals.app.fold.alphafold3.artifacts import (
@@ -2747,6 +2748,116 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
             output_dir=tmp_path,
             display_name="partial",
         )
+
+
+def test_artifact_download_rejects_overflow_before_writing_the_chunk(
+    tmp_path: Path,
+) -> None:
+    class OverflowReader:
+        def read_file(self, path: str):
+            yield b"1234"
+            yield b"56"
+            pytest.fail("download continued after the first overflowing chunk")
+
+    destination = tmp_path / "artifact.bin"
+    artifact = {
+        "volume_path": "artifact.bin",
+        "size_bytes": 5,
+        "sha256": hashlib.sha256(b"12345").hexdigest(),
+    }
+
+    with pytest.raises(RuntimeError, match="Downloaded size mismatch"):
+        request_results._download_artifact(
+            cast(Any, OverflowReader()),
+            artifact,
+            destination,
+        )
+
+    assert destination.read_bytes() == b"1234"
+
+
+def test_artifact_download_hashes_while_streaming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"streamed"
+    destination = tmp_path / "artifact.bin"
+    artifact = {
+        "volume_path": "artifact.bin",
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    monkeypatch.setattr(
+        request_results,
+        "sha256_file",
+        lambda path: pytest.fail("downloaded artifact was reread to hash it"),
+    )
+
+    request_results._download_artifact(
+        FakeVolumeReader({"artifact.bin": content}),
+        artifact,
+        destination,
+    )
+
+    assert destination.read_bytes() == content
+
+
+def test_archive_manifest_rehashes_only_rewritten_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "data.json"
+    output_path = tmp_path / "model.cif"
+    input_path.write_bytes(b"rewritten")
+    output_path.write_bytes(b"unchanged")
+    output_sha256 = hashlib.sha256(b"unchanged").hexdigest()
+    local_manifest: dict[str, object] = {
+        "artifacts": [
+            {"role": "input"},
+            {
+                "role": "seed_output",
+                "size_bytes": len(b"unchanged"),
+                "sha256": output_sha256,
+            },
+        ]
+    }
+    transformed = [
+        (
+            {
+                "role": "input",
+                "size_bytes": 1,
+                "sha256": "a" * 64,
+            },
+            PurePosixPath("data.json"),
+        ),
+        (
+            {
+                "role": "seed_output",
+                "size_bytes": len(b"unchanged"),
+                "sha256": output_sha256,
+            },
+            PurePosixPath("model.cif"),
+        ),
+    ]
+    sha256_file = request_results.sha256_file
+    hashed_paths: list[Path] = []
+
+    def track_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return sha256_file(path)
+
+    monkeypatch.setattr(request_results, "sha256_file", track_hash)
+
+    request_results._record_archive_artifacts(
+        local_manifest,
+        transformed,
+        tmp_path,
+    )
+
+    assert hashed_paths == [input_path]
+    local_output = cast(list[dict[str, object]], local_manifest["artifacts"])[1]
+    assert local_output["archive_size_bytes"] == len(b"unchanged")
+    assert local_output["archive_sha256"] == output_sha256
 
 
 def test_request_archive_rejects_same_size_changed_bytes(tmp_path: Path) -> None:

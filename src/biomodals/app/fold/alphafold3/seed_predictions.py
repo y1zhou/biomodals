@@ -39,7 +39,12 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     assert_generation_current,
     finish_generation_claim,
 )
-from biomodals.app.fold.alphafold3.inference_inputs import hash_sequences
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    hash_sequences,
+    validate_inference_parameters,
+    validate_inference_workload,
+    validate_model_seed,
+)
 
 SEED_PREDICTION_CLAIM_DICT_NAME = "AlphaFold3-inference-claims"
 
@@ -208,19 +213,12 @@ def validate_run_id(run_id: str) -> str:
 
 
 def _validate_sample_count(sample_count: int) -> int:
-    if (
-        isinstance(sample_count, bool)
-        or not isinstance(sample_count, int)
-        or sample_count < 1
-    ):
-        raise ValueError("sample_count must be a positive integer")
+    validate_inference_parameters(0, sample_count)
     return sample_count
 
 
 def _validate_seed(seed: int) -> int:
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise TypeError("seed must be an integer")
-    return seed
+    return validate_model_seed(seed)
 
 
 def canonical_output_name(run_id: str) -> str:
@@ -340,6 +338,7 @@ def inspect_seed_predictions(
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     selected_seeds = tuple(_validate_seed(seed) for seed in seeds)
+    validate_inference_workload(list(selected_seeds), selected_samples)
     if len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("seed inspection inputs must be unique")
     runtime.volume.reload()
@@ -387,6 +386,7 @@ def claim_seed_predictions(
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     selected_seeds = tuple(sorted(_validate_seed(seed) for seed in seeds))
+    validate_inference_workload(list(selected_seeds), selected_samples)
     if not selected_seeds or len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("claim inputs must be a non-empty unique seed set")
     runtime.volume.reload()

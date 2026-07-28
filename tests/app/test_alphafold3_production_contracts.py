@@ -112,7 +112,9 @@ from biomodals.app.fold.alphafold3.profiles import (
 )
 from biomodals.app.fold.alphafold3.request_results import (
     REQUEST_MANIFEST_SCHEMA_VERSION,
+    RequestPublication,
     create_request_archive,
+    publish_request_results,
     request_view_id,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
@@ -125,6 +127,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SeedClaimPlan,
     canonical_output_name,
     claim_seed_predictions,
+    inspect_seed_predictions,
     load_seed_marker,
 )
 from biomodals.app.fold.alphafold3.template_search import (
@@ -1840,6 +1843,69 @@ def test_seed_claims_reload_the_volume_once_per_reconciliation(
 
     assert tuple(item.seed for item in plan.owned) == (1, 2, 3)
     assert volume.reload_count == 2
+
+
+@pytest.mark.parametrize("boundary", ["inspect", "claim", "publish"])
+@pytest.mark.parametrize(
+    ("seeds", "sample_count", "message"),
+    [
+        ((-1,), 1, "32-bit unsigned"),
+        ((2**32,), 1, "32-bit unsigned"),
+        ((1,), 101, "between 1 and"),
+        (tuple(range(501)), 2, "modelSeeds × sample"),
+    ],
+)
+def test_downstream_inference_boundaries_repeat_request_limits(
+    tmp_path: Path,
+    boundary: str,
+    seeds: tuple[int, ...],
+    sample_count: int,
+    message: str,
+) -> None:
+    runtime = InferenceRuntime(
+        output_root=tmp_path,
+        volume=cast(
+            Any,
+            SimpleNamespace(
+                reload=lambda: pytest.fail("invalid request reached the Volume"),
+                commit=lambda: None,
+            ),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        summary_maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+    )
+    run_id = "a" * 64
+
+    with pytest.raises(ValueError, match=message):
+        if boundary == "inspect":
+            inspect_seed_predictions(
+                runtime,
+                run_id,
+                seeds,
+                sample_count=sample_count,
+            )
+        elif boundary == "claim":
+            claim_seed_predictions(
+                runtime,
+                run_id,
+                seeds,
+                sample_count=sample_count,
+            )
+        else:
+            publish_request_results(
+                runtime,
+                RequestPublication(
+                    run_id=run_id,
+                    request_id=hash_sequences(run_id, list(seeds)),
+                    submitted_seeds=seeds,
+                    normalized_seeds=seeds,
+                    sample_count=sample_count,
+                    display_name="bounded",
+                ),
+            )
 
 
 def test_staged_input_rederives_identity_and_stages_inline_templates(

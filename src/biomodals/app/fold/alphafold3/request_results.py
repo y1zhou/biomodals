@@ -34,7 +34,9 @@ from biomodals.app.fold.alphafold3.artifacts import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     hash_sequences,
+    normalize_model_seeds,
     sanitize_af3_name,
+    validate_inference_workload,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     CORE_OUTPUT_SUFFIXES,
@@ -90,8 +92,8 @@ def _validate_seed_tuple(
         raise TypeError(f"{field_name} must be a tuple")
     if not allow_empty and not value:
         raise ValueError(f"{field_name} must not be empty")
-    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in value):
-        raise TypeError(f"{field_name} must contain only integers")
+    if value:
+        normalize_model_seeds(list(value))
     return value
 
 
@@ -118,12 +120,7 @@ def _validate_publication(spec: RequestPublication) -> RequestPublication:
         raise ValueError("submitted_seeds do not normalize to normalized_seeds")
     if spec.request_id != hash_sequences(run_id, list(normalized)):
         raise ValueError("request_id does not match run_id and normalized_seeds")
-    if (
-        isinstance(spec.sample_count, bool)
-        or not isinstance(spec.sample_count, int)
-        or spec.sample_count < 1
-    ):
-        raise ValueError("sample_count must be a positive integer")
+    validate_inference_workload(list(normalized), spec.sample_count)
     sanitize_af3_name(spec.display_name)
     return spec
 

@@ -244,14 +244,19 @@ def _validate_inline_inputs(config: AF3Config) -> None:
         )
 
 
+def validate_model_seed(seed: int) -> int:
+    """Return one model seed after enforcing the upstream uint32 contract."""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("Every model seed must be an integer")
+    if seed < 0 or seed > 2**32 - 1:
+        raise ValueError(f"Model seeds must be 32-bit unsigned integers, got {seed}")
+    return seed
+
+
 def _validated_model_seeds(seeds: list[int]) -> tuple[int, ...]:
     if not seeds:
         raise ValueError("modelSeeds must contain at least one seed")
-    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds):
-        raise TypeError("Every model seed must be an integer")
-    if any(seed < 0 or seed > 2**32 - 1 for seed in seeds):
-        raise ValueError(f"Model seeds must be 32-bit unsigned integers, got {seeds}")
-    return tuple(seeds)
+    return tuple(validate_model_seed(seed) for seed in seeds)
 
 
 def _validated_submitted_model_seeds(seeds: list[int]) -> tuple[int, ...]:

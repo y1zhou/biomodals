@@ -808,7 +808,10 @@ may produce at most 1,000 seed/sample pairs after normalization. The
 accumulated summary may grow beyond that ceiling through multiple valid
 requests. Inference controls are bounded both before scheduling and again in
 the worker: model seeds are unsigned 32-bit integers, recycles are 0--100,
-diffusion samples are 1--100, and `max_num_gpus` is 1--100.
+diffusion samples are 1--100, and `max_num_gpus` is 1--100. Seed-cache
+inspection, seed claiming, and request publication independently repeat the
+seed, sample, and per-request workload checks before touching the output
+Volume.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
 normalized seed list. It identifies one computational seed request, not a seed

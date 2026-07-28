@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
+from typing import Literal
 
 import modal
 
@@ -223,11 +224,11 @@ class ModalSearchExecutor(SearchExecutor):
         )
 
 
-def _volume_file_matches(
+def _volume_file_state(
     volume: modal.Volume,
     path: str,
     expected: bytes,
-) -> bool:
+) -> Literal["missing", "match", "conflict"]:
     offset = 0
     try:
         for chunk in volume.read_file(path):
@@ -235,11 +236,11 @@ def _volume_file_matches(
                 raise TypeError(f"Volume returned non-bytes for {path}")
             end = offset + len(chunk)
             if end > len(expected) or expected[offset:end] != chunk:
-                return False
+                return "conflict"
             offset = end
     except FileNotFoundError:
-        return False
-    return offset == len(expected)
+        return "missing"
+    return "match" if offset == len(expected) else "conflict"
 
 
 def stage_inference_run(
@@ -248,20 +249,21 @@ def stage_inference_run(
 ) -> None:
     """Publish immutable payloads once, with the staged-input marker last."""
     marker_path = prepared.staged_input.relative_path.as_posix()
-    try:
-        existing_marker = b"".join(output_volume.read_file(marker_path))
-    except FileNotFoundError:
-        existing_marker = None
-    if existing_marker is not None:
-        if existing_marker != prepared.staged_input.content:
-            raise RuntimeError(
-                "Existing staged-input marker conflicts with the prepared request: "
-                f"{marker_path}"
-            )
+    marker_state = _volume_file_state(
+        output_volume,
+        marker_path,
+        prepared.staged_input.content,
+    )
+    if marker_state == "conflict":
+        raise RuntimeError(
+            "Existing staged-input marker conflicts with the prepared request: "
+            f"{marker_path}"
+        )
+    if marker_state == "match":
         pending_uploads = []
         for upload in prepared.payload_uploads:
             path = upload.relative_path.as_posix()
-            if not _volume_file_matches(output_volume, path, upload.content):
+            if _volume_file_state(output_volume, path, upload.content) != "match":
                 pending_uploads.append(upload)
         if not pending_uploads:
             return

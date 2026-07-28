@@ -419,6 +419,16 @@ def test_inference_staging_is_marker_last_and_reusable() -> None:
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_inference_run(volume, prepared)
 
+    class StreamingConflictVolume(FakeVolume):
+        def read_file(self, path: str):
+            if path == prepared.staged_input.relative_path.as_posix():
+                yield prepared.staged_input.content + b"x"
+                pytest.fail("staged marker read continued after a conflict")
+            yield from super().read_file(path)
+
+    with pytest.raises(RuntimeError, match="conflicts"):
+        stage_inference_run(StreamingConflictVolume(), prepared)
+
 
 def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     tmp_path: Path,

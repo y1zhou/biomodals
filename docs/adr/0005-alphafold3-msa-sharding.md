@@ -726,7 +726,9 @@ The marker records the path, byte size, and SHA-256 of the run identity,
 canonical request input, and every path-backed custom template. It is committed
 last. An exact existing marker causes repeat staging to validate every declared
 payload; missing or corrupt deterministic payloads are republished before the
-marker is reasserted. A marker mismatch at the same immutable path is an error.
+marker is reasserted. Existing payloads and the marker are compared as bounded
+streams against their expected bytes; a mismatch or extra byte stops the read.
+A marker mismatch at the same immutable path is an error.
 
 GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
 the staged-marker record. Each loads the marker-bound input from the output

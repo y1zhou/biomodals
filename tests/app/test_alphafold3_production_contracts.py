@@ -804,6 +804,14 @@ def test_remote_cache_inspectors_repeat_task_bounds() -> None:
         )
 
 
+def test_remote_msa_inspector_validates_assembly_shape_before_volume_access() -> None:
+    inspect = alphafold3_app.inspect_msa_search_cache.get_raw_f()
+    with pytest.raises(TypeError, match="include_unpaired must be a boolean"):
+        inspect([], [("protein", "ACDE", 1, True)])  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="complete canonical MSAs"):
+        inspect([], [("protein", "ACDE", True, False)])
+
+
 def test_remote_search_repeats_query_length_bound() -> None:
     with pytest.raises(ValueError, match="between 1 and 5,120"):
         alphafold3_app.search_database_msa.get_raw_f()(

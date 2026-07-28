@@ -308,6 +308,27 @@ def validate_polymer_query(polymer: Polymer, sequence: str) -> str:
     return sequence
 
 
+def validate_msa_assembly_task(
+    task: MsaAssemblyTask,
+    *,
+    require_canonical: bool = False,
+) -> None:
+    """Validate assembly fields before any mounted-Volume access."""
+    validate_polymer_query(task.polymer, task.sequence)
+    for field_name, value in (
+        ("include_unpaired", task.include_unpaired),
+        ("include_paired", task.include_paired),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{field_name} must be a boolean")
+    if not task.include_unpaired and not task.include_paired:
+        raise ValueError("MSA assembly must request at least one field")
+    if task.polymer == "rna" and task.include_paired:
+        raise ValueError("RNA MSA assembly cannot request pairedMsa")
+    if require_canonical and not task.publishes_canonical:
+        raise ValueError("Only complete canonical MSAs may be cache-inspected")
+
+
 def validate_query(spec: DatabaseProfileSpec, sequence: str) -> str:
     """Validate one query before invoking a pinned HMMER wrapper."""
     return validate_polymer_query(spec.polymer, sequence)
@@ -1134,7 +1155,7 @@ def inspect_msa_cache(
     for task in raw_tasks:
         validate_query(task.spec, task.sequence)
     for task in assembly_tasks:
-        validate_polymer_query(task.polymer, task.sequence)
+        validate_msa_assembly_task(task, require_canonical=True)
     contexts = {
         (task.database_id, task.sequence): load_search_context(
             sharded_root,
@@ -1148,8 +1169,6 @@ def inspect_msa_cache(
     reusable_sequences: set[tuple[Polymer, str]] = set()
     combined_statuses: list[dict[str, object]] = []
     for task in assembly_tasks:
-        if not task.publishes_canonical:
-            raise ValueError("Only complete canonical MSAs may be cache-inspected")
         metadata: dict[str, RawMsaMetadata] = {}
         for database_id in _required_database_ids(task):
             context = contexts.get((database_id, task.sequence))
@@ -1210,7 +1229,7 @@ def assemble_and_publish_msas(
     task: MsaAssemblyTask,
 ) -> dict[str, object]:
     """Assemble requested fields and publish complete canonical combinations."""
-    validate_polymer_query(task.polymer, task.sequence)
+    validate_msa_assembly_task(task)
     runtime.sharded_volume.reload()
     runtime.cache_volume.reload()
     contexts = {

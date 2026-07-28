@@ -75,6 +75,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
     inspect_msa_cache,
     run_database_search,
     sequence_cache_relpath,
+    validate_msa_assembly_task,
     validate_polymer_query,
     validate_query,
     validate_remote_search_task_count,
@@ -371,7 +372,7 @@ def inspect_msa_search_cache(
     for task in raw_tasks:
         validate_query(task.spec, task.sequence)
     for task in assembly_tasks:
-        validate_polymer_query(task.polymer, task.sequence)
+        validate_msa_assembly_task(task, require_canonical=True)
     SHARDED_MSA_DB_VOLUME.reload()
     MSA_CACHE_VOLUME.reload()
     return inspect_msa_cache(

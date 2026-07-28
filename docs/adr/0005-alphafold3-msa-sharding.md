@@ -670,9 +670,9 @@ counted once after canonicalization. The 5,120 bounds align with the largest
 default AlphaFold 3 compilation bucket documented by the pinned upstream
 revision. The CPU coordinator checks the conservative task upper bound before
 cache inspection. The directly callable MSA/template workers repeat the
-5,120-residue query and 512-task inspection limits before accessing mounted
-Volumes. Inference workers likewise repeat all staged-artifact byte checks when
-loading from the output Volume.
+5,120-residue query, 512-task inspection, and canonical assembly-shape checks
+before accessing mounted Volumes. Inference workers likewise repeat all
+staged-artifact byte checks when loading from the output Volume.
 
 For each custom mmCIF, the helper reads inline content or the caller's
 `mmcifPath` and computes its full SHA-256 before run identity.

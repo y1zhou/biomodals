@@ -19,6 +19,7 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
+from biomodals.app.fold.alphafold3 import template_search
 from biomodals.app.fold.alphafold3.artifacts import (
     artifact_record,
     json_bytes,
@@ -763,6 +764,27 @@ def test_template_cache_rejects_changed_template_bytes(tmp_path: Path) -> None:
 
     (context.sequence_root / "templates.json").write_bytes(b"[]")
     assert load_template_entry(context) is None
+
+
+def test_template_search_validates_remote_a3m_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid = ">query\nACDE\n>hit\nACd-E\n"
+
+    assert template_search._validate_template_msa("ACDE", valid) == valid
+    with pytest.raises(ValueError, match="valid FASTA/A3M"):
+        template_search._validate_template_msa("ACDE", "ACDE\n")
+    with pytest.raises(ValueError, match="query row"):
+        template_search._validate_template_msa("ACDE", ">query\nAAAA\n")
+    with pytest.raises(ValueError, match="alignment width"):
+        template_search._validate_template_msa(
+            "ACDE",
+            ">query\nACDE\n>hit\nACD\n",
+        )
+
+    monkeypatch.setattr(template_search, "MAX_LOCAL_MSA_BYTES", len(valid) - 1)
+    with pytest.raises(ValueError, match="byte limit"):
+        template_search._validate_template_msa("ACDE", valid)
 
 
 def test_generation_claims_fence_active_and_terminal_writers() -> None:

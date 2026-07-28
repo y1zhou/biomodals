@@ -39,6 +39,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     assert_generation_current,
     finish_generation_claim,
 )
+from biomodals.app.fold.alphafold3.inference_inputs import MAX_LOCAL_MSA_BYTES
 from biomodals.app.fold.alphafold3.msa_search import (
     SearchRuntime,
     sequence_cache_relpath,
@@ -329,7 +330,47 @@ def assert_pinned_template_contract() -> dict[str, str]:
     }
 
 
-def execute_template_search(
+def _validate_template_msa(sequence: str, unpaired_msa: str) -> str:
+    """Bound and parse one protein A3M, including its required query row."""
+    query = validate_query(resolve_database_profile("uniref90"), sequence)
+    if not isinstance(unpaired_msa, str) or not unpaired_msa:
+        raise ValueError("unpaired_msa must be a non-empty A3M string")
+    if not unpaired_msa.isascii():
+        raise ValueError("unpaired_msa must contain only ASCII A3M text")
+    if len(unpaired_msa) > MAX_LOCAL_MSA_BYTES:
+        raise ValueError(f"unpaired_msa exceeds the {MAX_LOCAL_MSA_BYTES}-byte limit")
+
+    records: list[str] = []
+    sequence_lines: list[str] = []
+    saw_header = False
+    for line in unpaired_msa.splitlines():
+        if line.startswith(">"):
+            if len(line) == 1:
+                raise ValueError("unpaired_msa contains an empty FASTA header")
+            if saw_header:
+                if not sequence_lines:
+                    raise ValueError("unpaired_msa contains an empty FASTA record")
+                records.append("".join(sequence_lines))
+                sequence_lines.clear()
+            saw_header = True
+        elif line:
+            if not saw_header or any(char.isspace() for char in line):
+                raise ValueError("unpaired_msa is not valid FASTA/A3M text")
+            sequence_lines.append(line)
+    if not saw_header or not sequence_lines:
+        raise ValueError("unpaired_msa contains no complete FASTA/A3M record")
+    records.append("".join(sequence_lines))
+    if records[0] != query:
+        raise ValueError("unpaired_msa query row does not match the protein sequence")
+    for record in records:
+        if any(not char.isalpha() and char != "-" for char in record):
+            raise ValueError("unpaired_msa contains invalid A3M sequence characters")
+        if sum(not char.islower() for char in record) != len(query):
+            raise ValueError("unpaired_msa rows do not match the query alignment width")
+    return unpaired_msa
+
+
+def _execute_template_search(
     sequence: str,
     unpaired_msa: str,
     source_root: Path,
@@ -339,8 +380,6 @@ def execute_template_search(
     from importlib import import_module
 
     query = validate_query(resolve_database_profile("uniref90"), sequence)
-    if not isinstance(unpaired_msa, str) or not unpaired_msa:
-        raise ValueError("unpaired_msa must be a non-empty A3M string")
     selected_date = datetime.date.fromisoformat(
         validate_max_template_date(max_template_date)
     )
@@ -442,8 +481,7 @@ def run_template_search(
     if not isinstance(task.publish_canonical, bool):
         raise TypeError("publish_canonical must be a boolean")
     validate_query(resolve_database_profile("uniref90"), task.sequence)
-    if not isinstance(task.unpaired_msa, str) or not task.unpaired_msa:
-        raise ValueError("unpaired_msa must be a non-empty A3M string")
+    unpaired_msa = _validate_template_msa(task.sequence, task.unpaired_msa)
     runtime.source_volume.reload()
     context = build_template_context(
         runtime.cache_root,
@@ -452,9 +490,9 @@ def run_template_search(
         task.max_template_date,
     )
     if not task.publish_canonical:
-        templates, contract = execute_template_search(
+        templates, contract = _execute_template_search(
             task.sequence,
-            task.unpaired_msa,
+            unpaired_msa,
             runtime.source_root,
             task.max_template_date,
         )
@@ -499,9 +537,9 @@ def run_template_search(
             log_path,
             f"Searching protein templates for {context.sequence_hash}",
         )
-        templates, contract = execute_template_search(
+        templates, contract = _execute_template_search(
             task.sequence,
-            task.unpaired_msa,
+            unpaired_msa,
             runtime.source_root,
             task.max_template_date,
         )

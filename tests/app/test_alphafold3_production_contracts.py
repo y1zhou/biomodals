@@ -1380,6 +1380,76 @@ def test_template_cache_rejects_changed_template_bytes(tmp_path: Path) -> None:
     assert load_template_entry(context) is None
 
 
+def test_template_cache_bounds_declared_payload_before_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = build_template_context(
+        tmp_path,
+        "ACDE",
+        "a" * 64,
+        "2021-09-30",
+    )
+    context.sequence_root.mkdir(parents=True)
+    (context.sequence_root / "templates.done.json").write_bytes(
+        orjson.dumps({
+            "schema_version": TEMPLATE_RESULT_SCHEMA_VERSION,
+            "status": "complete",
+            "provenance": context.provenance,
+            "templates": _artifact("templates.json", b"12345"),
+        })
+    )
+    monkeypatch.setattr(template_search, "MAX_TEMPLATE_INSPECTION_BYTES", 4)
+    monkeypatch.setattr(
+        template_search,
+        "load_artifact_bytes",
+        lambda *args, **kwargs: pytest.fail("oversized template payload was read"),
+    )
+
+    with pytest.raises(ValueError, match="template cache result exceeds"):
+        load_template_entry(context)
+
+
+def test_template_cache_inspection_bounds_aggregate_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = {
+        "status": "reused",
+        "sequence_sha256": "a" * 64,
+        "unpaired_msa_sha256": "b" * 64,
+        "template_identity": "c" * 64,
+        "done_sha256": "d" * 64,
+        "templates": [{"mmcif": "12345"}],
+    }
+    context = SimpleNamespace(
+        sequence_hash="a" * 64,
+        unpaired_msa_sha256="b" * 64,
+        template_identity="c" * 64,
+    )
+    entry = SimpleNamespace(summary=lambda result_status: status)
+    monkeypatch.setattr(
+        template_search,
+        "build_template_context",
+        lambda *args: context,
+    )
+    monkeypatch.setattr(template_search, "load_template_entry", lambda _: entry)
+    monkeypatch.setattr(
+        template_search,
+        "MAX_TEMPLATE_INSPECTION_BYTES",
+        2 + len(json_bytes(status)),
+    )
+
+    with pytest.raises(ValueError, match="template cache inspection exceeds"):
+        template_search.inspect_template_entries(
+            tmp_path,
+            (
+                ("ACDE", "b" * 64, "2021-09-30"),
+                ("ACDE", "b" * 64, "2021-09-30"),
+            ),
+        )
+
+
 def test_template_search_validates_remote_a3m_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

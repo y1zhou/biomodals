@@ -39,7 +39,10 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     assert_generation_current,
     finish_generation_claim,
 )
-from biomodals.app.fold.alphafold3.inference_inputs import MAX_LOCAL_MSA_BYTES
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    MAX_LOCAL_MSA_BYTES,
+    MAX_STAGED_INPUT_BYTES,
+)
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaArtifactReference,
     SearchRuntime,
@@ -65,6 +68,7 @@ HMMSEARCH_N_CPU = 8
 TEMPLATE_RESULT_SCHEMA_VERSION = 1
 TEMPLATE_IDENTITY_SCHEMA_VERSION = 1
 TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
+MAX_TEMPLATE_INSPECTION_BYTES = MAX_STAGED_INPUT_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +298,17 @@ def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
     ):
         return None
     artifact = done.get("templates")
+    if isinstance(artifact, dict):
+        size_bytes = artifact.get("size_bytes")
+        if (
+            not isinstance(size_bytes, bool)
+            and isinstance(size_bytes, int)
+            and size_bytes > MAX_TEMPLATE_INSPECTION_BYTES
+        ):
+            raise ValueError(
+                "template cache result exceeds the "
+                f"{MAX_TEMPLATE_INSPECTION_BYTES}-byte limit"
+            )
     templates_bytes = load_artifact_bytes(
         context.sequence_root,
         artifact,
@@ -323,6 +338,7 @@ def inspect_template_entries(
     """Inspect canonical template markers and return reusable payloads."""
     validate_remote_search_task_count(len(inputs))
     statuses: list[dict[str, object]] = []
+    response_bytes = 2
     for sequence, unpaired_msa_sha256, max_template_date in inputs:
         context = build_template_context(
             cache_root,
@@ -332,14 +348,24 @@ def inspect_template_entries(
         )
         entry = load_template_entry(context)
         if entry is None:
-            statuses.append({
-                "status": "missing",
-                "sequence_sha256": context.sequence_hash,
-                "unpaired_msa_sha256": context.unpaired_msa_sha256,
-                "template_identity": context.template_identity,
-            })
+            status = cast(
+                dict[str, object],
+                {
+                    "status": "missing",
+                    "sequence_sha256": context.sequence_hash,
+                    "unpaired_msa_sha256": context.unpaired_msa_sha256,
+                    "template_identity": context.template_identity,
+                },
+            )
         else:
-            statuses.append(entry.summary("reused"))
+            status = entry.summary("reused")
+        response_bytes += len(json_bytes(status)) + bool(statuses)
+        if response_bytes > MAX_TEMPLATE_INSPECTION_BYTES:
+            raise ValueError(
+                "template cache inspection exceeds the "
+                f"{MAX_TEMPLATE_INSPECTION_BYTES}-byte limit"
+            )
+        statuses.append(status)
     return statuses
 
 

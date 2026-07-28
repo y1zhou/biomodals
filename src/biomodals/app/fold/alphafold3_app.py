@@ -333,10 +333,10 @@ def finalize_sharded_database_setup() -> dict[str, object]:
 # MSA search functions
 ##########################################
 @app.function(
-    cpu=0.125,
+    cpu=(0.125, 4.125),
     memory=16384,
     timeout=600,
-    max_containers=1,
+    max_containers=4,
     volumes={
         SearchRuntime.SHARDED_MOUNT: (
             SHARDED_MSA_DB_VOLUME.with_mount_options(
@@ -469,10 +469,10 @@ def assemble_sequence_msas(
 
 
 @app.function(
-    cpu=0.125,
-    memory=1024,
+    cpu=(0.125, 4.125),
+    memory=16384,
     timeout=600,
-    max_containers=1,
+    max_containers=4,
     volumes={
         TemplateRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
             read_only=True,

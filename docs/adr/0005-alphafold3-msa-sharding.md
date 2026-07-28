@@ -550,6 +550,12 @@ not sharded.
 Both phases share the same worker budget and never overlap. There is no
 separate template-concurrency control initially.
 
+Read-only cache inspection is limited to four concurrent containers. Each
+inspector has 16 GiB of memory and can scale from 0.125 to 4.125 CPUs for large
+artifact validation and serialization. A template-cache inspection response is
+also capped at 1 GiB, both per stored result and in aggregate, before it crosses
+the Modal boundary.
+
 ### Upstream assembly and RNA gate
 
 The app-owned adapter constructs combined alignments in pinned upstream order:

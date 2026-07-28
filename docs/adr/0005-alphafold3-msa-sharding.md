@@ -699,16 +699,21 @@ The identity representation substitutes that digest for the path while
 retaining `queryIndices` and `templateIndices`. Inline mmCIF uses the same
 content-digest representation.
 
-After `run_id` is known, every inline or path-backed custom template is
+After `run_id` is known, every caller-supplied `mmcifPath` template is
 canonicalized and uploaded once to:
 
 ```text
 <run-root>/custom-templates/{sha256}.cif
 ```
 
-The worker input uses only the mounted `mmcifPath` representation. Identical
-content is deduplicated within the run, so equivalent inline and path-backed
-submissions produce identical staged inputs.
+The staged worker input rewrites only those path-backed templates to the
+mounted path. Inline caller templates and inline templates returned by the
+database search remain inline. Identical path-backed content is deduplicated
+within the run. Consequently, `custom-templates/` is absent when the request
+does not reference caller-local template files; database mmCIF files remain in
+the read-only MSA database Volume and are not copied into the output Volume.
+Equivalent inline and path-backed submissions still produce the same
+scientific `run_id`.
 
 ### Staged inference input
 
@@ -719,12 +724,15 @@ marker:
 inputs/identity.json
 requests/{request_id}/input.json
 requests/{request_id}/staged-input.json
-custom-templates/{sha256}.cif
+custom-templates/{sha256}.cif  # caller mmcifPath files only; optional
 ```
 
-The marker records the path, byte size, and SHA-256 of the run identity,
-canonical request input, and every path-backed custom template. It is committed
-last. An exact existing marker causes repeat staging to validate every declared
+`inputs/identity.json` is compact identity evidence: large MSA, `userCCD`, and
+template mmCIF strings are represented by byte size and SHA-256 rather than
+duplicated. `requests/{request_id}/input.json` remains the complete runnable
+enriched input. The marker records the path, byte size, and SHA-256 of both
+documents and every path-backed custom template. It is committed last. An
+exact existing marker causes repeat staging to validate every declared
 payload; missing or corrupt deterministic payloads are republished before the
 marker is reasserted. Existing payloads and the marker are compared as bounded
 streams against their expected bytes; a mismatch or extra byte stops the read.
@@ -753,12 +761,12 @@ An app-local `hash_sequences` helper derives `run_id` from the normalized
 Inference Identity View and seed-independent inference fragments.
 
 The view validates through `AF3Config`, dumps defaults explicitly, removes only
-`name` and `modelSeeds`, and replaces operational custom-template paths with
-content digests.
+`name` and `modelSeeds`, and replaces operational custom-template paths and
+large MSA, mmCIF, and custom CCD strings with content digests and byte sizes.
 
-It retains sequence order, chain IDs, descriptions, modifications, bonds,
-MSAs, templates and mappings, custom CCD content, dialect, schema version, and
-every other validated input field.
+It retains the content identity of sequence order, chain IDs, descriptions,
+modifications, bonds, MSAs, templates and mappings, custom CCD, dialect, schema
+version, and every other validated input field.
 
 Additional fragments cover recycle count, diffusion-sample count, pinned app
 and upstream identity, a code-owned model checkpoint label, and the
@@ -798,15 +806,21 @@ There is no top-level `runs/` directory. The run root contains:
 
 ```text
 inputs/identity.json
-custom-templates/{sha256}.cif
+custom-templates/{sha256}.cif  # caller mmcifPath files only; optional
 outputs/
 outputs/.workers/{claim-generation}/
 requests/{request_id}/input.json
 requests/{request_id}/staged-input.json
-requests/{request_id}/views/{view_id}/
+requests/{request_id}/views/{view_id}/manifest.json
 .markers/seeds/{seed}.json
 .markers/summary.json
 logs/
+```
+
+The Volume root also contains exact-invocation receipts outside run roots:
+
+```text
+/invocations/{invocation_id[:2]}/{invocation_id}.json
 ```
 
 `run_id` identifies one enriched input and seed-independent inference
@@ -833,6 +847,24 @@ including order and duplicates, and the caller display name. It identifies one
 stable durable presentation of that request. Exact reruns therefore select the
 same immutable manifest, while different presentations of the same normalized
 seed set do not overwrite one another.
+
+`invocation_id` is available before enrichment. It hashes the compact submitted
+input identity, display name and submitted seed order, search switches and
+scientific search contracts, inference parameters, publication schemas, pinned
+application/upstream identity, and declared model identity. Operational
+scheduling knobs such as search-worker and GPU-worker limits are excluded.
+After a request manifest has been published, a deterministic immutable receipt
+binds this exact invocation to that manifest's path, byte size, and SHA-256.
+The manifest is always durable before its receipt.
+
+An exact receipt hit is the earliest fast path: the local entrypoint validates
+the receipt and referenced manifest directly through the output Volume, skips
+MSA/template resolution, input staging, seed inspection, GPU workers, summary
+finalization, and request publication, then builds or reuses the local archive.
+If no receipt exists, enrichment proceeds. Once enrichment yields `run_id` and
+`request_id`, a valid existing request manifest is the second fast path: it
+skips staging and all inference-side remote calls. That invocation then
+publishes its missing receipt for future pre-enrichment hits.
 
 ### Seed claims and inference workers
 
@@ -923,29 +955,31 @@ scientifically equivalent; the tie-breakers only stabilize presentation.
 
 ### Request-scoped results
 
-Every successful presentation publishes a small stable view at
-`requests/{request_id}/views/{view_id}/` with:
+Every successful presentation publishes one stable manifest at
+`requests/{request_id}/views/{view_id}/manifest.json` with:
 
 - a manifest referencing the canonical enriched input;
-- request-seed ranking and best files;
+- request-seed ranking rows and direct references to canonical best files;
 - submitted and normalized seeds plus duplicates removed;
 - references to all requested canonical Seed Predictions;
 - the canonical-to-presentation name mapping;
 - referenced custom-template artifacts.
 
-It does not copy seed directories or include unrelated completed seeds. No
+It does not copy seed directories, ranking CSVs, best aliases, terms, or
+database template files, and it does not include unrelated completed seeds. No
 request archive is retained on the output Volume.
 
 The manifest contains only identity-stable fields and each selected artifact's
 byte size and SHA-256. It deliberately excludes publication timestamps,
 new-versus-reused execution outcomes, and the mutable accumulated run summary.
-An exact rerun validates and returns the existing manifest before rescanning or
-copying prediction artifacts.
+An exact rerun validates and returns the existing manifest without rescanning
+or republishing prediction artifacts.
 
 Remote functions return compact Volume-relative metadata, never prediction
 tarballs as function-result bytes.
 
-The local entrypoint downloads only manifest-declared artifacts and constructs:
+The local entrypoint downloads only manifest-declared canonical artifacts,
+generates the request ranking CSV and best aliases locally, and constructs:
 
 ```text
 {presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst
@@ -961,14 +995,15 @@ source size and digest; only the locally rewritten input is read again for its
 presentation-specific identity.
 
 The archive includes every requested seed/sample directory, optional embeddings
-and distograms, request ranking and best files, enriched input, manifest, and
-referenced Staged Custom Templates.
+and distograms, locally generated request ranking and best aliases, enriched
+input, manifest, and referenced staged caller template files.
 
 Custom templates appear at `custom-templates/{sha256}.cif`. Only the downloaded
 input copy rewrites `mmcifPath` to those archive-relative paths.
 
-Inline and path-backed custom mmCIF both use archive-relative paths. The request
-manifest prevents unrelated custom templates from being downloaded.
+Only path-backed custom mmCIF uses archive-relative paths. Inline templates
+remain inline. The request manifest prevents unrelated custom templates from
+being downloaded.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each

@@ -226,8 +226,6 @@ def test_inference_staging_bounds_the_serialized_input(
     with pytest.raises(ValueError, match="staged input exceeds the 128-byte limit"):
         prepare_inference_run(
             config,
-            (),
-            output_mount_root=tmp_path / "output",
             recycle=1,
             sample=1,
         )
@@ -255,8 +253,6 @@ def test_inference_staging_bounds_the_run_identity(
     )
     prepared = prepare_inference_run(
         config,
-        (),
-        output_mount_root=tmp_path / "output",
         recycle=1,
         sample=1,
     )
@@ -274,8 +270,6 @@ def test_inference_staging_bounds_the_run_identity(
     with pytest.raises(ValueError, match="run identity exceeds"):
         prepare_inference_run(
             config,
-            (),
-            output_mount_root=tmp_path / "output",
             recycle=1,
             sample=1,
         )
@@ -304,8 +298,6 @@ def test_run_identity_hashes_large_text_while_input_remains_runnable(
                 )
             ],
         ),
-        (),
-        output_mount_root=tmp_path / "output",
         recycle=1,
         sample=1,
     )
@@ -421,37 +413,36 @@ def _write_path_backed_template_input(
     return input_path
 
 
-def test_local_materialization_bounds_all_custom_templates(
+def test_local_materialization_bounds_all_path_backed_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unique path-backed templates should share one aggregate byte budget."""
+    """Path-backed templates should fit one aggregate inline byte budget."""
     input_path = _write_path_backed_template_input(
         tmp_path,
         (b"12345", b"67890"),
     )
-    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+    monkeypatch.setattr(inference_inputs, "MAX_TEMPLATE_TOTAL_BYTES", 8)
 
-    with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
+    with pytest.raises(ValueError, match="templates exceed the 8-byte limit"):
         materialize_local_input(input_path)
 
 
-def test_local_template_budget_counts_identical_content_once(
+def test_local_materialization_inlines_path_backed_templates(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Content-identical templates should consume one canonical byte budget."""
-    input_path = _write_path_backed_template_input(
-        tmp_path,
-        (b"12345", b"12345"),
-    )
-    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+    """Caller template files should become self-contained input JSON fields."""
+    content = b"data_inline\n#\n"
+    input_path = _write_path_backed_template_input(tmp_path, (content,))
 
     materialized = materialize_local_input(input_path)
 
-    assert len(materialized.custom_templates) == 2
-    assert len({template.sha256 for template in materialized.custom_templates}) == 1
-    assert materialized.caller_template_positions == frozenset({(0, 0), (0, 1)})
+    assert isinstance(materialized, AF3Config)
+    protein = materialized.sequences[0].protein
+    assert protein is not None
+    template = protein.templates[0]
+    assert template.mmcif == content.decode()
+    assert template.mmcifPath is None
 
 
 def test_inference_parameters_are_resource_bounded() -> None:

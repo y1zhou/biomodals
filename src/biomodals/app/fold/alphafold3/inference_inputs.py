@@ -37,13 +37,13 @@ from biomodals.app.fold.alphafold3.profiles import (
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
-RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v2"
-STAGED_INPUT_SCHEMA_VERSION = 1
+RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
+STAGED_INPUT_SCHEMA_VERSION = 2
 MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES
 MAX_STAGED_INPUT_BYTES = 1024 * 1024 * 1024
-MAX_CUSTOM_TEMPLATE_BYTES = 64 * 1024 * 1024
-MAX_CUSTOM_TEMPLATE_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
+MAX_TEMPLATE_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_USER_CCD_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_ENTITIES = 5_120
 MAX_TOTAL_POLYMER_RESIDUES = 5_120
@@ -56,24 +56,6 @@ MAX_PROTEIN_TEMPLATES = 20
 _TEXT_SIZE_CHUNK_CHARS = 1024 * 1024
 
 type _AF3Entity = AF3Protein | AF3RNA | AF3DNA | AF3Ligand
-
-
-@dataclass(frozen=True, slots=True)
-class LocalTemplateFile:
-    """Caller template bytes captured before any remote work."""
-
-    source_path: Path
-    content: bytes
-    sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializedLocalInput:
-    """Validated input with local MSA/CCD paths replaced by inline content."""
-
-    config: AF3Config
-    custom_templates: tuple[LocalTemplateFile, ...]
-    caller_template_positions: frozenset[tuple[int, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,12 +120,13 @@ def sanitize_af3_name(name: str) -> str:
     return sanitized
 
 
-def _field_bytes(value: str, *, field_name: str, max_bytes: int) -> None:
+def _field_bytes(value: str, *, field_name: str, max_bytes: int) -> int:
     size_bytes = 0
     for start in range(0, len(value), _TEXT_SIZE_CHUNK_CHARS):
         size_bytes += len(value[start : start + _TEXT_SIZE_CHUNK_CHARS].encode())
         if size_bytes > max_bytes:
             raise ValueError(f"{field_name} exceeds the {max_bytes}-byte limit")
+    return size_bytes
 
 
 def _entry_entity(entry: AF3SequenceEntry) -> tuple[str, _AF3Entity]:
@@ -207,6 +190,7 @@ def _validate_polymer(entity_name: str, entity: AF3Protein | AF3RNA | AF3DNA) ->
 
 
 def _validate_inline_inputs(config: AF3Config) -> None:
+    template_bytes = 0
     for chain_index, entry in enumerate(config.sequences):
         if (protein := entry.protein) is not None:
             for field_name in ("unpairedMsa", "pairedMsa"):
@@ -223,15 +207,19 @@ def _validate_inline_inputs(config: AF3Config) -> None:
                     f"AlphaFold 3's {MAX_PROTEIN_TEMPLATES}-template limit"
                 )
             for template_index, template in enumerate(protein.templates):
-                if template.mmcif is not None:
-                    _field_bytes(
-                        template.mmcif,
-                        field_name=(
-                            f"sequences[{chain_index}].protein."
-                            f"templates[{template_index}].mmcif"
-                        ),
-                        max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
+                field_name = (
+                    f"sequences[{chain_index}].protein.templates[{template_index}]"
+                )
+                if template.mmcifPath is not None or template.mmcif is None:
+                    raise ValueError(
+                        f"{field_name} must contain inline mmcif and no mmcifPath"
                     )
+                template_bytes += _field_bytes(
+                    template.mmcif,
+                    field_name=f"{field_name}.mmcif",
+                    max_bytes=MAX_TEMPLATE_BYTES,
+                )
+                _validate_template_total(template_bytes)
         elif (rna := entry.rna) is not None and rna.unpairedMsa is not None:
             _field_bytes(
                 rna.unpairedMsa,
@@ -436,15 +424,13 @@ def _materialize_text_pair(
     setattr(owner, path_field, None)
 
 
-def _validate_custom_template_total(size_bytes: int) -> None:
-    if size_bytes > MAX_CUSTOM_TEMPLATE_TOTAL_BYTES:
-        raise ValueError(
-            f"custom templates exceed the {MAX_CUSTOM_TEMPLATE_TOTAL_BYTES}-byte limit"
-        )
+def _validate_template_total(size_bytes: int) -> None:
+    if size_bytes > MAX_TEMPLATE_TOTAL_BYTES:
+        raise ValueError(f"templates exceed the {MAX_TEMPLATE_TOTAL_BYTES}-byte limit")
 
 
-def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
-    """Resolve every caller-local path needed before remote work."""
+def materialize_local_input(config_path: str | Path) -> AF3Config:
+    """Return a validated, self-contained input before any remote work."""
     path = _resolve_regular_file(
         Path.cwd(),
         str(config_path),
@@ -459,10 +445,6 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
         )
     )
 
-    custom_templates: dict[Path, LocalTemplateFile] = {}
-    custom_template_content: dict[str, bytes] = {}
-    custom_template_bytes = 0
-    caller_template_positions: set[tuple[int, int]] = set()
     for chain_index, entry in enumerate(conf.sequences):
         if (protein := entry.protein) is not None:
             _materialize_text_pair(
@@ -482,42 +464,16 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
                 max_bytes=MAX_LOCAL_MSA_BYTES,
             )
             for template_index, template in enumerate(protein.templates):
-                caller_template_positions.add((chain_index, template_index))
-                if template.mmcifPath is None:
-                    continue
-                template_path = _resolve_regular_file(
-                    input_root,
-                    template.mmcifPath,
+                _materialize_text_pair(
+                    template,
+                    inline_field="mmcif",
+                    path_field="mmcifPath",
+                    input_root=input_root,
                     field_name=(
-                        f"sequences[{chain_index}].protein."
-                        f"templates[{template_index}].mmcifPath"
+                        f"sequences[{chain_index}].protein.templates[{template_index}]"
                     ),
+                    max_bytes=MAX_TEMPLATE_BYTES,
                 )
-                if template_path not in custom_templates:
-                    content = _read_bounded_bytes(
-                        template_path,
-                        field_name=(
-                            f"sequences[{chain_index}].protein."
-                            f"templates[{template_index}].mmcifPath"
-                        ),
-                        max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
-                    )
-                    digest = sha256_bytes(content)
-                    canonical_content = custom_template_content.get(digest)
-                    if canonical_content is None:
-                        custom_template_bytes += len(content)
-                        _validate_custom_template_total(custom_template_bytes)
-                        custom_template_content[digest] = content
-                    elif canonical_content != content:
-                        raise RuntimeError(
-                            f"Custom template digest collision: {digest}"
-                        )
-                    custom_templates[template_path] = LocalTemplateFile(
-                        source_path=template_path,
-                        content=custom_template_content[digest],
-                        sha256=digest,
-                    )
-                template.mmcifPath = str(template_path)
         elif (rna := entry.rna) is not None:
             _materialize_text_pair(
                 rna,
@@ -545,51 +501,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
 
     validated = validate_submitted_af3_input(conf)
     _validate_inline_inputs(validated)
-    return MaterializedLocalInput(
-        config=validated,
-        custom_templates=tuple(custom_templates.values()),
-        caller_template_positions=frozenset(caller_template_positions),
-    )
-
-
-def _template_files_by_source(
-    custom_templates: tuple[LocalTemplateFile, ...],
-) -> dict[str, LocalTemplateFile]:
-    by_source: dict[str, LocalTemplateFile] = {}
-    for artifact in custom_templates:
-        if not artifact.content:
-            raise ValueError(
-                f"Custom template must be nonempty: {artifact.source_path}"
-            )
-        expected_digest = sha256_bytes(artifact.content)
-        if artifact.sha256 != expected_digest:
-            raise ValueError(f"Custom template digest mismatch: {artifact.source_path}")
-        source = str(artifact.source_path.resolve())
-        existing = by_source.get(source)
-        if existing is not None and existing.content != artifact.content:
-            raise RuntimeError(f"Custom template source changed: {source}")
-        by_source[source] = artifact
-    return by_source
-
-
-def _template_content(
-    template: dict[str, object],
-    template_files: dict[str, LocalTemplateFile],
-) -> bytes:
-    inline_value = template.get("mmcif")
-    path_value = template.get("mmcifPath")
-    if (inline_value is None) == (path_value is None):
-        raise ValueError("Exactly one template mmCIF form must be populated")
-    if inline_value is not None:
-        if not isinstance(inline_value, str):
-            raise TypeError("Inline template mmCIF must be a string")
-        return inline_value.encode()
-    if not isinstance(path_value, str):
-        raise TypeError("Template mmcifPath must be a string")
-    artifact = template_files.get(str(Path(path_value).resolve()))
-    if artifact is None:
-        raise ValueError(f"Template path was not materialized locally: {path_value}")
-    return artifact.content
+    return validated
 
 
 def _text_content_identity(value: object, *, field_name: str) -> object:
@@ -605,12 +517,10 @@ def _text_content_identity(value: object, *, field_name: str) -> object:
     }
 
 
-def build_inference_identity_view(
-    conf: AF3Config,
-    custom_templates: tuple[LocalTemplateFile, ...],
-) -> dict[str, object]:
+def build_inference_identity_view(conf: AF3Config) -> dict[str, object]:
     """Return the explicit-default, seed/name-neutral biological identity."""
     validated = validate_upstream_af3_input(conf)
+    _validate_inline_inputs(validated)
     raw_view = validated.model_dump(
         mode="json",
         exclude_unset=False,
@@ -621,7 +531,6 @@ def build_inference_identity_view(
     view.pop("name")
     view.pop("modelSeeds")
 
-    template_files = _template_files_by_source(custom_templates)
     raw_sequences = view.get("sequences")
     if not isinstance(raw_sequences, list):
         raise RuntimeError("Validated AlphaFold input has no sequence list")
@@ -647,10 +556,11 @@ def build_inference_identity_view(
                 if not isinstance(raw_template, dict):
                     raise RuntimeError("Validated AlphaFold template is invalid")
                 template_view = cast(dict[str, object], raw_template)
+                mmcif = template_view.get("mmcif")
+                if not isinstance(mmcif, str):
+                    raise RuntimeError("Validated AlphaFold template has no mmcif")
                 identity_templates.append({
-                    "mmcifSha256": sha256_bytes(
-                        _template_content(template_view, template_files)
-                    ),
+                    "mmcifSha256": sha256_bytes(mmcif.encode()),
                     "queryIndices": template_view.get("queryIndices"),
                     "templateIndices": template_view.get("templateIndices"),
                 })
@@ -753,24 +663,19 @@ def _run_identity(
 
 def prepare_inference_run(
     enriched_config: AF3Config,
-    custom_templates: tuple[LocalTemplateFile, ...],
     *,
-    output_mount_root: Path,
     recycle: int,
     sample: int,
-    caller_template_positions: frozenset[tuple[int, int]] = frozenset(),
 ) -> PreparedInferenceRun:
     """Build run/request identities and every required Volume upload."""
     validate_inference_parameters(recycle, sample)
-    mount_root = Path(output_mount_root)
-    if not mount_root.is_absolute():
-        raise ValueError("output_mount_root must be absolute")
     conf = validate_submitted_af3_input(enriched_config)
+    _validate_inline_inputs(conf)
     validate_inference_workload(conf.modelSeeds, sample)
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
     display_name = conf.name
-    identity_view = build_inference_identity_view(conf, custom_templates)
+    identity_view = build_inference_identity_view(conf)
 
     run_id, identity_document = _run_identity(
         identity_view,
@@ -780,51 +685,10 @@ def prepare_inference_run(
     request_id = hash_sequences(run_id, list(normalized_seeds))
     run_root = PurePosixPath(run_id[:2]) / run_id
 
-    template_files = _template_files_by_source(custom_templates)
-    if any(
-        not isinstance(position, tuple)
-        or len(position) != 2
-        or any(
-            isinstance(index, bool) or not isinstance(index, int) or index < 0
-            for index in position
-        )
-        for position in caller_template_positions
-    ):
-        raise ValueError("caller_template_positions must contain nonnegative pairs")
     staged_conf = conf.model_copy(deep=True)
     staged_conf.name = f"af3-{run_id[:16]}"
     staged_conf.modelSeeds = list(normalized_seeds)
     uploads: dict[PurePosixPath, bytes] = {}
-    template_paths: set[PurePosixPath] = set()
-    observed_caller_templates: set[tuple[int, int]] = set()
-    for chain_index, entry in enumerate(staged_conf.sequences):
-        if (protein := entry.protein) is None:
-            continue
-        for template_index, template in enumerate(protein.templates):
-            position = (chain_index, template_index)
-            is_caller_template = position in caller_template_positions
-            if is_caller_template:
-                observed_caller_templates.add(position)
-            if template.mmcifPath is None and not is_caller_template:
-                continue
-            template_view = cast(
-                dict[str, object],
-                template.model_dump(mode="python", exclude_unset=False),
-            )
-            content = _template_content(template_view, template_files)
-            digest = sha256_bytes(content)
-            relative_path = run_root / "custom-templates" / f"{digest}.cif"
-            existing = uploads.get(relative_path)
-            if existing is not None and existing != content:
-                raise RuntimeError(f"Custom template digest collision: {digest}")
-            uploads[relative_path] = content
-            template_paths.add(relative_path)
-            template.mmcif = None
-            template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
-
-    if observed_caller_templates != caller_template_positions:
-        raise ValueError("caller_template_positions do not match the enriched input")
-    _validate_custom_template_total(sum(len(uploads[path]) for path in template_paths))
     staged_conf = validate_upstream_af3_input(staged_conf)
     identity_path = run_root / "inputs" / "identity.json"
     input_path = run_root / "requests" / request_id / "input.json"
@@ -853,9 +717,6 @@ def prepare_inference_run(
             "request_id": request_id,
             "identity": uploads_by_path[identity_path].to_record(),
             "input": uploads_by_path[input_path].to_record(),
-            "custom_templates": [
-                uploads_by_path[path].to_record() for path in sorted(template_paths)
-            ],
         }),
     )
 
@@ -912,76 +773,6 @@ def _json_object(value: bytes, *, field_name: str) -> dict[str, object]:
     return cast(dict[str, object], parsed)
 
 
-def _staged_template_files(
-    config: AF3Config,
-    raw_records: object,
-    *,
-    output_root: Path,
-    run_root: PurePosixPath,
-) -> tuple[LocalTemplateFile, ...]:
-    if not isinstance(raw_records, list):
-        raise ValueError("Staged custom_templates must be a list")
-    template_root = run_root / "custom-templates"
-    files_by_path: dict[PurePosixPath, LocalTemplateFile] = {}
-    custom_template_bytes = 0
-    for raw_record in raw_records:
-        if not isinstance(raw_record, dict):
-            raise ValueError("Invalid staged custom-template record")
-        raw_path = raw_record.get("path")
-        if not isinstance(raw_path, str):
-            raise ValueError("Invalid staged custom-template path")
-        relative_path = PurePosixPath(raw_path)
-        if (
-            relative_path.parent != template_root
-            or re.fullmatch(r"[0-9a-f]{64}\.cif", relative_path.name) is None
-        ):
-            raise ValueError(
-                f"Staged custom template escapes its run directory: {raw_path}"
-            )
-        digest = relative_path.stem
-        if raw_record.get("sha256") != digest or relative_path in files_by_path:
-            raise ValueError(f"Invalid staged custom-template identity: {raw_path}")
-        content = _load_staged_artifact(
-            output_root,
-            raw_record,
-            relative_path,
-            max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
-        )
-        custom_template_bytes += len(content)
-        _validate_custom_template_total(custom_template_bytes)
-        files_by_path[relative_path] = LocalTemplateFile(
-            source_path=output_root / Path(relative_path.as_posix()),
-            content=content,
-            sha256=digest,
-        )
-
-    referenced_paths: set[PurePosixPath] = set()
-    for entry in config.sequences:
-        if (protein := entry.protein) is None:
-            continue
-        for template in protein.templates:
-            if template.mmcifPath is None:
-                continue
-            if template.mmcif is not None:
-                raise ValueError("Staged template sets both mmcif and mmcifPath")
-            path = Path(template.mmcifPath)
-            if not path.is_absolute():
-                raise ValueError("Staged template path must be absolute")
-            try:
-                relative_path = PurePosixPath(path.relative_to(output_root).as_posix())
-            except ValueError as exc:
-                raise ValueError(
-                    f"Staged template path escapes the output Volume: {path}"
-                ) from exc
-            expected_path = output_root / Path(relative_path.as_posix())
-            if path != expected_path or relative_path not in files_by_path:
-                raise ValueError(f"Staged template path is not marker-bound: {path}")
-            referenced_paths.add(relative_path)
-    if referenced_paths != set(files_by_path):
-        raise ValueError("Staged custom-template records do not match the input")
-    return tuple(files_by_path[path] for path in sorted(files_by_path))
-
-
 def load_staged_inference_input(
     output_mount_root: Path,
     *,
@@ -1033,6 +824,7 @@ def load_staged_inference_input(
         max_bytes=MAX_STAGED_INPUT_BYTES,
     )
     config = validate_upstream_af3_input(AF3Config.model_validate_json(input_bytes))
+    _validate_inline_inputs(config)
     if config.name != f"af3-{validated_run_id[:16]}":
         raise ValueError("Staged input canonical name does not match run_id")
     normalized_seeds = normalize_model_seeds(config.modelSeeds)
@@ -1041,12 +833,6 @@ def load_staged_inference_input(
     if hash_sequences(validated_run_id, list(normalized_seeds)) != validated_request_id:
         raise ValueError("Staged input request_id does not match its modelSeeds")
 
-    template_files = _staged_template_files(
-        config,
-        marker.get("custom_templates"),
-        output_root=output_root,
-        run_root=run_root,
-    )
     raw_inference = identity_document.get("inference")
     if not isinstance(raw_inference, dict):
         raise ValueError("Run identity inference parameters are invalid")
@@ -1061,7 +847,7 @@ def load_staged_inference_input(
         raise ValueError("Run identity inference parameters are invalid")
     validate_inference_parameters(recycle, sample_count)
 
-    identity_view = build_inference_identity_view(config, template_files)
+    identity_view = build_inference_identity_view(config)
     expected_run_id, expected_document = _run_identity(
         identity_view,
         recycle=recycle,

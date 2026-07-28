@@ -24,6 +24,7 @@ from uniaf3.schema.alphafold3 import (
 from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import (
     inference_inputs,
+    invocation_cache,
     msa_search,
     request_results,
     template_search,
@@ -46,11 +47,11 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
-    LocalTemplateFile,
     PreparedInferenceRun,
     VolumeUpload,
     hash_sequences,
     load_staged_inference_input,
+    materialize_local_input,
     prepare_inference_run,
     sanitize_af3_name,
     serialize_af3_input,
@@ -2116,8 +2117,6 @@ def test_staged_input_rederives_identity_and_preserves_inline_templates(
                 )
             ],
         ),
-        (),
-        output_mount_root=output_root,
         recycle=3,
         sample=2,
     )
@@ -2143,7 +2142,7 @@ def test_staged_input_rederives_identity_and_preserves_inline_templates(
         for upload in prepared.payload_uploads
         if upload.relative_path.parent.name == "custom-templates"
     ]
-    assert orjson.loads(prepared.staged_input.content)["custom_templates"] == []
+    assert "custom_templates" not in orjson.loads(prepared.staged_input.content)
 
     marker = orjson.loads(prepared.staged_input.content)
     marker["request_id"] = "f" * 64
@@ -2182,8 +2181,6 @@ def test_staged_input_accepts_a_symlinked_volume_mount(tmp_path: Path) -> None:
                 )
             ],
         ),
-        (),
-        output_mount_root=mount_root,
         recycle=1,
         sample=1,
     )
@@ -2220,8 +2217,6 @@ def test_staged_input_rechecks_the_serialized_input_limit(
                 )
             ],
         ),
-        (),
-        output_mount_root=output_root,
         recycle=1,
         sample=1,
     )
@@ -2267,8 +2262,6 @@ def test_staged_input_rechecks_the_run_identity_limit(
                 )
             ],
         ),
-        (),
-        output_mount_root=output_root,
         recycle=1,
         sample=1,
     )
@@ -2293,15 +2286,11 @@ def test_staged_input_rechecks_the_run_identity_limit(
         )
 
 
-def test_inference_staging_bounds_all_custom_templates(
+def test_inference_staging_bounds_all_inline_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    template_paths = [tmp_path / "first.cif", tmp_path / "second.cif"]
-    template_contents = [b"12345", b"67890"]
-    for path, content in zip(template_paths, template_contents, strict=True):
-        path.write_bytes(content)
-    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+    monkeypatch.setattr(inference_inputs, "MAX_TEMPLATE_TOTAL_BYTES", 8)
     config = AF3Config(
         name="bounded-template-staging",
         modelSeeds=[1],
@@ -2312,43 +2301,29 @@ def test_inference_staging_bounds_all_custom_templates(
                     sequence="ACDE",
                     templates=[
                         AF3Template(
-                            mmcifPath=str(path),
+                            mmcif=content,
                             queryIndices=[index],
                             templateIndices=[index],
                         )
-                        for index, path in enumerate(template_paths)
+                        for index, content in enumerate(("12345", "67890"))
                     ],
                 )
             )
         ],
     )
-    custom_templates = tuple(
-        LocalTemplateFile(
-            source_path=path,
-            content=content,
-            sha256=hashlib.sha256(content).hexdigest(),
-        )
-        for path, content in zip(template_paths, template_contents, strict=True)
-    )
 
-    with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
+    with pytest.raises(ValueError, match="templates exceed the 8-byte limit"):
         prepare_inference_run(
             config,
-            custom_templates,
-            output_mount_root=tmp_path / "output",
             recycle=1,
             sample=1,
         )
 
 
-def test_staged_input_rechecks_the_custom_template_total(
+def test_staged_input_rechecks_the_inline_template_total(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    template_paths = [tmp_path / "first.cif", tmp_path / "second.cif"]
-    template_contents = [b"12345", b"67890"]
-    for path, content in zip(template_paths, template_contents, strict=True):
-        path.write_bytes(content)
     output_root = tmp_path / "output"
     prepared = prepare_inference_run(
         AF3Config(
@@ -2361,32 +2336,23 @@ def test_staged_input_rechecks_the_custom_template_total(
                         sequence="ACDE",
                         templates=[
                             AF3Template(
-                                mmcifPath=str(path),
+                                mmcif=content,
                                 queryIndices=[index],
                                 templateIndices=[index],
                             )
-                            for index, path in enumerate(template_paths)
+                            for index, content in enumerate(("12345", "67890"))
                         ],
                     )
                 )
             ],
         ),
-        tuple(
-            LocalTemplateFile(
-                source_path=path,
-                content=content,
-                sha256=hashlib.sha256(content).hexdigest(),
-            )
-            for path, content in zip(template_paths, template_contents, strict=True)
-        ),
-        output_mount_root=output_root,
         recycle=1,
         sample=1,
     )
     _materialize_prepared_run(output_root, prepared)
-    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+    monkeypatch.setattr(inference_inputs, "MAX_TEMPLATE_TOTAL_BYTES", 8)
 
-    with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
+    with pytest.raises(ValueError, match="templates exceed the 8-byte limit"):
         load_staged_inference_input(
             output_root,
             run_id=prepared.run_id,
@@ -2417,39 +2383,38 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
             ],
         )
 
-    inline = prepare_inference_run(
+    inline_path = tmp_path / "inline.json"
+    inline_path.write_text(
         config(
             AF3Template(
                 mmcif=template_content.decode(),
                 queryIndices=[0],
                 templateIndices=[0],
             )
-        ),
-        (),
-        output_mount_root=tmp_path / "output",
-        recycle=1,
-        sample=1,
-        caller_template_positions=frozenset({(0, 0)}),
+        ).model_dump_json(exclude_none=True),
+        encoding="utf-8",
     )
-    path_backed = prepare_inference_run(
+    path_backed_path = tmp_path / "path-backed.json"
+    path_backed_path.write_text(
         config(
             AF3Template(
-                mmcifPath=str(template_path),
+                mmcifPath=template_path.name,
                 queryIndices=[0],
                 templateIndices=[0],
             )
-        ),
-        (
-            LocalTemplateFile(
-                source_path=template_path,
-                content=template_content,
-                sha256=hashlib.sha256(template_content).hexdigest(),
-            ),
-        ),
-        output_mount_root=tmp_path / "output",
+        ).model_dump_json(exclude_none=True),
+        encoding="utf-8",
+    )
+
+    inline = prepare_inference_run(
+        materialize_local_input(inline_path),
         recycle=1,
         sample=1,
-        caller_template_positions=frozenset({(0, 0)}),
+    )
+    path_backed = prepare_inference_run(
+        materialize_local_input(path_backed_path),
+        recycle=1,
+        sample=1,
     )
 
     assert inline.run_id == path_backed.run_id
@@ -2466,98 +2431,45 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
     )
     assert inline_identity == path_identity
     assert inline.staged_input == path_backed.staged_input
-    assert (
-        len([
-            upload
-            for upload in inline.payload_uploads
-            if upload.relative_path.parent.name == "custom-templates"
-        ])
-        == 1
-    )
     assert inline.payload_uploads == path_backed.payload_uploads
-
-
-def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:
-    template_path = tmp_path / "template.cif"
-    template_content = b"data_path_backed\n#\n"
-    template_path.write_bytes(template_content)
-    output_root = tmp_path / "output"
-    prepared = prepare_inference_run(
-        AF3Config(
-            name="path-template",
-            modelSeeds=[1],
-            sequences=[
-                AF3SequenceEntry(
-                    protein=AF3Protein(
-                        id="A",
-                        sequence="ACDE",
-                        templates=[
-                            AF3Template(
-                                mmcifPath=str(template_path),
-                                queryIndices=[0],
-                                templateIndices=[0],
-                            )
-                        ],
-                    )
-                )
-            ],
-        ),
-        (
-            LocalTemplateFile(
-                source_path=template_path,
-                content=template_content,
-                sha256=hashlib.sha256(template_content).hexdigest(),
-            ),
-        ),
-        output_mount_root=output_root,
-        recycle=1,
-        sample=1,
-    )
-    _materialize_prepared_run(output_root, prepared)
-
-    loaded = load_staged_inference_input(
-        output_root,
-        run_id=prepared.run_id,
-        request_id=prepared.request_id,
-        staged_input_record=prepared.staged_input.to_record(),
-    )
-    protein = loaded.config.sequences[0].protein
-    assert protein is not None
-    template = protein.templates[0]
-    assert template.mmcif is None
-    assert template.mmcifPath is not None
-    assert Path(template.mmcifPath).is_relative_to(output_root)
-
-    input_upload = next(
-        upload
-        for upload in prepared.payload_uploads
+    staged_bytes = next(
+        upload.content
+        for upload in inline.payload_uploads
         if upload.relative_path.name == "input.json"
     )
-    escaped_config = AF3Config.model_validate_json(input_upload.content)
-    escaped_protein = escaped_config.sequences[0].protein
-    assert escaped_protein is not None
-    escaped_protein.templates[0].mmcifPath = str(tmp_path / "escape.cif")
-    escaped_input = serialize_af3_input(escaped_config)
-    input_path = output_root / Path(input_upload.relative_path.as_posix())
-    input_path.write_bytes(escaped_input)
+    staged_document = orjson.loads(staged_bytes)
+    assert "mmcifPath" not in staged_document["sequences"][0]["protein"]["templates"][0]
+    staged_config = AF3Config.model_validate_json(staged_bytes)
+    staged_protein = staged_config.sequences[0].protein
+    assert staged_protein is not None
+    assert staged_protein.templates[0].mmcif == template_content.decode()
+    assert staged_protein.templates[0].mmcifPath is None
 
-    marker = orjson.loads(prepared.staged_input.content)
-    marker["input"] = VolumeUpload(
-        input_upload.relative_path,
-        escaped_input,
-    ).to_record()
-    marker_bytes = json_bytes(marker)
-    marker_path = output_root / Path(prepared.staged_input.relative_path.as_posix())
-    marker_path.write_bytes(marker_bytes)
-    with pytest.raises(ValueError, match="escapes the output Volume"):
-        load_staged_inference_input(
-            output_root,
-            run_id=prepared.run_id,
-            request_id=prepared.request_id,
-            staged_input_record=VolumeUpload(
-                prepared.staged_input.relative_path,
-                marker_bytes,
-            ).to_record(),
+
+def test_inference_staging_rejects_unmaterialized_template_paths() -> None:
+    with pytest.raises(ValueError, match="must contain inline mmcif"):
+        prepare_inference_run(
+            AF3Config(
+                name="path-template",
+                modelSeeds=[1],
+                sequences=[
+                    AF3SequenceEntry(
+                        protein=AF3Protein(
+                            id="A",
+                            sequence="ACDE",
+                            templates=[
+                                AF3Template(
+                                    mmcifPath="template.cif",
+                                    queryIndices=[0],
+                                    templateIndices=[0],
+                                )
+                            ],
+                        )
+                    )
+                ],
+            ),
+            recycle=1,
+            sample=1,
         )
 
 
@@ -2660,8 +2572,6 @@ def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
                 )
             ],
         ),
-        (),
-        output_mount_root=Path("/outputs"),
         recycle=1,
         sample=1,
     )
@@ -2738,6 +2648,42 @@ def test_completed_request_manifest_loads_without_a_remote_worker() -> None:
     assert load_request_manifest(FakeVolumeReader({}), publication) is None
 
 
+@pytest.mark.parametrize(
+    ("normalized_seeds", "sample_count", "message"),
+    [
+        ([1], 101, "between 1 and 100"),
+        (list(range(501)), 2, "modelSeeds × sample"),
+    ],
+)
+def test_request_manifest_workload_is_bounded_before_ranking_validation(
+    normalized_seeds: list[int],
+    sample_count: int,
+    message: str,
+) -> None:
+    run_id = "b" * 64
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=normalized_seeds,
+        display_name="bounded",
+        artifacts=[
+            {
+                "role": "input",
+                "volume_path": (
+                    f"{run_id[:2]}/{run_id}/requests/"
+                    f"{hash_sequences(run_id, normalized_seeds)}/input.json"
+                ),
+                "archive_path": f"{canonical_output_name(run_id)}_data.json",
+                "size_bytes": 1,
+                "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+        ],
+    )
+    manifest["sample_count"] = sample_count
+
+    with pytest.raises(ValueError, match=message):
+        request_results.request_publication_from_manifest(manifest)
+
+
 def test_invocation_identity_covers_result_and_presentation_options() -> None:
     """Only an exact scientific request and presentation should share a receipt."""
 
@@ -2758,7 +2704,6 @@ def test_invocation_identity_covers_result_and_presentation_options() -> None:
                     AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE"))
                 ],
             ),
-            (),
             search_msa=search_msa,
             search_protein_templates=search_templates,
             recycle=recycle,
@@ -2781,7 +2726,9 @@ def test_invocation_identity_covers_result_and_presentation_options() -> None:
     )
 
 
-def test_invocation_receipt_resolves_and_binds_the_manifest() -> None:
+def test_invocation_receipt_resolves_and_binds_the_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A receipt should be deterministic and reject changed manifest bytes."""
     submitted = AF3Config(
         name="Readable Name",
@@ -2790,7 +2737,6 @@ def test_invocation_receipt_resolves_and_binds_the_manifest() -> None:
     )
     invocation = prepare_invocation(
         submitted,
-        (),
         search_msa=True,
         search_protein_templates=True,
         recycle=1,
@@ -2804,8 +2750,6 @@ def test_invocation_receipt_resolves_and_binds_the_manifest() -> None:
     protein.templates = []
     prepared = prepare_inference_run(
         enriched,
-        (),
-        output_mount_root=Path("/outputs"),
         recycle=1,
         sample=1,
     )
@@ -2849,6 +2793,14 @@ def test_invocation_receipt_resolves_and_binds_the_manifest() -> None:
             FakeVolumeReader(files | {manifest_path: corrupted}),
             invocation,
         )
+
+    monkeypatch.setattr(
+        invocation_cache,
+        "MAX_REQUEST_MANIFEST_BYTES",
+        len(manifest_bytes) - 1,
+    )
+    with pytest.raises(ValueError, match="exceeds its byte limit"):
+        build_invocation_receipt(invocation, prepared, manifest)
 
 
 def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> None:

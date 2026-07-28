@@ -21,7 +21,6 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     DECLARED_MODEL_IDENTITY,
     RUN_IDENTITY_SCHEMA,
     STAGED_INPUT_SCHEMA_VERSION,
-    LocalTemplateFile,
     PreparedInferenceRun,
     VolumeUpload,
     build_inference_identity_view,
@@ -122,7 +121,6 @@ def _search_contract() -> dict[str, object]:
 
 def prepare_invocation(
     config: AF3Config,
-    custom_templates: tuple[LocalTemplateFile, ...],
     *,
     search_msa: bool,
     search_protein_templates: bool,
@@ -139,10 +137,7 @@ def prepare_invocation(
     validate_inference_workload(validated.modelSeeds, sample)
     identity: dict[str, object] = {
         "schema": INVOCATION_IDENTITY_SCHEMA,
-        "submitted_input": build_inference_identity_view(
-            validated,
-            custom_templates,
-        ),
+        "submitted_input": build_inference_identity_view(validated),
         "presentation": {
             "display_name": validated.name,
             "submitted_seeds": list(validated.modelSeeds),
@@ -179,6 +174,8 @@ def _manifest_record(manifest: dict[str, object]) -> dict[str, object]:
     publication = request_publication_from_manifest(manifest)
     path = request_manifest_path(publication)
     content = json_bytes(manifest)
+    if not 0 < len(content) <= MAX_REQUEST_MANIFEST_BYTES:
+        raise ValueError("Request manifest exceeds its byte limit")
     return {
         "path": path.as_posix(),
         "size_bytes": len(content),

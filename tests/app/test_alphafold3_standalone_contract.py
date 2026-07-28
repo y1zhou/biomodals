@@ -356,8 +356,6 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
                 )
             ],
         ),
-        (),
-        output_mount_root=Path("/outputs"),
         recycle=3,
         sample=2,
     )
@@ -483,8 +481,6 @@ def test_inference_staging_is_marker_last_and_reusable() -> None:
                 AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
             ],
         ),
-        (),
-        output_mount_root=Path("/outputs"),
         recycle=1,
         sample=1,
     )

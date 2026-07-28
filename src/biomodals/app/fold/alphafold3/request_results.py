@@ -56,7 +56,6 @@ from biomodals.helper.shell import run_command
 REQUEST_MANIFEST_SCHEMA_VERSION = 4
 REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v1"
 
-_CUSTOM_TEMPLATE_PATTERN = re.compile(r"(?P<digest>[0-9a-f]{64})\.cif")
 _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -225,7 +224,6 @@ def _artifact_record(
     volume_path: Path,
     archive_path: str | PurePosixPath,
     role: str,
-    worker_path: str | None = None,
 ) -> dict[str, object]:
     require_regular_file(source)
     record: dict[str, object] = {
@@ -238,8 +236,6 @@ def _artifact_record(
         "size_bytes": source.stat().st_size,
         "sha256": sha256_file(source),
     }
-    if worker_path is not None:
-        record["worker_path"] = worker_path
     return record
 
 
@@ -253,64 +249,6 @@ def _request_view_root(
     view_id: str,
 ) -> Path:
     return run_root / "requests" / request_id / "views" / view_id
-
-
-def _custom_template_sources(
-    *,
-    input_path: Path,
-    output_root: Path,
-    run_root: Path,
-) -> dict[str, Path]:
-    require_regular_file(input_path)
-    try:
-        document = orjson.loads(input_path.read_bytes())
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(f"Invalid enriched request input: {input_path}") from exc
-    if not isinstance(document, dict):
-        raise TypeError("Enriched request input must be a JSON object")
-    raw_sequences = document.get("sequences")
-    if not isinstance(raw_sequences, list):
-        raise TypeError("Enriched request input must contain a sequence list")
-
-    selected: dict[str, Path] = {}
-    expected_root = run_root / "custom-templates"
-    for raw_entry in raw_sequences:
-        if not isinstance(raw_entry, dict):
-            raise TypeError("Invalid enriched request sequence entry")
-        raw_protein = raw_entry.get("protein")
-        if raw_protein is None:
-            continue
-        if not isinstance(raw_protein, dict):
-            raise TypeError("Invalid enriched request protein entry")
-        raw_templates = raw_protein.get("templates")
-        if not isinstance(raw_templates, list):
-            raise TypeError("Invalid enriched request template list")
-        for raw_template in raw_templates:
-            if not isinstance(raw_template, dict):
-                raise TypeError("Invalid enriched request template entry")
-            worker_path = raw_template.get("mmcifPath")
-            if worker_path is None:
-                continue
-            if not isinstance(worker_path, str) or not worker_path:
-                raise TypeError("Custom template mmcifPath must be a non-empty string")
-            source = Path(worker_path)
-            if not source.is_absolute():
-                raise ValueError("Staged custom template path must be absolute")
-            try:
-                source.relative_to(expected_root)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Custom template is outside this run: {worker_path}"
-                ) from exc
-            match = _CUSTOM_TEMPLATE_PATTERN.fullmatch(source.name)
-            if match is None or source.parent != expected_root:
-                raise ValueError(f"Invalid staged custom template path: {worker_path}")
-            require_regular_file(source)
-            if sha256_file(source) != match.group("digest"):
-                raise ValueError(f"Custom template digest mismatch: {worker_path}")
-            _volume_relative_path(output_root, source)
-            selected[worker_path] = source
-    return selected
 
 
 def _seed_artifacts(
@@ -561,23 +499,6 @@ def publish_request_results(
             sample_count=spec.sample_count,
         )
     )
-    for worker_path, source in sorted(
-        _custom_template_sources(
-            input_path=input_path,
-            output_root=runtime.output_root,
-            run_root=run_root,
-        ).items()
-    ):
-        artifacts.append(
-            _artifact_record(
-                source=source,
-                output_root=runtime.output_root,
-                volume_path=source,
-                archive_path=PurePosixPath("custom-templates") / source.name,
-                role="custom_template",
-                worker_path=worker_path,
-            )
-        )
     artifacts.sort(
         key=lambda artifact: (
             cast(str, artifact["archive_path"]),
@@ -755,6 +676,7 @@ def _validated_manifest_artifacts(
         or manifest.get("manifest_volume_path") != expected_manifest_path
     ):
         raise ValueError("Request manifest view identity is invalid")
+    validate_inference_workload(normalized_seeds, sample_count)
     if manifest.get("name_mapping") != {
         "canonical": canonical_name,
         "presentation": presentation_name,
@@ -854,7 +776,6 @@ def _rewrite_downloaded_input(
     input_path: Path,
     *,
     display_name: str,
-    custom_template_paths: dict[str, str],
 ) -> None:
     try:
         document = orjson.loads(input_path.read_bytes())
@@ -863,34 +784,6 @@ def _rewrite_downloaded_input(
     if not isinstance(document, dict):
         raise TypeError("Downloaded AlphaFold input must be a JSON object")
     document["name"] = display_name
-    raw_sequences = document.get("sequences")
-    if not isinstance(raw_sequences, list):
-        raise TypeError("Downloaded AlphaFold input has no sequence list")
-    for raw_entry in raw_sequences:
-        if not isinstance(raw_entry, dict):
-            raise TypeError("Downloaded AlphaFold sequence entry is invalid")
-        raw_protein = raw_entry.get("protein")
-        if raw_protein is None:
-            continue
-        if not isinstance(raw_protein, dict):
-            raise TypeError("Downloaded AlphaFold protein entry is invalid")
-        raw_templates = raw_protein.get("templates")
-        if not isinstance(raw_templates, list):
-            raise TypeError("Downloaded AlphaFold template list is invalid")
-        for raw_template in raw_templates:
-            if not isinstance(raw_template, dict):
-                raise TypeError("Downloaded AlphaFold template entry is invalid")
-            worker_path = raw_template.get("mmcifPath")
-            if worker_path is None:
-                continue
-            if not isinstance(worker_path, str):
-                raise TypeError("Downloaded custom template path is invalid")
-            archive_path = custom_template_paths.get(worker_path)
-            if archive_path is None:
-                raise ValueError(
-                    f"Downloaded input references undeclared template: {worker_path}"
-                )
-            raw_template["mmcifPath"] = archive_path
     write_bytes_atomic(input_path, json_bytes(document))
 
 
@@ -927,7 +820,6 @@ def _local_request_manifest(
         strict=True,
     ):
         local_artifact["archive_path"] = transformed.as_posix()
-        local_artifact.pop("worker_path", None)
     local_manifest["generated_artifacts"] = [
         {
             "role": "request_ranking",
@@ -961,20 +853,6 @@ def _record_archive_artifacts(
             local_artifact["archive_sha256"] = artifact["sha256"]
 
 
-def _custom_template_archive_paths(
-    transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
-) -> dict[str, str]:
-    custom_template_paths: dict[str, str] = {}
-    for artifact, transformed in transformed_artifacts:
-        if artifact["role"] != "custom_template":
-            continue
-        worker_path = artifact.get("worker_path")
-        if not isinstance(worker_path, str) or not worker_path:
-            raise ValueError("Custom template artifact has no staged worker path")
-        custom_template_paths[worker_path] = transformed.as_posix()
-    return custom_template_paths
-
-
 def _bind_expected_archive_artifacts(
     reader: VolumeReader,
     local_manifest: dict[str, object],
@@ -1005,7 +883,6 @@ def _bind_expected_archive_artifacts(
         _rewrite_downloaded_input(
             input_path,
             display_name=display_name,
-            custom_template_paths=_custom_template_archive_paths(transformed_artifacts),
         )
         local_input["archive_size_bytes"] = input_path.stat().st_size
         local_input["archive_sha256"] = sha256_file(input_path)
@@ -1274,9 +1151,6 @@ def create_request_archive(
             _rewrite_downloaded_input(
                 input_paths[0],
                 display_name=display_name,
-                custom_template_paths=_custom_template_archive_paths(
-                    transformed_artifacts
-                ),
             )
             _record_archive_artifacts(
                 local_manifest,

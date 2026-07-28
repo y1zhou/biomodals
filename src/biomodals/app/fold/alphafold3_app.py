@@ -845,8 +845,7 @@ def submit_alphafold3_task(
     validate_search_worker_budget(max_parallel_search_workers)
     validate_inference_parameters(recycle, sample)
 
-    local_input = materialize_local_input(input_json)
-    conf = local_input.config
+    conf = materialize_local_input(input_json)
     validate_inference_workload(conf.modelSeeds, sample)
     if run_name is None:
         run_name = conf.name
@@ -855,7 +854,6 @@ def submit_alphafold3_task(
 
     invocation = prepare_invocation(
         conf,
-        local_input.custom_templates,
         search_msa=search_msa,
         search_protein_templates=search_protein_templates,
         recycle=recycle,
@@ -892,11 +890,8 @@ def submit_alphafold3_task(
     enriched_conf.modelSeeds = conf.modelSeeds
     prepared = prepare_inference_run(
         enriched_conf,
-        local_input.custom_templates,
-        output_mount_root=Path(CONF.output_volume_mountpoint),
         recycle=recycle,
         sample=sample,
-        caller_template_positions=local_input.caller_template_positions,
     )
     if prepared.submitted_seeds != prepared.normalized_seeds:
         print(

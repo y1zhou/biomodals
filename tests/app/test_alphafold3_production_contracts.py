@@ -21,10 +21,10 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
+from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import (
     inference_inputs,
     msa_search,
-    search_pipeline,
     template_search,
 )
 from biomodals.app.fold.alphafold3.artifacts import (
@@ -779,7 +779,7 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
         def __getattr__(self, name: str) -> Any:
             raise AssertionError(f"Remote executor method was accessed: {name}")
 
-    monkeypatch.setattr(search_pipeline, "MAX_REMOTE_SEARCH_TASKS", 1)
+    monkeypatch.setattr(msa_search, "MAX_REMOTE_SEARCH_TASKS", 1)
     config = AF3Config(
         name="bounded-search",
         modelSeeds=[1],
@@ -790,6 +790,26 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
 
     with pytest.raises(ValueError, match="1 remote search tasks"):
         resolve_msa_and_templates(config, cast(Any, NeverCalledExecutor()))
+
+
+def test_remote_cache_inspectors_repeat_task_bounds() -> None:
+    with pytest.raises(ValueError, match="512 remote search tasks"):
+        alphafold3_app.inspect_msa_search_cache.get_raw_f()(
+            [("small_bfd", "ACDE")] * 513,
+            [],
+        )
+    with pytest.raises(ValueError, match="512 remote search tasks"):
+        alphafold3_app.inspect_protein_template_cache.get_raw_f()(
+            [("ACDE", "a" * 64, "2021-09-30")] * 513,
+        )
+
+
+def test_remote_search_repeats_query_length_bound() -> None:
+    with pytest.raises(ValueError, match="between 1 and 5,120"):
+        alphafold3_app.search_database_msa.get_raw_f()(
+            "small_bfd",
+            "A" * 5_121,
+        )
 
 
 @pytest.mark.parametrize(

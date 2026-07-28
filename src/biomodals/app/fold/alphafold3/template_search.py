@@ -46,6 +46,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
     sequence_cache_relpath,
     sequence_hash,
     validate_query,
+    validate_remote_search_task_count,
 )
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
@@ -311,6 +312,7 @@ def inspect_template_entries(
     inputs: tuple[tuple[str, str, str], ...],
 ) -> list[dict[str, object]]:
     """Inspect canonical template markers and return reusable payloads."""
+    validate_remote_search_task_count(len(inputs))
     statuses: list[dict[str, object]] = []
     for sequence, unpaired_msa_sha256, max_template_date in inputs:
         context = build_template_context(

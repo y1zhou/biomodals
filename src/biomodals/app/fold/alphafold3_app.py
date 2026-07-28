@@ -75,6 +75,9 @@ from biomodals.app.fold.alphafold3.msa_search import (
     inspect_msa_cache,
     run_database_search,
     sequence_cache_relpath,
+    validate_polymer_query,
+    validate_query,
+    validate_remote_search_task_count,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
@@ -351,8 +354,7 @@ def inspect_msa_search_cache(
     assembly_inputs: list[tuple[Polymer, str, bool, bool]],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     """Prefer complete combined MSAs, then deep-check uncovered raw results."""
-    SHARDED_MSA_DB_VOLUME.reload()
-    MSA_CACHE_VOLUME.reload()
+    validate_remote_search_task_count(len(raw_inputs) + len(assembly_inputs))
     raw_tasks = tuple(
         RawSearchTask(database_id=database_id, sequence=sequence)
         for database_id, sequence in raw_inputs
@@ -366,6 +368,12 @@ def inspect_msa_search_cache(
         )
         for polymer, sequence, include_unpaired, include_paired in assembly_inputs
     )
+    for task in raw_tasks:
+        validate_query(task.spec, task.sequence)
+    for task in assembly_tasks:
+        validate_polymer_query(task.polymer, task.sequence)
+    SHARDED_MSA_DB_VOLUME.reload()
+    MSA_CACHE_VOLUME.reload()
     return inspect_msa_cache(
         Path(SearchRuntime.SHARDED_MOUNT),
         Path(SearchRuntime.CACHE_MOUNT),
@@ -475,6 +483,9 @@ def inspect_protein_template_cache(
     inputs: list[tuple[str, str, str]],
 ) -> list[dict[str, object]]:
     """Inspect canonical template markers without consuming search workers."""
+    validate_remote_search_task_count(len(inputs))
+    for sequence, _, _ in inputs:
+        validate_polymer_query("protein", sequence)
     MSA_CACHE_VOLUME.reload()
     return inspect_template_entries(
         Path(TemplateRuntime.CACHE_MOUNT),

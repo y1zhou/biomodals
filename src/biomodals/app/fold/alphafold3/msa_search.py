@@ -84,6 +84,8 @@ NHMMER_SHORT_SEQUENCE_FILTER_F3 = 0.02
 
 SEARCH_N_CPU = 2
 SEARCH_MAX_PARALLEL_SHARDS = 16
+MAX_QUERY_RESIDUES = 5_120
+MAX_REMOTE_SEARCH_TASKS = 512
 
 PROTEIN_UNPAIRED_DATABASES = ("uniref90", "small_bfd", "mgnify")
 PROTEIN_PAIRED_DATABASES = ("uniprot",)
@@ -277,16 +279,38 @@ def sequence_hash(sequence: str) -> str:
     return sha256_bytes(sequence.encode())
 
 
-def validate_query(spec: DatabaseProfileSpec, sequence: str) -> str:
-    """Validate one query before invoking a pinned HMMER wrapper."""
+def validate_remote_search_task_count(task_count: int) -> None:
+    """Bound one coordinator or remote cache-inspection request."""
+    if (
+        isinstance(task_count, bool)
+        or not isinstance(task_count, int)
+        or not 0 <= task_count <= MAX_REMOTE_SEARCH_TASKS
+    ):
+        raise ValueError(
+            "Request may derive no more than "
+            f"{MAX_REMOTE_SEARCH_TASKS} remote search tasks, got {task_count}"
+        )
+
+
+def validate_polymer_query(polymer: Polymer, sequence: str) -> str:
+    """Validate one protein or RNA query at a remote trust boundary."""
+    if polymer not in {"protein", "rna"}:
+        raise ValueError(f"Unsupported polymer: {polymer!r}")
     if not isinstance(sequence, str):
         raise TypeError("sequence must be a string")
-    if not 1 <= len(sequence) <= 10_000:
-        raise ValueError("sequence length must be between 1 and 10,000")
-    pattern = r"[A-Z]+" if spec.polymer == "protein" else r"[ACGU]+"
+    if not 1 <= len(sequence) <= MAX_QUERY_RESIDUES:
+        raise ValueError(
+            f"sequence length must be between 1 and {MAX_QUERY_RESIDUES:,}"
+        )
+    pattern = r"[A-Z]+" if polymer == "protein" else r"[ACGU]+"
     if re.fullmatch(pattern, sequence) is None:
-        raise ValueError(f"sequence contains invalid {spec.polymer} characters")
+        raise ValueError(f"sequence contains invalid {polymer} characters")
     return sequence
+
+
+def validate_query(spec: DatabaseProfileSpec, sequence: str) -> str:
+    """Validate one query before invoking a pinned HMMER wrapper."""
+    return validate_polymer_query(spec.polymer, sequence)
 
 
 def _hmmer_constructor_parameters(
@@ -865,6 +889,7 @@ def run_database_search(
     sequence: str,
 ) -> dict[str, object]:
     """Validate/reuse or publish one resumable Raw Database MSA."""
+    validate_query(resolve_database_profile(database_id), sequence)
     runtime.sharded_volume.reload()
     runtime.cache_volume.reload()
     context = load_search_context(
@@ -1094,6 +1119,11 @@ def inspect_msa_cache(
     assembly_tasks: tuple[MsaAssemblyTask, ...],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     """Inspect combined publications before deep-reading raw dependencies."""
+    validate_remote_search_task_count(len(raw_tasks) + len(assembly_tasks))
+    for task in raw_tasks:
+        validate_query(task.spec, task.sequence)
+    for task in assembly_tasks:
+        validate_polymer_query(task.polymer, task.sequence)
     contexts = {
         (task.database_id, task.sequence): load_search_context(
             sharded_root,
@@ -1169,6 +1199,7 @@ def assemble_and_publish_msas(
     task: MsaAssemblyTask,
 ) -> dict[str, object]:
     """Assemble requested fields and publish complete canonical combinations."""
+    validate_polymer_query(task.polymer, task.sequence)
     runtime.sharded_volume.reload()
     runtime.cache_volume.reload()
     contexts = {

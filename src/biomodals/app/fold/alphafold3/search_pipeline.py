@@ -34,12 +34,11 @@ from biomodals.app.fold.alphafold3.msa_search import (
     RawSearchTask,
     plan_msa_resolution,
     sequence_hash,
+    validate_remote_search_task_count,
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
 
 type SearchOutcome = dict[str, object] | Exception
-
-MAX_REMOTE_SEARCH_TASKS = 512
 
 
 class SearchExecutor(Protocol):
@@ -150,11 +149,7 @@ def resolve_msa_and_templates(
             if not protein.templates:
                 possible_template_tasks += 1
     task_count = len(plan.raw_searches) + len(plan.assemblies) + possible_template_tasks
-    if task_count > MAX_REMOTE_SEARCH_TASKS:
-        raise ValueError(
-            "Request may derive no more than "
-            f"{MAX_REMOTE_SEARCH_TASKS} remote search tasks, got {task_count}"
-        )
+    validate_remote_search_task_count(task_count)
     canonical_assemblies = tuple(
         task for task in plan.assemblies if task.publishes_canonical
     )

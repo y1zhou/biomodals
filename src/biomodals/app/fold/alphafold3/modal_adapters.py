@@ -312,13 +312,9 @@ def _run_claimed_seed_batches(
     prepared: PreparedInferenceRun,
     claimed_seeds: tuple[ClaimedSeed, ...],
     *,
-    recycle: int,
-    sample_count: int,
     max_workers: int,
     poll_timeout_seconds: int,
 ) -> InferenceBatchOutcome:
-    if recycle != prepared.recycle or sample_count != prepared.sample_count:
-        raise ValueError("Worker parameters do not match the staged inference input")
     batches = partition_claimed_seeds(claimed_seeds, max_workers)
     calls = [
         (
@@ -406,8 +402,6 @@ class ModalInferenceExecutor(InferenceExecutor):
         prepared: PreparedInferenceRun,
         claimed_seeds: tuple[ClaimedSeed, ...],
         *,
-        recycle: int,
-        sample_count: int,
         max_workers: int,
         poll_timeout_seconds: int,
     ) -> InferenceBatchOutcome:
@@ -415,8 +409,6 @@ class ModalInferenceExecutor(InferenceExecutor):
             self.worker_function,
             prepared,
             claimed_seeds,
-            recycle=recycle,
-            sample_count=sample_count,
             max_workers=max_workers,
             poll_timeout_seconds=poll_timeout_seconds,
         )
@@ -424,11 +416,7 @@ class ModalInferenceExecutor(InferenceExecutor):
     def finalize_summary(
         self,
         prepared: PreparedInferenceRun,
-        *,
-        sample_count: int,
     ) -> dict[str, object]:
-        if sample_count != prepared.sample_count:
-            raise ValueError("Summary parameters do not match the staged input")
         return self.summary_function.remote(
             prepared.run_id,
             prepared.request_id,
@@ -438,16 +426,12 @@ class ModalInferenceExecutor(InferenceExecutor):
     def finalize_request(
         self,
         prepared: PreparedInferenceRun,
-        *,
-        sample_count: int,
     ) -> dict[str, object]:
-        if sample_count != prepared.sample_count:
-            raise ValueError("Request parameters do not match the staged input")
         return self.request_function.remote(
             prepared.run_id,
             prepared.request_id,
             list(prepared.submitted_seeds),
             list(prepared.normalized_seeds),
-            sample_count,
+            prepared.sample_count,
             prepared.display_name,
         )

@@ -312,8 +312,6 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     outcome = executor.run_claimed(
         prepared,
         claimed,
-        recycle=3,
-        sample_count=2,
         max_workers=2,
         poll_timeout_seconds=7,
     )
@@ -323,11 +321,8 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     assert spawned_seeds == [1, 2]
     assert poll_timeouts == [7, 7, 7]
 
-    assert executor.finalize_summary(prepared, sample_count=2) == {"status": "complete"}
-    assert executor.finalize_request(
-        prepared,
-        sample_count=2,
-    ) == {"status": "complete"}
+    assert executor.finalize_summary(prepared) == {"status": "complete"}
+    assert executor.finalize_request(prepared) == {"status": "complete"}
     claim_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     inspect_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     summary_remote.assert_called_once_with(
@@ -442,13 +437,9 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
 
     def fake_predict_structures(
         prepared: PreparedInferenceRun,
-        recycle: int,
-        sample: int,
         num_containers: int,
     ) -> dict[str, object]:
         captured["prepared"] = prepared
-        captured["recycle"] = recycle
-        captured["sample"] = sample
         captured["num_containers"] = num_containers
         return {"request": {"status": "complete"}}
 
@@ -497,7 +488,7 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
         if upload.relative_path.name == "input.json"
     )
     assert AF3Config.model_validate_json(input_upload.content).modelSeeds == [11, 12]
-    assert captured == {"recycle": 3, "sample": 2, "num_containers": 2}
+    assert captured == {"num_containers": 2}
 
 
 def test_submit_alphafold3_task_rejects_input_json_symlink(tmp_path: Path) -> None:

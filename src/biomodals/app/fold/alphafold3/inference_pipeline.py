@@ -55,8 +55,6 @@ class InferenceExecutor(Protocol):
         prepared: PreparedInferenceRun,
         claimed_seeds: tuple[ClaimedSeed, ...],
         *,
-        recycle: int,
-        sample_count: int,
         max_workers: int,
         poll_timeout_seconds: int,
     ) -> InferenceBatchOutcome:
@@ -66,8 +64,6 @@ class InferenceExecutor(Protocol):
     def finalize_summary(
         self,
         prepared: PreparedInferenceRun,
-        *,
-        sample_count: int,
     ) -> dict[str, object]:
         """Rebuild the accumulated non-regressing run summary."""
         ...
@@ -75,8 +71,6 @@ class InferenceExecutor(Protocol):
     def finalize_request(
         self,
         prepared: PreparedInferenceRun,
-        *,
-        sample_count: int,
     ) -> dict[str, object]:
         """Publish the immutable request view over completed seeds."""
         ...
@@ -110,8 +104,6 @@ def coordinate_seed_predictions(
     prepared: PreparedInferenceRun,
     executor: InferenceExecutor,
     *,
-    recycle: int,
-    sample: int,
     num_containers: int,
     active_wait_timeout_seconds: int | float,
     worker_poll_timeout_seconds: int = 30,
@@ -144,6 +136,7 @@ def coordinate_seed_predictions(
         raise ValueError("active_poll_seconds must be positive")
 
     requested = prepared.normalized_seeds
+    sample_count = prepared.sample_count
     pending = set(requested)
     reused: set[int] = set()
     published: set[int] = set()
@@ -155,7 +148,7 @@ def coordinate_seed_predictions(
         plan = executor.claim_seeds(
             prepared.run_id,
             tuple(sorted(pending)),
-            sample_count=sample,
+            sample_count=sample_count,
         )
         reused.update(plan.reused_seeds)
         pending.difference_update(plan.reused_seeds)
@@ -167,8 +160,6 @@ def coordinate_seed_predictions(
             batch = executor.run_claimed(
                 prepared,
                 plan.owned,
-                recycle=recycle,
-                sample_count=sample,
                 max_workers=num_containers,
                 poll_timeout_seconds=worker_poll_timeout_seconds,
             )
@@ -176,7 +167,7 @@ def coordinate_seed_predictions(
                 executor,
                 prepared.run_id,
                 tuple(sorted(owned_seeds)),
-                sample,
+                sample_count,
             )
             published.update(batch.published_seeds)
             published.update(completed_owned - batch.reused_seeds)
@@ -216,16 +207,13 @@ def coordinate_seed_predictions(
         executor,
         prepared.run_id,
         requested,
-        sample,
+        sample_count,
     )
     reused.update(completed.difference(reused, published))
     incomplete = set(requested) - completed
     summary: dict[str, object] | None = None
     if completed:
-        summary = executor.finalize_summary(
-            prepared,
-            sample_count=sample,
-        )
+        summary = executor.finalize_summary(prepared)
     result: dict[str, object] = {
         "run_id": prepared.run_id,
         "request_id": prepared.request_id,
@@ -242,8 +230,5 @@ def coordinate_seed_predictions(
             "Incomplete AlphaFold3 seed predictions; completed siblings remain "
             f"reusable and no failed seed was retried: {result}"
         )
-    result["request"] = executor.finalize_request(
-        prepared,
-        sample_count=sample,
-    )
+    result["request"] = executor.finalize_request(prepared)
     return result

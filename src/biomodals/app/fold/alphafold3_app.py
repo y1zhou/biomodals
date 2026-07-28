@@ -482,18 +482,6 @@ def inspect_protein_template_cache(
     )
 
 
-def _template_runtime() -> TemplateRuntime:
-    """Bind shared template search to production mounts and claims."""
-    return TemplateRuntime(
-        source_volume=AF3_MSA_DB_VOLUME,
-        cache_volume=MSA_CACHE_VOLUME,
-        claims=MSA_SEARCH_CLAIMS,
-        container_id=_CONTAINER_INSTANCE_ID,
-        maximum_age_seconds=CONF.timeout + 900,
-        wait_timeout_seconds=max(60, CONF.timeout - 60),
-    )
-
-
 @app.function(
     cpu=(0.125, 8.125),
     memory=(1024, 32_768),
@@ -518,7 +506,14 @@ def search_protein_templates(
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
     return run_template_search(
-        _template_runtime(),
+        TemplateRuntime(
+            source_volume=AF3_MSA_DB_VOLUME,
+            cache_volume=MSA_CACHE_VOLUME,
+            claims=MSA_SEARCH_CLAIMS,
+            container_id=_CONTAINER_INSTANCE_ID,
+            maximum_age_seconds=CONF.timeout + 900,
+            wait_timeout_seconds=max(60, CONF.timeout - 60),
+        ),
         TemplateTask(
             sequence=sequence,
             unpaired_msa=unpaired_msa,
@@ -723,8 +718,6 @@ def finalize_inference_request(
 
 def _predict_structures(
     prepared: PreparedInferenceRun,
-    recycle: int,
-    sample: int,
     num_containers: int,
     *,
     poll_timeout: int = 30,
@@ -739,8 +732,6 @@ def _predict_structures(
             summary_function=finalize_inference_summary,
             request_function=finalize_inference_request,
         ),
-        recycle=recycle,
-        sample=sample,
         num_containers=num_containers,
         active_wait_timeout_seconds=MAX_TIMEOUT + 900,
         worker_poll_timeout_seconds=poll_timeout,
@@ -870,8 +861,6 @@ def submit_alphafold3_task(
     print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
     result = _predict_structures(
         prepared,
-        recycle,
-        sample,
         num_containers,
     )
     archive_path = create_request_archive(

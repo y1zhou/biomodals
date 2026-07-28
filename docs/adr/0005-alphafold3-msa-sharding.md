@@ -710,6 +710,10 @@ Volume, validates every payload, confines template paths to that run's
 the run identity before using the input. A caller therefore cannot publish
 outputs under one run while supplying another run's input.
 
+After preparation, recycle and diffusion-sample counts are read only from the
+prepared/staged request. Coordinator and executor APIs do not accept duplicate
+copies of those parameters, eliminating representational mismatch states.
+
 ### Inference identity
 
 An app-local `hash_sequences` helper derives `run_id` from the normalized

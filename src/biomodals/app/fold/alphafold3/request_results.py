@@ -1155,7 +1155,7 @@ def create_request_archive(
                     "--",
                     presentation_name,
                 ],
-                output_mode="capture",
+                output_mode="discard",
                 cwd=work_root,
             )
         if not _archive_matches_request(

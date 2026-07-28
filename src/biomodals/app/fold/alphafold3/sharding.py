@@ -243,7 +243,7 @@ def scan_record_multiset(
         f"({input_bytes} bytes)"
     )
     append_log(log_path, start_message)
-    print(f"🧬 validator {start_message}", flush=True)
+    print(f"💊 validator {start_message}", flush=True)
     with log_path.open("ab") as log:
         completed = subprocess.run(  # noqa: S603
             argv,
@@ -262,7 +262,7 @@ def scan_record_multiset(
     record_multiset_signature(report)
     completed_message = "Completed record-multiset helper"
     append_log(log_path, completed_message)
-    print(f"🧬 validator {completed_message}", flush=True)
+    print(f"💊 validator {completed_message}", flush=True)
     return {
         "input_bytes": input_bytes,
         "report": report,
@@ -359,7 +359,7 @@ def shuffle_fasta_occurrences(
         for line in iter(process.stderr.readline, b""):
             diagnostics.write(line)
             diagnostics.flush()
-            print(f"🧬 shuffler {line.decode(errors='replace')}", end="", flush=True)
+            print(f"💊 shuffler {line.decode(errors='replace')}", end="", flush=True)
         process.stderr.close()
         report_bytes = process.stdout.read()
         process.stdout.close()

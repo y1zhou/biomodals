@@ -1830,12 +1830,10 @@ def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
             prepared,
             claimed_seeds: tuple[ClaimedSeed, ...],
             *,
-            recycle: int,
-            sample_count: int,
             max_workers: int,
             poll_timeout_seconds: int,
         ) -> InferenceBatchOutcome:
-            del prepared, recycle, sample_count, max_workers, poll_timeout_seconds
+            del prepared, max_workers, poll_timeout_seconds
             self.calls.append("run")
             assert tuple(item.seed for item in claimed_seeds) == (2,)
             return InferenceBatchOutcome(
@@ -1847,20 +1845,16 @@ def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
         def finalize_summary(
             self,
             prepared,
-            *,
-            sample_count: int,
         ) -> dict[str, object]:
-            del prepared, sample_count
+            del prepared
             self.calls.append("summary")
             return {"status": "complete"}
 
         def finalize_request(
             self,
             prepared,
-            *,
-            sample_count: int,
         ) -> dict[str, object]:
-            del prepared, sample_count
+            del prepared
             self.calls.append("request")
             return {"status": "complete"}
 
@@ -1890,8 +1884,6 @@ def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
     result = coordinate_seed_predictions(
         prepared,
         executor,
-        recycle=1,
-        sample=1,
         num_containers=2,
         active_wait_timeout_seconds=60,
     )

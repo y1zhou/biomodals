@@ -2052,7 +2052,7 @@ def test_downstream_inference_boundaries_repeat_request_limits(
             )
 
 
-def test_staged_input_rederives_identity_and_stages_inline_templates(
+def test_staged_input_rederives_identity_and_preserves_inline_templates(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "output"
@@ -2093,17 +2093,17 @@ def test_staged_input_rederives_identity_and_stages_inline_templates(
     assert loaded.recycle == 3
     assert loaded.sample_count == 2
     assert loaded.config.modelSeeds == [1, 2]
-    template = loaded.config.sequences[0].protein.templates[0]
-    assert template.mmcif is None
-    assert Path(template.mmcifPath).is_relative_to(output_root)
-    assert (
-        len([
-            upload
-            for upload in prepared.payload_uploads
-            if upload.relative_path.parent.name == "custom-templates"
-        ])
-        == 1
-    )
+    protein = loaded.config.sequences[0].protein
+    assert protein is not None
+    template = protein.templates[0]
+    assert template.mmcif == "data_inline\n#\n"
+    assert template.mmcifPath is None
+    assert not [
+        upload
+        for upload in prepared.payload_uploads
+        if upload.relative_path.parent.name == "custom-templates"
+    ]
+    assert orjson.loads(prepared.staged_input.content)["custom_templates"] == []
 
     marker = orjson.loads(prepared.staged_input.content)
     marker["request_id"] = "f" * 64
@@ -2257,6 +2257,10 @@ def test_inference_staging_bounds_all_custom_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    template_paths = [tmp_path / "first.cif", tmp_path / "second.cif"]
+    template_contents = [b"12345", b"67890"]
+    for path, content in zip(template_paths, template_contents, strict=True):
+        path.write_bytes(content)
     monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
     config = AF3Config(
         name="bounded-template-staging",
@@ -2268,25 +2272,29 @@ def test_inference_staging_bounds_all_custom_templates(
                     sequence="ACDE",
                     templates=[
                         AF3Template(
-                            mmcif="12345",
-                            queryIndices=[0],
-                            templateIndices=[0],
-                        ),
-                        AF3Template(
-                            mmcif="67890",
-                            queryIndices=[1],
-                            templateIndices=[1],
-                        ),
+                            mmcifPath=str(path),
+                            queryIndices=[index],
+                            templateIndices=[index],
+                        )
+                        for index, path in enumerate(template_paths)
                     ],
                 )
             )
         ],
     )
+    custom_templates = tuple(
+        LocalTemplateFile(
+            source_path=path,
+            content=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        for path, content in zip(template_paths, template_contents, strict=True)
+    )
 
     with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
         prepare_inference_run(
             config,
-            (),
+            custom_templates,
             output_mount_root=tmp_path / "output",
             recycle=1,
             sample=1,
@@ -2297,6 +2305,10 @@ def test_staged_input_rechecks_the_custom_template_total(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    template_paths = [tmp_path / "first.cif", tmp_path / "second.cif"]
+    template_contents = [b"12345", b"67890"]
+    for path, content in zip(template_paths, template_contents, strict=True):
+        path.write_bytes(content)
     output_root = tmp_path / "output"
     prepared = prepare_inference_run(
         AF3Config(
@@ -2309,21 +2321,24 @@ def test_staged_input_rechecks_the_custom_template_total(
                         sequence="ACDE",
                         templates=[
                             AF3Template(
-                                mmcif="12345",
-                                queryIndices=[0],
-                                templateIndices=[0],
-                            ),
-                            AF3Template(
-                                mmcif="67890",
-                                queryIndices=[1],
-                                templateIndices=[1],
-                            ),
+                                mmcifPath=str(path),
+                                queryIndices=[index],
+                                templateIndices=[index],
+                            )
+                            for index, path in enumerate(template_paths)
                         ],
                     )
                 )
             ],
         ),
-        (),
+        tuple(
+            LocalTemplateFile(
+                source_path=path,
+                content=content,
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+            for path, content in zip(template_paths, template_contents, strict=True)
+        ),
         output_mount_root=output_root,
         recycle=1,
         sample=1,
@@ -2397,8 +2412,30 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
 
     assert inline.run_id == path_backed.run_id
     assert inline.request_id == path_backed.request_id
-    assert inline.payload_uploads == path_backed.payload_uploads
-    assert inline.staged_input == path_backed.staged_input
+    inline_identity = next(
+        upload
+        for upload in inline.payload_uploads
+        if upload.relative_path.name == "identity.json"
+    )
+    path_identity = next(
+        upload
+        for upload in path_backed.payload_uploads
+        if upload.relative_path.name == "identity.json"
+    )
+    assert inline_identity == path_identity
+    assert not [
+        upload
+        for upload in inline.payload_uploads
+        if upload.relative_path.parent.name == "custom-templates"
+    ]
+    assert (
+        len([
+            upload
+            for upload in path_backed.payload_uploads
+            if upload.relative_path.parent.name == "custom-templates"
+        ])
+        == 1
+    )
 
 
 def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:
@@ -2445,8 +2482,11 @@ def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:
         request_id=prepared.request_id,
         staged_input_record=prepared.staged_input.to_record(),
     )
-    template = loaded.config.sequences[0].protein.templates[0]
+    protein = loaded.config.sequences[0].protein
+    assert protein is not None
+    template = protein.templates[0]
     assert template.mmcif is None
+    assert template.mmcifPath is not None
     assert Path(template.mmcifPath).is_relative_to(output_root)
 
     input_upload = next(
@@ -2455,9 +2495,9 @@ def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:
         if upload.relative_path.name == "input.json"
     )
     escaped_config = AF3Config.model_validate_json(input_upload.content)
-    escaped_config.sequences[0].protein.templates[0].mmcifPath = str(
-        tmp_path / "escape.cif"
-    )
+    escaped_protein = escaped_config.sequences[0].protein
+    assert escaped_protein is not None
+    escaped_protein.templates[0].mmcifPath = str(tmp_path / "escape.cif")
     escaped_input = serialize_af3_input(escaped_config)
     input_path = output_root / Path(input_upload.relative_path.as_posix())
     input_path.write_bytes(escaped_input)

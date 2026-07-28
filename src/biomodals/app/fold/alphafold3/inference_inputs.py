@@ -37,7 +37,7 @@ from biomodals.app.fold.alphafold3.profiles import (
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
-RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v1"
+RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v2"
 STAGED_INPUT_SCHEMA_VERSION = 1
 MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES
@@ -588,6 +588,19 @@ def _template_content(
     return artifact.content
 
 
+def _text_content_identity(value: object, *, field_name: str) -> object:
+    """Replace one optional text payload with compact content evidence."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string or null")
+    content = value.encode()
+    return {
+        "sha256": sha256_bytes(content),
+        "size_bytes": len(content),
+    }
+
+
 def build_inference_identity_view(
     conf: AF3Config,
     custom_templates: tuple[LocalTemplateFile, ...],
@@ -613,27 +626,43 @@ def build_inference_identity_view(
             raise RuntimeError("Validated AlphaFold sequence entry is invalid")
         entry_view = cast(dict[str, object], raw_entry)
         raw_protein = entry_view.get("protein")
-        if raw_protein is None:
-            continue
-        if not isinstance(raw_protein, dict):
-            raise RuntimeError("Validated AlphaFold protein entry is invalid")
-        protein_view = cast(dict[str, object], raw_protein)
-        raw_templates = protein_view.get("templates")
-        if not isinstance(raw_templates, list):
-            raise RuntimeError("Validated AlphaFold template list is invalid")
-        identity_templates: list[dict[str, object]] = []
-        for raw_template in raw_templates:
-            if not isinstance(raw_template, dict):
-                raise RuntimeError("Validated AlphaFold template is invalid")
-            template_view = cast(dict[str, object], raw_template)
-            identity_templates.append({
-                "mmcifSha256": sha256_bytes(
-                    _template_content(template_view, template_files)
-                ),
-                "queryIndices": template_view.get("queryIndices"),
-                "templateIndices": template_view.get("templateIndices"),
-            })
-        protein_view["templates"] = identity_templates
+        if raw_protein is not None:
+            if not isinstance(raw_protein, dict):
+                raise RuntimeError("Validated AlphaFold protein entry is invalid")
+            protein_view = cast(dict[str, object], raw_protein)
+            for field_name in ("unpairedMsa", "pairedMsa"):
+                protein_view[field_name] = _text_content_identity(
+                    protein_view.get(field_name),
+                    field_name=f"protein.{field_name}",
+                )
+            raw_templates = protein_view.get("templates")
+            if not isinstance(raw_templates, list):
+                raise RuntimeError("Validated AlphaFold template list is invalid")
+            identity_templates: list[dict[str, object]] = []
+            for raw_template in raw_templates:
+                if not isinstance(raw_template, dict):
+                    raise RuntimeError("Validated AlphaFold template is invalid")
+                template_view = cast(dict[str, object], raw_template)
+                identity_templates.append({
+                    "mmcifSha256": sha256_bytes(
+                        _template_content(template_view, template_files)
+                    ),
+                    "queryIndices": template_view.get("queryIndices"),
+                    "templateIndices": template_view.get("templateIndices"),
+                })
+            protein_view["templates"] = identity_templates
+        elif (raw_rna := entry_view.get("rna")) is not None:
+            if not isinstance(raw_rna, dict):
+                raise RuntimeError("Validated AlphaFold RNA entry is invalid")
+            rna_view = cast(dict[str, object], raw_rna)
+            rna_view["unpairedMsa"] = _text_content_identity(
+                rna_view.get("unpairedMsa"),
+                field_name="rna.unpairedMsa",
+            )
+    view["userCCD"] = _text_content_identity(
+        view.get("userCCD"),
+        field_name="userCCD",
+    )
     return view
 
 
@@ -756,6 +785,8 @@ def prepare_inference_run(
         if (protein := entry.protein) is None:
             continue
         for template in protein.templates:
+            if template.mmcifPath is None:
+                continue
             template_view = cast(
                 dict[str, object],
                 template.model_dump(mode="python", exclude_unset=False),

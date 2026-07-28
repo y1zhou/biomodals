@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import orjson
@@ -278,6 +279,61 @@ def test_inference_staging_bounds_the_run_identity(
             recycle=1,
             sample=1,
         )
+
+
+def test_run_identity_hashes_large_text_while_input_remains_runnable(
+    tmp_path: Path,
+) -> None:
+    """Identity evidence should not duplicate large runnable input fields."""
+    unpaired_msa = ">query\nACDE\n"
+    user_ccd = "data_custom\n#\n"
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="compact-identity",
+            modelSeeds=[1],
+            userCCD=user_ccd,
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa=unpaired_msa,
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=tmp_path / "output",
+        recycle=1,
+        sample=1,
+    )
+    uploads = {
+        upload.relative_path.name: upload.content for upload in prepared.payload_uploads
+    }
+    identity = orjson.loads(uploads["identity.json"])
+    identity_input = identity["input"]
+
+    assert unpaired_msa.encode() not in uploads["identity.json"]
+    assert user_ccd.encode() not in uploads["identity.json"]
+    assert identity_input["sequences"][0]["protein"]["unpairedMsa"] == {
+        "sha256": hashlib.sha256(unpaired_msa.encode()).hexdigest(),
+        "size_bytes": len(unpaired_msa),
+    }
+    assert identity_input["sequences"][0]["protein"]["pairedMsa"] == {
+        "sha256": hashlib.sha256(b"").hexdigest(),
+        "size_bytes": 0,
+    }
+    assert identity_input["userCCD"] == {
+        "sha256": hashlib.sha256(user_ccd.encode()).hexdigest(),
+        "size_bytes": len(user_ccd),
+    }
+    runnable = AF3Config.model_validate_json(uploads["input.json"])
+    protein = runnable.sequences[0].protein
+    assert protein is not None
+    assert protein.unpairedMsa == unpaired_msa
+    assert runnable.userCCD == user_ccd
 
 
 def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:

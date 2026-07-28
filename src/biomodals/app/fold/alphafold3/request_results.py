@@ -28,12 +28,14 @@ import polars as pl
 from biomodals.app.fold.alphafold3.artifacts import (
     VolumeReader,
     json_bytes,
+    read_volume_bytes,
     require_regular_file,
     sha256_file,
     write_bytes_atomic,
     write_json_atomic,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    PreparedInferenceRun,
     hash_sequences,
     normalize_model_seeds,
     sanitize_af3_name,
@@ -68,6 +70,18 @@ class RequestPublication:
     normalized_seeds: tuple[int, ...]
     sample_count: int
     display_name: str
+
+    @classmethod
+    def from_prepared(cls, prepared: PreparedInferenceRun) -> RequestPublication:
+        """Build the stable publication identity of one prepared request."""
+        return cls(
+            run_id=prepared.run_id,
+            request_id=prepared.request_id,
+            submitted_seeds=prepared.submitted_seeds,
+            normalized_seeds=prepared.normalized_seeds,
+            sample_count=prepared.sample_count,
+            display_name=prepared.display_name,
+        )
 
 
 def request_manifest_from_result(value: object) -> dict[str, object]:
@@ -353,6 +367,55 @@ def _best_artifacts(
     ]
 
 
+def request_manifest_path(publication: RequestPublication) -> PurePosixPath:
+    """Return the stable output-Volume path of one request-view manifest."""
+    spec = _validate_publication(publication)
+    view_id = request_view_id(
+        spec.request_id,
+        spec.submitted_seeds,
+        spec.display_name,
+    )
+    return (
+        PurePosixPath(spec.run_id[:2])
+        / spec.run_id
+        / "requests"
+        / spec.request_id
+        / "views"
+        / view_id
+        / "manifest.json"
+    )
+
+
+def _matching_request_manifest(
+    manifest: object,
+    *,
+    source: str | Path | PurePosixPath,
+    spec: RequestPublication,
+    view_id: str,
+) -> dict[str, object]:
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"Existing request view manifest is invalid: {source}")
+    selected = cast(dict[str, object], manifest)
+    _validated_manifest_artifacts(selected)
+    expected = {
+        "run_id": spec.run_id,
+        "request_id": spec.request_id,
+        "view_id": view_id,
+        "sample_count": spec.sample_count,
+        "submitted_display_name": spec.display_name,
+        "presentation_name": sanitize_af3_name(spec.display_name),
+        "submitted_seeds": list(spec.submitted_seeds),
+        "normalized_seeds": list(spec.normalized_seeds),
+        "duplicates_removed": _duplicates_removed(spec.submitted_seeds),
+    }
+    if any(selected.get(key) != value for key, value in expected.items()):
+        raise RuntimeError(
+            "Existing request view manifest does not match its stable identity: "
+            f"{source}"
+        )
+    return selected
+
+
 def _reusable_request_manifest(
     *,
     path: Path,
@@ -367,25 +430,40 @@ def _reusable_request_manifest(
         raise RuntimeError(
             f"Existing request view manifest is unreadable: {path}"
         ) from exc
-    if not isinstance(manifest, dict):
-        raise RuntimeError(f"Existing request view manifest is invalid: {path}")
-    _validated_manifest_artifacts(manifest)
-    expected = {
-        "run_id": spec.run_id,
-        "request_id": spec.request_id,
-        "view_id": view_id,
-        "sample_count": spec.sample_count,
-        "submitted_display_name": spec.display_name,
-        "presentation_name": sanitize_af3_name(spec.display_name),
-        "submitted_seeds": list(spec.submitted_seeds),
-        "normalized_seeds": list(spec.normalized_seeds),
-        "duplicates_removed": _duplicates_removed(spec.submitted_seeds),
-    }
-    if any(manifest.get(key) != value for key, value in expected.items()):
+    return _matching_request_manifest(
+        manifest,
+        source=path,
+        spec=spec,
+        view_id=view_id,
+    )
+
+
+def load_request_manifest(
+    reader: VolumeReader,
+    publication: RequestPublication,
+) -> dict[str, object] | None:
+    """Read and validate one completed request view without a remote worker."""
+    spec = _validate_publication(publication)
+    path = request_manifest_path(spec)
+    content = read_volume_bytes(
+        reader,
+        path.as_posix(),
+        max_bytes=_ARCHIVE_MANIFEST_MAX_BYTES,
+    )
+    if content is None:
+        return None
+    try:
+        manifest = orjson.loads(content)
+    except orjson.JSONDecodeError as exc:
         raise RuntimeError(
-            f"Existing request view manifest does not match its stable identity: {path}"
-        )
-    return cast(dict[str, object], manifest)
+            f"Existing request view manifest is unreadable: {path}"
+        ) from exc
+    return _matching_request_manifest(
+        manifest,
+        source=path,
+        spec=spec,
+        view_id=path.parent.name,
+    )
 
 
 def publish_request_results(

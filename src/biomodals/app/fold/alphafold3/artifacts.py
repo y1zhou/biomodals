@@ -38,6 +38,32 @@ class VolumeReader(Protocol):
         ...
 
 
+def read_volume_bytes(
+    reader: VolumeReader,
+    path: str,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    """Read one bounded Volume file, returning ``None`` when it is absent."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("Volume path must be a non-empty string")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    content = bytearray()
+    try:
+        for chunk in reader.read_file(path):
+            if not isinstance(chunk, bytes):
+                raise TypeError(f"Volume returned non-bytes for {path}")
+            if len(content) + len(chunk) > max_bytes:
+                raise ValueError(
+                    f"Volume file exceeds the {max_bytes}-byte limit: {path}"
+                )
+            content.extend(chunk)
+    except FileNotFoundError:
+        return None
+    return bytes(content)
+
+
 def json_bytes(value: object) -> bytes:
     """Serialize canonical, human-readable JSON bytes."""
     return orjson.dumps(value, option=_JSON_OPTIONS)

@@ -103,6 +103,7 @@ from biomodals.app.fold.alphafold3.profiles import (
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     create_request_archive,
+    load_request_manifest,
     publish_request_results,
     request_manifest_from_result,
 )
@@ -868,22 +869,32 @@ def submit_alphafold3_task(
             f"{list(prepared.submitted_seeds)} -> "
             f"{list(prepared.normalized_seeds)}"
         )
-    stage_inference_run(CONF.output_volume, prepared)
-    print(
-        "🧬 Staged inference input: "
-        f"run_id={prepared.run_id}, request_id={prepared.request_id}"
-    )
+    publication = RequestPublication.from_prepared(prepared)
+    manifest = load_request_manifest(CONF.output_volume, publication)
+    if manifest is None:
+        stage_inference_run(CONF.output_volume, prepared)
+        print(
+            "🧬 Staged inference input: "
+            f"run_id={prepared.run_id}, request_id={prepared.request_id}"
+        )
 
-    num_seeds = len(prepared.normalized_seeds)
-    num_containers = min(max_num_gpus, num_seeds)
-    print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
-    result = _predict_structures(
-        prepared,
-        num_containers,
-    )
+        num_seeds = len(prepared.normalized_seeds)
+        num_containers = min(max_num_gpus, num_seeds)
+        print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
+        manifest = request_manifest_from_result(
+            _predict_structures(
+                prepared,
+                num_containers,
+            )
+        )
+    else:
+        print(
+            "🧬 Reusing completed request view: "
+            f"run_id={prepared.run_id}, request_id={prepared.request_id}"
+        )
     archive_path = create_request_archive(
         CONF.output_volume,
-        request_manifest_from_result(result),
+        manifest,
         output_dir=resolve_local_output_dir(out_dir),
         display_name=run_name,
     )

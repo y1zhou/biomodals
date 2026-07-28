@@ -32,6 +32,7 @@ from biomodals.app.fold.alphafold3.artifacts import (
     artifact_record,
     json_bytes,
     load_artifact_bytes,
+    read_volume_bytes,
     validate_artifact_record,
     write_bytes_atomic,
 )
@@ -115,7 +116,9 @@ from biomodals.app.fold.alphafold3.request_results import (
     REQUEST_MANIFEST_SCHEMA_VERSION,
     RequestPublication,
     create_request_archive,
+    load_request_manifest,
     publish_request_results,
+    request_manifest_path,
     request_view_id,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
@@ -274,6 +277,16 @@ def test_durable_artifact_helpers_detect_changed_bytes(tmp_path: Path) -> None:
     assert validate_artifact_record(tmp_path, record) is None
 
 
+def test_bounded_volume_read_distinguishes_missing_and_oversized_files() -> None:
+    """Local Volume reads should stream within their explicit metadata budget."""
+    reader = FakeVolumeReader({"present": b"payload"})
+
+    assert read_volume_bytes(reader, "present", max_bytes=7) == b"payload"
+    assert read_volume_bytes(reader, "missing", max_bytes=7) is None
+    with pytest.raises(ValueError, match="exceeds the 6-byte limit"):
+        read_volume_bytes(reader, "present", max_bytes=6)
+
+
 def test_artifact_loader_rejects_size_mismatch_before_reading(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -401,6 +414,8 @@ class FakeVolumeReader:
         self.files = files
 
     def read_file(self, path: str):
+        if path not in self.files:
+            raise FileNotFoundError(path)
         value = self.files[path]
         midpoint = len(value) // 2
         yield value[:midpoint]
@@ -2677,6 +2692,46 @@ def test_request_view_identity_preserves_invocation_presentation() -> None:
     assert request_view_id(request_id, (2, 1, 1), "Readable Name") == view_id
     assert request_view_id(request_id, (1, 2), "Readable Name") != view_id
     assert request_view_id(request_id, (2, 1, 1), "Another Name") != view_id
+
+
+def test_completed_request_manifest_loads_without_a_remote_worker() -> None:
+    """A locally known request identity should resolve its durable manifest."""
+    run_id = "c" * 64
+    submitted_seeds = [2, 1, 1]
+    publication = RequestPublication(
+        run_id=run_id,
+        request_id=hash_sequences(run_id, [1, 2]),
+        submitted_seeds=tuple(submitted_seeds),
+        normalized_seeds=(1, 2),
+        sample_count=1,
+        display_name="Readable Name",
+    )
+    input_path = f"{run_id[:2]}/{run_id}/requests/{publication.request_id}/input.json"
+    input_bytes = b"input"
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=submitted_seeds,
+        display_name=publication.display_name,
+        artifacts=[
+            {
+                "role": "input",
+                "volume_path": input_path,
+                "archive_path": f"{canonical_output_name(run_id)}_data.json",
+                "size_bytes": len(input_bytes),
+                "sha256": hashlib.sha256(input_bytes).hexdigest(),
+            }
+        ],
+    )
+    manifest_path = request_manifest_path(publication).as_posix()
+
+    assert (
+        load_request_manifest(
+            FakeVolumeReader({manifest_path: json_bytes(manifest)}),
+            publication,
+        )
+        == manifest
+    )
+    assert load_request_manifest(FakeVolumeReader({}), publication) is None
 
 
 def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> None:

@@ -37,6 +37,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
     sequence_cache_relpath,
 )
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
+from biomodals.app.fold.alphafold3.request_results import RequestPublication
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -586,6 +587,11 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
 
     monkeypatch.setattr(
         alphafold3_app,
+        "load_request_manifest",
+        lambda output_volume, publication: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
         "stage_inference_run",
         lambda output_volume, prepared: None,
     )
@@ -630,6 +636,75 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     )
     assert AF3Config.model_validate_json(input_upload.content).modelSeeds == [11, 12]
     assert captured == {"num_containers": 2}
+
+
+def test_submit_alphafold3_task_reuses_a_completed_request_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed view should skip staging and all inference remote calls."""
+    input_json = tmp_path / "input.json"
+    input_json.write_text(
+        AF3Config(
+            name="cached",
+            modelSeeds=[11],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    cached_manifest: dict[str, object] = {"status": "complete"}
+    captured: dict[str, object] = {}
+
+    def load_manifest(output_volume, publication):
+        del output_volume
+        captured["publication"] = publication
+        return cached_manifest
+
+    def create_archive(reader, manifest, *, output_dir, display_name):
+        del reader, output_dir
+        captured["manifest"] = manifest
+        captured["display_name"] = display_name
+        return tmp_path / "cached.tar.zst"
+
+    monkeypatch.setattr(alphafold3_app, "load_request_manifest", load_manifest)
+    monkeypatch.setattr(
+        alphafold3_app,
+        "stage_inference_run",
+        lambda *args: pytest.fail("completed request was restaged"),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_predict_structures",
+        lambda *args: pytest.fail("completed request launched inference"),
+    )
+    monkeypatch.setattr(alphafold3_app, "create_request_archive", create_archive)
+
+    entrypoint = alphafold3_app.submit_alphafold3_task.info
+    assert entrypoint is not None and entrypoint.raw_f is not None
+    entrypoint.raw_f(
+        input_json=str(input_json),
+        out_dir=str(tmp_path),
+        search_msa=False,
+        recycle=1,
+        sample=1,
+    )
+
+    publication = captured["publication"]
+    assert isinstance(publication, RequestPublication)
+    assert publication.display_name == "cached"
+    assert publication.submitted_seeds == (11,)
+    assert captured["manifest"] is cached_manifest
+    assert captured["display_name"] == "cached"
 
 
 def test_submit_alphafold3_task_rejects_input_json_symlink(tmp_path: Path) -> None:

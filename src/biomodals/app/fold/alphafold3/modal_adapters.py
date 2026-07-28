@@ -211,6 +211,11 @@ class ModalSearchExecutor(SearchExecutor):
             lambda task: self.template_search_function.remote(
                 task.sequence,
                 task.unpaired_msa,
+                (
+                    task.unpaired_msa_reference.to_record()
+                    if task.unpaired_msa_reference is not None
+                    else None
+                ),
                 task.publish_canonical,
                 task.max_template_date,
             ),

@@ -27,8 +27,10 @@ from biomodals.app.fold.alphafold3.modal_adapters import (
     stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
+    MsaArtifactReference,
     MsaAssemblyTask,
     RawSearchTask,
+    sequence_cache_relpath,
 )
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
 from biomodals.app.fold.alphafold3.seed_predictions import (
@@ -152,10 +154,16 @@ def test_modal_search_executor_marshals_remote_fanout(
         {"status": "published"},
     )
 
+    unpaired_msa = b">query\nACDE\n"
+    reference = MsaArtifactReference.from_content(
+        sequence_cache_relpath("protein", "ACDE") / "unpaired.a3m",
+        unpaired_msa,
+    )
     template_tasks = (
         TemplateTask(
             sequence="ACDE",
-            unpaired_msa=">query\nACDE\n",
+            unpaired_msa=None,
+            unpaired_msa_reference=reference,
             publish_canonical=True,
             max_template_date="2021-09-30",
         ),
@@ -187,7 +195,8 @@ def test_modal_search_executor_marshals_remote_fanout(
     ])
     run_template.assert_called_once_with(
         "ACDE",
-        ">query\nACDE\n",
+        None,
+        reference.to_record(),
         True,
         "2021-09-30",
     )

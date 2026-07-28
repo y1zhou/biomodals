@@ -66,6 +66,7 @@ from biomodals.app.fold.alphafold3.modal_adapters import (
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
+    MsaArtifactReference,
     MsaAssemblyTask,
     Polymer,
     RawSearchTask,
@@ -73,6 +74,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
     assemble_and_publish_msas,
     inspect_msa_cache,
     run_database_search,
+    sequence_cache_relpath,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
@@ -509,7 +511,8 @@ def _template_runtime() -> TemplateRuntime:
 )
 def search_protein_templates(
     sequence: str,
-    unpaired_msa: str,
+    unpaired_msa: str | None,
+    unpaired_msa_reference: dict[str, object] | None,
     publish_canonical: bool,
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
 ) -> dict[str, object]:
@@ -519,6 +522,16 @@ def search_protein_templates(
         TemplateTask(
             sequence=sequence,
             unpaired_msa=unpaired_msa,
+            unpaired_msa_reference=(
+                MsaArtifactReference.from_record(
+                    unpaired_msa_reference,
+                    expected_path=(
+                        sequence_cache_relpath("protein", sequence) / "unpaired.a3m"
+                    ),
+                )
+                if unpaired_msa_reference is not None
+                else None
+            ),
             publish_canonical=publish_canonical,
             max_template_date=max_template_date,
         ),

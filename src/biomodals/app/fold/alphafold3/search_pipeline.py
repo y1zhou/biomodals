@@ -259,7 +259,7 @@ def resolve_msa_and_templates(
     template_plan = plan_template_searches(
         conf,
         states,
-        assembly_resolution.canonical_sequences,
+        assembly_resolution,
     )
     canonical_tasks = template_plan.canonical_tasks
     template_statuses = (

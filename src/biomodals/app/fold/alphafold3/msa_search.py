@@ -17,7 +17,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Literal, cast
 
 import orjson
@@ -156,6 +156,65 @@ class MsaAssemblyTask:
     def publishes_canonical(self) -> bool:
         """Return whether this task can publish the complete canonical MSA."""
         return self.include_unpaired and (self.polymer == "rna" or self.include_paired)
+
+
+@dataclass(frozen=True, slots=True)
+class MsaArtifactReference:
+    """One content-bound combined-MSA file on the shared cache Volume."""
+
+    relative_path: PurePosixPath
+    size_bytes: int
+    sha256: str
+
+    @classmethod
+    def from_record(
+        cls,
+        record: object,
+        *,
+        expected_path: Path | PurePosixPath,
+    ) -> MsaArtifactReference:
+        """Validate a serialized reference against its deterministic path."""
+        expected = PurePosixPath(expected_path.as_posix())
+        if not isinstance(record, dict) or record.get("path") != expected.as_posix():
+            raise ValueError(f"Invalid MSA artifact path: {record!r}")
+        size_bytes = record.get("size_bytes")
+        digest = record.get("sha256")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes <= 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValueError(f"Invalid MSA artifact record: {record!r}")
+        return cls(expected, size_bytes, digest)
+
+    @classmethod
+    def from_content(
+        cls,
+        relative_path: Path | PurePosixPath,
+        content: bytes,
+    ) -> MsaArtifactReference:
+        """Build a reference for nonempty bytes already validated in memory."""
+        if not content:
+            raise ValueError("MSA artifact content must be nonempty")
+        return cls(
+            PurePosixPath(relative_path.as_posix()),
+            len(content),
+            sha256_bytes(content),
+        )
+
+    def to_record(self) -> dict[str, object]:
+        """Serialize the reference for a Modal worker boundary."""
+        return {
+            "path": self.relative_path.as_posix(),
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+    def matches_content(self, content: bytes) -> bool:
+        """Return whether bytes have the reference's exact size and digest."""
+        return len(content) == self.size_bytes and sha256_bytes(content) == self.sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -1005,6 +1064,29 @@ def _load_combined_msa(
     return fields
 
 
+def _combined_msa_result(
+    status: str,
+    task: MsaAssemblyTask,
+    provenance: dict[str, object],
+    fields: dict[str, str],
+) -> dict[str, object]:
+    sequence_root = sequence_cache_relpath(task.polymer, task.sequence)
+    unpaired_msa = fields.get("unpairedMsa")
+    if unpaired_msa is None:
+        raise RuntimeError("Canonical combined MSA has no unpaired field")
+    return {
+        "status": status,
+        "polymer": task.polymer,
+        "sequence_sha256": sequence_hash(task.sequence),
+        "combined_identity": provenance["combined_identity"],
+        "fields": fields,
+        "unpaired_msa_reference": MsaArtifactReference.from_content(
+            sequence_root / "unpaired.a3m",
+            unpaired_msa.encode(),
+        ).to_record(),
+    }
+
+
 def inspect_msa_cache(
     sharded_root: Path,
     cache_root: Path,
@@ -1053,13 +1135,12 @@ def inspect_msa_cache(
             )
             if fields := _load_combined_msa(sequence_root, provenance, task):
                 reusable_sequences.add((task.polymer, task.sequence))
-                status = {
-                    "status": "reused",
-                    "polymer": task.polymer,
-                    "sequence_sha256": sequence_hash(task.sequence),
-                    "combined_identity": provenance["combined_identity"],
-                    "fields": fields,
-                }
+                status = _combined_msa_result(
+                    "reused",
+                    task,
+                    provenance,
+                    fields,
+                )
         combined_statuses.append(status)
 
     raw_statuses: list[dict[str, object]] = []
@@ -1119,13 +1200,7 @@ def assemble_and_publish_msas(
         )
         provenance = _combined_provenance(task, metadata, assembly_contract)
         if reusable := _load_combined_msa(sequence_root, provenance, task):
-            return {
-                "status": "reused",
-                "polymer": task.polymer,
-                "sequence_sha256": sequence_hash(task.sequence),
-                "combined_identity": provenance["combined_identity"],
-                "fields": reusable,
-            }
+            return _combined_msa_result("reused", task, provenance, reusable)
 
     entries: dict[str, RawMsaEntry] = {}
     for database_id, context in contexts.items():
@@ -1167,13 +1242,7 @@ def assemble_and_publish_msas(
     while claim is None:
         runtime.cache_volume.reload()
         if reusable := _load_combined_msa(sequence_root, provenance, task):
-            return {
-                "status": "reused",
-                "polymer": task.polymer,
-                "sequence_sha256": sequence_hash(task.sequence),
-                "combined_identity": provenance["combined_identity"],
-                "fields": reusable,
-            }
+            return _combined_msa_result("reused", task, provenance, reusable)
         try:
             claim = acquire_generation_claim(
                 runtime.claims,
@@ -1207,13 +1276,7 @@ def assemble_and_publish_msas(
         if reusable := _load_combined_msa(sequence_root, provenance, task):
             terminal_status = "complete"
             terminal_detail = {"publication": "raced"}
-            return {
-                "status": "reused",
-                "polymer": task.polymer,
-                "sequence_sha256": sequence_hash(task.sequence),
-                "combined_identity": provenance["combined_identity"],
-                "fields": reusable,
-            }
+            return _combined_msa_result("reused", task, provenance, reusable)
         filenames = {
             "unpairedMsa": "unpaired.a3m",
             "pairedMsa": "paired.a3m",
@@ -1253,13 +1316,7 @@ def assemble_and_publish_msas(
             "publication": "published",
             "combined_identity": provenance["combined_identity"],
         }
-        return {
-            "status": "published",
-            "polymer": task.polymer,
-            "sequence_sha256": sequence_hash(task.sequence),
-            "combined_identity": provenance["combined_identity"],
-            "fields": reusable,
-        }
+        return _combined_msa_result("published", task, provenance, reusable)
     except Exception as exc:
         terminal_detail = {
             "error_type": type(exc).__name__,

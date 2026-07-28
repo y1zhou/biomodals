@@ -64,6 +64,7 @@ from biomodals.app.fold.alphafold3.input_enrichment import (
 from biomodals.app.fold.alphafold3.msa_search import (
     RAW_RESULT_SCHEMA_VERSION,
     ChainMsaState,
+    MsaArtifactReference,
     MsaAssemblyTask,
     RawMsaEntry,
     RawSearchTask,
@@ -126,6 +127,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 )
 from biomodals.app.fold.alphafold3.template_search import (
     TEMPLATE_RESULT_SCHEMA_VERSION,
+    TemplateRuntime,
     TemplateTask,
     build_template_context,
     load_template_entry,
@@ -138,6 +140,46 @@ def _artifact(path: str, content: bytes = b"x") -> dict[str, object]:
         "path": path,
         "size_bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _unpaired_msa_reference(
+    polymer: str,
+    sequence: str,
+    unpaired_msa: str,
+) -> dict[str, object]:
+    root = f"{'Protein' if polymer == 'protein' else 'RNA'}"
+    digest = sequence_hash(sequence)
+    return _artifact(
+        f"{root}/{digest[:2]}/{digest}/unpaired.a3m",
+        unpaired_msa.encode(),
+    )
+
+
+def _combined_outcome(
+    task: MsaAssemblyTask,
+    *,
+    status: str = "published",
+) -> dict[str, object]:
+    fields = {
+        field: f">query\n{task.sequence}\n"
+        for field, include in (
+            ("unpairedMsa", task.include_unpaired),
+            ("pairedMsa", task.include_paired),
+        )
+        if include
+    }
+    return {
+        "status": status,
+        "polymer": task.polymer,
+        "sequence_sha256": sequence_hash(task.sequence),
+        "combined_identity": "a" * 64,
+        "fields": fields,
+        "unpaired_msa_reference": _unpaired_msa_reference(
+            task.polymer,
+            task.sequence,
+            fields["unpairedMsa"],
+        ),
     }
 
 
@@ -514,18 +556,7 @@ def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
     assembly_task = plan_msa_resolution(states).assemblies[0]
     resolution = reduce_msa_assembly_results(
         (assembly_task,),
-        (
-            {
-                "status": "published",
-                "polymer": "protein",
-                "sequence_sha256": sequence_hash("ACDE"),
-                "combined_identity": "c" * 64,
-                "fields": {
-                    "unpairedMsa": ">query\nACDE\n",
-                    "pairedMsa": ">query\nACDE\n",
-                },
-            },
-        ),
+        (_combined_outcome(assembly_task),),
     )
 
     apply_msa_resolution(
@@ -534,15 +565,48 @@ def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
         resolution,
         search_protein_templates=True,
     )
-    template_plan = plan_template_searches(
-        config, states, resolution.canonical_sequences
-    )
+    template_plan = plan_template_searches(config, states, resolution)
 
     assert len(template_plan.tasks) == 1
     assert template_plan.tasks[0].publish_canonical is True
+    assert template_plan.tasks[0].unpaired_msa is None
+    assert template_plan.tasks[0].unpaired_msa_reference is not None
     assert template_plan.chain_indices_by_identity == {
         template_plan.tasks[0].template_identity: (0, 1)
     }
+
+
+def test_msa_resolution_binds_references_to_returned_fields() -> None:
+    task = MsaAssemblyTask(
+        polymer="protein",
+        sequence="ACDE",
+        include_unpaired=True,
+        include_paired=True,
+    )
+    fields = {
+        "unpairedMsa": ">query\nACDE\n",
+        "pairedMsa": ">query\nACDE\n",
+    }
+    reference = _unpaired_msa_reference("protein", "ACDE", fields["unpairedMsa"])
+    reference = _artifact(
+        cast(str, reference["path"]),
+        b">query\nCHANGED\n",
+    )
+
+    with pytest.raises(RuntimeError, match="does not match the returned field"):
+        reduce_msa_assembly_results(
+            (task,),
+            (
+                {
+                    "status": "reused",
+                    "polymer": "protein",
+                    "sequence_sha256": sequence_hash("ACDE"),
+                    "combined_identity": "a" * 64,
+                    "fields": fields,
+                    "unpaired_msa_reference": reference,
+                },
+            ),
+        )
 
 
 def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
@@ -597,19 +661,7 @@ def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
         ) -> tuple[dict[str, object] | Exception, ...]:
             del max_parallel
             self.calls.append("assemble")
-            return tuple(
-                {
-                    "status": "published",
-                    "polymer": task.polymer,
-                    "sequence_sha256": sequence_hash(task.sequence),
-                    "combined_identity": "a" * 64,
-                    "fields": {
-                        "unpairedMsa": ">query\nACDE\n",
-                        "pairedMsa": ">query\nACDE\n",
-                    },
-                }
-                for task in tasks
-            )
+            return tuple(_combined_outcome(task) for task in tasks)
 
         def inspect_templates(
             self,
@@ -691,17 +743,7 @@ def test_search_pipeline_reuses_combined_msa_without_assembly() -> None:
                     for task in raw_tasks
                 ),
                 tuple(
-                    {
-                        "status": "reused",
-                        "polymer": task.polymer,
-                        "sequence_sha256": sequence_hash(task.sequence),
-                        "combined_identity": "a" * 64,
-                        "fields": {
-                            "unpairedMsa": ">query\nACDE\n",
-                            "pairedMsa": ">query\nACDE\n",
-                        },
-                    }
-                    for task in assembly_tasks
+                    _combined_outcome(task, status="reused") for task in assembly_tasks
                 ),
             )
 
@@ -1049,6 +1091,50 @@ def test_template_search_validates_remote_a3m_boundary(
     monkeypatch.setattr(template_search, "MAX_LOCAL_MSA_BYTES", len(valid) - 1)
     with pytest.raises(ValueError, match="byte limit"):
         template_search._validate_template_msa("ACDE", valid)
+
+
+def test_template_search_loads_canonical_msa_from_its_volume_reference(
+    tmp_path: Path,
+) -> None:
+    unpaired_msa = ">query\nACDE\n"
+    relative_path = (
+        msa_search.sequence_cache_relpath("protein", "ACDE") / "unpaired.a3m"
+    )
+    msa_path = tmp_path / relative_path
+    msa_path.parent.mkdir(parents=True)
+    msa_path.write_text(unpaired_msa, encoding="ascii")
+    reference = MsaArtifactReference.from_record(
+        _artifact(relative_path.as_posix(), unpaired_msa.encode()),
+        expected_path=relative_path,
+    )
+    reloads: list[None] = []
+    runtime = TemplateRuntime(
+        source_volume=cast(
+            Any, SimpleNamespace(reload=lambda: None, commit=lambda: None)
+        ),
+        cache_volume=cast(
+            Any,
+            SimpleNamespace(
+                reload=lambda: reloads.append(None),
+                commit=lambda: None,
+            ),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+        source_root=tmp_path / "source",
+        cache_root=tmp_path,
+    )
+    task = TemplateTask(
+        sequence="ACDE",
+        unpaired_msa=None,
+        unpaired_msa_reference=reference,
+        publish_canonical=True,
+    )
+
+    assert template_search._resolve_template_msa(runtime, task) == unpaired_msa
+    assert reloads == [None]
 
 
 def test_generation_claims_fence_active_and_terminal_writers() -> None:

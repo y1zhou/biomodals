@@ -481,6 +481,13 @@ A canonical template result is published only when its input was the canonical
 combined unpaired MSA. Mixed caller/generated assemblies and templates stay
 request-local.
 
+Canonical assembly results carry a content-bound reference to their flat
+`unpaired.a3m` publication. The coordinator verifies that the reference digest
+and size match the MSA text used to enrich the inference input. It sends that
+small reference—not the A3M text—to a canonical template worker, which reloads
+the MSA cache Volume and validates the referenced path, size, and digest before
+searching. Caller-supplied MSA evidence remains inline and request-local.
+
 Request-local template work may be deduplicated only when both the protein
 sequence and resolved unpaired-MSA digest match.
 

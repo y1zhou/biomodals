@@ -41,6 +41,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import MAX_LOCAL_MSA_BYTES
 from biomodals.app.fold.alphafold3.msa_search import (
+    MsaArtifactReference,
     SearchRuntime,
     sequence_cache_relpath,
     sequence_hash,
@@ -89,13 +90,31 @@ class TemplateTask:
     """One deduplicated protein template-search input."""
 
     sequence: str
-    unpaired_msa: str
+    unpaired_msa: str | None
     publish_canonical: bool
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE
+    unpaired_msa_reference: MsaArtifactReference | None = None
+
+    def __post_init__(self) -> None:
+        """Require canonical references or request-local inline evidence."""
+        has_inline = self.unpaired_msa is not None
+        has_reference = self.unpaired_msa_reference is not None
+        if has_inline == has_reference:
+            raise ValueError(
+                "TemplateTask requires exactly one unpaired MSA representation"
+            )
+        if self.publish_canonical != has_reference:
+            raise ValueError(
+                "Only canonical template tasks may use an MSA artifact reference"
+            )
 
     @property
     def unpaired_msa_sha256(self) -> str:
         """Return the content identity of the resolved unpaired MSA."""
+        if self.unpaired_msa_reference is not None:
+            return self.unpaired_msa_reference.sha256
+        if self.unpaired_msa is None:
+            raise RuntimeError("Template task has no unpaired MSA")
         return sha256_bytes(self.unpaired_msa.encode())
 
     @property
@@ -375,6 +394,30 @@ def _validate_template_msa(sequence: str, unpaired_msa: str) -> str:
     return unpaired_msa
 
 
+def _resolve_template_msa(runtime: TemplateRuntime, task: TemplateTask) -> str:
+    """Load canonical evidence from the cache Volume or use caller text."""
+    reference = task.unpaired_msa_reference
+    if reference is None:
+        if task.unpaired_msa is None:
+            raise RuntimeError("Template task has no unpaired MSA")
+        return _validate_template_msa(task.sequence, task.unpaired_msa)
+    if reference.size_bytes > MAX_LOCAL_MSA_BYTES:
+        raise ValueError(f"unpaired_msa exceeds the {MAX_LOCAL_MSA_BYTES}-byte limit")
+    runtime.cache_volume.reload()
+    content = load_artifact_bytes(
+        runtime.cache_root,
+        reference.to_record(),
+        reference.relative_path.as_posix(),
+    )
+    if content is None:
+        raise RuntimeError("Canonical unpaired MSA reference failed validation")
+    try:
+        unpaired_msa = content.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("unpaired_msa must contain only ASCII A3M text") from exc
+    return _validate_template_msa(task.sequence, unpaired_msa)
+
+
 def _execute_template_search(
     sequence: str,
     unpaired_msa: str,
@@ -478,7 +521,7 @@ def run_template_search(
     if not isinstance(task.publish_canonical, bool):
         raise TypeError("publish_canonical must be a boolean")
     validate_query(resolve_database_profile("uniref90"), task.sequence)
-    unpaired_msa = _validate_template_msa(task.sequence, task.unpaired_msa)
+    unpaired_msa = _resolve_template_msa(runtime, task)
     runtime.source_volume.reload()
     context = build_template_context(
         runtime.cache_root,

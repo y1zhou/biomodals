@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence, Set
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,10 +11,12 @@ from uniaf3.schema.alphafold3 import AF3Config, AF3Template
 
 from biomodals.app.fold.alphafold3.msa_search import (
     ChainMsaState,
+    MsaArtifactReference,
     MsaAssemblyTask,
     Polymer,
     RawSearchTask,
     field_is_populated,
+    sequence_cache_relpath,
     sequence_hash,
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
@@ -27,7 +29,7 @@ class MsaAssemblyResolution:
     """Validated assembled MSA fields keyed by polymer and sequence."""
 
     fields_by_sequence: dict[SequenceKey, dict[str, str]]
-    canonical_sequences: frozenset[SequenceKey]
+    unpaired_references: dict[SequenceKey, MsaArtifactReference]
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +146,7 @@ def reduce_msa_assembly_results(
     if len(outcomes) != len(tasks):
         raise RuntimeError("MSA assembly returned the wrong result count")
     fields_by_sequence: dict[SequenceKey, dict[str, str]] = {}
-    canonical_sequences: set[SequenceKey] = set()
+    unpaired_references: dict[SequenceKey, MsaArtifactReference] = {}
     for task, outcome in zip(tasks, outcomes, strict=True):
         status = outcome.get("status")
         if (
@@ -179,11 +181,25 @@ def reduce_msa_assembly_results(
                 or re.fullmatch(r"[0-9a-f]{64}", combined_identity) is None
             ):
                 raise RuntimeError(f"Invalid MSA assembly result: {outcome!r}")
-            canonical_sequences.add(key)
+            sequence_root = sequence_cache_relpath(task.polymer, task.sequence)
+            try:
+                reference = MsaArtifactReference.from_record(
+                    outcome.get("unpaired_msa_reference"),
+                    expected_path=sequence_root / "unpaired.a3m",
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid unpaired MSA reference: {outcome!r}"
+                ) from exc
+            if not reference.matches_content(fields["unpairedMsa"].encode()):
+                raise RuntimeError(
+                    "Unpaired MSA reference does not match the returned field"
+                )
+            unpaired_references[key] = reference
         fields_by_sequence[key] = fields
     return MsaAssemblyResolution(
         fields_by_sequence=fields_by_sequence,
-        canonical_sequences=frozenset(canonical_sequences),
+        unpaired_references=unpaired_references,
     )
 
 
@@ -237,7 +253,7 @@ def _resolved_msa_text(
 def plan_template_searches(
     config: AF3Config,
     states: Sequence[ChainMsaState],
-    canonical_sequences: Set[SequenceKey],
+    resolution: MsaAssemblyResolution,
 ) -> TemplateSearchPlan:
     """Deduplicate missing templates without publishing caller MSA evidence."""
     tasks: dict[str, TemplateTask] = {}
@@ -250,34 +266,32 @@ def plan_template_searches(
             raise RuntimeError("Protein MSA state no longer matches its chain")
         if protein.templates:
             continue
-        unpaired_msa = _resolved_msa_text(
-            protein.unpairedMsa,
-            protein.unpairedMsaPath,
-            field_name=f"sequences[{state.chain_index}].protein.unpairedMsa",
-        )
-        publish_canonical = (
-            not state.unpaired_present
-            and ("protein", state.sequence) in canonical_sequences
+        reference = resolution.unpaired_references.get(("protein", state.sequence))
+        publish_canonical = not state.unpaired_present and reference is not None
+        unpaired_msa = (
+            None
+            if publish_canonical
+            else _resolved_msa_text(
+                protein.unpairedMsa,
+                protein.unpairedMsaPath,
+                field_name=f"sequences[{state.chain_index}].protein.unpairedMsa",
+            )
         )
         candidate = TemplateTask(
             sequence=state.sequence,
             unpaired_msa=unpaired_msa,
+            unpaired_msa_reference=reference if publish_canonical else None,
             publish_canonical=publish_canonical,
         )
         identity = candidate.template_identity
         if existing := tasks.get(identity):
             if (
                 existing.sequence != candidate.sequence
-                or existing.unpaired_msa != candidate.unpaired_msa
+                or existing.unpaired_msa_sha256 != candidate.unpaired_msa_sha256
             ):
                 raise RuntimeError("Protein template identity collision")
             if publish_canonical and not existing.publish_canonical:
-                tasks[identity] = TemplateTask(
-                    sequence=existing.sequence,
-                    unpaired_msa=existing.unpaired_msa,
-                    publish_canonical=True,
-                    max_template_date=existing.max_template_date,
-                )
+                tasks[identity] = candidate
         else:
             tasks[identity] = candidate
         chain_indices.setdefault(identity, []).append(state.chain_index)

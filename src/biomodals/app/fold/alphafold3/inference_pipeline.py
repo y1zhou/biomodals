@@ -77,8 +77,6 @@ class InferenceExecutor(Protocol):
         prepared: PreparedInferenceRun,
         *,
         sample_count: int,
-        reused_seeds: tuple[int, ...],
-        published_seeds: tuple[int, ...],
     ) -> dict[str, object]:
         """Publish the immutable request view over completed seeds."""
         ...
@@ -247,7 +245,5 @@ def coordinate_seed_predictions(
     result["request"] = executor.finalize_request(
         prepared,
         sample_count=sample,
-        reused_seeds=tuple(sorted(reused)),
-        published_seeds=tuple(sorted(published)),
     )
     return result

@@ -374,8 +374,6 @@ class ModalInferenceExecutor(InferenceExecutor):
         prepared: PreparedInferenceRun,
         *,
         sample_count: int,
-        reused_seeds: tuple[int, ...],
-        published_seeds: tuple[int, ...],
     ) -> dict[str, object]:
         return self.request_function.remote(
             prepared.run_id,
@@ -384,6 +382,4 @@ class ModalInferenceExecutor(InferenceExecutor):
             list(prepared.normalized_seeds),
             sample_count,
             prepared.display_name,
-            list(reused_seeds),
-            list(published_seeds),
         )

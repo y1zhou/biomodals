@@ -652,8 +652,6 @@ def finalize_inference_request(
     normalized_seeds: list[int],
     sample_count: int,
     display_name: str,
-    reused_seeds: list[int],
-    published_seeds: list[int],
 ) -> dict[str, object]:
     """Publish one manifest-last view over the request's completed seeds."""
     return publish_request_results(
@@ -665,8 +663,6 @@ def finalize_inference_request(
             normalized_seeds=tuple(normalized_seeds),
             sample_count=sample_count,
             display_name=display_name,
-            reused_seeds=tuple(reused_seeds),
-            published_seeds=tuple(published_seeds),
         ),
     )
 

@@ -32,6 +32,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 from biomodals.app.fold.alphafold3.inference_inputs import (
     hash_sequences,
     prepare_inference_run,
+    sanitize_af3_name,
     serialize_af3_input,
 )
 from biomodals.app.fold.alphafold3.inference_pipeline import (
@@ -89,6 +90,7 @@ from biomodals.app.fold.alphafold3.profiles import (
 from biomodals.app.fold.alphafold3.request_results import (
     REQUEST_MANIFEST_SCHEMA_VERSION,
     create_request_archive,
+    request_view_id,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
     resolve_msa_and_templates,
@@ -114,6 +116,47 @@ def _artifact(path: str, content: bytes = b"x") -> dict[str, object]:
         "path": path,
         "size_bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _request_manifest(
+    *,
+    run_id: str,
+    submitted_seeds: list[int],
+    display_name: str,
+    artifacts: list[dict[str, object]],
+    sample_count: int = 1,
+) -> dict[str, object]:
+    normalized_seeds = sorted(set(submitted_seeds))
+    request_id = hash_sequences(run_id, normalized_seeds)
+    view_id = request_view_id(request_id, tuple(submitted_seeds), display_name)
+    canonical_name = canonical_output_name(run_id)
+    presentation_name = sanitize_af3_name(display_name)
+    return {
+        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
+        "status": "complete",
+        "run_id": run_id,
+        "request_id": request_id,
+        "view_id": view_id,
+        "canonical_name": canonical_name,
+        "sample_count": sample_count,
+        "submitted_display_name": display_name,
+        "presentation_name": presentation_name,
+        "name_mapping": {
+            "canonical": canonical_name,
+            "presentation": presentation_name,
+        },
+        "submitted_seeds": submitted_seeds,
+        "normalized_seeds": normalized_seeds,
+        "duplicates_removed": [
+            seed
+            for index, seed in enumerate(submitted_seeds)
+            if seed in submitted_seeds[:index]
+        ],
+        "artifacts": artifacts,
+        "manifest_volume_path": (
+            f"{run_id[:2]}/{run_id}/requests/{request_id}/views/{view_id}/manifest.json"
+        ),
     }
 
 
@@ -927,13 +970,9 @@ def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
             prepared,
             *,
             sample_count: int,
-            reused_seeds: tuple[int, ...],
-            published_seeds: tuple[int, ...],
         ) -> dict[str, object]:
             del prepared, sample_count
             self.calls.append("request")
-            assert reused_seeds == (1,)
-            assert published_seeds == (2,)
             return {"status": "complete"}
 
     prepared = prepare_inference_run(
@@ -983,6 +1022,15 @@ def test_inference_pipeline_coordinates_seed_reuse_and_publication() -> None:
     ]
 
 
+def test_request_view_identity_preserves_invocation_presentation() -> None:
+    request_id = hash_sequences("a" * 64, [1, 2])
+    view_id = request_view_id(request_id, (2, 1, 1), "Readable Name")
+
+    assert request_view_id(request_id, (2, 1, 1), "Readable Name") == view_id
+    assert request_view_id(request_id, (1, 2), "Readable Name") != view_id
+    assert request_view_id(request_id, (2, 1, 1), "Another Name") != view_id
+
+
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     run_id = "d" * 64
     normalized_seeds = [7]
@@ -1006,14 +1054,11 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         )
     )
     volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
-    manifest: dict[str, object] = {
-        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
-        "status": "complete",
-        "run_id": run_id,
-        "request_id": request_id,
-        "canonical_name": canonical_name,
-        "normalized_seeds": normalized_seeds,
-        "artifacts": [
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=normalized_seeds,
+        display_name="Readable Name",
+        artifacts=[
             {
                 "role": "input",
                 "volume_path": volume_path,
@@ -1022,7 +1067,8 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
                 "sha256": hashlib.sha256(input_bytes).hexdigest(),
             }
         ],
-    }
+    )
+    view_id = cast(str, manifest["view_id"])
 
     archive = create_request_archive(
         FakeVolumeReader({volume_path: input_bytes}),
@@ -1031,7 +1077,7 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         display_name="Readable Name",
     )
 
-    assert archive.name == f"Readable_Name_{request_id[:12]}_AlphaFold3.tar.zst"
+    assert archive.name == f"Readable_Name_{view_id[:12]}_AlphaFold3.tar.zst"
     archived_input = "\n".join(
         run_command(
             [
@@ -1129,14 +1175,11 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
     request_id = hash_sequences(run_id, normalized_seeds)
     canonical_name = canonical_output_name(run_id)
     volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
-    manifest: dict[str, object] = {
-        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
-        "status": "complete",
-        "run_id": run_id,
-        "request_id": request_id,
-        "canonical_name": canonical_name,
-        "normalized_seeds": normalized_seeds,
-        "artifacts": [
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=normalized_seeds,
+        display_name="partial",
+        artifacts=[
             {
                 "role": "input",
                 "volume_path": volume_path,
@@ -1145,7 +1188,7 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
                 "sha256": hashlib.sha256(b"expected!!").hexdigest(),
             }
         ],
-    }
+    )
 
     with pytest.raises(RuntimeError, match="Downloaded size mismatch"):
         create_request_archive(
@@ -1163,14 +1206,11 @@ def test_request_archive_rejects_same_size_changed_bytes(tmp_path: Path) -> None
     canonical_name = canonical_output_name(run_id)
     volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
     expected = b'{"ok":true}'
-    manifest: dict[str, object] = {
-        "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
-        "status": "complete",
-        "run_id": run_id,
-        "request_id": request_id,
-        "canonical_name": canonical_name,
-        "normalized_seeds": normalized_seeds,
-        "artifacts": [
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=normalized_seeds,
+        display_name="changed",
+        artifacts=[
             {
                 "role": "input",
                 "volume_path": volume_path,
@@ -1179,7 +1219,7 @@ def test_request_archive_rejects_same_size_changed_bytes(tmp_path: Path) -> None
                 "sha256": hashlib.sha256(expected).hexdigest(),
             }
         ],
-    }
+    )
 
     with pytest.raises(RuntimeError, match="Downloaded SHA-256 mismatch"):
         create_request_archive(

@@ -42,14 +42,14 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     copy_best_outputs,
     inference_run_root,
     load_seed_marker,
-    load_summary_entry,
     ranked_rows,
     validate_run_id,
     write_ranking_table,
 )
 from biomodals.helper.shell import run_command
 
-REQUEST_MANIFEST_SCHEMA_VERSION = 2
+REQUEST_MANIFEST_SCHEMA_VERSION = 3
+REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v1"
 
 _CUSTOM_TEMPLATE_PATTERN = re.compile(r"(?P<digest>[0-9a-f]{64})\.cif")
 _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
@@ -57,7 +57,7 @@ _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class RequestPublication:
-    """One successful request's immutable seed selection and observed outcome."""
+    """One stable request view over an immutable seed selection."""
 
     run_id: str
     request_id: str
@@ -65,8 +65,6 @@ class RequestPublication:
     normalized_seeds: tuple[int, ...]
     sample_count: int
     display_name: str
-    reused_seeds: tuple[int, ...]
-    published_seeds: tuple[int, ...]
 
 
 def request_manifest_from_result(value: object) -> dict[str, object]:
@@ -126,23 +124,32 @@ def _validate_publication(spec: RequestPublication) -> RequestPublication:
     ):
         raise ValueError("sample_count must be a positive integer")
     sanitize_af3_name(spec.display_name)
-    reused = _validate_seed_tuple(
-        spec.reused_seeds,
-        field_name="reused_seeds",
-        allow_empty=True,
-    )
-    published = _validate_seed_tuple(
-        spec.published_seeds,
-        field_name="published_seeds",
-        allow_empty=True,
-    )
-    if len(set(reused)) != len(reused) or len(set(published)) != len(published):
-        raise ValueError("Request outcome seed sets must be unique")
-    if set(reused).intersection(published):
-        raise ValueError("A seed cannot be both reused and newly published")
-    if set(reused).union(published) != set(normalized):
-        raise ValueError("Request outcome does not cover every normalized seed")
     return spec
+
+
+def request_view_id(
+    request_id: str,
+    submitted_seeds: tuple[int, ...],
+    display_name: str,
+) -> str:
+    """Identify one stable presentation of a normalized seed request."""
+    if (
+        not isinstance(request_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", request_id) is None
+    ):
+        raise ValueError("request_id must be a lowercase SHA-256 digest")
+    submitted = _validate_seed_tuple(
+        submitted_seeds,
+        field_name="submitted_seeds",
+        allow_empty=False,
+    )
+    sanitize_af3_name(display_name)
+    return hash_sequences(
+        REQUEST_VIEW_IDENTITY_SCHEMA,
+        request_id,
+        list(submitted),
+        display_name,
+    )
 
 
 def _duplicates_removed(submitted: tuple[int, ...]) -> list[int]:
@@ -209,6 +216,14 @@ def _artifact_record(
 
 def _request_input_path(run_root: Path, request_id: str) -> Path:
     return run_root / "requests" / request_id / "input.json"
+
+
+def _request_view_root(
+    run_root: Path,
+    request_id: str,
+    view_id: str,
+) -> Path:
+    return run_root / "requests" / request_id / "views" / view_id
 
 
 def _custom_template_sources(
@@ -362,6 +377,41 @@ def _record_publication_failure(
         )
 
 
+def _reusable_request_manifest(
+    *,
+    path: Path,
+    spec: RequestPublication,
+    view_id: str,
+) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    try:
+        manifest = orjson.loads(path.read_bytes())
+    except (OSError, orjson.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Existing request view manifest is unreadable: {path}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"Existing request view manifest is invalid: {path}")
+    _validated_manifest_artifacts(manifest)
+    expected = {
+        "run_id": spec.run_id,
+        "request_id": spec.request_id,
+        "view_id": view_id,
+        "sample_count": spec.sample_count,
+        "submitted_display_name": spec.display_name,
+        "presentation_name": sanitize_af3_name(spec.display_name),
+        "submitted_seeds": list(spec.submitted_seeds),
+        "normalized_seeds": list(spec.normalized_seeds),
+        "duplicates_removed": _duplicates_removed(spec.submitted_seeds),
+    }
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        raise RuntimeError(
+            f"Existing request view manifest does not match its stable identity: {path}"
+        )
+    return cast(dict[str, object], manifest)
+
+
 def publish_request_results(
     runtime: InferenceRuntime,
     publication: RequestPublication,
@@ -370,9 +420,21 @@ def publish_request_results(
     spec = _validate_publication(publication)
     runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, spec.run_id)
-    request_root = run_root / "requests" / spec.request_id
+    view_id = request_view_id(
+        spec.request_id,
+        spec.submitted_seeds,
+        spec.display_name,
+    )
+    request_root = _request_view_root(run_root, spec.request_id, view_id)
     input_path = _request_input_path(run_root, spec.request_id)
     require_regular_file(input_path)
+    manifest_path = request_root / "manifest.json"
+    if manifest := _reusable_request_manifest(
+        path=manifest_path,
+        spec=spec,
+        view_id=view_id,
+    ):
+        return manifest
 
     markers = []
     for seed in spec.normalized_seeds:
@@ -390,14 +452,6 @@ def publish_request_results(
         raise RuntimeError("Requested seed markers contain no rankings")
     best = rows[0]
 
-    summary = load_summary_entry(run_root, spec.run_id)
-    if summary is None:
-        raise RuntimeError("The accumulated inference summary is not complete")
-    if not set(spec.normalized_seeds).issubset(summary.included_seeds):
-        raise RuntimeError("The accumulated summary does not cover this request")
-    summary_marker_path = run_root / ".markers" / "summary.json"
-    require_regular_file(summary_marker_path)
-
     canonical_name = canonical_output_name(spec.run_id)
     outputs_root = run_root / "outputs"
     generation_id = uuid.uuid4().hex
@@ -408,15 +462,8 @@ def publish_request_results(
         f"{canonical_name}_ranking_scores.csv",
         *(f"{canonical_name}_{suffix}" for suffix in CORE_OUTPUT_SUFFIXES),
         "TERMS_OF_USE.md",
-        f"global-summary-{summary.marker_sha256[:16]}.json",
     )
     try:
-        observed_summary = (
-            staging_root / f"global-summary-{summary.marker_sha256[:16]}.json"
-        )
-        shutil.copy2(summary_marker_path, observed_summary)
-        if sha256_file(observed_summary) != summary.marker_sha256:
-            raise RuntimeError("The observed summary marker changed during publication")
         write_ranking_table(
             staging_root / f"{canonical_name}_ranking_scores.csv",
             rows,
@@ -485,18 +532,6 @@ def publish_request_results(
             role="terms",
         )
     )
-    observed_summary_path = (
-        request_root / f"global-summary-{summary.marker_sha256[:16]}.json"
-    )
-    artifacts.append(
-        _artifact_record(
-            source=observed_summary_path,
-            output_root=runtime.output_root,
-            volume_path=observed_summary_path,
-            archive_path="global_summary.json",
-            role="observed_global_summary",
-        )
-    )
     artifacts.extend(
         _seed_artifacts(
             run_root=run_root,
@@ -536,10 +571,11 @@ def publish_request_results(
     manifest: dict[str, object] = {
         "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
         "status": "complete",
-        "published_at": utc_now(),
         "run_id": spec.run_id,
         "request_id": spec.request_id,
+        "view_id": view_id,
         "canonical_name": canonical_name,
+        "sample_count": spec.sample_count,
         "submitted_display_name": spec.display_name,
         "presentation_name": sanitize_af3_name(spec.display_name),
         "name_mapping": {
@@ -549,29 +585,22 @@ def publish_request_results(
         "submitted_seeds": list(spec.submitted_seeds),
         "normalized_seeds": list(spec.normalized_seeds),
         "duplicates_removed": _duplicates_removed(spec.submitted_seeds),
-        "reused_seeds": list(spec.reused_seeds),
-        "published_seeds": list(spec.published_seeds),
         "ranking": [row.to_dict() for row in rows],
         "best": best.to_dict(),
-        "global_summary": {
-            "marker_sha256": summary.marker_sha256,
-            "included_seeds": list(summary.included_seeds),
-            "best": summary.best.to_dict(),
-        },
         "artifacts": artifacts,
         "manifest_volume_path": _volume_relative_path(
             runtime.output_root,
             request_root / "manifest.json",
         ).as_posix(),
     }
-    write_json_atomic(request_root / "manifest.json", manifest)
+    write_json_atomic(manifest_path, manifest)
     runtime.volume.commit()
     return manifest
 
 
 def _validated_manifest_artifacts(
     manifest: dict[str, object],
-) -> tuple[str, str, list[dict[str, object]]]:
+) -> tuple[str, str, str, list[dict[str, object]]]:
     if (
         manifest.get("schema_version") != REQUEST_MANIFEST_SCHEMA_VERSION
         or manifest.get("status") != "complete"
@@ -579,10 +608,13 @@ def _validated_manifest_artifacts(
         raise ValueError("Request manifest is not a supported complete publication")
     run_id = manifest.get("run_id")
     request_id = manifest.get("request_id")
+    view_id = manifest.get("view_id")
     canonical_name = manifest.get("canonical_name")
     if (
         not isinstance(run_id, str)
         or not isinstance(request_id, str)
+        or not isinstance(view_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", view_id) is None
         or not isinstance(canonical_name, str)
         or canonical_name != canonical_output_name(run_id)
     ):
@@ -595,11 +627,59 @@ def _validated_manifest_artifacts(
             isinstance(seed, bool) or not isinstance(seed, int)
             for seed in raw_normalized_seeds
         )
-        or raw_normalized_seeds != sorted(set(raw_normalized_seeds))
-        or request_id != hash_sequences(run_id, raw_normalized_seeds)
     ):
         raise ValueError("Request manifest seed identity is invalid")
+    normalized_seeds = cast(list[int], raw_normalized_seeds)
+    if normalized_seeds != sorted(
+        set(normalized_seeds)
+    ) or request_id != hash_sequences(run_id, normalized_seeds):
+        raise ValueError("Request manifest seed identity is invalid")
+    raw_submitted_seeds = manifest.get("submitted_seeds")
+    display_name = manifest.get("submitted_display_name")
+    sample_count = manifest.get("sample_count")
+    presentation_name = manifest.get("presentation_name")
+    duplicates_removed = manifest.get("duplicates_removed")
     expected_run_root = PurePosixPath(run_id[:2]) / run_id
+    expected_manifest_path = (
+        expected_run_root
+        / "requests"
+        / request_id
+        / "views"
+        / view_id
+        / "manifest.json"
+    ).as_posix()
+    if (
+        not isinstance(raw_submitted_seeds, list)
+        or not raw_submitted_seeds
+        or any(
+            isinstance(seed, bool) or not isinstance(seed, int)
+            for seed in raw_submitted_seeds
+        )
+        or not isinstance(display_name, str)
+    ):
+        raise ValueError("Request manifest view identity is invalid")
+    submitted_seeds = cast(list[int], raw_submitted_seeds)
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 1
+        or presentation_name != sanitize_af3_name(display_name)
+        or tuple(sorted(set(submitted_seeds))) != tuple(normalized_seeds)
+        or duplicates_removed != _duplicates_removed(tuple(submitted_seeds))
+        or view_id
+        != request_view_id(
+            request_id,
+            tuple(submitted_seeds),
+            display_name,
+        )
+        or manifest.get("manifest_volume_path") != expected_manifest_path
+    ):
+        raise ValueError("Request manifest view identity is invalid")
+    if manifest.get("name_mapping") != {
+        "canonical": canonical_name,
+        "presentation": presentation_name,
+    }:
+        raise ValueError("Request manifest name mapping is invalid")
     raw_artifacts = manifest.get("artifacts")
     if not isinstance(raw_artifacts, list) or not raw_artifacts:
         raise ValueError("Request manifest contains no artifacts")
@@ -633,7 +713,7 @@ def _validated_manifest_artifacts(
             raise ValueError(f"Duplicate request archive path: {safe_archive_path}")
         archive_paths.add(safe_archive_path)
         artifacts.append(cast(dict[str, object], raw_artifact))
-    return request_id, canonical_name, artifacts
+    return request_id, view_id, canonical_name, artifacts
 
 
 def _presentation_archive_path(
@@ -979,7 +1059,9 @@ def create_request_archive(
     display_name: str,
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
-    request_id, canonical_name, artifacts = _validated_manifest_artifacts(manifest)
+    _, view_id, canonical_name, artifacts = _validated_manifest_artifacts(manifest)
+    if manifest["submitted_display_name"] != display_name:
+        raise ValueError("Archive display_name does not match the request view")
     presentation_name = sanitize_af3_name(display_name)
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]] = []
     transformed_paths: set[PurePosixPath] = set()
@@ -1008,7 +1090,7 @@ def create_request_archive(
     local_output_dir = Path(output_dir).expanduser().resolve()
     local_output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = (
-        local_output_dir / f"{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst"
+        local_output_dir / f"{presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst"
     )
     if archive_path.exists():
         _bind_expected_archive_artifacts(

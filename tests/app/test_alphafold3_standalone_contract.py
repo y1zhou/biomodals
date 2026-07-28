@@ -299,8 +299,6 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
     assert executor.finalize_request(
         prepared,
         sample_count=2,
-        reused_seeds=(2,),
-        published_seeds=(1,),
     ) == {"status": "complete"}
     claim_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
     inspect_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
@@ -316,8 +314,6 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
         [1, 2],
         2,
         "composition",
-        [2],
-        [1],
     )
 
 

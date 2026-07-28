@@ -422,7 +422,10 @@ resolution. It always publishes `templates.json`, including a valid empty list,
 then writes `templates.done.json` last.
 
 Only the latest validated template publication is retained at the flat path. A
-marker mismatch reruns template search without invalidating raw MSAs.
+marker mismatch or oversized existing result reruns template search without
+invalidating raw MSAs. Newly generated template JSON must satisfy the supported
+size envelope before either the flat artifact or its completion marker is
+published.
 
 Template identity binds the resolved unpaired-A3M digest, maximum template date,
 pinned tool behavior, and result-affecting parameters.

@@ -29,6 +29,7 @@ from biomodals.app.fold.alphafold3.artifacts import (
     require_regular_file,
     sha256_bytes,
     utc_now,
+    write_bytes_atomic,
     write_json_atomic,
 )
 from biomodals.app.fold.alphafold3.generation_claims import (
@@ -316,10 +317,7 @@ def load_template_entry(context: TemplateContext) -> TemplateEntry | None:
             and isinstance(size_bytes, int)
             and size_bytes > MAX_TEMPLATE_INSPECTION_BYTES
         ):
-            raise ValueError(
-                "template cache result exceeds the "
-                f"{MAX_TEMPLATE_INSPECTION_BYTES}-byte limit"
-            )
+            return None
     templates_bytes = load_artifact_bytes(
         context.sequence_root,
         artifact,
@@ -378,6 +376,16 @@ def inspect_template_entries(
             )
         statuses.append(status)
     return statuses
+
+
+def _serialize_template_result(templates: list[dict[str, object]]) -> bytes:
+    content = json_bytes(templates)
+    if len(content) > MAX_TEMPLATE_INSPECTION_BYTES:
+        raise ValueError(
+            "template search result exceeds the "
+            f"{MAX_TEMPLATE_INSPECTION_BYTES}-byte limit"
+        )
+    return content
 
 
 def assert_pinned_template_contract() -> dict[str, str]:
@@ -585,6 +593,7 @@ def run_template_search(
             runtime.source_root,
             task.max_template_date,
         )
+        _serialize_template_result(templates)
         return {
             "status": "request-local",
             "sequence_sha256": context.sequence_hash,
@@ -637,7 +646,7 @@ def run_template_search(
             f"Completed template search with {len(templates)} hits",
         )
         templates_path = generation_root / "templates.json"
-        write_json_atomic(templates_path, templates)
+        write_bytes_atomic(templates_path, _serialize_template_result(templates))
         artifact = artifact_record(templates_path, generation_root)
         runtime.cache_volume.commit()
         assert_generation_current(runtime.claims, claim)

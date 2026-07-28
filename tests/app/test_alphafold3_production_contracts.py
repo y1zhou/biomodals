@@ -1430,8 +1430,80 @@ def test_template_cache_bounds_declared_payload_before_reading(
         lambda *args, **kwargs: pytest.fail("oversized template payload was read"),
     )
 
-    with pytest.raises(ValueError, match="template cache result exceeds"):
-        load_template_entry(context)
+    assert load_template_entry(context) is None
+
+
+def test_template_search_rejects_oversized_result_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    templates = [{"mmcif": "12345"}]
+    monkeypatch.setattr(
+        template_search,
+        "MAX_TEMPLATE_INSPECTION_BYTES",
+        len(json_bytes(templates)) - 1,
+    )
+    monkeypatch.setattr(
+        template_search,
+        "_resolve_template_msa",
+        lambda runtime, task: ">query\nACDE\n",
+    )
+    monkeypatch.setattr(
+        template_search,
+        "_execute_template_search",
+        lambda *args: (templates, {"contract": "pinned"}),
+    )
+    monkeypatch.setattr(
+        template_search,
+        "_wait_for_template_claim",
+        lambda runtime, context: (
+            None,
+            SimpleNamespace(generation_id="generation"),
+        ),
+    )
+    monkeypatch.setattr(
+        template_search, "assert_generation_current", lambda *args: None
+    )
+    monkeypatch.setattr(
+        template_search, "finish_generation_claim", lambda *args, **kwargs: None
+    )
+    runtime = TemplateRuntime(
+        source_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        cache_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+        source_root=tmp_path / "source",
+        cache_root=tmp_path,
+    )
+    reference = MsaArtifactReference.from_content(
+        msa_search.sequence_cache_relpath("protein", "ACDE") / "unpaired.a3m",
+        b">query\nACDE\n",
+    )
+    task = TemplateTask(
+        sequence="ACDE",
+        unpaired_msa=None,
+        unpaired_msa_reference=reference,
+        publish_canonical=True,
+    )
+
+    with pytest.raises(ValueError, match="template search result exceeds"):
+        template_search.run_template_search(runtime, task)
+
+    context = build_template_context(
+        tmp_path,
+        task.sequence,
+        task.unpaired_msa_sha256,
+        task.max_template_date,
+    )
+    assert not (context.sequence_root / "templates.done.json").exists()
 
 
 def test_template_cache_inspection_bounds_aggregate_response(

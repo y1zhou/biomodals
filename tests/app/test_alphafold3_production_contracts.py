@@ -2974,6 +2974,62 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     assert volume.commit_count == 1
 
 
+def test_request_publication_bounds_input_before_artifact_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "d" * 64
+    seed = 7
+    request_id = hash_sequences(run_id, [seed])
+    run_root = tmp_path / run_id[:2] / run_id
+    input_path = run_root / "requests" / request_id / "input.json"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"{}")
+    marker_path = run_root / ".markers" / "seeds" / f"{seed}.json"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(
+        orjson.dumps({
+            "schema_version": SEED_MARKER_SCHEMA_VERSION,
+            "status": "complete",
+            "run_id": run_id,
+            "seed": seed,
+            "sample_count": 1,
+            "generation_id": "generation",
+            "rankings": [{"seed": seed, "sample_index": 0, "ranking_score": 0.9}],
+        })
+    )
+    monkeypatch.setattr(request_results, "MAX_STAGED_INPUT_BYTES", 1)
+    monkeypatch.setattr(
+        request_results,
+        "_artifact_record",
+        lambda **kwargs: pytest.fail("oversized staged input reached artifact hashing"),
+    )
+
+    with pytest.raises(ValueError, match="Staged AlphaFold input exceeds"):
+        publish_request_results(
+            InferenceRuntime(
+                output_root=tmp_path,
+                volume=cast(
+                    Any,
+                    SimpleNamespace(reload=lambda: None, commit=lambda: None),
+                ),
+                claims=FakeClaimStore(),
+                container_id="test",
+                maximum_age_seconds=100,
+                summary_maximum_age_seconds=100,
+                wait_timeout_seconds=100,
+            ),
+            RequestPublication(
+                run_id=run_id,
+                request_id=request_id,
+                submitted_seeds=(seed,),
+                normalized_seeds=(seed,),
+                sample_count=1,
+                display_name="Readable Name",
+            ),
+        )
+
+
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     run_id = "d" * 64
     normalized_seeds = [7]
@@ -3162,6 +3218,43 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
             manifest,
             output_dir=tmp_path,
             display_name="partial",
+        )
+
+
+def test_request_archive_rejects_oversized_input_before_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "e" * 64
+    normalized_seeds = [9]
+    request_id = hash_sequences(run_id, normalized_seeds)
+    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=normalized_seeds,
+        display_name="oversized",
+        artifacts=[
+            {
+                "role": "input",
+                "volume_path": volume_path,
+                "archive_path": f"{canonical_output_name(run_id)}_data.json",
+                "size_bytes": 5,
+                "sha256": hashlib.sha256(b"12345").hexdigest(),
+            }
+        ],
+    )
+    monkeypatch.setattr(request_results, "MAX_STAGED_INPUT_BYTES", 4)
+
+    class NoReadVolume:
+        def read_file(self, path: str):
+            pytest.fail(f"oversized input reached Volume download: {path}")
+
+    with pytest.raises(ValueError, match="Request input artifact exceeds"):
+        create_request_archive(
+            cast(Any, NoReadVolume()),
+            manifest,
+            output_dir=tmp_path,
+            display_name="oversized",
         )
 
 

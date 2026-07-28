@@ -64,6 +64,40 @@ def read_volume_bytes(
     return bytes(content)
 
 
+def read_bounded_file_bytes(
+    path: Path,
+    *,
+    field_name: str,
+    max_bytes: int,
+) -> bytes:
+    """Read one stable regular file without exceeding its byte limit."""
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"Expected regular file: {path}")
+    stat_before = path.stat()
+    if stat_before.st_size > max_bytes:
+        raise ValueError(f"{field_name} exceeds the {max_bytes}-byte limit")
+    with path.open("rb") as handle:
+        value = handle.read(max_bytes + 1)
+    if len(value) > max_bytes:
+        raise ValueError(f"{field_name} exceeds the {max_bytes}-byte limit")
+    stat_after = path.stat()
+    before_identity = (
+        stat_before.st_dev,
+        stat_before.st_ino,
+        stat_before.st_size,
+        stat_before.st_mtime_ns,
+    )
+    after_identity = (
+        stat_after.st_dev,
+        stat_after.st_ino,
+        stat_after.st_size,
+        stat_after.st_mtime_ns,
+    )
+    if before_identity != after_identity or len(value) != stat_after.st_size:
+        raise RuntimeError(f"{field_name} changed while it was being read: {path}")
+    return value
+
+
 def json_bytes(value: object) -> bytes:
     """Serialize canonical, human-readable JSON bytes."""
     return orjson.dumps(value, option=_JSON_OPTIONS)

@@ -122,6 +122,7 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
     resolve_msa_and_templates,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
+    CORE_OUTPUT_SUFFIXES,
     SEED_MARKER_SCHEMA_VERSION,
     ClaimedSeed,
     InferenceRuntime,
@@ -202,6 +203,23 @@ def _request_manifest(
     view_id = request_view_id(request_id, tuple(submitted_seeds), display_name)
     canonical_name = canonical_output_name(run_id)
     presentation_name = sanitize_af3_name(display_name)
+    ranking = [
+        {
+            "seed": seed,
+            "sample_index": sample_index,
+            "ranking_score": float(len(normalized_seeds) - seed_index)
+            - sample_index / max(sample_count, 1),
+        }
+        for seed_index, seed in enumerate(normalized_seeds)
+        for sample_index in range(sample_count)
+    ]
+    ranking.sort(
+        key=lambda row: (
+            -cast(float, row["ranking_score"]),
+            cast(int, row["seed"]),
+            cast(int, row["sample_index"]),
+        )
+    )
     return {
         "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
         "status": "complete",
@@ -223,6 +241,8 @@ def _request_manifest(
             for index, seed in enumerate(submitted_seeds)
             if seed in submitted_seeds[:index]
         ],
+        "ranking": ranking,
+        "best": ranking[0],
         "artifacts": artifacts,
         "manifest_volume_path": (
             f"{run_id[:2]}/{run_id}/requests/{request_id}/views/{view_id}/manifest.json"
@@ -2659,6 +2679,109 @@ def test_request_view_identity_preserves_invocation_presentation() -> None:
     assert request_view_id(request_id, (2, 1, 1), "Another Name") != view_id
 
 
+def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> None:
+    """Request aliases should reference canonical outputs without Volume copies."""
+    run_id = "d" * 64
+    seed = 7
+    request_id = hash_sequences(run_id, [seed])
+    canonical_name = canonical_output_name(run_id)
+    run_root = tmp_path / run_id[:2] / run_id
+    input_path = run_root / "requests" / request_id / "input.json"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_bytes(
+        serialize_af3_input(
+            AF3Config(
+                name=canonical_name,
+                modelSeeds=[seed],
+                sequences=[
+                    AF3SequenceEntry(
+                        protein=AF3Protein(
+                            id="A",
+                            sequence="ACDE",
+                            unpairedMsa="",
+                            pairedMsa="",
+                            templates=[],
+                        )
+                    )
+                ],
+            )
+        )
+    )
+    outputs_root = run_root / "outputs"
+    sample_root = outputs_root / f"seed-{seed}_sample-0"
+    sample_root.mkdir(parents=True)
+    prefix = f"{canonical_name}_seed-{seed}_sample-0"
+    for suffix in CORE_OUTPUT_SUFFIXES:
+        (sample_root / f"{prefix}_{suffix}").write_text(
+            f"{suffix}\n",
+            encoding="utf-8",
+        )
+    (outputs_root / "TERMS_OF_USE.md").write_text("terms\n", encoding="utf-8")
+    marker_path = run_root / ".markers" / "seeds" / f"{seed}.json"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(
+        orjson.dumps({
+            "schema_version": SEED_MARKER_SCHEMA_VERSION,
+            "status": "complete",
+            "run_id": run_id,
+            "seed": seed,
+            "sample_count": 1,
+            "generation_id": "generation",
+            "rankings": [{"seed": seed, "sample_index": 0, "ranking_score": 0.9}],
+        })
+    )
+
+    class CountingVolume:
+        def __init__(self) -> None:
+            self.reload_count = 0
+            self.commit_count = 0
+
+        def reload(self) -> None:
+            self.reload_count += 1
+
+        def commit(self) -> None:
+            self.commit_count += 1
+
+    volume = CountingVolume()
+    manifest = publish_request_results(
+        InferenceRuntime(
+            output_root=tmp_path,
+            volume=cast(Any, volume),
+            claims=FakeClaimStore(),
+            container_id="test",
+            maximum_age_seconds=100,
+            summary_maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+        ),
+        RequestPublication(
+            run_id=run_id,
+            request_id=request_id,
+            submitted_seeds=(seed,),
+            normalized_seeds=(seed,),
+            sample_count=1,
+            display_name="Readable Name",
+        ),
+    )
+
+    view_id = cast(str, manifest["view_id"])
+    view_root = run_root / "requests" / request_id / "views" / view_id
+    assert [path.name for path in view_root.iterdir()] == ["manifest.json"]
+    artifacts = cast(list[dict[str, object]], manifest["artifacts"])
+    assert "request_ranking" not in {artifact["role"] for artifact in artifacts}
+    best_artifacts = [
+        artifact
+        for artifact in artifacts
+        if cast(str, artifact["role"]).startswith("request_best_")
+    ]
+    assert len(best_artifacts) == len(CORE_OUTPUT_SUFFIXES)
+    assert all(
+        f"/outputs/seed-{seed}_sample-0/" in f"/{artifact['volume_path']}"
+        for artifact in best_artifacts
+    )
+    assert volume.reload_count == 1
+    assert volume.commit_count == 1
+
+
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     run_id = "d" * 64
     normalized_seeds = [7]
@@ -2721,6 +2844,24 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         )
     )
     assert orjson.loads(archived_input)["name"] == "Readable Name"
+    ranking_csv = "\n".join(
+        run_command(
+            [
+                "tar",
+                "-I",
+                "zstd",
+                "-xOf",
+                str(archive),
+                "Readable_Name/Readable_Name_ranking_scores.csv",
+            ],
+            output_mode="capture",
+            show_command=False,
+        )
+    )
+    assert ranking_csv.splitlines() == [
+        "seed,sample,ranking_score",
+        "7,0,1.0",
+    ]
 
     assert (
         create_request_archive(

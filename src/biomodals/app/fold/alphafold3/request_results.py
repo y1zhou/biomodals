@@ -9,6 +9,7 @@ caller's presentation name in the local archive.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -22,13 +23,13 @@ from tempfile import TemporaryDirectory
 from typing import IO, cast
 
 import orjson
+import polars as pl
 
 from biomodals.app.fold.alphafold3.artifacts import (
     VolumeReader,
     json_bytes,
     require_regular_file,
     sha256_file,
-    utc_now,
     write_bytes_atomic,
     write_json_atomic,
 )
@@ -41,17 +42,16 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 from biomodals.app.fold.alphafold3.seed_predictions import (
     CORE_OUTPUT_SUFFIXES,
     InferenceRuntime,
+    RankingRow,
     canonical_output_name,
-    copy_best_outputs,
     inference_run_root,
     load_seed_marker,
     ranked_rows,
     validate_run_id,
-    write_ranking_table,
 )
 from biomodals.helper.shell import run_command
 
-REQUEST_MANIFEST_SCHEMA_VERSION = 3
+REQUEST_MANIFEST_SCHEMA_VERSION = 4
 REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v1"
 
 _CUSTOM_TEMPLATE_PATTERN = re.compile(r"(?P<digest>[0-9a-f]{64})\.cif")
@@ -332,47 +332,25 @@ def _seed_artifacts(
     return artifacts
 
 
-def _replace_staged_file(source: Path, destination: Path) -> None:
-    require_regular_file(source)
-    if destination.exists() and (destination.is_symlink() or not destination.is_file()):
-        raise ValueError(f"Invalid request-view destination: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(source, destination)
-
-
-def _record_publication_failure(
-    runtime: InferenceRuntime,
+def _best_artifacts(
     *,
-    request_root: Path,
-    run_id: str,
-    request_id: str,
-    generation_id: str,
-    error: Exception,
-) -> None:
-    """Commit compact request failure evidence before staging cleanup."""
-    failure_path = request_root / "failures" / f"{generation_id}.json"
-    message = str(error)
-    try:
-        write_json_atomic(
-            failure_path,
-            {
-                "schema_version": REQUEST_MANIFEST_SCHEMA_VERSION,
-                "status": "failed",
-                "failed_at": utc_now(),
-                "run_id": run_id,
-                "request_id": request_id,
-                "generation_id": generation_id,
-                "error_type": type(error).__name__,
-                "message": message[:4096],
-                "message_truncated": len(message) > 4096,
-            },
+    run_root: Path,
+    output_root: Path,
+    canonical_name: str,
+    best: RankingRow,
+) -> list[dict[str, object]]:
+    sample_root = run_root / "outputs" / f"seed-{best.seed}_sample-{best.sample_index}"
+    source_prefix = f"{canonical_name}_seed-{best.seed}_sample-{best.sample_index}"
+    return [
+        _artifact_record(
+            source=sample_root / f"{source_prefix}_{suffix}",
+            output_root=output_root,
+            volume_path=sample_root / f"{source_prefix}_{suffix}",
+            archive_path=f"{canonical_name}_{suffix}",
+            role=f"request_best_{suffix.removesuffix('.json').replace('.', '_')}",
         )
-        runtime.volume.commit()
-    except Exception as evidence_error:
-        error.add_note(
-            "Failed to persist request publication evidence: "
-            f"{type(evidence_error).__name__}: {evidence_error}"
-        )
+        for suffix in CORE_OUTPUT_SUFFIXES
+    ]
 
 
 def _reusable_request_manifest(
@@ -452,47 +430,6 @@ def publish_request_results(
 
     canonical_name = canonical_output_name(spec.run_id)
     outputs_root = run_root / "outputs"
-    generation_id = uuid.uuid4().hex
-    staging_root = request_root / ".workers" / generation_id
-    staging_root.mkdir(parents=True, exist_ok=False)
-
-    generated_names = (
-        f"{canonical_name}_ranking_scores.csv",
-        *(f"{canonical_name}_{suffix}" for suffix in CORE_OUTPUT_SUFFIXES),
-        "TERMS_OF_USE.md",
-    )
-    try:
-        write_ranking_table(
-            staging_root / f"{canonical_name}_ranking_scores.csv",
-            rows,
-        )
-        copy_best_outputs(
-            staging_root,
-            outputs_root,
-            canonical_name,
-            best,
-        )
-        require_regular_file(outputs_root / "TERMS_OF_USE.md")
-        shutil.copy2(
-            outputs_root / "TERMS_OF_USE.md",
-            staging_root / "TERMS_OF_USE.md",
-        )
-        for name in generated_names:
-            _replace_staged_file(staging_root / name, request_root / name)
-        runtime.volume.commit()
-    except Exception as exc:
-        _record_publication_failure(
-            runtime,
-            request_root=request_root,
-            run_id=spec.run_id,
-            request_id=spec.request_id,
-            generation_id=generation_id,
-            error=exc,
-        )
-        raise
-    finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
-
     artifacts = [
         _artifact_record(
             source=input_path,
@@ -501,26 +438,16 @@ def publish_request_results(
             archive_path=f"{canonical_name}_data.json",
             role="input",
         ),
-        _artifact_record(
-            source=request_root / f"{canonical_name}_ranking_scores.csv",
-            output_root=runtime.output_root,
-            volume_path=request_root / f"{canonical_name}_ranking_scores.csv",
-            archive_path=f"{canonical_name}_ranking_scores.csv",
-            role="request_ranking",
-        ),
     ]
-    for suffix in CORE_OUTPUT_SUFFIXES:
-        source = request_root / f"{canonical_name}_{suffix}"
-        artifacts.append(
-            _artifact_record(
-                source=source,
-                output_root=runtime.output_root,
-                volume_path=source,
-                archive_path=source.name,
-                role=f"request_best_{suffix.removesuffix('.json').replace('.', '_')}",
-            )
+    artifacts.extend(
+        _best_artifacts(
+            run_root=run_root,
+            output_root=runtime.output_root,
+            canonical_name=canonical_name,
+            best=best,
         )
-    terms_path = request_root / "TERMS_OF_USE.md"
+    )
+    terms_path = outputs_root / "TERMS_OF_USE.md"
     artifacts.append(
         _artifact_record(
             source=terms_path,
@@ -596,9 +523,69 @@ def publish_request_results(
     return manifest
 
 
+def _validated_manifest_ranking(
+    manifest: dict[str, object],
+    *,
+    normalized_seeds: tuple[int, ...],
+    sample_count: int,
+) -> tuple[RankingRow, ...]:
+    raw_ranking = manifest.get("ranking")
+    if not isinstance(raw_ranking, list):
+        raise ValueError("Request manifest ranking is invalid")
+    expected_pairs = {
+        (seed, sample_index)
+        for seed in normalized_seeds
+        for sample_index in range(sample_count)
+    }
+    rows: list[RankingRow] = []
+    observed_pairs: set[tuple[int, int]] = set()
+    for raw_row in raw_ranking:
+        if not isinstance(raw_row, dict):
+            raise ValueError("Request manifest ranking is invalid")
+        seed = raw_row.get("seed")
+        sample_index = raw_row.get("sample_index")
+        score = raw_row.get("ranking_score")
+        if (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or isinstance(sample_index, bool)
+            or not isinstance(sample_index, int)
+            or isinstance(score, bool)
+            or not isinstance(score, int | float)
+            or not math.isfinite(score)
+            or (seed, sample_index) not in expected_pairs
+            or (seed, sample_index) in observed_pairs
+        ):
+            raise ValueError("Request manifest ranking is invalid")
+        observed_pairs.add((seed, sample_index))
+        rows.append(
+            RankingRow(
+                seed=seed,
+                sample_index=sample_index,
+                ranking_score=float(score),
+            )
+        )
+    expected_order = sorted(
+        rows,
+        key=lambda row: (-row.ranking_score, row.seed, row.sample_index),
+    )
+    if observed_pairs != expected_pairs or rows != expected_order:
+        raise ValueError("Request manifest ranking is invalid")
+    ranking = tuple(rows)
+    if not ranking or manifest.get("best") != ranking[0].to_dict():
+        raise ValueError("Request manifest best prediction is invalid")
+    return ranking
+
+
 def _validated_manifest_artifacts(
     manifest: dict[str, object],
-) -> tuple[str, str, str, list[dict[str, object]]]:
+) -> tuple[
+    str,
+    str,
+    str,
+    list[dict[str, object]],
+    tuple[RankingRow, ...],
+]:
     if (
         manifest.get("schema_version") != REQUEST_MANIFEST_SCHEMA_VERSION
         or manifest.get("status") != "complete"
@@ -678,6 +665,11 @@ def _validated_manifest_artifacts(
         "presentation": presentation_name,
     }:
         raise ValueError("Request manifest name mapping is invalid")
+    ranking = _validated_manifest_ranking(
+        manifest,
+        normalized_seeds=tuple(normalized_seeds),
+        sample_count=sample_count,
+    )
     raw_artifacts = manifest.get("artifacts")
     if not isinstance(raw_artifacts, list) or not raw_artifacts:
         raise ValueError("Request manifest contains no artifacts")
@@ -711,7 +703,7 @@ def _validated_manifest_artifacts(
             raise ValueError(f"Duplicate request archive path: {safe_archive_path}")
         archive_paths.add(safe_archive_path)
         artifacts.append(cast(dict[str, object], raw_artifact))
-    return request_id, view_id, canonical_name, artifacts
+    return request_id, view_id, canonical_name, artifacts, ranking
 
 
 def _presentation_archive_path(
@@ -807,6 +799,15 @@ def _rewrite_downloaded_input(
     write_bytes_atomic(input_path, json_bytes(document))
 
 
+def _ranking_csv_bytes(rows: tuple[RankingRow, ...]) -> bytes:
+    value = pl.DataFrame({
+        "seed": [row.seed for row in rows],
+        "sample": [row.sample_index for row in rows],
+        "ranking_score": [row.ranking_score for row in rows],
+    }).write_csv()
+    return value.encode()
+
+
 def _local_request_manifest(
     manifest: dict[str, object],
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
@@ -814,6 +815,7 @@ def _local_request_manifest(
     display_name: str,
     canonical_name: str,
     presentation_name: str,
+    ranking_csv: bytes,
 ) -> dict[str, object]:
     """Build the presentation-local manifest embedded in the archive."""
     local_manifest = deepcopy(manifest)
@@ -831,6 +833,14 @@ def _local_request_manifest(
     ):
         local_artifact["archive_path"] = transformed.as_posix()
         local_artifact.pop("worker_path", None)
+    local_manifest["generated_artifacts"] = [
+        {
+            "role": "request_ranking",
+            "archive_path": f"{presentation_name}_ranking_scores.csv",
+            "archive_size_bytes": len(ranking_csv),
+            "archive_sha256": hashlib.sha256(ranking_csv).hexdigest(),
+        }
+    ]
     return local_manifest
 
 
@@ -909,11 +919,16 @@ def _bind_expected_archive_artifacts(
 def _expected_archive_members(
     presentation_name: str,
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
+    generated_artifacts: list[dict[str, object]],
 ) -> set[str]:
     """Return the exact files and parent directories generated by GNU tar."""
     relative_files = {
         PurePosixPath("request_manifest.json"),
         *(transformed for _, transformed in transformed_artifacts),
+        *(
+            _safe_archive_path(cast(str, artifact["archive_path"]))
+            for artifact in generated_artifacts
+        ),
     }
     members = {f"{presentation_name}/"}
     for relative in relative_files:
@@ -1031,9 +1046,10 @@ def _archive_matches_request(
     ):
         return False
     artifacts = inspection.manifest.get("artifacts")
-    if not isinstance(artifacts, list):
+    generated_artifacts = inspection.manifest.get("generated_artifacts")
+    if not isinstance(artifacts, list) or not isinstance(generated_artifacts, list):
         return False
-    for artifact in artifacts:
+    for artifact in [*artifacts, *generated_artifacts]:
         if not isinstance(artifact, dict):
             return False
         archive_path = artifact.get("archive_path")
@@ -1066,7 +1082,9 @@ def create_request_archive(
     display_name: str,
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
-    _, view_id, canonical_name, artifacts = _validated_manifest_artifacts(manifest)
+    _, view_id, canonical_name, artifacts, ranking = _validated_manifest_artifacts(
+        manifest
+    )
     if manifest["submitted_display_name"] != display_name:
         raise ValueError("Archive display_name does not match the request view")
     presentation_name = sanitize_af3_name(display_name)
@@ -1082,16 +1100,23 @@ def create_request_archive(
             raise ValueError(f"Presentation path collision: {transformed}")
         transformed_paths.add(transformed)
         transformed_artifacts.append((artifact, transformed))
+    ranking_csv = _ranking_csv_bytes(ranking)
     local_manifest = _local_request_manifest(
         manifest,
         transformed_artifacts,
         display_name=display_name,
         canonical_name=canonical_name,
         presentation_name=presentation_name,
+        ranking_csv=ranking_csv,
+    )
+    generated_artifacts = cast(
+        list[dict[str, object]],
+        local_manifest["generated_artifacts"],
     )
     expected_members = _expected_archive_members(
         presentation_name,
         transformed_artifacts,
+        generated_artifacts,
     )
 
     local_output_dir = Path(output_dir).expanduser().resolve()
@@ -1126,10 +1151,25 @@ def create_request_archive(
             work_root = Path(directory)
             archive_root = work_root / presentation_name
             archive_root.mkdir()
+            write_bytes_atomic(
+                archive_root / f"{presentation_name}_ranking_scores.csv",
+                ranking_csv,
+            )
             input_paths: list[Path] = []
+            downloaded: dict[tuple[str, int, str], Path] = {}
             for artifact, transformed in transformed_artifacts:
                 destination = archive_root / Path(transformed.as_posix())
-                _download_artifact(reader, artifact, destination)
+                source_identity = (
+                    cast(str, artifact["volume_path"]),
+                    cast(int, artifact["size_bytes"]),
+                    cast(str, artifact["sha256"]),
+                )
+                if source := downloaded.get(source_identity):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                else:
+                    _download_artifact(reader, artifact, destination)
+                    downloaded[source_identity] = destination
                 if artifact["role"] == "input":
                     input_paths.append(destination)
             if len(input_paths) != 1:

@@ -114,11 +114,22 @@ class TemplateTask:
             raise ValueError(
                 "Only canonical template tasks may use an MSA artifact reference"
             )
-        digest = (
-            self.unpaired_msa_reference.sha256
-            if self.unpaired_msa_reference is not None
-            else sha256_bytes(cast(str, self.unpaired_msa).encode())
-        )
+        validate_query(resolve_database_profile("uniref90"), self.sequence)
+        validate_max_template_date(self.max_template_date)
+        if self.unpaired_msa_reference is not None:
+            digest = self.unpaired_msa_reference.sha256
+        else:
+            if not isinstance(self.unpaired_msa, str):
+                raise TypeError("unpaired_msa must be a string")
+            if not self.unpaired_msa:
+                raise ValueError("unpaired_msa must be a non-empty A3M string")
+            if not self.unpaired_msa.isascii():
+                raise ValueError("unpaired_msa must contain only ASCII A3M text")
+            if len(self.unpaired_msa) > MAX_LOCAL_MSA_BYTES:
+                raise ValueError(
+                    f"unpaired_msa exceeds the {MAX_LOCAL_MSA_BYTES}-byte limit"
+                )
+            digest = sha256_bytes(self.unpaired_msa.encode())
         object.__setattr__(self, "_unpaired_msa_sha256", digest)
         object.__setattr__(
             self,

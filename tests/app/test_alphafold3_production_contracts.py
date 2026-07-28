@@ -623,6 +623,30 @@ def test_template_task_computes_immutable_identities_once(
     assert len(hashed_values) == 2
 
 
+def test_template_task_rejects_invalid_inline_msa_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(template_search, "MAX_LOCAL_MSA_BYTES", 4)
+    monkeypatch.setattr(
+        template_search,
+        "sha256_bytes",
+        lambda _: pytest.fail("invalid inline MSA was hashed"),
+    )
+
+    with pytest.raises(ValueError, match="byte limit"):
+        TemplateTask(
+            sequence="ACDE",
+            unpaired_msa="12345",
+            publish_canonical=False,
+        )
+    with pytest.raises(TypeError, match="must be a string"):
+        TemplateTask(
+            sequence="ACDE",
+            unpaired_msa=cast(Any, b"1234"),
+            publish_canonical=False,
+        )
+
+
 def test_msa_resolution_binds_references_to_returned_fields() -> None:
     task = MsaAssemblyTask(
         polymer="protein",

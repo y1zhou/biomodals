@@ -185,6 +185,17 @@ def _hmmsearch_parameters() -> dict[str, object]:
     }
 
 
+def _template_filter_parameters() -> dict[str, object]:
+    """Return result-affecting template filters shared by identity and runtime."""
+    return {
+        "max_subsequence_ratio": 0.95,
+        "min_align_ratio": 0.1,
+        "min_hit_length": 10,
+        "deduplicate_sequences": True,
+        "max_hits": 4,
+    }
+
+
 def template_search_parameters(max_template_date: str) -> dict[str, object]:
     """Return every result-affecting upstream template parameter."""
     selected_date = validate_max_template_date(max_template_date)
@@ -194,13 +205,7 @@ def template_search_parameters(max_template_date: str) -> dict[str, object]:
         "max_template_date": selected_date,
         "max_a3m_query_sequences": None,
         "hmmsearch": _hmmsearch_parameters(),
-        "filter": {
-            "max_subsequence_ratio": 0.95,
-            "min_align_ratio": 0.1,
-            "min_hit_length": 10,
-            "deduplicate_sequences": True,
-            "max_hits": 4,
-        },
+        "filter": _template_filter_parameters(),
     }
 
 
@@ -452,11 +457,7 @@ def _execute_template_search(
             ),
         ),
         filter_config=msa_config.TemplateFilterConfig(
-            max_subsequence_ratio=0.95,
-            min_align_ratio=0.1,
-            min_hit_length=10,
-            deduplicate_sequences=True,
-            max_hits=4,
+            **_template_filter_parameters(),
             max_template_date=selected_date,
         ),
     )

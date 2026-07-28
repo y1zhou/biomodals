@@ -427,6 +427,11 @@ marker mismatch reruns template search without invalidating raw MSAs.
 Template identity binds the resolved unpaired-A3M digest, maximum template date,
 pinned tool behavior, and result-affecting parameters.
 
+The HMMER and template-filter parameter mappings used in cache identity are the
+same mappings expanded into the pinned upstream constructors. Contract tests
+capture the actual Jackhmmer, Nhmmer, Hmmsearch, and template-filter arguments
+so a runtime-only or identity-only scientific change cannot pass silently.
+
 The fixed `pdb_seqres_2022_09_28.fasta` and `mmcif_files/` paths are an immutable
 operator-controlled template store. Their inventory and digests are excluded
 from cache identity.

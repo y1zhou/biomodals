@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import importlib
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -790,13 +792,114 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
         resolve_msa_and_templates(config, cast(Any, NeverCalledExecutor()))
 
 
-@pytest.mark.parametrize("database_id", ["uniref90", "rfam"])
-def test_search_identity_uses_runtime_hmmer_parameters(database_id: str) -> None:
+@pytest.mark.parametrize(
+    ("database_id", "module_name", "constructor_name"),
+    [
+        ("small_bfd", "alphafold3.data.tools.jackhmmer", "Jackhmmer"),
+        ("rfam", "alphafold3.data.tools.nhmmer", "Nhmmer"),
+    ],
+)
+def test_search_identity_matches_upstream_constructor_arguments(
+    database_id: str,
+    module_name: str,
+    constructor_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     spec = resolve_database_profile(database_id)
+    captured: dict[str, object] = {}
 
-    assert scientific_search_parameters(spec)["hmmer"] == (
-        msa_search._hmmer_constructor_parameters(spec)
+    class Tool:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def _query_db_shard(self, **kwargs):
+            return SimpleNamespace(
+                target_sequence=kwargs["target_sequence"],
+                a3m=f">query\n{kwargs['target_sequence']}\n",
+                e_value=0.0,
+                tblout="# no hits",
+            )
+
+    module = SimpleNamespace(**{constructor_name: Tool})
+    if spec.polymer == "protein":
+        module._merge_jackhmmer_results = lambda results, max_sequences: (  # noqa: SLF001
+            SimpleNamespace(a3m=results[0].a3m)
+        )
+    else:
+        monkeypatch.setattr(
+            msa_search,
+            "merge_nhmmer_results_by_reported_score",
+            lambda module, results, max_sequences: SimpleNamespace(a3m=results[0].a3m),
+        )
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: module if name == module_name else None,
     )
+
+    msa_search.execute_profile_database_search(
+        spec,
+        "ACDE" if spec.polymer == "protein" else "ACGU",
+        selected_profile_root=tmp_path,
+        sharded_n_cpu=3,
+        max_parallel_shards=1,
+    )
+
+    hmmer = {
+        "max_sequences": spec.max_sequences,
+        "z_value": spec.search_space_value,
+        **(
+            {
+                "n_iter": 1,
+                "e_value": 1e-4,
+                "dom_e": None,
+                "dom_z_value": spec.search_space_value,
+                "filter_f1": 5e-4,
+                "filter_f2": 5e-5,
+                "filter_f3": 5e-7,
+            }
+            if spec.polymer == "protein"
+            else {
+                "e_value": 1e-3,
+                "filter_f3": 1e-5,
+                "alphabet": "rna",
+                "strand": None,
+            }
+        ),
+    }
+    binary_arguments = (
+        {"binary_path": msa_search.JACKHMMER_BINARY_PATH}
+        if spec.polymer == "protein"
+        else {
+            "binary_path": msa_search.NHMMER_BINARY_PATH,
+            "hmmalign_binary_path": msa_search.HMMALIGN_BINARY_PATH,
+            "hmmbuild_binary_path": msa_search.HMMBUILD_BINARY_PATH,
+        }
+    )
+    assert captured == {
+        **binary_arguments,
+        "database_path": (tmp_path / "shards" / spec.source_filename).as_posix()
+        + f"@{spec.shard_count}",
+        "n_cpu": 3,
+        "max_threads": 1,
+        **hmmer,
+    }
+    expected_identity: dict[str, object] = {
+        "database_id": spec.database_id,
+        "polymer": spec.polymer,
+        "tool": "jackhmmer" if spec.polymer == "protein" else "nhmmer",
+        "hmmer": hmmer,
+    }
+    if spec.polymer == "rna":
+        expected_identity |= {
+            "short_sequence": {
+                "length_cutoff": 50,
+                "filter_f3": 0.02,
+            },
+            "sharded_merge_order": "reported-evalue-descending-bit-score-name-v1",
+        }
+    assert scientific_search_parameters(spec) == expected_identity
 
 
 def test_rna_identity_captures_upstream_short_query_override() -> None:
@@ -808,11 +911,112 @@ def test_rna_identity_captures_upstream_short_query_override() -> None:
     }
 
 
-def test_template_identity_uses_runtime_hmmsearch_parameters() -> None:
-    assert (
-        template_search.template_search_parameters("2025-01-01")["hmmsearch"]
-        == template_search._hmmsearch_parameters()
+def test_template_identity_matches_upstream_constructor_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, dict[str, object]] = {}
+
+    def constructor(name: str):
+        def build(**kwargs):
+            captured[name] = kwargs
+            return SimpleNamespace(**kwargs)
+
+        return build
+
+    def get_templates(**kwargs):
+        captured["pipeline"] = kwargs
+        return SimpleNamespace(get_hits_with_structures=lambda: ())
+
+    msa_config = SimpleNamespace(
+        HmmsearchConfig=constructor("hmmsearch"),
+        TemplateToolConfig=constructor("tool"),
+        TemplateFilterConfig=constructor("filter"),
+        TemplatesConfig=constructor("templates"),
     )
+    modules = {
+        "alphafold3.data.msa_config": msa_config,
+        "alphafold3.constants.mmcif_names": SimpleNamespace(PROTEIN_CHAIN="protein"),
+        "alphafold3.data.pipeline": SimpleNamespace(
+            _get_protein_templates=get_templates
+        ),
+    }
+    monkeypatch.setattr(importlib, "import_module", modules.__getitem__)
+    monkeypatch.setattr(
+        template_search,
+        "assert_pinned_template_contract",
+        lambda: {"contract": "pinned"},
+    )
+    (tmp_path / template_search.PDB_SEQRES_FILENAME).write_text(
+        ">template\nACDE\n",
+        encoding="ascii",
+    )
+    (tmp_path / template_search.MMCIF_DIRECTORY_NAME).mkdir()
+
+    templates, contract = template_search._execute_template_search(
+        "ACDE",
+        ">query\nACDE\n",
+        tmp_path,
+        "2025-01-01",
+    )
+
+    hmmsearch = {
+        "filter_f1": 0.1,
+        "filter_f2": 0.1,
+        "filter_f3": 0.1,
+        "e_value": 100,
+        "inc_e": 100,
+        "dom_e": 100,
+        "incdom_e": 100,
+        "alphabet": "amino",
+        "filter_max": False,
+    }
+    template_filter = {
+        "max_subsequence_ratio": 0.95,
+        "min_align_ratio": 0.1,
+        "min_hit_length": 10,
+        "deduplicate_sequences": True,
+        "max_hits": 4,
+    }
+    assert templates == []
+    assert contract == {"contract": "pinned"}
+    assert captured["hmmsearch"] == {
+        "hmmsearch_binary_path": template_search.HMMSEARCH_BINARY_PATH,
+        "hmmbuild_binary_path": template_search.HMMBUILD_BINARY_PATH,
+        **hmmsearch,
+    }
+    assert captured["filter"] == {
+        **template_filter,
+        "max_template_date": datetime.date(2025, 1, 1),
+    }
+    assert captured["tool"] == {
+        "database_path": str(tmp_path / template_search.PDB_SEQRES_FILENAME),
+        "chain_poly_type": "protein",
+        "hmmsearch_config": cast(
+            SimpleNamespace,
+            captured["templates"]["template_tool_config"],
+        ).hmmsearch_config,
+    }
+    templates_config = cast(
+        SimpleNamespace,
+        captured["pipeline"]["templates_config"],
+    )
+    assert vars(templates_config.filter_config) == captured["filter"]
+    assert captured["pipeline"] == {
+        "sequence": "ACDE",
+        "input_msa_a3m": ">query\nACDE\n",
+        "run_template_search": True,
+        "templates_config": templates_config,
+        "pdb_database_path": str(tmp_path / template_search.MMCIF_DIRECTORY_NAME),
+    }
+    assert template_search.template_search_parameters("2025-01-01") == {
+        "tool": "hmmsearch",
+        "hmmsearch_n_cpu": 8,
+        "max_template_date": "2025-01-01",
+        "max_a3m_query_sequences": None,
+        "hmmsearch": hmmsearch,
+        "filter": template_filter,
+    }
 
 
 def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:

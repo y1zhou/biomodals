@@ -30,109 +30,13 @@ _Avoid_: final node, last node
 A deployed Modal app that owns tool runtime, images, volumes, and exported app functions.
 _Avoid_: workflow node, app node
 
-**MSA Benchmark App**:
-An experimental, self-contained Biomodals app that produces comparable AlphaFold3 MSA-search measurements while remaining outside production prediction and workflow behavior. It may copy proven environment and image setup, but owns separate Modal resources and never imports the production AlphaFold3 app module. Profile preparation, storage scanning, and search benchmarking are separately invoked operations; later operations require a valid Published Database Profile. Local commands are plan-only by default and require an explicit `--submit` flag before making remote calls. The initial implementation is limited to small-BFD profile preparation, Volume scans, smoke validation, and the Phase 1 search matrix; four-database/per-sequence fanout is designed only after Phase 1 measurements select candidate layouts.
-_Avoid_: temporary AlphaFold3 app, production AlphaFold3 app
-
-**Benchmark Database Profile**:
-A manifest-identified set of scientifically equivalent physical layouts of one genetic reference database used for controlled MSA-search comparisons.
-_Avoid_: shard directory, test database, database copy
-
-**Published Database Profile**:
-A Benchmark Database Profile whose source identity, shard equivalence, and balance have passed validation and whose readiness manifest has been published.
-_Avoid_: complete directory, prepared database
-
-**Profile Audit**:
-An explicit maintenance operation that rechecks the declared artifacts and scientific validation evidence of a Published Database Profile. It is never an implicit prerequisite for an MSA search.
-_Avoid_: search startup check, profile preparation, manifest read
-
-**Profile Preparation**:
-The explicit pre-measurement operation that creates, validates, and publishes a Benchmark Database Profile.
-_Avoid_: benchmark setup, lazy shard creation
-
 **Shard Build Recipe**:
-A versioned deterministic transformation from a reference-database monolith into the shard layout of a Benchmark Database Profile.
+A versioned deterministic transformation from a reference-database monolith into the shard layout of a Sharded Database Profile.
 _Avoid_: ad hoc split, shard command
-
-**Benchmark Run**:
-A controlled MSA-search execution that reads a published Benchmark Database Profile without modifying it and produces performance and scientific evidence.
-_Avoid_: profile preparation, production prediction
-
-**Storage Scan**:
-A Benchmark Run that reads one complete physical database layout without performing sequence search, establishing the storage-delivery envelope.
-_Avoid_: MSA search, cold-cache benchmark
-
-**Storage Reader Topology**:
-The allocation of concurrent database read streams across benchmark containers during a Storage Scan.
-_Avoid_: shard count, HMMER CPU layout
-
-**Isolated Database Search**:
-A Benchmark Run that queries exactly one genetic database through the pinned AlphaFold MSA implementation, excluding other databases, templates, and inference.
-_Avoid_: full data pipeline, prediction benchmark
-
-**Instrumented Search Adapter**:
-A benchmark-only wrapper around the pinned AlphaFold database search that retains raw evidence and timings without changing search or merge behavior.
-_Avoid_: AlphaFold fork, alternative search implementation
-
-**Validated Search Result**:
-A database-search result whose completion marker proves its scientific identity and the integrity of its declared artifacts.
-_Avoid_: existing A3M file, benchmark cache hit
-
-**Operational Search Baseline**:
-An Isolated Database Search using the current unsharded AlphaFold search configuration, used to quantify change from existing behavior.
-_Avoid_: scientific oracle, full production latency
-
-**Monolithic Search Oracle**:
-An unsharded Isolated Database Search with full-database statistical scaling fixed explicitly, used to evaluate sharded scientific evidence.
-_Avoid_: operational baseline, byte-identical output oracle
-
-**HMMER CPU Layout**:
-The combination of tool threads per shard process and simultaneously active shard processes within an Isolated Database Search.
-_Avoid_: Modal CPU allocation, total database shard count
-
-**Screening Query**:
-The pinned representative protein sequence evaluated across every initial Isolated Database Search configuration.
-_Avoid_: example input, stress query
-
-**Stress Query**:
-The pinned protein sequence with high expected search and merge demand used to validate promoted search configurations.
-_Avoid_: screening query, arbitrary long sequence
-
-**Benchmark Block**:
-One sequential pass through a defined set of search configurations in a controlled order, providing one measured sample per configuration.
-_Avoid_: concurrent batch, benchmark case
-
-**Promoted Search Layout**:
-A sharded HMMER CPU Layout that passes screening gates and advances to stress-query or integrated-pipeline evaluation.
-_Avoid_: fastest observation, presumed production default
-
-**Scientific Promotion Gate**:
-The evidence requirements an Isolated Database Search must satisfy against the Monolithic Search Oracle before its performance can justify further evaluation.
-_Avoid_: byte-identity requirement, final-model score check
-
-**Performance Promotion Gate**:
-The latency and cost requirements a scientifically valid search layout must satisfy before advancing beyond isolated-database evaluation.
-_Avoid_: fastest sample, scientific gate
-
-**Benchmark Evidence Set**:
-The durable raw search outputs, measurements, provenance, and completion state produced by one defined benchmark execution. At the campaign root, `plan.json` fixes the work, `results.parquet` indexes one row per sample, and `summary.md` reports comparisons and gates; large/raw artifacts remain in their sample directories and are referenced rather than copied.
-_Avoid_: MSA cache, database profile, downloaded summary
-
-**Resource Trace**:
-A durable time series of container resource use and active search work aligned to the phase boundaries of a Benchmark Run.
-_Avoid_: transient platform log, aggregate runtime only
-
-**Benchmark Campaign**:
-A finite, reproducible collection of Benchmark Runs performed to select an MSA Sharding Strategy. Non-sequence evidence such as storage scans and campaign summaries lives under `/benchmarks/{campaign_id}/`; it is never assigned a synthetic sequence hash. The immutable initial campaign ID is `small-bfd-phase1-v1`; changing its plan requires a new ID. This campaign permits one smoke invocation and, after it passes, one measured matrix invocation containing the agreed three blocks. Completion markers make accidental reruns submit no work.
-_Avoid_: benchmark service, production workload
-
-**MSA Sharding Strategy**:
-A scientifically valid database layout and search-resource configuration selected for possible incorporation into the production AlphaFold3 app. Benchmarking may rank candidates but never migrates one automatically; production promotion is a separate, explicitly approved implementation step.
-_Avoid_: fastest sample, benchmark harness
 
 **Sharded Database Profile**:
 An immutable, manifest-validated publication of every shard for one logical MSA database. Its manifest preserves the source FASTA identity and construction recipe, but the published profile does not retain a duplicate source FASTA.
-_Avoid_: source database directory, incomplete shard staging, benchmark sample
+_Avoid_: source database directory, incomplete shard staging, arbitrary shard set
 
 **Profile ID**:
 A code-owned identifier for one immutable Sharded Database Profile, fixing its source database generation, shard count, and build recipe. It is selected by the Supported Database Specification rather than through a mutable runtime alias.
@@ -164,7 +68,7 @@ _Avoid_: database ID, polymer-aware sequence hash, chain type suffix
 
 **Raw Database MSA**:
 A validated result of searching one MSA Search Subject against one reference database profile. It is independently complete and reusable before AlphaFold constructs combined unpaired or paired MSAs.
-_Avoid_: combined unpaired MSA, paired MSA, benchmark summary
+_Avoid_: combined unpaired MSA, paired MSA, search log
 
 **Combined Unpaired MSA**:
 The AlphaFold-ready unpaired alignment assembled from validated Raw Database MSAs in pinned upstream order, with duplicate aligned sequences removed after ignoring lowercase insertions. Protein order is UniRef90, small BFD, then MGnify; RNA order is RFam, RNAcentral, then NT-RNA.
@@ -197,6 +101,10 @@ _Avoid_: raw database MSA, combined MSA publication, template search result
 **Staged Custom Template**:
 A caller-supplied mmCIF made remotely accessible at a content-addressed path beneath one AlphaFold Run Root. Its content digest and residue mappings define biological identity; its original and staged paths do not.
 _Avoid_: template search result, local template path, shared template cache
+
+**Staged Inference Input**:
+The marker-complete canonical request input, run identity, and path-backed custom templates stored beneath one AlphaFold Run Root. GPU workers and summary finalizers load and re-derive its run and request identities instead of accepting caller-supplied inference JSON.
+_Avoid_: unchecked worker payload, enriched local input, seed prediction
 
 **Search Field Resolution**:
 The request-scoped selection or generation of each MSA and template field independently. A populated field neither authorizes its replacement nor implies that a missing sibling field is resolved.
@@ -251,20 +159,20 @@ The deterministic ordering shared by request-scoped and global prediction summar
 _Avoid_: worker completion order, submission order, arbitrary equal-score winner
 
 **Inference Request**:
-One invocation's requested model-seed set against an Inference Run Identity. It may reuse existing Seed Predictions and compute missing ones without changing the shared run identity.
-_Avoid_: inference run identity, GPU worker assignment, newly computed seeds only
+The normalized model-seed set requested against an Inference Run Identity. Its request ID ignores submitted order, duplicate seeds, and display name, and it may reuse existing Seed Predictions without changing the shared run identity.
+_Avoid_: inference run identity, request view, GPU worker assignment
 
-**Inference Request Result**:
-The durable return view restricted to one Inference Request: references to all requested canonical Seed Predictions, request-specific ranking and best files, and a manifest distinguishing reused from newly computed seeds while referencing the accumulated run summary. It does not duplicate full seed artifacts.
-_Avoid_: complete run archive, global best prediction, worker output
+**Inference Request View**:
+An identity-stable durable presentation of one Inference Request, identified from its request ID, submitted seed order and duplicates, and display name. It references all requested canonical Seed Predictions plus request-specific ranking and best files without recording mutable invocation outcomes or duplicating seed artifacts.
+_Avoid_: inference request, complete run archive, accumulated run summary
 
 **Partial Inference Request**:
-An Inference Request for which at least one normalized requested seed has a Seed Completion Marker and at least one remains unmarked after a surfaced failure. It retains reusable seeds and diagnostics but has no successful Inference Request Result.
+An Inference Request for which at least one normalized requested seed has a Seed Completion Marker and at least one remains unmarked after a surfaced failure. It retains reusable seeds and diagnostics but has no successful Inference Request View.
 _Avoid_: failed seed prediction, completed request, empty run
 
 **Request Retrieval Archive**:
-A self-contained local `.tar.zst` materialization of one Inference Request Result, assembled by downloading only its manifest-declared canonical artifacts and referenced Staged Custom Templates. Its input copy uses archive-relative template paths, and its filename combines the Presentation Output Name with a request-ID prefix so different seed sets cannot collide.
-_Avoid_: inference request result, global run archive, remote function payload
+A self-contained local `.tar.zst` materialization of one Inference Request View, assembled by downloading only its manifest-declared canonical artifacts and referenced Staged Custom Templates. Its input copy uses archive-relative template paths, and its filename combines the Presentation Output Name with a view-ID prefix.
+_Avoid_: inference request view, global run archive, remote function payload
 
 **Seed Build Claim**:
 An atomic, generation-scoped coordination record granting one request ownership of computing one missing Seed Prediction. It is never evidence that the prediction completed; only the validated seed publication is authoritative.
@@ -283,48 +191,16 @@ The request-wide maximum number of active CPU search containers across database-
 _Avoid_: MSA-only worker limit, shard count, HMMER thread count, number of input chains
 
 **Search Identity**:
-A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes the database-profile manifest, scientific search parameters, and pinned tool versions, but excludes operational benchmark settings such as CPU allocation and container layout.
-_Avoid_: sequence hash, benchmark sample ID, resource configuration
+A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes semantic source/shard profile content, scientific search parameters, and pinned tool versions, but excludes build timestamps, thread counts, CPU allocation, and container layout.
+_Avoid_: sequence hash, full profile-manifest digest, resource configuration
 
 **Canonical Search Result**:
 The immutable production-cache publication for one Raw Database MSA, stored at its Search Identity root only after validation. It preserves the merged database alignment and compact provenance needed for reuse; per-shard merge evidence is transient execution data.
-_Avoid_: arbitrary benchmark result, fastest unvalidated sample, shard tblout
-
-**Benchmark Sample**:
-One measured execution of a search case within a Benchmark Campaign, identified by a human-readable sample ID such as `screen-S3-block-01`. Multiple Benchmark Samples may share one Search Identity while measuring different operational layouts or repetitions. Query-derived evidence always lives beneath `/{sequence_hash_prefix}/{sequence_hash}/raw-msa/`.
-_Avoid_: scientific cache identity, unique biological sequence
+_Avoid_: arbitrary search output, unvalidated sample, shard tblout
 
 **Sequence Hash Prefix**:
 The first two hexadecimal characters of the full sequence hash, used only to fan out directories. It is not a sequence identifier by itself.
 _Avoid_: sequence hash, search identity
-
-**Duplicate-Tail Difference**:
-A sharded-search discrepancy attributable only to cross-shard duplicate hits and their effect at the truncated end of an MSA result.
-_Avoid_: unexplained hit difference, scientific equivalence
-
-**RNA Sharding Oracle**:
-The pinned monolithic-versus-sharded Nhmmer comparison for a documented RNA query, covering every RNA database result and the final upstream-order deduplicated unpaired MSA.
-_Avoid_: query-only smoke test, protein oracle, performance benchmark
-
-**Benchmark CPU Floor**:
-The minimum Modal CPU reserved throughout a Benchmark Run, balancing guaranteed compute availability against cost during low-utilization phases.
-_Avoid_: HMMER CPU layout, CPU limit
-
-**Search Wall Time**:
-Elapsed time from starting the pinned database query through completion of its merged A3M result.
-_Avoid_: sample wall time, remote call wall time
-
-**Sample Wall Time**:
-Elapsed time from benchmark-function entry through durable publication of that sample's evidence.
-_Avoid_: search wall time, remote call wall time
-
-**Remote Call Wall Time**:
-Elapsed time from submitting a benchmark function call through observing its completion, including platform scheduling and container startup.
-_Avoid_: search wall time, sample wall time
-
-**Volume-Resident Reference Data**:
-Genetic reference-database payloads that remain on persistent Modal Volumes throughout preparation and measurement rather than being fully staged on container-local storage.
-_Avoid_: local database staging, SSD-cached database
 
 **App Function**:
 A callable Modal remote function exposed by a Biomodals app or another Modal app and invoked by a workflow node.

@@ -30,3 +30,9 @@ The skill routes app work to focused references under
 - If an app needs to intentionally deviate from the skill, add a focused note under `docs/agents/` explaining why and link it from this document.
 - Keep local entrypoints CLI-only. Workflow reuse should happen through remote
   app functions that return shared schemas from `biomodals.schema`.
+
+## Approved App-Specific Deviations
+
+- [AlphaFold3 cache integrity and run layout](alphafold3-app-deviations.md)
+  documents the intentionally trusted immutable stores, marker-only seed cache,
+  and multi-request run layout used by `alphafold3_app.py`.

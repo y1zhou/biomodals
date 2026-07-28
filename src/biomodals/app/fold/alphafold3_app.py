@@ -15,6 +15,20 @@ The model checkpoint must be available at `/AlphaFold3/af3.bin` in the
 `AlphaFold3-msa-db`, then use `setup_sharded_databases` to populate the
 separate `AlphaFold3-msa-db-sharded` Volume before running searches.
 
+## Examples
+
+Inspect the database-build plan without submitting paid work:
+
+`uv run biomodals app run alphafold3::setup_sharded_databases`
+
+After reviewing that plan, build all missing profiles explicitly:
+
+`uv run biomodals app run alphafold3::setup_sharded_databases --submit`
+
+Run prediction and download the request-scoped archive:
+
+`uv run biomodals app run alphafold3::submit_alphafold3_task --input-json input.json --out-dir outputs`
+
 See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general docs.
 
 ## Outputs

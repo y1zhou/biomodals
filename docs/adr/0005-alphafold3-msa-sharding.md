@@ -376,9 +376,13 @@ published in production.
 A preempted worker reruns that whole database. Per-shard durable scheduling and
 repair remain outside the initial design.
 
-Search Identity covers polymer and sequence, the immutable profile manifest,
-pinned AlphaFold and HMMER behavior, and every result-affecting search
-parameter.
+Search Identity covers polymer and sequence, a semantic view of the immutable
+profile, pinned AlphaFold and HMMER behavior, and every result-affecting search
+parameter. The profile view includes source and ordered-shard content,
+full-database search space, and compatibility pins. It excludes build
+timestamps, claim generations, builder thread counts, and other operational
+provenance, so rebuilding byte-identical shards preserves scientific cache
+reuse.
 
 CPU allocation, HMMER CPU count, active shard count, and container topology are
 operational settings outside Search Identity.
@@ -652,6 +656,30 @@ After `run_id` is known, each path-backed template is uploaded once to:
 The worker input rewrites `mmcifPath` to the mounted path. Identical content is
 deduplicated within the run, while inline mmCIF remains inline.
 
+### Staged inference input
+
+Input staging publishes deterministic payloads before a compact completion
+marker:
+
+```text
+inputs/identity.json
+requests/{request_id}/input.json
+requests/{request_id}/staged-input.json
+custom-templates/{sha256}.cif
+```
+
+The marker records the path, byte size, and SHA-256 of the run identity,
+canonical request input, and every path-backed custom template. It is committed
+last. An exact existing marker makes repeat staging a no-op; a mismatch at the
+same immutable path is an error.
+
+GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
+the staged-marker record. Each loads the marker-bound input from the output
+Volume, validates every payload, confines template paths to that run's
+`custom-templates/` directory, recomputes the request identity, and re-derives
+the run identity before using the input. A caller therefore cannot publish
+outputs under one run while supplying another run's input.
+
 ### Inference identity
 
 An app-local `hash_sequences` helper derives `run_id` from the normalized
@@ -706,7 +734,9 @@ inputs/identity.json
 custom-templates/{sha256}.cif
 outputs/
 outputs/.workers/{claim-generation}/
-requests/{request_id}/
+requests/{request_id}/input.json
+requests/{request_id}/staged-input.json
+requests/{request_id}/views/{view_id}/
 .markers/seeds/{seed}.json
 .markers/summary.json
 logs/
@@ -717,19 +747,22 @@ configuration. Different seed requests and display names share the same run
 root.
 
 The submitted seed list must be non-empty. It is normalized to a sorted unique
-set before identity, reconciliation, or scheduling.
-
-One submitted request may contain at most 1,000 model seeds. The accumulated
-summary may grow beyond that ceiling through multiple valid requests.
-Inference controls are bounded both before scheduling and again in the worker:
-recycles are 0--100, diffusion samples are 1--100, and `max_num_gpus` is
-1--100.
-
-The request manifest preserves submitted and normalized seeds and records any
-duplicates removed by normalization.
+set before computation identity, reconciliation, or scheduling. One invocation
+may produce at most 1,000 seed/sample pairs after normalization. The
+accumulated summary may grow beyond that ceiling through multiple valid
+requests. Inference controls are bounded both before scheduling and again in
+the worker: model seeds are unsigned 32-bit integers, recycles are 0--100,
+diffusion samples are 1--100, and `max_num_gpus` is 1--100.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
-normalized seed list. It identifies a return view, not a seed cache entry.
+normalized seed list. It identifies one computational seed request, not a seed
+cache entry.
+
+`view_id` is separately derived from `request_id`, the submitted seed list
+including order and duplicates, and the caller display name. It identifies one
+stable durable presentation of that request. Exact reruns therefore select the
+same immutable manifest, while different presentations of the same normalized
+seed set do not overwrite one another.
 
 ### Seed claims and inference workers
 
@@ -788,6 +821,9 @@ previously summarized seeds.
 
 A path-scoped Summary Build Claim serializes finalization. The finalizer reloads
 markers after taking ownership and builds from that exact completed-seed union.
+Summary claims use a lease bounded slightly above the one-hour summary
+function, independently of the longer GPU-seed claim lifetime, so a preempted
+summary cannot block recovery for nearly a full inference timeout.
 
 It publishes ranking and global-best files before writing the summary marker
 last. It may publish only if its seed set contains every seed in the current
@@ -810,21 +846,24 @@ scientifically equivalent; the tie-breakers only stabilize presentation.
 
 ### Request-scoped results
 
-Every successful request publishes a small `requests/{request_id}/` view with:
+Every successful presentation publishes a small stable view at
+`requests/{request_id}/views/{view_id}/` with:
 
-- its enriched input and manifest;
-- requested-seed ranking and best files;
-- reused and newly computed seed sets;
+- a manifest referencing the canonical enriched input;
+- request-seed ranking and best files;
+- submitted and normalized seeds plus duplicates removed;
 - references to all requested canonical Seed Predictions;
-- the observed global-summary marker;
 - the canonical-to-presentation name mapping;
 - referenced custom-template artifacts.
 
 It does not copy seed directories or include unrelated completed seeds. No
 request archive is retained on the output Volume.
 
-The request manifest records the observed global-summary marker digest, global
-best seed, and each selected artifact's byte size and SHA-256.
+The manifest contains only identity-stable fields and each selected artifact's
+byte size and SHA-256. It deliberately excludes publication timestamps,
+new-versus-reused execution outcomes, and the mutable accumulated run summary.
+An exact rerun validates and returns the existing manifest before rescanning or
+copying prediction artifacts.
 
 Remote functions return compact Volume-relative metadata, never prediction
 tarballs as function-result bytes.
@@ -832,7 +871,7 @@ tarballs as function-result bytes.
 The local entrypoint downloads only manifest-declared artifacts and constructs:
 
 ```text
-{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst
+{presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst
 ```
 
 The presentation name is the sanitized caller display name. Downloaded

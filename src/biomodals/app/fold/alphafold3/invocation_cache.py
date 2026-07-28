@@ -61,7 +61,7 @@ from biomodals.app.fold.alphafold3.template_search import (
 
 INVOCATION_IDENTITY_SCHEMA = "biomodals-alphafold3-invocation-v1"
 INVOCATION_RECEIPT_SCHEMA_VERSION = 1
-MAX_INVOCATION_RECEIPT_BYTES = 16 * 1024 * 1024
+MAX_INVOCATION_RECEIPT_BYTES = 64 * 1024
 MAX_REQUEST_MANIFEST_BYTES = 64 * 1024 * 1024
 
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -212,19 +212,21 @@ def build_invocation_receipt(
         or inference.get("num_diffusion_samples") != publication.sample_count
     ):
         raise ValueError("Request manifest does not match the invocation")
-    return VolumeUpload(
+    receipt = VolumeUpload(
         relative_path=invocation.receipt_path,
         content=json_bytes({
             "schema_version": INVOCATION_RECEIPT_SCHEMA_VERSION,
             "status": "complete",
             "invocation_id": invocation.invocation_id,
-            "invocation": invocation.identity,
             "run_id": publication.run_id,
             "request_id": publication.request_id,
             "view_id": view_id,
             "manifest": _manifest_record(manifest),
         }),
     )
+    if len(receipt.content) > MAX_INVOCATION_RECEIPT_BYTES:
+        raise RuntimeError("Invocation receipt exceeds its byte limit")
+    return receipt
 
 
 def _artifact_record(value: object, *, field_name: str) -> tuple[str, int, str]:
@@ -270,7 +272,6 @@ def load_invocation_manifest(
         or receipt.get("schema_version") != INVOCATION_RECEIPT_SCHEMA_VERSION
         or receipt.get("status") != "complete"
         or receipt.get("invocation_id") != invocation.invocation_id
-        or receipt.get("invocation") != invocation.identity
     ):
         raise RuntimeError("Invocation receipt identity is invalid")
     manifest_path, manifest_size, manifest_sha256 = _artifact_record(

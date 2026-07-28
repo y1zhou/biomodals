@@ -896,6 +896,7 @@ def submit_alphafold3_task(
         output_mount_root=Path(CONF.output_volume_mountpoint),
         recycle=recycle,
         sample=sample,
+        caller_template_positions=local_input.caller_template_positions,
     )
     if prepared.submitted_seeds != prepared.normalized_seeds:
         print(

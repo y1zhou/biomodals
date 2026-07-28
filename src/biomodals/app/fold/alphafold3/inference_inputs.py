@@ -73,6 +73,7 @@ class MaterializedLocalInput:
 
     config: AF3Config
     custom_templates: tuple[LocalTemplateFile, ...]
+    caller_template_positions: frozenset[tuple[int, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +462,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
     custom_templates: dict[Path, LocalTemplateFile] = {}
     custom_template_content: dict[str, bytes] = {}
     custom_template_bytes = 0
+    caller_template_positions: set[tuple[int, int]] = set()
     for chain_index, entry in enumerate(conf.sequences):
         if (protein := entry.protein) is not None:
             _materialize_text_pair(
@@ -480,6 +482,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
                 max_bytes=MAX_LOCAL_MSA_BYTES,
             )
             for template_index, template in enumerate(protein.templates):
+                caller_template_positions.add((chain_index, template_index))
                 if template.mmcifPath is None:
                     continue
                 template_path = _resolve_regular_file(
@@ -545,6 +548,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
     return MaterializedLocalInput(
         config=validated,
         custom_templates=tuple(custom_templates.values()),
+        caller_template_positions=frozenset(caller_template_positions),
     )
 
 
@@ -754,6 +758,7 @@ def prepare_inference_run(
     output_mount_root: Path,
     recycle: int,
     sample: int,
+    caller_template_positions: frozenset[tuple[int, int]] = frozenset(),
 ) -> PreparedInferenceRun:
     """Build run/request identities and every required Volume upload."""
     validate_inference_parameters(recycle, sample)
@@ -776,16 +781,31 @@ def prepare_inference_run(
     run_root = PurePosixPath(run_id[:2]) / run_id
 
     template_files = _template_files_by_source(custom_templates)
+    if any(
+        not isinstance(position, tuple)
+        or len(position) != 2
+        or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in position
+        )
+        for position in caller_template_positions
+    ):
+        raise ValueError("caller_template_positions must contain nonnegative pairs")
     staged_conf = conf.model_copy(deep=True)
     staged_conf.name = f"af3-{run_id[:16]}"
     staged_conf.modelSeeds = list(normalized_seeds)
     uploads: dict[PurePosixPath, bytes] = {}
     template_paths: set[PurePosixPath] = set()
-    for entry in staged_conf.sequences:
+    observed_caller_templates: set[tuple[int, int]] = set()
+    for chain_index, entry in enumerate(staged_conf.sequences):
         if (protein := entry.protein) is None:
             continue
-        for template in protein.templates:
-            if template.mmcifPath is None:
+        for template_index, template in enumerate(protein.templates):
+            position = (chain_index, template_index)
+            is_caller_template = position in caller_template_positions
+            if is_caller_template:
+                observed_caller_templates.add(position)
+            if template.mmcifPath is None and not is_caller_template:
                 continue
             template_view = cast(
                 dict[str, object],
@@ -802,6 +822,8 @@ def prepare_inference_run(
             template.mmcif = None
             template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
 
+    if observed_caller_templates != caller_template_positions:
+        raise ValueError("caller_template_positions do not match the enriched input")
     _validate_custom_template_total(sum(len(uploads[path]) for path in template_paths))
     staged_conf = validate_upstream_af3_input(staged_conf)
     identity_path = run_root / "inputs" / "identity.json"

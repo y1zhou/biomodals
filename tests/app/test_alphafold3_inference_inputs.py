@@ -451,6 +451,7 @@ def test_local_template_budget_counts_identical_content_once(
 
     assert len(materialized.custom_templates) == 2
     assert len({template.sha256 for template in materialized.custom_templates}) == 1
+    assert materialized.caller_template_positions == frozenset({(0, 0), (0, 1)})
 
 
 def test_inference_parameters_are_resource_bounded() -> None:

@@ -699,21 +699,21 @@ The identity representation substitutes that digest for the path while
 retaining `queryIndices` and `templateIndices`. Inline mmCIF uses the same
 content-digest representation.
 
-After `run_id` is known, every caller-supplied `mmcifPath` template is
+After `run_id` is known, every caller-supplied inline or `mmcifPath` template is
 canonicalized and uploaded once to:
 
 ```text
 <run-root>/custom-templates/{sha256}.cif
 ```
 
-The staged worker input rewrites only those path-backed templates to the
-mounted path. Inline caller templates and inline templates returned by the
-database search remain inline. Identical path-backed content is deduplicated
-within the run. Consequently, `custom-templates/` is absent when the request
-does not reference caller-local template files; database mmCIF files remain in
-the read-only MSA database Volume and are not copied into the output Volume.
-Equivalent inline and path-backed submissions still produce the same
-scientific `run_id`.
+The staged worker input rewrites only those caller templates to the mounted
+path. Inline templates returned by the database search remain inline. Identical
+caller template content is deduplicated within the run. Consequently,
+`custom-templates/` is absent when the submitted JSON contains no templates;
+source database mmCIF files remain in the read-only MSA database Volume and are
+not copied into the output Volume as standalone files. Equivalent inline and
+path-backed submissions produce the same scientific `run_id` and canonical
+staged input.
 
 ### Staged inference input
 
@@ -724,14 +724,14 @@ marker:
 inputs/identity.json
 requests/{request_id}/input.json
 requests/{request_id}/staged-input.json
-custom-templates/{sha256}.cif  # caller mmcifPath files only; optional
+custom-templates/{sha256}.cif  # caller templates only; optional
 ```
 
 `inputs/identity.json` is compact identity evidence: large MSA, `userCCD`, and
 template mmCIF strings are represented by byte size and SHA-256 rather than
 duplicated. `requests/{request_id}/input.json` remains the complete runnable
 enriched input. The marker records the path, byte size, and SHA-256 of both
-documents and every path-backed custom template. It is committed last. An
+documents and every staged caller template. It is committed last. An
 exact existing marker causes repeat staging to validate every declared
 payload; missing or corrupt deterministic payloads are republished before the
 marker is reasserted. Existing payloads and the marker are compared as bounded
@@ -806,7 +806,7 @@ There is no top-level `runs/` directory. The run root contains:
 
 ```text
 inputs/identity.json
-custom-templates/{sha256}.cif  # caller mmcifPath files only; optional
+custom-templates/{sha256}.cif  # caller templates only; optional
 outputs/
 outputs/.workers/{claim-generation}/
 requests/{request_id}/input.json
@@ -1001,9 +1001,9 @@ input, manifest, and referenced staged caller template files.
 Custom templates appear at `custom-templates/{sha256}.cif`. Only the downloaded
 input copy rewrites `mmcifPath` to those archive-relative paths.
 
-Only path-backed custom mmCIF uses archive-relative paths. Inline templates
-remain inline. The request manifest prevents unrelated custom templates from
-being downloaded.
+Caller inline and path-backed custom mmCIF use archive-relative paths.
+Database-search templates remain inline. The request manifest prevents
+unrelated custom templates from being downloaded.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each

@@ -2429,6 +2429,7 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
         output_mount_root=tmp_path / "output",
         recycle=1,
         sample=1,
+        caller_template_positions=frozenset({(0, 0)}),
     )
     path_backed = prepare_inference_run(
         config(
@@ -2448,6 +2449,7 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
         output_mount_root=tmp_path / "output",
         recycle=1,
         sample=1,
+        caller_template_positions=frozenset({(0, 0)}),
     )
 
     assert inline.run_id == path_backed.run_id
@@ -2463,19 +2465,16 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
         if upload.relative_path.name == "identity.json"
     )
     assert inline_identity == path_identity
-    assert not [
-        upload
-        for upload in inline.payload_uploads
-        if upload.relative_path.parent.name == "custom-templates"
-    ]
+    assert inline.staged_input == path_backed.staged_input
     assert (
         len([
             upload
-            for upload in path_backed.payload_uploads
+            for upload in inline.payload_uploads
             if upload.relative_path.parent.name == "custom-templates"
         ])
         == 1
     )
+    assert inline.payload_uploads == path_backed.payload_uploads
 
 
 def test_staged_input_confines_path_backed_templates(tmp_path: Path) -> None:
@@ -2831,6 +2830,9 @@ def test_invocation_receipt_resolves_and_binds_the_manifest() -> None:
     )
     receipt = build_invocation_receipt(invocation, prepared, manifest)
     assert build_invocation_receipt(invocation, prepared, manifest) == receipt
+    receipt_document = orjson.loads(receipt.content)
+    assert receipt_document["invocation_id"] == invocation.invocation_id
+    assert "invocation" not in receipt_document
     manifest_path = cast(str, manifest["manifest_volume_path"])
     manifest_bytes = json_bytes(manifest)
     files = {

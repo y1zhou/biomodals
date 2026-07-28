@@ -151,6 +151,21 @@ def validate_max_template_date(value: str) -> str:
     return parsed.isoformat()
 
 
+def _hmmsearch_parameters() -> dict[str, object]:
+    """Return result-affecting HMMER arguments shared by identity and runtime."""
+    return {
+        "filter_f1": 0.1,
+        "filter_f2": 0.1,
+        "filter_f3": 0.1,
+        "e_value": 100,
+        "inc_e": 100,
+        "dom_e": 100,
+        "incdom_e": 100,
+        "alphabet": "amino",
+        "filter_max": False,
+    }
+
+
 def template_search_parameters(max_template_date: str) -> dict[str, object]:
     """Return every result-affecting upstream template parameter."""
     selected_date = validate_max_template_date(max_template_date)
@@ -159,17 +174,7 @@ def template_search_parameters(max_template_date: str) -> dict[str, object]:
         "hmmsearch_n_cpu": HMMSEARCH_N_CPU,
         "max_template_date": selected_date,
         "max_a3m_query_sequences": None,
-        "hmmsearch": {
-            "filter_f1": 0.1,
-            "filter_f2": 0.1,
-            "filter_f3": 0.1,
-            "e_value": 100,
-            "inc_e": 100,
-            "dom_e": 100,
-            "incdom_e": 100,
-            "alphabet": "amino",
-            "filter_max": False,
-        },
+        "hmmsearch": _hmmsearch_parameters(),
         "filter": {
             "max_subsequence_ratio": 0.95,
             "min_align_ratio": 0.1,
@@ -400,15 +405,7 @@ def _execute_template_search(
             hmmsearch_config=msa_config.HmmsearchConfig(
                 hmmsearch_binary_path=HMMSEARCH_BINARY_PATH,
                 hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
-                filter_f1=0.1,
-                filter_f2=0.1,
-                filter_f3=0.1,
-                e_value=100,
-                inc_e=100,
-                dom_e=100,
-                incdom_e=100,
-                alphabet="amino",
-                filter_max=False,
+                **_hmmsearch_parameters(),
             ),
         ),
         filter_config=msa_config.TemplateFilterConfig(

@@ -660,6 +660,31 @@ def test_search_pipeline_coordinates_cache_assembly_and_templates() -> None:
     ]
 
 
+@pytest.mark.parametrize("database_id", ["uniref90", "rfam"])
+def test_search_identity_uses_runtime_hmmer_parameters(database_id: str) -> None:
+    spec = resolve_database_profile(database_id)
+
+    assert scientific_search_parameters(spec)["hmmer"] == (
+        msa_search._hmmer_constructor_parameters(spec)
+    )
+
+
+def test_rna_identity_captures_upstream_short_query_override() -> None:
+    assert scientific_search_parameters(resolve_database_profile("rfam"))[
+        "short_sequence"
+    ] == {
+        "length_cutoff": 50,
+        "filter_f3": 0.02,
+    }
+
+
+def test_template_identity_uses_runtime_hmmsearch_parameters() -> None:
+    assert (
+        template_search.template_search_parameters("2025-01-01")["hmmsearch"]
+        == template_search._hmmsearch_parameters()
+    )
+
+
 def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
     assert (
         scientific_search_parameters(resolve_database_profile("rfam"))[

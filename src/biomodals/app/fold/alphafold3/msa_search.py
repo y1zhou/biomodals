@@ -79,6 +79,7 @@ JACKHMMER_FILTER_F2 = 5e-5
 JACKHMMER_FILTER_F3 = 5e-7
 NHMMER_E_VALUE = 1e-3
 NHMMER_FILTER_F3 = 1e-5
+NHMMER_SHORT_SEQUENCE_CUTOFF = 50
 NHMMER_SHORT_SEQUENCE_FILTER_F3 = 0.02
 
 SEARCH_N_CPU = 2
@@ -224,34 +225,51 @@ def validate_query(spec: DatabaseProfileSpec, sequence: str) -> str:
     return sequence
 
 
-def scientific_search_parameters(
+def _hmmer_constructor_parameters(
     spec: DatabaseProfileSpec,
-) -> dict[str, object]:
-    """Return only result-affecting parameters from the pinned pipeline."""
-    common: dict[str, object] = {
-        "database_id": spec.database_id,
-        "polymer": spec.polymer,
+) -> dict[str, Any]:
+    """Return result-affecting arguments shared by identity and runtime."""
+    common: dict[str, Any] = {
         "max_sequences": spec.max_sequences,
         "z_value": spec.search_space_value,
     }
     if spec.polymer == "protein":
         return common | {
-            "tool": "jackhmmer",
             "n_iter": JACKHMMER_N_ITER,
             "e_value": JACKHMMER_E_VALUE,
+            "dom_e": None,
             "dom_z_value": spec.search_space_value,
             "filter_f1": JACKHMMER_FILTER_F1,
             "filter_f2": JACKHMMER_FILTER_F2,
             "filter_f3": JACKHMMER_FILTER_F3,
         }
     return common | {
-        "tool": "nhmmer",
         "e_value": NHMMER_E_VALUE,
         "filter_f3": NHMMER_FILTER_F3,
         "alphabet": "rna",
-        "short_sequence_filter_f3": NHMMER_SHORT_SEQUENCE_FILTER_F3,
-        "sharded_merge_order": NHMMER_SHARDED_MERGE_ORDER,
+        "strand": None,
     }
+
+
+def scientific_search_parameters(
+    spec: DatabaseProfileSpec,
+) -> dict[str, object]:
+    """Return only result-affecting parameters from the pinned pipeline."""
+    parameters: dict[str, object] = {
+        "database_id": spec.database_id,
+        "polymer": spec.polymer,
+        "tool": "jackhmmer" if spec.polymer == "protein" else "nhmmer",
+        "hmmer": _hmmer_constructor_parameters(spec),
+    }
+    if spec.polymer == "rna":
+        parameters |= {
+            "short_sequence": {
+                "length_cutoff": NHMMER_SHORT_SEQUENCE_CUTOFF,
+                "filter_f3": NHMMER_SHORT_SEQUENCE_FILTER_F3,
+            },
+            "sharded_merge_order": NHMMER_SHARDED_MERGE_ORDER,
+        }
+    return parameters
 
 
 def production_search_identity(
@@ -598,6 +616,7 @@ def execute_profile_database_search(
     search_paths = tuple(
         selected_profile_root / "shards" / name for name in shard_names(spec)
     )
+    hmmer_parameters = _hmmer_constructor_parameters(spec)
 
     if spec.polymer == "protein":
         module = import_module("alphafold3.data.tools.jackhmmer")
@@ -605,15 +624,8 @@ def execute_profile_database_search(
             binary_path=JACKHMMER_BINARY_PATH,
             database_path=database_path,
             n_cpu=sharded_n_cpu,
-            n_iter=JACKHMMER_N_ITER,
-            e_value=JACKHMMER_E_VALUE,
-            z_value=spec.search_space_value,
-            dom_z_value=spec.search_space_value,
-            max_sequences=spec.max_sequences,
-            filter_f1=JACKHMMER_FILTER_F1,
-            filter_f2=JACKHMMER_FILTER_F2,
-            filter_f3=JACKHMMER_FILTER_F3,
             max_threads=max_parallel_shards,
+            **hmmer_parameters,
         )
     else:
         module = import_module("alphafold3.data.tools.nhmmer")
@@ -623,12 +635,8 @@ def execute_profile_database_search(
             hmmbuild_binary_path=HMMBUILD_BINARY_PATH,
             database_path=database_path,
             n_cpu=sharded_n_cpu,
-            e_value=NHMMER_E_VALUE,
-            z_value=spec.search_space_value,
-            max_sequences=spec.max_sequences,
-            filter_f3=NHMMER_FILTER_F3,
-            alphabet="rna",
             max_threads=max_parallel_shards,
+            **hmmer_parameters,
         )
 
     global_temp_dir = tempfile.mkdtemp(

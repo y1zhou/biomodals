@@ -35,6 +35,7 @@ from biomodals.app.fold.alphafold3.artifacts import (
     write_json_atomic,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    MAX_STAGED_INPUT_BYTES,
     PreparedInferenceRun,
     hash_sequences,
     normalize_model_seeds,
@@ -53,8 +54,8 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 )
 from biomodals.helper.shell import run_command
 
-REQUEST_MANIFEST_SCHEMA_VERSION = 4
-REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v1"
+REQUEST_MANIFEST_SCHEMA_VERSION = 5
+REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v2"
 
 _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 
@@ -236,6 +237,53 @@ def _artifact_record(
         "size_bytes": source.stat().st_size,
         "sha256": sha256_file(source),
     }
+    return record
+
+
+def _presentation_input_bytes(value: bytes, *, display_name: str) -> bytes:
+    """Return canonical archive input bytes with the caller's display name."""
+    try:
+        document = orjson.loads(value)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError("Staged AlphaFold input is invalid JSON") from exc
+    if not isinstance(document, dict):
+        raise TypeError("Staged AlphaFold input must be a JSON object")
+    document["name"] = display_name
+    return json_bytes(document)
+
+
+def _input_artifact_record(
+    *,
+    source: Path,
+    output_root: Path,
+    volume_path: Path,
+    archive_path: str | PurePosixPath,
+    display_name: str,
+) -> dict[str, object]:
+    """Describe staged and presentation-rewritten input bytes."""
+    record = _artifact_record(
+        source=source,
+        output_root=output_root,
+        volume_path=volume_path,
+        archive_path=archive_path,
+        role="input",
+    )
+    source_size = cast(int, record["size_bytes"])
+    if source_size > MAX_STAGED_INPUT_BYTES:
+        raise ValueError("Staged AlphaFold input exceeds its byte limit")
+    with source.open("rb") as handle:
+        source_bytes = handle.read(MAX_STAGED_INPUT_BYTES + 1)
+    if (
+        len(source_bytes) != source_size
+        or hashlib.sha256(source_bytes).hexdigest() != record["sha256"]
+    ):
+        raise RuntimeError("Staged AlphaFold input changed during publication")
+    archive_bytes = _presentation_input_bytes(
+        source_bytes,
+        display_name=display_name,
+    )
+    record["archive_size_bytes"] = len(archive_bytes)
+    record["archive_sha256"] = hashlib.sha256(archive_bytes).hexdigest()
     return record
 
 
@@ -464,12 +512,12 @@ def publish_request_results(
     canonical_name = canonical_output_name(spec.run_id)
     outputs_root = run_root / "outputs"
     artifacts = [
-        _artifact_record(
+        _input_artifact_record(
             source=input_path,
             output_root=runtime.output_root,
             volume_path=input_path,
             archive_path=f"{canonical_name}_data.json",
-            role="input",
+            display_name=spec.display_name,
         ),
     ]
     artifacts.extend(
@@ -692,6 +740,7 @@ def _validated_manifest_artifacts(
         raise ValueError("Request manifest contains no artifacts")
     artifacts: list[dict[str, object]] = []
     archive_paths: set[str] = set()
+    input_artifact_count = 0
     for raw_artifact in raw_artifacts:
         if not isinstance(raw_artifact, dict):
             raise TypeError("Request manifest artifact must be a dictionary")
@@ -712,6 +761,18 @@ def _validated_manifest_artifacts(
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         ):
             raise ValueError(f"Invalid request artifact: {raw_artifact!r}")
+        if role == "input":
+            archive_size_bytes = raw_artifact.get("archive_size_bytes")
+            archive_sha256 = raw_artifact.get("archive_sha256")
+            if (
+                isinstance(archive_size_bytes, bool)
+                or not isinstance(archive_size_bytes, int)
+                or archive_size_bytes <= 0
+                or not isinstance(archive_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None
+            ):
+                raise ValueError("Request input archive identity is invalid")
+            input_artifact_count += 1
         safe_volume_path = _safe_archive_path(volume_path)
         if not safe_volume_path.is_relative_to(expected_run_root):
             raise ValueError(f"Request artifact is outside its run root: {volume_path}")
@@ -720,6 +781,8 @@ def _validated_manifest_artifacts(
             raise ValueError(f"Duplicate request archive path: {safe_archive_path}")
         archive_paths.add(safe_archive_path)
         artifacts.append(cast(dict[str, object], raw_artifact))
+    if input_artifact_count != 1:
+        raise ValueError("Request manifest requires exactly one input artifact")
     return request_id, view_id, canonical_name, artifacts, ranking
 
 
@@ -777,14 +840,13 @@ def _rewrite_downloaded_input(
     *,
     display_name: str,
 ) -> None:
-    try:
-        document = orjson.loads(input_path.read_bytes())
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(f"Downloaded input is invalid JSON: {input_path}") from exc
-    if not isinstance(document, dict):
-        raise TypeError("Downloaded AlphaFold input must be a JSON object")
-    document["name"] = display_name
-    write_bytes_atomic(input_path, json_bytes(document))
+    write_bytes_atomic(
+        input_path,
+        _presentation_input_bytes(
+            input_path.read_bytes(),
+            display_name=display_name,
+        ),
+    )
 
 
 def _ranking_csv_bytes(rows: tuple[RankingRow, ...]) -> bytes:
@@ -820,6 +882,9 @@ def _local_request_manifest(
         strict=True,
     ):
         local_artifact["archive_path"] = transformed.as_posix()
+        if local_artifact["role"] != "input":
+            local_artifact["archive_size_bytes"] = local_artifact["size_bytes"]
+            local_artifact["archive_sha256"] = local_artifact["sha256"]
     local_manifest["generated_artifacts"] = [
         {
             "role": "request_ranking",
@@ -846,46 +911,18 @@ def _record_archive_artifacts(
         archived_path = archive_root / Path(transformed.as_posix())
         require_regular_file(archived_path)
         if artifact["role"] == "input":
-            local_artifact["archive_size_bytes"] = archived_path.stat().st_size
-            local_artifact["archive_sha256"] = sha256_file(archived_path)
+            observed = (archived_path.stat().st_size, sha256_file(archived_path))
+            expected = (
+                local_artifact.get("archive_size_bytes"),
+                local_artifact.get("archive_sha256"),
+            )
+            if observed != expected:
+                raise RuntimeError(
+                    "Rewritten AlphaFold input does not match its request manifest"
+                )
         else:
             local_artifact["archive_size_bytes"] = artifact["size_bytes"]
             local_artifact["archive_sha256"] = artifact["sha256"]
-
-
-def _bind_expected_archive_artifacts(
-    reader: VolumeReader,
-    local_manifest: dict[str, object],
-    transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
-    *,
-    display_name: str,
-) -> None:
-    """Derive presentation-local digests before reusing an existing archive."""
-    local_artifacts = cast(list[dict[str, object]], local_manifest["artifacts"])
-    input_pairs: list[tuple[dict[str, object], dict[str, object], PurePosixPath]] = []
-    for local_artifact, (artifact, transformed) in zip(
-        local_artifacts,
-        transformed_artifacts,
-        strict=True,
-    ):
-        if artifact["role"] == "input":
-            input_pairs.append((local_artifact, artifact, transformed))
-            continue
-        local_artifact["archive_size_bytes"] = artifact["size_bytes"]
-        local_artifact["archive_sha256"] = artifact["sha256"]
-    if len(input_pairs) != 1:
-        raise RuntimeError("Request archive requires exactly one input artifact")
-
-    local_input, input_artifact, transformed_input = input_pairs[0]
-    with TemporaryDirectory(prefix="alphafold3_archive_identity_") as directory:
-        input_path = Path(directory) / transformed_input.name
-        _download_artifact(reader, input_artifact, input_path)
-        _rewrite_downloaded_input(
-            input_path,
-            display_name=display_name,
-        )
-        local_input["archive_size_bytes"] = input_path.stat().st_size
-        local_input["archive_sha256"] = sha256_file(input_path)
 
 
 def _expected_archive_members(
@@ -1097,12 +1134,6 @@ def create_request_archive(
         local_output_dir / f"{presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst"
     )
     if archive_path.exists():
-        _bind_expected_archive_artifacts(
-            reader,
-            local_manifest,
-            transformed_artifacts,
-            display_name=display_name,
-        )
         if _archive_matches_request(
             archive_path,
             presentation_name=presentation_name,

@@ -207,6 +207,10 @@ def _request_manifest(
     artifacts: list[dict[str, object]],
     sample_count: int = 1,
 ) -> dict[str, object]:
+    for artifact in artifacts:
+        if artifact.get("role") == "input":
+            artifact.setdefault("archive_size_bytes", artifact["size_bytes"])
+            artifact.setdefault("archive_sha256", artifact["sha256"])
     normalized_seeds = sorted(set(submitted_seeds))
     request_id = hash_sequences(run_id, normalized_seeds)
     view_id = request_view_id(request_id, tuple(submitted_seeds), display_name)
@@ -2675,6 +2679,32 @@ def test_completed_request_manifest_loads_without_a_remote_worker() -> None:
     assert load_request_manifest(FakeVolumeReader({}), publication) is None
 
 
+def test_request_manifest_requires_presentation_input_identity() -> None:
+    run_id = "c" * 64
+    input_path = (
+        f"{run_id[:2]}/{run_id}/requests/{hash_sequences(run_id, [1])}/input.json"
+    )
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=[1],
+        display_name="Readable Name",
+        artifacts=[
+            {
+                "role": "input",
+                "volume_path": input_path,
+                "archive_path": f"{canonical_output_name(run_id)}_data.json",
+                "size_bytes": 1,
+                "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+        ],
+    )
+    input_artifact = cast(list[dict[str, object]], manifest["artifacts"])[0]
+    input_artifact.pop("archive_sha256")
+
+    with pytest.raises(ValueError, match="input archive identity"):
+        request_results.request_publication_from_manifest(manifest)
+
+
 @pytest.mark.parametrize(
     ("normalized_seeds", "sample_count", "message"),
     [
@@ -2918,6 +2948,17 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     view_root = run_root / "requests" / request_id / "views" / view_id
     assert [path.name for path in view_root.iterdir()] == ["manifest.json"]
     artifacts = cast(list[dict[str, object]], manifest["artifacts"])
+    input_artifact = next(
+        artifact for artifact in artifacts if artifact["role"] == "input"
+    )
+    presentation_document = orjson.loads(input_path.read_bytes())
+    presentation_document["name"] = "Readable Name"
+    presentation_bytes = json_bytes(presentation_document)
+    assert input_artifact["archive_size_bytes"] == len(presentation_bytes)
+    assert (
+        input_artifact["archive_sha256"]
+        == hashlib.sha256(presentation_bytes).hexdigest()
+    )
     assert "request_ranking" not in {artifact["role"] for artifact in artifacts}
     best_artifacts = [
         artifact
@@ -2956,6 +2997,9 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         )
     )
     volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+    presentation_document = orjson.loads(input_bytes)
+    presentation_document["name"] = "Readable Name"
+    presentation_input = json_bytes(presentation_document)
     manifest = _request_manifest(
         run_id=run_id,
         submitted_seeds=normalized_seeds,
@@ -2967,6 +3011,8 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
                 "archive_path": f"{canonical_name}_data.json",
                 "size_bytes": len(input_bytes),
                 "sha256": hashlib.sha256(input_bytes).hexdigest(),
+                "archive_size_bytes": len(presentation_input),
+                "archive_sha256": hashlib.sha256(presentation_input).hexdigest(),
             }
         ],
     )
@@ -3016,7 +3062,7 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
 
     assert (
         create_request_archive(
-            FakeVolumeReader({volume_path: input_bytes}),
+            FakeVolumeReader({}),
             manifest,
             output_dir=tmp_path,
             display_name="Readable Name",
@@ -3171,7 +3217,7 @@ def test_artifact_download_hashes_while_streaming(
     assert destination.read_bytes() == content
 
 
-def test_archive_manifest_rehashes_only_rewritten_input(
+def test_archive_manifest_verifies_only_rewritten_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3182,7 +3228,11 @@ def test_archive_manifest_rehashes_only_rewritten_input(
     output_sha256 = hashlib.sha256(b"unchanged").hexdigest()
     local_manifest: dict[str, object] = {
         "artifacts": [
-            {"role": "input"},
+            {
+                "role": "input",
+                "archive_size_bytes": len(b"rewritten"),
+                "archive_sha256": hashlib.sha256(b"rewritten").hexdigest(),
+            },
             {
                 "role": "seed_output",
                 "size_bytes": len(b"unchanged"),

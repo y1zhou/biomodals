@@ -994,13 +994,14 @@ directory.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each
-archive-local artifact after input rewriting. Existing archives are streamed
-once and reused only when their exact member set, presentation manifest, and
-all payload digests match the current request. For the rewritten input, the
-local client derives the expected presentation digest from the current staged
-input before reuse; changing both a payload and its embedded digest therefore
-does not make a repacked archive valid. A corrupt, stale, or otherwise
-mismatched archive causes a clear failure instead of silent overwrite.
+archive-local artifact after input rewriting. The durable request-view manifest
+records the rewritten input's expected size and digest when the view is
+published. Existing archives are therefore streamed locally once and reused
+only when their exact member set, presentation manifest, and all payload
+digests match the current request; the staged input is not reread from the
+Modal Volume. Changing both a payload and its embedded digest therefore does
+not make a repacked archive valid. A corrupt, stale, or otherwise mismatched
+archive causes a clear failure instead of silent overwrite.
 
 ### Failure and retry behavior
 

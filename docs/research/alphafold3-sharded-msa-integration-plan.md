@@ -686,11 +686,12 @@ inline in the enriched input; no standalone template files are copied to the
 output Volume or archive.
 
 Each streamed artifact must match the manifest-declared byte size and SHA-256.
-The presentation manifest additionally binds each archive-local payload after
-input rewriting. An existing archive is reused only if one streamed pass
-validates its exact member set, embedded manifest, and all payload digests
-against the current request. A corrupt, stale, or otherwise mismatched archive
-causes a clear failure instead of silent overwrite.
+At publication, the durable request-view manifest additionally records the
+expected size and digest of the presentation-rewritten input. An existing
+archive is therefore reused without rereading the staged input from the Modal
+Volume when one local streamed pass validates its exact member set, embedded
+manifest, and all payload digests. A corrupt, stale, or otherwise mismatched
+archive causes a clear failure instead of silent overwrite.
 
 ## Incremental implementation
 
@@ -968,13 +969,13 @@ input copy changes its display name. The resulting
 `{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after its exact member set and embedded
 presentation manifest validate, including every archive-local payload digest.
-Before reusing an existing archive, the client derives the expected rewritten
-input digest from the current staged input and requires all other archive
-digests to equal their published source records. Updating a corrupt payload and
-its embedded digest together therefore still fails. A matching existing
-archive is reused; a corrupt, stale, or mismatched one causes an explicit error
-and is never overwritten. Every streamed source artifact must first match the
-manifest-declared byte size and SHA-256.
+The request-view publisher derives and persists the rewritten input digest once.
+Before reusing an existing archive, the client reads only the local archive and
+requires all archive digests to equal their published records. Updating a
+corrupt payload and its embedded digest together therefore still fails. A
+matching existing archive is reused; a corrupt, stale, or mismatched one causes
+an explicit error and is never overwritten. Every streamed source artifact
+must first match the manifest-declared byte size and SHA-256.
 
 ### 9. Record validation and remove obsolete production paths
 

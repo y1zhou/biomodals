@@ -170,7 +170,9 @@ def _record_location(
             return None
     try:
         require_regular_file(path)
-    except (FileNotFoundError, ValueError):
+        if path.stat().st_size != size_value:
+            return None
+    except (OSError, ValueError):
         return None
     return path, size_value, digest_value
 
@@ -186,8 +188,9 @@ def load_artifact_bytes(
         return None
     path, expected_size, expected_digest = location
     try:
-        value = path.read_bytes()
-    except OSError:
+        with path.open("rb") as handle:
+            value = handle.read(expected_size + 1)
+    except (OSError, OverflowError):
         return None
     if len(value) != expected_size or sha256_bytes(value) != expected_digest:
         return None

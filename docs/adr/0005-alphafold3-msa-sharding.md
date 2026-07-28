@@ -714,8 +714,11 @@ GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
 the staged-marker record. Each loads the marker-bound input from the output
 Volume, validates every payload, confines template paths to that run's
 `custom-templates/` directory, recomputes the request identity, and re-derives
-the run identity before using the input. A caller therefore cannot publish
-outputs under one run while supplying another run's input.
+the run identity before using the input. Before reading a staged artifact, the
+loader requires its filesystem size to match the marker and then reads at most
+the declared size plus one byte, so a corrupt marker or changing file cannot
+bypass the byte ceilings. A caller therefore cannot publish outputs under one
+run while supplying another run's input.
 
 After preparation, recycle and diffusion-sample counts are read only from the
 prepared/staged request. Coordinator and executor APIs do not accept duplicate

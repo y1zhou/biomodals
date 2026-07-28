@@ -250,6 +250,25 @@ def test_durable_artifact_helpers_detect_changed_bytes(tmp_path: Path) -> None:
     assert validate_artifact_record(tmp_path, record) is None
 
 
+def test_artifact_loader_rejects_size_mismatch_before_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = tmp_path / "payload.bin"
+    payload_path.write_bytes(b"oversized")
+    record = _artifact("payload.bin", b"x")
+    read_bytes = Path.read_bytes
+
+    def reject_payload_read(path: Path) -> bytes:
+        if path == payload_path:
+            pytest.fail("size-mismatched artifact was read")
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_payload_read)
+
+    assert load_artifact_bytes(tmp_path, record, "payload.bin") is None
+
+
 def _profile_manifest(database_id: str) -> dict[str, Any]:
     spec = resolve_database_profile(database_id)
     num_seqs = spec.expected_num_seqs or 1

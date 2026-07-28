@@ -664,8 +664,10 @@ each custom mmCIF or user CCD. A file that changes while being read is rejected.
 Large caller MSAs therefore belong in the path-backed fields rather than the
 inline JSON document.
 
-It reads protein and RNA `unpairedMsaPath` and protein `pairedMsaPath` into
-inline MSA strings, then clears those path fields.
+It reads protein and RNA `unpairedMsaPath`, protein `pairedMsaPath`, and
+template `mmcifPath` fields into inline strings, then clears every path field.
+All templates are therefore self-contained before the input leaves the local
+machine.
 
 It reads `userCCDPath` into inline `userCCD` and clears the path. CCD content,
 not its source path, participates in inference identity.
@@ -682,9 +684,8 @@ preflight before invoking upstream.
 
 The supported request envelope is also explicit: at most 5,120 expanded
 entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
-tasks, 1 GiB of custom-template content, and 1 GiB each for the serialized
-staged input and run-identity document. Identical custom-template content is
-counted once after canonicalization. The 5,120 bounds align with the largest
+tasks, 1 GiB across inline template fields, and 1 GiB each for the serialized
+staged input and run-identity document. The 5,120 bounds align with the largest
 default AlphaFold 3 compilation bucket documented by the pinned upstream
 revision. The CPU coordinator checks the conservative task upper bound before
 cache inspection. The directly callable MSA/template workers repeat the
@@ -692,28 +693,13 @@ cache inspection. The directly callable MSA/template workers repeat the
 before accessing mounted Volumes. Inference workers likewise repeat all
 staged-artifact byte checks when loading from the output Volume.
 
-For each custom mmCIF, the helper reads inline content or the caller's
-`mmcifPath` and computes its full SHA-256 before run identity.
-
-The identity representation substitutes that digest for the path while
-retaining `queryIndices` and `templateIndices`. Inline mmCIF uses the same
-content-digest representation.
-
-After `run_id` is known, every caller-supplied inline or `mmcifPath` template is
-canonicalized and uploaded once to:
-
-```text
-<run-root>/custom-templates/{sha256}.cif
-```
-
-The staged worker input rewrites only those caller templates to the mounted
-path. Inline templates returned by the database search remain inline. Identical
-caller template content is deduplicated within the run. Consequently,
-`custom-templates/` is absent when the submitted JSON contains no templates;
-source database mmCIF files remain in the read-only MSA database Volume and are
-not copied into the output Volume as standalone files. Equivalent inline and
-path-backed submissions produce the same scientific `run_id` and canonical
-staged input.
+For each mmCIF, the identity representation substitutes the full content digest
+while retaining `queryIndices` and `templateIndices`. Caller inline and
+path-backed submissions therefore produce the same scientific `run_id` and
+canonical staged input. Database-search templates already use the same inline
+representation. No template mmCIF is copied into the output Volume as a
+standalone file; source database files remain only in the read-only MSA
+database Volume.
 
 ### Staged inference input
 
@@ -724,32 +710,35 @@ marker:
 inputs/identity.json
 requests/{request_id}/input.json
 requests/{request_id}/staged-input.json
-custom-templates/{sha256}.cif  # caller templates only; optional
 ```
 
 `inputs/identity.json` is compact identity evidence: large MSA, `userCCD`, and
 template mmCIF strings are represented by byte size and SHA-256 rather than
 duplicated. `requests/{request_id}/input.json` remains the complete runnable
-enriched input. The marker records the path, byte size, and SHA-256 of both
-documents and every staged caller template. It is committed last. An
-exact existing marker causes repeat staging to validate every declared
-payload; missing or corrupt deterministic payloads are republished before the
-marker is reasserted. Existing payloads and the marker are compared as bounded
-streams against their expected bytes; a mismatch or extra byte stops the read.
-A marker mismatch at the same immutable path is an error.
+enriched input, including every template mmCIF. The marker records the path,
+byte size, and SHA-256 of both documents and is committed last. An exact
+existing marker causes repeat staging to validate every declared payload;
+missing or corrupt deterministic payloads are republished before the marker is
+reasserted. Existing payloads and the marker are compared as bounded streams
+against their expected bytes; a mismatch or extra byte stops the read. A marker
+mismatch at the same immutable path is an error.
 The app-controlled Volume mountpoint may itself be a symlink, as it can be in a
 Modal container, but staged artifact paths beneath that root may not traverse
 symlinks.
 
 GPU workers and the summary finalizer receive only `run_id`, `request_id`, and
 the staged-marker record. Each loads the marker-bound input from the output
-Volume, validates every payload, confines template paths to that run's
-`custom-templates/` directory, recomputes the request identity, and re-derives
-the run identity before using the input. Before reading a staged artifact, the
-loader requires its filesystem size to match the marker and then reads at most
-the declared size plus one byte, so a corrupt marker or changing file cannot
-bypass the byte ceilings. A caller therefore cannot publish outputs under one
-run while supplying another run's input.
+Volume, validates every payload, requires every template to be inline with no
+`mmcifPath`, recomputes the request identity, and re-derives the run identity
+before using the input. Before reading a staged artifact, the loader requires
+its filesystem size to match the marker and then reads at most the declared
+size plus one byte, so a corrupt marker or changing file cannot bypass the byte
+ceilings. A caller therefore cannot publish outputs under one run while
+supplying another run's input.
+
+This canonical inline representation is staged-input schema version 2 and
+run-identity schema v3. The versioned invocation/run identities prevent older
+path-backed staged inputs from colliding with this layout.
 
 After preparation, recycle and diffusion-sample counts are read only from the
 prepared/staged request. Coordinator and executor APIs do not accept duplicate
@@ -761,8 +750,8 @@ An app-local `hash_sequences` helper derives `run_id` from the normalized
 Inference Identity View and seed-independent inference fragments.
 
 The view validates through `AF3Config`, dumps defaults explicitly, removes only
-`name` and `modelSeeds`, and replaces operational custom-template paths and
-large MSA, mmCIF, and custom CCD strings with content digests and byte sizes.
+`name` and `modelSeeds`, and replaces large MSA, mmCIF, and custom CCD strings
+with content digests and byte sizes.
 
 It retains the content identity of sequence order, chain IDs, descriptions,
 modifications, bonds, MSAs, templates and mappings, custom CCD, dialect, schema
@@ -806,7 +795,6 @@ There is no top-level `runs/` directory. The run root contains:
 
 ```text
 inputs/identity.json
-custom-templates/{sha256}.cif  # caller templates only; optional
 outputs/
 outputs/.workers/{claim-generation}/
 requests/{request_id}/input.json
@@ -855,7 +843,9 @@ application/upstream identity, and declared model identity. Operational
 scheduling knobs such as search-worker and GPU-worker limits are excluded.
 After a request manifest has been published, a deterministic immutable receipt
 binds this exact invocation to that manifest's path, byte size, and SHA-256.
-The manifest is always durable before its receipt.
+The manifest is always durable before its receipt. Receipt publication and
+loading enforce the same 64 MiB manifest ceiling, and manifest validation
+applies the seed/sample workload limit before expanding expected ranking rows.
 
 An exact receipt hit is the earliest fast path: the local entrypoint validates
 the receipt and referenced manifest directly through the output Volume, skips
@@ -962,8 +952,7 @@ Every successful presentation publishes one stable manifest at
 - request-seed ranking rows and direct references to canonical best files;
 - submitted and normalized seeds plus duplicates removed;
 - references to all requested canonical Seed Predictions;
-- the canonical-to-presentation name mapping;
-- referenced custom-template artifacts.
+- the canonical-to-presentation name mapping.
 
 It does not copy seed directories, ranking CSVs, best aliases, terms, or
 database template files, and it does not include unrelated completed seeds. No
@@ -996,14 +985,9 @@ presentation-specific identity.
 
 The archive includes every requested seed/sample directory, optional embeddings
 and distograms, locally generated request ranking and best aliases, enriched
-input, manifest, and referenced staged caller template files.
-
-Custom templates appear at `custom-templates/{sha256}.cif`. Only the downloaded
-input copy rewrites `mmcifPath` to those archive-relative paths.
-
-Caller inline and path-backed custom mmCIF use archive-relative paths.
-Database-search templates remain inline. The request manifest prevents
-unrelated custom templates from being downloaded.
+input, and manifest. Caller and database-search template mmCIF content remains
+inline in that enriched input; the archive has no `custom-templates/`
+directory.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each

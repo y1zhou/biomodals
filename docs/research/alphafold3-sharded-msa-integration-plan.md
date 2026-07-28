@@ -575,12 +575,12 @@ Before any remote work, the local helper:
 2. reads `unpairedMsaPath` and `pairedMsaPath` into inline strings and clears
    their path fields;
 3. reads `userCCDPath` into inline `userCCD` and clears its path;
-4. rejects any inline/path pair that is simultaneously populated;
-5. reads and hashes each custom template `mmcifPath`.
+4. reads every template `mmcifPath` into inline `mmcif` and clears its path;
+5. rejects any inline/path pair that is simultaneously populated.
 
 After search enrichment, construct an Inference Identity View by dumping the
 validated input with explicit defaults, removing only `name` and `modelSeeds`,
-and representing every custom template by content digest plus its mappings.
+and representing every inline template by content digest plus its mappings.
 
 The app-local `hash_sequences` helper derives `run_id` from:
 
@@ -595,15 +595,12 @@ It excludes display name, seeds, GPU class/count, worker counts, search policy,
 paths, and other scheduling controls. Supported GPU classes are deliberately
 cache-interchangeable and do not promise bitwise-identical outputs.
 
-After computing `run_id`, upload each path-backed custom template once as
-`custom-templates/{sha256}.cif`, rewrite the worker input to its mounted path,
-persist the neutral identity under `inputs/`, and persist the request's
-Enriched AlphaFold Input under its request directory:
+After computing `run_id`, persist the neutral identity under `inputs/` and the
+request's self-contained Enriched AlphaFold Input under its request directory:
 
 ```text
-/{run_id[:2]}/{run_id}/
+  /{run_id[:2]}/{run_id}/
   inputs/
-  custom-templates/
   outputs/
   requests/
   .markers/
@@ -684,10 +681,9 @@ creates:
 ```
 
 Downloaded copies replace the canonical `af3-{run_id[:16]}` basename prefix
-with the sanitized display name. The archive also contains every referenced
-`custom-templates/{sha256}.cif`; only the downloaded input copy rewrites its
-`mmcifPath` values to those archive-relative files. Durable Volume inputs,
-paths, and template files remain canonical.
+with the sanitized display name. Caller and database-search templates remain
+inline in the enriched input; no standalone template files are copied to the
+output Volume or archive.
 
 Each streamed artifact must match the manifest-declared byte size and SHA-256.
 The presentation manifest additionally binds each archive-local payload after
@@ -851,20 +847,19 @@ and unpaired-MSA digests, and the coordinator adds no retry loop.
 
 Commit: `fold: stage enriched AlphaFold inputs`
 
-Status: implemented; Volume staging, stable identity, custom-template
-retrieval, and strict upstream JSON parsing passed on 2026-07-27.
+Status: implemented; Volume staging, stable identity, inline-template
+canonicalization, and strict upstream JSON parsing passed locally.
 
-- inline caller MSA and CCD path inputs;
-- hash/upload custom templates;
+- inline caller MSA, CCD, and template path inputs;
 - implement `hash_sequences`, the normalized identity view, `run_id`, and
   request ID;
 - persist inputs under the hash-fanned output-Volume run root.
 
 The local materialization and identity seam now lives in
 `alphafold3/inference_inputs.py`. Before search submission it resolves every
-relative path against the input JSON, inlines protein/RNA MSA and custom CCD
-content, clears those path fields, rejects ambiguous inline/path pairs, and
-captures every path-backed custom-template byte string and SHA-256.
+relative path against the input JSON, inlines protein/RNA MSA, custom CCD, and
+template mmCIF content, clears those path fields, and rejects ambiguous
+inline/path pairs.
 It accepts only non-symlink regular files and bounds reads to 64 MiB for input
 JSON/custom mmCIF/user CCD and 512 MiB for each path-backed MSA.
 
@@ -879,21 +874,19 @@ requests. Recycles, diffusion samples, and GPU workers are bounded at 0--100,
 sample checks.
 
 After enrichment, the module validates and explicitly dumps the complete
-input, removes only `name` and `modelSeeds`, and represents inline and
-path-backed templates identically by content digest plus residue mappings.
+input, removes only `name` and `modelSeeds`, and represents every inline
+template by content digest plus residue mappings.
 `hash_sequences` length-frames canonical JSON fragments. The resulting
 `run_id` covers that view, recycle/sample counts, pinned app/upstream identity,
 the declared `AlphaFold3/af3.bin:v1` model label, and the run-identity schema.
 Seeds are normalized to a non-empty sorted unique tuple and only affect
 `request_id`.
 
-The prepared staging payload uses `/{run_id[:2]}/{run_id}/`, deduplicates
-custom templates at `custom-templates/{sha256}.cif`, rewrites worker paths to
-the mounted `AlphaFold3-outputs` location, and includes
-`inputs/identity.json` plus `requests/{request_id}/input.json`. The app uses
-Modal's local `Volume.batch_upload(force=True)` interface for those exact
-bytes. The output Volume is also mounted for inference so staged templates are
-readable; canonical seed-output publication remains Checklist 7.
+The prepared staging payload uses `/{run_id[:2]}/{run_id}/` and includes
+`inputs/identity.json` plus the self-contained
+`requests/{request_id}/input.json`. The app uses Modal's local
+`Volume.batch_upload(force=True)` interface for those exact bytes. Canonical
+seed-output publication remains Checklist 7.
 
 ### 7. Persist and reconcile seed predictions
 
@@ -953,8 +946,7 @@ files, terms, and a content-addressed copy of the observed global-summary
 marker. Its `manifest.json` is written last and records submitted/normalized
 seeds, removed duplicates, reused/newly published seeds, the observed global
 best, every requested sample file, optional seed outputs, per-artifact byte
-sizes and SHA-256 digests, and only the custom templates referenced by the
-enriched request input.
+sizes and SHA-256 digests.
 Before promotion, the finalizer snapshots the observed global-summary marker
 and verifies that the copied bytes still match the loaded marker digest; a
 concurrent summary expansion causes a clear retryable failure instead of
@@ -967,12 +959,10 @@ The local entrypoint streams only those Volume-relative manifest artifacts,
 rejects paths outside the hash-fanned run root, verifies each stream's declared
 size and SHA-256, and restores upstream's exact sanitized display-name prefix
 in downloaded basenames. The durable request input uses the canonical
-`af3-{run_id[:16]}` name and content-addressed `custom-templates/{sha256}.cif`
-paths, so callers with the same scientific input and seeds upload identical
-bytes even when their display names or original inline/path template
-representations differ. Only the downloaded input copy changes: it restores
-the current display name and rewrites staged `mmcifPath` values to
-archive-relative custom-template paths. The resulting
+`af3-{run_id[:16]}` name and inline template content, so callers with the same
+scientific input and seeds upload identical bytes even when their display names
+or original inline/path template representations differ. Only the downloaded
+input copy changes its display name. The resulting
 `{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after its exact member set and embedded
 presentation manifest validate, including every archive-local payload digest.

@@ -661,11 +661,13 @@ preflight before invoking upstream.
 
 The supported request envelope is also explicit: at most 5,120 expanded
 entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
-tasks, and a 1 GiB serialized staged input. The 5,120 bounds align with the
-largest default AlphaFold 3 compilation bucket documented by the pinned
-upstream revision. The CPU coordinator checks the conservative task upper bound
-before cache inspection, and inference workers repeat the staged-input byte
-check when loading from the output Volume.
+tasks, 1 GiB of custom-template content, and a 1 GiB serialized staged input.
+Identical custom-template content is counted once after canonicalization. The
+5,120 bounds align with the largest default AlphaFold 3 compilation bucket
+documented by the pinned upstream revision. The CPU coordinator checks the
+conservative task upper bound before cache inspection, and inference workers
+repeat the staged-input and custom-template byte checks when loading from the
+output Volume.
 
 For each custom mmCIF, the helper reads inline content or the caller's
 `mmcifPath` and computes its full SHA-256 before run identity.

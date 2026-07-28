@@ -11,6 +11,7 @@ from uniaf3.schema.alphafold3 import (
     AF3Ligand,
     AF3Protein,
     AF3SequenceEntry,
+    AF3Template,
 )
 
 from biomodals.app.fold import alphafold3_app
@@ -277,6 +278,44 @@ def test_local_materialization_rejects_path_backed_msa_symlink(
     input_path = _write_path_backed_msa_input(tmp_path, link_path.name)
 
     with pytest.raises(ValueError, match="must not be a symbolic link"):
+        materialize_local_input(input_path)
+
+
+def test_local_materialization_bounds_all_custom_templates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Path-backed templates should share one aggregate byte budget."""
+    template_paths = [tmp_path / f"template-{index}.cif" for index in range(2)]
+    for template_path in template_paths:
+        template_path.write_bytes(b"12345")
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        AF3Config(
+            name="bounded-templates",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        templates=[
+                            AF3Template(
+                                mmcifPath=template_path.name,
+                                queryIndices=[0],
+                                templateIndices=[0],
+                            )
+                            for template_path in template_paths
+                        ],
+                    )
+                )
+            ],
+        ).model_dump_json(exclude_none=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+
+    with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
         materialize_local_input(input_path)
 
 

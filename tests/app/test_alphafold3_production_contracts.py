@@ -1633,6 +1633,93 @@ def test_staged_input_rechecks_the_serialized_input_limit(
         )
 
 
+def test_inference_staging_bounds_all_custom_templates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+    config = AF3Config(
+        name="bounded-template-staging",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    templates=[
+                        AF3Template(
+                            mmcif="12345",
+                            queryIndices=[0],
+                            templateIndices=[0],
+                        ),
+                        AF3Template(
+                            mmcif="67890",
+                            queryIndices=[1],
+                            templateIndices=[1],
+                        ),
+                    ],
+                )
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
+        prepare_inference_run(
+            config,
+            (),
+            output_mount_root=tmp_path / "output",
+            recycle=1,
+            sample=1,
+        )
+
+
+def test_staged_input_rechecks_the_custom_template_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "output"
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="bounded-template-reload",
+            modelSeeds=[1],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        templates=[
+                            AF3Template(
+                                mmcif="12345",
+                                queryIndices=[0],
+                                templateIndices=[0],
+                            ),
+                            AF3Template(
+                                mmcif="67890",
+                                queryIndices=[1],
+                                templateIndices=[1],
+                            ),
+                        ],
+                    )
+                )
+            ],
+        ),
+        (),
+        output_mount_root=output_root,
+        recycle=1,
+        sample=1,
+    )
+    _materialize_prepared_run(output_root, prepared)
+    monkeypatch.setattr(inference_inputs, "MAX_CUSTOM_TEMPLATE_TOTAL_BYTES", 8)
+
+    with pytest.raises(ValueError, match="custom templates exceed the 8-byte limit"):
+        load_staged_inference_input(
+            output_root,
+            run_id=prepared.run_id,
+            request_id=prepared.request_id,
+            staged_input_record=prepared.staged_input.to_record(),
+        )
+
+
 def test_staging_canonicalizes_equivalent_inline_and_path_templates(
     tmp_path: Path,
 ) -> None:

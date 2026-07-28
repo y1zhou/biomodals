@@ -42,6 +42,7 @@ MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = 512 * 1024 * 1024
 MAX_STAGED_INPUT_BYTES = 1024 * 1024 * 1024
 MAX_CUSTOM_TEMPLATE_BYTES = 64 * 1024 * 1024
+MAX_CUSTOM_TEMPLATE_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_USER_CCD_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_ENTITIES = 5_120
 MAX_TOTAL_POLYMER_RESIDUES = 5_120
@@ -428,6 +429,13 @@ def _materialize_text_pair(
     setattr(owner, path_field, None)
 
 
+def _validate_custom_template_total(size_bytes: int) -> None:
+    if size_bytes > MAX_CUSTOM_TEMPLATE_TOTAL_BYTES:
+        raise ValueError(
+            f"custom templates exceed the {MAX_CUSTOM_TEMPLATE_TOTAL_BYTES}-byte limit"
+        )
+
+
 def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
     """Resolve every caller-local path needed before remote work."""
     path = _resolve_regular_file(
@@ -444,7 +452,8 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
         )
     )
 
-    custom_templates: list[LocalTemplateFile] = []
+    custom_templates: dict[Path, LocalTemplateFile] = {}
+    custom_template_bytes = 0
     for chain_index, entry in enumerate(conf.sequences):
         if (protein := entry.protein) is not None:
             _materialize_text_pair(
@@ -474,22 +483,23 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
                         f"templates[{template_index}].mmcifPath"
                     ),
                 )
-                content = _read_bounded_bytes(
-                    template_path,
-                    field_name=(
-                        f"sequences[{chain_index}].protein."
-                        f"templates[{template_index}].mmcifPath"
-                    ),
-                    max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
-                )
-                template.mmcifPath = str(template_path)
-                custom_templates.append(
-                    LocalTemplateFile(
+                if template_path not in custom_templates:
+                    content = _read_bounded_bytes(
+                        template_path,
+                        field_name=(
+                            f"sequences[{chain_index}].protein."
+                            f"templates[{template_index}].mmcifPath"
+                        ),
+                        max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
+                    )
+                    custom_template_bytes += len(content)
+                    _validate_custom_template_total(custom_template_bytes)
+                    custom_templates[template_path] = LocalTemplateFile(
                         source_path=template_path,
                         content=content,
                         sha256=sha256_bytes(content),
                     )
-                )
+                template.mmcifPath = str(template_path)
         elif (rna := entry.rna) is not None:
             _materialize_text_pair(
                 rna,
@@ -519,7 +529,7 @@ def materialize_local_input(config_path: str | Path) -> MaterializedLocalInput:
     _validate_inline_inputs(validated)
     return MaterializedLocalInput(
         config=validated,
-        custom_templates=tuple(custom_templates),
+        custom_templates=tuple(custom_templates.values()),
     )
 
 
@@ -746,6 +756,7 @@ def prepare_inference_run(
             template.mmcif = None
             template.mmcifPath = str(mount_root / Path(relative_path.as_posix()))
 
+    _validate_custom_template_total(sum(len(uploads[path]) for path in template_paths))
     staged_conf = validate_upstream_af3_input(staged_conf)
     identity_path = run_root / "inputs" / "identity.json"
     input_path = run_root / "requests" / request_id / "input.json"
@@ -838,6 +849,7 @@ def _staged_template_files(
         raise ValueError("Staged custom_templates must be a list")
     template_root = run_root / "custom-templates"
     files_by_path: dict[PurePosixPath, LocalTemplateFile] = {}
+    custom_template_bytes = 0
     for raw_record in raw_records:
         if not isinstance(raw_record, dict):
             raise ValueError("Invalid staged custom-template record")
@@ -861,6 +873,8 @@ def _staged_template_files(
             relative_path,
             max_bytes=MAX_CUSTOM_TEMPLATE_BYTES,
         )
+        custom_template_bytes += len(content)
+        _validate_custom_template_total(custom_template_bytes)
         files_by_path[relative_path] = LocalTemplateFile(
             source_path=output_root / Path(relative_path.as_posix()),
             content=content,

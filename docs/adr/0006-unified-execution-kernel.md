@@ -237,6 +237,18 @@ terminal, the dependent Node becomes `skipped`. Explicit Run cancellation
 takes precedence and marks unfinished Nodes `cancelled` rather than obscuring
 the cancellation through skip propagation.
 
+The Node aggregation policy was accepted on 2026-07-29. Every Node declares
+exactly one of `fail_fast`, `collect_all`, or `allow_partial`. On the first
+Task failure, `fail_fast` stops admitting pending siblings, marks unowned
+siblings `skipped`, lets already-owned work finish without cancellation, and
+then fails the Node. `collect_all` admits every Task subject to resource
+budgets and fails the Node if any Task fails. `allow_partial` also admits every
+Task: all successes produce `succeeded`, a mixture of successes and failures
+produces `partial`, and no successes produces `failed`. Cache-validated Tasks
+count as successes. Explicit Run cancellation and result pruning take
+precedence over aggregation. None of these policies retries a Task or releases
+uncertain ownership.
+
 The result-boundary policy was accepted on 2026-07-29. Terminal Execution
 Nodes—the DAG leaves with no downstream dependency—collectively define the
 scientific result boundary. The scheduler validates their workload

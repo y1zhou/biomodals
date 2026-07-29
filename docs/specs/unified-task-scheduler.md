@@ -1064,14 +1064,22 @@ recoverable prepare/publish/finalize protocol.
 
 Nodes declare one of three workload-selected aggregation policies:
 
-- `fail_fast`: stop admitting sibling Tasks after the first terminal failure;
-- `collect_all`: allow all admitted Tasks to finish and report every outcome;
-- `allow_partial`: publish an explicit partial result that downstream nodes
-  may consume only through an `accept_partial` dependency edge.
+- `fail_fast`: the first failed Task stops new admission; unowned pending
+  siblings become `skipped`, already-owned Tasks continue without
+  cancellation, and the Node becomes `failed` after every owner is
+  conclusive;
+- `collect_all`: admit every Task subject to resource budgets; all successes
+  produce `succeeded`, while any failure produces `failed`;
+- `allow_partial`: admit every Task; all successes produce `succeeded`, some
+  successes and some failures produce `partial`, and no successes produce
+  `failed`.
 
-These policies do not authorize another submission. A failed Task remains
-failed for that Execution Run; retry requires an explicit Successor Execution
-Run.
+Cache-validated Tasks count as successes. A partial Node publication may be
+consumed downstream only through an `accept_partial` dependency edge.
+Explicit Run cancellation and result pruning take precedence over aggregation.
+These policies neither cancel already-owned work nor authorize another
+submission. A failed Task remains failed for that Execution Run; retry
+requires an explicit Successor Execution Run.
 
 ## Correctness work before extraction
 
@@ -1185,6 +1193,7 @@ Phase 0 test inventory:
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
+| `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; cache hits count as successes; cancellation and pruning take precedence |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1237,6 +1246,8 @@ Deliverables:
   ancestor work;
 - derive strict terminal aggregation and Successor Repair Closures without
   mutating predecessor state;
+- implement pure `fail_fast`, `collect_all`, and `allow_partial` Task
+  aggregation decisions;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1269,6 +1280,8 @@ Deliverables:
   `expired` states;
 - persist `result_already_satisfied` on pruned Nodes and Tasks, and reconcile
   active owners before terminal Run completion;
+- persist Node aggregation outcomes only after all required Task ownership is
+  conclusive;
 - enforce Node-local dispatch, zero-to-many Tasks per Provider Call, and at
   most one durable remote owner path per Task without a generic many-to-many
   call association;
@@ -1920,6 +1933,13 @@ after each decision:
     calls retain ownership and are not cancelled. There is no automatic retry;
     explicit `resume` repeats validation. `state_unknown` remains reserved for
     ambiguous provider submission, call, or cancellation ownership.
+46. **Node aggregation policies — accepted 2026-07-29**: `fail_fast` stops
+    new admission after the first failure, skips unowned siblings, drains
+    owned work without cancellation, and fails the Node. `collect_all` admits
+    every Task and fails on any failure. `allow_partial` admits every Task,
+    succeeds when all succeed, is partial when some succeed and some fail, and
+    fails when none succeed. Cache hits count as successes; explicit
+    cancellation and result pruning take precedence; no policy retries work.
 
 ## Definition of ready for implementation
 

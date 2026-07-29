@@ -121,6 +121,14 @@ always satisfies the edge; a partial upstream Node satisfies it only when the
 edge opts in. Failed, cancelled, and skipped outcomes never satisfy it.
 _Avoid_: global partial mode, implicit best effort, accepted-status set
 
+**Node Aggregation Policy** [planned]:
+The immutable `fail_fast`, `collect_all`, or `allow_partial` rule by which one
+Execution Node admits Tasks and derives its outcome. Fail-fast stops new
+admission without cancelling owned work; collect-all is strict after every
+Task finishes; allow-partial succeeds partially only when at least one Task
+succeeds.
+_Avoid_: same-Run retry policy, implicit cancellation, arbitrary success threshold
+
 **Task**:
 The smallest independently scheduled and validated work item in an Execution
 Node whose cached publication and outcome can be observed. Every Task belongs

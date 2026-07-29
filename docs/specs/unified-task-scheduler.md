@@ -407,8 +407,8 @@ The kernel uses exactly six Task statuses:
 | `running` | No | Durably owned by local execution, a Provider Call, or a Worker Assignment |
 | `succeeded` | Yes | The required Workload Publication was validated |
 | `failed` | Yes | Execution or publication validation conclusively failed |
-| `cancelled` | Yes | Explicit Run cancellation stopped the Task |
-| `skipped` | Yes | The Node's `fail_fast` policy stopped it before admission |
+| `cancelled` | Yes | Explicit cancellation or result pruning stopped owned Task work |
+| `skipped` | Yes | Admission stopped before the Task acquired an execution owner |
 
 Provider submission and attachment phases belong to the Provider Call rather
 than the Task. If the owner's outcome becomes unknown, the Task remains
@@ -417,6 +417,24 @@ does not become eligible for replacement work. Task success records whether it
 came from cache validation or execution as provenance, not as a `cached`
 status. Individual Tasks are never `partial`; the Node aggregation policy
 derives partiality.
+
+Result pruning applies the same ownership boundary at Task granularity:
+
+- do not create rows for Tasks that were never discovered;
+- mark discovered, pending, unowned Tasks `skipped` with
+  `status_reason=result_already_satisfied`;
+- keep owned Tasks `running` until their Provider Call or Worker Assignment is
+  conclusive;
+- mark an owned Task `cancelled` with the same reason only when cancellation
+  wins; if execution or publication validation completes first, retain that
+  observed terminal outcome;
+- never rewrite an already-terminal Task;
+- preserve `running` ownership and set the Run to `state_unknown` when
+  ownership or cancellation remains unknown.
+
+`result_already_satisfied` is the only initial Task `status_reason` and is
+valid only with `skipped` or `cancelled`. Every other Task status requires a
+null reason; Task failure diagnostics remain in its error record.
 
 ## Responsibility boundary
 
@@ -1116,7 +1134,7 @@ Phase 0 test inventory:
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; traversal starts from incomplete terminals; complete terminal results prune pending ancestors; historical outcomes remain; running owners are reconciled before success; unknown cancellation blocks completion |
-| `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
+| `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1163,8 +1181,8 @@ Deliverables:
   `accept_partial` boolean per edge;
 - derive the terminal result boundary from DAG leaves and prune ancestor work
   backward from validated terminal publications;
-- persist `result_already_satisfied` for pruned Nodes and reconcile active
-  Provider Calls before terminal Run completion;
+- derive deterministic pruning decisions for pending, active, and terminal
+  ancestor work;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1193,6 +1211,8 @@ Deliverables:
   `status_message`;
 - implement the eight-status Provider Call lifecycle without `planned` or
   `expired` states;
+- persist `result_already_satisfied` on pruned Nodes and Tasks, and reconcile
+  active owners before terminal Run completion;
 - enforce Node-local dispatch, zero-to-many Tasks per Provider Call, and at
   most one durable remote owner path per Task without a generic many-to-many
   call association;
@@ -1742,14 +1762,15 @@ after each decision:
     only the first two are nonterminal. Readiness is derived, cache reuse is
     Task provenance on a successful Node, and Run-level cancellation request,
     suspension, and unknown state are not duplicated onto Nodes. `skipped`
-    means an upstream terminal outcome made a planned Node unreachable.
+    means an upstream terminal outcome made a planned Node unreachable or a
+    complete terminal result pruned it before work started.
 33. **Task statuses — accepted 2026-07-29**: Tasks use `pending`, `running`,
     `succeeded`, `failed`, `cancelled`, and `skipped`; only the first two are
     nonterminal. Durable local or provider ownership moves a Task to
     `running`, which is retained while the owner is uncertain. Cache reuse is
     success provenance, partiality belongs to Node aggregation, provider
-    submission phases stay on Provider Calls, and `skipped` is reserved for
-    sibling Tasks not admitted after `fail_fast`.
+    submission phases stay on Provider Calls, and `skipped` represents unowned
+    Tasks not admitted after `fail_fast` or result pruning.
 34. **Node, Task, and Provider Call relationships — accepted 2026-07-29**:
     Nodes are fixed semantic stages, Tasks are independently scheduled and
     validated items, and Provider Calls are concrete remote worker
@@ -1813,6 +1834,13 @@ after each decision:
     terminal outcome wins its race. The Run stays `running` during cleanup,
     becomes `state_unknown` if cancellation is inconclusive, and still derives
     its final outcome from terminal scientific results.
+42. **Task-level result pruning — accepted 2026-07-29**: pruning creates no
+    undiscovered Task rows. Pending unowned Tasks become `skipped` with
+    `status_reason=result_already_satisfied`; owned Tasks remain `running`
+    until their owner is conclusive. Cancellation marks them `cancelled` with
+    the same reason, while execution or publication completion wins its race.
+    Terminal outcomes are preserved, and unknown ownership keeps the Task
+    `running` and the Run `state_unknown`.
 
 ## Definition of ready for implementation
 

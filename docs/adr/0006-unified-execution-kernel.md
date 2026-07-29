@@ -269,8 +269,21 @@ Provider uncertainty remains on that owner and projects the Run to
 `state_unknown`; it does not release the Task from `running`. `partial` is a
 Node aggregation result, provider submission phases remain Provider Call
 state, and cache reuse is success provenance rather than a Task status.
-`skipped` is reserved for sibling Tasks never admitted after a `fail_fast`
-failure.
+`skipped` represents unowned Tasks not admitted after a `fail_fast` failure or
+after result pruning; the latter carries
+`status_reason=result_already_satisfied`.
+
+The Task-level result-pruning policy was accepted on 2026-07-29. A pruned Node
+creates no records for Tasks it never discovered. Discovered pending Tasks
+without an owner become `skipped` with
+`status_reason=result_already_satisfied`. An owned Task remains `running`
+until its Provider Call or Worker Assignment reaches a conclusive outcome.
+Conclusive cancellation makes the Task `cancelled` with the same reason;
+success, failure, or a validated publication that wins the race is retained
+instead. Existing terminal Task outcomes never change. Unknown ownership or
+cancellation keeps the Task `running` and the Run `state_unknown`. These rules
+make pruning close every durable work record without inventing completion or
+releasing uncertain ownership.
 
 The Node, Task, and Provider Call relationship policy was accepted on
 2026-07-29. A Node is a fixed semantic DAG stage, a Task is one independently

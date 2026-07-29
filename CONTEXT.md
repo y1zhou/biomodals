@@ -113,6 +113,9 @@ The kernel lifecycle value for a Task: `pending`, `running`, `succeeded`,
 nonterminal. A Task becomes `running` when durable local or provider ownership
 is assigned and retains that status while its owner outcome is unknown.
 Partiality belongs to Node aggregation, and cache reuse is success provenance.
+The optional `status_reason=result_already_satisfied` identifies an unowned
+Task skipped or an owned Task cancelled because its terminal result no longer
+needed that ancestor work.
 _Avoid_: partial, cached, submitting, attached, state unknown
 
 **Single-Submission Rule** [planned]:

@@ -69,6 +69,13 @@ A non-user-requested loss or shutdown of the current Coordinator Attempt that
 requires a replacement Attempt to recover durable execution state.
 _Avoid_: Job cancellation, Task failure, Provider Call cancellation
 
+**Coordinator Ownership Generation** [planned]:
+One append-only grant allowing a remote Execution Coordinator invocation and
+its replacement Attempts to write a Volume-backed Execution State Repository.
+A successor is valid only after the preceding invocation is conclusively
+terminal.
+_Avoid_: timeout lease, SQLite file lock, Task Attempt
+
 **Service Job**:
 A user-facing API service record for ownership, admission, configuration,
 result delivery, and presentation that refers to an Execution Run without

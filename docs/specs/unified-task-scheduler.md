@@ -288,10 +288,24 @@ checkpoint. The current workflow exit behavior that cancels active child calls
 must be removed when it adopts this policy. Explicit user cancellation remains
 separate and may cancel those calls.
 
-Exactly one Coordinator Attempt may write one repository at a time. How a
-replacement Attempt proves exclusive write ownership is the next decision
-gate; it must not rely on concurrent writes to the same Volume-backed SQLite
-files.
+Exactly one Coordinator Ownership Generation may write one Volume-backed
+repository at a time:
+
+1. a remote coordinator invocation receives a stable generation ID in its
+   provider input;
+2. before opening SQLite, it atomically appends ownership in a
+   provider-accessible claim store;
+3. Modal replacement Attempts for that same input retain the generation;
+4. a separate invocation fails closed while the predecessor call is active or
+   unknown;
+5. a successor generation may be appended only after the predecessor call is
+   conclusively terminal;
+6. the current generation is revalidated before each Volume checkpoint.
+
+Ownership is not a timeout lease. A stuck or unobservable predecessor requires
+explicit cancellation or operator recovery before reassignment. The API
+service and local CLI coordinators use host-owned single-writer exclusion and
+do not need the Modal ownership adapter.
 
 ### Host-invariant execution state
 
@@ -592,6 +606,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
+| `tests/execution/test_ownership.py` | Same-input replacement retains ownership; active or unknown predecessor blocks; only terminal predecessor permits a successor |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -943,6 +958,7 @@ authorized smoke test after local and CI gates pass.
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
+| Two Coordinator Attempts write one Volume ledger | Acquire call-bound ownership before opening SQLite; never steal on elapsed time |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1010,9 +1026,14 @@ after each decision:
     scheduling without cancelling child calls. A Coordinator Attempt drains
     and checkpoints best-effort, correctness survives hard interruption, and
     a replacement recovers attached calls and permits from durable state.
-11. **Single-writer handoff — pending**: define how a replacement Coordinator
-    Attempt proves exclusive ownership before opening a Volume-backed SQLite
-    repository.
+11. **Single-writer handoff — accepted 2026-07-29**: Volume-backed remote
+    coordinators use append-only, call-bound ownership generations. The same
+    provider input retains ownership across preemption Attempts; another
+    invocation may succeed it only after conclusive predecessor termination.
+    Unknown state blocks, and elapsed time alone never transfers ownership.
+12. **Worker interruption — pending**: define how direct, batched, and
+    work-stealing Task assignments survive worker preemption or terminal
+    failure without relying on lifecycle callbacks.
 
 ## Definition of ready for implementation
 

@@ -98,6 +98,14 @@ from the last durable checkpoint. A replacement Attempt reloads execution
 state, reconstructs permits, and resolves attached calls by ID. Only an
 explicit user cancellation authorizes cancelling child calls.
 
+The single-writer policy was accepted on 2026-07-29. A Volume-backed remote
+coordinator must acquire an append-only, call-bound Coordinator Ownership
+Generation before opening SQLite. Replacement Attempts for the same provider
+input retain that generation. A different invocation may create a successor
+only after the predecessor call is conclusively terminal; unknown state fails
+closed and requires operator recovery. Ownership never transfers merely
+because time elapsed.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -145,6 +153,13 @@ correctness proof. Any transition that must precede an external side effect is
 committed through the host's durability boundary before that side effect, and
 an attached call ID is checkpointed promptly after submission. Preemption is
 therefore recovery, not implicit cancellation.
+
+A Modal-backed ownership adapter uses insert-only generation records in a
+provider-accessible coordination store. Host-exclusive coordinators such as
+the single-process API service use their existing ownership instead. This
+avoids concurrent access to one Volume-backed SQLite file without introducing
+a time-based distributed lease or pretending SQLite can fence writers before
+it is safely opened.
 
 This is an incremental extraction, not a rewrite. Internal types, tables, and
 imports may change directly while each consumer adopts the kernel. Scientific

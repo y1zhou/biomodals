@@ -377,6 +377,21 @@ describes ways to obtain scientific results, while validated terminal
 publications determine whether those results exist. It preserves fast cached
 return and the current workflow runtime's terminal-pruning semantics.
 
+After provider ownership and control states are conclusive, terminal Nodes
+aggregate strictly for that Execution Run:
+
+| Terminal result boundary | Run outcome |
+| --- | --- |
+| Every terminal Node is `succeeded` | `succeeded` |
+| Every terminal Node is `succeeded` or `partial`, and at least one is `partial` | `partial` |
+| At least one terminal Node is `failed` or `skipped`, and none is `cancelled` | `failed` |
+| At least one terminal Node is `cancelled` | `cancelled` |
+
+An upstream status never changes this table. If a subset of independent
+outputs is scientifically usable, the workload represents that fact with a
+terminal aggregation Node whose Node policy can produce `partial`; the kernel
+does not guess that an arbitrary subset is usable.
+
 Result pruning preserves ownership safety:
 
 - a pending unnecessary ancestor becomes `skipped` with
@@ -552,11 +567,17 @@ over `biomodals run restart`; it invokes the same successor operation rather
 than mutating the predecessor.
 
 A Successor Execution Run revalidates each expected Workload Publication.
-Valid successes become cache-satisfied Tasks. Missing or conclusively invalid
+Its repair closure starts at predecessor terminal Nodes in `partial`,
+`failed`, `skipped`, or `cancelled`, plus any `succeeded` terminal whose
+publication no longer validates. It walks backward through their ancestor
+closure and stops at complete reusable publications. Valid Task successes
+inside the closure become cache-satisfied Tasks; partial publications are not
+mistaken for complete terminal results. Missing or conclusively invalid
 publications are eligible for new Tasks only when predecessor ownership is
 conclusively terminal; active or unknown ownership blocks replacement. Once
 those Tasks succeed, previously untouched downstream Nodes become ready
-normally.
+normally. The predecessor remains terminal, and the successor receives its
+own independently aggregated outcome.
 
 Generic restart reuses the predecessor's stored immutable scientific plan.
 Launch-time `--restart-from` normalizes the supplied workload inputs and
@@ -1133,13 +1154,13 @@ Phase 0 test inventory:
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
-| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; traversal starts from incomplete terminals; complete terminal results prune pending ancestors; historical outcomes remain; running owners are reconciled before success; unknown cancellation blocks completion |
+| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; strict terminal aggregation ignores upstream history; complete results prune pending ancestors; running owners are reconciled before success; unknown cancellation blocks completion |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
-| `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; valid publications are reused; unknown or invalid predecessor state fails closed |
+| `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; non-successful terminals define a backward repair closure; valid publications are reused; unknown or invalid predecessor state fails closed |
 | `tests/execution/test_restart_compatibility.py` | Result-affecting input, content, and declared version changes reject successor creation; operational policy and Deployment Identity changes remain compatible; generic and launch-time restart use the same fingerprint |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
@@ -1183,6 +1204,8 @@ Deliverables:
   backward from validated terminal publications;
 - derive deterministic pruning decisions for pending, active, and terminal
   ancestor work;
+- derive strict terminal aggregation and Successor Repair Closures without
+  mutating predecessor state;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1841,6 +1864,15 @@ after each decision:
     the same reason, while execution or publication completion wins its race.
     Terminal outcomes are preserved, and unknown ownership keeps the Task
     `running` and the Run `state_unknown`.
+43. **Strict terminal aggregation and repair — accepted 2026-07-29**: within
+    one Run, all-successful terminals produce `succeeded`; only successful and
+    partial terminals produce `partial`; failed or skipped terminals produce
+    `failed`; and any cancelled terminal produces `cancelled`. Restart creates
+    a Successor Execution Run and traces backward from every predecessor
+    terminal that was partial, failed, skipped, or cancelled, plus any
+    successful terminal whose publication no longer validates. Complete
+    publications prune the repair closure, successful Task publications are
+    reused, and only conclusively unowned missing work is submitted.
 
 ## Definition of ready for implementation
 

@@ -61,6 +61,15 @@ Provider Call is conclusively terminal. It is the only way to retry failed
 provider work.
 _Avoid_: in-place migration, same-run retry, provider redelivery
 
+**Successor Repair Closure** [planned]:
+The union of the backward ancestor closures needed to repair predecessor
+terminal Nodes that were `partial`, `failed`, `skipped`, or `cancelled`, plus
+any previously successful terminal whose publication no longer validates.
+Traversal stops at complete reusable publications. Within the closure,
+successful Task publications are reused and only conclusively unowned missing
+work may be submitted in the Successor Execution Run.
+_Avoid_: rerun whole DAG, reopen predecessor, accept partial as complete
+
 **Suspended Run** [planned]:
 A nonterminal Execution Run whose coordinator stopped after an application
 error. It admits no new work until explicit resume reconciles durable state.

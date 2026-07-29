@@ -248,6 +248,21 @@ Intermediate lifecycle history remains available for diagnosis but is not an
 all-Node vote on the scientific outcome. This generalizes the workflow
 runtime's existing terminal-pruning behavior to every kernel consumer.
 
+The terminal-aggregation and repair policy was accepted on 2026-07-29. For one
+Execution Run, all-successful terminal Nodes produce `succeeded`; a boundary
+containing only `succeeded` and `partial` produces `partial` when at least one
+is partial; any `failed` or `skipped` terminal produces `failed`; and any
+`cancelled` terminal produces `cancelled`. Upstream outcomes do not enter this
+aggregation. A restart never reopens that result. It creates a Successor
+Execution Run whose repair closure starts from every predecessor terminal
+that was `partial`, `failed`, `skipped`, or `cancelled`, and from any
+previously successful terminal whose publication no longer validates. The
+successor walks backward to complete reusable publications, reuses successful
+Task publications inside the closure, and submits only conclusively unowned
+missing work. Unknown publication or predecessor ownership blocks new work
+rather than guessing. The successor is aggregated independently and may reach
+the same terminal outcome again.
+
 The result-pruning cleanup policy was accepted on 2026-07-29. A pending
 ancestor made unnecessary by a complete result becomes `skipped` with
 `status_reason=result_already_satisfied`; a previously terminal ancestor keeps

@@ -259,6 +259,19 @@ suspends under the result-validation policy, and a missing or invalid
 post-finalization publication fails the Node. Task aggregation policy does not
 infer an outcome for an empty set, and no synthetic Task row is created.
 
+The Task-discovery checkpoint policy was accepted on 2026-07-30. A workload's
+read-only `discover_tasks(node, inputs)` hook returns the complete finite set
+of `TaskPlan` values for that Node, each with a unique stable Node-local key
+and deterministic fingerprint. The repository validates and inserts all
+Tasks and marks the Node `discovery_complete` in one transaction. The host
+crosses its durability boundary before any Task may acquire a Provider Call,
+Worker Assignment, or local owner. A crash before that boundary exposes no
+paid work and recovery rediscovers the complete set; a crash after it reloads
+the persisted set and never invokes discovery again for that Node in the same
+Run. Empty discovery follows `allow_empty_result`. The first kernel version
+does not support streaming, incremental, or worker-side Task discovery, so a
+worker can never observe a half-populated SQLite queue.
+
 The result-boundary policy was accepted on 2026-07-29. Terminal Execution
 Nodes—the DAG leaves with no downstream dependency—collectively define the
 scientific result boundary. The scheduler validates their workload

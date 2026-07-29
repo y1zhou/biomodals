@@ -216,7 +216,8 @@ during migration.
 
 **Task** is the smallest independently identified unit whose cache and outcome
 can be reasoned about. Every Task belongs to exactly one Node, and Tasks may be
-discovered only when their containing Node starts.
+discovered only when their containing Node starts. Each has a stable
+Node-local key and deterministic fingerprint.
 
 **Single-Submission Rule** means the kernel schedules each Task once and
 creates at most one Provider Call submission or Worker Assignment for it in
@@ -467,6 +468,28 @@ Result pruning applies the same ownership boundary at Task granularity:
 `result_already_satisfied` is the only initial Task `status_reason` and is
 valid only with `skipped` or `cancelled`. Every other Task status requires a
 null reason; Task failure diagnostics remain in its error record.
+
+### Task discovery checkpoint
+
+The workload port exposes a read-only
+`discover_tasks(node, inputs) -> Sequence[TaskPlan]` hook. It returns the
+complete finite Task set for a Node. The kernel validates unique stable
+Node-local keys and deterministic fingerprints, then atomically inserts every
+Task and marks the Node `discovery_complete`.
+
+No Task can acquire a Provider Call, Worker Assignment, or local owner until
+that transaction and the host's durability boundary complete. For a
+Volume-backed repository, this includes the explicit Volume checkpoint. A
+crash before the boundary causes recovery to rediscover the whole set without
+having authorized paid work. A crash after the boundary reloads the persisted
+Tasks and never calls discovery again for that Node in the same Run. Empty
+sets follow `allow_empty_result`.
+
+The first kernel version has no streaming, incremental, paginated, or
+worker-side discovery. This deliberately keeps SQLite's ready queue complete
+and prevents workers from observing a partially discovered Node. Scientific
+ordering, when relevant, belongs in stable Task payloads rather than provider
+admission order.
 
 ## Responsibility boundary
 
@@ -829,6 +852,7 @@ work:
 - the immutable Deployment Identity used to recover provider calls;
 - the immutable Workload Plan Fingerprint and Task fingerprints;
 - dependency edges and legal execution states;
+- Node discovery-complete checkpoints and immutable Task plans;
 - submission tokens, provider targets, call IDs, and observed outcomes;
 - Node result observation timestamps and cache-versus-current-Run completion
   provenance, without workload publication contents;
@@ -1210,6 +1234,7 @@ Phase 0 test inventory:
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
+| `tests/execution/test_discovery.py` | Task keys and fingerprints are validated; discovery is all-or-nothing; no owner is admitted before host durability; pre-checkpoint recovery rediscovers; post-checkpoint recovery reloads without rediscovery |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1266,6 +1291,8 @@ Deliverables:
   mutating predecessor state;
 - implement pure `fail_fast`, `collect_all`, and `allow_partial` Task
   aggregation decisions;
+- define finite Node-owned Task discovery with stable keys and deterministic
+  fingerprints, without streaming or provider dependencies;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1305,6 +1332,8 @@ Deliverables:
   call association;
 - persist immutable Task plans and enforce one submission claim per Task per
   Execution Run;
+- insert each Node's complete Task set and `discovery_complete` marker
+  atomically, then cross host durability before admitting owners;
 - implement preclaim, spawn, attachment, observation, collection,
   cancellation, and unknown-outcome recovery behind the provider port;
 - reuse `ModalJobSubmitter`'s preclaim, attachment, and unknown-spawn
@@ -1965,6 +1994,14 @@ after each decision:
     succeeds, `unknown` suspends, and missing or invalid output fails. No
     synthetic Task is created, and Task aggregation never infers vacuous
     success.
+48. **Atomic Task discovery — accepted 2026-07-30**: a read-only workload hook
+    returns one complete finite Task set with unique stable Node-local keys and
+    deterministic fingerprints. The repository atomically inserts the set and
+    marks discovery complete, then crosses host durability before ownership.
+    Recovery before that boundary rediscovers the whole set; recovery after it
+    reloads without rediscovery. Empty discovery uses the declared empty-result
+    policy. Streaming, incremental, paginated, and worker-side discovery are
+    excluded from the first kernel version.
 
 ## Definition of ready for implementation
 

@@ -142,6 +142,14 @@ Node whose cached publication and outcome can be observed. Every Task belongs
 to exactly one Node.
 _Avoid_: workflow node, thread, untracked work item
 
+**Task Discovery Checkpoint** [planned]:
+The atomic per-Node repository transition that validates and inserts the
+complete finite set of `TaskPlan` records with unique stable Node-local keys,
+then marks discovery complete. The host durability boundary must be crossed
+before any Task can acquire an execution owner. Recovery either rediscovers
+the whole set or reloads the whole set, never a partial queue.
+_Avoid_: incremental Task creation, half-discovered queue, worker-side discovery
+
 **Task Status** [planned]:
 The kernel lifecycle value for a Task: `pending`, `running`, `succeeded`,
 `failed`, `cancelled`, or `skipped`. Only `pending` and `running` are

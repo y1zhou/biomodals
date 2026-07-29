@@ -66,7 +66,7 @@ never changes its Deployment Identity in place. The kernel continues to
 observe already attached calls by FunctionCall ID and validates any resulting
 Workload Publications. If the pinned coordinator version is unavailable while
 the run remains incomplete, the run becomes `failed` with
-`failure_reason=deployment_unavailable` and admits no new work. An explicit
+`status_reason=deployment_unavailable` and admits no new work. An explicit
 restart creates a Successor Execution Run with a newly resolved Deployment
 Identity and predecessor link. It revalidates publications and schedules only
 missing Tasks; active or unknown predecessor ownership blocks replacement
@@ -167,12 +167,20 @@ Execution Run statuses: `pending`, `running`, `cancel_requested`, `suspended`,
 five are nonterminal; the final four are terminal. An unexpected coordinator
 application error sets `suspended`; provider submission, state, or
 cancellation uncertainty sets `state_unknown`. Deployment unavailability is
-`failed` with `failure_reason=deployment_unavailable`, not a separate status.
+`failed` with `status_reason=deployment_unavailable`, not a separate status.
 Provider-call `outcome_unknown` remains lower-level detail. Provider
 preemption does not change Run status, finalization remains an ordinary
 running Node, and the kernel adds no `queued`, `finalizing`, generic `blocked`,
 `interrupted`, or `retrying` state. Service Job projections may retain
 user-facing labels without persisting another compute state machine.
+
+The Run-reason representation was accepted on 2026-07-29. Every Execution Run
+has one nullable, stable machine-readable `status_reason` and one nullable
+human-readable `status_message`. Repository transitions replace or clear both
+alongside `status`; control flow never parses `status_message`. Workload errors
+remain canonical on their Task or Node records, while the Run fields summarize
+only why the overall lifecycle changed. The kernel does not add separate
+failure, suspension, or unknown-reason columns.
 
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and

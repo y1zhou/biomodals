@@ -233,10 +233,20 @@ The kernel uses exactly nine Run statuses:
 | `failed` | Yes | Required work conclusively failed or the Run cannot continue |
 | `cancelled` | Yes | Cancellation completed conclusively |
 
-Structured reason and diagnostic fields refine these statuses. In particular,
-an unavailable pinned deployment is `failed` with
-`failure_reason=deployment_unavailable`. It is not a separate Run status.
+Two nullable fields refine the current status:
+
+- `status_reason` is a stable, machine-readable kernel code;
+- `status_message` is a human-readable diagnostic and is never control-flow
+  input.
+
+A repository transition atomically replaces or clears both fields with
+`status`. The allowed reason codes depend on the status. In particular, an
+unavailable pinned deployment is `failed` with
+`status_reason=deployment_unavailable`; it is not a separate Run status.
 Provider-call `outcome_unknown` projects to Run-level `state_unknown`.
+Task- and Node-specific errors remain canonical on those records. The Run
+fields summarize the lifecycle change without copying stack traces or detailed
+workload diagnostics. There are no status-specific reason columns.
 
 The primary transitions are:
 
@@ -580,7 +590,8 @@ work:
 - immutable plan and task fingerprints;
 - dependency edges and legal execution states;
 - submission tokens, provider targets, call IDs, and observed outcomes;
-- execution timestamps, errors, single-submission state, and resource permits;
+- execution timestamps, Run `status_reason` and `status_message`, Task and Node
+  errors, single-submission state, and resource permits;
 - workload execution payloads required to reconstruct a Task.
 
 They must not store:
@@ -927,7 +938,8 @@ Deliverables:
 
 - add `SqliteExecutionRepository` tables and transitions for Execution Runs,
   Nodes, Tasks, and Provider Calls over a host-supplied SQLite connection;
-- implement the nine-status Run transition table and structured status reasons;
+- implement the nine-status Run transition table, `status_reason`, and
+  `status_message`;
 - persist immutable Task plans and enforce one submission claim per Task per
   Execution Run;
 - implement preclaim, spawn, attachment, observation, collection,
@@ -1446,6 +1458,12 @@ after each decision:
     `failed` with reason `deployment_unavailable`; provider
     `outcome_unknown` projects to `state_unknown`. Preemption and finalization
     do not create Run statuses, and host Job labels remain derived projections.
+30. **Execution Run status reasons — accepted 2026-07-29**: a Run stores one
+    nullable stable `status_reason` code plus one nullable human-readable
+    `status_message`. Transitions replace or clear them atomically with
+    `status`, and control flow never parses the message. Task- and Node-specific
+    failures stay canonical on those records; there are no status-specific
+    reason columns.
 
 ## Definition of ready for implementation
 

@@ -33,6 +33,14 @@ The kernel lifecycle value for an Execution Run: `pending`, `running`,
 terminal. Structured reasons refine a status without creating another status.
 _Avoid_: queued, finalizing, blocked, interrupted
 
+**Execution Run Status Reason** [planned]:
+The optional stable, machine-readable `status_reason` code that explains the
+current Execution Run Status. An optional human-readable `status_message`
+provides diagnostics but is never used for control flow. Task- and
+Node-specific failures remain canonical on those records; the Run fields only
+summarize why its lifecycle changed.
+_Avoid_: status-specific reason columns, free-text state machine, copied stack trace
+
 **Successor Execution Run** [planned]:
 A new Execution Run created by an explicit restart of an eligible terminal
 Run. It records its predecessor, uses a newly resolved Deployment Identity and

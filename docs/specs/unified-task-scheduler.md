@@ -234,6 +234,49 @@ committed atomically, while a workflow can commit execution rows together with
 its Volume-backed ledger. If a host cannot share a transaction, its adapter
 must implement the same prepare/publish/finalize recovery protocol.
 
+### Workflow Ledger decomposition
+
+The existing physical workflow `ledger.sqlite3` file remains useful. The
+existing `WorkflowLedger` class and its generic execution schema should not
+remain as a parallel implementation.
+
+The target split is:
+
+| Current Workflow Ledger concern | Destination |
+| --- | --- |
+| `runs`, `nodes`, `attempts`, and `remote_calls` tables | Shared execution SQLite schema |
+| Run, Node, Task, Task Attempt, and Provider Call transitions | Shared execution repository implementation |
+| `RunStatus`, `NodeStatus`, Attempt records, placement, and recovery policy | Shared execution models, with temporary workflow re-exports if needed |
+| `artifacts`, `artifact_files`, `node_inputs`, and `node_outputs` tables | Workflow-specific run store |
+| `WorkflowArtifact`, `ArtifactSelector`, and materialized `AppRunResult` handling | Workflow-specific artifact module |
+| Run-root directories, reset behavior, connection closure, and Volume synchronization | Workflow-specific run store |
+| Finalizing execution state and artifacts together | One host-owned SQLite transaction spanning both implementations |
+
+This leaves one SQLite file per workflow run, not an execution database beside
+a workflow database. The file contains shared execution tables and
+workflow-specific artifact tables on the same connection.
+
+During migration, `WorkflowLedger` can be a compatibility facade so the
+runtime does not change in one large step. It must not become a permanent
+pass-through interface duplicating every execution repository method. Once
+callers use the kernel, either:
+
+- rename the remaining workflow-specific implementation to
+  `WorkflowRunStore`; or
+- delete the facade and let the workflow runtime compose the shared execution
+  repository with a narrow artifact store directly.
+
+The preferred end state is the second option if composition remains readable.
+The deletion test is that removing `WorkflowLedger` must not redistribute
+generic SQL or transition logic back into workflow callers.
+
+The service follows the same pattern. `JobState` and the user-facing Job
+envelope remain service concepts, while `job_operations` and
+`JobOperationState` are migrated to shared Execution Nodes, Tasks, Task
+Attempts, and Provider Calls. Service projections build the public timeline
+from shared execution rows instead of preserving a second operation state
+machine.
+
 ### Paid-call lifecycle
 
 The durable lifecycle must distinguish:
@@ -572,10 +615,11 @@ after each decision:
 1. **Authority boundary — accepted 2026-07-29**: the kernel owns execution
    mechanics and its durable state contract, while host stores and scientific
    publications retain their established authority.
-2. **Repository scope**: should repositories follow durable coordinator
-   boundaries: one database for the API service, the existing per-run database
-   for each workflow orchestrator, and no app-owned database unless an app
-   independently schedules recoverable nested Tasks? Recommendation: yes.
+2. **Repository scope and Workflow Ledger decomposition**: should repositories
+   follow durable coordinator boundaries, while the current `WorkflowLedger`
+   gives its generic tables and transitions to the shared execution
+   repository and retains only workflow artifacts and Volume lifecycle?
+   Recommendation: yes.
 3. **Repository implementation**: should the kernel provide one reusable,
    embeddable SQLite execution repository for those durable coordinators?
    Recommendation: yes.

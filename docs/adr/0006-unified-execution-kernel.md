@@ -26,6 +26,14 @@ per-run ledger because its remote workflow orchestrator is a separate durable
 coordinator. An app needs another repository only if it independently owns
 nested, recoverable scheduling; simple app calls do not create databases.
 
+Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
+separate workflow implementation of generic execution state. The shared
+execution repository should own run, node, task, attempt, and provider-call
+tables and transitions inside that file. Workflow code should retain only its
+artifact records, run-directory lifecycle, and Modal Volume synchronization.
+The current `WorkflowLedger` may serve as a compatibility facade during
+migration, then shrink into a workflow run store or be removed.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG

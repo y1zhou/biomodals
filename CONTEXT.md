@@ -52,6 +52,23 @@ Calls governed by the execution kernel's transition contract. Each durable
 coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
+**Execution Coordinator** [planned]:
+The logical scheduling authority that serializes transitions in an Execution
+State Repository and drives its Execution Runs. It outlives any process or
+container temporarily performing that work.
+_Avoid_: worker, SQLite writer container, Provider Call
+
+**Coordinator Attempt** [planned]:
+One continuous tenure in which a process or container acts for an Execution
+Coordinator. An interruption ends the Attempt without cancelling the
+Coordinator's Runs or child Provider Calls.
+_Avoid_: Task Attempt, automatic retry, Execution Run
+
+**Coordinator Interruption** [planned]:
+A non-user-requested loss or shutdown of the current Coordinator Attempt that
+requires a replacement Attempt to recover durable execution state.
+_Avoid_: Job cancellation, Task failure, Provider Call cancellation
+
 **Service Job**:
 A user-facing API service record for ownership, admission, configuration,
 result delivery, and presentation that refers to an Execution Run without

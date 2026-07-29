@@ -94,6 +94,8 @@ These existing decisions remain binding during the refactor:
 - Provider workers never write the coordinator's SQLite repository.
 - A Remote Work Queue is disposable dispatch transport, not durable Task state
   or scientific completion evidence.
+- Coordinator Interruption suspends scheduling and preserves attached child
+  Provider Calls; only explicit cancellation terminates them.
 - No paid Modal calls run in CI.
 
 ## Proposed domain model
@@ -256,6 +258,40 @@ The first implementation has no persistence protocol. Tests exercise the
 production repository through an in-memory SQLite connection. If a second real
 backend later appears, its requirements provide evidence for extracting a
 smaller, proven persistence interface instead of guessing one now.
+
+### Coordinator interruption and checkpoints
+
+An Execution Coordinator is a logical scheduling authority that may span
+several Coordinator Attempts. Modal preemption, infrastructure loss, or a hard
+container shutdown ends an Attempt; it does not cancel the Execution Run or
+its attached child Provider Calls.
+
+A graceful interruption handler performs best-effort draining:
+
+1. stop admitting new Tasks and Dispatch Batches;
+2. finish or roll back the current SQLite transaction;
+3. close or checkpoint SQLite and cross the host's explicit durability
+   boundary;
+4. leave attached child Provider Calls running;
+5. exit without projecting the Run as cancelled.
+
+A replacement Attempt reloads the latest durable repository, reconstructs
+active permits and batches, resolves attached calls by ID, and resumes
+observation. Correctness must also survive a hard kill before the handler runs
+or finishes. Lifecycle hooks and background Volume commits reduce lost
+progress but are not correctness boundaries.
+
+For a Volume-backed repository, a local SQLite commit is not sufficient when
+ordering state against a provider side effect. Required preclaims and call
+attachments must be made visible through an explicit, serialized Volume
+checkpoint. The current workflow exit behavior that cancels active child calls
+must be removed when it adopts this policy. Explicit user cancellation remains
+separate and may cancel those calls.
+
+Exactly one Coordinator Attempt may write one repository at a time. How a
+replacement Attempt proves exclusive write ownership is the next decision
+gate; it must not rely on concurrent writes to the same Volume-backed SQLite
+files.
 
 ### Host-invariant execution state
 
@@ -477,6 +513,9 @@ characterization tests:
 4. `CONTEXT.md` says `WorkflowLedger` records fan-out tasks, but its schema
    does not yet contain task rows. Keep the term marked planned until the
    durable-task phase implements it.
+5. `WorkflowOrchestrator.exit()` currently cancels active remote calls during
+   every container exit. Separate interruption from explicit cancellation and
+   preserve attached calls for replacement-attempt recovery.
 
 Fault-injection tests must stop immediately after preclaim, spawn, attachment,
 collection, decode, publication, and final commit. Each restart assertion must
@@ -551,6 +590,8 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after durable claim but before attachment does not submit replacement work |
 | `tests/workflow/test_runtime.py` | A recorded call ID is resolved and collected instead of resubmitted |
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
+| `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
+| `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -568,6 +609,8 @@ Deliverables:
 - preclaim workflow remote submission and preserve submission outcome unknown;
 - finalize a successful workflow call, processed result, artifacts, Task
   Attempt, and Node under one recoverable synchronization protocol;
+- stop cancelling attached child calls from the orchestrator exit hook and
+  checkpoint best-effort instead;
 - add explicit tests that no restart automatically duplicates uncertain work.
 
 Exit gate:
@@ -833,8 +876,10 @@ Files:
 - `src/biomodals/workflow/core/ledger.py`
 - `src/biomodals/workflow/core/_runtime/remote_calls.py`
 - `src/biomodals/workflow/core/_runtime/node_runner.py`
+- `src/biomodals/workflow/core/orchestrator.py`
 - `tests/workflow/test_ledger.py`
 - `tests/workflow/test_runtime.py`
+- `tests/workflow/test_orchestrator.py`
 
 Change:
 
@@ -843,6 +888,7 @@ Change:
 - leave an unattached or interrupted submission explicitly outcome-unknown;
 - finalize the processed result, artifacts, Task Attempt, Node, and Provider
   Call in one host transaction and Volume synchronization boundary;
+- replace exit-time child cancellation with best-effort drain and checkpoint;
 - remove the earlier transition that marks a call succeeded before its result
   is recoverable;
 - add the fault-injection cases from the Phase 0 inventory.
@@ -855,8 +901,10 @@ prek run --files \
   src/biomodals/workflow/core/ledger.py \
   src/biomodals/workflow/core/_runtime/remote_calls.py \
   src/biomodals/workflow/core/_runtime/node_runner.py \
+  src/biomodals/workflow/core/orchestrator.py \
   tests/workflow/test_ledger.py \
-  tests/workflow/test_runtime.py
+  tests/workflow/test_runtime.py \
+  tests/workflow/test_orchestrator.py
 ```
 
 Rollback: revert the commit and recreate any unfinished workflow ledger
@@ -871,6 +919,7 @@ written by it. No compatibility reader is required.
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
 | Batching | Call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
 | Dispatch | Direct fan-out, many-call work pools, realized Task attribution, queue loss and duplicate delivery |
+| Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from Task permits, batched permit accounting, no permit leak on failure |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
 | Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, resume and force behavior |
@@ -893,6 +942,7 @@ authorized smoke test after local and CI gates pass.
 | A Remote Work Queue is mistaken for durable state | Persist Dispatch Batches and reconcile returned outcomes or validated publications |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
+| Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -956,15 +1006,20 @@ after each decision:
    proven, BoltzGen adopts reusable direct fan-out and Rosetta adopts a
    queue-backed work-pool adapter. SQLite remains the single-writer control
    plane while Modal Queue remains disposable remote dispatch transport.
-10. **Coordinator interruption — pending**: define checkpoint, shutdown, child
-    call, and replacement-coordinator behavior for Modal preemption.
+10. **Coordinator interruption — accepted 2026-07-29**: preemption suspends
+    scheduling without cancelling child calls. A Coordinator Attempt drains
+    and checkpoints best-effort, correctness survives hard interruption, and
+    a replacement recovers attached calls and permits from durable state.
+11. **Single-writer handoff — pending**: define how a replacement Coordinator
+    Attempt proves exclusive ownership before opening a Volume-backed SQLite
+    repository.
 
 ## Definition of ready for implementation
 
 Implementation begins only when:
 
 - ADR 0006 is accepted;
-- the ten decision gates are resolved;
+- all decision gates are resolved;
 - the proposed execution terms are reconciled into `CONTEXT.md`;
 - Phase 0 scientific, cost-safety, and user-visible regression fixtures plus
   fault-injection points are enumerated as test cases;

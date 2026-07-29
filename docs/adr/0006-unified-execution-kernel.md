@@ -90,6 +90,14 @@ queue-backed work-stealing case. Provider queues remain disposable dispatch
 transport; they do not become execution authority, and provider workers do
 not write the coordinator's SQLite repository.
 
+The interruption policy was accepted on 2026-07-29. A Modal preemption ends
+one Coordinator Attempt but does not cancel its Execution Runs or attached
+child Provider Calls. The Attempt stops admitting work and checkpoints
+best-effort during graceful shutdown; correctness also survives a hard kill
+from the last durable checkpoint. A replacement Attempt reloads execution
+state, reconstructs permits, and resolves attached calls by ID. Only an
+explicit user cancellation authorizes cancelling child calls.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -130,6 +138,13 @@ Dispatch Batch relates Task Attempts to one or more Provider Calls without
 pretending that a transient queue is a database. Workload code retains task
 identity, batch compatibility, execution, and publication validation; shared
 adapters own reusable fan-out and worker-pool mechanics.
+
+An Execution Coordinator is logical and may span several Coordinator Attempts.
+Graceful lifecycle hooks improve checkpoint freshness but are not part of the
+correctness proof. Any transition that must precede an external side effect is
+committed through the host's durability boundary before that side effect, and
+an attached call ID is checkpointed promptly after submission. Preemption is
+therefore recovery, not implicit cancellation.
 
 This is an incremental extraction, not a rewrite. Internal types, tables, and
 imports may change directly while each consumer adopts the kernel. Scientific

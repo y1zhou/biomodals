@@ -40,6 +40,12 @@ Calls governed by the execution kernel's transition contract. Each durable
 coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
+**Service Job**:
+A user-facing API service record for ownership, admission, configuration,
+result delivery, and presentation that refers to an Execution Run without
+becoming part of it.
+_Avoid_: Execution Run, Task, provider call
+
 **Workload Publication**:
 Workload-owned durable evidence that a Task's scientific output is complete
 and reusable.
@@ -482,5 +488,6 @@ _Avoid_: temporary scratch, local cache
 - "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for shared child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
 - "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each durable coordinator may persist it separately and **Workload Publications** remain authoritative for scientific completion.
+- "job" can mean a user-facing service request or actual scheduled work. Resolved: a **Service Job** holds service metadata and refers one-way to an **Execution Run**; the execution kernel knows only the Run and its work.
 - "Workflow Ledger" can mean either the physical per-run database or a workflow-specific implementation of execution state. Resolved: it names the physical database; shared execution tables come from the execution kernel, while the **Workflow Artifact Store** owns only workflow artifact records.
 - "positions marked for RFdiffusion to generate scaffolds for" can mean every RFdiffusion output residue or only de novo contig residues. Resolved: use **LigandMPNN Redesign Set** for de novo output residues and exclude copied motif residues.

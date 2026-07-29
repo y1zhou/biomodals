@@ -50,6 +50,14 @@ internal shared module with no compatibility promise for Python imports,
 unfinished database schemas, or in-progress run formats. Its interface remains
 small for depth, locality, and testability rather than external stability.
 
+The service-invariance rule was accepted on 2026-07-29. Execution tables store
+only facts required to schedule, recover, and account for actual work. They
+contain no user, API Job, display, authentication, administrator, HTTP, or
+workflow-artifact metadata and have no foreign keys back to host tables. A
+Service Job or Workflow Artifact Store may refer to execution IDs in the
+opposite direction. Physical colocation in one SQLite file does not weaken
+this dependency rule.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG

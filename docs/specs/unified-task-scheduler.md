@@ -207,7 +207,7 @@ Repository scope follows the coordinator boundary:
 
 | Coordinator | Repository scope | Execution authority | Separate authority |
 | --- | --- | --- | --- |
-| API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Job-owned Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, admission, runtime configuration, and result cache remain service-owned |
+| API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Service-coordinated Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, Jobs, admission, runtime configuration, and result cache remain service-owned |
 | Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
 | Nested app coordinator | None for a simple app call; a durable repository only when the app independently schedules recoverable child work | Nested Tasks, Task Attempts, batches, and child calls | AlphaFold3 claims and validated publications remain scientific authority |
 
@@ -241,6 +241,44 @@ The first implementation has no persistence protocol. Tests exercise the
 production repository through an in-memory SQLite connection. If a second real
 backend later appears, its requirements provide evidence for extracting a
 smaller, proven persistence interface instead of guessing one now.
+
+### Host-invariant execution state
+
+Physical colocation does not make service metadata part of the execution
+model. Dependencies point toward execution IDs only:
+
+```text
+Service Job ───────────────┐
+                          ├──> Execution Run -> Node -> Task -> Task Attempt
+Workflow Artifact Store ──┘                              └-> Provider Call
+
+Execution tables --X--> Service Job, user, HTTP, admin, or artifact tables
+```
+
+Execution tables may store only data needed to reconstruct and manage actual
+work:
+
+- stable run, node, task, attempt, and call identifiers;
+- immutable plan and task fingerprints;
+- dependency edges and legal execution states;
+- submission tokens, provider targets, call IDs, and observed outcomes;
+- execution timestamps, errors, retry authorization, and resource permits;
+- workload execution payloads required to reconstruct a Task.
+
+They must not store:
+
+- service user or Job ownership;
+- display names, UI labels, or HTTP state;
+- administrator configuration or the source of a resolved provider setting;
+- result-download policy or service cache-management fields;
+- workflow artifact schemas, selectors, or presentation metadata;
+- arbitrary host `metadata_json` bags.
+
+The service owns a one-way `execution_run_id` reference from a Service Job.
+Workflow artifact rows may similarly refer to producing execution IDs.
+Resolved provider bindings may be recorded because they determine actual
+execution, but the kernel is invariant to whether those values came from an
+administrator setting, CLI option, or workload default.
 
 ### Workflow Ledger decomposition
 
@@ -278,12 +316,12 @@ The preferred end state is the second option if composition remains readable.
 The deletion test is that removing `WorkflowLedger` must not redistribute
 generic SQL or transition logic back into workflow callers.
 
-The service follows the same pattern. `JobState` and the user-facing Job
-envelope remain service concepts, while `job_operations` and
-`JobOperationState` are migrated to shared Execution Nodes, Tasks, Task
-Attempts, and Provider Calls. Service projections build the public timeline
-from shared execution rows instead of preserving a second operation state
-machine.
+The service follows the same pattern. `JobState` and the user-facing Service
+Job envelope remain service concepts and point to an Execution Run.
+`job_operations` and `JobOperationState` are replaced by shared Execution
+Nodes, Tasks, Task Attempts, and Provider Calls. Service projections build the
+public timeline from shared execution rows instead of preserving a second
+operation state machine.
 
 ### Paid-call lifecycle
 
@@ -436,8 +474,8 @@ Deliverables:
   `SqliteExecutionRepository` and behind the provider port;
 - use `ModalJobSubmitter` as the behavioral baseline for uncertain spawn;
 - add thin async service and sync workflow drivers;
-- adapt service `job_operations` and workflow `remote_calls` without initially
-  replacing either schema;
+- replace service `job_operations` and workflow `remote_calls` with shared
+  execution tables as each host migrates;
 - expose a common read-only execution snapshot for logs and diagnostics.
 
 Exit gate:

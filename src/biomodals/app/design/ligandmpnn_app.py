@@ -103,7 +103,7 @@ runtime_image = (
         ))
     )
     .env({"PYTHONPATH": str(CONF.git_clone_dir)})
-    .pipe(patch_image_for_helper)
+    .pipe(patch_image_for_helper, skip_deps=["uniaf3", "polars"])
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

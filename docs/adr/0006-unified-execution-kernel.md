@@ -113,6 +113,13 @@ call-bound; another call may receive a successor assignment only after the
 owner call is conclusively terminal. Lifecycle exit hooks may checkpoint work
 or emit diagnostics, but they never authorize failure or reassignment.
 
+The retry policy was accepted on 2026-07-29. Redelivery before assignment and
+provider-managed restart of one input remain inside the existing Task Attempt.
+After a paid Provider Call becomes terminal and may have started work, the
+kernel never creates a successor call automatically. A later explicit resume
+or retry invocation revalidates publications and authorizes new Task Attempts
+only for work still missing.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -174,6 +181,11 @@ only a delivery hint, and a provider-accessible Worker Assignment elects the
 worker allowed to execute a delivered Task. Publication validation and
 terminal provider state recover dropped or interrupted delivery without a
 timeout-based steal.
+
+This separates recovery from repeated spending. Provider-native retries and
+safe Task Redelivery preserve one call or one Task Attempt; Retry Authorization
+creates a successor attempt. Local operations may declare a separate bounded
+automatic policy, but paid provider work defaults to explicit authorization.
 
 This is an incremental extraction, not a rewrite. Internal types, tables, and
 imports may change directly while each consumer adopts the kernel. Scientific

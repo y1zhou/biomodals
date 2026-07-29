@@ -28,6 +28,18 @@ One explicitly authorized effort to satisfy a Task through cache reuse, local
 processing, or provider execution.
 _Avoid_: automatic retry, Modal retry
 
+**Task Redelivery** [planned]:
+A repeated delivery of an unassigned Task or an interrupted provider input
+within its existing Task Attempt. It does not authorize a new paid Provider
+Call.
+_Avoid_: successor Task Attempt, automatic paid retry
+
+**Retry Authorization** [planned]:
+Explicit permission to create a successor Task Attempt after a preceding
+attempt became terminal. Paid provider work requires authorization from a
+later resume or retry invocation.
+_Avoid_: provider-managed retry, queue redelivery, timeout
+
 **Provider Call**:
 One detached operation submitted to a compute provider and identified for
 later observation, recovery, or cancellation. A Provider Call may serve

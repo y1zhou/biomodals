@@ -98,6 +98,8 @@ These existing decisions remain binding during the refactor:
   Provider Calls; only explicit cancellation terminates them.
 - Worker lifecycle callbacks are advisory: they may checkpoint or diagnose an
   interruption but never fail or reassign a Task.
+- Safe redelivery and provider-managed retries remain within one Task Attempt;
+  a successor paid Task Attempt requires explicit resume authorization.
 - No paid Modal calls run in CI.
 
 ## Proposed domain model
@@ -339,6 +341,19 @@ unassigned in the Dispatch Batch and may be delivered again. If it dies after
 claiming, the restarted provider input retains the assignment. A different
 Provider Call may receive a successor assignment only after the owning call is
 conclusively terminal.
+
+Task Redelivery is not a retry. Delivery may repeat automatically when no
+Worker Assignment was elected, and Modal may restart or retry the same
+provider input without creating another Provider Call record. Once a paid call
+is conclusively terminal and may have started work, the Task Attempt becomes
+terminal. The kernel creates no successor paid call until a later explicit
+resume or retry invocation grants Retry Authorization.
+
+Resume first revalidates every expected Workload Publication. Satisfied Tasks
+remain complete, while only still-missing Tasks receive successor attempts.
+This allows a large fan-out run to retain all successful results and rerun only
+its failed remainder. A local, non-provider Task may opt into a separate
+bounded automatic retry policy declared in its immutable plan.
 
 An exit hook may commit workload checkpoints and emit an advisory
 `interrupted` event containing the call, slot, and Task IDs. The coordinator
@@ -653,6 +668,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_ownership.py` | Same-input replacement retains ownership; active or unknown predecessor blocks; only terminal predecessor permits a successor |
 | `tests/execution/test_dispatch.py` | Duplicate and lost queue delivery, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
+| `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -1006,6 +1022,7 @@ authorized smoke test after local and CI gates pass.
 | A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
 | A Remote Work Queue is mistaken for durable state | Persist Dispatch Batches and reconcile returned outcomes or validated publications |
 | An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
+| Recovery silently spends on a second call | Distinguish Task Redelivery from explicit Retry Authorization |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
@@ -1086,8 +1103,13 @@ after each decision:
     Task Attempt and call-bound Worker Assignment. Exit callbacks are advisory.
     A successor assignment requires conclusive owner-call termination, while
     unknown state blocks replacement.
-13. **Retry authority — pending**: distinguish safe redelivery within one Task
-    Attempt from creation of a new paid Task Attempt after terminal failure.
+13. **Retry authority — accepted 2026-07-29**: safe redelivery and
+    provider-managed retries stay within one Task Attempt. A new paid Provider
+    Call after terminal failure requires a later explicit resume or retry
+    invocation, which revalidates publications and retries only missing Tasks.
+14. **Coordination-store liveness — pending**: define how active ownership and
+    Worker Assignment records avoid provider-store inactivity expiry without
+    turning heartbeats into timeout-based takeover authority.
 
 ## Definition of ready for implementation
 

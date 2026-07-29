@@ -1060,6 +1060,22 @@ committed before the Task and call are made durably terminal. If a store
 cannot make those changes in one transaction, its adapter must use a
 recoverable prepare/publish/finalize protocol.
 
+Dynamic Task discovery never treats an empty collection as vacuous success.
+Every `NodePlan` carries `allow_empty_result: bool = False`, which is included
+in the Workload Plan Fingerprint:
+
+- zero Tasks with the default `False` fails the Node with a workload
+  diagnostic;
+- zero Tasks with `True` calls the workload finalizer with an empty result set
+  and creates no synthetic Task;
+- only an explicit empty Node publication that validates as `available` makes
+  the Node `succeeded`;
+- `unknown` suspends the Run under the existing result-validation policy, and
+  a missing or invalid publication after finalization fails the Node.
+
+This rule runs before Task aggregation and is independent of `fail_fast`,
+`collect_all`, and `allow_partial`.
+
 ### Failure modes
 
 Nodes declare one of three workload-selected aggregation policies:
@@ -1193,7 +1209,7 @@ Phase 0 test inventory:
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
-| `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; cache hits count as successes; cancellation and pruning take precedence |
+| `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1236,6 +1252,8 @@ Rollback:
 Deliverables:
 
 - add immutable `ExecutionPlan`, `NodePlan`, and dependency validation;
+- include strict-by-default `allow_empty_result` semantics in `NodePlan` and
+  the Workload Plan Fingerprint;
 - represent partial dependency acceptance with one strict-by-default
   `accept_partial` boolean per edge;
 - derive the terminal result boundary from DAG leaves and prune ancestor work
@@ -1940,6 +1958,13 @@ after each decision:
     succeeds when all succeed, is partial when some succeed and some fail, and
     fails when none succeed. Cache hits count as successes; explicit
     cancellation and result pruning take precedence; no policy retries work.
+47. **Explicit empty results — accepted 2026-07-29**: `NodePlan` includes
+    `allow_empty_result: bool = False` in the Workload Plan Fingerprint. Zero
+    discovered Tasks fail by default. When enabled, the workload finalizer
+    must publish and validate an explicit empty Node result; `available`
+    succeeds, `unknown` suspends, and missing or invalid output fails. No
+    synthetic Task is created, and Task aggregation never infers vacuous
+    success.
 
 ## Definition of ready for implementation
 

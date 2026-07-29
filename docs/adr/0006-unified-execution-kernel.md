@@ -249,6 +249,16 @@ count as successes. Explicit Run cancellation and result pruning take
 precedence over aggregation. None of these policies retries a Task or releases
 uncertain ownership.
 
+The empty-result policy was accepted on 2026-07-29. `NodePlan` has
+`allow_empty_result: bool = False`, and that result-affecting declaration is
+included in the Workload Plan Fingerprint. Discovering zero Tasks fails a Node
+whose flag is false. When it is true, the kernel invokes the workload
+finalizer with the empty result set; the workload must publish and validate an
+explicit complete empty Node result. `available` succeeds the Node, `unknown`
+suspends under the result-validation policy, and a missing or invalid
+post-finalization publication fails the Node. Task aggregation policy does not
+infer an outcome for an empty set, and no synthetic Task row is created.
+
 The result-boundary policy was accepted on 2026-07-29. Terminal Execution
 Nodes—the DAG leaves with no downstream dependency—collectively define the
 scientific result boundary. The scheduler validates their workload

@@ -129,6 +129,13 @@ Task finishes; allow-partial succeeds partially only when at least one Task
 succeeds.
 _Avoid_: same-Run retry policy, implicit cancellation, arbitrary success threshold
 
+**Explicit Empty Result** [planned]:
+A workload-published and validated complete Node result created after a
+`NodePlan` with `allow_empty_result=True` discovers zero Tasks. The boolean is
+part of the Workload Plan Fingerprint. An empty in-memory collection alone is
+never evidence of scientific completion.
+_Avoid_: vacuous success, implicit empty cache hit, zero Tasks means succeeded
+
 **Task**:
 The smallest independently scheduled and validated work item in an Execution
 Node whose cached publication and outcome can be observed. Every Task belongs

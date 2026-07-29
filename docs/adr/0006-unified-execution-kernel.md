@@ -22,8 +22,18 @@ Repository scope follows the coordinator boundary, not each API request,
 application call, or Modal function. The API service uses one long-lived
 database for all service-owned execution runs. A workflow keeps its existing
 per-run ledger because its remote workflow orchestrator is a separate durable
-coordinator. An app needs another repository only if it independently owns
-nested, recoverable scheduling; simple app calls do not create databases.
+coordinator. Every direct CLI app invocation creates a remote run-scoped
+coordinator and remote per-run repository. App functions invoked by a service
+or workflow remain child calls in the parent's Execution Run and do not create
+another repository.
+
+The coordinator-placement policy was accepted on 2026-07-29. A Local
+Entrypoint is a thin client: it validates and stages local input, submits a
+Direct CLI App Run, and observes or retrieves its result. It never creates a
+local SQLite ledger. API service calls remain coordinated through the service
+database, and workflow CLI calls remain coordinated through the remote
+workflow ledger. Generic scheduling inside a child app moves to the parent
+coordinator instead of introducing a nested execution database.
 
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared

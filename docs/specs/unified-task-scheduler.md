@@ -95,6 +95,10 @@ These existing decisions remain binding during the refactor:
 - Ready Task rows and Worker Assignments are the durable pull-work queue.
 - A remote SQLite coordinator is routed by Execution Run and pinned deployment
   version to a provider pool capped at one container.
+- Every Direct CLI App Run uses that remote coordinator and stores no execution
+  database on the user's machine.
+- Child App Calls use their service, workflow, or app-run parent's execution
+  repository rather than creating nested execution databases.
 - Coordinator Interruption suspends scheduling and preserves attached child
   Provider Calls; only explicit cancellation terminates them.
 - Worker lifecycle callbacks are advisory: they may checkpoint or diagnose an
@@ -221,17 +225,19 @@ bindings.
 ### Driver model
 
 The pure transition and readiness functions are shared. The API service keeps
-an async driver around them; the workflow and current app entrypoints use a
-sync driver. Maintaining two small drivers is preferable to infecting every
-consumer with an async abstraction or running nested event loops.
+an async driver around them; remote workflow and app-run coordinators use a
+sync driver. Local Entrypoints are thin clients of those remote drivers rather
+than execution hosts. Maintaining two small coordinator drivers is preferable
+to infecting every consumer with an async abstraction or running nested event
+loops.
 
 ### Durable execution state
 
 Every coordinator that promises restart or recovery requires an Execution
 State Repository. Centralization applies to the state model, transition rules,
 and persistence operations, not to one database process or file for all
-Biomodals activity. A deliberately non-resumable one-shot entrypoint may use a
-transient repository, but it must not present transient state as durable.
+Biomodals activity. Production CLI app runs are durable remote runs; only
+tests and dry-run planning may use a transient in-memory repository.
 
 Repository scope follows the coordinator boundary:
 
@@ -239,7 +245,8 @@ Repository scope follows the coordinator boundary:
 | --- | --- | --- | --- |
 | API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Service-coordinated Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, Jobs, admission, runtime configuration, and result cache remain service-owned |
 | Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
-| Nested app coordinator | None for a simple app call; a durable repository only when the app independently schedules recoverable child work | Nested Tasks, Task Attempts, batches, and child calls | AlphaFold3 claims and validated publications remain scientific authority |
+| Direct CLI app coordinator | One remote per-run execution ledger | App Nodes, Tasks, Task Attempts, batches, child calls, and recovery | Workload publications, scientific inputs, and outputs remain app-owned |
+| Child App Call | No separate repository; use the parent Execution Run | Work attributed to the service, workflow, or Direct CLI App Run | Function implementation, resources, and scientific publication remain app-owned |
 
 An ordinary API request therefore updates only the service database. It does
 not create a database for the called app. If the service starts a remote
@@ -248,12 +255,16 @@ call and the workflow's existing per-run ledger tracks the internal DAG. Those
 repositories describe different scheduling levels; they do not duplicate the
 same Tasks.
 
-Likewise, a simple direct app invocation does not create a SQLite file merely
-because it uses a kernel plan or provider adapter. A complex app such as
-AlphaFold3 needs another durable repository only if its app-owned coordinator
-promises restartable tracking of its internal search and seed Tasks. If the
-service directly owns those Tasks instead, they live only in the service
-repository.
+A Direct CLI App Run always creates its per-run ledger remotely and executes
+through a Run-Scoped Coordinator Pool, even for one direct Provider Call. The
+Local Entrypoint owns no SQLite file: it prepares local input, submits the run,
+and optionally waits for or retrieves the result.
+
+The same app invoked from an API service or workflow is instead a Child App
+Call. Its Tasks live in that parent coordinator's repository, so the child
+does not create a duplicate ledger. A complex app such as AlphaFold3 exposes
+its plan and workload hooks to the owning coordinator; its markers and
+validated publications remain scientific authority in every call shape.
 
 Provider workers do not write SQLite. A single coordinator applies
 transitions and commits them using its transaction and Volume synchronization
@@ -319,9 +330,10 @@ coordinator enforces this through a run-scoped provider pool:
 Stable request IDs make duplicate control inputs idempotent in SQLite. The
 provider's per-parameter pool isolation, one-container cap, and replacement
 behavior are correctness assumptions and require a manual Modal smoke test
-before adoption. A host-exclusive coordinator that needs no remote worker RPC
-may keep its existing process-level single-writer exclusion without this
-remote wrapper.
+before adoption. The API service keeps its existing process-level
+single-writer exclusion. Direct CLI App Runs use the remote wrapper even when
+they need no pull-worker RPC, so production app execution never creates a
+local run database.
 
 ### Worker interruption and assignment recovery
 
@@ -817,7 +829,10 @@ Deliverables:
   into one GPU call;
 - persist the one-call-to-many-seed mapping and per-seed outcomes;
 - retain explicit-invocation retry authority and current request/run identity;
-- preserve the current local entrypoint and direct app-call behavior.
+- route the Local Entrypoint through a remote run-scoped coordinator;
+- let service and workflow hosts execute the same plan through their parent
+  coordinator without creating a nested ledger;
+- preserve current CLI inputs, outputs, and direct Child App Call behavior.
 
 Exit gate:
 
@@ -1134,9 +1149,14 @@ after each decision:
     queue and assignment store. The design adds neither Modal Dict nor Modal
     Queue; remote workers claim bounded microbatches through the run-scoped
     coordinator.
-15. **Coordinator placement — pending**: decide which execution shapes require
-    a remote run-scoped coordinator and which may remain driven by an existing
-    service, workflow, or local CLI process.
+15. **Coordinator placement — accepted 2026-07-29**: every Direct CLI App Run
+    and workflow CLI run uses a remote run-scoped coordinator and remote
+    per-run repository. API service calls use `service.sqlite3`. Child App
+    Calls use their parent Run and never create a redundant nested ledger.
+    Local Entrypoints are thin clients and create no local execution database.
+16. **Remote coordinator deployment — pending**: decide whether the
+    run-scoped coordinator is one shared Modal deployment or a shared kernel
+    adapter included in each app and workflow deployment.
 
 ## Definition of ready for implementation
 

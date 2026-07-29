@@ -96,6 +96,12 @@ for that identity; concurrent control requests submit commands to that
 container's single SQLite writer.
 _Avoid_: worker pool, timeout lease, service database
 
+**Direct CLI App Run** [planned]:
+A top-level Execution Run initiated through an app's Local Entrypoint and
+owned by a remote Run-Scoped Coordinator Pool. Its durable repository lives
+remotely; the user's machine does not create or own a run database.
+_Avoid_: Child App Call, local scheduler, API Job
+
 **Service Job**:
 A user-facing API service record for ownership, admission, configuration,
 result delivery, and presentation that refers to an Execution Run without
@@ -313,12 +319,16 @@ A callable Modal remote function exposed by a Biomodals app or another Modal app
 _Avoid_: workflow node
 
 **Child App Call**:
-A Modal app function call submitted inside an app-backed workflow node or an app-local entrypoint as part of a larger semantic operation.
-_Avoid_: workflow node, scheduler node
+A Modal app function call submitted by an Execution Coordinator as part of a
+larger Execution Run. It uses its parent Run's execution state rather than
+creating another coordinator repository.
+_Avoid_: workflow node, execution run, Direct CLI App Run
 
 **Local Entrypoint**:
-A CLI-facing Modal entrypoint that parses local user inputs, submits app functions, downloads or reports outputs, and returns no workflow contract.
-_Avoid_: workflow entrypoint
+A CLI-facing Modal entrypoint that parses and stages local user inputs,
+submits a Direct CLI App Run to a remote coordinator, then observes, downloads,
+or reports its outputs. It does not own an Execution State Repository.
+_Avoid_: workflow entrypoint, execution coordinator
 
 **CLI Namespace**:
 A top-level `biomodals` command group that separates app commands from workflow commands.

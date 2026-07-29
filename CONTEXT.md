@@ -437,8 +437,9 @@ A tool-specific queue, worker pool, pod pool, or fan-out loop inside an app func
 _Avoid_: workflow runtime, DAG scheduler
 
 **Run-Level Task Budget**:
-A shared concurrency budget for child app calls and local workers participating in one user-submitted run.
-_Avoid_: max_parallel, workflow node parallelism
+A coordinator-enforced concurrency budget for Tasks and Provider Calls in one
+Execution Run.
+_Avoid_: service admission limit, Modal deployment limit, cross-run global cap
 
 **Workflow Runtime**:
 The reusable library that validates a workflow DAG, schedules workflow nodes, tracks durable run state, and materializes workflow artifacts.
@@ -490,7 +491,7 @@ _Avoid_: temporary scratch, local cache
 - "step" can mean either a semantic workflow operation or one callable remote function. Resolved: use **Workflow Node** for the semantic DAG unit and **App Function** for a Modal remote callable.
 - "app node" can mean either a Modal deployment unit or a DAG vertex backed by that app. Resolved: use **App** for the deployment unit and **App-Backed Node** for the DAG vertex.
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.
-- "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for shared child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
+- "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for coordinator-scoped child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
 - "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each durable coordinator may persist it separately and **Workload Publications** remain authoritative for scientific completion.
 - "job" can mean a user-facing service request or actual scheduled work. Resolved: a **Service Job** holds service metadata and refers one-way to an **Execution Run**; the execution kernel knows only the Run and its work.

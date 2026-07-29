@@ -65,6 +65,13 @@ operation ledger. `JobState`, timelines, active-job counts, and administrative
 running-job counts are service views derived from execution rows and
 service-owned result data.
 
+The resource scope was accepted on 2026-07-29. The first kernel persists and
+enforces Task and Provider Call permits within one Execution Run and
+coordinator. Service-wide admission limits remain service-owned, and Modal
+CPU, GPU, memory, timeout, and deployment limits remain workload-owned.
+Cross-coordinator and cross-run global enforcement, including a shared-lease
+interface, is deferred until a concrete requirement exists.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG

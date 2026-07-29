@@ -147,7 +147,7 @@ duplicated.
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Mapping Tasks to call batches and distributing outcomes | Batch compatibility and workload-specific limits |
-| Resources | Run budget, permit accounting, later shared-lease protocol | Modal decorators and actual CPU/GPU/memory selection |
+| Resources | Coordinator-scoped run budget and persisted permit accounting | Service admission, Modal resources, deployment limits, cross-coordinator policy |
 | Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
 | Presentation | Stable snapshots/events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
 
@@ -319,6 +319,36 @@ The same projection is used for:
 Do not add a trigger or materialized state column until query evidence shows
 that the indexed join is insufficient. If a read projection is cached later,
 it is disposable and never becomes a second authority.
+
+### Resource ownership
+
+The first kernel manages resources only inside one Execution Run owned by one
+coordinator. Its SQLite state records:
+
+- the resolved Run-Level Task Budget;
+- permit cost for an admitted Task or Provider Call batch;
+- active permit allocations tied to Task Attempts and Provider Calls;
+- release or recovery of allocations when calls become terminal or unknown.
+
+Permit allocation is atomic with the transition that admits work, so a
+coordinator restart can reconstruct the active count from durable execution
+rows. Batching policy decides whether permits account for a container, a Task,
+or another workload-defined unit, but the meaning is fixed in the immutable
+Task plan before submission.
+
+The kernel does not own:
+
+- per-user, per-tool, or service-wide active-Job admission limits;
+- the administrator settings from which a service resolves a Run budget;
+- Modal CPU, GPU, memory, timeout, accelerator, or deployment concurrency;
+- limits shared across different coordinators or Execution Runs.
+
+No shared-lease interface or Modal Dict implementation is added in this
+refactor. If a future workflow truly needs a hard limit across multiple
+coordinators, that concrete requirement must define the failure and recovery
+semantics before introducing another storage seam. The existing ADR principle
+still applies: a hard distributed limit cannot be implemented by pretending
+separate in-process counters are global.
 
 ### Workflow Ledger decomposition
 
@@ -541,8 +571,8 @@ Deliverables:
 - make PPIFlow the first runtime-discovered Task consumer;
 - represent partial candidate outcomes without making a Node successful by
   implication;
-- add a shared-lease port, but defer distributed hard-limit implementation
-  unless required by the decision gate.
+- persist coordinator-scoped permit allocations and recovery without adding a
+  distributed lease abstraction.
 
 Exit gate:
 
@@ -696,6 +726,7 @@ authorized smoke test after local and CI gates pass.
 - a YAML workflow language;
 - global plugin registration or autodiscovery;
 - automatic retries of paid provider calls;
+- a cross-coordinator or cross-run global resource scheduler;
 - scheduler-driven mutation of Modal function decorators;
 - moving scientific parsers into generic execution code;
 - rewriting AlphaFold3, GROMACS, or PPIFlow public interfaces as part of the
@@ -727,9 +758,10 @@ after each decision:
    one-way Execution Run ID and service-owned metadata but no duplicate compute
    state. `JobState`, timelines, filters, limits, and counts derive from
    execution rows.
-6. **Distributed resource limits**: should the first extraction define a lease
-   port but defer a Modal Dict-backed global lease implementation?
-   Recommendation: yes, until a concrete cross-container limit requires it.
+6. **Resource scope — accepted 2026-07-29**: the kernel persists permit
+   accounting only within one Execution Run and coordinator. Service admission
+   and Modal resources remain with their current owners; no distributed lease
+   interface is added without a concrete cross-coordinator requirement.
 7. **Migration scope**: should service database changes be additive and
    migratable while in-progress workflow runs keep their documented restart
    policy? Recommendation: yes.

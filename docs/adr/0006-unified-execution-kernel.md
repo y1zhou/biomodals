@@ -128,6 +128,18 @@ transaction must recover as a valid durable state such as `submitting` or
 partial rows. The design adds no command-fingerprint catalog or implicit
 latest-run lookup.
 
+The successor-compatibility policy was accepted on 2026-07-29. Each Run stores
+a Workload Plan Fingerprint over normalized result-affecting inputs and
+declared scientific tool, model, adapter, and schema versions. Generic restart
+reuses the predecessor's immutable scientific plan. Launch-time
+`--restart-from` constructs and compares the candidate fingerprint before
+creating state; a mismatch requires a new root Run. File identity uses content
+digests rather than paths. Operational concurrency, batching, resource
+allocation, and Deployment Identity may change without changing the
+fingerprint. Deployment Identity is not itself scientific cache identity, but
+a new deployment may reuse publications only if its workload adapter accepts
+the stored plan and all result-affecting version declarations still match.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, dispatch-batch,

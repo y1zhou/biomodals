@@ -26,6 +26,14 @@ arguments, output paths, or publication identity. Successor Execution Runs may
 reuse it, and the kernel stores it only as immutable workload plan input.
 _Avoid_: Execution Run ID, ledger path, display label alone
 
+**Workload Plan Fingerprint** [planned]:
+A stable digest of every normalized result-affecting input and declared
+scientific tool, model, adapter, or schema version for an Execution Run.
+Successor Execution Runs require the same fingerprint. File contents are
+represented by content digests; operational concurrency, batching, resources,
+and Deployment Identity are excluded.
+_Avoid_: command-text hash, file path alone, Execution Run ID, deployment version alone
+
 **Execution Run Status** [planned]:
 The kernel lifecycle value for an Execution Run: `pending`, `running`,
 `cancel_requested`, `suspended`, `state_unknown`, `succeeded`, `partial`,

@@ -89,6 +89,9 @@ These existing decisions remain binding during the refactor:
   may invoke spawn. Duplicate or recovered callers never resubmit it.
 - Scientific and cache identity excludes operational concurrency, placement,
   and resource allocation.
+- A successor requires the same Workload Plan Fingerprint over normalized
+  result-affecting inputs and declared scientific versions. Changed science
+  requires a new root Run.
 - Workflow node parallelism and child-call task budgets are different limits.
 - AlphaFold3 raw searches, assemblies, templates, and seeds retain their
   current identities and Volume layouts.
@@ -199,6 +202,12 @@ coordinator routing, lineage, and ledger location.
 **Workload Run Key** is an optional workload-owned name or scientific key in
 the immutable plan. It may be reused by successor runs and publications but is
 never an execution primary key or ledger path.
+
+**Workload Plan Fingerprint** is a stable digest over normalized
+result-affecting inputs and declared scientific tool, model, adapter, and
+schema versions. File inputs contribute content digests rather than paths.
+Operational concurrency, batching, resource allocation, and Deployment
+Identity are excluded.
 
 **Execution Node** is a fixed semantic DAG stage. Its identity does not change
 with batching or concurrency. It replaces neither `WorkflowNode` nor
@@ -479,6 +488,20 @@ conclusively terminal; active or unknown ownership blocks replacement. Once
 those Tasks succeed, previously untouched downstream Nodes become ready
 normally.
 
+Generic restart reuses the predecessor's stored immutable scientific plan.
+Launch-time `--restart-from` normalizes the supplied workload inputs and
+requires its Workload Plan Fingerprint to equal the predecessor's before
+creating successor state. Changed file content, seeds, scientific parameters,
+or declared result-affecting versions require a new root Run. Operational
+concurrency, batching, resource settings, and the newly resolved Deployment
+Identity may differ.
+
+Deployment Identity is not scientific identity by itself. A new deployment's
+workload adapter must accept the stored plan schema and preserve every
+declared result-affecting tool, model, adapter, and schema version before the
+successor may reuse publications. Otherwise restart is rejected and the user
+must create a new root Run.
+
 SQLite transactions and repository constraints are expected to turn an
 interruption into a valid checkpoint, not broken partial rows. Recovery may
 therefore encounter a valid `submitting` or `outcome_unknown` call and must
@@ -696,7 +719,7 @@ work:
 - stable run, node, task, batch, assignment, and call identifiers;
 - an optional predecessor Execution Run ID for explicit restart lineage;
 - the immutable Deployment Identity used to recover provider calls;
-- immutable plan and task fingerprints;
+- the immutable Workload Plan Fingerprint and Task fingerprints;
 - dependency edges and legal execution states;
 - submission tokens, provider targets, call IDs, and observed outcomes;
 - execution timestamps, Run `status_reason` and `status_message`, Task and Node
@@ -1045,6 +1068,7 @@ Phase 0 test inventory:
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; valid publications are reused; unknown or invalid predecessor state fails closed |
+| `tests/execution/test_restart_compatibility.py` | Result-affecting input, content, and declared version changes reject successor creation; operational policy and Deployment Identity changes remain compatible; generic and launch-time restart use the same fingerprint |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -1081,6 +1105,8 @@ Rollback:
 Deliverables:
 
 - add immutable `ExecutionPlan`, `NodePlan`, and dependency validation;
+- add deterministic Workload Plan Fingerprints that separate result-affecting
+  inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
 - build pure GROMACS and workflow adapters beside their current execution
   paths and prove graph equivalence without switching either composition root;
@@ -1204,6 +1230,8 @@ Exit gate:
   development mode clearly lacks cross-invocation recovery;
 - a repeated launch creates a new root Run, while `--restart-from` and generic
   restart create the same linked successor behavior;
+- successor creation rejects a changed Workload Plan Fingerprint while
+  allowing operational policy and Deployment Identity changes;
 - restart creates a Successor Execution Run and cannot replace active or
   unknown predecessor work;
 - manual Modal tests validate deployment lookup, run-scoped routing,
@@ -1696,6 +1724,14 @@ after each decision:
     failure preserves unknown ownership. Resolution and input preparation
     precede preclaim, and only a Successor Execution Run can retry failed
     Tasks.
+38. **Successor scientific compatibility — accepted 2026-07-29**: every Run
+    stores a Workload Plan Fingerprint over normalized result-affecting inputs,
+    content digests, and declared scientific tool, model, adapter, and schema
+    versions. Generic restart reuses that plan; `--restart-from` must match its
+    fingerprint. Scientific changes require a new root Run. Operational
+    concurrency, batching, resources, and Deployment Identity may change, but
+    a new adapter may reuse publications only if it accepts the stored plan and
+    preserves all result-affecting declarations.
 
 ## Definition of ready for implementation
 

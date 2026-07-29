@@ -106,6 +106,9 @@ These existing decisions remain binding during the refactor:
   unavailable, an explicit restart creates a linked successor run.
 - Direct CLI App Run ledgers live in a reserved namespace in that deployment's
   configured durable Volume; there is no cross-app execution-state Volume.
+- Terminal remote CLI and workflow ledgers have no automatic TTL or garbage
+  collection. A future explicit host cleanup may remove terminal execution
+  state but never scientific outputs or publications.
 - Every Execution Run has a kernel-generated UUID distinct from workload run
   names, scientific identities, Service Job IDs, and user-provided paths.
 - Launch commands print the explicit deployment and run identity fields;
@@ -1231,6 +1234,7 @@ authorized smoke test after local and CI gates pass.
 - a cross-coordinator or cross-run global resource scheduler;
 - remote workers opening or mutating the coordinator's SQLite file;
 - a generic provider-native message-queue abstraction;
+- automatic expiry or background garbage collection of execution ledgers;
 - scheduler-driven mutation of Modal function decorators;
 - moving scientific parsers into generic execution code;
 - rewriting AlphaFold3, GROMACS, or PPIFlow public interfaces as part of the
@@ -1350,6 +1354,12 @@ after each decision:
     `--execution-run-id` explicitly on every invocation. An optional
     `--coordinator-call-id` is a replaceable observation hint. There is no
     encoded run-reference format or parsing abstraction.
+24. **Remote ledger retention — accepted 2026-07-29**: terminal Direct CLI
+    App Run and workflow ledgers are retained without a TTL or background
+    garbage collector. A future explicit host or CLI cleanup operation must
+    reject non-terminal Runs and may remove only execution state, never
+    Workload Publications or scientific outputs. Service database retention
+    remains service-owned.
 
 ## Definition of ready for implementation
 

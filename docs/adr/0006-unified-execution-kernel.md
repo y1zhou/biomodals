@@ -80,6 +80,15 @@ retains execution tables in `service.sqlite3`. The host supplies the Volume,
 mountpoint, and repository path; the kernel declares no global execution
 Volume or workload output location.
 
+The remote-ledger retention policy was accepted on 2026-07-29. The initial
+kernel neither expires terminal ledgers nor runs background garbage
+collection. Direct CLI app and workflow ledgers remain available for status,
+diagnosis, and restart until an operator explicitly removes them. Any future
+cleanup operation belongs to the host or CLI, must reject non-terminal Runs,
+and removes only execution state—not Workload Publications, scientific
+outputs, or service-owned records. The API service retains its own database
+according to service policy.
+
 The execution-identity policy was accepted on 2026-07-29. The admitting host
 uses the kernel's generator to create an opaque UUID Execution Run ID before
 repository creation or work admission. That UUID keys execution rows,

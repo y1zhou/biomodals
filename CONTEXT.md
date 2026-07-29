@@ -81,6 +81,14 @@ The smallest independently identified unit in an Execution Node whose cached
 publication and outcome can be observed.
 _Avoid_: workflow node, thread, untracked work item
 
+**Task Status** [planned]:
+The kernel lifecycle value for a Task: `pending`, `running`, `succeeded`,
+`failed`, `cancelled`, or `skipped`. Only `pending` and `running` are
+nonterminal. A Task becomes `running` when durable local or provider ownership
+is assigned and retains that status while its owner outcome is unknown.
+Partiality belongs to Node aggregation, and cache reuse is success provenance.
+_Avoid_: partial, cached, submitting, attached, state unknown
+
 **Single-Submission Rule** [planned]:
 Within one Execution Run, the kernel schedules each Task once and submits at
 most one Provider Call or Worker Assignment for it. Provider redelivery may

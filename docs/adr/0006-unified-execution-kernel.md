@@ -199,6 +199,17 @@ Node is `succeeded`, with cache reuse retained as Task provenance. Run-level
 Nodes. `skipped` means that an upstream terminal outcome made a planned Node
 unreachable.
 
+The Task status policy was accepted on 2026-07-29. Tasks have exactly six
+statuses: `pending`, `running`, `succeeded`, `failed`, `cancelled`, and
+`skipped`. Only the first two are nonterminal. Durable local execution,
+Provider Call ownership, or Worker Assignment moves a Task to `running`.
+Provider uncertainty remains on that owner and projects the Run to
+`state_unknown`; it does not release the Task from `running`. `partial` is a
+Node aggregation result, provider submission phases remain Provider Call
+state, and cache reuse is success provenance rather than a Task status.
+`skipped` is reserved for sibling Tasks never admitted after a `fail_fast`
+failure.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal

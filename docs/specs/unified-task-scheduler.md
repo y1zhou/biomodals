@@ -305,6 +305,27 @@ Run-level `cancel_requested`, `suspended`, and `state_unknown` are not
 duplicated onto Nodes. A workload excludes an optional branch from its
 immutable plan rather than creating a Node that is already `skipped`.
 
+### Task statuses
+
+The kernel uses exactly six Task statuses:
+
+| Status | Terminal | Meaning |
+| --- | --- | --- |
+| `pending` | No | Discovered but not yet cache-satisfied or assigned |
+| `running` | No | Durably owned by local execution, a Provider Call, or a Worker Assignment |
+| `succeeded` | Yes | The required Workload Publication was validated |
+| `failed` | Yes | Execution or publication validation conclusively failed |
+| `cancelled` | Yes | Explicit Run cancellation stopped the Task |
+| `skipped` | Yes | The Node's `fail_fast` policy stopped it before admission |
+
+Provider submission and attachment phases belong to the Provider Call rather
+than the Task. If the owner's outcome becomes unknown, the Task remains
+`running`, the owner retains it, and the Run becomes `state_unknown`; the Task
+does not become eligible for replacement work. Task success records whether it
+came from cache validation or execution as provenance, not as a `cached`
+status. Individual Tasks are never `partial`; the Node aggregation policy
+derives partiality.
+
 ## Responsibility boundary
 
 | Concern | Execution kernel owns | Workload or host owns |
@@ -908,6 +929,7 @@ Phase 0 test inventory:
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
+| `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
@@ -1508,6 +1530,13 @@ after each decision:
     Task provenance on a successful Node, and Run-level cancellation request,
     suspension, and unknown state are not duplicated onto Nodes. `skipped`
     means an upstream terminal outcome made a planned Node unreachable.
+33. **Task statuses — accepted 2026-07-29**: Tasks use `pending`, `running`,
+    `succeeded`, `failed`, `cancelled`, and `skipped`; only the first two are
+    nonterminal. Durable local or provider ownership moves a Task to
+    `running`, which is retained while the owner is uncertain. Cache reuse is
+    success provenance, partiality belongs to Node aggregation, provider
+    submission phases stay on Provider Calls, and `skipped` is reserved for
+    sibling Tasks not admitted after `fail_fast`.
 
 ## Definition of ready for implementation
 

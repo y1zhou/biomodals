@@ -95,6 +95,8 @@ These existing decisions remain binding during the refactor:
 - Ready Task rows and Worker Assignments are the durable pull-work queue.
 - A remote SQLite coordinator is routed by Execution Run and pinned deployment
   version to a provider pool capped at one container.
+- The coordinator binding ships with each app or workflow deployment; there
+  is no universal execution-coordinator deployment or workload registry.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -202,6 +204,7 @@ src/biomodals/execution/
   sqlite.py               # schema and transitions on a host connection
   ports.py                # provider and workload protocols
   runtime.py              # composition facade after primitives stabilize
+  modal.py                # reusable remote-coordinator mechanics, no app globals
   _internal/
     scheduler.py          # ready-node/task selection
     submission.py         # paid-call lifecycle
@@ -220,7 +223,8 @@ The initial internal interface should be no larger than:
 Each composition root supplies its SQLite connection and transaction,
 provider implementation, and workload implementation explicitly. Do not add
 global registries, plugin discovery, YAML workflows, or import-time Modal
-bindings.
+app or Volume bindings. Each app and workflow declares its own thin decorated
+coordinator wrapper over `execution.modal`.
 
 ### Driver model
 
@@ -315,8 +319,8 @@ separate and may cancel those calls.
 Exactly one process may write one Volume-backed repository at a time. A remote
 coordinator enforces this through a run-scoped provider pool:
 
-1. the immutable Execution Run ID and pinned coordinator deployment version
-   identify a parameterized coordinator pool;
+1. the immutable Execution Run ID and pinned containing app or workflow
+   deployment version identify a parameterized coordinator pool;
 2. every unique parameter tuple has its own container pool, capped at one
    coordinator container;
 3. concurrent `run`, `claim`, `complete`, and observation inputs route to that
@@ -864,6 +868,8 @@ Deliverables:
   become available;
 - add a reusable run-scoped remote coordinator and pull-work adapter for
   idempotent claims, worker-call attachment, and outcome reconciliation;
+- keep only workload hooks, Modal decorators, and Volume bindings in each
+  deployment's thin Coordinator Adapter;
 - add durable Worker Assignments so lost claim responses are harmless and
   preempted provider inputs recover their current Tasks;
 - keep SQLite single-writer: workers return outcome records or publish
@@ -1063,6 +1069,7 @@ authorized smoke test after local and CI gates pass.
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
 | Two coordinator containers open one Volume ledger | Route by Run ID and pinned deployment version, cap the pool at one container, serialize writes, and smoke-test provider behavior |
+| One coordinator must understand every workload | Ship a thin binding with each app or workflow deployment; keep shared mechanics in the kernel |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1154,9 +1161,14 @@ after each decision:
     per-run repository. API service calls use `service.sqlite3`. Child App
     Calls use their parent Run and never create a redundant nested ledger.
     Local Entrypoints are thin clients and create no local execution database.
-16. **Remote coordinator deployment — pending**: decide whether the
-    run-scoped coordinator is one shared Modal deployment or a shared kernel
-    adapter included in each app and workflow deployment.
+16. **Remote coordinator deployment — accepted 2026-07-29**: each app and
+    workflow deployment includes a thin Deployment Coordinator Adapter over
+    the shared kernel. The containing deployment version pins coordinator and
+    workload code together. There is no universal coordinator deployment,
+    workload registry, or deployment-global Volume in the kernel.
+17. **CLI deployment lifetime — pending**: define whether Direct CLI App Runs
+    continue using ephemeral `modal run` deployments and how a later resume
+    observes or replaces a coordinator from an expired deployment.
 
 ## Definition of ready for implementation
 

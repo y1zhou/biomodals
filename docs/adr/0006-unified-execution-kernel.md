@@ -35,6 +35,14 @@ database, and workflow CLI calls remain coordinated through the remote
 workflow ledger. Generic scheduling inside a child app moves to the parent
 coordinator instead of introducing a nested execution database.
 
+The deployment-binding policy was accepted on 2026-07-29. There is no
+universal execution-coordinator Modal app. Each app and workflow deployment
+includes a thin Deployment Coordinator Adapter that binds the shared kernel
+to its workload hooks, Volumes, and provider configuration. The containing
+deployment version pins the coordinator code and workload adapter together.
+The shared kernel contains reusable Modal coordination mechanics but declares
+no app object, workload registry, or deployment-global Volume.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -110,13 +118,13 @@ explicit user cancellation authorizes cancelling child calls.
 
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by
-the Execution Run and a pinned coordinator deployment version. That pool is
-capped at one coordinator container. Concurrent run, claim, completion, and
-observation requests enter that container, but one in-process writer loop
-serializes every SQLite transition and Volume checkpoint. Different Run IDs
-have independent pools and may execute concurrently. The provider routing and
-single-container assumptions require a manual Modal smoke test before remote
-adoption.
+the Execution Run and the pinned containing app or workflow deployment
+version. That pool is capped at one coordinator container. Concurrent run,
+claim, completion, and observation requests enter that container, but one
+in-process writer loop serializes every SQLite transition and Volume
+checkpoint. Different Run IDs have independent pools and may execute
+concurrently. The provider routing and single-container assumptions require a
+manual Modal smoke test before remote adoption.
 
 The worker-interruption policy was accepted on 2026-07-29. Worker preemption
 does not fail a Task Attempt or release its Worker Assignment because Modal
@@ -153,6 +161,10 @@ only for work still missing.
 - Mirroring assignments into Modal Dict and transporting Tasks through Modal
   Queue would add a second state model with expiry and delivery-recovery
   semantics even though SQLite already contains the durable ready set.
+- One universal coordinator deployment would avoid small per-deployment
+  wrappers, but would require a workload registry, access to every workload's
+  storage, and independent compatibility between coordinator and workload
+  deployment versions.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.
@@ -215,3 +227,8 @@ identities, publications, cost-safety rules, and documented user behavior
 remain regression constraints unless a separate decision deliberately changes
 them. Duplicated orchestration code is removed after its replacement passes
 characterization and recovery tests.
+
+The deployment-local wrappers are intentional composition roots, not duplicate
+schedulers. They contain only Modal decorators and bindings that must remain
+with the workload deployment; graph traversal, state transitions, task claims,
+recovery, and resource accounting remain in `biomodals.execution`.

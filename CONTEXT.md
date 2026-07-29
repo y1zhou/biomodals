@@ -90,11 +90,17 @@ requires a replacement Attempt to recover durable execution state.
 _Avoid_: Job cancellation, Task failure, Provider Call cancellation
 
 **Run-Scoped Coordinator Pool** [planned]:
-A provider-routed container pool identified by an Execution Run and pinned
-coordinator deployment version. It admits at most one coordinator container
-for that identity; concurrent control requests submit commands to that
-container's single SQLite writer.
+A provider-routed container pool created by a Deployment Coordinator Adapter
+and identified by an Execution Run and pinned containing-deployment version.
+It admits at most one coordinator container for that identity; concurrent
+control requests submit commands to that container's single SQLite writer.
 _Avoid_: worker pool, timeout lease, service database
+
+**Deployment Coordinator Adapter** [planned]:
+A thin Modal binding included in each app or workflow deployment. It binds the
+shared execution kernel to that deployment's workload hooks, Volumes, and
+configuration without introducing a universal coordinator service.
+_Avoid_: execution kernel, workload registry, API service
 
 **Direct CLI App Run** [planned]:
 A top-level Execution Run initiated through an app's Local Entrypoint and

@@ -210,9 +210,10 @@ remain canonical on their Task or Node records, while the Run fields summarize
 only why the overall lifecycle changed. The kernel does not add separate
 failure, suspension, or unknown-reason columns.
 
-The initial Run-reason vocabulary was accepted on 2026-07-29. A `suspended`
-Run requires `coordinator_error`. A `state_unknown` Run requires one of
-`submission_outcome_unknown`, `provider_outcome_unknown`, or
+The initial Run-reason vocabulary was accepted on 2026-07-29 and extended by
+the result-validation policy below. A `suspended` Run requires
+`coordinator_error` or `result_validation_unknown`. A `state_unknown` Run
+requires one of `submission_outcome_unknown`, `provider_outcome_unknown`, or
 `cancellation_outcome_unknown`. A `failed` Run requires either
 `required_work_failed` or `deployment_unavailable`. Every other Run status
 requires a null `status_reason`. The repository rejects all mismatched and
@@ -262,6 +263,16 @@ completion was cache-validated or produced in this Run; scientific evidence,
 markers, manifests, and validation logic remain workload-owned. This hook is
 part of the workload port and does not add a fake terminal Task or another
 top-level kernel abstraction.
+
+The unknown-result policy was accepted on 2026-07-29. An `unknown` Node or
+Task result observation leaves that record nonterminal, stops new admission,
+and suspends the Run with
+`status_reason=result_validation_unknown`. Attached Provider Calls continue
+under their existing ownership; they are not cancelled. The coordinator does
+not poll or retry the failed validator automatically. Explicit `resume`
+repeats the observation and continues the same Run if it becomes conclusive.
+`state_unknown` remains reserved for ambiguous provider submission, call, or
+cancellation ownership, where replacement work could duplicate paid compute.
 
 The terminal-aggregation and repair policy was accepted on 2026-07-29. For one
 Execution Run, all-successful terminal Nodes produce `succeeded`; a boundary

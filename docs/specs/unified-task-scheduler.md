@@ -267,7 +267,7 @@ The kernel uses exactly nine Run statuses:
 | `pending` | No | The immutable plan is persisted and no Task has been dispatched |
 | `running` | No | The DAG is advancing or waiting on dependencies, permits, publications, or attached calls |
 | `cancel_requested` | No | Explicit cancellation is durable and attached work is being reconciled |
-| `suspended` | No | A coordinator application error stopped admission until explicit resume |
+| `suspended` | No | A coordinator error or unknown result validation stopped admission until explicit resume |
 | `state_unknown` | No | Provider submission, call state, or cancellation outcome cannot be established; replacement is forbidden |
 | `succeeded` | Yes | Every terminal Node has a complete validated scientific result |
 | `partial` | Yes | The terminal result boundary is usable but explicitly incomplete |
@@ -285,7 +285,7 @@ A repository transition atomically replaces or clears both fields with
 
 | Status | Required `status_reason` |
 | --- | --- |
-| `suspended` | `coordinator_error` |
+| `suspended` | `coordinator_error` or `result_validation_unknown` |
 | `state_unknown` | `submission_outcome_unknown`, `provider_outcome_unknown`, or `cancellation_outcome_unknown` |
 | `failed` | `required_work_failed` or `deployment_unavailable` |
 | Every other status | `NULL` |
@@ -378,6 +378,14 @@ an aggregate reusable publication deliberately reports `missing`. A partial
 publication is not an available complete Node result, but its successful Task
 publications remain eligible for granular reuse after the Node enters the
 repair closure.
+
+An `unknown` Node or Task result observation leaves that record nonterminal
+and moves the Run to `suspended` with
+`status_reason=result_validation_unknown`. New admission stops, attached
+Provider Calls retain ownership and continue, and no automatic validator retry
+loop runs. Explicit `resume` rechecks the publication and continues the same
+Run after a conclusive observation. `state_unknown` is not used because no
+provider ownership is ambiguous.
 
 The Run succeeds when every terminal Node succeeds. A failed, cancelled,
 partial, or skipped upstream Node does not override complete terminal results.
@@ -1043,7 +1051,9 @@ closure. Nodes without a standalone complete publication report `missing`;
 partial aggregate output does not satisfy the probe. The repository records
 when the observation occurred and whether Node completion was cache-validated
 or produced in the current Run, without copying workload manifests into
-generic execution state.
+generic execution state. `unknown` leaves the observed Node or Task
+nonterminal and suspends the Run with `result_validation_unknown`; explicit
+resume repeats validation.
 
 After a call succeeds, the decoded result and workload publication are
 committed before the Task and call are made durably terminal. If a store
@@ -1170,7 +1180,7 @@ Phase 0 test inventory:
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner failure without same-run reassignment, and unknown-owner blocking |
 | `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
-| `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
+| `tests/execution/test_run_status.py` | Exactly nine statuses and seven reason codes exist; legal transitions, terminality, status-reason constraints, coordinator and result-validation suspension, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
@@ -1253,6 +1263,8 @@ Deliverables:
   Nodes, Tasks, and Provider Calls over a host-supplied SQLite connection;
 - implement the nine-status Run transition table, `status_reason`, and
   `status_message`;
+- suspend unknown Node or Task result validation with
+  `result_validation_unknown` until explicit resume;
 - implement the eight-status Provider Call lifecycle without `planned` or
   `expired` states;
 - persist `result_already_satisfied` on pruned Nodes and Tasks, and reconcile
@@ -1599,7 +1611,7 @@ authorized smoke test after local and CI gates pass.
 | An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
 | Recovery silently spends on a second call | Enforce one Task submission per Run in SQLite; require a Successor Execution Run for failed work |
 | “Exactly once” hides provider re-execution | Promise single scheduler submission only; require idempotent work or authoritative publication validation across redelivery |
-| Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
+| Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work; `unknown` suspends until explicit resume |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
 | Two coordinator containers open one Volume ledger | Route by Execution Run ID and pinned deployment version, cap the pool at one container, serialize writes, and smoke-test provider behavior |
@@ -1794,13 +1806,13 @@ after each decision:
     failures stay canonical on those records; there are no status-specific
     reason columns.
 31. **Initial Run reason vocabulary — accepted 2026-07-29**: the closed
-    kernel enum contains `coordinator_error`,
+    kernel enum contains `coordinator_error`, `result_validation_unknown`,
     `submission_outcome_unknown`, `provider_outcome_unknown`,
     `cancellation_outcome_unknown`, `required_work_failed`, and
-    `deployment_unavailable`. The first applies only to `suspended`, the next
-    three only to `state_unknown`, the final two only to `failed`, and every
-    other Run status requires a null reason. The repository rejects invalid
-    combinations.
+    `deployment_unavailable`. The first two apply only to `suspended`, the
+    next three only to `state_unknown`, the final two only to `failed`, and
+    every other Run status requires a null reason. The repository rejects
+    invalid combinations.
 32. **Execution Node statuses — accepted 2026-07-29**: Nodes use `pending`,
     `running`, `succeeded`, `partial`, `failed`, `cancelled`, and `skipped`;
     only the first two are nonterminal. Readiness is derived, cache reuse is
@@ -1902,6 +1914,12 @@ after each decision:
     are reused only at Task granularity after expansion. The kernel records
     minimal observation provenance while workload code owns all scientific
     evidence and validation.
+45. **Unknown result validation — accepted 2026-07-29**: an `unknown` Node or
+    Task observation leaves the record nonterminal, stops admission, and
+    suspends the Run with `status_reason=result_validation_unknown`. Attached
+    calls retain ownership and are not cancelled. There is no automatic retry;
+    explicit `resume` repeats validation. `state_unknown` remains reserved for
+    ambiguous provider submission, call, or cancellation ownership.
 
 ## Definition of ready for implementation
 

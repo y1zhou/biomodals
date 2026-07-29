@@ -47,7 +47,8 @@ current Execution Run Status. An optional human-readable `status_message`
 provides diagnostics but is never used for control flow. Task- and
 Node-specific failures remain canonical on those records; the Run fields only
 summarize why its lifecycle changed. The initial reason vocabulary is:
-`coordinator_error`, `submission_outcome_unknown`,
+`coordinator_error`, `result_validation_unknown`,
+`submission_outcome_unknown`,
 `provider_outcome_unknown`, `cancellation_outcome_unknown`,
 `required_work_failed`, and `deployment_unavailable`.
 _Avoid_: status-specific reason columns, free-text state machine, copied stack trace
@@ -72,7 +73,9 @@ _Avoid_: rerun whole DAG, reopen predecessor, accept partial as complete
 
 **Suspended Run** [planned]:
 A nonterminal Execution Run whose coordinator stopped after an application
-error. It admits no new work until explicit resume reconciles durable state.
+error or an unknown Node or Task publication observation. It admits no new
+work until explicit resume reconciles durable state and repeats any unresolved
+validation.
 _Avoid_: failed Task, provider state unknown, Modal preemption
 
 **State-Unknown Run** [planned]:

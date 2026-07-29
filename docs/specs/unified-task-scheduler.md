@@ -96,6 +96,8 @@ These existing decisions remain binding during the refactor:
   or scientific completion evidence.
 - Coordinator Interruption suspends scheduling and preserves attached child
   Provider Calls; only explicit cancellation terminates them.
+- Worker lifecycle callbacks are advisory: they may checkpoint or diagnose an
+  interruption but never fail or reassign a Task.
 - No paid Modal calls run in CI.
 
 ## Proposed domain model
@@ -108,6 +110,7 @@ Service Job (optional API envelope)
         │           └── Task Attempt
         └── Dispatch Batch
               ├── contains one or more Task Attempts
+              ├── records call-bound Worker Assignments
               └── served by one or more Provider Calls
 ```
 
@@ -143,6 +146,9 @@ call ID and observed lifecycle. A call can cover a batch of Task Attempts.
 **Dispatch Batch** is a durable grouping of Task Attempts offered to one
 provider call or a shared worker pool. Exact Task-to-call attribution is
 recorded only when it is observed.
+
+**Worker Assignment** is an append-only, call-bound claim electing the worker
+allowed to execute one Task Attempt delivered through a shared work pool.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -306,6 +312,39 @@ Ownership is not a timeout lease. A stuck or unobservable predecessor requires
 explicit cancellation or operator recovery before reassignment. The API
 service and local CLI coordinators use host-owned single-writer exclusion and
 do not need the Modal ownership adapter.
+
+### Worker interruption and assignment recovery
+
+Worker recovery is driven by provider-call state and publication validation,
+not elapsed time:
+
+- preemption or a rescheduled container retains the same Provider Call, Task
+  Attempt, permit allocation, and Worker Assignment;
+- a normal result may carry independent per-Task outcomes for a batch;
+- a conclusive terminal call failure fails its unfinished Task Attempts and
+  releases their permits;
+- a successful call with a missing or invalid expected publication fails the
+  affected Task;
+- unknown call state preserves `state_unknown` and forbids replacement work.
+
+Direct one-Task-per-call execution needs no separate remote assignment store.
+For a queue-backed Dispatch Batch, the immutable Task catalog remains durable
+in SQLite and active Worker Assignments are mirrored into a provider-accessible
+insert-only store. A queue delivery is executed only after the receiving
+worker atomically elects itself for that Task. Duplicate delivery therefore
+loses the election and is harmless.
+
+If a worker removes a queue item and dies before claiming it, the Task remains
+unassigned in the Dispatch Batch and may be delivered again. If it dies after
+claiming, the restarted provider input retains the assignment. A different
+Provider Call may receive a successor assignment only after the owning call is
+conclusively terminal.
+
+An exit hook may commit workload checkpoints and emit an advisory
+`interrupted` event containing the call, slot, and Task IDs. The coordinator
+does not treat receipt as failure, and correctness does not depend on receipt.
+In particular, an exit hook must not remove a BoltzGen output claim or requeue
+a Rosetta Task while Modal may restart the same input.
 
 ### Host-invariant execution state
 
@@ -530,6 +569,12 @@ characterization tests:
 5. `WorkflowOrchestrator.exit()` currently cancels active remote calls during
    every container exit. Separate interruption from explicit cancellation and
    preserve attached calls for replacement-attempt recovery.
+6. Rosetta removes a queue item before any durable Worker Assignment, so a
+   hard interruption can lose delivery. Retain the SQLite Dispatch Batch as
+   the task catalog and elect a call-bound assignment before execution.
+7. BoltzGen removes its output lock from `@modal.exit`, which can expose the
+   same output to another worker while Modal restarts the interrupted input.
+   Exit must preserve call-bound ownership.
 
 Fault-injection tests must stop immediately after preclaim, spawn, attachment,
 collection, decode, publication, and final commit. Each restart assertion must
@@ -607,6 +652,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_ownership.py` | Same-input replacement retains ownership; active or unknown predecessor blocks; only terminal predecessor permits a successor |
+| `tests/execution/test_dispatch.py` | Duplicate and lost queue delivery, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -766,6 +812,8 @@ Deliverables:
   become available;
 - add a reusable Modal work-pool adapter for queue population, worker-call
   attachment, outcome reconciliation, and queue cleanup;
+- add call-bound Worker Assignments so duplicate delivery is harmless and
+  preempted provider inputs retain their current Tasks;
 - keep SQLite single-writer: workers return outcome records or publish
   outputs, and only the coordinator commits execution transitions;
 - remove BoltzGen's generic `bounded_map` orchestration and use Task state to
@@ -782,6 +830,7 @@ Exit gate:
   an uncertain GPU call;
 - Rosetta workers balance Tasks dynamically, and every Task is reconciled
   independently after partial worker failure;
+- worker exit callbacks can be dropped without changing any recovery result;
 - a coordinator restart reconstructs permits, batches, and attached worker
   calls without treating queue contents as authoritative;
 - workload modules contain scientific execution and validation rather than
@@ -847,9 +896,10 @@ Use small commits in dependency order:
 10. `execution: add durable task attempts`
 11. `ppiflow: adopt durable task fanout`
 12. `alphafold3: adopt execution adapters`
-13. `boltzgen: adopt direct task fanout`
-14. `rosetta: adopt queue work pool`
-15. `execution: remove duplicate schedulers`
+13. `execution: add dispatch adapters`
+14. `boltzgen: adopt direct task fanout`
+15. `rosetta: adopt queue work pool`
+16. `execution: remove duplicate schedulers`
 
 Split a commit further whenever its predecessor and replacement cannot be
 reviewed side by side. Never combine an AlphaFold3 scientific contract change
@@ -933,7 +983,7 @@ written by it. No compatibility reader is required.
 | Call lifecycle | Fault injection around every transition, attach validation, recovery, expiry, cancellation, unknown outcomes |
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
 | Batching | Call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
-| Dispatch | Direct fan-out, many-call work pools, realized Task attribution, queue loss and duplicate delivery |
+| Dispatch | Direct fan-out, many-call work pools, call-bound Worker Assignments, queue loss and duplicate delivery |
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from Task permits, batched permit accounting, no permit leak on failure |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
@@ -955,6 +1005,7 @@ authorized smoke test after local and CI gates pass.
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate drivers |
 | A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
 | A Remote Work Queue is mistaken for durable state | Persist Dispatch Batches and reconcile returned outcomes or validated publications |
+| An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
@@ -1031,9 +1082,12 @@ after each decision:
     provider input retains ownership across preemption Attempts; another
     invocation may succeed it only after conclusive predecessor termination.
     Unknown state blocks, and elapsed time alone never transfers ownership.
-12. **Worker interruption — pending**: define how direct, batched, and
-    work-stealing Task assignments survive worker preemption or terminal
-    failure without relying on lifecycle callbacks.
+12. **Worker interruption — accepted 2026-07-29**: preemption retains the
+    Task Attempt and call-bound Worker Assignment. Exit callbacks are advisory.
+    A successor assignment requires conclusive owner-call termination, while
+    unknown state blocks replacement.
+13. **Retry authority — pending**: distinguish safe redelivery within one Task
+    Attempt from creation of a new paid Task Attempt after terminal failure.
 
 ## Definition of ready for implementation
 

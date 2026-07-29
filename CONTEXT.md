@@ -46,6 +46,13 @@ Dispatch Batch. It is neither durable execution authority nor evidence that
 an item completed.
 _Avoid_: Execution State Repository, workflow ledger, publication
 
+**Worker Assignment** [planned]:
+An append-only claim linking one Task Attempt to the Provider Call and worker
+slot currently responsible for it. Replacement containers for that call
+retain the assignment; a different call may succeed it only after the owner
+call is conclusively terminal.
+_Avoid_: queue item, timeout lease, Task Attempt
+
 **Execution State Repository**:
 A durable record of Execution Runs, Nodes, Tasks, Task Attempts, and Provider
 Calls governed by the execution kernel's transition contract. Each durable

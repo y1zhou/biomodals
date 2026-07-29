@@ -106,6 +106,13 @@ only after the predecessor call is conclusively terminal; unknown state fails
 closed and requires operator recovery. Ownership never transfers merely
 because time elapsed.
 
+The worker-interruption policy was accepted on 2026-07-29. Worker preemption
+does not fail a Task Attempt or release its Worker Assignment because Modal
+restarts the same provider input. Work-pool assignments are append-only and
+call-bound; another call may receive a successor assignment only after the
+owner call is conclusively terminal. Lifecycle exit hooks may checkpoint work
+or emit diagnostics, but they never authorize failure or reassignment.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -160,6 +167,13 @@ the single-process API service use their existing ownership instead. This
 avoids concurrent access to one Volume-backed SQLite file without introducing
 a time-based distributed lease or pretending SQLite can fence writers before
 it is safely opened.
+
+Queue-backed work stealing uses the same call-bound principle at Task scope.
+The durable Dispatch Batch remains the task catalog, a Remote Work Queue is
+only a delivery hint, and a provider-accessible Worker Assignment elects the
+worker allowed to execute a delivered Task. Publication validation and
+terminal provider state recover dropped or interrupted delivery without a
+timeout-based steal.
 
 This is an incremental extraction, not a rewrite. Internal types, tables, and
 imports may change directly while each consumer adopts the kernel. Scientific

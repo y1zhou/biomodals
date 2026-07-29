@@ -85,6 +85,13 @@ and `running` are nonterminal. Readiness is derived rather than persisted, and
 cache reuse is Task provenance rather than a Node status.
 _Avoid_: ready, cached, suspended, state unknown
 
+**Terminal Execution Node** [planned]:
+An Execution Node with no downstream dependency. Terminal Execution Nodes
+collectively define an Execution Run's scientific result boundary. Their
+validated publications determine the Run outcome; upstream Node history does
+not override a complete terminal result.
+_Avoid_: last executed node, designated result node, all-Node aggregation
+
 **Partial Dependency Acceptance** [planned]:
 The immutable `accept_partial` boolean on one Node dependency edge. Success
 always satisfies the edge; a partial upstream Node satisfies it only when the

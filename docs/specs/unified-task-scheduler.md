@@ -269,9 +269,9 @@ The kernel uses exactly nine Run statuses:
 | `cancel_requested` | No | Explicit cancellation is durable and attached work is being reconciled |
 | `suspended` | No | A coordinator application error stopped admission until explicit resume |
 | `state_unknown` | No | Provider submission, call state, or cancellation outcome cannot be established; replacement is forbidden |
-| `succeeded` | Yes | All required work and publications completed successfully |
-| `partial` | Yes | The declared aggregation policy produced a usable partial result |
-| `failed` | Yes | Required work conclusively failed or the Run cannot continue |
+| `succeeded` | Yes | Every terminal Node has a complete validated scientific result |
+| `partial` | Yes | The terminal result boundary is usable but explicitly incomplete |
+| `failed` | Yes | A required terminal result cannot be produced or the Run cannot continue |
 | `cancelled` | Yes | Cancellation completed conclusively |
 
 Two nullable fields refine the current status:
@@ -359,6 +359,23 @@ cancellation takes precedence and marks unfinished Nodes `cancelled` instead
 of applying dependency-skip propagation. The edge-level boolean lets one Node
 accept a partial candidate set from one dependency while requiring complete
 output from another, without a generic accepted-status policy.
+
+Terminal Execution Nodes—the DAG leaves with no downstream dependency—form
+the scientific result boundary. Scheduling is result-driven:
+
+1. validate the expected publications of every terminal Node;
+2. treat a reusable terminal publication as successful without scheduling its
+   ancestors;
+3. for each incomplete terminal, walk backward through only its ancestor
+   closure, stopping whenever another reusable Node publication is found;
+4. schedule the remaining required Nodes forward in dependency order.
+
+The Run succeeds when every terminal Node succeeds. A failed, cancelled,
+partial, or skipped upstream Node does not override complete terminal results.
+This is intentionally not an aggregation across every planned Node: the graph
+describes ways to obtain scientific results, while validated terminal
+publications determine whether those results exist. It preserves fast cached
+return and the current workflow runtime's terminal-pruning semantics.
 
 ### Task statuses
 
@@ -467,10 +484,11 @@ ledger, reconciles attached calls, and then returns the same Execution Run to
 `running`.
 
 A workload or Provider Call failure is different: it terminally fails the
-affected Task, and the Node aggregation policy derives the Node and Run
-outcome. The coordinator reports that outcome and returns when the DAG is
-terminal. It does not convert a known Task failure into a resumable coordinator
-error.
+affected Task, and the Node aggregation policy derives the Node outcome. The
+Run outcome is derived from the terminal scientific result boundary rather
+than every intermediate Node. The coordinator reports that outcome and
+returns when the required result boundary is terminal. It does not convert a
+known Task failure into a resumable coordinator error.
 
 Every app and workflow deployment exports its thin class under the standard
 name `ExecutionCoordinator`. Its version-pinned, run-parameterized instance
@@ -1076,7 +1094,8 @@ Phase 0 test inventory:
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
-| `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; explicit cancellation takes precedence |
+| `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
+| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; traversal starts from incomplete terminals; complete terminal results make the Run succeed regardless of upstream history |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
@@ -1122,6 +1141,8 @@ Deliverables:
 - add immutable `ExecutionPlan`, `NodePlan`, and dependency validation;
 - represent partial dependency acceptance with one strict-by-default
   `accept_partial` boolean per edge;
+- derive the terminal result boundary from DAG leaves and prune ancestor work
+  backward from validated terminal publications;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1755,6 +1776,12 @@ after each decision:
     cancelled, and skipped outcomes never satisfy it. An unacceptable terminal
     dependency skips the downstream Node, while explicit Run cancellation
     takes precedence and cancels unfinished Nodes.
+40. **Result-driven terminal boundary — accepted 2026-07-29**: DAG leaves are
+    the scientific result boundary. Validate their publications first and walk
+    backward only through incomplete terminals' ancestor closures. The Run
+    succeeds when every terminal Node succeeds, regardless of failed,
+    cancelled, or skipped upstream history; intermediate Nodes do not vote on
+    the final scientific outcome.
 
 ## Definition of ready for implementation
 

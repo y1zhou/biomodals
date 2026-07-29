@@ -236,6 +236,18 @@ terminal, the dependent Node becomes `skipped`. Explicit Run cancellation
 takes precedence and marks unfinished Nodes `cancelled` rather than obscuring
 the cancellation through skip propagation.
 
+The result-boundary policy was accepted on 2026-07-29. Terminal Execution
+Nodes—the DAG leaves with no downstream dependency—collectively define the
+scientific result boundary. The scheduler validates their workload
+publications first and walks backward only through the ancestor closure of
+terminal Nodes whose results are incomplete. A reusable terminal publication
+therefore completes that Node without scheduling already-unnecessary
+ancestors. If every terminal Node succeeds, the Execution Run succeeds even
+when an upstream Node previously failed, was cancelled, or was skipped.
+Intermediate lifecycle history remains available for diagnosis but is not an
+all-Node vote on the scientific outcome. This generalizes the workflow
+runtime's existing terminal-pruning behavior to every kernel consumer.
+
 The Task status policy was accepted on 2026-07-29. Tasks have exactly six
 statuses: `pending`, `running`, `succeeded`, `failed`, `cancelled`, and
 `skipped`. Only the first two are nonterminal. Durable local execution,
@@ -365,13 +377,13 @@ one Execution Run, each Task is scheduled once and receives at most one
 Provider Call submission or Worker Assignment. Modal may redeliver and
 re-execute the same provider input, so the kernel does not claim exactly-once
 execution. A conclusive provider or workload failure terminates the Task; the
-Node aggregation policy then determines the terminal Node and Run outcome.
-`resume` reconciles interrupted coordination and may submit Tasks that were
-never submitted, but it never resubmits failed Tasks. Retrying failed work
-requires an explicit `restart`, which creates a Successor Execution Run,
-revalidates Workload Publications, and schedules only missing Tasks whose
-predecessor ownership is conclusively terminal. Active or unknown predecessor
-calls block replacement work.
+Node aggregation policy then determines the Node outcome, while terminal
+scientific results determine the Run outcome. `resume` reconciles interrupted
+coordination and may submit Tasks that were never submitted, but it never
+resubmits failed Tasks. Retrying failed work requires an explicit `restart`,
+which creates a Successor Execution Run, revalidates Workload Publications,
+and schedules only missing Tasks whose predecessor ownership is conclusively
+terminal. Active or unknown predecessor calls block replacement work.
 
 ## Considered options
 

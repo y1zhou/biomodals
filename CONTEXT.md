@@ -107,14 +107,15 @@ _Avoid_: scientific output directory, Workflow Ledger, shared execution Volume
 
 **Execution Coordinator** [planned]:
 The logical scheduling authority that serializes transitions in an Execution
-State Repository and drives its Execution Runs. It outlives any process or
-container temporarily performing that work.
+State Repository and advances active Execution Runs independently of their
+launching clients. It outlives any process or container temporarily performing
+that work.
 _Avoid_: worker, SQLite writer container, Provider Call
 
 **Coordinator Attempt** [planned]:
-One continuous tenure in which a process or container acts for an Execution
-Coordinator. An interruption ends the Attempt without cancelling the
-Coordinator's Runs or child Provider Calls.
+One continuous tenure in which a process or container actively advances an
+Execution Coordinator. An interruption ends the Attempt without cancelling
+the Coordinator's Runs or child Provider Calls.
 _Avoid_: Task Attempt, automatic retry, Execution Run
 
 **Coordinator Interruption** [planned]:

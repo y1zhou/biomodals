@@ -116,6 +116,9 @@ These existing decisions remain binding during the refactor:
   need no encoded reference, local registry, or app-specific implementation.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
+- Each remote top-level CLI run has one detached coordinator loop that advances
+  it to a terminal state without client polling, then returns so its container
+  may scale to zero.
 - Child App Calls use their service, workflow, or app-run parent's execution
   repository rather than creating nested execution databases.
 - Coordinator Interruption suspends scheduling and preserves attached child
@@ -264,15 +267,27 @@ global registries, plugin discovery, YAML workflows, or import-time Modal
 app or Volume bindings. Each app and workflow declares its own thin decorated
 coordinator wrapper over `execution.modal`.
 
-### Driver model
+### Coordinator loop model
 
 The pure transition and readiness functions are shared. The API service keeps
-an async driver around them; remote workflow and app-run coordinators use a
-sync driver. Local Entrypoints are thin clients of those remote drivers rather
-than execution hosts. By default they address a named deployment version;
-local source-backed execution is an explicit development path. Maintaining two
-small coordinator drivers is preferable to infecting every consumer with an
-async abstraction or running nested event loops.
+an async coordinator loop around them; remote workflow and app-run
+coordinators use a sync loop. Local Entrypoints are thin clients of those
+remote coordinators rather than execution hosts. By default they address a
+named deployment version; local source-backed execution is an explicit
+development path. Maintaining two small host loops is preferable to infecting
+every consumer with an async abstraction or running nested event loops.
+
+Each remote top-level CLI run submits one detached coordinator-loop input. The
+loop reconciles durable state, schedules ready work, observes attached calls,
+and advances the DAG until the Execution Run becomes terminal. The launching
+CLI may observe it but need not stay connected or poll to make progress.
+Lifecycle methods and pull-worker claims or completions may enter the same
+Run-Scoped Coordinator Pool concurrently; they all use its serialized writer.
+After preemption, a replacement Coordinator Attempt reloads the ledger and
+continues reconciliation. After a terminal transition, the loop returns and
+the container may scale to zero. A later `status` call may start a fresh
+container and read the retained ledger. “Coordinator loop” is an internal
+activity, not a public `drive` CLI command or a new kernel domain type.
 
 Every app and workflow deployment exports its thin class under the standard
 name `ExecutionCoordinator`. Its version-pinned, run-parameterized instance
@@ -397,8 +412,8 @@ coordinator enforces this through a run-scoped provider pool:
    deployment version identify a parameterized coordinator pool;
 2. every unique parameter tuple has its own container pool, capped at one
    coordinator container;
-3. concurrent `run`, `claim`, `complete`, and observation inputs route to that
-   container;
+3. concurrent coordinator-loop, claim, completion, and observation inputs
+   route to that container;
 4. method handlers submit commands to one in-process writer loop rather than
    opening transactions themselves;
 5. the writer serializes SQLite transactions and explicit Volume checkpoints;
@@ -786,7 +801,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
-| `tests/execution/test_remote_coordinator.py` | Duplicate run, claim, and completion commands are idempotent; replacement reloads checkpoints; different Execution Run IDs remain isolated |
+| `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; replacement reloads checkpoints; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
 | `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
@@ -852,7 +867,7 @@ Deliverables:
 - move the proven preclaim/attach/recover transitions into
   `SqliteExecutionRepository` and behind the provider port;
 - use `ModalJobSubmitter` as the behavioral baseline for uncertain spawn;
-- add thin async service and sync workflow drivers;
+- add thin async service and sync workflow coordinator loops;
 - replace service `job_operations` and workflow `remote_calls` with shared
   execution tables as each host migrates;
 - add the explicit offline service-state transition command;
@@ -1040,6 +1055,8 @@ Deliverables:
 - use only exact versioned Function and Cls lookups after resolution;
 - retain workload-specific argument parsing and local input staging in thin
   Local Entrypoints without creating local execution state;
+- submit one detached coordinator loop per remote top-level run so progress
+  does not depend on the CLI process remaining connected;
 - add an explicit development mode for source-backed ephemeral execution and
   label its lack of cross-invocation resume;
 - keep help, shell, and workflow dry-run behavior local and free of paid calls;
@@ -1202,7 +1219,7 @@ authorized smoke test after local and CI gates pass.
 | --- | --- |
 | A universal abstraction hides scientific differences | Workload-owned hooks and provider adapters; migrate AF3 last |
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
-| Async and sync consumers distort the API | Share pure transitions; keep thin separate drivers |
+| Async and sync consumers distort the API | Share pure transitions; keep thin separate host loops |
 | A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
 | A claim response is lost after assignment | Commit and Volume-checkpoint the assignment before responding; replay by stable request ID |
 | An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
@@ -1360,6 +1377,13 @@ after each decision:
     reject non-terminal Runs and may remove only execution state, never
     Workload Publications or scientific outputs. Service database retention
     remains service-owned.
+25. **Active remote coordinator — accepted 2026-07-29**: each remote
+    top-level CLI app or workflow run submits one detached coordinator loop
+    that advances it until terminal without client polling. Concurrent control
+    and worker inputs share its serialized writer. Preemption starts a
+    replacement Coordinator Attempt from the ledger; after terminal completion
+    the loop returns, and later status calls may reopen the retained ledger in
+    a fresh container. The loop is not a CLI subcommand or public domain type.
 
 ## Definition of ready for implementation
 

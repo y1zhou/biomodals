@@ -193,6 +193,18 @@ checkpoint. Different Run IDs have independent pools and may execute
 concurrently. The provider routing and single-container assumptions require a
 manual Modal smoke test before remote adoption.
 
+The active-run lifecycle was accepted on 2026-07-29. Each remote top-level CLI
+app or workflow run submits one detached coordinator-loop input to its
+Run-Scoped Coordinator Pool. This is an internal activity, not a CLI
+subcommand or public kernel type. It reconciles durable state, dispatches ready
+work, observes attached calls, and advances the DAG until the Run becomes
+terminal; progress never depends on the launching CLI remaining connected or
+polling. Concurrent lifecycle and worker inputs enter the same pool and use
+the serialized writer. A replacement Coordinator Attempt reloads the ledger
+after preemption. Once terminal, the loop returns and the container may scale
+to zero; a later status request may start a fresh container and read the
+retained ledger.
+
 The worker-interruption policy was accepted on 2026-07-29. Worker preemption
 does not fail a Task Attempt or release its Worker Assignment because Modal
 restarts the same provider input. Pull workers use stable, idempotent claim

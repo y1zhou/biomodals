@@ -43,6 +43,14 @@ deployment version pins the coordinator code and workload adapter together.
 The shared kernel contains reusable Modal coordination mechanics but declares
 no app object, workload registry, or deployment-global Volume.
 
+The CLI deployment-lifetime policy was accepted on 2026-07-29. Both
+`biomodals app run` and `biomodals workflow run` submit to an exact named
+deployment version by default. This keeps the same parameterized coordinator
+pool addressable after the launching process exits. Source-backed
+`modal run` execution remains available only as an explicit Development CLI
+Run and carries no cross-invocation resume guarantee. Local dry-run planning
+does not require a deployment.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -165,6 +173,10 @@ only for work still missing.
   wrappers, but would require a workload registry, access to every workload's
   storage, and independent compatibility between coordinator and workload
   deployment versions.
+- Keeping ephemeral `modal run` as the default CLI launcher would preserve the
+  current source-first behavior, but a later process could recover a
+  FunctionCall by ID without being able to address the same parameterized
+  coordinator deployment reliably.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.

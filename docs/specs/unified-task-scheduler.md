@@ -97,6 +97,9 @@ These existing decisions remain binding during the refactor:
   version to a provider pool capped at one container.
 - The coordinator binding ships with each app or workflow deployment; there
   is no universal execution-coordinator deployment or workload registry.
+- `biomodals app run` and `biomodals workflow run` target exact deployed
+  versions by default; source-backed ephemeral execution is explicit
+  development mode without cross-invocation resume.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -231,9 +234,10 @@ coordinator wrapper over `execution.modal`.
 The pure transition and readiness functions are shared. The API service keeps
 an async driver around them; remote workflow and app-run coordinators use a
 sync driver. Local Entrypoints are thin clients of those remote drivers rather
-than execution hosts. Maintaining two small coordinator drivers is preferable
-to infecting every consumer with an async abstraction or running nested event
-loops.
+than execution hosts. By default they address a named deployment version;
+local source-backed execution is an explicit development path. Maintaining two
+small coordinator drivers is preferable to infecting every consumer with an
+async abstraction or running nested event loops.
 
 ### Durable execution state
 
@@ -263,6 +267,12 @@ A Direct CLI App Run always creates its per-run ledger remotely and executes
 through a Run-Scoped Coordinator Pool, even for one direct Provider Call. The
 Local Entrypoint owns no SQLite file: it prepares local input, submits the run,
 and optionally waits for or retrieves the result.
+
+A workflow CLI run follows the same deployment rule and uses its remote
+Workflow Orchestrator and per-run Workflow Ledger. Both CLI commands pin an
+exact deployed version before admitting work. An explicit Development CLI Run
+may execute current source through an ephemeral Modal app, but it cannot later
+claim the durable resume semantics of a Deployed CLI Run.
 
 The same app invoked from an API service or workflow is instead a Child App
 Call. Its Tasks live in that parent coordinator's repository, so the child
@@ -938,6 +948,38 @@ Rollback:
   require no reverse migration. Old local databases and unfinished workflow
   runs may require explicit recreation.
 
+### Phase 8 — switch the CLI launch contract
+
+Deliverables:
+
+- make `biomodals app run` and `biomodals workflow run` resolve the
+  deployment-local coordinator at an exact app or workflow version;
+- retain workload-specific argument parsing and local input staging in thin
+  Local Entrypoints without creating local execution state;
+- add an explicit development mode for source-backed ephemeral execution and
+  label its lack of cross-invocation resume;
+- keep help, shell, and workflow dry-run behavior local and free of paid calls;
+- print the Run ID, deployment identity, and coordinator FunctionCall ID needed
+  for inspection and recovery;
+- update CLI command builders, help, README examples, and characterization
+  tests together.
+
+Exit gate:
+
+- default app and workflow runs never place their coordinator in an ephemeral
+  deployment;
+- a second CLI process can address the same run-scoped coordinator using the
+  recorded deployment identity and Run ID;
+- development mode remains useful for source iteration but cannot be mistaken
+  for a resumable deployed run;
+- dry-run and help start no remote execution.
+
+Rollback:
+
+- restore the old ephemeral command builders only before users depend on the
+  new durable CLI run contract. Remote ledgers and publications need no
+  conversion.
+
 ## Suggested incremental commits
 
 Use small commits in dependency order:
@@ -954,10 +996,11 @@ Use small commits in dependency order:
 10. `execution: add durable task attempts`
 11. `ppiflow: adopt durable task fanout`
 12. `alphafold3: adopt execution adapters`
-13. `execution: add dispatch adapters`
+13. `execution: add dispatch coordinators`
 14. `boltzgen: adopt direct task fanout`
 15. `rosetta: adopt sqlite work pool`
-16. `execution: remove duplicate schedulers`
+16. `cli: target deployed coordinators`
+17. `execution: remove duplicate schedulers`
 
 Split a commit further whenever its predecessor and replacement cannot be
 reviewed side by side. Never combine an AlphaFold3 scientific contract change
@@ -1166,9 +1209,15 @@ after each decision:
     the shared kernel. The containing deployment version pins coordinator and
     workload code together. There is no universal coordinator deployment,
     workload registry, or deployment-global Volume in the kernel.
-17. **CLI deployment lifetime — pending**: define whether Direct CLI App Runs
-    continue using ephemeral `modal run` deployments and how a later resume
-    observes or replaces a coordinator from an expired deployment.
+17. **CLI deployment lifetime — accepted 2026-07-29**: both
+    `biomodals app run` and `biomodals workflow run` target exact named
+    deployment versions by default, keeping their coordinator pools
+    addressable across CLI processes. Source-backed ephemeral execution is an
+    explicit Development CLI Run with no cross-invocation resume guarantee.
+    Local dry-run planning needs no deployment.
+18. **Deployment version selection — pending**: define whether every CLI run
+    requires an explicit Modal deployment version or may resolve the current
+    deployed version once and persist that exact identity before admission.
 
 ## Definition of ready for implementation
 

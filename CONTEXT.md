@@ -102,11 +102,23 @@ shared execution kernel to that deployment's workload hooks, Volumes, and
 configuration without introducing a universal coordinator service.
 _Avoid_: execution kernel, workload registry, API service
 
+**Deployed CLI Run** [planned]:
+A top-level app or workflow Execution Run submitted by the Biomodals CLI to an
+exact named deployment version. It may be observed or resumed across local CLI
+processes through its remote Run-Scoped Coordinator Pool.
+_Avoid_: ephemeral development run, API Job, Child App Call
+
 **Direct CLI App Run** [planned]:
-A top-level Execution Run initiated through an app's Local Entrypoint and
-owned by a remote Run-Scoped Coordinator Pool. Its durable repository lives
-remotely; the user's machine does not create or own a run database.
+A Deployed CLI Run initiated through `biomodals app run`. Its durable
+repository lives remotely; the user's machine does not create or own a run
+database.
 _Avoid_: Child App Call, local scheduler, API Job
+
+**Development CLI Run** [planned]:
+An explicitly requested source-backed app or workflow run using an ephemeral
+Modal deployment. It may use the remote kernel but promises no
+cross-invocation resume after that deployment expires.
+_Avoid_: Deployed CLI Run, production deployment, dry run
 
 **Service Job**:
 A user-facing API service record for ownership, admission, configuration,
@@ -332,7 +344,7 @@ _Avoid_: workflow node, execution run, Direct CLI App Run
 
 **Local Entrypoint**:
 A CLI-facing Modal entrypoint that parses and stages local user inputs,
-submits a Direct CLI App Run to a remote coordinator, then observes, downloads,
+submits a Deployed CLI Run to a remote coordinator, then observes, downloads,
 or reports its outputs. It does not own an Execution State Repository.
 _Avoid_: workflow entrypoint, execution coordinator
 

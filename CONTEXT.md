@@ -34,6 +34,18 @@ later observation, recovery, or cancellation. A Provider Call may serve
 several Task Attempts.
 _Avoid_: Task, workflow node, app
 
+**Dispatch Batch** [planned]:
+A durable grouping of Task Attempts offered together to one Provider Call or
+to a shared remote worker pool. It records intended dispatch without claiming
+that a particular worker performed a Task before that assignment is observed.
+_Avoid_: workflow node, provider call, scientific batch
+
+**Remote Work Queue**:
+A provider-accessible transport from which remote workers claim items in a
+Dispatch Batch. It is neither durable execution authority nor evidence that
+an item completed.
+_Avoid_: Execution State Repository, workflow ledger, publication
+
 **Execution State Repository**:
 A durable record of Execution Runs, Nodes, Tasks, Task Attempts, and Provider
 Calls governed by the execution kernel's transition contract. Each durable
@@ -433,8 +445,9 @@ The number of ready workflow nodes the workflow runtime may start concurrently i
 _Avoid_: global Modal container limit, child app concurrency
 
 **App-Local Scheduler**:
-A tool-specific queue, worker pool, pod pool, or fan-out loop inside an app function or local entrypoint.
-_Avoid_: workflow runtime, DAG scheduler
+A tool-specific queue, worker pool, pod pool, or fan-out loop that directly
+coordinates an app's concurrent Tasks.
+_Avoid_: execution kernel, provider autoscaler
 
 **Run-Level Task Budget**:
 A coordinator-enforced concurrency budget for Tasks and Provider Calls in one

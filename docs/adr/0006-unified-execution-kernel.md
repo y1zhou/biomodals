@@ -83,6 +83,13 @@ runtime establish fixed graph and one-Task-per-call behavior, PPIFlow is the
 first runtime-discovered fan-out consumer, and AlphaFold3 adopts the proven
 kernel afterward.
 
+The app-fan-out scope was accepted on 2026-07-29. The kernel also replaces
+generic App-Local Scheduler mechanics after its Task lifecycle is proven.
+BoltzGen supplies the direct one-Task-per-call case and Rosetta supplies the
+queue-backed work-stealing case. Provider queues remain disposable dispatch
+transport; they do not become execution authority, and provider workers do
+not write the coordinator's SQLite repository.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -115,6 +122,14 @@ observed provider state, and timestamps. It records that a workload
 publication was validated, but the publication's marker, manifest, or
 workload-specific validator remains authoritative for whether scientific
 output is reusable.
+
+Concurrent Task execution does not imply concurrent SQLite writers. One
+coordinator durably admits work and records returned events while direct
+calls, batched calls, or queue-backed worker pools run concurrently. A
+Dispatch Batch relates Task Attempts to one or more Provider Calls without
+pretending that a transient queue is a database. Workload code retains task
+identity, batch compatibility, execution, and publication validation; shared
+adapters own reusable fan-out and worker-pool mechanics.
 
 This is an incremental extraction, not a rewrite. Internal types, tables, and
 imports may change directly while each consumer adopts the kernel. Scientific

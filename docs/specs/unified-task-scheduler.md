@@ -17,7 +17,8 @@ The target is one place to reason about:
 - safe submission, attachment, polling, cancellation, and recovery;
 - cache observations and the decision to reuse or compute;
 - input preparation and output collection boundaries;
-- batching and run-level resource budgets.
+- batching and run-level resource budgets;
+- reusable direct-fan-out and queue-backed worker-pool dispatch.
 
 It is not one place to encode every workload's scientific semantics or persist
 every kind of state.
@@ -25,9 +26,10 @@ every kind of state.
 ## Success definition
 
 The refactor is complete when GROMACS service jobs, reusable workflows,
-PPIFlow candidate fan-out, and AlphaFold3 search and inference all use the same
-execution-state vocabulary and scheduling primitives without changing their
-public behavior, scientific identities, durable layouts, or retry authority.
+PPIFlow candidate fan-out, AlphaFold3 search and inference, BoltzGen direct
+fan-out, and Rosetta work stealing all use the same execution-state vocabulary
+and scheduling primitives without changing their public behavior, scientific
+identities, durable layouts, or retry authority.
 
 In particular:
 
@@ -41,7 +43,9 @@ In particular:
    workload publication are durably recoverable.
 6. Parallel tasks run when their dependencies and resource budget allow it.
 7. One provider call may represent a batch of independently identified tasks.
-8. Service, workflow, and app CLI entrypoints remain functionally testable;
+8. Several provider calls may serve one queue-backed Dispatch Batch without
+   making the queue an execution authority.
+9. Service, workflow, and app CLI entrypoints remain functionally testable;
    internal imports and unfinished schemas carry no compatibility promise.
 
 ## Current execution authorities
@@ -52,6 +56,8 @@ In particular:
 | Workflow runtime | `Workflow`, `WorkflowRuntime`, `WorkflowLedger`, `RemoteCallManager` | Static DAG validation, node attempts, artifacts, per-run recovery, terminal pruning | Per-run ledger and workflow artifact contracts stay workflow-owned |
 | PPIFlow | Fixed workflow nodes plus candidate manifests and bounded coordinator loops | Runtime candidate identity, partial outcomes, stage-specific fan-out | Scientific candidate schemas and joins stay PPIFlow-owned |
 | AlphaFold3 | Pure search/inference plans, Modal adapters, generation claims, Volume markers | Fine-grained cache identity, multi-writer claims, per-seed reuse, batched inference, publication validation | Markers and validated publications remain scientific completion authority |
+| BoltzGen | Incomplete-run discovery, bounded direct fan-out, output-directory locks | One independently reusable run per Task and resumable upstream output | BoltzGen inputs, completion validation, and cross-coordinator publication claims stay workload-owned |
+| Rosetta | Modal Queue, multi-pod work stealing, per-pod thread pools | Efficient balancing of many independent CPU Tasks | Rosetta commands, Task payloads, and output validation stay workload-owned |
 | Helper layer | `bounded_map` and `batches_for_total_concurrency` | Small deterministic local concurrency helpers | Thread pools are not durable schedulers or global limits |
 
 The duplication is not merely similar function names. Each area independently
@@ -85,6 +91,9 @@ These existing decisions remain binding during the refactor:
 - GROMACS continues to call the deployed app's established functions. The
   service does not rewrite the app or replace its CLI entrypoint.
 - PPIFlow keeps a fixed stage DAG while candidate work fans out inside a stage.
+- Provider workers never write the coordinator's SQLite repository.
+- A Remote Work Queue is disposable dispatch transport, not durable Task state
+  or scientific completion evidence.
 - No paid Modal calls run in CI.
 
 ## Proposed domain model
@@ -95,8 +104,9 @@ Service Job (optional API envelope)
         ├── Node
         │     └── Task
         │           └── Task Attempt
-        └── Provider Call
-              └── serves one or more Task Attempts
+        └── Dispatch Batch
+              ├── contains one or more Task Attempts
+              └── served by one or more Provider Calls
 ```
 
 The relationship between Task Attempt and Provider Call is not one-to-one:
@@ -104,6 +114,7 @@ The relationship between Task Attempt and Provider Call is not one-to-one:
 - a cache hit completes a Task Attempt without a call;
 - GROMACS usually has one Task Attempt per Modal call;
 - one AlphaFold3 inference worker call may serve several seed Task Attempts;
+- several Rosetta worker calls may steal Tasks from one Dispatch Batch;
 - a Task may have several explicitly authorized Task Attempts over its
   lifetime.
 
@@ -127,6 +138,10 @@ owns the decision to reuse, submit, recover, or report an unknown outcome.
 **Provider Call** is one detached Modal function call, including its durable
 call ID and observed lifecycle. A call can cover a batch of Task Attempts.
 
+**Dispatch Batch** is a durable grouping of Task Attempts offered to one
+provider call or a shared worker pool. Exact Task-to-call attribution is
+recorded only when it is observed.
+
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
 its file or marker format.
@@ -144,6 +159,7 @@ duplicated.
 | Cache | `available` / `missing` / `unknown` vocabulary and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
+| Dispatch | Durable batches, direct fan-out, worker-call tracking, returned outcome routing | Task payloads, batch compatibility, provider-native queue binding |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Mapping Tasks to call batches and distributing outcomes | Batch compatibility and workload-specific limits |
 | Resources | Coordinator-scoped run budget and persisted permit accounting | Service admission, Modal resources, deployment limits, cross-coordinator policy |
@@ -676,7 +692,49 @@ Rollback:
 - adapters can return control to the existing pure pipelines because no marker
   or publication format changes in this phase.
 
-### Phase 6 — make WorkflowRuntime a host and remove duplication
+### Phase 6 — replace generic App-Local Scheduler mechanics
+
+Adopt two concrete dispatch adapters only after durable Tasks and batches are
+proven:
+
+1. BoltzGen exercises bounded direct fan-out, where each run ID is one Task
+   and one GPU Provider Call.
+2. Rosetta exercises a queue-backed worker pool, where several Provider Calls
+   steal Task payloads from one Dispatch Batch.
+
+Deliverables:
+
+- add a reusable direct-fan-out adapter that admits ready Tasks as permits
+  become available;
+- add a reusable Modal work-pool adapter for queue population, worker-call
+  attachment, outcome reconciliation, and queue cleanup;
+- keep SQLite single-writer: workers return outcome records or publish
+  outputs, and only the coordinator commits execution transitions;
+- remove BoltzGen's generic `bounded_map` orchestration and use Task state to
+  prevent duplicate work within one coordinator;
+- retain or replace BoltzGen's output lock only as a cross-coordinator
+  publication claim;
+- remove Rosetta's generic queue and worker-pool lifecycle from workload code
+  while retaining Modal Queue as the remote work-stealing transport;
+- preserve deterministic result ordering and existing CLI behavior.
+
+Exit gate:
+
+- interrupted BoltzGen runs reuse validated completed runs and do not duplicate
+  an uncertain GPU call;
+- Rosetta workers balance Tasks dynamically, and every Task is reconciled
+  independently after partial worker failure;
+- a coordinator restart reconstructs permits, batches, and attached worker
+  calls without treating queue contents as authoritative;
+- workload modules contain scientific execution and validation rather than
+  generic concurrent scheduling loops.
+
+Rollback:
+
+- revert each workload-adoption commit independently; validated outputs remain
+  reusable and no publication format changes are required.
+
+### Phase 7 — make WorkflowRuntime a host and remove duplication
 
 Deliverables:
 
@@ -696,6 +754,8 @@ Likely deletion candidates, only after equivalence:
 - workflow-specific paid-call transition logic;
 - AlphaFold3 `_bounded_remote_outcomes` and claimed seed-batch loops;
 - PPIFlow durable candidate scheduling through bare `bounded_map`;
+- BoltzGen incomplete-run fan-out and same-coordinator output locking;
+- Rosetta queue population, worker-pool sizing, and cleanup orchestration;
 - repeated generation-claim mechanics that have converged on the common port.
 
 Exit gate:
@@ -729,7 +789,9 @@ Use small commits in dependency order:
 10. `execution: add durable task attempts`
 11. `ppiflow: adopt durable task fanout`
 12. `alphafold3: adopt execution adapters`
-13. `execution: remove duplicate schedulers`
+13. `boltzgen: adopt direct task fanout`
+14. `rosetta: adopt queue work pool`
+15. `execution: remove duplicate schedulers`
 
 Split a commit further whenever its predecessor and replacement cannot be
 reviewed side by side. Never combine an AlphaFold3 scientific contract change
@@ -808,6 +870,7 @@ written by it. No compatibility reader is required.
 | Call lifecycle | Fault injection around every transition, attach validation, recovery, expiry, cancellation, unknown outcomes |
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
 | Batching | Call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
+| Dispatch | Direct fan-out, many-call work pools, realized Task attribution, queue loss and duplicate delivery |
 | Resources | Node parallelism independent from Task permits, batched permit accounting, no permit leak on failure |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
 | Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, resume and force behavior |
@@ -827,6 +890,7 @@ authorized smoke test after local and CI gates pass.
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate drivers |
 | A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
+| A Remote Work Queue is mistaken for durable state | Persist Dispatch Batches and reconcile returned outcomes or validated publications |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
@@ -843,6 +907,8 @@ authorized smoke test after local and CI gates pass.
 - global plugin registration or autodiscovery;
 - automatic retries of paid provider calls;
 - a cross-coordinator or cross-run global resource scheduler;
+- remote workers opening or mutating the coordinator's SQLite file;
+- eliminating provider-native queues when work stealing is useful;
 - scheduler-driven mutation of Modal function decorators;
 - moving scientific parsers into generic execution code;
 - rewriting AlphaFold3, GROMACS, or PPIFlow public interfaces as part of the
@@ -886,13 +952,19 @@ after each decision:
    runtime prove fixed scheduling first, PPIFlow is the first
    runtime-discovered Task consumer, and AlphaFold3 adopts the proven kernel
    afterward.
+9. **App-internal fan-out — accepted 2026-07-29**: after the Task lifecycle is
+   proven, BoltzGen adopts reusable direct fan-out and Rosetta adopts a
+   queue-backed work-pool adapter. SQLite remains the single-writer control
+   plane while Modal Queue remains disposable remote dispatch transport.
+10. **Coordinator interruption — pending**: define checkpoint, shutdown, child
+    call, and replacement-coordinator behavior for Modal preemption.
 
 ## Definition of ready for implementation
 
 Implementation begins only when:
 
 - ADR 0006 is accepted;
-- the eight decision gates are resolved;
+- the ten decision gates are resolved;
 - the proposed execution terms are reconciled into `CONTEXT.md`;
 - Phase 0 scientific, cost-safety, and user-visible regression fixtures plus
   fault-injection points are enumerated as test cases;

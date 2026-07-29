@@ -38,7 +38,10 @@ The optional stable, machine-readable `status_reason` code that explains the
 current Execution Run Status. An optional human-readable `status_message`
 provides diagnostics but is never used for control flow. Task- and
 Node-specific failures remain canonical on those records; the Run fields only
-summarize why its lifecycle changed.
+summarize why its lifecycle changed. The initial reason vocabulary is:
+`coordinator_error`, `submission_outcome_unknown`,
+`provider_outcome_unknown`, `cancellation_outcome_unknown`,
+`required_work_failed`, and `deployment_unavailable`.
 _Avoid_: status-specific reason columns, free-text state machine, copied stack trace
 
 **Successor Execution Run** [planned]:

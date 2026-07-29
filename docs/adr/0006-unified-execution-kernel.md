@@ -182,6 +182,14 @@ remain canonical on their Task or Node records, while the Run fields summarize
 only why the overall lifecycle changed. The kernel does not add separate
 failure, suspension, or unknown-reason columns.
 
+The initial Run-reason vocabulary was accepted on 2026-07-29. A `suspended`
+Run requires `coordinator_error`. A `state_unknown` Run requires one of
+`submission_outcome_unknown`, `provider_outcome_unknown`, or
+`cancellation_outcome_unknown`. A `failed` Run requires either
+`required_work_failed` or `deployment_unavailable`. Every other Run status
+requires a null `status_reason`. The repository rejects all mismatched and
+unknown codes.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal

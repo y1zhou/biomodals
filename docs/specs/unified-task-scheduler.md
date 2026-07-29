@@ -240,13 +240,21 @@ Two nullable fields refine the current status:
   input.
 
 A repository transition atomically replaces or clears both fields with
-`status`. The allowed reason codes depend on the status. In particular, an
-unavailable pinned deployment is `failed` with
-`status_reason=deployment_unavailable`; it is not a separate Run status.
-Provider-call `outcome_unknown` projects to Run-level `state_unknown`.
-Task- and Node-specific errors remain canonical on those records. The Run
-fields summarize the lifecycle change without copying stack traces or detailed
-workload diagnostics. There are no status-specific reason columns.
+`status`. The first version has a closed, kernel-owned `RunStatusReason`:
+
+| Status | Required `status_reason` |
+| --- | --- |
+| `suspended` | `coordinator_error` |
+| `state_unknown` | `submission_outcome_unknown`, `provider_outcome_unknown`, or `cancellation_outcome_unknown` |
+| `failed` | `required_work_failed` or `deployment_unavailable` |
+| Every other status | `NULL` |
+
+The repository rejects missing, unknown, and status-incompatible reason codes.
+Provider-call `outcome_unknown` projects to Run-level `state_unknown` with
+`provider_outcome_unknown`. Task- and Node-specific errors remain canonical on
+those records. The Run fields summarize the lifecycle change without copying
+stack traces or detailed workload diagnostics. There are no status-specific
+reason columns.
 
 The primary transitions are:
 
@@ -877,7 +885,7 @@ Phase 0 test inventory:
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner failure without same-run reassignment, and unknown-owner blocking |
 | `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
-| `tests/execution/test_run_status.py` | Exactly nine statuses exist; legal transitions, terminality, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
+| `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
@@ -1464,6 +1472,14 @@ after each decision:
     `status`, and control flow never parses the message. Task- and Node-specific
     failures stay canonical on those records; there are no status-specific
     reason columns.
+31. **Initial Run reason vocabulary — accepted 2026-07-29**: the closed
+    kernel enum contains `coordinator_error`,
+    `submission_outcome_unknown`, `provider_outcome_unknown`,
+    `cancellation_outcome_unknown`, `required_work_failed`, and
+    `deployment_unavailable`. The first applies only to `suspended`, the next
+    three only to `state_unknown`, the final two only to `failed`, and every
+    other Run status requires a null reason. The repository rejects invalid
+    combinations.
 
 ## Definition of ready for implementation
 

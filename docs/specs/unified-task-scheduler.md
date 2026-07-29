@@ -85,6 +85,8 @@ These existing decisions remain binding during the refactor:
 - A Task receives at most one scheduler submission in an Execution Run.
   Retrying failed paid work requires a Successor Execution Run, and active or
   unknown predecessor ownership blocks replacement.
+- Only the repository call that creates a durable `submitting` Provider Call
+  may invoke spawn. Duplicate or recovered callers never resubmit it.
 - Scientific and cache identity excludes operational concurrency, placement,
   and resource allocation.
 - Workflow node parallelism and child-call task budgets are different limits.
@@ -872,6 +874,30 @@ Dispatch Batch, and the durable preclaim creates a call directly in
 with conclusive failure becomes `failed`; without a conclusive outcome it
 becomes `state_unknown`, with the expiry retained as diagnostic reason.
 
+The preclaim operation atomically creates the call, assigns its Tasks, and
+returns whether this caller created the row. The creating caller must then
+cross the host's durability boundary: a service transaction commits, while a
+Volume-backed host checkpoints the committed SQLite file. Only after that
+boundary succeeds does the creation result become a one-time in-process
+authorization to invoke spawn. Duplicate request IDs, concurrent commands,
+and later coordinators observe the existing call and perform no provider side
+effect. The authorization is not persisted as a lease and cannot be recovered.
+
+Provider resolution, version checks, normalized input preparation, and other
+failure-prone work happen before preclaim. Once preclaim crosses the host
+durability boundary:
+
+- a returned provider call ID is attached and checkpointed;
+- a conclusive provider rejection makes the call and unfinished Tasks
+  `failed`;
+- an ambiguous spawn exception makes the call `outcome_unknown`;
+- recovery of an abandoned `submitting` row also makes it
+  `outcome_unknown`, because the coordinator cannot prove spawn never began.
+
+No path automatically invokes spawn again for that Provider Call. Failed Tasks
+can run again only in a Successor Execution Run; unknown ownership must first
+be resolved conclusively.
+
 A provider adapter must expose only the operations the kernel needs: spawn,
 resolve by call ID, observe or collect, and cancel. Modal-specific objects
 must not leak into plans or persisted models.
@@ -1001,7 +1027,7 @@ Phase 0 test inventory:
 | Test location | Required case |
 | --- | --- |
 | `tests/workflow/test_artifacts.py` | An external checker exception returns `unknown`, never `missing` |
-| `tests/service/test_submission.py` | Definite rejection releases work; unknown spawn blocks; an unattached returned call is cancelled and marked unknown |
+| `tests/service/test_submission.py` | Pre-preclaim failure leaves work unowned; one preclaim authorizes one spawn; definite post-preclaim rejection fails; unknown or abandoned submission blocks; an unattached returned call is cancelled and marked unknown |
 | `tests/workflow/test_runtime.py` | A crash after durable claim but before attachment does not submit replacement work |
 | `tests/workflow/test_runtime.py` | A recorded call ID is resolved and collected instead of resubmitted |
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
@@ -1088,7 +1114,9 @@ Deliverables:
   Execution Run;
 - implement preclaim, spawn, attachment, observation, collection,
   cancellation, and unknown-outcome recovery behind the provider port;
-- use `ModalJobSubmitter` as the behavioral baseline for uncertain spawn;
+- reuse `ModalJobSubmitter`'s preclaim, attachment, and unknown-spawn
+  classifications, but deliberately replace its retryable operation-release
+  behavior with the one-spawn preclaim rule;
 - expose a common read-only execution snapshot for logs and diagnostics.
 
 Exit gate:
@@ -1659,6 +1687,15 @@ after each decision:
     advancing downstream Nodes. Active, unknown, unreadable, or
     invariant-invalid predecessor ownership fails closed; there is no implicit
     run catalog.
+37. **Submission preclaim boundary — accepted 2026-07-29**: the atomic
+    preclaim creates a `submitting` Provider Call, assigns its Tasks, and
+    authorizes only the caller that created the row and crossed the host
+    durability boundary to invoke spawn. Duplicate requests perform no side
+    effect. Recovery of `submitting` becomes `outcome_unknown` and never
+    spawns again. Conclusive rejection fails the call and Tasks; ambiguous
+    failure preserves unknown ownership. Resolution and input preparation
+    precede preclaim, and only a Successor Execution Run can retry failed
+    Tasks.
 
 ## Definition of ready for implementation
 

@@ -99,6 +99,14 @@ A conclusive failure terminates the Task; retry requires a Successor Execution
 Run.
 _Avoid_: exactly-once execution, same-run retry, attempt counter
 
+**Submission Preclaim** [planned]:
+The atomic repository operation that creates a Provider Call in `submitting`
+and durably assigns its Tasks before the external spawn side effect. Only the
+caller that created the row and crossed its host durability boundary receives
+permission to invoke spawn; duplicate requests and recovered coordinators
+preserve the existing owner without spawning.
+_Avoid_: retry token, timeout lease, Task Attempt
+
 **Provider Call**:
 One concrete remote worker invocation submitted to a compute provider and
 identified for later observation, recovery, logging, or cancellation. It

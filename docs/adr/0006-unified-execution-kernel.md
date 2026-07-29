@@ -252,6 +252,18 @@ cancellation is inconclusive. An expired provider handle is an observation,
 not a status: conclusive failure becomes `failed`, while an unresolved outcome
 becomes `state_unknown`.
 
+The submission-preclaim boundary was accepted on 2026-07-29. The atomic
+repository preclaim creates the `submitting` Provider Call, assigns its Tasks,
+and tells exactly one in-process caller that it created the row. That caller
+must commit or checkpoint through the host's durability boundary before it may
+invoke provider spawn. A duplicate request observes the existing call and
+performs no side effect. Recovery of an abandoned `submitting` row cannot
+prove whether spawn began, so it moves the call to `outcome_unknown` and never
+invokes spawn again. A conclusive provider rejection moves the call and its
+unfinished Tasks to `failed`; an ambiguous exception preserves unknown
+ownership. Provider resolution and input preparation happen before preclaim.
+Retrying failed Tasks requires a Successor Execution Run.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal

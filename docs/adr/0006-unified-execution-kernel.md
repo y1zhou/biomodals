@@ -89,17 +89,17 @@ inside the immutable workload plan; they never select a ledger or coordinator
 pool. A Successor Execution Run receives a new UUID while retaining the same
 Workload Run Key and publication identity where scientifically appropriate.
 
-The CLI location policy was accepted on 2026-07-29. App and workflow launch
-commands print one portable Execution Run Reference containing the Deployment
-Identity, Execution Run ID, and optional root coordinator FunctionCall ID.
-Each Deployment Coordinator Adapter exposes the same lifecycle surface, so
-`biomodals run status`, `cancel`, `resume`, and `restart` consume that
-reference without app-specific command implementations. References contain no
-authority: the adapter verifies every field against the App Run Ledger or
-Workflow Ledger before acting. Individual fields may reconstruct a lost
-reference; no local registry or global remote run index is introduced.
-`resume` retains the Execution Run ID and Deployment Identity, while `restart`
-always creates and returns a successor reference.
+The CLI location policy was accepted on 2026-07-29 and simplified the same
+day. App and workflow launch commands print the Deployment Identity, Execution
+Run ID, and optional root coordinator FunctionCall ID. Each Deployment
+Coordinator Adapter exposes the same lifecycle surface, so `biomodals run
+status`, `cancel`, `resume`, and `restart` accept those values as explicit CLI
+flags without app-specific command implementations. There is no encoded run
+reference, parser, local registry, or global remote run index. The adapter
+verifies the Deployment Identity and Execution Run ID against the App Run
+Ledger or Workflow Ledger before acting; the optional FunctionCall ID is only
+an observation hint. `resume` retains the Execution Run ID and Deployment
+Identity, while `restart` always creates a successor and prints its new fields.
 
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared

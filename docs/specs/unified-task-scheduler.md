@@ -108,8 +108,9 @@ These existing decisions remain binding during the refactor:
   configured durable Volume; there is no cross-app execution-state Volume.
 - Every Execution Run has a kernel-generated UUID distinct from workload run
   names, scientific identities, Service Job IDs, and user-provided paths.
-- Launch commands print a portable Execution Run Reference; generic lifecycle
-  commands need no local run registry or app-specific implementation.
+- Launch commands print the explicit deployment and run identity fields;
+  generic lifecycle commands accept those values as repeated CLI flags and
+  need no encoded reference, local registry, or app-specific implementation.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -153,10 +154,6 @@ without an API Job.
 
 **Execution Run ID** is a kernel-generated UUID that keys execution state,
 coordinator routing, lineage, and ledger location.
-
-**Execution Run Reference** is a portable locator containing Deployment
-Identity, Execution Run ID, and an optional root coordinator FunctionCall ID.
-It is verified against durable state and grants no authority by itself.
 
 **Workload Run Key** is an optional workload-owned name or scientific key in
 the immutable plan. It may be reused by successor runs and publications but is
@@ -256,7 +253,6 @@ The initial internal interface should be no larger than:
 - `NodePlan`
 - `TaskPlan`
 - `TaskResult`
-- `ExecutionRunReference`
 - `ExecutionRuntime`
 
 Each composition root supplies its SQLite connection and transaction,
@@ -285,8 +281,9 @@ methods may remain deployment-specific.
 `status` is read-only, `cancel` is an idempotent explicit cancellation,
 `resume` retains Execution Run ID and Deployment Identity while granting only
 the already defined retry authority, and `restart` always returns a new
-Execution Run Reference. None infer paid-work authorization from possession of
-the reference alone; the CLI still performs its normal Modal authentication.
+Execution Run ID and Deployment Identity. Passing those fields does not grant
+paid-work authorization; the CLI still performs its normal Modal
+authentication.
 
 ### Durable execution state
 
@@ -791,7 +788,7 @@ Phase 0 test inventory:
 | `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
-| `tests/execution/test_reference.py` | Run references round-trip locator fields; mismatched ledger fields fail; optional call IDs remain non-authoritative |
+| `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -1045,11 +1042,12 @@ Deliverables:
 - keep help, shell, and workflow dry-run behavior local and free of paid calls;
 - print the Execution Run ID, Workload Run Key when present, Deployment
   Identity, and coordinator FunctionCall ID needed for inspection and recovery;
-- emit those locator fields as one Execution Run Reference;
 - add shared `biomodals run status`, `cancel`, `resume`, and `restart`
   commands backed by the standard deployment-local `ExecutionCoordinator`;
-- accept individual locator fields as an explicit reconstruction path without
-  storing a local registry;
+- require `--environment`, `--deployment-name`, `--deployment-version`, and
+  `--execution-run-id` on lifecycle commands, with
+  `--coordinator-call-id` as an optional observation hint;
+- do not add an encoded reference format, reference parser, or local registry;
 - update CLI command builders, help, README examples, and characterization
   tests together.
 
@@ -1059,8 +1057,8 @@ Exit gate:
   deployment;
 - a second CLI process can address the same run-scoped coordinator using the
   recorded Deployment Identity and Execution Run ID;
-- app and workflow references exercise the same generic lifecycle commands;
-- tampered or mismatched reference fields fail before state mutation;
+- app and workflow fields exercise the same generic lifecycle commands;
+- mismatched deployment or run fields fail before state mutation;
 - a rolling deployment after admission cannot change any Provider Call target;
 - unavailable or unretained versions fail before new paid work rather than
   falling back to a floating latest handle;
@@ -1216,7 +1214,7 @@ authorized smoke test after local and CI gates pass.
 | A newer deployment mutates an old run | Make Deployment Identity immutable; create a linked successor after publication revalidation |
 | One Volume couples unrelated app ledgers | Store app ledgers in deployment-specific Volumes and reserve a kernel-owned path namespace |
 | A workload name collides with execution state | Generate an opaque Execution Run ID and keep workload keys only in immutable plan input |
-| A copied run locator is treated as authority | Verify every Execution Run Reference field against the ledger before observing or mutating state |
+| CLI identity flags are treated as authority | Verify Deployment Identity and Execution Run ID against the ledger before observing or mutating state |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1342,15 +1340,16 @@ after each decision:
     User and scientific names remain Workload Run Keys in immutable plan input.
     A successor receives a new UUID while reusing appropriate workload keys
     and validated publications.
-22. **CLI run location — accepted 2026-07-29**: launch commands emit an
-    Execution Run Reference containing Deployment Identity, Execution Run ID,
-    and optional root coordinator FunctionCall ID. Shared `biomodals run`
-    lifecycle commands verify the reference against the ledger. Explicit
-    fields can reconstruct it; no local registry or global run index is added.
-23. **Run-reference encoding — pending**: choose a stable human-readable
-    encoding for the reference and define whether the optional FunctionCall ID
-    participates in canonical equality or remains a replaceable observation
-    hint.
+22. **CLI run location — accepted 2026-07-29**: launch commands print
+    Deployment Identity, Execution Run ID, and optional root coordinator
+    FunctionCall ID. Shared `biomodals run` lifecycle commands verify the
+    deployment and run fields against the ledger. No local registry or global
+    run index is added.
+23. **CLI run arguments — accepted 2026-07-29**: lifecycle commands take
+    `--environment`, `--deployment-name`, `--deployment-version`, and
+    `--execution-run-id` explicitly on every invocation. An optional
+    `--coordinator-call-id` is a replaceable observation hint. There is no
+    encoded run-reference format or parsing abstraction.
 
 ## Definition of ready for implementation
 

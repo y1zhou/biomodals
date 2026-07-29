@@ -346,6 +346,20 @@ Run-level `cancel_requested`, `suspended`, and `state_unknown` are not
 duplicated onto Nodes. A workload excludes an optional branch from its
 immutable plan rather than creating a Node that is already `skipped`.
 
+Each immutable dependency edge has `accept_partial: bool = False`:
+
+- `succeeded` always satisfies the edge;
+- `partial` satisfies only an edge that explicitly opts in;
+- `failed`, `cancelled`, and `skipped` never satisfy an edge.
+
+A Node becomes ready only when every dependency is satisfied. If an
+unacceptable upstream outcome is terminal, the dependent Node becomes
+`skipped`; that skip may propagate through its descendants. Explicit Run
+cancellation takes precedence and marks unfinished Nodes `cancelled` instead
+of applying dependency-skip propagation. The edge-level boolean lets one Node
+accept a partial candidate set from one dependency while requiring complete
+output from another, without a generic accepted-status policy.
+
 ### Task statuses
 
 The kernel uses exactly six Task statuses:
@@ -947,7 +961,7 @@ Nodes declare one of three workload-selected aggregation policies:
 - `fail_fast`: stop admitting sibling Tasks after the first terminal failure;
 - `collect_all`: allow all admitted Tasks to finish and report every outcome;
 - `allow_partial`: publish an explicit partial result that downstream nodes
-  must opt into.
+  may consume only through an `accept_partial` dependency edge.
 
 These policies do not authorize another submission. A failed Task remains
 failed for that Execution Run; retry requires an explicit Successor Execution
@@ -1062,6 +1076,7 @@ Phase 0 test inventory:
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
+| `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; explicit cancellation takes precedence |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
@@ -1105,6 +1120,8 @@ Rollback:
 Deliverables:
 
 - add immutable `ExecutionPlan`, `NodePlan`, and dependency validation;
+- represent partial dependency acceptance with one strict-by-default
+  `accept_partial` boolean per edge;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1732,6 +1749,12 @@ after each decision:
     concurrency, batching, resources, and Deployment Identity may change, but
     a new adapter may reuse publications only if it accepts the stored plan and
     preserves all result-affecting declarations.
+39. **Partial dependency acceptance — accepted 2026-07-29**: every immutable
+    Node dependency edge has `accept_partial: bool = False`. Success always
+    satisfies it; partial output requires explicit edge opt-in; failed,
+    cancelled, and skipped outcomes never satisfy it. An unacceptable terminal
+    dependency skips the downstream Node, while explicit Run cancellation
+    takes precedence and cancels unfinished Nodes.
 
 ## Definition of ready for implementation
 

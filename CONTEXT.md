@@ -85,6 +85,12 @@ and `running` are nonterminal. Readiness is derived rather than persisted, and
 cache reuse is Task provenance rather than a Node status.
 _Avoid_: ready, cached, suspended, state unknown
 
+**Partial Dependency Acceptance** [planned]:
+The immutable `accept_partial` boolean on one Node dependency edge. Success
+always satisfies the edge; a partial upstream Node satisfies it only when the
+edge opts in. Failed, cancelled, and skipped outcomes never satisfy it.
+_Avoid_: global partial mode, implicit best effort, accepted-status set
+
 **Task**:
 The smallest independently scheduled and validated work item in an Execution
 Node whose cached publication and outcome can be observed. Every Task belongs

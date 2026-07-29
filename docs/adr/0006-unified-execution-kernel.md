@@ -227,6 +227,15 @@ Node is `succeeded`, with cache reuse retained as Task provenance. Run-level
 Nodes. `skipped` means that an upstream terminal outcome made a planned Node
 unreachable.
 
+The partial-dependency policy was accepted on 2026-07-29. Every immutable Node
+dependency edge has `accept_partial: bool = False`. A `succeeded` upstream Node
+always satisfies the edge; `partial` satisfies only an opted-in edge; and
+`failed`, `cancelled`, or `skipped` never satisfies it. All dependencies must
+be satisfied before a Node is ready. Once an unacceptable upstream outcome is
+terminal, the dependent Node becomes `skipped`. Explicit Run cancellation
+takes precedence and marks unfinished Nodes `cancelled` rather than obscuring
+the cancellation through skip propagation.
+
 The Task status policy was accepted on 2026-07-29. Tasks have exactly six
 statuses: `pending`, `running`, `succeeded`, `failed`, `cancelled`, and
 `skipped`. Only the first two are nonterminal. Durable local execution,

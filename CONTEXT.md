@@ -10,8 +10,21 @@ Biomodals runs bioinformatics tools as Modal apps and composes them into reusabl
 
 **Execution Run**:
 One invocation of an immutable execution plan, whether started by an API Job,
-a workflow, or an app entrypoint.
+a workflow, or an app entrypoint. It has one opaque Execution Run ID that is
+independent of workload naming and scientific identity.
 _Avoid_: API Job, workflow definition
+
+**Execution Run ID** [planned]:
+A kernel-generated UUID identifying exactly one Execution Run. It is generated
+before admission and used for repository keys, coordinator routing, lineage,
+and ledger paths.
+_Avoid_: Workload Run Key, Service Job ID, display name
+
+**Workload Run Key** [planned]:
+An optional workload-owned name or scientific key that influences provider
+arguments, output paths, or publication identity. Successor Execution Runs may
+reuse it, and the kernel stores it only as immutable workload plan input.
+_Avoid_: Execution Run ID, ledger path, display label alone
 
 **Deployment-Blocked Run** [planned]:
 A terminal, incomplete Execution Run whose immutable Deployment Identity is no
@@ -22,8 +35,8 @@ _Avoid_: state unknown, cancelled run, resumable run
 **Successor Execution Run** [planned]:
 A new Execution Run created by an explicit restart of a terminal or
 Deployment-Blocked Run. It records its predecessor, uses a newly resolved
-Deployment Identity, revalidates Workload Publications, and schedules only
-missing work.
+Deployment Identity and Execution Run ID, reuses the Workload Run Key when
+applicable, revalidates Workload Publications, and schedules only missing work.
 _Avoid_: in-place migration, Task Attempt, provider retry
 
 **Execution Node**:
@@ -87,8 +100,9 @@ _Avoid_: universal service database, scientific cache
 
 **App Run Ledger** [planned]:
 The physical per-run SQLite Execution State Repository for a Direct CLI App
-Run, stored under `.biomodals/execution/runs/` in that app deployment's
-configured durable Volume.
+Run, stored at
+`.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in that app
+deployment's configured durable Volume.
 _Avoid_: scientific output directory, Workflow Ledger, shared execution Volume
 
 **Execution Coordinator** [planned]:
@@ -110,8 +124,8 @@ _Avoid_: Job cancellation, Task failure, Provider Call cancellation
 
 **Run-Scoped Coordinator Pool** [planned]:
 A provider-routed container pool created by a Deployment Coordinator Adapter
-and identified by an Execution Run and Deployment Identity. It admits at most
-one coordinator container for that identity; concurrent control requests
+and identified by an Execution Run ID and Deployment Identity. It admits at
+most one coordinator container for that identity; concurrent control requests
 submit commands to that container's single SQLite writer.
 _Avoid_: worker pool, timeout lease, service database
 
@@ -288,7 +302,7 @@ _Avoid_: checkpoint digest, model Volume path alone, model seed
 
 **Canonical Output Name**:
 The deterministic, run-derived name given to upstream inference so every durable output filename is stable across caller display names. It uses `af3-{run_id[:16]}` and is not a user-facing run label.
-_Avoid_: display name, run ID, local archive name
+_Avoid_: display name, Execution Run ID, local archive name
 
 **Presentation Output Name**:
 The sanitized caller display name applied to filenames only while creating a Request Retrieval Archive. It never renames or identifies durable prediction artifacts.

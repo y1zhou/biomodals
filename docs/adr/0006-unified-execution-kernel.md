@@ -80,6 +80,15 @@ retains execution tables in `service.sqlite3`. The host supplies the Volume,
 mountpoint, and repository path; the kernel declares no global execution
 Volume or workload output location.
 
+The execution-identity policy was accepted on 2026-07-29. The admitting host
+uses the kernel's generator to create an opaque UUID Execution Run ID before
+repository creation or work admission. That UUID keys execution rows,
+coordinator routing, predecessor lineage, and remote ledger paths.
+User-provided run names and scientific IDs remain optional Workload Run Keys
+inside the immutable workload plan; they never select a ledger or coordinator
+pool. A Successor Execution Run receives a new UUID while retaining the same
+Workload Run Key and publication identity where scientifically appropriate.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -212,12 +221,15 @@ only for work still missing.
 - Calling an unversioned handle throughout a run would be simpler, but Modal
   may route later calls to a newer deployment during a rolling update.
 - Migrating an incomplete run to a newer deployment in place would preserve
-  its Run ID, but would mix plan, adapter, schema, and coordinator versions
-  inside one execution authority.
+  its Execution Run ID, but would mix plan, adapter, schema, and coordinator
+  versions inside one execution authority.
 - One execution-state Volume shared by every deployment would simplify global
   discovery, but would broaden storage access and couple unrelated apps to one
   Volume lifecycle. Existing deployment-specific Volumes already provide the
   required durable boundary.
+- Reusing a user or scientific run name as the execution primary key would
+  make CLI lookup familiar, but would couple untrusted paths, publication
+  reuse, restart lineage, and one scheduler invocation to the same string.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.
@@ -231,6 +243,11 @@ call. Workloads continue to define scientific identity, cache validation,
 input and output contracts, function arguments, resource requirements, and
 publication rules. The kernel determines when those hooks run and how their
 observations affect scheduling.
+
+Execution identity is deliberately operational. A Service Job, workflow
+request, GROMACS run name, or AlphaFold run identity may refer to it, but none
+is interchangeable with it. This lets a new execution reuse valid scientific
+outputs without reopening or overwriting its predecessor ledger.
 
 An execution repository is authoritative for scheduling facts such as the
 immutable plan, readiness, attempts, submission tokens, attached call IDs,

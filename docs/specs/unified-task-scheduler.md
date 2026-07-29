@@ -106,6 +106,8 @@ These existing decisions remain binding during the refactor:
   unavailable, an explicit restart creates a linked successor run.
 - Direct CLI App Run ledgers live in a reserved namespace in that deployment's
   configured durable Volume; there is no cross-app execution-state Volume.
+- Every Execution Run has a kernel-generated UUID distinct from workload run
+  names, scientific identities, Service Job IDs, and user-provided paths.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -147,6 +149,13 @@ The relationship between Task Attempt and Provider Call is not one-to-one:
 may own one run, while a CLI workflow or app invocation can create a run
 without an API Job.
 
+**Execution Run ID** is a kernel-generated UUID that keys execution state,
+coordinator routing, lineage, and ledger location.
+
+**Workload Run Key** is an optional workload-owned name or scientific key in
+the immutable plan. It may be reused by successor runs and publications but is
+never an execution primary key or ledger path.
+
 **Execution Node** is a fixed semantic DAG step. It replaces neither
 `WorkflowNode` nor user-facing service stages immediately; adapters map those
 concepts to it during migration.
@@ -182,8 +191,9 @@ Identity is unavailable. It remains inspectable and admits no new work.
 terminal predecessor. It uses a new Deployment Identity and reuses only
 validated Workload Publications.
 
-**App Run Ledger** is the physical per-run SQLite repository stored beneath
-`.biomodals/execution/runs/` in an app deployment's durable Volume.
+**App Run Ledger** is the physical per-run SQLite repository stored at
+`.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in an app
+deployment's durable Volume.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -294,11 +304,12 @@ may execute current source through an ephemeral Modal app, but it cannot later
 claim the durable resume semantics of a Deployed CLI Run.
 
 Each app Deployment Coordinator Adapter binds its App Run Ledger to a reserved
-`.biomodals/execution/runs/` path in that app's configured durable Volume,
-normally its existing output Volume. The workflow adapter keeps using the
-workflow orchestrator Volume. The kernel receives a connection and explicit
-Volume synchronization boundary from either host and never imports a global
-execution Volume.
+`.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` path in that
+app's configured durable Volume, normally its existing output Volume. The
+workflow adapter keeps using the workflow orchestrator Volume and likewise
+keys its physical run root by Execution Run ID rather than a user-supplied
+name. The kernel receives a connection and explicit Volume synchronization
+boundary from either host and never imports a global execution Volume.
 
 The same app invoked from an API service or workflow is instead a Child App
 Call. Its Tasks live in that parent coordinator's repository, so the child
@@ -436,9 +447,10 @@ bounded automatic retry policy declared in its immutable plan.
 A deployment restart is different from a successor Task Attempt. When the
 pinned Deployment Identity is unavailable, the predecessor Execution Run
 becomes Deployment-Blocked and immutable. An explicit restart builds a new
-plan under a new Deployment Identity, records the predecessor Run ID, and
-revalidates the same workload publications before creating Tasks. It never
-copies mutable attempt or permit state into the successor.
+plan under a new Deployment Identity and Execution Run ID, records the
+predecessor Execution Run ID, and reuses the Workload Run Key while
+revalidating the same publications before creating Tasks. It never copies
+mutable attempt or permit state into the successor.
 
 An exit hook may commit workload checkpoints and emit an advisory
 `interrupted` event containing the call, slot, and Task IDs. The coordinator
@@ -463,7 +475,7 @@ Execution tables may store only data needed to reconstruct and manage actual
 work:
 
 - stable run, node, task, attempt, and call identifiers;
-- an optional predecessor Run ID for explicit restart lineage;
+- an optional predecessor Execution Run ID for explicit restart lineage;
 - the immutable Deployment Identity used to recover provider calls;
 - immutable plan and task fingerprints;
 - dependency edges and legal execution states;
@@ -754,10 +766,11 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
-| `tests/execution/test_remote_coordinator.py` | Duplicate run, claim, and completion commands are idempotent; replacement reloads checkpoints; different Run IDs remain isolated |
+| `tests/execution/test_remote_coordinator.py` | Duplicate run, claim, and completion commands are idempotent; replacement reloads checkpoints; different Execution Run IDs remain isolated |
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
 | `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
+| `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -893,8 +906,8 @@ Deliverables:
 
 Exit gate:
 
-- run IDs, request IDs, search identities, marker payloads, Volume paths, seed
-  reuse, ranking order, and retrieval archives remain unchanged;
+- AlphaFold run IDs, request IDs, search identities, marker payloads, Volume
+  paths, seed reuse, ranking order, and retrieval archives remain unchanged;
 - an overlapping seed request performs only its missing seed work;
 - partial search and seed failures preserve the same reusable publications;
 - no automatic paid retry is introduced.
@@ -909,8 +922,8 @@ Rollback:
 Adopt two concrete dispatch adapters only after durable Tasks and batches are
 proven:
 
-1. BoltzGen exercises bounded direct fan-out, where each run ID is one Task
-   and one GPU Provider Call.
+1. BoltzGen exercises bounded direct fan-out, where each workload run key is
+   one Task and one GPU Provider Call.
 2. Rosetta exercises a SQLite-backed pull worker pool, where several Provider
    Calls claim Task microbatches from one Dispatch Batch through the
    coordinator.
@@ -1009,8 +1022,8 @@ Deliverables:
 - add an explicit development mode for source-backed ephemeral execution and
   label its lack of cross-invocation resume;
 - keep help, shell, and workflow dry-run behavior local and free of paid calls;
-- print the Run ID, deployment identity, and coordinator FunctionCall ID needed
-  for inspection and recovery;
+- print the Execution Run ID, Workload Run Key when present, Deployment
+  Identity, and coordinator FunctionCall ID needed for inspection and recovery;
 - update CLI command builders, help, README examples, and characterization
   tests together.
 
@@ -1019,7 +1032,7 @@ Exit gate:
 - default app and workflow runs never place their coordinator in an ephemeral
   deployment;
 - a second CLI process can address the same run-scoped coordinator using the
-  recorded deployment identity and Run ID;
+  recorded Deployment Identity and Execution Run ID;
 - a rolling deployment after admission cannot change any Provider Call target;
 - unavailable or unretained versions fail before new paid work rather than
   falling back to a floating latest handle;
@@ -1168,12 +1181,13 @@ authorized smoke test after local and CI gates pass.
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
-| Two coordinator containers open one Volume ledger | Route by Run ID and pinned deployment version, cap the pool at one container, serialize writes, and smoke-test provider behavior |
+| Two coordinator containers open one Volume ledger | Route by Execution Run ID and pinned deployment version, cap the pool at one container, serialize writes, and smoke-test provider behavior |
 | One coordinator must understand every workload | Ship a thin binding with each app or workflow deployment; keep shared mechanics in the kernel |
 | Latest deployment changes between CLI calls | Resolve history once, persist the exact Deployment Identity, and use only versioned handles |
 | Version-pinned lookup is unsupported or expired | Preflight workspace support and exact availability; fail closed with the recorded identity |
 | A newer deployment mutates an old run | Make Deployment Identity immutable; create a linked successor after publication revalidation |
 | One Volume couples unrelated app ledgers | Store app ledgers in deployment-specific Volumes and reserve a kernel-owned path namespace |
+| A workload name collides with execution state | Generate an opaque Execution Run ID and keep workload keys only in immutable plan input |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1243,10 +1257,10 @@ after each decision:
     and checkpoints best-effort, correctness survives hard interruption, and
     a replacement recovers attached calls and permits from durable state.
 11. **Single-writer topology — accepted 2026-07-29**: a Volume-backed remote
-    coordinator is parameterized by Run ID and pinned deployment version. Its
-    provider pool is capped at one container, and concurrent method inputs
-    submit commands to one in-process SQLite writer. Different Runs use
-    independent pools.
+    coordinator is parameterized by Execution Run ID and pinned deployment
+    version. Its provider pool is capped at one container, and concurrent
+    method inputs submit commands to one in-process SQLite writer. Different
+    Runs use independent pools.
 12. **Worker interruption — accepted 2026-07-29**: preemption retains the
     Task Attempt and committed Worker Assignment. Claim and completion methods
     are idempotent; assignment is checkpointed before payload delivery. Exit
@@ -1287,14 +1301,22 @@ after each decision:
     Explicit restart creates a linked Successor Execution Run on a new version,
     revalidates publications, and schedules only missing Tasks.
 20. **Remote ledger storage — accepted 2026-07-29**: each Direct CLI App Run
-    stores an App Run Ledger under `.biomodals/execution/runs/` in its
-    deployment's configured durable Volume. Workflows retain their orchestrator
-    Volume and the API retains `service.sqlite3`. The kernel receives these
-    host bindings and defines no shared cross-app execution Volume.
-21. **Execution Run identity — pending**: decide whether the kernel Run ID is
-    an opaque UUID distinct from user-facing and scientific workload run names,
-    especially when a successor must reuse publications without reusing its
-    predecessor's ledger path.
+    stores an App Run Ledger at
+    `.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in its
+    deployment's configured durable Volume. Workflows retain their
+    orchestrator Volume and the API retains `service.sqlite3`. The kernel
+    receives these host bindings and defines no shared cross-app execution
+    Volume.
+21. **Execution Run identity — accepted 2026-07-29**: the admitting host
+    generates an opaque UUID before repository creation or work admission.
+    It keys execution rows, coordinator routing, lineage, and ledger paths.
+    User and scientific names remain Workload Run Keys in immutable plan input.
+    A successor receives a new UUID while reusing appropriate workload keys
+    and validated publications.
+22. **CLI run location — pending**: define the portable information a later
+    CLI process needs, in addition to Execution Run ID, to locate the owning
+    deployment and issue status, cancel, resume, or restart commands without a
+    local registry.
 
 ## Definition of ready for implementation
 

@@ -468,10 +468,44 @@ collection, decode, publication, and final commit. Each restart assertion must
 prove whether the old call is recovered, the run blocks as unknown, or a new
 call is safe.
 
+## State-transition policy
+
+This pre-release refactor does not carry old execution history into the new
+model.
+
+For the API service:
+
+- preserve `users`, password and session data, `service_settings`, and
+  `workload_settings`;
+- recreate the Service Job table around its one-way `execution_run_id`;
+- remove `job_operations` and all persisted compute-state columns;
+- create the shared execution schema at the current kernel version;
+- discard old Job history, result-cache rows, and unfinished execution state;
+- leave remote Modal Volumes and workload publications untouched.
+
+The transition is an explicit offline CLI operation, not an automatic
+destructive startup migration. It stops if the source schema is unexpected,
+performs the service-table preservation and execution-state replacement in a
+transaction, and records the new schema version. No compatibility reader,
+dual-write path, or automatic backup is required.
+
+For workflows:
+
+- write an execution-schema version into each new physical Workflow Ledger;
+- reject an older ledger with a clear instruction to restart or force the run;
+- do not migrate old Nodes, attempts, calls, or artifact rows;
+- retain app-owned Volume outputs so workload validators can reuse valid
+  scientific publications in the restarted run.
+
+Local staged API result files left by discarded Job rows are service cache, not
+kernel state. Clean them through the existing administrator cache-management
+path rather than teaching the execution migration about service files.
+
 ## Migration plan
 
-Each phase is reviewable and reversible. A phase deletes no predecessor until
-the new path has equivalent contract and recovery coverage.
+Each phase is reviewable and reversible as a Git commit. Internal predecessor
+code may be replaced directly once scientific, cost-safety, and recovery tests
+pass; do not maintain dual schemas or runtime compatibility switches.
 
 ### Phase 0 — accept boundaries and freeze behavior
 
@@ -480,7 +514,7 @@ Deliverables:
 - accept or revise ADR 0006 and the proposed glossary;
 - add pure characterization tests for GROMACS graph readiness, workflow
   recovery, PPIFlow candidate outcomes, and AlphaFold3 plan identities;
-- add fault-injection fixtures using fake provider calls and stores;
+- add fault-injection fixtures using fake provider calls and in-memory SQLite;
 - record scientific identities, publication markers, cost-safety behavior,
   CLI operations, and user-visible results as regression fixtures.
 
@@ -510,8 +544,8 @@ Exit gate:
 
 Rollback:
 
-- no schema replacement; keep additive state fields readable by the old path
-  until the phase is accepted.
+- revert the implementation commit. Unfinished ledgers created with the
+  reverted schema may be recreated; they need not remain readable.
 
 ### Phase 2 — extract immutable plans and graph algorithms
 
@@ -533,8 +567,7 @@ Exit gate:
 
 Rollback:
 
-- adapters can switch back to the existing readiness functions without
-  changing persisted state.
+- revert the implementation commit; do not retain a runtime selection flag.
 
 ### Phase 3 — extract the provider-call state machine
 
@@ -546,6 +579,7 @@ Deliverables:
 - add thin async service and sync workflow drivers;
 - replace service `job_operations` and workflow `remote_calls` with shared
   execution tables as each host migrates;
+- add the explicit offline service-state transition command;
 - expose a common read-only execution snapshot for logs and diagnostics.
 
 Exit gate:
@@ -583,8 +617,8 @@ Exit gate:
 
 Rollback:
 
-- additive workflow-ledger tables can be ignored by the predecessor runtime;
-  old PPIFlow runs retain the restart policy already documented in the ADR.
+- revert the implementation commit and recreate incompatible unfinished
+  workflow runs. Keep validated app-owned publications for reuse.
 
 ### Phase 5 — adapt AlphaFold3 without changing scientific authority
 
@@ -762,9 +796,10 @@ after each decision:
    accounting only within one Execution Run and coordinator. Service admission
    and Modal resources remain with their current owners; no distributed lease
    interface is added without a concrete cross-coordinator requirement.
-7. **Migration scope**: should service database changes be additive and
-   migratable while in-progress workflow runs keep their documented restart
-   policy? Recommendation: yes.
+7. **State transition — accepted 2026-07-29**: preserve service-owned users,
+   authentication, and administrator configuration; recreate Service Job and
+   execution state without old Job history; reject and restart old workflow
+   ledgers; preserve remote scientific publications and caches.
 8. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
    AlphaFold3? Recommendation: yes; it exercises fan-out with lower scientific
    and cache risk.

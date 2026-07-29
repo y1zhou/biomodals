@@ -72,6 +72,12 @@ CPU, GPU, memory, timeout, and deployment limits remain workload-owned.
 Cross-coordinator and cross-run global enforcement, including a shared-lease
 interface, is deferred until a concrete requirement exists.
 
+The state-transition policy was accepted on 2026-07-29. The service preserves
+users, authentication data, and administrator configuration while recreating
+the Job and execution schema without old Job history. Existing workflow
+ledgers are incompatible and must restart. Remote scientific publications,
+markers, and caches remain reusable and are never deleted by this transition.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG

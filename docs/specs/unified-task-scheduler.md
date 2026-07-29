@@ -219,6 +219,22 @@ can be reasoned about. Every Task belongs to exactly one Node, and Tasks may be
 discovered only when their containing Node starts. Each has a stable
 Node-local key and deterministic fingerprint.
 
+**Task Fingerprint** is computed by the kernel once at discovery:
+
+```text
+sha256(canonical_json({
+  "plan": workload_plan_fingerprint,
+  "node": node_key,
+  "task": task_key,
+  "science": scientific_payload
+}))
+```
+
+The workload supplies a JSON-compatible normalized `scientific_payload`; the
+kernel uses compact sorted-key JSON, rejects non-finite numbers, and persists
+the digest. File inputs are already represented by content digests.
+Operational execution payloads are separate and excluded.
+
 **Single-Submission Rule** means the kernel schedules each Task once and
 creates at most one Provider Call submission or Worker Assignment for it in
 one Execution Run. Provider redelivery can re-execute that same call, so this
@@ -474,8 +490,10 @@ null reason; Task failure diagnostics remain in its error record.
 The workload port exposes a read-only
 `discover_tasks(node, inputs) -> Sequence[TaskPlan]` hook. It returns the
 complete finite Task set for a Node. The kernel validates unique stable
-Node-local keys and deterministic fingerprints, then atomically inserts every
-Task and marks the Node `discovery_complete`.
+Node-local keys, computes each Task Fingerprint once, then atomically inserts
+every Task and marks the Node `discovery_complete`. Resume loads persisted
+fingerprints and does not recompute them during status polling or provider
+observation.
 
 No Task can acquire a Provider Call, Worker Assignment, or local owner until
 that transaction and the host's durability boundary complete. For a
@@ -491,12 +509,22 @@ and prevents workers from observing a partially discovered Node. Scientific
 ordering, when relevant, belongs in stable Task payloads rather than provider
 admission order.
 
+`TaskPlan` keeps its normalized scientific payload separate from the
+operational execution payload used to prepare provider arguments. The latter
+may contain staging paths, batching choices, concurrency, and resource
+requirements without changing scientific cache identity. A Successor
+Execution Run reuses a Task publication only when Node key, Task key,
+kernel-computed fingerprint, and workload validation all match. The first
+version uses one fixed standard-library SHA-256/canonical-JSON implementation;
+it has no codec or hashing plugin layer and never reads large files while
+fingerprinting Tasks.
+
 ## Responsibility boundary
 
 | Concern | Execution kernel owns | Workload or host owns |
 | --- | --- | --- |
 | DAG | Validation, topological readiness, terminal reachability | Nodes, dependencies, semantic labels |
-| Task planning | Immutable task records, fingerprints, dependency links | Task discovery and scientific identity payload |
+| Task planning | Immutable task records, canonical fingerprint calculation, dependency links | Task discovery, normalized scientific payload, and content digests |
 | Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
@@ -1234,7 +1262,7 @@ Phase 0 test inventory:
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
-| `tests/execution/test_discovery.py` | Task keys and fingerprints are validated; discovery is all-or-nothing; no owner is admitted before host durability; pre-checkpoint recovery rediscovers; post-checkpoint recovery reloads without rediscovery |
+| `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; no owner is admitted before host durability; recovery reloads persisted fingerprints without polling-time recomputation |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1293,6 +1321,8 @@ Deliverables:
   aggregation decisions;
 - define finite Node-owned Task discovery with stable keys and deterministic
   fingerprints, without streaming or provider dependencies;
+- compute Task fingerprints once from fixed canonical JSON and keep
+  operational execution payloads outside scientific identity;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -2002,6 +2032,14 @@ after each decision:
     reloads without rediscovery. Empty discovery uses the declared empty-result
     policy. Streaming, incremental, paginated, and worker-side discovery are
     excluded from the first kernel version.
+49. **Simple Task fingerprints — accepted 2026-07-30**: the kernel computes
+    and persists one SHA-256 digest during discovery over compact canonical
+    JSON containing the Workload Plan Fingerprint, Node key, Task key, and
+    normalized scientific payload. Workloads provide content digests;
+    operational payloads and provider policy are excluded. Resume and polling
+    load the stored digest. Successor reuse also requires publication
+    validation. There is no pluggable codec, hash registry, or large-file
+    hashing in the kernel.
 
 ## Definition of ready for implementation
 

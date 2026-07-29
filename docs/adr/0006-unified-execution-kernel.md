@@ -272,6 +272,20 @@ Run. Empty discovery follows `allow_empty_result`. The first kernel version
 does not support streaming, incremental, or worker-side Task discovery, so a
 worker can never observe a half-populated SQLite queue.
 
+The Task-fingerprint policy was accepted on 2026-07-30 with an explicit
+simplicity and performance constraint. `TaskPlan` separates a JSON-compatible
+workload-normalized scientific payload from its operational execution
+payload. The kernel computes SHA-256 once during discovery over compact,
+sorted-key canonical JSON containing the Workload Plan Fingerprint, Node key,
+Task key, and scientific payload; non-finite JSON numbers are rejected.
+Workloads supply content digests rather than file paths or file bytes. The
+persisted fingerprint is loaded on resume and never recomputed during polling.
+Provider kwargs, staging paths, batching, concurrency, resources, and call
+identity are excluded. A successor may reuse a publication only when Node
+key, Task key, computed fingerprint, and workload validation all match. The
+kernel has no pluggable hash registry, custom codec framework, or repeated
+large-file hashing.
+
 The result-boundary policy was accepted on 2026-07-29. Terminal Execution
 Nodes—the DAG leaves with no downstream dependency—collectively define the
 scientific result boundary. The scheduler validates their workload

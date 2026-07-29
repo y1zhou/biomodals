@@ -142,6 +142,14 @@ Node whose cached publication and outcome can be observed. Every Task belongs
 to exactly one Node.
 _Avoid_: workflow node, thread, untracked work item
 
+**Task Fingerprint** [planned]:
+The kernel-computed SHA-256 digest of compact canonical JSON containing the
+Workload Plan Fingerprint, Node key, Task key, and workload-normalized
+scientific payload. It is calculated once at discovery and persisted.
+Operational execution payloads, provider kwargs, paths, batching, resources,
+and call identity are excluded.
+_Avoid_: workload-supplied opaque digest, whole-file hashing, polling-time recomputation
+
 **Task Discovery Checkpoint** [planned]:
 The atomic per-Node repository transition that validates and inserts the
 complete finite set of `TaskPlan` records with unique stable Node-local keys,

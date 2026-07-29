@@ -284,6 +284,27 @@ ordinary running Node. `queued` and `finalizing` may remain service-facing Job
 labels derived from the execution projection; `blocked`, `interrupted`,
 `retrying`, `expired`, `cached`, and `skipped` are not Run statuses.
 
+### Execution Node statuses
+
+The kernel uses exactly seven Node statuses:
+
+| Status | Terminal | Meaning |
+| --- | --- | --- |
+| `pending` | No | Waiting for dependencies or Task discovery |
+| `running` | No | Discovering, scheduling, or executing Tasks |
+| `succeeded` | Yes | The required Node output is complete |
+| `partial` | Yes | The Node aggregation policy accepted incomplete output |
+| `failed` | Yes | Required work conclusively failed |
+| `cancelled` | Yes | Run cancellation stopped the Node |
+| `skipped` | Yes | An upstream terminal outcome made the Node unreachable |
+
+Readiness is derived from dependencies and their accepted outcomes; it is not
+a persisted `ready` status. A Node satisfied entirely by reusable
+publications becomes `succeeded`, while its Tasks retain cache provenance.
+Run-level `cancel_requested`, `suspended`, and `state_unknown` are not
+duplicated onto Nodes. A workload excludes an optional branch from its
+immutable plan rather than creating a Node that is already `skipped`.
+
 ## Responsibility boundary
 
 | Concern | Execution kernel owns | Workload or host owns |
@@ -886,6 +907,7 @@ Phase 0 test inventory:
 | `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
+| `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
@@ -1480,6 +1502,12 @@ after each decision:
     three only to `state_unknown`, the final two only to `failed`, and every
     other Run status requires a null reason. The repository rejects invalid
     combinations.
+32. **Execution Node statuses — accepted 2026-07-29**: Nodes use `pending`,
+    `running`, `succeeded`, `partial`, `failed`, `cancelled`, and `skipped`;
+    only the first two are nonterminal. Readiness is derived, cache reuse is
+    Task provenance on a successful Node, and Run-level cancellation request,
+    suspension, and unknown state are not duplicated onto Nodes. `skipped`
+    means an upstream terminal outcome made a planned Node unreachable.
 
 ## Definition of ready for implementation
 

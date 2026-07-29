@@ -69,6 +69,13 @@ A fixed semantic step in an execution DAG that may discover one or more Tasks
 when it becomes ready.
 _Avoid_: Modal function, dynamic task, provider call
 
+**Execution Node Status** [planned]:
+The kernel lifecycle value for an Execution Node: `pending`, `running`,
+`succeeded`, `partial`, `failed`, `cancelled`, or `skipped`. Only `pending`
+and `running` are nonterminal. Readiness is derived rather than persisted, and
+cache reuse is Task provenance rather than a Node status.
+_Avoid_: ready, cached, suspended, state unknown
+
 **Task**:
 The smallest independently identified unit in an Execution Node whose cached
 publication and outcome can be observed.

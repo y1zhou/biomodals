@@ -190,6 +190,15 @@ Run requires `coordinator_error`. A `state_unknown` Run requires one of
 requires a null `status_reason`. The repository rejects all mismatched and
 unknown codes.
 
+The Execution Node status policy was accepted on 2026-07-29. Nodes have
+exactly seven statuses: `pending`, `running`, `succeeded`, `partial`, `failed`,
+`cancelled`, and `skipped`. Only the first two are nonterminal. `ready` is a
+derived dependency predicate, not persisted state. A fully cache-satisfied
+Node is `succeeded`, with cache reuse retained as Task provenance. Run-level
+`cancel_requested`, `suspended`, and `state_unknown` are not duplicated on
+Nodes. `skipped` means that an upstream terminal outcome made a planned Node
+unreachable.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal

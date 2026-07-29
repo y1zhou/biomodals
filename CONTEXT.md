@@ -26,20 +26,32 @@ arguments, output paths, or publication identity. Successor Execution Runs may
 reuse it, and the kernel stores it only as immutable workload plan input.
 _Avoid_: Execution Run ID, ledger path, display label alone
 
-**Deployment-Blocked Run** [planned]:
-A terminal, incomplete Execution Run whose immutable Deployment Identity is no
-longer available for coordinator or Provider Call lookup. It remains
-inspectable but admits no new work and cannot change deployment in place.
-_Avoid_: state unknown, cancelled run, resumable run
+**Execution Run Status** [planned]:
+The kernel lifecycle value for an Execution Run: `pending`, `running`,
+`cancel_requested`, `suspended`, `state_unknown`, `succeeded`, `partial`,
+`failed`, or `cancelled`. The first five are nonterminal and the final four are
+terminal. Structured reasons refine a status without creating another status.
+_Avoid_: queued, finalizing, blocked, interrupted
 
 **Successor Execution Run** [planned]:
-A new Execution Run created by an explicit restart of a terminal or
-Deployment-Blocked Run. It records its predecessor, uses a newly resolved
-Deployment Identity and Execution Run ID, reuses the Workload Run Key when
-applicable, revalidates Workload Publications, and schedules only missing work
-whose predecessor Provider Call is conclusively terminal. It is the only way
-to retry failed provider work.
+A new Execution Run created by an explicit restart of an eligible terminal
+Run. It records its predecessor, uses a newly resolved Deployment Identity and
+Execution Run ID, reuses the Workload Run Key when applicable, revalidates
+Workload Publications, and schedules only missing work whose predecessor
+Provider Call is conclusively terminal. It is the only way to retry failed
+provider work.
 _Avoid_: in-place migration, same-run retry, provider redelivery
+
+**Suspended Run** [planned]:
+A nonterminal Execution Run whose coordinator stopped after an application
+error. It admits no new work until explicit resume reconciles durable state.
+_Avoid_: failed Task, provider state unknown, Modal preemption
+
+**State-Unknown Run** [planned]:
+A nonterminal Execution Run whose provider submission, call state, or
+cancellation outcome cannot be established. It preserves ownership and forbids
+replacement work until explicit reconciliation or administrative resolution.
+_Avoid_: suspended Run, missing publication, failed Run
 
 **Execution Node**:
 A fixed semantic step in an execution DAG that may discover one or more Tasks

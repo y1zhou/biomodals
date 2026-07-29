@@ -65,12 +65,12 @@ The expired-deployment policy was accepted on 2026-07-29. An Execution Run
 never changes its Deployment Identity in place. The kernel continues to
 observe already attached calls by FunctionCall ID and validates any resulting
 Workload Publications. If the pinned coordinator version is unavailable while
-the run remains incomplete, the run becomes Deployment-Blocked and admits no
-new work. This is a terminal run state. An explicit restart creates a
-Successor Execution Run with a newly resolved Deployment Identity and
-predecessor link. It revalidates publications and schedules only missing Tasks;
-active or unknown predecessor ownership blocks replacement work, and the
-predecessor repository remains read-only and inspectable.
+the run remains incomplete, the run becomes `failed` with
+`failure_reason=deployment_unavailable` and admits no new work. An explicit
+restart creates a Successor Execution Run with a newly resolved Deployment
+Identity and predecessor link. It revalidates publications and schedules only
+missing Tasks; active or unknown predecessor ownership blocks replacement
+work, and the predecessor repository remains read-only and inspectable.
 
 The remote-ledger storage policy was accepted on 2026-07-29. A Direct CLI App
 Run stores its App Run Ledger beneath the reserved
@@ -161,6 +161,19 @@ operation ledger. `JobState`, timelines, active-job counts, and administrative
 running-job counts are service views derived from execution rows and
 service-owned result data.
 
+The Run-status policy was accepted on 2026-07-29. The kernel has exactly nine
+Execution Run statuses: `pending`, `running`, `cancel_requested`, `suspended`,
+`state_unknown`, `succeeded`, `partial`, `failed`, and `cancelled`. The first
+five are nonterminal; the final four are terminal. An unexpected coordinator
+application error sets `suspended`; provider submission, state, or
+cancellation uncertainty sets `state_unknown`. Deployment unavailability is
+`failed` with `failure_reason=deployment_unavailable`, not a separate status.
+Provider-call `outcome_unknown` remains lower-level detail. Provider
+preemption does not change Run status, finalization remains an ordinary
+running Node, and the kernel adds no `queued`, `finalizing`, generic `blocked`,
+`interrupted`, or `retrying` state. Service Job projections may retain
+user-facing labels without persisting another compute state machine.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal
@@ -221,7 +234,7 @@ redelivery after infrastructure interruption may transparently create a
 replacement Coordinator Attempt, but the coordinator adapter configures no
 automatic retry loop for an uncaught application exception. Such an exception
 stops admission, preserves attached Provider Calls, and records a diagnostic
-when possible. The Execution Run remains incomplete and requires an explicit
+when possible. The Execution Run becomes `suspended` and requires an explicit
 `resume` command to reconcile durable state and continue. Resume may schedule
 Tasks that were never submitted, but it does not retry a failed Task.
 

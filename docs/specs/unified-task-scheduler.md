@@ -105,7 +105,8 @@ These existing decisions remain binding during the refactor:
 - A CLI version override is optional. Without one, deployment history is
   resolved once and the resulting exact version is persisted before work.
 - An incomplete run never changes Deployment Identity. If its version becomes
-  unavailable, an explicit restart creates a linked successor run.
+  unavailable, it fails with reason `deployment_unavailable`; an explicit
+  restart creates a linked successor run.
 - Direct CLI App Run ledgers live in a reserved namespace in that deployment's
   configured durable Volume; there is no cross-app execution-state Volume.
 - Terminal remote CLI and workflow ledgers have no automatic TTL or garbage
@@ -200,9 +201,6 @@ Tasks. Repeating its stable request ID returns the same Worker Assignments.
 **Deployment Identity** is the Modal Environment, deployed app or workflow
 name, and exact numeric deployment version fixed before run admission.
 
-**Deployment-Blocked Run** is a terminal, incomplete run whose Deployment
-Identity is unavailable. It remains inspectable and admits no new work.
-
 **Successor Execution Run** is a new, explicitly authorized run linked to a
 terminal predecessor. It is the retry boundary for failed work, uses a new
 Deployment Identity, reuses validated Workload Publications, and submits only
@@ -218,6 +216,55 @@ its file or marker format.
 
 These accepted terms are reconciled in `CONTEXT.md`; adapters should use them
 instead of preserving legacy workflow attempt terminology.
+
+### Execution Run statuses
+
+The kernel uses exactly nine Run statuses:
+
+| Status | Terminal | Meaning |
+| --- | --- | --- |
+| `pending` | No | The immutable plan is persisted and no Task has been dispatched |
+| `running` | No | The DAG is advancing or waiting on dependencies, permits, publications, or attached calls |
+| `cancel_requested` | No | Explicit cancellation is durable and attached work is being reconciled |
+| `suspended` | No | A coordinator application error stopped admission until explicit resume |
+| `state_unknown` | No | Provider submission, call state, or cancellation outcome cannot be established; replacement is forbidden |
+| `succeeded` | Yes | All required work and publications completed successfully |
+| `partial` | Yes | The declared aggregation policy produced a usable partial result |
+| `failed` | Yes | Required work conclusively failed or the Run cannot continue |
+| `cancelled` | Yes | Cancellation completed conclusively |
+
+Structured reason and diagnostic fields refine these statuses. In particular,
+an unavailable pinned deployment is `failed` with
+`failure_reason=deployment_unavailable`. It is not a separate Run status.
+Provider-call `outcome_unknown` projects to Run-level `state_unknown`.
+
+The primary transitions are:
+
+```text
+pending
+  -> running | cancel_requested | suspended | state_unknown
+  -> failed | cancelled
+
+running
+  -> cancel_requested | suspended | state_unknown
+  -> succeeded | partial | failed
+
+cancel_requested
+  -> cancelled | state_unknown | succeeded | partial | failed
+
+suspended
+  -> running through explicit resume
+  -> cancel_requested | state_unknown | failed
+
+state_unknown
+  -> running | cancel_requested
+  -> succeeded | partial | failed | cancelled
+```
+
+Modal preemption does not create a Run transition. Result preparation is an
+ordinary running Node. `queued` and `finalizing` may remain service-facing Job
+labels derived from the execution projection; `blocked`, `interrupted`,
+`retrying`, `expired`, `cached`, and `skipped` are not Run statuses.
 
 ## Responsibility boundary
 
@@ -299,9 +346,10 @@ activity, not a public `drive` CLI command or a new kernel domain type.
 Provider redelivery of an interrupted coordinator input is recovery, not an
 application-level retry. An uncaught exception from coordinator code stops
 admission, leaves attached Provider Calls running, and records its diagnostic
-when possible. The adapter does not automatically retry that exception.
-Explicit `resume` reloads the durable ledger, reconciles attached calls, and
-then continues the same Execution Run.
+when possible. It sets the Run to `suspended`; the adapter does not
+automatically retry that exception. Explicit `resume` reloads the durable
+ledger, reconciles attached calls, and then returns the same Execution Run to
+`running`.
 
 A workload or Provider Call failure is different: it terminally fails the
 affected Task, and the Node aggregation policy derives the Node and Run
@@ -633,7 +681,7 @@ The target split is:
 | Execution columns from `runs`, `nodes`, and `remote_calls` | Shared execution SQLite schema |
 | `attempts`, `current_attempt_id`, attempt foreign keys, and attempt counters | Delete; move the one retained result or error to Task, Node, Provider Call, or artifact state |
 | Run, Node, Task, Dispatch Batch, Worker Assignment, and Provider Call transitions | Shared execution repository implementation |
-| `RunStatus`, `NodeStatus`, placement, and recovery policy | Shared execution models, with temporary workflow re-exports if needed |
+| `RunStatus`, `NodeStatus`, placement, and recovery policy | Shared execution models imported directly after cutover |
 | `NodeExecutionPolicy`, `AttemptRecord`, and `NodeStatusRecord.attempts` | Delete; provider redelivery and Successor Execution Runs replace generic rerun policy |
 | `artifacts`, `artifact_files`, `node_inputs`, and `node_outputs` tables | Workflow-specific run store |
 | `WorkflowArtifact`, `ArtifactSelector`, and materialized `AppRunResult` handling | Workflow-specific artifact module |
@@ -817,7 +865,8 @@ Phase 0 test inventory:
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner failure without same-run reassignment, and unknown-owner blocking |
 | `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
-| `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
+| `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
+| `tests/execution/test_run_status.py` | Exactly nine statuses exist; legal transitions, terminality, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
@@ -878,6 +927,7 @@ Deliverables:
 
 - add `SqliteExecutionRepository` tables and transitions for Execution Runs,
   Nodes, Tasks, and Provider Calls over a host-supplied SQLite connection;
+- implement the nine-status Run transition table and structured status reasons;
 - persist immutable Task plans and enforce one submission claim per Task per
   Execution Run;
 - implement preclaim, spawn, attachment, observation, collection,
@@ -937,6 +987,9 @@ Deliverables:
   configuration while recreating Job and execution state;
 - update OpenAPI and frontend-facing service projections with the backend
   cutover;
+- derive existing service `queued` and `finalizing` labels from kernel
+  `pending`, `running`, and the active Node rather than persisting them as Run
+  statuses;
 - switch the workflow composition root in one commit to
   `SqliteExecutionRepository` plus `WorkflowArtifactStore`;
 - in that same workflow cutover, delete the old `WorkflowLedger` execution
@@ -1328,10 +1381,10 @@ after each decision:
     persisted before admission; later lookups never float to latest.
 19. **Expired deployment recovery — accepted 2026-07-29**: an Execution Run
     never changes Deployment Identity. Existing calls remain observable by ID.
-    An incomplete run with an unavailable version becomes Deployment-Blocked.
-    Explicit restart creates a linked Successor Execution Run on a new version,
-    revalidates publications, and schedules only missing Tasks whose
-    predecessor ownership is conclusively terminal.
+    An incomplete run with an unavailable version becomes `failed` with reason
+    `deployment_unavailable`. Explicit restart creates a linked Successor
+    Execution Run on a new version, revalidates publications, and schedules
+    only missing Tasks whose predecessor ownership is conclusively terminal.
 20. **Remote ledger storage — accepted 2026-07-29**: each Direct CLI App Run
     stores an App Run Ledger at
     `.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in its
@@ -1372,8 +1425,8 @@ after each decision:
     redelivery may replace an infrastructure-interrupted Coordinator Attempt.
     An uncaught coordinator application exception is not automatically
     retried: admission stops, attached calls remain running, a diagnostic is
-    recorded when possible, and the Run stays incomplete until explicit
-    resume reconciles durable state.
+    recorded when possible, and the Run becomes `suspended` until explicit
+    resume reconciles durable state and returns it to `running`.
 27. **Workflow attempt removal — accepted 2026-07-29**: the workflow
     migration deletes `attempts`, `current_attempt_id`, attempt foreign keys and
     counters, `AttemptRecord`, generic `NodeExecutionPolicy`, attempt status
@@ -1386,6 +1439,13 @@ after each decision:
     `WorkflowLedger` compatibility facade, dual schema, dual writes, or
     attempt-preserving adapter. Delete the replaced execution implementation
     and reject old unfinished ledgers at cutover.
+29. **Execution Run statuses — accepted 2026-07-29**: the kernel uses
+    `pending`, `running`, `cancel_requested`, `suspended`, `state_unknown`,
+    `succeeded`, `partial`, `failed`, and `cancelled`. The first five are
+    nonterminal and the final four terminal. Deployment unavailability is
+    `failed` with reason `deployment_unavailable`; provider
+    `outcome_unknown` projects to `state_unknown`. Preemption and finalization
+    do not create Run statuses, and host Job labels remain derived projections.
 
 ## Definition of ready for implementation
 

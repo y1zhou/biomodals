@@ -1,6 +1,6 @@
 # Centralize execution mechanics without centralizing workload state
 
-Status: proposed.
+Status: accepted.
 
 Biomodals should introduce a provider-aware execution kernel under
 `biomodals.execution` for DAG traversal, task readiness, paid-call attachment
@@ -77,6 +77,11 @@ users, authentication data, and administrator configuration while recreating
 the Job and execution schema without old Job history. Existing workflow
 ledgers are incompatible and must restart. Remote scientific publications,
 markers, and caches remain reusable and are never deleted by this transition.
+
+The adoption order was accepted on 2026-07-29. GROMACS and the basic workflow
+runtime establish fixed graph and one-Task-per-call behavior, PPIFlow is the
+first runtime-discovered fan-out consumer, and AlphaFold3 adopts the proven
+kernel afterward.
 
 ## Considered options
 

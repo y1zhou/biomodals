@@ -2,8 +2,7 @@
 
 # Unified task scheduler refactor plan
 
-Status: proposed; implementation must not begin until the decision gates are
-accepted.
+Status: accepted and ready for implementation.
 
 This plan consolidates the execution and recovery findings from the API
 service, reusable workflow runtime, PPIFlow fan-out, and AlphaFold3 search and
@@ -527,6 +526,24 @@ Rollback:
 
 - documentation and test-only changes can be reverted without state migration.
 
+Phase 0 test inventory:
+
+| Test location | Required case |
+| --- | --- |
+| `tests/workflow/test_artifacts.py` | An external checker exception returns `unknown`, never `missing` |
+| `tests/service/test_submission.py` | Definite rejection releases work; unknown spawn blocks; an unattached returned call is cancelled and marked unknown |
+| `tests/workflow/test_runtime.py` | A crash after durable claim but before attachment does not submit replacement work |
+| `tests/workflow/test_runtime.py` | A recorded call ID is resolved and collected instead of resubmitted |
+| `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
+| `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
+| `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
+| `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
+| `tests/app/test_alphafold3_production_contracts.py` | Search, run, request, marker, and seed-batch identities remain unchanged |
+
+Each fault test uses a deterministic injected failure point and asserts both
+the durable rows and the number of fake paid calls. Merely asserting a final
+status is insufficient.
+
 ### Phase 1 — repair recovery semantics in place
 
 Deliverables:
@@ -718,6 +735,71 @@ Split a commit further whenever its predecessor and replacement cannot be
 reviewed side by side. Never combine an AlphaFold3 scientific contract change
 with scheduler extraction.
 
+### First two implementation commits
+
+The first two implementation commits have fixed scope:
+
+#### `workflow: fix availability uncertainty`
+
+Files:
+
+- `src/biomodals/workflow/core/artifact_availability.py`
+- `tests/workflow/test_artifacts.py`
+
+Change:
+
+- map external checker exceptions to `ArtifactAvailabilityStatus.UNKNOWN`;
+- put the exception diagnostic in `unknown_reason`;
+- leave `errors` empty because absence was not established;
+- add the focused regression test and change no scheduling code.
+
+Verification:
+
+```text
+uv run pytest tests/workflow/test_artifacts.py
+prek run --files \
+  src/biomodals/workflow/core/artifact_availability.py \
+  tests/workflow/test_artifacts.py
+```
+
+Rollback: revert the commit; it has no schema or durable-state effect.
+
+#### `workflow: harden remote call recovery`
+
+Files:
+
+- `src/biomodals/workflow/core/ledger.py`
+- `src/biomodals/workflow/core/_runtime/remote_calls.py`
+- `src/biomodals/workflow/core/_runtime/node_runner.py`
+- `tests/workflow/test_ledger.py`
+- `tests/workflow/test_runtime.py`
+
+Change:
+
+- record a durable submission identity before invoking the provider;
+- attach the returned call ID to that identity;
+- leave an unattached or interrupted submission explicitly outcome-unknown;
+- finalize the processed result, artifacts, Task Attempt, Node, and Provider
+  Call in one host transaction and Volume synchronization boundary;
+- remove the earlier transition that marks a call succeeded before its result
+  is recoverable;
+- add the fault-injection cases from the Phase 0 inventory.
+
+Verification:
+
+```text
+uv run pytest tests/workflow/test_ledger.py tests/workflow/test_runtime.py
+prek run --files \
+  src/biomodals/workflow/core/ledger.py \
+  src/biomodals/workflow/core/_runtime/remote_calls.py \
+  src/biomodals/workflow/core/_runtime/node_runner.py \
+  tests/workflow/test_ledger.py \
+  tests/workflow/test_runtime.py
+```
+
+Rollback: revert the commit and recreate any unfinished workflow ledger
+written by it. No compatibility reader is required.
+
 ## Verification matrix
 
 | Layer | Required verification |
@@ -800,9 +882,10 @@ after each decision:
    authentication, and administrator configuration; recreate Service Job and
    execution state without old Job history; reject and restart old workflow
    ledgers; preserve remote scientific publications and caches.
-8. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
-   AlphaFold3? Recommendation: yes; it exercises fan-out with lower scientific
-   and cache risk.
+8. **Adoption order — accepted 2026-07-29**: GROMACS and the basic workflow
+   runtime prove fixed scheduling first, PPIFlow is the first
+   runtime-discovered Task consumer, and AlphaFold3 adopts the proven kernel
+   afterward.
 
 ## Definition of ready for implementation
 
@@ -814,3 +897,5 @@ Implementation begins only when:
 - Phase 0 scientific, cost-safety, and user-visible regression fixtures plus
   fault-injection points are enumerated as test cases;
 - the first two implementation commits have exact file and rollback scopes.
+
+All five conditions are satisfied by this accepted plan.

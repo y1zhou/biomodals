@@ -20,6 +20,13 @@ before admission and used for repository keys, coordinator routing, lineage,
 and ledger paths.
 _Avoid_: Workload Run Key, Service Job ID, display name
 
+**Execution Run Reference** [planned]:
+A portable locator containing an Execution Run ID, Deployment Identity, and
+optional root coordinator FunctionCall ID. Generic CLI lifecycle commands
+verify its fields against the ledger before acting; the reference is never
+execution authority.
+_Avoid_: local run registry, authentication token, Execution State Repository
+
 **Workload Run Key** [planned]:
 An optional workload-owned name or scientific key that influences provider
 arguments, output paths, or publication identity. Successor Execution Runs may

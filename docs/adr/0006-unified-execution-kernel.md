@@ -89,6 +89,18 @@ inside the immutable workload plan; they never select a ledger or coordinator
 pool. A Successor Execution Run receives a new UUID while retaining the same
 Workload Run Key and publication identity where scientifically appropriate.
 
+The CLI location policy was accepted on 2026-07-29. App and workflow launch
+commands print one portable Execution Run Reference containing the Deployment
+Identity, Execution Run ID, and optional root coordinator FunctionCall ID.
+Each Deployment Coordinator Adapter exposes the same lifecycle surface, so
+`biomodals run status`, `cancel`, `resume`, and `restart` consume that
+reference without app-specific command implementations. References contain no
+authority: the adapter verifies every field against the App Run Ledger or
+Workflow Ledger before acting. Individual fields may reconstruct a lost
+reference; no local registry or global remote run index is introduced.
+`resume` retains the Execution Run ID and Deployment Identity, while `restart`
+always creates and returns a successor reference.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -230,6 +242,9 @@ only for work still missing.
 - Reusing a user or scientific run name as the execution primary key would
   make CLI lookup familiar, but would couple untrusted paths, publication
   reuse, restart lineage, and one scheduler invocation to the same string.
+- A local run registry would shorten later commands, but would make recovery
+  machine-specific and introduce another mutable state store. Separate app and
+  workflow lifecycle commands would duplicate an identical kernel surface.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.

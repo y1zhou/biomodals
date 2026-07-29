@@ -2,7 +2,7 @@
 
 # Unified task scheduler refactor plan
 
-Status: accepted and ready for implementation.
+Status: accepted architecture; execution topology under review.
 
 This plan consolidates the execution and recovery findings from the API
 service, reusable workflow runtime, PPIFlow fan-out, and AlphaFold3 search and
@@ -18,7 +18,7 @@ The target is one place to reason about:
 - cache observations and the decision to reuse or compute;
 - input preparation and output collection boundaries;
 - batching and run-level resource budgets;
-- reusable direct-fan-out and queue-backed worker-pool dispatch.
+- reusable direct-fan-out and SQLite-backed pull worker-pool dispatch.
 
 It is not one place to encode every workload's scientific semantics or persist
 every kind of state.
@@ -43,8 +43,8 @@ In particular:
    workload publication are durably recoverable.
 6. Parallel tasks run when their dependencies and resource budget allow it.
 7. One provider call may represent a batch of independently identified tasks.
-8. Several provider calls may serve one queue-backed Dispatch Batch without
-   making the queue an execution authority.
+8. Several provider calls may claim work from one SQLite-backed Dispatch Batch
+   without opening or writing the repository themselves.
 9. Service, workflow, and app CLI entrypoints remain functionally testable;
    internal imports and unfinished schemas carry no compatibility promise.
 
@@ -92,8 +92,9 @@ These existing decisions remain binding during the refactor:
   service does not rewrite the app or replace its CLI entrypoint.
 - PPIFlow keeps a fixed stage DAG while candidate work fans out inside a stage.
 - Provider workers never write the coordinator's SQLite repository.
-- A Remote Work Queue is disposable dispatch transport, not durable Task state
-  or scientific completion evidence.
+- Ready Task rows and Worker Assignments are the durable pull-work queue.
+- A remote SQLite coordinator is routed by Execution Run and pinned deployment
+  version to a provider pool capped at one container.
 - Coordinator Interruption suspends scheduling and preserves attached child
   Provider Calls; only explicit cancellation terminates them.
 - Worker lifecycle callbacks are advisory: they may checkpoint or diagnose an
@@ -149,8 +150,12 @@ call ID and observed lifecycle. A call can cover a batch of Task Attempts.
 provider call or a shared worker pool. Exact Task-to-call attribution is
 recorded only when it is observed.
 
-**Worker Assignment** is an append-only, call-bound claim electing the worker
-allowed to execute one Task Attempt delivered through a shared work pool.
+**Worker Assignment** is a durable, call-bound SQLite record electing the
+worker allowed to execute one Task Attempt from a shared pull work pool. It is
+checkpointed before the Task payload is returned.
+
+**Task Claim Request** is an idempotent request for a bounded set of ready
+Tasks. Repeating its stable request ID returns the same Worker Assignments.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -169,7 +174,7 @@ duplicated.
 | Cache | `available` / `missing` / `unknown` vocabulary and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
-| Dispatch | Durable batches, direct fan-out, worker-call tracking, returned outcome routing | Task payloads, batch compatibility, provider-native queue binding |
+| Dispatch | Durable batches, direct fan-out, pull claims, worker-call tracking, returned outcome routing | Task payloads and batch compatibility |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Mapping Tasks to call batches and distributing outcomes | Batch compatibility and workload-specific limits |
 | Resources | Coordinator-scoped run budget and persisted permit accounting | Service admission, Modal resources, deployment limits, cross-coordinator policy |
@@ -252,8 +257,8 @@ repository.
 
 Provider workers do not write SQLite. A single coordinator applies
 transitions and commits them using its transaction and Volume synchronization
-boundary. Modal Dict remains appropriate for distributed writer claims; it is
-not a replacement for the coordinator's attempt and call ledger.
+boundary. Remote pull workers submit idempotent claim and completion commands
+to that coordinator instead of mounting or opening the ledger.
 
 The accepted implementation is one `SqliteExecutionRepository` for
 single-writer durable coordinators. The host supplies the SQLite connection
@@ -296,24 +301,27 @@ checkpoint. The current workflow exit behavior that cancels active child calls
 must be removed when it adopts this policy. Explicit user cancellation remains
 separate and may cancel those calls.
 
-Exactly one Coordinator Ownership Generation may write one Volume-backed
-repository at a time:
+Exactly one process may write one Volume-backed repository at a time. A remote
+coordinator enforces this through a run-scoped provider pool:
 
-1. a remote coordinator invocation receives a stable generation ID in its
-   provider input;
-2. before opening SQLite, it atomically appends ownership in a
-   provider-accessible claim store;
-3. Modal replacement Attempts for that same input retain the generation;
-4. a separate invocation fails closed while the predecessor call is active or
-   unknown;
-5. a successor generation may be appended only after the predecessor call is
-   conclusively terminal;
-6. the current generation is revalidated before each Volume checkpoint.
+1. the immutable Execution Run ID and pinned coordinator deployment version
+   identify a parameterized coordinator pool;
+2. every unique parameter tuple has its own container pool, capped at one
+   coordinator container;
+3. concurrent `run`, `claim`, `complete`, and observation inputs route to that
+   container;
+4. method handlers submit commands to one in-process writer loop rather than
+   opening transactions themselves;
+5. the writer serializes SQLite transactions and explicit Volume checkpoints;
+6. a replacement container reloads the last checkpoint after preemption;
+7. different Execution Runs use independent pools and may proceed in parallel.
 
-Ownership is not a timeout lease. A stuck or unobservable predecessor requires
-explicit cancellation or operator recovery before reassignment. The API
-service and local CLI coordinators use host-owned single-writer exclusion and
-do not need the Modal ownership adapter.
+Stable request IDs make duplicate control inputs idempotent in SQLite. The
+provider's per-parameter pool isolation, one-container cap, and replacement
+behavior are correctness assumptions and require a manual Modal smoke test
+before adoption. A host-exclusive coordinator that needs no remote worker RPC
+may keep its existing process-level single-writer exclusion without this
+remote wrapper.
 
 ### Worker interruption and assignment recovery
 
@@ -330,24 +338,35 @@ not elapsed time:
 - unknown call state preserves `state_unknown` and forbids replacement work.
 
 Direct one-Task-per-call execution needs no separate remote assignment store.
-For a queue-backed Dispatch Batch, the immutable Task catalog remains durable
-in SQLite and active Worker Assignments are mirrored into a provider-accessible
-insert-only store. A queue delivery is executed only after the receiving
-worker atomically elects itself for that Task. Duplicate delivery therefore
-loses the election and is harmless.
+For a pull Dispatch Batch, ready Task rows are the queue. A worker sends
+`claim(worker_id, capacity, request_id)` to the coordinator. In one serialized
+operation, the coordinator:
 
-If a worker removes a queue item and dies before claiming it, the Task remains
-unassigned in the Dispatch Batch and may be delivered again. If it dies after
-claiming, the restarted provider input retains the assignment. A different
-Provider Call may receive a successor assignment only after the owning call is
-conclusively terminal.
+1. returns an existing result if `request_id` was already processed;
+2. selects ready Task Attempts that fit the worker's capacity;
+3. records their Worker Assignments and permit allocation;
+4. commits SQLite and crosses the explicit Volume durability boundary;
+5. only then returns the Task payloads.
 
-Task Redelivery is not a retry. Delivery may repeat automatically when no
-Worker Assignment was elected, and Modal may restart or retry the same
-provider input without creating another Provider Call record. Once a paid call
-is conclusively terminal and may have started work, the Task Attempt becomes
-terminal. The kernel creates no successor paid call until a later explicit
-resume or retry invocation grants Retry Authorization.
+A lost response can therefore be requested again without creating another
+assignment. If the coordinator dies before the checkpoint, no payload has
+been returned; if it dies afterward, the replacement coordinator recovers the
+same assignments. A restarted provider input repeats its claim request and
+retains its work. A different Provider Call may receive a successor assignment
+only after the owning call is conclusively terminal.
+
+Workers publish their outputs before sending an idempotent completion report.
+The coordinator records individual Task outcomes and releases permits in one
+serialized transaction. A lost completion response is harmless, and
+publication validation reconciles output that became durable before its
+completion report.
+
+Task Redelivery is not a retry. A claim request may repeat automatically
+before or after a Worker Assignment is committed, and Modal may restart or
+retry the same provider input without creating another Provider Call record.
+Once a paid call is conclusively terminal and may have started work, the Task
+Attempt becomes terminal. The kernel creates no successor paid call until a
+later explicit resume or retry invocation grants Retry Authorization.
 
 Resume first revalidates every expected Workload Publication. Satisfied Tasks
 remain complete, while only still-missing Tasks receive successor attempts.
@@ -584,9 +603,10 @@ characterization tests:
 5. `WorkflowOrchestrator.exit()` currently cancels active remote calls during
    every container exit. Separate interruption from explicit cancellation and
    preserve attached calls for replacement-attempt recovery.
-6. Rosetta removes a queue item before any durable Worker Assignment, so a
-   hard interruption can lose delivery. Retain the SQLite Dispatch Batch as
-   the task catalog and elect a call-bound assignment before execution.
+6. Rosetta removes a Modal Queue item before any durable Worker Assignment, so
+   a hard interruption can lose delivery. Replace that transport with an
+   idempotent coordinator claim that commits and checkpoints the assignment
+   before returning the Task payload.
 7. BoltzGen removes its output lock from `@modal.exit`, which can expose the
    same output to another worker while Modal restarts the interrupted input.
    Exit must preserve call-bound ownership.
@@ -819,17 +839,18 @@ proven:
 
 1. BoltzGen exercises bounded direct fan-out, where each run ID is one Task
    and one GPU Provider Call.
-2. Rosetta exercises a queue-backed worker pool, where several Provider Calls
-   steal Task payloads from one Dispatch Batch.
+2. Rosetta exercises a SQLite-backed pull worker pool, where several Provider
+   Calls claim Task microbatches from one Dispatch Batch through the
+   coordinator.
 
 Deliverables:
 
 - add a reusable direct-fan-out adapter that admits ready Tasks as permits
   become available;
-- add a reusable Modal work-pool adapter for queue population, worker-call
-  attachment, outcome reconciliation, and queue cleanup;
-- add call-bound Worker Assignments so duplicate delivery is harmless and
-  preempted provider inputs retain their current Tasks;
+- add a reusable run-scoped remote coordinator and pull-work adapter for
+  idempotent claims, worker-call attachment, and outcome reconciliation;
+- add durable Worker Assignments so lost claim responses are harmless and
+  preempted provider inputs recover their current Tasks;
 - keep SQLite single-writer: workers return outcome records or publish
   outputs, and only the coordinator commits execution transitions;
 - remove BoltzGen's generic `bounded_map` orchestration and use Task state to
@@ -837,7 +858,7 @@ Deliverables:
 - retain or replace BoltzGen's output lock only as a cross-coordinator
   publication claim;
 - remove Rosetta's generic queue and worker-pool lifecycle from workload code
-  while retaining Modal Queue as the remote work-stealing transport;
+  and use ready Task rows as the remote work-stealing queue;
 - preserve deterministic result ordering and existing CLI behavior.
 
 Exit gate:
@@ -848,7 +869,7 @@ Exit gate:
   independently after partial worker failure;
 - worker exit callbacks can be dropped without changing any recovery result;
 - a coordinator restart reconstructs permits, batches, and attached worker
-  calls without treating queue contents as authoritative;
+  calls from the SQLite ledger;
 - workload modules contain scientific execution and validation rather than
   generic concurrent scheduling loops.
 
@@ -914,7 +935,7 @@ Use small commits in dependency order:
 12. `alphafold3: adopt execution adapters`
 13. `execution: add dispatch adapters`
 14. `boltzgen: adopt direct task fanout`
-15. `rosetta: adopt queue work pool`
+15. `rosetta: adopt sqlite work pool`
 16. `execution: remove duplicate schedulers`
 
 Split a commit further whenever its predecessor and replacement cannot be
@@ -999,7 +1020,7 @@ written by it. No compatibility reader is required.
 | Call lifecycle | Fault injection around every transition, attach validation, recovery, expiry, cancellation, unknown outcomes |
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
 | Batching | Call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
-| Dispatch | Direct fan-out, many-call work pools, call-bound Worker Assignments, queue loss and duplicate delivery |
+| Dispatch | Direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from Task permits, batched permit accounting, no permit leak on failure |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
@@ -1020,13 +1041,13 @@ authorized smoke test after local and CI gates pass.
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate drivers |
 | A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
-| A Remote Work Queue is mistaken for durable state | Persist Dispatch Batches and reconcile returned outcomes or validated publications |
+| A claim response is lost after assignment | Commit and Volume-checkpoint the assignment before responding; replay by stable request ID |
 | An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
 | Recovery silently spends on a second call | Distinguish Task Redelivery from explicit Retry Authorization |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
-| Two Coordinator Attempts write one Volume ledger | Acquire call-bound ownership before opening SQLite; never steal on elapsed time |
+| Two coordinator containers open one Volume ledger | Route by Run ID and pinned deployment version, cap the pool at one container, serialize writes, and smoke-test provider behavior |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1042,7 +1063,7 @@ authorized smoke test after local and CI gates pass.
 - automatic retries of paid provider calls;
 - a cross-coordinator or cross-run global resource scheduler;
 - remote workers opening or mutating the coordinator's SQLite file;
-- eliminating provider-native queues when work stealing is useful;
+- a generic provider-native message-queue abstraction;
 - scheduler-driven mutation of Modal function decorators;
 - moving scientific parsers into generic execution code;
 - rewriting AlphaFold3, GROMACS, or PPIFlow public interfaces as part of the
@@ -1088,28 +1109,34 @@ after each decision:
    afterward.
 9. **App-internal fan-out — accepted 2026-07-29**: after the Task lifecycle is
    proven, BoltzGen adopts reusable direct fan-out and Rosetta adopts a
-   queue-backed work-pool adapter. SQLite remains the single-writer control
-   plane while Modal Queue remains disposable remote dispatch transport.
+   SQLite-backed pull work-pool adapter. Ready Task rows and Worker
+   Assignments are the durable queue; workers access them only through
+   idempotent coordinator methods.
 10. **Coordinator interruption — accepted 2026-07-29**: preemption suspends
     scheduling without cancelling child calls. A Coordinator Attempt drains
     and checkpoints best-effort, correctness survives hard interruption, and
     a replacement recovers attached calls and permits from durable state.
-11. **Single-writer handoff — accepted 2026-07-29**: Volume-backed remote
-    coordinators use append-only, call-bound ownership generations. The same
-    provider input retains ownership across preemption Attempts; another
-    invocation may succeed it only after conclusive predecessor termination.
-    Unknown state blocks, and elapsed time alone never transfers ownership.
+11. **Single-writer topology — accepted 2026-07-29**: a Volume-backed remote
+    coordinator is parameterized by Run ID and pinned deployment version. Its
+    provider pool is capped at one container, and concurrent method inputs
+    submit commands to one in-process SQLite writer. Different Runs use
+    independent pools.
 12. **Worker interruption — accepted 2026-07-29**: preemption retains the
-    Task Attempt and call-bound Worker Assignment. Exit callbacks are advisory.
-    A successor assignment requires conclusive owner-call termination, while
-    unknown state blocks replacement.
+    Task Attempt and committed Worker Assignment. Claim and completion methods
+    are idempotent; assignment is checkpointed before payload delivery. Exit
+    callbacks are advisory, and a successor assignment requires conclusive
+    owner-call termination.
 13. **Retry authority — accepted 2026-07-29**: safe redelivery and
     provider-managed retries stay within one Task Attempt. A new paid Provider
     Call after terminal failure requires a later explicit resume or retry
     invocation, which revalidates publications and retries only missing Tasks.
-14. **Coordination-store liveness — pending**: define how active ownership and
-    Worker Assignment records avoid provider-store inactivity expiry without
-    turning heartbeats into timeout-based takeover authority.
+14. **Task queue storage — accepted 2026-07-29**: SQLite is the only durable
+    queue and assignment store. The design adds neither Modal Dict nor Modal
+    Queue; remote workers claim bounded microbatches through the run-scoped
+    coordinator.
+15. **Coordinator placement — pending**: decide which execution shapes require
+    a remote run-scoped coordinator and which may remain driven by an existing
+    service, workflow, or local CLI process.
 
 ## Definition of ready for implementation
 
@@ -1122,4 +1149,4 @@ Implementation begins only when:
   fault-injection points are enumerated as test cases;
 - the first two implementation commits have exact file and rollback scopes.
 
-All five conditions are satisfied by this accepted plan.
+Implementation remains paused until the remaining decision gates are resolved.

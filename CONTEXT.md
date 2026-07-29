@@ -48,22 +48,23 @@ _Avoid_: Task, workflow node, app
 
 **Dispatch Batch** [planned]:
 A durable grouping of Task Attempts offered together to one Provider Call or
-to a shared remote worker pool. It records intended dispatch without claiming
-that a particular worker performed a Task before that assignment is observed.
+to a shared pull worker pool. It records intended dispatch without claiming
+that a particular worker performed a Task before a Worker Assignment is
+committed.
 _Avoid_: workflow node, provider call, scientific batch
 
-**Remote Work Queue**:
-A provider-accessible transport from which remote workers claim items in a
-Dispatch Batch. It is neither durable execution authority nor evidence that
-an item completed.
-_Avoid_: Execution State Repository, workflow ledger, publication
-
 **Worker Assignment** [planned]:
-An append-only claim linking one Task Attempt to the Provider Call and worker
-slot currently responsible for it. Replacement containers for that call
-retain the assignment; a different call may succeed it only after the owner
-call is conclusively terminal.
-_Avoid_: queue item, timeout lease, Task Attempt
+A durable SQLite record linking one Task Attempt to the Provider Call and
+worker claim currently responsible for it. The coordinator commits and
+checkpoints the assignment before returning its payload. Repeating the same
+claim request returns the same assignment.
+_Avoid_: queue item, timeout lease, Task Attempt, publication
+
+**Task Claim Request** [planned]:
+An idempotent request from a pull worker for a bounded set of ready Tasks.
+Its stable request ID lets a replacement worker recover the same committed
+Worker Assignments after a lost response or provider restart.
+_Avoid_: Task Attempt, automatic retry, timeout lease
 
 **Execution State Repository**:
 A durable record of Execution Runs, Nodes, Tasks, Task Attempts, and Provider
@@ -88,12 +89,12 @@ A non-user-requested loss or shutdown of the current Coordinator Attempt that
 requires a replacement Attempt to recover durable execution state.
 _Avoid_: Job cancellation, Task failure, Provider Call cancellation
 
-**Coordinator Ownership Generation** [planned]:
-One append-only grant allowing a remote Execution Coordinator invocation and
-its replacement Attempts to write a Volume-backed Execution State Repository.
-A successor is valid only after the preceding invocation is conclusively
-terminal.
-_Avoid_: timeout lease, SQLite file lock, Task Attempt
+**Run-Scoped Coordinator Pool** [planned]:
+A provider-routed container pool identified by an Execution Run and pinned
+coordinator deployment version. It admits at most one coordinator container
+for that identity; concurrent control requests submit commands to that
+container's single SQLite writer.
+_Avoid_: worker pool, timeout lease, service database
 
 **Service Job**:
 A user-facing API service record for ownership, admission, configuration,

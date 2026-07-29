@@ -86,9 +86,9 @@ kernel afterward.
 The app-fan-out scope was accepted on 2026-07-29. The kernel also replaces
 generic App-Local Scheduler mechanics after its Task lifecycle is proven.
 BoltzGen supplies the direct one-Task-per-call case and Rosetta supplies the
-queue-backed work-stealing case. Provider queues remain disposable dispatch
-transport; they do not become execution authority, and provider workers do
-not write the coordinator's SQLite repository.
+SQLite-backed pull work-pool case. Ready Task rows are the durable queue;
+provider workers claim bounded microbatches through coordinator methods and
+never open the coordinator's SQLite repository.
 
 The interruption policy was accepted on 2026-07-29. A Modal preemption ends
 one Coordinator Attempt but does not cancel its Execution Runs or attached
@@ -98,20 +98,25 @@ from the last durable checkpoint. A replacement Attempt reloads execution
 state, reconstructs permits, and resolves attached calls by ID. Only an
 explicit user cancellation authorizes cancelling child calls.
 
-The single-writer policy was accepted on 2026-07-29. A Volume-backed remote
-coordinator must acquire an append-only, call-bound Coordinator Ownership
-Generation before opening SQLite. Replacement Attempts for the same provider
-input retain that generation. A different invocation may create a successor
-only after the predecessor call is conclusively terminal; unknown state fails
-closed and requires operator recovery. Ownership never transfers merely
-because time elapsed.
+The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
+coordinator runs in a parameterized, run-scoped provider pool identified by
+the Execution Run and a pinned coordinator deployment version. That pool is
+capped at one coordinator container. Concurrent run, claim, completion, and
+observation requests enter that container, but one in-process writer loop
+serializes every SQLite transition and Volume checkpoint. Different Run IDs
+have independent pools and may execute concurrently. The provider routing and
+single-container assumptions require a manual Modal smoke test before remote
+adoption.
 
 The worker-interruption policy was accepted on 2026-07-29. Worker preemption
 does not fail a Task Attempt or release its Worker Assignment because Modal
-restarts the same provider input. Work-pool assignments are append-only and
-call-bound; another call may receive a successor assignment only after the
-owner call is conclusively terminal. Lifecycle exit hooks may checkpoint work
-or emit diagnostics, but they never authorize failure or reassignment.
+restarts the same provider input. Pull workers use stable, idempotent claim
+request IDs. The coordinator transactionally records an assignment, crosses
+the Volume durability boundary, and only then returns its Task payload; a
+repeated request returns the same assignment. Another call may receive a
+successor assignment only after the owner call is conclusively terminal.
+Lifecycle exit hooks may checkpoint work or emit diagnostics, but they never
+authorize failure or reassignment.
 
 The retry policy was accepted on 2026-07-29. Redelivery before assignment and
 provider-managed restart of one input remain inside the existing Task Attempt.
@@ -132,6 +137,12 @@ only for work still missing.
 - Introducing one universal Job class and database would make inspection look
   uniform while conflating API admission, workflow recovery, provider calls,
   and scientific cache authority.
+- Letting remote workers open SQLite on a shared Volume would remove a control
+  hop, but Modal Volumes do not provide safe distributed file locking or
+  coherent concurrent same-file writes.
+- Mirroring assignments into Modal Dict and transporting Tasks through Modal
+  Queue would add a second state model with expiry and delivery-recovery
+  semantics even though SQLite already contains the durable ready set.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.
@@ -155,11 +166,11 @@ output is reusable.
 
 Concurrent Task execution does not imply concurrent SQLite writers. One
 coordinator durably admits work and records returned events while direct
-calls, batched calls, or queue-backed worker pools run concurrently. A
+calls, batched calls, or SQLite-backed pull worker pools run concurrently. A
 Dispatch Batch relates Task Attempts to one or more Provider Calls without
-pretending that a transient queue is a database. Workload code retains task
-identity, batch compatibility, execution, and publication validation; shared
-adapters own reusable fan-out and worker-pool mechanics.
+introducing another queue. Workload code retains task identity, batch
+compatibility, execution, and publication validation; shared adapters own
+reusable fan-out and worker-pool mechanics.
 
 An Execution Coordinator is logical and may span several Coordinator Attempts.
 Graceful lifecycle hooks improve checkpoint freshness but are not part of the
@@ -168,19 +179,20 @@ committed through the host's durability boundary before that side effect, and
 an attached call ID is checkpointed promptly after submission. Preemption is
 therefore recovery, not implicit cancellation.
 
-A Modal-backed ownership adapter uses insert-only generation records in a
-provider-accessible coordination store. Host-exclusive coordinators such as
-the single-process API service use their existing ownership instead. This
-avoids concurrent access to one Volume-backed SQLite file without introducing
-a time-based distributed lease or pretending SQLite can fence writers before
-it is safely opened.
+A remote run-scoped coordinator relies on provider routing, a one-container
+pool cap, and deployment-version pinning to ensure that only one process opens
+its Volume-backed SQLite file. Concurrent method inputs enqueue commands to
+one in-process writer rather than executing database transactions directly.
+Host-exclusive coordinators such as the single-process API service keep their
+existing process ownership.
 
-Queue-backed work stealing uses the same call-bound principle at Task scope.
-The durable Dispatch Batch remains the task catalog, a Remote Work Queue is
-only a delivery hint, and a provider-accessible Worker Assignment elects the
-worker allowed to execute a delivered Task. Publication validation and
-terminal provider state recover dropped or interrupted delivery without a
-timeout-based steal.
+SQLite-backed work stealing uses the same call-bound principle at Task scope.
+Ready Tasks and committed Worker Assignments form the durable work pool.
+Workers request capacity through idempotent coordinator calls; the assignment
+and Volume checkpoint precede the response. Completion reports are likewise
+idempotent. Publication validation and terminal provider state recover lost
+responses or interrupted delivery without a timeout-based steal, Modal Dict,
+or Modal Queue.
 
 This separates recovery from repeated spending. Provider-native retries and
 safe Task Redelivery preserve one call or one Task Attempt; Retry Authorization

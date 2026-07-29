@@ -51,6 +51,16 @@ pool addressable after the launching process exits. Source-backed
 Run and carries no cross-invocation resume guarantee. Local dry-run planning
 does not require a deployment.
 
+The deployment-resolution policy was accepted on 2026-07-29. A CLI
+`--version` value is an explicit override. Otherwise the CLI queries
+`modal app history --json` once, selects the current deployed version, and
+forms an exact Deployment Identity from the Modal Environment, deployment
+name, and numeric version. It preflights and persists that identity before
+admitting Tasks or starting Provider Calls. Every lookup then supplies the
+exact version; a missing or unretained version fails closed rather than
+falling back to the latest deployment. Modal support for version-pinned
+lookups is therefore a deployment prerequisite.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -177,6 +187,11 @@ only for work still missing.
   current source-first behavior, but a later process could recover a
   FunctionCall by ID without being able to address the same parameterized
   coordinator deployment reliably.
+- Requiring users to enter a numeric deployment version on every run would be
+  deterministic but unnecessarily cumbersome. Resolving history once and
+  immediately switching to exact versioned lookups provides the same pin.
+- Calling an unversioned handle throughout a run would be simpler, but Modal
+  may route later calls to a newer deployment during a rolling update.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.

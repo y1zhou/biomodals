@@ -91,9 +91,9 @@ _Avoid_: Job cancellation, Task failure, Provider Call cancellation
 
 **Run-Scoped Coordinator Pool** [planned]:
 A provider-routed container pool created by a Deployment Coordinator Adapter
-and identified by an Execution Run and pinned containing-deployment version.
-It admits at most one coordinator container for that identity; concurrent
-control requests submit commands to that container's single SQLite writer.
+and identified by an Execution Run and Deployment Identity. It admits at most
+one coordinator container for that identity; concurrent control requests
+submit commands to that container's single SQLite writer.
 _Avoid_: worker pool, timeout lease, service database
 
 **Deployment Coordinator Adapter** [planned]:
@@ -102,9 +102,16 @@ shared execution kernel to that deployment's workload hooks, Volumes, and
 configuration without introducing a universal coordinator service.
 _Avoid_: execution kernel, workload registry, API service
 
+**Deployment Identity** [planned]:
+The Modal Environment, deployed app or workflow name, and exact numeric
+deployment version selected and persisted before an Execution Run admits work.
+An explicit CLI version wins; otherwise the CLI resolves current deployment
+history once and pins the result.
+_Avoid_: floating latest handle, semantic app version, source revision alone
+
 **Deployed CLI Run** [planned]:
 A top-level app or workflow Execution Run submitted by the Biomodals CLI to an
-exact named deployment version. It may be observed or resumed across local CLI
+exact Deployment Identity. It may be observed or resumed across local CLI
 processes through its remote Run-Scoped Coordinator Pool.
 _Avoid_: ephemeral development run, API Job, Child App Call
 

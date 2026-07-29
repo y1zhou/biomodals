@@ -100,6 +100,8 @@ These existing decisions remain binding during the refactor:
 - `biomodals app run` and `biomodals workflow run` target exact deployed
   versions by default; source-backed ephemeral execution is explicit
   development mode without cross-invocation resume.
+- A CLI version override is optional. Without one, deployment history is
+  resolved once and the resulting exact version is persisted before work.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -165,6 +167,9 @@ checkpointed before the Task payload is returned.
 
 **Task Claim Request** is an idempotent request for a bounded set of ready
 Tasks. Repeating its stable request ID returns the same Worker Assignments.
+
+**Deployment Identity** is the Modal Environment, deployed app or workflow
+name, and exact numeric deployment version fixed before run admission.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -423,6 +428,7 @@ Execution tables may store only data needed to reconstruct and manage actual
 work:
 
 - stable run, node, task, attempt, and call identifiers;
+- the immutable Deployment Identity used to recover provider calls;
 - immutable plan and task fingerprints;
 - dependency edges and legal execution states;
 - submission tokens, provider targets, call IDs, and observed outcomes;
@@ -954,6 +960,11 @@ Deliverables:
 
 - make `biomodals app run` and `biomodals workflow run` resolve the
   deployment-local coordinator at an exact app or workflow version;
+- accept an explicit `--version` override or parse `modal app history --json`
+  once to select the current deployed version;
+- preflight and persist the resulting Environment, deployment name, and
+  numeric version before admitting any Task;
+- use only exact versioned Function and Cls lookups after resolution;
 - retain workload-specific argument parsing and local input staging in thin
   Local Entrypoints without creating local execution state;
 - add an explicit development mode for source-backed ephemeral execution and
@@ -970,6 +981,9 @@ Exit gate:
   deployment;
 - a second CLI process can address the same run-scoped coordinator using the
   recorded deployment identity and Run ID;
+- a rolling deployment after admission cannot change any Provider Call target;
+- unavailable or unretained versions fail before new paid work rather than
+  falling back to a floating latest handle;
 - development mode remains useful for source iteration but cannot be mistaken
   for a resumable deployed run;
 - dry-run and help start no remote execution.
@@ -1091,7 +1105,7 @@ written by it. No compatibility reader is required.
 | Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, resume and force behavior |
 | PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, stage restart |
 | AlphaFold3 | Search/run/request identities, claims, publications, seed batching/reuse, summaries, archive hashes |
-| CLI | Existing app and workflow discovery/help plus representative local-entrypoint dry tests |
+| CLI | App and workflow discovery/help, version resolution and overrides, deployed versus development launch, representative dry tests |
 
 CI uses an in-memory SQLite repository plus fake provider and workload-storage
 implementations. Remote Modal validation remains a manual, explicitly
@@ -1113,6 +1127,8 @@ authorized smoke test after local and CI gates pass.
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
 | Two coordinator containers open one Volume ledger | Route by Run ID and pinned deployment version, cap the pool at one container, serialize writes, and smoke-test provider behavior |
 | One coordinator must understand every workload | Ship a thin binding with each app or workflow deployment; keep shared mechanics in the kernel |
+| Latest deployment changes between CLI calls | Resolve history once, persist the exact Deployment Identity, and use only versioned handles |
+| Version-pinned lookup is unsupported or expired | Preflight workspace support and exact availability; fail closed with the recorded identity |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1215,9 +1231,14 @@ after each decision:
     addressable across CLI processes. Source-backed ephemeral execution is an
     explicit Development CLI Run with no cross-invocation resume guarantee.
     Local dry-run planning needs no deployment.
-18. **Deployment version selection — pending**: define whether every CLI run
-    requires an explicit Modal deployment version or may resolve the current
-    deployed version once and persist that exact identity before admission.
+18. **Deployment version selection — accepted 2026-07-29**: `--version`
+    explicitly selects a version. When omitted, the CLI resolves
+    `modal app history --json` once and pins the current deployed version.
+    Environment, deployment name, and numeric version are preflighted and
+    persisted before admission; later lookups never float to latest.
+19. **Expired deployment recovery — pending**: define whether an incomplete
+    run whose pinned version leaves Modal's retention window fails closed or
+    may resume in place under a newer deployment.
 
 ## Definition of ready for implementation
 

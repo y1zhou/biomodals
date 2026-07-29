@@ -104,6 +104,8 @@ These existing decisions remain binding during the refactor:
   resolved once and the resulting exact version is persisted before work.
 - An incomplete run never changes Deployment Identity. If its version becomes
   unavailable, an explicit restart creates a linked successor run.
+- Direct CLI App Run ledgers live in a reserved namespace in that deployment's
+  configured durable Volume; there is no cross-app execution-state Volume.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -179,6 +181,9 @@ Identity is unavailable. It remains inspectable and admits no new work.
 **Successor Execution Run** is a new, explicitly authorized run linked to a
 terminal predecessor. It uses a new Deployment Identity and reuses only
 validated Workload Publications.
+
+**App Run Ledger** is the physical per-run SQLite repository stored beneath
+`.biomodals/execution/runs/` in an app deployment's durable Volume.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -267,7 +272,7 @@ Repository scope follows the coordinator boundary:
 | --- | --- | --- | --- |
 | API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Service-coordinated Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, Jobs, admission, runtime configuration, and result cache remain service-owned |
 | Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
-| Direct CLI app coordinator | One remote per-run execution ledger | App Nodes, Tasks, Task Attempts, batches, child calls, and recovery | Workload publications, scientific inputs, and outputs remain app-owned |
+| Direct CLI app coordinator | One App Run Ledger in the app deployment's configured durable Volume | App Nodes, Tasks, Task Attempts, batches, child calls, and recovery | Workload publications, scientific inputs, and outputs remain app-owned |
 | Child App Call | No separate repository; use the parent Execution Run | Work attributed to the service, workflow, or Direct CLI App Run | Function implementation, resources, and scientific publication remain app-owned |
 
 An ordinary API request therefore updates only the service database. It does
@@ -287,6 +292,13 @@ Workflow Orchestrator and per-run Workflow Ledger. Both CLI commands pin an
 exact deployed version before admitting work. An explicit Development CLI Run
 may execute current source through an ephemeral Modal app, but it cannot later
 claim the durable resume semantics of a Deployed CLI Run.
+
+Each app Deployment Coordinator Adapter binds its App Run Ledger to a reserved
+`.biomodals/execution/runs/` path in that app's configured durable Volume,
+normally its existing output Volume. The workflow adapter keeps using the
+workflow orchestrator Volume. The kernel receives a connection and explicit
+Volume synchronization boundary from either host and never imports a global
+execution Volume.
 
 The same app invoked from an API service or workflow is instead a Child App
 Call. Its Tasks live in that parent coordinator's repository, so the child
@@ -339,6 +351,13 @@ attachments must be made visible through an explicit, serialized Volume
 checkpoint. The current workflow exit behavior that cancels active child calls
 must be removed when it adopts this policy. Explicit user cancellation remains
 separate and may cancel those calls.
+
+Different Run-Scoped Coordinator Pools use distinct SQLite files. Their
+deployment-specific Modal Volume v2 may accept concurrent commits to those
+different paths, while the one-container pool cap prevents concurrent access
+to one ledger file. A coordinator closes or checkpoints SQLite before a Volume
+reload or commit and never places scientific outputs inside the reserved ledger
+namespace.
 
 Exactly one process may write one Volume-backed repository at a time. A remote
 coordinator enforces this through a run-scoped provider pool:
@@ -904,6 +923,8 @@ Deliverables:
   idempotent claims, worker-call attachment, and outcome reconciliation;
 - keep only workload hooks, Modal decorators, and Volume bindings in each
   deployment's thin Coordinator Adapter;
+- bind each Direct CLI App Run to a distinct App Run Ledger in the app's
+  configured durable Volume;
 - add durable Worker Assignments so lost claim responses are harmless and
   preempted provider inputs recover their current Tasks;
 - keep SQLite single-writer: workers return outcome records or publish
@@ -1152,6 +1173,7 @@ authorized smoke test after local and CI gates pass.
 | Latest deployment changes between CLI calls | Resolve history once, persist the exact Deployment Identity, and use only versioned handles |
 | Version-pinned lookup is unsupported or expired | Preflight workspace support and exact availability; fail closed with the recorded identity |
 | A newer deployment mutates an old run | Make Deployment Identity immutable; create a linked successor after publication revalidation |
+| One Volume couples unrelated app ledgers | Store app ledgers in deployment-specific Volumes and reserve a kernel-owned path namespace |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1264,9 +1286,15 @@ after each decision:
     An incomplete run with an unavailable version becomes Deployment-Blocked.
     Explicit restart creates a linked Successor Execution Run on a new version,
     revalidates publications, and schedules only missing Tasks.
-20. **Remote ledger storage — pending**: choose whether Direct CLI App Run
-    ledgers share one execution-state Volume per Modal Environment or live in
-    deployment-specific Volumes.
+20. **Remote ledger storage — accepted 2026-07-29**: each Direct CLI App Run
+    stores an App Run Ledger under `.biomodals/execution/runs/` in its
+    deployment's configured durable Volume. Workflows retain their orchestrator
+    Volume and the API retains `service.sqlite3`. The kernel receives these
+    host bindings and defines no shared cross-app execution Volume.
+21. **Execution Run identity — pending**: decide whether the kernel Run ID is
+    an opaque UUID distinct from user-facing and scientific workload run names,
+    especially when a successor must reuse publications without reusing its
+    predecessor's ledger path.
 
 ## Definition of ready for implementation
 

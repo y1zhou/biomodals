@@ -85,6 +85,12 @@ Calls governed by the execution kernel's transition contract. Each durable
 coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
+**App Run Ledger** [planned]:
+The physical per-run SQLite Execution State Repository for a Direct CLI App
+Run, stored under `.biomodals/execution/runs/` in that app deployment's
+configured durable Volume.
+_Avoid_: scientific output directory, Workflow Ledger, shared execution Volume
+
 **Execution Coordinator** [planned]:
 The logical scheduling authority that serializes transitions in an Execution
 State Repository and drives its Execution Runs. It outlives any process or

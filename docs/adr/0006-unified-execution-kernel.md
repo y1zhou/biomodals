@@ -71,6 +71,15 @@ Successor Execution Run with a newly resolved Deployment Identity and
 predecessor link. It revalidates publications and schedules only missing Tasks;
 the predecessor repository remains read-only and inspectable.
 
+The remote-ledger storage policy was accepted on 2026-07-29. A Direct CLI App
+Run stores its App Run Ledger beneath the reserved
+`.biomodals/execution/runs/` namespace in the app deployment's configured
+durable Volume, normally its existing output Volume. A workflow retains its
+physical ledger in the workflow orchestrator Volume, and the API service
+retains execution tables in `service.sqlite3`. The host supplies the Volume,
+mountpoint, and repository path; the kernel declares no global execution
+Volume or workload output location.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -205,6 +214,10 @@ only for work still missing.
 - Migrating an incomplete run to a newer deployment in place would preserve
   its Run ID, but would mix plan, adapter, schema, and coordinator versions
   inside one execution authority.
+- One execution-state Volume shared by every deployment would simplify global
+  discovery, but would broaden storage access and couple unrelated apps to one
+  Volume lifecycle. Existing deployment-specific Volumes already provide the
+  required durable boundary.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.
@@ -247,6 +260,12 @@ its Volume-backed SQLite file. Concurrent method inputs enqueue commands to
 one in-process writer rather than executing database transactions directly.
 Host-exclusive coordinators such as the single-process API service keep their
 existing process ownership.
+
+Different remote runs write distinct ledger files. Modal Volume v2 supports
+concurrent writes to distinct files, while the run-scoped one-container rule
+protects each individual SQLite file. The coordinator closes or checkpoints
+SQLite before reloading or committing its host Volume; scientific outputs and
+the reserved ledger namespace never share files.
 
 SQLite-backed work stealing uses the same call-bound principle at Task scope.
 Ready Tasks and committed Worker Assignments form the durable work pool.

@@ -280,6 +280,46 @@ Resolved provider bindings may be recorded because they determine actual
 execution, but the kernel is invariant to whether those values came from an
 administrator setting, CLI option, or workload default.
 
+### Service Job projection
+
+The service does not mirror compute state. Admission uses one host-owned
+transaction to:
+
+1. create an Execution Run and its initial plan through
+   `SqliteExecutionRepository`; and
+2. create a Service Job containing a distinct `job_id` and one-way
+   `execution_run_id`.
+
+The Service Job owns only service concerns such as:
+
+- owner and authorization scope;
+- request idempotency and submitted parameters;
+- selected workload and user-facing display data;
+- admission and configuration snapshots;
+- input-upload references;
+- result location, checksum, size, retention, and download metadata;
+- service audit timestamps that are not compute transitions.
+
+The Execution Run owns all actual work, including local result preparation,
+provider submission, cancellation progress, unknown outcomes, and terminal
+compute status. The service retains `JobState` as an HTTP/OpenAPI enum only and
+derives it at read time from the Execution Run plus service result-delivery
+facts. Workload presentation code maps stable Node and Task keys to labels and
+timeline rows without writing those labels into execution tables.
+
+The same projection is used for:
+
+- Job detail and list endpoints;
+- per-column Job filtering and sorting;
+- active-job admission limits;
+- administrator running-job counts;
+- cancellation eligibility;
+- stage timelines and Running Function values.
+
+Do not add a trigger or materialized state column until query evidence shows
+that the indexed join is insufficient. If a read projection is cached later,
+it is disposable and never becomes a second authority.
+
 ### Workflow Ledger decomposition
 
 The existing physical workflow `ledger.sqlite3` file remains useful. The
@@ -316,12 +356,12 @@ The preferred end state is the second option if composition remains readable.
 The deletion test is that removing `WorkflowLedger` must not redistribute
 generic SQL or transition logic back into workflow callers.
 
-The service follows the same pattern. `JobState` and the user-facing Service
-Job envelope remain service concepts and point to an Execution Run.
-`job_operations` and `JobOperationState` are replaced by shared Execution
-Nodes, Tasks, Task Attempts, and Provider Calls. Service projections build the
-public timeline from shared execution rows instead of preserving a second
-operation state machine.
+The service follows the same pattern. The user-facing Service Job points to an
+Execution Run. `job_operations`, persisted `JobOperationState`, and persisted
+compute `JobState` are replaced by shared Execution Nodes, Tasks, Task
+Attempts, and Provider Calls. Service projections retain the existing HTTP
+state and timeline vocabulary without preserving a second operation state
+machine.
 
 ### Paid-call lifecycle
 
@@ -683,13 +723,17 @@ after each decision:
    `biomodals.execution` has a small interface for depth and testability but no
    compatibility promise for Python imports, unfinished database schemas, or
    in-progress run formats.
-5. **Distributed resource limits**: should the first extraction define a lease
+5. **Service Job projection — accepted 2026-07-29**: a Service Job stores a
+   one-way Execution Run ID and service-owned metadata but no duplicate compute
+   state. `JobState`, timelines, filters, limits, and counts derive from
+   execution rows.
+6. **Distributed resource limits**: should the first extraction define a lease
    port but defer a Modal Dict-backed global lease implementation?
    Recommendation: yes, until a concrete cross-container limit requires it.
-6. **Migration scope**: should service database changes be additive and
+7. **Migration scope**: should service database changes be additive and
    migratable while in-progress workflow runs keep their documented restart
    policy? Recommendation: yes.
-7. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
+8. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
    AlphaFold3? Recommendation: yes; it exercises fan-out with lower scientific
    and cache risk.
 
@@ -698,7 +742,7 @@ after each decision:
 Implementation begins only when:
 
 - ADR 0006 is accepted;
-- the seven decision gates are resolved;
+- the eight decision gates are resolved;
 - the proposed execution terms are reconciled into `CONTEXT.md`;
 - Phase 0 scientific, cost-safety, and user-visible regression fixtures plus
   fault-injection points are enumerated as test cases;

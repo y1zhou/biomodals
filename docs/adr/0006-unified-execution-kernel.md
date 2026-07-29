@@ -58,6 +58,13 @@ Service Job or Workflow Artifact Store may refer to execution IDs in the
 opposite direction. Physical colocation in one SQLite file does not weaken
 this dependency rule.
 
+The service projection rule was accepted on 2026-07-29. A Service Job stores
+service-owned identity, admission, request, and result-delivery data plus a
+one-way Execution Run ID. It does not persist a second compute state or
+operation ledger. `JobState`, timelines, active-job counts, and administrative
+running-job counts are service views derived from execution rows and
+service-owned result data.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG

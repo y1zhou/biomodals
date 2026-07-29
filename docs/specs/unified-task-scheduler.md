@@ -164,7 +164,8 @@ src/biomodals/execution/
   model.py                # immutable plan and state value objects
   plan.py                 # graph validation and readiness
   availability.py         # tri-state observations
-  ports.py                # persistence, provider, and workload protocols
+  sqlite.py               # schema and transitions on a host connection
+  ports.py                # provider and workload protocols
   runtime.py              # composition facade after primitives stabilize
   _internal/
     scheduler.py          # ready-node/task selection
@@ -181,9 +182,10 @@ The first supported imports should be no larger than:
 - `TaskResult`
 - `ExecutionRuntime`
 
-Provider, store, and workload implementations are supplied explicitly by each
-composition root. Do not add global registries, plugin discovery, YAML
-workflows, or import-time Modal bindings.
+Each composition root supplies its SQLite connection and transaction,
+provider implementation, and workload implementation explicitly. Do not add
+global registries, plugin discovery, YAML workflows, or import-time Modal
+bindings.
 
 ### Driver model
 
@@ -227,12 +229,17 @@ transitions and commits them using its transaction and Volume synchronization
 boundary. Modal Dict remains appropriate for distributed writer claims; it is
 not a replacement for the coordinator's attempt and call ledger.
 
-The recommended implementation is a reusable SQLite repository for
-single-writer durable coordinators. It should be embeddable into a host-owned
-transaction. That lets service admission and initial execution state be
-committed atomically, while a workflow can commit execution rows together with
-its Volume-backed ledger. If a host cannot share a transaction, its adapter
-must implement the same prepare/publish/finalize recovery protocol.
+The accepted implementation is one `SqliteExecutionRepository` for
+single-writer durable coordinators. The host supplies the SQLite connection
+and transaction; the repository does not select the database path, commit,
+close, or synchronize a Modal Volume. This lets service admission and initial
+execution state be committed atomically, while a workflow can commit
+execution rows together with its Volume-backed ledger.
+
+The first implementation has no persistence protocol. Tests exercise the
+production repository through an in-memory SQLite connection. If a second real
+backend later appears, its requirements provide evidence for extracting a
+smaller, proven persistence interface instead of guessing one now.
 
 ### Workflow Ledger decomposition
 
@@ -422,8 +429,8 @@ Rollback:
 
 Deliverables:
 
-- move the proven preclaim/attach/recover transitions behind persistence and
-  provider ports;
+- move the proven preclaim/attach/recover transitions into
+  `SqliteExecutionRepository` and behind the provider port;
 - use `ModalJobSubmitter` as the behavioral baseline for uncertain spawn;
 - add thin async service and sync workflow drivers;
 - adapt service `job_operations` and workflow `remote_calls` without initially
@@ -440,7 +447,7 @@ Exit gate:
 Rollback:
 
 - keep old coordinators behind a temporary composition switch for one phase;
-  remove the switch when both adapters pass compatibility tests.
+  remove the switch when both host integrations pass compatibility tests.
 
 ### Phase 4 — add durable Tasks, batches, and budgets
 
@@ -580,21 +587,22 @@ with scheduler extraction.
 | AlphaFold3 | Search/run/request identities, claims, publications, seed batching/reuse, summaries, archive hashes |
 | CLI | Existing app and workflow discovery/help plus representative local-entrypoint dry tests |
 
-CI uses fake provider and storage adapters. Remote Modal validation remains a
-manual, explicitly authorized smoke test after local and CI gates pass.
+CI uses an in-memory SQLite repository plus fake provider and workload-storage
+implementations. Remote Modal validation remains a manual, explicitly
+authorized smoke test after local and CI gates pass.
 
 ## Risks and controls
 
 | Risk | Control |
 | --- | --- |
-| A universal abstraction hides scientific differences | Workload-owned hooks and persistence adapters; migrate AF3 last |
+| A universal abstraction hides scientific differences | Workload-owned hooks and provider adapters; migrate AF3 last |
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate drivers |
 | A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
-| One ledger becomes a cross-context bottleneck | Keep existing stores and define atomic persistence ports |
+| One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Migration changes established app behavior | Compatibility fixtures and adapter-first rollout |
 
 ## Explicit non-goals
@@ -625,9 +633,10 @@ after each decision:
    move to the shared execution repository. After migration, the
    `WorkflowLedger` facade is removed and workflow code retains a narrow
    Workflow Artifact Store and Volume lifecycle.
-3. **Repository implementation**: should the kernel provide one reusable,
-   embeddable SQLite execution repository for those durable coordinators?
-   Recommendation: yes.
+3. **Repository implementation — accepted 2026-07-29**: the kernel provides
+   one concrete `SqliteExecutionRepository` over a host-supplied connection
+   and transaction. Tests use in-memory SQLite; a generic persistence protocol
+   waits for a second real backend.
 4. **Surface stability**: should `biomodals.execution` be a supported Python
    package with a deliberately small public surface, while adapters remain
    internal until two consumers use them? Recommendation: yes.

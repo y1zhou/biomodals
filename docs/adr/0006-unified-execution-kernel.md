@@ -16,8 +16,7 @@ workload state” does not mean that execution state may remain ephemeral. The
 kernel governs the durable state model and atomic transition contract for
 runs, nodes, tasks, attempts, and provider calls. Separate repository
 instances implement that contract so an API service, a per-run workflow, and
-an app coordinator do not depend on one shared database. The exact reusable
-repository implementation remains a pending design decision.
+an app coordinator do not depend on one shared database.
 
 Repository scope follows the coordinator boundary, not each API request,
 application call, or Modal function. The API service uses one long-lived
@@ -39,6 +38,13 @@ The accepted end state removes the compatibility facade: the workflow runtime
 composes the shared execution repository and a narrow Workflow Artifact Store
 over the same connection. The physical `ledger.sqlite3` file remains.
 
+The repository implementation was accepted on 2026-07-29. The first kernel
+uses one concrete `SqliteExecutionRepository` over a host-supplied SQLite
+connection and transaction. It owns the execution schema and transitions but
+does not choose a file path, commit, close, or synchronize a Volume. Tests use
+the same implementation with an in-memory SQLite connection. A generic
+persistence protocol is deferred until a second real storage backend exists.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -51,9 +57,9 @@ over the same connection. The physical `ledger.sqlite3` file remains.
 - Introducing one universal Job class and database would make inspection look
   uniform while conflating API admission, workflow recovery, provider calls,
   and scientific cache authority.
-- A small execution kernel with explicit adapters reuses the common algorithms
-  while allowing each existing store to preserve its transaction and
-  durability model.
+- A small execution kernel with one embeddable SQLite implementation and
+  explicit provider and workload adapters reuses the common algorithms while
+  allowing each host to preserve its transaction and durability model.
 
 ## Consequences
 

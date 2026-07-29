@@ -104,6 +104,14 @@ validated publications determine the Run outcome; upstream Node history does
 not override a complete terminal result.
 _Avoid_: last executed node, designated result node, all-Node aggregation
 
+**Node Result Observation** [planned]:
+The workload-owned `available`, `missing`, or `unknown` answer from validating
+one Execution Node's complete publication before its dependencies or Tasks
+run. `available` prunes unnecessary ancestors, `missing` expands the backward
+repair closure, and `unknown` blocks new work. A partial publication is not an
+available complete Node result.
+_Avoid_: boolean cache hit, fake terminal Task, kernel-owned scientific validator
+
 **Partial Dependency Acceptance** [planned]:
 The immutable `accept_partial` boolean on one Node dependency edge. Success
 always satisfies the edge; a partial upstream Node satisfies it only when the

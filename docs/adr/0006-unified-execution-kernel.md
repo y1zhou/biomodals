@@ -248,6 +248,21 @@ Intermediate lifecycle history remains available for diagnosis but is not an
 all-Node vote on the scientific outcome. This generalizes the workflow
 runtime's existing terminal-pruning behavior to every kernel consumer.
 
+The Node-result observation policy was accepted on 2026-07-29. Every workload
+adapter exposes a lightweight `observe_node_result(node)` hook that can run
+before dependency inputs or Tasks are prepared and returns the shared
+`available`, `missing`, or `unknown` vocabulary. `available` means the
+complete workload publication validated and may mark the Node `succeeded`;
+`missing` authorizes backward expansion into its dependencies; and `unknown`
+blocks new work. A workload with no aggregate reusable publication
+deliberately returns `missing`. Partial publications are not complete Node
+hits, although their successful Task publications may be reused later inside
+the repair closure. The kernel records the observation time and whether Node
+completion was cache-validated or produced in this Run; scientific evidence,
+markers, manifests, and validation logic remain workload-owned. This hook is
+part of the workload port and does not add a fake terminal Task or another
+top-level kernel abstraction.
+
 The terminal-aggregation and repair policy was accepted on 2026-07-29. For one
 Execution Run, all-successful terminal Nodes produce `succeeded`; a boundary
 containing only `succeeded` and `partial` produces `partial` when at least one

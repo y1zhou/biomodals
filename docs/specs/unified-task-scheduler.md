@@ -363,12 +363,21 @@ output from another, without a generic accepted-status policy.
 Terminal Execution Nodes—the DAG leaves with no downstream dependency—form
 the scientific result boundary. Scheduling is result-driven:
 
-1. validate the expected publications of every terminal Node;
-2. treat a reusable terminal publication as successful without scheduling its
-   ancestors;
+1. call the workload's `observe_node_result(node)` hook for every terminal
+   Node before preparing dependency inputs or Tasks;
+2. treat an `available` complete publication as successful without scheduling
+   its ancestors;
 3. for each incomplete terminal, walk backward through only its ancestor
-   closure, stopping whenever another reusable Node publication is found;
+   closure, stopping whenever another Node result is `available`;
 4. schedule the remaining required Nodes forward in dependency order.
+
+The hook returns the same `available`, `missing`, or `unknown` vocabulary as
+Task publication validation. `missing` expands the backward closure.
+`unknown` blocks new work; it never becomes a cache miss. A workload without
+an aggregate reusable publication deliberately reports `missing`. A partial
+publication is not an available complete Node result, but its successful Task
+publications remain eligible for granular reuse after the Node enters the
+repair closure.
 
 The Run succeeds when every terminal Node succeeds. A failed, cancelled,
 partial, or skipped upstream Node does not override complete terminal results.
@@ -457,7 +466,7 @@ null reason; Task failure diagnostics remain in its error record.
 | --- | --- | --- |
 | DAG | Validation, topological readiness, terminal reachability | Nodes, dependencies, semantic labels |
 | Task planning | Immutable task records, fingerprints, dependency links | Task discovery and scientific identity payload |
-| Cache | `available` / `missing` / `unknown` vocabulary and scheduling policy | Validation logic, markers, manifests, content checks |
+| Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
 | Dispatch | Durable batches, direct fan-out, pull claims, worker-call tracking, returned outcome routing | Task payloads and batch compatibility |
@@ -813,6 +822,8 @@ work:
 - the immutable Workload Plan Fingerprint and Task fingerprints;
 - dependency edges and legal execution states;
 - submission tokens, provider targets, call IDs, and observed outcomes;
+- Node result observation timestamps and cache-versus-current-Run completion
+  provenance, without workload publication contents;
 - execution timestamps, Run `status_reason` and `status_message`, Task and Node
   errors, single-submission state, and resource permits;
 - workload execution payloads required to reconstruct a Task.
@@ -1018,18 +1029,26 @@ must not leak into plans or persisted models.
 
 ### Cache and publication lifecycle
 
-Every reuse decision returns exactly one observation:
+Node and Task reuse decisions return exactly one observation:
 
-- `available`: validated publication can satisfy the Task;
+- `available`: a validated complete publication can satisfy the Node or Task;
 - `missing`: validation authoritatively established that no reusable
   publication exists;
 - `unknown`: the checker failed, the storage was unavailable, or absence could
   not be established.
 
-Only `missing` authorizes new work. After a call succeeds, the decoded result
-and workload publication are committed before the Task and call are made
-durably terminal. If a store cannot make those changes in one transaction, its
-adapter must use a recoverable prepare/publish/finalize protocol.
+Only `missing` authorizes new work. `observe_node_result(node)` runs before
+dependency input or Task preparation and may prune the Node's ancestor
+closure. Nodes without a standalone complete publication report `missing`;
+partial aggregate output does not satisfy the probe. The repository records
+when the observation occurred and whether Node completion was cache-validated
+or produced in the current Run, without copying workload manifests into
+generic execution state.
+
+After a call succeeds, the decoded result and workload publication are
+committed before the Task and call are made durably terminal. If a store
+cannot make those changes in one transaction, its adapter must use a
+recoverable prepare/publish/finalize protocol.
 
 ### Failure modes
 
@@ -1154,7 +1173,7 @@ Phase 0 test inventory:
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
-| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; strict terminal aggregation ignores upstream history; complete results prune pending ancestors; running owners are reconciled before success; unknown cancellation blocks completion |
+| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
@@ -1202,6 +1221,8 @@ Deliverables:
   `accept_partial` boolean per edge;
 - derive the terminal result boundary from DAG leaves and prune ancestor work
   backward from validated terminal publications;
+- define the workload-owned `observe_node_result(node)` tri-state port without
+  adding a fake Task or scientific schema to the kernel;
 - derive deterministic pruning decisions for pending, active, and terminal
   ancestor work;
 - derive strict terminal aggregation and Successor Repair Closures without
@@ -1873,6 +1894,14 @@ after each decision:
     successful terminal whose publication no longer validates. Complete
     publications prune the repair closure, successful Task publications are
     reused, and only conclusively unowned missing work is submitted.
+44. **Node result observation — accepted 2026-07-29**: each workload exposes
+    `observe_node_result(node)` before dependency or Task preparation. A
+    complete `available` publication succeeds the Node and prunes ancestors;
+    `missing` expands the backward closure; `unknown` blocks work. Nodes
+    without aggregate publications report `missing`, and partial publications
+    are reused only at Task granularity after expansion. The kernel records
+    minimal observation provenance while workload code owns all scientific
+    evidence and validation.
 
 ## Definition of ready for implementation
 

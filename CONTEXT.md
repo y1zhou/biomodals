@@ -6,6 +6,45 @@ Biomodals runs bioinformatics tools as Modal apps and composes them into reusabl
 
 ## Language
 
+### Execution scheduling
+
+**Execution Run**:
+One invocation of an immutable execution plan, whether started by an API Job,
+a workflow, or an app entrypoint.
+_Avoid_: API Job, workflow definition
+
+**Execution Node**:
+A fixed semantic step in an execution DAG that may discover one or more Tasks
+when it becomes ready.
+_Avoid_: Modal function, dynamic task, provider call
+
+**Task**:
+The smallest independently identified unit in an Execution Node whose cached
+publication and outcome can be observed.
+_Avoid_: workflow node, thread, untracked work item
+
+**Task Attempt**:
+One explicitly authorized effort to satisfy a Task through cache reuse, local
+processing, or provider execution.
+_Avoid_: automatic retry, Modal retry
+
+**Provider Call**:
+One detached operation submitted to a compute provider and identified for
+later observation, recovery, or cancellation. A Provider Call may serve
+several Task Attempts.
+_Avoid_: Task, workflow node, app
+
+**Execution State Repository**:
+A durable record of Execution Runs, Nodes, Tasks, Task Attempts, and Provider
+Calls governed by the execution kernel's transition contract. Each host may
+use a separate physical repository.
+_Avoid_: universal service database, scientific cache
+
+**Workload Publication**:
+Workload-owned durable evidence that a Task's scientific output is complete
+and reusable.
+_Avoid_: provider success, build claim, database status alone
+
 **Workflow Artifact**:
 A durable record of data produced or consumed by a workflow step, including its data category, storage location, and metadata needed by downstream steps.
 _Avoid_: raw app output, untyped file path, loose tarball
@@ -434,4 +473,5 @@ _Avoid_: temporary scratch, local cache
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.
 - "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for shared child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
+- "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each host may persist it separately and **Workload Publications** remain authoritative for scientific completion.
 - "positions marked for RFdiffusion to generate scaffolds for" can mean every RFdiffusion output residue or only de novo contig residues. Resolved: use **LigandMPNN Redesign Set** for de novo output residues and exclude copied motif residues.

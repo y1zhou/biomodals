@@ -11,6 +11,14 @@ records. A service Job remains the user-facing admission and result envelope;
 workflows retain per-run ledgers; workload publications remain authoritative
 for scientific cache completion.
 
+The authority boundary was accepted on 2026-07-29. “Without centralizing
+workload state” does not mean that execution state may remain ephemeral. The
+kernel governs the durable state model and atomic transition contract for
+runs, nodes, tasks, attempts, and provider calls. Separate repository
+instances implement that contract so an API service, a per-run workflow, and
+an app coordinator do not depend on one shared database. The exact reusable
+repository implementation remains a pending design decision.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG
@@ -36,6 +44,13 @@ call. Workloads continue to define scientific identity, cache validation,
 input and output contracts, function arguments, resource requirements, and
 publication rules. The kernel determines when those hooks run and how their
 observations affect scheduling.
+
+An execution repository is authoritative for scheduling facts such as the
+immutable plan, readiness, attempts, submission tokens, attached call IDs,
+observed provider state, and timestamps. It records that a workload
+publication was validated, but the publication's marker, manifest, or
+workload-specific validator remains authoritative for whether scientific
+output is reusable.
 
 This is an incremental extraction, not a rewrite. Existing contracts must
 remain usable while each consumer adopts the kernel, and duplicated

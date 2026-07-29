@@ -94,17 +94,18 @@ Service Job (optional API envelope)
   └── Execution Run
         ├── Node
         │     └── Task
-        │           └── Attempt
+        │           └── Task Attempt
         └── Provider Call
-              └── serves one or more Attempts
+              └── serves one or more Task Attempts
 ```
 
-The relationship between Attempt and Provider Call is not one-to-one:
+The relationship between Task Attempt and Provider Call is not one-to-one:
 
-- a cache hit completes an Attempt without a call;
-- GROMACS usually has one Attempt per Modal call;
-- one AlphaFold3 inference worker call may serve several seed Attempts;
-- a Task may have several explicitly authorized Attempts over its lifetime.
+- a cache hit completes a Task Attempt without a call;
+- GROMACS usually has one Task Attempt per Modal call;
+- one AlphaFold3 inference worker call may serve several seed Task Attempts;
+- a Task may have several explicitly authorized Task Attempts over its
+  lifetime.
 
 ### Proposed terms
 
@@ -120,11 +121,11 @@ concepts to it during migration.
 can be reasoned about. Tasks may be discovered only when their containing Node
 starts.
 
-**Attempt** is one explicitly authorized effort to complete a Task. It owns
-the decision to reuse, submit, recover, or report an unknown outcome.
+**Task Attempt** is one explicitly authorized effort to complete a Task. It
+owns the decision to reuse, submit, recover, or report an unknown outcome.
 
 **Provider Call** is one detached Modal function call, including its durable
-call ID and observed lifecycle. A call can cover a batch of Attempts.
+call ID and observed lifecycle. A call can cover a batch of Task Attempts.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -146,7 +147,7 @@ duplicated.
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Mapping Tasks to call batches and distributing outcomes | Batch compatibility and workload-specific limits |
 | Resources | Run budget, permit accounting, later shared-lease protocol | Modal decorators and actual CPU/GPU/memory selection |
-| Persistence | Atomic operations expressed as ports | SQLite, Modal Dict, Volume, and transaction mechanics |
+| Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
 | Presentation | Stable snapshots/events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
 
 “Centralized input/output handling” therefore means one lifecycle for invoking
@@ -191,6 +192,33 @@ an async driver around them; the workflow and current app entrypoints use a
 sync driver. Maintaining two small drivers is preferable to infecting every
 consumer with an async abstraction or running nested event loops.
 
+### Durable execution state
+
+The kernel requires an Execution State Repository; an in-memory repository is
+only a test implementation. Centralization applies to the state model,
+transition rules, and persistence operations, not to one database process or
+file for all Biomodals activity.
+
+The recommended implementation is one reusable SQLite repository for
+single-writer coordinators, embedded as separate instances:
+
+| Host | Proposed location | Execution authority | Separate authority |
+| --- | --- | --- | --- |
+| API service | Execution tables in `service.sqlite3` | Job-owned Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, admission, runtime configuration, and result cache remain service-owned |
+| Workflow | Execution tables in the per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
+| App coordinator | Per-run coordinator repository at a workload-selected durable location | Invocation Tasks, Task Attempts, batches, and calls | AlphaFold3 claims and validated publications remain scientific authority |
+
+Provider workers do not write SQLite. A single coordinator applies transitions
+and commits them using its host's transaction and Volume synchronization
+boundary. Modal Dict remains appropriate for distributed writer claims; it is
+not a replacement for the coordinator's attempt and call ledger.
+
+The common repository should be embeddable into a host-owned transaction. That
+lets service admission and initial execution state be committed atomically,
+while a workflow can commit execution rows together with its Volume-backed
+ledger. If a host cannot share a transaction, its adapter must implement the
+same prepare/publish/finalize recovery protocol.
+
 ### Paid-call lifecycle
 
 The durable lifecycle must distinguish:
@@ -226,9 +254,10 @@ Every reuse decision returns exactly one observation:
   not be established.
 
 Only `missing` authorizes new work. After a call succeeds, the decoded result
-and workload publication are committed before the Attempt and call are made
-durably terminal. If a store cannot make those changes in one transaction, its
-adapter must use a recoverable prepare/publish/finalize protocol.
+and workload publication are committed before the Task Attempt and call are
+made durably terminal. If a store cannot make those changes in one
+transaction, its adapter must use a recoverable prepare/publish/finalize
+protocol.
 
 ### Failure modes
 
@@ -240,7 +269,7 @@ Nodes declare one of three workload-selected aggregation policies:
   must opt into.
 
 These policies do not authorize retries. Retry authority remains a separate,
-explicit Attempt decision.
+explicit Task Attempt decision.
 
 ## Correctness work before extraction
 
@@ -295,8 +324,8 @@ Deliverables:
 
 - map availability-check exceptions to `unknown`;
 - preclaim workflow remote submission and preserve submission outcome unknown;
-- finalize a successful workflow call, processed result, artifacts, Attempt,
-  and Node under one recoverable synchronization protocol;
+- finalize a successful workflow call, processed result, artifacts, Task
+  Attempt, and Node under one recoverable synchronization protocol;
 - add explicit tests that no restart automatically duplicates uncertain work.
 
 Exit gate:
@@ -360,7 +389,8 @@ Rollback:
 Deliverables:
 
 - persist immutable Task plans before submission;
-- add Attempt rows and an explicit many-to-many Attempt-to-call link;
+- add Task Attempt rows and an explicit many-to-many Task-Attempt-to-call
+  link;
 - move bounded batching and permit accounting into execution internals;
 - make PPIFlow the first runtime-discovered Task consumer;
 - represent partial candidate outcomes without making a Node successful by
@@ -498,7 +528,7 @@ manual, explicitly authorized smoke test after local and CI gates pass.
 | A universal abstraction hides scientific differences | Workload-owned hooks and persistence adapters; migrate AF3 last |
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate drivers |
-| A batch obscures individual outcomes | Persist Task and Attempt identities plus explicit call links |
+| A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
@@ -524,19 +554,22 @@ manual, explicitly authorized smoke test after local and CI gates pass.
 Resolve these one at a time and update ADR 0006 and `CONTEXT.md` immediately
 after each decision:
 
-1. **Authority boundary**: should the kernel own execution mechanics while
-   existing stores and scientific publications remain authoritative?
-   Recommendation: yes.
-2. **Surface stability**: should `biomodals.execution` be a supported Python
+1. **Authority boundary — accepted 2026-07-29**: the kernel owns execution
+   mechanics and its durable state contract, while host stores and scientific
+   publications retain their established authority.
+2. **Repository implementation**: should the kernel provide one reusable,
+   embeddable SQLite execution repository, instantiated separately by service,
+   workflow, and app coordinators? Recommendation: yes.
+3. **Surface stability**: should `biomodals.execution` be a supported Python
    package with a deliberately small public surface, while adapters remain
    internal until two consumers use them? Recommendation: yes.
-3. **Distributed resource limits**: should the first extraction define a lease
+4. **Distributed resource limits**: should the first extraction define a lease
    port but defer a Modal Dict-backed global lease implementation?
    Recommendation: yes, until a concrete cross-container limit requires it.
-4. **Migration scope**: should service database changes be additive and
+5. **Migration scope**: should service database changes be additive and
    migratable while in-progress workflow runs keep their documented restart
    policy? Recommendation: yes.
-5. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
+6. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
    AlphaFold3? Recommendation: yes; it exercises fan-out with lower scientific
    and cache risk.
 
@@ -545,7 +578,7 @@ after each decision:
 Implementation begins only when:
 
 - ADR 0006 is accepted;
-- the five decision gates are resolved;
+- the six decision gates are resolved;
 - the proposed execution terms are reconciled into `CONTEXT.md`;
 - Phase 0 compatibility fixtures and fault-injection points are enumerated as
   test cases;

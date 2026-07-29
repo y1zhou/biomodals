@@ -42,7 +42,8 @@ In particular:
    workload publication are durably recoverable.
 6. Parallel tasks run when their dependencies and resource budget allow it.
 7. One provider call may represent a batch of independently identified tasks.
-8. Service, workflow, and app CLI entrypoints retain their existing contracts.
+8. Service, workflow, and app CLI entrypoints remain functionally testable;
+   internal imports and unfinished schemas carry no compatibility promise.
 
 ## Current execution authorities
 
@@ -174,7 +175,7 @@ src/biomodals/execution/
     resources.py          # budgets and permit accounting
 ```
 
-The first supported imports should be no larger than:
+The initial internal interface should be no larger than:
 
 - `ExecutionPlan`
 - `NodePlan`
@@ -263,10 +264,10 @@ This leaves one SQLite file per workflow run, not an execution database beside
 a workflow database. The file contains shared execution tables and
 workflow-specific artifact tables on the same connection.
 
-During migration, `WorkflowLedger` can be a compatibility facade so the
-runtime does not change in one large step. It must not become a permanent
-pass-through interface duplicating every execution repository method. Once
-callers use the kernel, either:
+During migration, `WorkflowLedger` can be a short-lived facade between
+incremental commits so the runtime does not change in one large step. It must
+not become a permanent pass-through interface duplicating every execution
+repository method. Once callers use the kernel, either:
 
 - rename the remaining workflow-specific implementation to
   `WorkflowRunStore`; or
@@ -372,12 +373,13 @@ Deliverables:
 - add pure characterization tests for GROMACS graph readiness, workflow
   recovery, PPIFlow candidate outcomes, and AlphaFold3 plan identities;
 - add fault-injection fixtures using fake provider calls and stores;
-- record current public APIs, CLI entrypoints, run layouts, archive layouts,
-  marker formats, and cache fingerprints as compatibility fixtures.
+- record scientific identities, publication markers, cost-safety behavior,
+  CLI operations, and user-visible results as regression fixtures.
 
 Exit gate:
 
-- every subsequent phase can prove semantic equivalence without Modal access.
+- every subsequent phase can prove scientific and cost-safety invariants
+  without Modal access.
 
 Rollback:
 
@@ -410,7 +412,8 @@ Deliverables:
 - add immutable `ExecutionPlan`, `NodePlan`, and dependency validation;
 - extract deterministic readiness and terminal-reachability functions;
 - adapt the pure GROMACS operation plan and workflow builder to the same graph
-  representation while retaining their public types;
+  representation, replacing internal types directly where that simplifies the
+  interface;
 - keep dynamic work represented as a Node-owned Task factory, not mutable DAG
   vertices.
 
@@ -446,8 +449,8 @@ Exit gate:
 
 Rollback:
 
-- keep old coordinators behind a temporary composition switch for one phase;
-  remove the switch when both host integrations pass compatibility tests.
+- revert the host migration commit. Do not retain a runtime migration switch
+  after a host uses the shared repository.
 
 ### Phase 4 — add durable Tasks, batches, and budgets
 
@@ -523,7 +526,7 @@ Deliverables:
 - retain workflow-specific artifact materialization, Volume synchronization,
   display, run layout, and Workflow Artifact Store;
 - migrate remaining durable fan-out consumers;
-- remove the temporary `WorkflowLedger` compatibility facade after callers
+- remove the temporary `WorkflowLedger` migration facade after callers
   compose the shared execution repository and Workflow Artifact Store;
 - remove replaced coordinator loops and stale planned documentation;
 - publish the final supported execution inspection surface.
@@ -542,13 +545,14 @@ Exit gate:
   reason to differ;
 - the physical `ledger.sqlite3` contains shared execution tables and
   workflow-specific artifact tables without a second execution state machine;
-- no `WorkflowLedger` compatibility facade remains;
-- no compatibility switch or dead adapter remains.
+- no `WorkflowLedger` migration facade remains;
+- no migration switch or dead adapter remains.
 
 Rollback:
 
-- phase commits remain independently revertible; scientific publications and
-  public contracts require no reverse migration.
+- phase commits remain independently revertible; scientific publications
+  require no reverse migration. Old local databases and unfinished workflow
+  runs may require explicit recreation.
 
 ## Suggested incremental commits
 
@@ -603,7 +607,7 @@ authorized smoke test after local and CI gates pass.
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
-| Migration changes established app behavior | Compatibility fixtures and adapter-first rollout |
+| Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
 
 ## Explicit non-goals
 
@@ -637,9 +641,10 @@ after each decision:
    one concrete `SqliteExecutionRepository` over a host-supplied connection
    and transaction. Tests use in-memory SQLite; a generic persistence protocol
    waits for a second real backend.
-4. **Surface stability**: should `biomodals.execution` be a supported Python
-   package with a deliberately small public surface, while adapters remain
-   internal until two consumers use them? Recommendation: yes.
+4. **Internal surface — accepted 2026-07-29**:
+   `biomodals.execution` has a small interface for depth and testability but no
+   compatibility promise for Python imports, unfinished database schemas, or
+   in-progress run formats.
 5. **Distributed resource limits**: should the first extraction define a lease
    port but defer a Modal Dict-backed global lease implementation?
    Recommendation: yes, until a concrete cross-container limit requires it.
@@ -657,6 +662,6 @@ Implementation begins only when:
 - ADR 0006 is accepted;
 - the seven decision gates are resolved;
 - the proposed execution terms are reconciled into `CONTEXT.md`;
-- Phase 0 compatibility fixtures and fault-injection points are enumerated as
-  test cases;
+- Phase 0 scientific, cost-safety, and user-visible regression fixtures plus
+  fault-injection points are enumerated as test cases;
 - the first two implementation commits have exact file and rollback scopes.

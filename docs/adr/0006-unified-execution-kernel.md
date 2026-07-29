@@ -30,11 +30,11 @@ separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
 tables and transitions inside that file. Workflow code should retain only its
 artifact records, run-directory lifecycle, and Modal Volume synchronization.
-The current `WorkflowLedger` may serve as a compatibility facade during
-migration, then shrink into a workflow run store or be removed.
+The current `WorkflowLedger` may serve as a short-lived migration facade
+between incremental commits, then be removed.
 
 The repository scope and ledger decomposition were accepted on 2026-07-29.
-The accepted end state removes the compatibility facade: the workflow runtime
+The accepted end state removes the migration facade: the workflow runtime
 composes the shared execution repository and a narrow Workflow Artifact Store
 over the same connection. The physical `ledger.sqlite3` file remains.
 
@@ -44,6 +44,11 @@ connection and transaction. It owns the execution schema and transitions but
 does not choose a file path, commit, close, or synchronize a Volume. Tests use
 the same implementation with an in-memory SQLite connection. A generic
 persistence protocol is deferred until a second real storage backend exists.
+
+The surface policy was accepted on 2026-07-29. `biomodals.execution` is an
+internal shared module with no compatibility promise for Python imports,
+unfinished database schemas, or in-progress run formats. Its interface remains
+small for depth, locality, and testability rather than external stability.
 
 ## Considered options
 
@@ -78,7 +83,9 @@ publication was validated, but the publication's marker, manifest, or
 workload-specific validator remains authoritative for whether scientific
 output is reusable.
 
-This is an incremental extraction, not a rewrite. Existing contracts must
-remain usable while each consumer adopts the kernel, and duplicated
-orchestration code is removed only after its replacement passes
+This is an incremental extraction, not a rewrite. Internal types, tables, and
+imports may change directly while each consumer adopts the kernel. Scientific
+identities, publications, cost-safety rules, and documented user behavior
+remain regression constraints unless a separate decision deliberately changes
+them. Duplicated orchestration code is removed after its replacement passes
 characterization and recovery tests.

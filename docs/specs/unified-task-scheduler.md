@@ -123,6 +123,9 @@ These existing decisions remain binding during the refactor:
   repository rather than creating nested execution databases.
 - Coordinator Interruption suspends scheduling and preserves attached child
   Provider Calls; only explicit cancellation terminates them.
+- Provider redelivery may recover infrastructure interruption, but an
+  uncaught coordinator application exception is not automatically retried. It
+  leaves the Run incomplete with a visible diagnostic until explicit resume.
 - Worker lifecycle callbacks are advisory: they may checkpoint or diagnose an
   interruption but never fail or reassign a Task.
 - Safe redelivery and provider-managed retries remain within one Task Attempt;
@@ -288,6 +291,13 @@ continues reconciliation. After a terminal transition, the loop returns and
 the container may scale to zero. A later `status` call may start a fresh
 container and read the retained ledger. “Coordinator loop” is an internal
 activity, not a public `drive` CLI command or a new kernel domain type.
+
+Provider redelivery of an interrupted coordinator input is recovery, not an
+application-level retry. An uncaught exception from coordinator code stops
+admission, leaves attached Provider Calls running, and records its diagnostic
+when possible. The adapter does not automatically retry that exception.
+Explicit `resume` reloads the durable ledger, reconciles attached calls, and
+then continues the same Execution Run.
 
 Every app and workflow deployment exports its thin class under the standard
 name `ExecutionCoordinator`. Its version-pinned, run-parameterized instance
@@ -801,7 +811,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
-| `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; replacement reloads checkpoints; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
+| `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
 | `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
@@ -1384,6 +1394,12 @@ after each decision:
     replacement Coordinator Attempt from the ledger; after terminal completion
     the loop returns, and later status calls may reopen the retained ledger in
     a fresh container. The loop is not a CLI subcommand or public domain type.
+26. **Coordinator application errors — accepted 2026-07-29**: provider
+    redelivery may replace an infrastructure-interrupted Coordinator Attempt.
+    An uncaught coordinator application exception is not automatically
+    retried: admission stops, attached calls remain running, a diagnostic is
+    recorded when possible, and the Run stays incomplete until explicit
+    resume reconciles durable state.
 
 ## Definition of ready for implementation
 

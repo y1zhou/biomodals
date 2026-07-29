@@ -205,6 +205,14 @@ after preemption. Once terminal, the loop returns and the container may scale
 to zero; a later status request may start a fresh container and read the
 retained ledger.
 
+The coordinator-error policy was accepted on 2026-07-29. Provider
+redelivery after infrastructure interruption may transparently create a
+replacement Coordinator Attempt, but the coordinator adapter configures no
+automatic retry loop for an uncaught application exception. Such an exception
+stops admission, preserves attached Provider Calls, and records a diagnostic
+when possible. The Execution Run remains incomplete and requires an explicit
+`resume` command to reconcile durable state and continue.
+
 The worker-interruption policy was accepted on 2026-07-29. Worker preemption
 does not fail a Task Attempt or release its Worker Assignment because Modal
 restarts the same provider input. Pull workers use stable, idempotent claim

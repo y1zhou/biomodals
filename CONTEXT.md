@@ -36,8 +36,10 @@ _Avoid_: state unknown, cancelled run, resumable run
 A new Execution Run created by an explicit restart of a terminal or
 Deployment-Blocked Run. It records its predecessor, uses a newly resolved
 Deployment Identity and Execution Run ID, reuses the Workload Run Key when
-applicable, revalidates Workload Publications, and schedules only missing work.
-_Avoid_: in-place migration, Task Attempt, provider retry
+applicable, revalidates Workload Publications, and schedules only missing work
+whose predecessor Provider Call is conclusively terminal. It is the only way
+to retry failed provider work.
+_Avoid_: in-place migration, same-run retry, provider redelivery
 
 **Execution Node**:
 A fixed semantic step in an execution DAG that may discover one or more Tasks
@@ -49,53 +51,43 @@ The smallest independently identified unit in an Execution Node whose cached
 publication and outcome can be observed.
 _Avoid_: workflow node, thread, untracked work item
 
-**Task Attempt**:
-One explicitly authorized effort to satisfy a Task through cache reuse, local
-processing, or provider execution.
-_Avoid_: automatic retry, Modal retry
-
-**Task Redelivery** [planned]:
-A repeated delivery of an unassigned Task or an interrupted provider input
-within its existing Task Attempt. It does not authorize a new paid Provider
-Call.
-_Avoid_: successor Task Attempt, automatic paid retry
-
-**Retry Authorization** [planned]:
-Explicit permission to create a successor Task Attempt after a preceding
-attempt became terminal. Paid provider work requires authorization from a
-later resume or retry invocation.
-_Avoid_: provider-managed retry, queue redelivery, timeout
+**Single-Submission Rule** [planned]:
+Within one Execution Run, the kernel schedules each Task once and submits at
+most one Provider Call or Worker Assignment for it. Provider redelivery may
+re-execute that same call, so this rule does not claim exactly-once execution.
+A conclusive failure terminates the Task; retry requires a Successor Execution
+Run.
+_Avoid_: exactly-once execution, same-run retry, attempt counter
 
 **Provider Call**:
 One detached operation submitted to a compute provider and identified for
 later observation, recovery, or cancellation. A Provider Call may serve
-several Task Attempts.
-_Avoid_: Task, workflow node, app
+several Tasks.
+_Avoid_: Task, provider redelivery, workflow node, app
 
 **Dispatch Batch** [planned]:
-A durable grouping of Task Attempts offered together to one Provider Call or
-to a shared pull worker pool. It records intended dispatch without claiming
-that a particular worker performed a Task before a Worker Assignment is
-committed.
+A durable grouping of Tasks offered together to one Provider Call or to a
+shared pull worker pool. It records intended dispatch without claiming that a
+particular worker performed a Task before a Worker Assignment is committed.
 _Avoid_: workflow node, provider call, scientific batch
 
 **Worker Assignment** [planned]:
-A durable SQLite record linking one Task Attempt to the Provider Call and
-worker claim currently responsible for it. The coordinator commits and
-checkpoints the assignment before returning its payload. Repeating the same
-claim request returns the same assignment.
-_Avoid_: queue item, timeout lease, Task Attempt, publication
+A durable SQLite record linking one Task to the Provider Call and worker claim
+responsible for it. The coordinator commits and checkpoints the assignment
+before returning its payload. Repeating the same claim request returns the
+same assignment.
+_Avoid_: queue item, timeout lease, retry, publication
 
 **Task Claim Request** [planned]:
 An idempotent request from a pull worker for a bounded set of ready Tasks.
 Its stable request ID lets a replacement worker recover the same committed
 Worker Assignments after a lost response or provider restart.
-_Avoid_: Task Attempt, automatic retry, timeout lease
+_Avoid_: automatic retry, timeout lease
 
 **Execution State Repository**:
-A durable record of Execution Runs, Nodes, Tasks, Task Attempts, and Provider
-Calls governed by the execution kernel's transition contract. Each durable
-coordinator may use a separate physical repository.
+A durable record of Execution Runs, Nodes, Tasks, Dispatch Batches, Worker
+Assignments, and Provider Calls governed by the execution kernel's transition
+contract. Each durable coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
 **App Run Ledger** [planned]:
@@ -116,7 +108,7 @@ _Avoid_: worker, SQLite writer container, Provider Call
 One continuous tenure in which a process or container actively advances an
 Execution Coordinator. An interruption ends the Attempt without cancelling
 the Coordinator's Runs or child Provider Calls.
-_Avoid_: Task Attempt, automatic retry, Execution Run
+_Avoid_: Task, provider retry, Execution Run
 
 **Coordinator Interruption** [planned]:
 A non-user-requested loss or shutdown of the current Coordinator Attempt that
@@ -575,12 +567,9 @@ _Avoid_: engine
 In-memory inspection data produced by the workflow runtime for the most recent run, including scheduler decisions and scheduled node waves.
 _Avoid_: public scheduler API, debug-only list
 
-**Stale Node Attempt** [planned]:
-A durable node attempt from a previous failed orchestrator session. On next session the runtime should either rerun the node as a fresh attempt or recover from the previous run's recorded state and remote-call identity.
-_Avoid_: active node, pending node
-
 **Durable Node Completion**:
-The committed state in which a node's processed result, materialized files, artifact manifests, attempt status, node status, and remote-call status agree.
+The committed state in which a node's processed result, materialized files,
+artifact manifests, Task status, node status, and Provider Call status agree.
 _Avoid_: returned function result, partially recorded success
 
 **Workflow Orchestrator**:
@@ -603,12 +592,10 @@ _Avoid_: execution repository, scientific publication
 The execution location for a workflow node, either inline in the workflow orchestrator or in a separate remote Modal function.
 _Avoid_: runner location, execution site
 
-**Node Execution Policy**:
-The restart and recovery contract for an incomplete workflow node when Modal interrupts or retries the node.
-_Avoid_: runner tag, retry hint
-
 **Durable Node Cache** [planned]:
-Volume-backed intermediate checkpoint state that lets a long-running workflow node with `RESUME` execution policy restore progress after interruption or restart.
+Volume-backed intermediate checkpoint state that workload code may use when
+Modal redelivers the same provider input or a Successor Execution Run schedules
+still-missing work.
 _Avoid_: temporary scratch, local cache
 
 ## Flagged ambiguities

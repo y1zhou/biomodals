@@ -13,7 +13,7 @@ The target is one place to reason about:
 
 - fixed DAG construction and readiness;
 - runtime-discovered tasks inside fixed semantic nodes;
-- task attempts and their relationship to provider calls;
+- single-submission Task state and its relationship to Provider Calls;
 - safe submission, attachment, polling, cancellation, and recovery;
 - cache observations and the decision to reuse or compute;
 - input preparation and output collection boundaries;
@@ -29,7 +29,8 @@ The refactor is complete when GROMACS service jobs, reusable workflows,
 PPIFlow candidate fan-out, AlphaFold3 search and inference, BoltzGen direct
 fan-out, and Rosetta work stealing all use the same execution-state vocabulary
 and scheduling primitives without changing their public behavior, scientific
-identities, durable layouts, or retry authority.
+identities, scientific publication layouts, or cost-safety authority. Legacy
+execution-ledger and attempt-directory layouts are intentionally replaced.
 
 In particular:
 
@@ -53,7 +54,7 @@ In particular:
 | Area | Current authority | Reusable strength | Boundary to preserve |
 | --- | --- | --- | --- |
 | API service | `ServiceStore`, `ModalJobSubmitter`, GROMACS coordinator and plan | API admission, per-Job locking, preclaim-before-spawn, call attachment, cancellation, user-visible operations | User/auth/config state and global service transactions stay service-owned |
-| Workflow runtime | `Workflow`, `WorkflowRuntime`, `WorkflowLedger`, `RemoteCallManager` | Static DAG validation, node attempts, artifacts, per-run recovery, terminal pruning | Per-run ledger and workflow artifact contracts stay workflow-owned |
+| Workflow runtime | `Workflow`, `WorkflowRuntime`, `WorkflowLedger`, `RemoteCallManager` | Static DAG validation, node state, artifacts, per-run recovery, terminal pruning | Per-run ledger and workflow artifact contracts stay workflow-owned |
 | PPIFlow | Fixed workflow nodes plus candidate manifests and bounded coordinator loops | Runtime candidate identity, partial outcomes, stage-specific fan-out | Scientific candidate schemas and joins stay PPIFlow-owned |
 | AlphaFold3 | Pure search/inference plans, Modal adapters, generation claims, Volume markers | Fine-grained cache identity, multi-writer claims, per-seed reuse, batched inference, publication validation | Markers and validated publications remain scientific completion authority |
 | BoltzGen | Incomplete-run discovery, bounded direct fan-out, output-directory locks | One independently reusable run per Task and resumable upstream output | BoltzGen inputs, completion validation, and cross-coordinator publication claims stay workload-owned |
@@ -81,8 +82,9 @@ These existing decisions remain binding during the refactor:
   changes create Tasks inside a Node, not new Nodes.
 - A claim coordinates writers; it is never proof of completion. A validated
   marker or publication remains authoritative.
-- Retrying a paid operation requires a later explicit invocation unless the
-  provider proves that the original operation did not start.
+- A Task receives at most one scheduler submission in an Execution Run.
+  Retrying failed paid work requires a Successor Execution Run, and active or
+  unknown predecessor ownership blocks replacement.
 - Scientific and cache identity excludes operational concurrency, placement,
   and resource allocation.
 - Workflow node parallelism and child-call task budgets are different limits.
@@ -128,8 +130,8 @@ These existing decisions remain binding during the refactor:
   leaves the Run incomplete with a visible diagnostic until explicit resume.
 - Worker lifecycle callbacks are advisory: they may checkpoint or diagnose an
   interruption but never fail or reassign a Task.
-- Safe redelivery and provider-managed retries remain within one Task Attempt;
-  a successor paid Task Attempt requires explicit resume authorization.
+- Provider redelivery may re-execute the same call and Task identity; it never
+  creates a second kernel submission. `resume` does not retry failed Tasks.
 - No paid Modal calls run in CI.
 
 ## Proposed domain model
@@ -139,21 +141,21 @@ Service Job (optional API envelope)
   └── Execution Run
         ├── Node
         │     └── Task
-        │           └── Task Attempt
         └── Dispatch Batch
-              ├── contains one or more Task Attempts
+              ├── contains one or more Tasks
               ├── records call-bound Worker Assignments
               └── served by one or more Provider Calls
 ```
 
-The relationship between Task Attempt and Provider Call is not one-to-one:
+The relationship between Task and Provider Call is not one-to-one:
 
-- a cache hit completes a Task Attempt without a call;
-- GROMACS usually has one Task Attempt per Modal call;
-- one AlphaFold3 inference worker call may serve several seed Task Attempts;
+- a cache hit completes a Task without a call;
+- GROMACS usually has one Task per Modal call;
+- one AlphaFold3 inference worker call may serve several seed Tasks;
 - several Rosetta worker calls may steal Tasks from one Dispatch Batch;
-- a Task may have several explicitly authorized Task Attempts over its
-  lifetime.
+- a Task receives at most one Provider Call or Worker Assignment in its
+  Execution Run;
+- a failed Task can be represented again only in a Successor Execution Run.
 
 ### Proposed terms
 
@@ -176,18 +178,20 @@ concepts to it during migration.
 can be reasoned about. Tasks may be discovered only when their containing Node
 starts.
 
-**Task Attempt** is one explicitly authorized effort to complete a Task. It
-owns the decision to reuse, submit, recover, or report an unknown outcome.
+**Single-Submission Rule** means the kernel schedules each Task once and
+creates at most one Provider Call submission or Worker Assignment for it in
+one Execution Run. Provider redelivery can re-execute that same call, so this
+is not an exactly-once execution claim.
 
 **Provider Call** is one detached Modal function call, including its durable
-call ID and observed lifecycle. A call can cover a batch of Task Attempts.
+call ID and observed lifecycle. A call can cover a batch of Tasks.
 
-**Dispatch Batch** is a durable grouping of Task Attempts offered to one
-provider call or a shared worker pool. Exact Task-to-call attribution is
-recorded only when it is observed.
+**Dispatch Batch** is a durable grouping of Tasks offered to one provider call
+or a shared worker pool. Exact Task-to-call attribution is recorded only when
+it is observed.
 
 **Worker Assignment** is a durable, call-bound SQLite record electing the
-worker allowed to execute one Task Attempt from a shared pull work pool. It is
+worker allowed to execute one Task from a shared pull work pool. It is
 checkpointed before the Task payload is returned.
 
 **Task Claim Request** is an idempotent request for a bounded set of ready
@@ -200,8 +204,9 @@ name, and exact numeric deployment version fixed before run admission.
 Identity is unavailable. It remains inspectable and admits no new work.
 
 **Successor Execution Run** is a new, explicitly authorized run linked to a
-terminal predecessor. It uses a new Deployment Identity and reuses only
-validated Workload Publications.
+terminal predecessor. It is the retry boundary for failed work, uses a new
+Deployment Identity, reuses validated Workload Publications, and submits only
+missing Tasks whose predecessor ownership is conclusively terminal.
 
 **App Run Ledger** is the physical per-run SQLite repository stored at
 `.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in an app
@@ -211,9 +216,8 @@ deployment's durable Volume.
 output is complete. The kernel records the observation but does not prescribe
 its file or marker format.
 
-These terms should be added to `CONTEXT.md` only after the architectural
-boundary is accepted. Existing terms should then be reconciled rather than
-duplicated.
+These accepted terms are reconciled in `CONTEXT.md`; adapters should use them
+instead of preserving legacy workflow attempt terminology.
 
 ## Responsibility boundary
 
@@ -299,6 +303,12 @@ when possible. The adapter does not automatically retry that exception.
 Explicit `resume` reloads the durable ledger, reconciles attached calls, and
 then continues the same Execution Run.
 
+A workload or Provider Call failure is different: it terminally fails the
+affected Task, and the Node aggregation policy derives the Node and Run
+outcome. The coordinator reports that outcome and returns when the DAG is
+terminal. It does not convert a known Task failure into a resumable coordinator
+error.
+
 Every app and workflow deployment exports its thin class under the standard
 name `ExecutionCoordinator`. Its version-pinned, run-parameterized instance
 provides the common `status`, `cancel`, and `resume` lifecycle methods.
@@ -307,9 +317,10 @@ instance linked to the predecessor. Workload launch and result-retrieval
 methods may remain deployment-specific.
 
 `status` is read-only, `cancel` is an idempotent explicit cancellation,
-`resume` retains Execution Run ID and Deployment Identity while granting only
-the already defined retry authority, and `restart` always returns a new
-Execution Run ID and Deployment Identity. Passing those fields does not grant
+`resume` retains Execution Run ID and Deployment Identity, reconciles existing
+work, and may submit Tasks that were never submitted, but it never retries a
+failed Task. `restart` always returns a new Execution Run ID and Deployment
+Identity and is the only retry boundary. Passing those fields does not grant
 paid-work authorization; the CLI still performs its normal Modal
 authentication.
 
@@ -325,9 +336,9 @@ Repository scope follows the coordinator boundary:
 
 | Coordinator | Repository scope | Execution authority | Separate authority |
 | --- | --- | --- | --- |
-| API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Service-coordinated Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, Jobs, admission, runtime configuration, and result cache remain service-owned |
-| Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
-| Direct CLI app coordinator | One App Run Ledger in the app deployment's configured durable Volume | App Nodes, Tasks, Task Attempts, batches, child calls, and recovery | Workload publications, scientific inputs, and outputs remain app-owned |
+| API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Service-coordinated Nodes, Tasks, call IDs, and observed state | Users, Jobs, admission, runtime configuration, and result cache remain service-owned |
+| Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
+| Direct CLI app coordinator | One App Run Ledger in the app deployment's configured durable Volume | App Nodes, Tasks, batches, assignments, child calls, and recovery | Workload publications, scientific inputs, and outputs remain app-owned |
 | Child App Call | No separate repository; use the parent Execution Run | Work attributed to the service, workflow, or Direct CLI App Run | Function implementation, resources, and scientific publication remain app-owned |
 
 An ordinary API request therefore updates only the service database. It does
@@ -443,11 +454,11 @@ local run database.
 Worker recovery is driven by provider-call state and publication validation,
 not elapsed time:
 
-- preemption or a rescheduled container retains the same Provider Call, Task
-  Attempt, permit allocation, and Worker Assignment;
+- preemption or a rescheduled container retains the same Provider Call, Task,
+  permit allocation, and Worker Assignment;
 - a normal result may carry independent per-Task outcomes for a batch;
-- a conclusive terminal call failure fails its unfinished Task Attempts and
-  releases their permits;
+- a conclusive terminal call failure fails its unfinished Tasks and releases
+  their permits;
 - a successful call with a missing or invalid expected publication fails the
   affected Task;
 - unknown call state preserves `state_unknown` and forbids replacement work.
@@ -458,7 +469,7 @@ For a pull Dispatch Batch, ready Task rows are the queue. A worker sends
 operation, the coordinator:
 
 1. returns an existing result if `request_id` was already processed;
-2. selects ready Task Attempts that fit the worker's capacity;
+2. selects ready Tasks that fit the worker's capacity;
 3. records their Worker Assignments and permit allocation;
 4. commits SQLite and crosses the explicit Volume durability boundary;
 5. only then returns the Task payloads.
@@ -467,8 +478,8 @@ A lost response can therefore be requested again without creating another
 assignment. If the coordinator dies before the checkpoint, no payload has
 been returned; if it dies afterward, the replacement coordinator recovers the
 same assignments. A restarted provider input repeats its claim request and
-retains its work. A different Provider Call may receive a successor assignment
-only after the owning call is conclusively terminal.
+retains its work. A conclusively failed owner call fails its unfinished Tasks;
+no different Provider Call may claim them in the same Execution Run.
 
 Workers publish their outputs before sending an idempotent completion report.
 The coordinator records individual Task outcomes and releases permits in one
@@ -476,26 +487,22 @@ serialized transaction. A lost completion response is harmless, and
 publication validation reconciles output that became durable before its
 completion report.
 
-Task Redelivery is not a retry. A claim request may repeat automatically
-before or after a Worker Assignment is committed, and Modal may restart or
-retry the same provider input without creating another Provider Call record.
-Once a paid call is conclusively terminal and may have started work, the Task
-Attempt becomes terminal. The kernel creates no successor paid call until a
-later explicit resume or retry invocation grants Retry Authorization.
+Provider redelivery is not a second kernel submission. A claim request may
+repeat automatically before or after a Worker Assignment is committed, and
+Modal may restart or retry the same provider input without creating another
+Provider Call record. Once a paid call is conclusively terminal and its Task
+is failed, the kernel cannot submit that Task again in the same Execution Run.
+`resume` only reconciles attached or unknown calls and schedules ready Tasks
+that have never been submitted.
 
-Resume first revalidates every expected Workload Publication. Satisfied Tasks
-remain complete, while only still-missing Tasks receive successor attempts.
-This allows a large fan-out run to retain all successful results and rerun only
-its failed remainder. A local, non-provider Task may opt into a separate
-bounded automatic retry policy declared in its immutable plan.
-
-A deployment restart is different from a successor Task Attempt. When the
-pinned Deployment Identity is unavailable, the predecessor Execution Run
-becomes Deployment-Blocked and immutable. An explicit restart builds a new
-plan under a new Deployment Identity and Execution Run ID, records the
-predecessor Execution Run ID, and reuses the Workload Run Key while
-revalidating the same publications before creating Tasks. It never copies
-mutable attempt or permit state into the successor.
+An explicit `restart` builds a Successor Execution Run under a newly resolved
+Deployment Identity and Execution Run ID, records the predecessor Execution
+Run ID, and reuses the Workload Run Key. It revalidates every expected
+Workload Publication before creating Tasks. Satisfied work remains complete;
+missing work becomes eligible only when the predecessor Provider Call or
+Worker Assignment is conclusively terminal. Active or unknown predecessor
+ownership blocks replacement work. The successor copies no mutable Task,
+assignment, call, or permit state.
 
 An exit hook may commit workload checkpoints and emit an advisory
 `interrupted` event containing the call, slot, and Task IDs. The coordinator
@@ -510,8 +517,8 @@ model. Dependencies point toward execution IDs only:
 
 ```text
 Service Job ───────────────┐
-                          ├──> Execution Run -> Node -> Task -> Task Attempt
-Workflow Artifact Store ──┘                              └-> Provider Call
+                          ├──> Execution Run -> Node -> Task
+Workflow Artifact Store ──┘                         └-> Provider Call
 
 Execution tables --X--> Service Job, user, HTTP, admin, or artifact tables
 ```
@@ -519,13 +526,13 @@ Execution tables --X--> Service Job, user, HTTP, admin, or artifact tables
 Execution tables may store only data needed to reconstruct and manage actual
 work:
 
-- stable run, node, task, attempt, and call identifiers;
+- stable run, node, task, batch, assignment, and call identifiers;
 - an optional predecessor Execution Run ID for explicit restart lineage;
 - the immutable Deployment Identity used to recover provider calls;
 - immutable plan and task fingerprints;
 - dependency edges and legal execution states;
 - submission tokens, provider targets, call IDs, and observed outcomes;
-- execution timestamps, errors, retry authorization, and resource permits;
+- execution timestamps, errors, single-submission state, and resource permits;
 - workload execution payloads required to reconstruct a Task.
 
 They must not store:
@@ -590,7 +597,7 @@ coordinator. Its SQLite state records:
 
 - the resolved Run-Level Task Budget;
 - permit cost for an admitted Task or Provider Call batch;
-- active permit allocations tied to Task Attempts and Provider Calls;
+- active permit allocations tied to Tasks and Provider Calls;
 - release or recovery of allocations when calls become terminal or unknown.
 
 Permit allocation is atomic with the transition that admits work, so a
@@ -623,12 +630,14 @@ The target split is:
 
 | Current Workflow Ledger concern | Destination |
 | --- | --- |
-| `runs`, `nodes`, `attempts`, and `remote_calls` tables | Shared execution SQLite schema |
-| Run, Node, Task, Task Attempt, and Provider Call transitions | Shared execution repository implementation |
-| `RunStatus`, `NodeStatus`, Attempt records, placement, and recovery policy | Shared execution models, with temporary workflow re-exports if needed |
+| Execution columns from `runs`, `nodes`, and `remote_calls` | Shared execution SQLite schema |
+| `attempts`, `current_attempt_id`, attempt foreign keys, and attempt counters | Delete; move the one retained result or error to Task, Node, Provider Call, or artifact state |
+| Run, Node, Task, Dispatch Batch, Worker Assignment, and Provider Call transitions | Shared execution repository implementation |
+| `RunStatus`, `NodeStatus`, placement, and recovery policy | Shared execution models, with temporary workflow re-exports if needed |
+| `NodeExecutionPolicy`, `AttemptRecord`, and `NodeStatusRecord.attempts` | Delete; provider redelivery and Successor Execution Runs replace generic rerun policy |
 | `artifacts`, `artifact_files`, `node_inputs`, and `node_outputs` tables | Workflow-specific run store |
 | `WorkflowArtifact`, `ArtifactSelector`, and materialized `AppRunResult` handling | Workflow-specific artifact module |
-| Run-root directories, reset behavior, connection closure, and Volume synchronization | Workflow-specific run store |
+| Run-root directories, node/task output paths, connection closure, and Volume synchronization | Workflow-specific run store |
 | Finalizing execution state and artifacts together | One host-owned SQLite transaction spanning both implementations |
 
 This leaves one SQLite file per workflow run, not an execution database beside
@@ -651,10 +660,9 @@ generic SQL or transition logic back into workflow callers.
 
 The service follows the same pattern. The user-facing Service Job points to an
 Execution Run. `job_operations`, persisted `JobOperationState`, and persisted
-compute `JobState` are replaced by shared Execution Nodes, Tasks, Task
-Attempts, and Provider Calls. Service projections retain the existing HTTP
-state and timeline vocabulary without preserving a second operation state
-machine.
+compute `JobState` are replaced by shared Execution Nodes, Tasks, and Provider
+Calls. Service projections retain the existing HTTP state and timeline
+vocabulary without preserving a second operation state machine.
 
 ### Paid-call lifecycle
 
@@ -691,10 +699,9 @@ Every reuse decision returns exactly one observation:
   not be established.
 
 Only `missing` authorizes new work. After a call succeeds, the decoded result
-and workload publication are committed before the Task Attempt and call are
-made durably terminal. If a store cannot make those changes in one
-transaction, its adapter must use a recoverable prepare/publish/finalize
-protocol.
+and workload publication are committed before the Task and call are made
+durably terminal. If a store cannot make those changes in one transaction, its
+adapter must use a recoverable prepare/publish/finalize protocol.
 
 ### Failure modes
 
@@ -705,8 +712,9 @@ Nodes declare one of three workload-selected aggregation policies:
 - `allow_partial`: publish an explicit partial result that downstream nodes
   must opt into.
 
-These policies do not authorize retries. Retry authority remains a separate,
-explicit Task Attempt decision.
+These policies do not authorize another submission. A failed Task remains
+failed for that Execution Run; retry requires an explicit Successor Execution
+Run.
 
 ## Correctness work before extraction
 
@@ -727,7 +735,7 @@ characterization tests:
    durable-task phase implements it.
 5. `WorkflowOrchestrator.exit()` currently cancels active remote calls during
    every container exit. Separate interruption from explicit cancellation and
-   preserve attached calls for replacement-attempt recovery.
+   preserve attached calls for replacement-coordinator recovery.
 6. Rosetta removes a Modal Queue item before any durable Worker Assignment, so
    a hard interruption can lose delivery. Replace that transport with an
    idempotent coordinator claim that commits and checkpoints the assignment
@@ -738,8 +746,8 @@ characterization tests:
 
 Fault-injection tests must stop immediately after preclaim, spawn, attachment,
 collection, decode, publication, and final commit. Each restart assertion must
-prove whether the old call is recovered, the run blocks as unknown, or a new
-call is safe.
+prove whether the old call is recovered, the run blocks as unknown, or a
+Successor Execution Run may safely submit missing work.
 
 ## State-transition policy
 
@@ -812,12 +820,12 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
-| `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
-| `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
+| `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner failure without same-run reassignment, and unknown-owner blocking |
+| `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
-| `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
+| `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
 | `tests/app/test_alphafold3_production_contracts.py` | Search, run, request, marker, and seed-batch identities remain unchanged |
@@ -832,8 +840,8 @@ Deliverables:
 
 - map availability-check exceptions to `unknown`;
 - preclaim workflow remote submission and preserve submission outcome unknown;
-- finalize a successful workflow call, processed result, artifacts, Task
-  Attempt, and Node under one recoverable synchronization protocol;
+- finalize a successful workflow call, processed result, artifacts, Task, and
+  Node under one recoverable synchronization protocol;
 - stop cancelling attached child calls from the orchestrator exit hook and
   checkpoint best-effort instead;
 - add explicit tests that no restart automatically duplicates uncertain work.
@@ -900,8 +908,8 @@ Rollback:
 Deliverables:
 
 - persist immutable Task plans before submission;
-- add Task Attempt rows and an explicit many-to-many Task-Attempt-to-call
-  link;
+- add explicit Task-to-call and Task-to-assignment links with database
+  constraints enforcing at most one submission per Task per Execution Run;
 - move bounded batching and permit accounting into execution internals;
 - make PPIFlow the first runtime-discovered Task consumer;
 - represent partial candidate outcomes without making a Node successful by
@@ -944,7 +952,8 @@ Deliverables:
 - claim each missing seed Task independently before batching compatible seeds
   into one GPU call;
 - persist the one-call-to-many-seed mapping and per-seed outcomes;
-- retain explicit-invocation retry authority and current request/run identity;
+- make a Successor Execution Run the only retry path while retaining current
+  scientific request and workload run identities;
 - route the Local Entrypoint through a remote run-scoped coordinator;
 - let service and workflow hosts execute the same plan through their parent
   coordinator without creating a nested ledger;
@@ -1024,6 +1033,10 @@ Deliverables:
 - migrate remaining durable fan-out consumers;
 - remove the temporary `WorkflowLedger` migration facade after callers
   compose the shared execution repository and Workflow Artifact Store;
+- delete the legacy `attempts` table, `current_attempt_id`, attempt foreign
+  keys, attempt counters, generic `NodeExecutionPolicy`, attempt status fields,
+  and `attempts/<attempt-id>/` path segment;
+- key node and Task staging paths directly by their stable identities;
 - remove replaced coordinator loops and stale planned documentation;
 - publish the final supported execution inspection surface.
 
@@ -1095,7 +1108,8 @@ Exit gate:
 - attached calls from a now-unavailable deployment remain observable by
   FunctionCall ID and their publications are still validated;
 - an explicit restart creates a linked Successor Execution Run and schedules
-  only Tasks whose publications remain missing;
+  only Tasks whose publications remain missing and whose predecessor ownership
+  is conclusively terminal;
 - development mode remains useful for source iteration but cannot be mistaken
   for a resumable deployed run;
 - dry-run and help start no remote execution.
@@ -1119,7 +1133,7 @@ Use small commits in dependency order:
 7. `execution: add call lifecycle`
 8. `service: adopt call lifecycle`
 9. `workflow: adopt call lifecycle`
-10. `execution: add durable task attempts`
+10. `execution: add durable task state`
 11. `ppiflow: adopt durable task fanout`
 12. `alphafold3: adopt execution adapters`
 13. `execution: add dispatch coordinators`
@@ -1178,8 +1192,8 @@ Change:
 - record a durable submission identity before invoking the provider;
 - attach the returned call ID to that identity;
 - leave an unattached or interrupted submission explicitly outcome-unknown;
-- finalize the processed result, artifacts, Task Attempt, Node, and Provider
-  Call in one host transaction and Volume synchronization boundary;
+- finalize the processed result, artifacts, Task, Node, and Provider Call in
+  one host transaction and Volume synchronization boundary;
 - replace exit-time child cancellation with best-effort drain and checkpoint;
 - remove the earlier transition that marks a call succeeded before its result
   is recoverable;
@@ -1214,8 +1228,8 @@ written by it. No compatibility reader is required.
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from Task permits, batched permit accounting, no permit leak on failure |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
-| Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, resume and force behavior |
-| PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, stage restart |
+| Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, coordinator resume, and successor restart behavior |
+| PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, and successor publication reuse |
 | AlphaFold3 | Search/run/request identities, claims, publications, seed batching/reuse, summaries, archive hashes |
 | CLI | App and workflow discovery/help, version resolution and overrides, deployed versus development launch, representative dry tests |
 
@@ -1230,10 +1244,11 @@ authorized smoke test after local and CI gates pass.
 | A universal abstraction hides scientific differences | Workload-owned hooks and provider adapters; migrate AF3 last |
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate host loops |
-| A batch obscures individual outcomes | Persist Task and Task Attempt identities plus explicit call links |
+| A batch obscures individual outcomes | Persist Task identities, per-Task outcomes, and explicit call links |
 | A claim response is lost after assignment | Commit and Volume-checkpoint the assignment before responding; replay by stable request ID |
 | An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
-| Recovery silently spends on a second call | Distinguish Task Redelivery from explicit Retry Authorization |
+| Recovery silently spends on a second call | Enforce one Task submission per Run in SQLite; require a Successor Execution Run for failed work |
+| “Exactly once” hides provider re-execution | Promise single scheduler submission only; require idempotent work or authoritative publication validation across redelivery |
 | Cache checker outage triggers expensive recomputation | Tri-state availability; only `missing` authorizes work |
 | Crash after paid spawn duplicates work | Preclaim, attach protocol, explicit outcome unknown, no blind retry |
 | Preemption is mistaken for cancellation | Preserve child calls, checkpoint best-effort, and recover by call ID |
@@ -1319,15 +1334,18 @@ after each decision:
     version. Its provider pool is capped at one container, and concurrent
     method inputs submit commands to one in-process SQLite writer. Different
     Runs use independent pools.
-12. **Worker interruption — accepted 2026-07-29**: preemption retains the
-    Task Attempt and committed Worker Assignment. Claim and completion methods
-    are idempotent; assignment is checkpointed before payload delivery. Exit
-    callbacks are advisory, and a successor assignment requires conclusive
-    owner-call termination.
-13. **Retry authority — accepted 2026-07-29**: safe redelivery and
-    provider-managed retries stay within one Task Attempt. A new paid Provider
-    Call after terminal failure requires a later explicit resume or retry
-    invocation, which revalidates publications and retries only missing Tasks.
+12. **Worker interruption — accepted and revised 2026-07-29**: preemption
+    retains the Task, Provider Call, and committed Worker Assignment. Claim and
+    completion methods are idempotent, and assignment is checkpointed before
+    payload delivery. A terminal owner fails unfinished Tasks; no successor
+    assignment is created in the same Execution Run.
+13. **Single submission and retry boundary — accepted 2026-07-29**: the
+    kernel stores no Task Attempt identity. Each Task receives at most one
+    Provider Call submission or Worker Assignment in an Execution Run.
+    Provider redelivery may re-execute the same call, so exactly-once execution
+    is not promised. `resume` never retries failed Tasks. Explicit `restart`
+    creates a Successor Execution Run, revalidates publications, and submits
+    only missing work whose predecessor ownership is conclusively terminal.
 14. **Task queue storage — accepted 2026-07-29**: SQLite is the only durable
     queue and assignment store. The design adds neither Modal Dict nor Modal
     Queue; remote workers claim bounded microbatches through the run-scoped
@@ -1357,7 +1375,8 @@ after each decision:
     never changes Deployment Identity. Existing calls remain observable by ID.
     An incomplete run with an unavailable version becomes Deployment-Blocked.
     Explicit restart creates a linked Successor Execution Run on a new version,
-    revalidates publications, and schedules only missing Tasks.
+    revalidates publications, and schedules only missing Tasks whose
+    predecessor ownership is conclusively terminal.
 20. **Remote ledger storage — accepted 2026-07-29**: each Direct CLI App Run
     stores an App Run Ledger at
     `.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in its
@@ -1400,6 +1419,12 @@ after each decision:
     retried: admission stops, attached calls remain running, a diagnostic is
     recorded when possible, and the Run stays incomplete until explicit
     resume reconciles durable state.
+27. **Workflow attempt removal — accepted 2026-07-29**: the workflow
+    migration deletes `attempts`, `current_attempt_id`, attempt foreign keys and
+    counters, `AttemptRecord`, generic `NodeExecutionPolicy`, attempt status
+    output, and the `attempts/<attempt-id>/` path layer. Task, Node, Provider
+    Call, and artifact records retain the one result, error, timing, and output
+    state needed by the single-submission model.
 
 ## Definition of ready for implementation
 

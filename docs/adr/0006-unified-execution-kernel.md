@@ -14,9 +14,9 @@ workload publications remain authoritative for scientific cache completion.
 The authority boundary was accepted on 2026-07-29. “Without centralizing
 workload state” does not mean that execution state may remain ephemeral. The
 kernel governs the durable state model and atomic transition contract for
-runs, nodes, tasks, attempts, and provider calls. Separate repository
-instances implement that contract so an API service, a per-run workflow, and
-an app coordinator do not depend on one shared database.
+runs, nodes, tasks, dispatch batches, worker assignments, and provider calls.
+Separate repository instances implement that contract so an API service, a
+per-run workflow, and an app coordinator do not depend on one shared database.
 
 Repository scope follows the coordinator boundary, not each API request,
 application call, or Modal function. The API service uses one long-lived
@@ -69,7 +69,8 @@ the run remains incomplete, the run becomes Deployment-Blocked and admits no
 new work. This is a terminal run state. An explicit restart creates a
 Successor Execution Run with a newly resolved Deployment Identity and
 predecessor link. It revalidates publications and schedules only missing Tasks;
-the predecessor repository remains read-only and inspectable.
+active or unknown predecessor ownership blocks replacement work, and the
+predecessor repository remains read-only and inspectable.
 
 The remote-ledger storage policy was accepted on 2026-07-29. A Direct CLI App
 Run stores its App Run Ledger beneath the reserved
@@ -108,15 +109,17 @@ reference, parser, local registry, or global remote run index. The adapter
 verifies the Deployment Identity and Execution Run ID against the App Run
 Ledger or Workflow Ledger before acting; the optional FunctionCall ID is only
 an observation hint. `resume` retains the Execution Run ID and Deployment
-Identity, while `restart` always creates a successor and prints its new fields.
+Identity and never retries failed Tasks, while `restart` always creates a
+successor and prints its new fields.
 
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
-execution repository should own run, node, task, attempt, and provider-call
-tables and transitions inside that file. Workflow code should retain only its
-artifact records, run-directory lifecycle, and Modal Volume synchronization.
-The current `WorkflowLedger` may serve as a short-lived migration facade
-between incremental commits, then be removed.
+execution repository should own run, node, task, dispatch-batch,
+worker-assignment, and provider-call tables and transitions inside that file.
+It deliberately has no attempt table or attempt foreign key. Workflow code
+should retain only its artifact records, run-directory lifecycle, and Modal
+Volume synchronization. The current `WorkflowLedger` may serve as a
+short-lived migration facade between incremental commits, then be removed.
 
 The repository scope and ledger decomposition were accepted on 2026-07-29.
 The accepted end state removes the migration facade: the workflow runtime
@@ -211,24 +214,32 @@ replacement Coordinator Attempt, but the coordinator adapter configures no
 automatic retry loop for an uncaught application exception. Such an exception
 stops admission, preserves attached Provider Calls, and records a diagnostic
 when possible. The Execution Run remains incomplete and requires an explicit
-`resume` command to reconcile durable state and continue.
+`resume` command to reconcile durable state and continue. Resume may schedule
+Tasks that were never submitted, but it does not retry a failed Task.
 
 The worker-interruption policy was accepted on 2026-07-29. Worker preemption
-does not fail a Task Attempt or release its Worker Assignment because Modal
-restarts the same provider input. Pull workers use stable, idempotent claim
-request IDs. The coordinator transactionally records an assignment, crosses
-the Volume durability boundary, and only then returns its Task payload; a
-repeated request returns the same assignment. Another call may receive a
-successor assignment only after the owner call is conclusively terminal.
-Lifecycle exit hooks may checkpoint work or emit diagnostics, but they never
-authorize failure or reassignment.
+does not fail a Task or release its Worker Assignment because Modal restarts
+the same provider input. Pull workers use stable, idempotent claim request IDs.
+The coordinator transactionally records an assignment, crosses the Volume
+durability boundary, and only then returns its Task payload; a repeated request
+returns the same assignment. A conclusively failed owner call fails its
+unfinished Tasks and releases their permits, but no other call may claim those
+Tasks in the same Execution Run. Lifecycle exit hooks may checkpoint work or
+emit diagnostics, but they never authorize reassignment.
 
-The retry policy was accepted on 2026-07-29. Redelivery before assignment and
-provider-managed restart of one input remain inside the existing Task Attempt.
-After a paid Provider Call becomes terminal and may have started work, the
-kernel never creates a successor call automatically. A later explicit resume
-or retry invocation revalidates publications and authorizes new Task Attempts
-only for work still missing.
+The single-submission policy superseded the earlier attempt-based retry policy
+on 2026-07-29. The kernel stores no Task Attempt identity or counter. Within
+one Execution Run, each Task is scheduled once and receives at most one
+Provider Call submission or Worker Assignment. Modal may redeliver and
+re-execute the same provider input, so the kernel does not claim exactly-once
+execution. A conclusive provider or workload failure terminates the Task; the
+Node aggregation policy then determines the terminal Node and Run outcome.
+`resume` reconciles interrupted coordination and may submit Tasks that were
+never submitted, but it never resubmits failed Tasks. Retrying failed work
+requires an explicit `restart`, which creates a Successor Execution Run,
+revalidates Workload Publications, and schedules only missing Tasks whose
+predecessor ownership is conclusively terminal. Active or unknown predecessor
+calls block replacement work.
 
 ## Considered options
 
@@ -274,6 +285,9 @@ only for work still missing.
 - A local run registry would shorten later commands, but would make recovery
   machine-specific and introduce another mutable state store. Separate app and
   workflow lifecycle commands would duplicate an identical kernel surface.
+- Retaining Task Attempt rows would support retries inside one Execution Run,
+  but would duplicate run lineage and complicate cost safety. A failed Run and
+  an explicit Successor Execution Run provide one retry boundary.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.
@@ -281,12 +295,12 @@ only for work still missing.
 ## Consequences
 
 The common hierarchy is an execution run containing fixed semantic nodes,
-runtime-discovered tasks, task attempts, and provider calls. One provider call
-may serve several tasks, and a cache hit may complete a task without a provider
-call. Workloads continue to define scientific identity, cache validation,
-input and output contracts, function arguments, resource requirements, and
-publication rules. The kernel determines when those hooks run and how their
-observations affect scheduling.
+runtime-discovered tasks, dispatch batches, worker assignments, and provider
+calls. One provider call may serve several tasks, and a cache hit may complete
+a task without a provider call. Workloads continue to define scientific
+identity, cache validation, input and output contracts, function arguments,
+resource requirements, and publication rules. The kernel determines when
+those hooks run and how their observations affect scheduling.
 
 Execution identity is deliberately operational. A Service Job, workflow
 request, GROMACS run name, or AlphaFold run identity may refer to it, but none
@@ -294,19 +308,18 @@ is interchangeable with it. This lets a new execution reuse valid scientific
 outputs without reopening or overwriting its predecessor ledger.
 
 An execution repository is authoritative for scheduling facts such as the
-immutable plan, readiness, attempts, submission tokens, attached call IDs,
-observed provider state, and timestamps. It records that a workload
-publication was validated, but the publication's marker, manifest, or
-workload-specific validator remains authoritative for whether scientific
-output is reusable.
+immutable plan, readiness, single-submission claims, attached call IDs,
+observed provider state, and timestamps. It records that a workload publication
+was validated, but the publication's marker, manifest, or workload-specific
+validator remains authoritative for whether scientific output is reusable.
 
 Concurrent Task execution does not imply concurrent SQLite writers. One
 coordinator durably admits work and records returned events while direct
 calls, batched calls, or SQLite-backed pull worker pools run concurrently. A
-Dispatch Batch relates Task Attempts to one or more Provider Calls without
-introducing another queue. Workload code retains task identity, batch
-compatibility, execution, and publication validation; shared adapters own
-reusable fan-out and worker-pool mechanics.
+Dispatch Batch relates Tasks to one or more Provider Calls without introducing
+another queue. Workload code retains task identity, batch compatibility,
+execution, and publication validation; shared adapters own reusable fan-out
+and worker-pool mechanics.
 
 An Execution Coordinator is logical and may span several Coordinator Attempts.
 Graceful lifecycle hooks improve checkpoint freshness but are not part of the
@@ -336,10 +349,11 @@ idempotent. Publication validation and terminal provider state recover lost
 responses or interrupted delivery without a timeout-based steal, Modal Dict,
 or Modal Queue.
 
-This separates recovery from repeated spending. Provider-native retries and
-safe Task Redelivery preserve one call or one Task Attempt; Retry Authorization
-creates a successor attempt. Local operations may declare a separate bounded
-automatic policy, but paid provider work defaults to explicit authorization.
+This separates recovery from repeated spending. Provider-native redelivery
+preserves one Provider Call and Task identity. A terminal failure cannot create
+another submission in the same Execution Run; retrying requires a Successor
+Execution Run after publication validation and conclusive predecessor
+termination.
 
 This is an incremental extraction, not a rewrite. Internal types, tables, and
 imports may change directly while each consumer adopts the kernel. Scientific

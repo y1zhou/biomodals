@@ -210,6 +210,20 @@ state, and cache reuse is success provenance rather than a Task status.
 `skipped` is reserved for sibling Tasks never admitted after a `fail_fast`
 failure.
 
+The Node, Task, and Provider Call relationship policy was accepted on
+2026-07-29. A Node is a fixed semantic DAG stage, a Task is one independently
+scheduled and validated item in that stage, and a Provider Call is one
+concrete remote worker invocation. Every Task, Dispatch Batch, and Provider
+Call belongs to exactly one Node. A Provider Call may own zero or many Tasks,
+but only from that Node; a Task has at most one durable remote owner path in
+one Execution Run. Fixed dispatch may link Tasks directly to the call, while a
+pull worker uses one unique Worker Assignment per Task. The kernel has no
+generic many-to-many Task-to-call association. Cache or local execution can
+complete Tasks without a Provider Call, provider redelivery retains the same
+call identity, and restart creates new Tasks in a Successor Execution Run.
+The remote invocation hosting an Execution Coordinator is a Coordinator
+Attempt, not a Task-owning Provider Call.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal

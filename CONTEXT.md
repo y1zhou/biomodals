@@ -65,8 +65,9 @@ replacement work until explicit reconciliation or administrative resolution.
 _Avoid_: suspended Run, missing publication, failed Run
 
 **Execution Node**:
-A fixed semantic step in an execution DAG that may discover one or more Tasks
-when it becomes ready.
+A fixed semantic stage in an execution DAG that may discover one or more Tasks
+when it becomes ready. Its identity and dependencies do not change when
+provider batch size or concurrency changes.
 _Avoid_: Modal function, dynamic task, provider call
 
 **Execution Node Status** [planned]:
@@ -77,8 +78,9 @@ cache reuse is Task provenance rather than a Node status.
 _Avoid_: ready, cached, suspended, state unknown
 
 **Task**:
-The smallest independently identified unit in an Execution Node whose cached
-publication and outcome can be observed.
+The smallest independently scheduled and validated work item in an Execution
+Node whose cached publication and outcome can be observed. Every Task belongs
+to exactly one Node.
 _Avoid_: workflow node, thread, untracked work item
 
 **Task Status** [planned]:
@@ -98,15 +100,17 @@ Run.
 _Avoid_: exactly-once execution, same-run retry, attempt counter
 
 **Provider Call**:
-One detached operation submitted to a compute provider and identified for
-later observation, recovery, or cancellation. A Provider Call may serve
-several Tasks.
-_Avoid_: Task, provider redelivery, workflow node, app
+One concrete remote worker invocation submitted to a compute provider and
+identified for later observation, recovery, logging, or cancellation. It
+belongs to exactly one Node and may own zero or more of that Node's Tasks. A
+Modal Function Call is the current provider-specific implementation.
+_Avoid_: Task, Node, Coordinator Attempt, provider redelivery, app
 
 **Dispatch Batch** [planned]:
-A durable grouping of Tasks offered together to one Provider Call or to a
-shared pull worker pool. It records intended dispatch without claiming that a
-particular worker performed a Task before a Worker Assignment is committed.
+A durable grouping of Tasks from one Node offered together to one Provider
+Call or to a shared pull worker pool. It records intended dispatch without
+claiming that a particular worker performed a Task before a Worker Assignment
+is committed.
 _Avoid_: workflow node, provider call, scientific batch
 
 **Worker Assignment** [planned]:

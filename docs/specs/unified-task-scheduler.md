@@ -140,23 +140,47 @@ These existing decisions remain binding during the refactor:
 ```text
 Service Job (optional API envelope)
   └── Execution Run
-        ├── Node
-        │     └── Task
-        └── Dispatch Batch
-              ├── contains one or more Tasks
-              ├── records call-bound Worker Assignments
-              └── served by one or more Provider Calls
+        └── Node
+              ├── contains zero or more Tasks
+              └── Dispatch Batch
+                    ├── groups Tasks from this Node
+                    ├── records call-bound Worker Assignments
+                    └── is served by one or more Provider Calls
 ```
 
-The relationship between Task and Provider Call is not one-to-one:
+The three levels answer different questions:
+
+- Node: what semantic stage is running?
+- Task: which independently cacheable and verifiable item is being processed?
+- Provider Call: where and how is that work executing remotely?
+
+Their strict relationships are:
 
 - a cache hit completes a Task without a call;
+- every Task, Dispatch Batch, and Provider Call belongs to exactly one Node;
+- one Node may use zero, one, or many Provider Calls;
+- one Provider Call may own zero or many Tasks from its Node;
+- a Task has at most one durable Provider Call or Worker Assignment owner in
+  its Execution Run;
+- a Provider Call never spans Nodes, and there is no generic many-to-many
+  Task-to-call association;
 - GROMACS usually has one Task per Modal call;
 - one AlphaFold3 inference worker call may serve several seed Tasks;
 - several Rosetta worker calls may steal Tasks from one Dispatch Batch;
-- a Task receives at most one Provider Call or Worker Assignment in its
-  Execution Run;
+- provider redelivery retains the same Provider Call identity;
 - a failed Task can be represented again only in a Successor Execution Run.
+
+For example, an `alphafold3-inference` Node might contain one Task per seed.
+Changing its GPU concurrency repartitions those Tasks across Provider Calls
+without changing the Node, its dependencies, or the Task identities. If every
+seed publication is already reusable, the same Node succeeds without creating
+any Provider Call.
+
+Provider Calls are internal runtime records rather than workload modeling
+objects. Workloads define Nodes and Tasks; the kernel creates calls while
+dispatching them. The remote Modal invocation hosting the scheduler is instead
+a Coordinator Attempt because it coordinates Tasks rather than executing
+them.
 
 ### Proposed terms
 
@@ -171,25 +195,28 @@ coordinator routing, lineage, and ledger location.
 the immutable plan. It may be reused by successor runs and publications but is
 never an execution primary key or ledger path.
 
-**Execution Node** is a fixed semantic DAG step. It replaces neither
-`WorkflowNode` nor user-facing service stages immediately; adapters map those
-concepts to it during migration.
+**Execution Node** is a fixed semantic DAG stage. Its identity does not change
+with batching or concurrency. It replaces neither `WorkflowNode` nor
+user-facing service stages immediately; adapters map those concepts to it
+during migration.
 
 **Task** is the smallest independently identified unit whose cache and outcome
-can be reasoned about. Tasks may be discovered only when their containing Node
-starts.
+can be reasoned about. Every Task belongs to exactly one Node, and Tasks may be
+discovered only when their containing Node starts.
 
 **Single-Submission Rule** means the kernel schedules each Task once and
 creates at most one Provider Call submission or Worker Assignment for it in
 one Execution Run. Provider redelivery can re-execute that same call, so this
 is not an exactly-once execution claim.
 
-**Provider Call** is one detached Modal function call, including its durable
-call ID and observed lifecycle. A call can cover a batch of Tasks.
+**Provider Call** is one concrete remote worker invocation, including its
+durable provider call ID and observed lifecycle. It belongs to one Node and
+can cover zero or many Tasks from that Node. A Modal Function Call is its
+current provider implementation.
 
-**Dispatch Batch** is a durable grouping of Tasks offered to one provider call
-or a shared worker pool. Exact Task-to-call attribution is recorded only when
-it is observed.
+**Dispatch Batch** is a durable grouping of Tasks from one Node offered to one
+Provider Call or a shared worker pool. Exact Task-to-call attribution is
+recorded only when it is observed.
 
 **Worker Assignment** is a durable, call-bound SQLite record electing the
 worker allowed to execute one Task from a shared pull work pool. It is
@@ -626,7 +653,11 @@ model. Dependencies point toward execution IDs only:
 ```text
 Service Job ───────────────┐
                           ├──> Execution Run -> Node -> Task
-Workflow Artifact Store ──┘                         └-> Provider Call
+Workflow Artifact Store ──┘                    ├-> Dispatch Batch
+                                              └-> Provider Call
+
+Task --optional direct ownership---------------> Provider Call
+Task -> Worker Assignment ---------------------> Provider Call
 
 Execution tables --X--> Service Job, user, HTTP, admin, or artifact tables
 ```
@@ -930,6 +961,7 @@ Phase 0 test inventory:
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
+| `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
@@ -992,6 +1024,9 @@ Deliverables:
   Nodes, Tasks, and Provider Calls over a host-supplied SQLite connection;
 - implement the nine-status Run transition table, `status_reason`, and
   `status_message`;
+- enforce Node-local dispatch, zero-to-many Tasks per Provider Call, and at
+  most one durable remote owner path per Task without a generic many-to-many
+  call association;
 - persist immutable Task plans and enforce one submission claim per Task per
   Execution Run;
 - implement preclaim, spawn, attachment, observation, collection,
@@ -1537,6 +1572,15 @@ after each decision:
     success provenance, partiality belongs to Node aggregation, provider
     submission phases stay on Provider Calls, and `skipped` is reserved for
     sibling Tasks not admitted after `fail_fast`.
+34. **Node, Task, and Provider Call relationships — accepted 2026-07-29**:
+    Nodes are fixed semantic stages, Tasks are independently scheduled and
+    validated items, and Provider Calls are concrete remote worker
+    invocations. Every Task, Dispatch Batch, and Provider Call belongs to one
+    Node. A call may own zero or many Tasks from that Node, while a Task has at
+    most one durable remote owner path per Run. There is no cross-Node call or
+    generic many-to-many Task-to-call relation. Cache and local execution need
+    no call; provider redelivery retains call identity; coordinator hosting is
+    a separate Coordinator Attempt.
 
 ## Definition of ready for implementation
 

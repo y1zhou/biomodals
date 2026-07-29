@@ -224,6 +224,18 @@ call identity, and restart creates new Tasks in a Successor Execution Run.
 The remote invocation hosting an Execution Coordinator is a Coordinator
 Attempt, not a Task-owning Provider Call.
 
+The Provider Call status policy was accepted on 2026-07-29. Calls have exactly
+eight statuses: `submitting`, `attached`, `running`, `outcome_unknown`,
+`state_unknown`, `succeeded`, `failed`, and `cancelled`. The first five are
+nonterminal and preserve Task ownership; the final three are terminal. The
+submission preclaim creates a call directly in `submitting`, so unsubmitted
+intent remains on the Task or Dispatch Batch rather than a `planned` call.
+`outcome_unknown` means spawn may have occurred without a durably attached
+provider ID, while `state_unknown` means the ID exists but observation or
+cancellation is inconclusive. An expired provider handle is an observation,
+not a status: conclusive failure becomes `failed`, while an unresolved outcome
+becomes `state_unknown`.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Task and Provider Call permits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal

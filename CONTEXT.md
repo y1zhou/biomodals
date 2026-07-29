@@ -106,6 +106,14 @@ belongs to exactly one Node and may own zero or more of that Node's Tasks. A
 Modal Function Call is the current provider-specific implementation.
 _Avoid_: Task, Node, Coordinator Attempt, provider redelivery, app
 
+**Provider Call Status** [planned]:
+The kernel lifecycle value for a Provider Call: `submitting`, `attached`,
+`running`, `outcome_unknown`, `state_unknown`, `succeeded`, `failed`, or
+`cancelled`. The first five are nonterminal and preserve ownership; the final
+three are terminal. `outcome_unknown` has no durably attached provider call ID,
+whereas `state_unknown` does.
+_Avoid_: planned, expired, retrying
+
 **Dispatch Batch** [planned]:
 A durable grouping of Tasks from one Node offered together to one Provider
 Call or to a shared pull worker pool. It records intended dispatch without

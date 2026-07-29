@@ -801,23 +801,50 @@ vocabulary without preserving a second operation state machine.
 
 ### Paid-call lifecycle
 
-The durable lifecycle must distinguish:
+The kernel uses exactly eight Provider Call statuses:
+
+| Status | Terminal | Meaning |
+| --- | --- | --- |
+| `submitting` | No | The durable preclaim exists and spawn has not safely returned |
+| `attached` | No | The provider call ID is durable but the call has not yet been observed |
+| `running` | No | The provider reports that the call is active |
+| `outcome_unknown` | No | Spawn may have occurred, but no provider call ID was durably attached |
+| `state_unknown` | No | The call ID exists, but state or cancellation outcome is inconclusive |
+| `succeeded` | Yes | The provider call returned successfully |
+| `failed` | Yes | The provider conclusively reported failure |
+| `cancelled` | Yes | The provider conclusively confirmed cancellation |
+
+The primary lifecycle is:
 
 ```text
-planned
-  -> submitting
-  -> attached
-  -> running
-  -> succeeded | failed | cancelled | expired
+submitting
+  -> attached | outcome_unknown | failed
 
-submitting -> outcome_unknown
-attached/running -> state_unknown
+attached
+  -> running
+  -> succeeded | failed | cancelled | state_unknown
+
+running
+  -> succeeded | failed | cancelled | state_unknown
+
+outcome_unknown
+  -> attached | running | succeeded | failed | cancelled
+
+state_unknown
+  -> running | succeeded | failed | cancelled
 ```
 
 `outcome_unknown` means a spawn may have started but no call ID was durably
 attached. `state_unknown` means an attached call exists but its current or
-terminal provider state cannot be established. Neither state automatically
-returns to `planned`.
+terminal provider state cannot be established. Both preserve Task ownership
+and prohibit replacement work until explicit reconciliation establishes one
+of the listed transitions.
+
+There is no `planned` Provider Call: unsubmitted intent remains on the Task or
+Dispatch Batch, and the durable preclaim creates a call directly in
+`submitting`. There is no `expired` status either. An expired provider handle
+with conclusive failure becomes `failed`; without a conclusive outcome it
+becomes `state_unknown`, with the expiry retained as diagnostic reason.
 
 A provider adapter must expose only the operations the kernel needs: spawn,
 resolve by call ID, observe or collect, and cancel. Modal-specific objects
@@ -962,6 +989,7 @@ Phase 0 test inventory:
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
+| `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
@@ -1024,6 +1052,8 @@ Deliverables:
   Nodes, Tasks, and Provider Calls over a host-supplied SQLite connection;
 - implement the nine-status Run transition table, `status_reason`, and
   `status_message`;
+- implement the eight-status Provider Call lifecycle without `planned` or
+  `expired` states;
 - enforce Node-local dispatch, zero-to-many Tasks per Provider Call, and at
   most one durable remote owner path per Task without a generic many-to-many
   call association;
@@ -1581,6 +1611,13 @@ after each decision:
     generic many-to-many Task-to-call relation. Cache and local execution need
     no call; provider redelivery retains call identity; coordinator hosting is
     a separate Coordinator Attempt.
+35. **Provider Call statuses — accepted 2026-07-29**: calls use
+    `submitting`, `attached`, `running`, `outcome_unknown`, `state_unknown`,
+    `succeeded`, `failed`, and `cancelled`. The first five are nonterminal and
+    preserve ownership; the final three are terminal. The preclaim creates a
+    `submitting` call directly. Unsubmitted intent is not a `planned` call, and
+    handle expiry projects to conclusive `failed` or unresolved
+    `state_unknown` rather than an `expired` status.
 
 ## Definition of ready for implementation
 

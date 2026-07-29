@@ -194,7 +194,9 @@ _Avoid_: ephemeral development run, API Job, Child App Call
 **Direct CLI App Run** [planned]:
 A Deployed CLI Run initiated through `biomodals app run`. Its durable
 repository lives remotely; the user's machine does not create or own a run
-database.
+database. Repeating a launch without predecessor identity creates a new root
+Run; `--restart-from <execution-run-id>` explicitly creates a Successor
+Execution Run and is a convenience over the generic restart command.
 _Avoid_: Child App Call, local scheduler, API Job
 
 **Development CLI Run** [planned]:

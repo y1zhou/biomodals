@@ -117,6 +117,9 @@ These existing decisions remain binding during the refactor:
 - Launch commands print the explicit deployment and run identity fields;
   generic lifecycle commands accept those values as repeated CLI flags and
   need no encoded reference, local registry, or app-specific implementation.
+- Repeating an app or workflow launch without predecessor identity creates a
+  new root Run. `--restart-from <execution-run-id>` explicitly creates a
+  successor through the same operation as the generic restart command.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Each remote top-level CLI run has one detached coordinator loop that advances
@@ -458,6 +461,29 @@ failed Task. `restart` always returns a new Execution Run ID and Deployment
 Identity and is the only retry boundary. Passing those fields does not grant
 paid-work authorization; the CLI still performs its normal Modal
 authentication.
+
+Repeating `biomodals app run` or `biomodals workflow run` without predecessor
+identity always creates a new root Execution Run. The kernel does not infer
+identity from matching command text, file paths, Workload Run Keys, or
+normalized arguments, and it maintains no command-fingerprint catalog. Both
+launch commands accept `--restart-from <execution-run-id>` as a convenience
+over `biomodals run restart`; it invokes the same successor operation rather
+than mutating the predecessor.
+
+A Successor Execution Run revalidates each expected Workload Publication.
+Valid successes become cache-satisfied Tasks. Missing or conclusively invalid
+publications are eligible for new Tasks only when predecessor ownership is
+conclusively terminal; active or unknown ownership blocks replacement. Once
+those Tasks succeed, previously untouched downstream Nodes become ready
+normally.
+
+SQLite transactions and repository constraints are expected to turn an
+interruption into a valid checkpoint, not broken partial rows. Recovery may
+therefore encounter a valid `submitting` or `outcome_unknown` call and must
+preserve its ownership. An unreadable database or invariant-invalid
+predecessor fails closed: neither resume nor restart reconstructs ownership
+from partial rows or scientific outputs alone. Publications remain reusable
+after an operator separately resolves the risk of active provider work.
 
 ### Durable execution state
 
@@ -992,6 +1018,7 @@ Phase 0 test inventory:
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
+| `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; valid publications are reused; unknown or invalid predecessor state fails closed |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -1133,6 +1160,9 @@ Deliverables:
   then persist and use only the exact Deployment Identity;
 - add shared `biomodals run status`, `cancel`, `resume`, and `restart`
   lifecycle commands using explicit deployment and run flags;
+- add `--restart-from <execution-run-id>` to app and workflow launch commands
+  as a thin convenience over the generic restart operation, without implicit
+  command matching;
 - keep local input staging, result retrieval, dry-run, help, and explicit
   source-backed development mode in thin CLI clients.
 
@@ -1144,6 +1174,8 @@ Exit gate:
   passes DAG, recovery, artifact, and publication-equivalence tests;
 - a second CLI process can address the same version-pinned run, while
   development mode clearly lacks cross-invocation recovery;
+- a repeated launch creates a new root Run, while `--restart-from` and generic
+  restart create the same linked successor behavior;
 - restart creates a Successor Execution Run and cannot replace active or
   unknown predecessor work;
 - manual Modal tests validate deployment lookup, run-scoped routing,
@@ -1618,6 +1650,15 @@ after each decision:
     `submitting` call directly. Unsubmitted intent is not a `planned` call, and
     handle expiry projects to conclusive `failed` or unresolved
     `state_unknown` rather than an `expired` status.
+36. **Explicit CLI recovery — accepted 2026-07-29**: a repeated app or
+    workflow launch without predecessor identity creates a new root Run and
+    never infers identity from command text, paths, arguments, or Workload Run
+    Keys. `resume` retains the Run and never retries failed Tasks. Generic
+    restart or launch-time `--restart-from` creates a linked successor, reuses
+    valid publications, and schedules conclusively unowned missing work before
+    advancing downstream Nodes. Active, unknown, unreadable, or
+    invariant-invalid predecessor ownership fails closed; there is no implicit
+    run catalog.
 
 ## Definition of ready for implementation
 

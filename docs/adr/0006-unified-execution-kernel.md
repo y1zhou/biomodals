@@ -112,6 +112,22 @@ an observation hint. `resume` retains the Execution Run ID and Deployment
 Identity and never retries failed Tasks, while `restart` always creates a
 successor and prints its new fields.
 
+The explicit CLI recovery policy was accepted on 2026-07-29. Repeating
+`biomodals app run` or `biomodals workflow run` without predecessor identity
+creates a new root Execution Run; command text, file paths, and Workload Run
+Keys are not implicit execution identity. Both launch commands accept
+`--restart-from <execution-run-id>` as a convenience that delegates to the
+same Successor Execution Run operation as `biomodals run restart`.
+`resume` reconciles the same Run and never retries failed Tasks. Restart
+revalidates Workload Publications, reuses valid successes, schedules only
+missing or invalid work whose predecessor ownership is conclusively terminal,
+and then advances untouched downstream Nodes. Active, unknown, unreadable, or
+invariant-invalid predecessor ownership fails closed. An interrupted SQLite
+transaction must recover as a valid durable state such as `submitting` or
+`outcome_unknown`; physical database corruption is not reconstructed from
+partial rows. The design adds no command-fingerprint catalog or implicit
+latest-run lookup.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, dispatch-batch,

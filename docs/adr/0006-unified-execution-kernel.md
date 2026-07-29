@@ -248,6 +248,19 @@ Intermediate lifecycle history remains available for diagnosis but is not an
 all-Node vote on the scientific outcome. This generalizes the workflow
 runtime's existing terminal-pruning behavior to every kernel consumer.
 
+The result-pruning cleanup policy was accepted on 2026-07-29. A pending
+ancestor made unnecessary by a complete result becomes `skipped` with
+`status_reason=result_already_satisfied`; a previously terminal ancestor keeps
+its historical outcome. The coordinator stops admission for a running
+unnecessary ancestor, cancels and reconciles its attached Provider Calls, and
+marks the Node `cancelled` with the same reason when cancellation wins.
+Provider work that reaches another conclusive terminal outcome first retains
+that observed outcome. The Run remains `running` during this internal cleanup;
+an inconclusive cancellation moves it to `state_unknown`. Only after every
+unnecessary remote owner is conclusive may the coordinator exit with the Run
+outcome derived from its terminal scientific results. This prevents cached
+return from abandoning paid work without adding another Node status.
+
 The Task status policy was accepted on 2026-07-29. Tasks have exactly six
 statuses: `pending`, `running`, `succeeded`, `failed`, `cancelled`, and
 `skipped`. Only the first two are nonterminal. Durable local execution,

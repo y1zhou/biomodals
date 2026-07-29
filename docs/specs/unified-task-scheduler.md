@@ -336,8 +336,8 @@ The kernel uses exactly seven Node statuses:
 | `succeeded` | Yes | The required Node output is complete |
 | `partial` | Yes | The Node aggregation policy accepted incomplete output |
 | `failed` | Yes | Required work conclusively failed |
-| `cancelled` | Yes | Run cancellation stopped the Node |
-| `skipped` | Yes | An upstream terminal outcome made the Node unreachable |
+| `cancelled` | Yes | Explicit cancellation or result pruning stopped active Node work |
+| `skipped` | Yes | The Node became unreachable or was unnecessary before work started |
 
 Readiness is derived from dependencies and their accepted outcomes; it is not
 a persisted `ready` status. A Node satisfied entirely by reusable
@@ -376,6 +376,26 @@ This is intentionally not an aggregation across every planned Node: the graph
 describes ways to obtain scientific results, while validated terminal
 publications determine whether those results exist. It preserves fast cached
 return and the current workflow runtime's terminal-pruning semantics.
+
+Result pruning preserves ownership safety:
+
+- a pending unnecessary ancestor becomes `skipped` with
+  `status_reason=result_already_satisfied`;
+- an already-terminal ancestor keeps its historical status;
+- a running unnecessary ancestor admits no more work while the coordinator
+  cancels and reconciles its attached Provider Calls;
+- if cancellation wins, that Node becomes `cancelled` with
+  `status_reason=result_already_satisfied`; if work reaches another conclusive
+  terminal outcome first, that observed outcome is retained;
+- the Run remains `running` during cleanup and moves to `state_unknown` if a
+  cancellation outcome cannot be established.
+
+`result_already_satisfied` is the only initial Node `status_reason` and is
+valid only with `skipped` or `cancelled`. Every other Node status requires a
+null reason; workload failures remain in the Node error record. A successful
+result boundary may determine Run success only after every unnecessary remote
+owner is conclusively terminal. The normal cache-hit path remains immediate
+because no ancestor work is admitted before terminal validation.
 
 ### Task statuses
 
@@ -1095,7 +1115,7 @@ Phase 0 test inventory:
 | `tests/execution/test_run_status.py` | Exactly nine statuses and six reason codes exist; legal transitions, terminality, status-reason constraints, suspension/resume, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
-| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; traversal starts from incomplete terminals; complete terminal results make the Run succeed regardless of upstream history |
+| `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; traversal starts from incomplete terminals; complete terminal results prune pending ancestors; historical outcomes remain; running owners are reconciled before success; unknown cancellation blocks completion |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast skipping, and absence of partial Task state are deterministic |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
@@ -1143,6 +1163,8 @@ Deliverables:
   `accept_partial` boolean per edge;
 - derive the terminal result boundary from DAG leaves and prune ancestor work
   backward from validated terminal publications;
+- persist `result_already_satisfied` for pruned Nodes and reconcile active
+  Provider Calls before terminal Run completion;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
   inputs and declared scientific versions from operational execution policy;
 - extract deterministic readiness and terminal-reachability functions;
@@ -1782,6 +1804,15 @@ after each decision:
     succeeds when every terminal Node succeeds, regardless of failed,
     cancelled, or skipped upstream history; intermediate Nodes do not vote on
     the final scientific outcome.
+41. **Result-pruning cleanup — accepted 2026-07-29**: pending unnecessary
+    ancestors become `skipped` with
+    `status_reason=result_already_satisfied`; terminal history is preserved.
+    Running unnecessary ancestors stop admission and their Provider Calls are
+    cancelled and reconciled before the coordinator exits. Conclusive
+    cancellation marks the Node `cancelled` with the same reason; another
+    terminal outcome wins its race. The Run stays `running` during cleanup,
+    becomes `state_unknown` if cancellation is inconclusive, and still derives
+    its final outcome from terminal scientific results.
 
 ## Definition of ready for implementation
 

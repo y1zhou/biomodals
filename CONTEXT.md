@@ -82,7 +82,10 @@ _Avoid_: Modal function, dynamic task, provider call
 The kernel lifecycle value for an Execution Node: `pending`, `running`,
 `succeeded`, `partial`, `failed`, `cancelled`, or `skipped`. Only `pending`
 and `running` are nonterminal. Readiness is derived rather than persisted, and
-cache reuse is Task provenance rather than a Node status.
+cache reuse is Task provenance rather than a Node status. The optional
+`status_reason=result_already_satisfied` distinguishes an ancestor pruned by a
+complete terminal result from ordinary dependency failure or explicit Run
+cancellation.
 _Avoid_: ready, cached, suspended, state unknown
 
 **Terminal Execution Node** [planned]:

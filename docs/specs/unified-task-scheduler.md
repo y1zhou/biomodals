@@ -514,8 +514,10 @@ Deliverables:
 - delegate graph traversal, Task scheduling, call lifecycle, availability
   policy, and budgets from `WorkflowRuntime` to the execution kernel;
 - retain workflow-specific artifact materialization, Volume synchronization,
-  display, and ledger implementation;
+  display, run layout, and Workflow Artifact Store;
 - migrate remaining durable fan-out consumers;
+- remove the temporary `WorkflowLedger` compatibility facade after callers
+  compose the shared execution repository and Workflow Artifact Store;
 - remove replaced coordinator loops and stale planned documentation;
 - publish the final supported execution inspection surface.
 
@@ -531,7 +533,9 @@ Exit gate:
 
 - each concern has one implementation or a documented workload-specific
   reason to differ;
-- `WorkflowLedger` documentation matches its real task schema;
+- the physical `ledger.sqlite3` contains shared execution tables and
+  workflow-specific artifact tables without a second execution state machine;
+- no `WorkflowLedger` compatibility facade remains;
 - no compatibility switch or dead adapter remains.
 
 Rollback:
@@ -615,11 +619,12 @@ after each decision:
 1. **Authority boundary — accepted 2026-07-29**: the kernel owns execution
    mechanics and its durable state contract, while host stores and scientific
    publications retain their established authority.
-2. **Repository scope and Workflow Ledger decomposition**: should repositories
-   follow durable coordinator boundaries, while the current `WorkflowLedger`
-   gives its generic tables and transitions to the shared execution
-   repository and retains only workflow artifacts and Volume lifecycle?
-   Recommendation: yes.
+2. **Repository scope and Workflow Ledger decomposition — accepted
+   2026-07-29**: repositories follow durable coordinator boundaries. The
+   physical workflow ledger remains, but its generic tables and transitions
+   move to the shared execution repository. After migration, the
+   `WorkflowLedger` facade is removed and workflow code retains a narrow
+   Workflow Artifact Store and Volume lifecycle.
 3. **Repository implementation**: should the kernel provide one reusable,
    embeddable SQLite execution repository for those durable coordinators?
    Recommendation: yes.

@@ -5,11 +5,11 @@ Status: proposed.
 Biomodals should introduce a provider-aware execution kernel under
 `biomodals.execution` for DAG traversal, task readiness, paid-call attachment
 and recovery, cache-observation policy, batching, and resource budgets. The
-kernel should use persistence and workload adapters instead of replacing
-`ServiceStore`, `WorkflowLedger`, or AlphaFold3's claim and publication
-records. A service Job remains the user-facing admission and result envelope;
-workflows retain per-run ledgers; workload publications remain authoritative
-for scientific cache completion.
+kernel should embed its execution tables into host-owned databases without
+replacing `ServiceStore` domain state, workflow artifact records, or
+AlphaFold3's claims and publications. A service Job remains the user-facing
+admission and result envelope; workflows retain the physical per-run ledger;
+workload publications remain authoritative for scientific cache completion.
 
 The authority boundary was accepted on 2026-07-29. “Without centralizing
 workload state” does not mean that execution state may remain ephemeral. The
@@ -33,6 +33,11 @@ tables and transitions inside that file. Workflow code should retain only its
 artifact records, run-directory lifecycle, and Modal Volume synchronization.
 The current `WorkflowLedger` may serve as a compatibility facade during
 migration, then shrink into a workflow run store or be removed.
+
+The repository scope and ledger decomposition were accepted on 2026-07-29.
+The accepted end state removes the compatibility facade: the workflow runtime
+composes the shared execution repository and a narrow Workflow Artifact Store
+over the same connection. The physical `ledger.sqlite3` file remains.
 
 ## Considered options
 

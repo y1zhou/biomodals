@@ -450,8 +450,16 @@ A Modal-hosted coordinator that owns one workflow run, hosts the workflow runtim
 _Avoid_: workflow node, runner
 
 **Workflow Ledger**:
-A per-run SQLite database written by the workflow orchestrator that records run, node, attempt, remote-call, fan-out task, and artifact state for recovery and manual debugging.
-_Avoid_: scattered JSON state files, worker-owned database
+The physical per-run SQLite database in which a workflow orchestrator hosts
+the shared Execution State Repository alongside workflow-specific artifact
+records.
+_Avoid_: separate workflow execution state machine, worker-owned database
+
+**Workflow Artifact Store**:
+The workflow-specific persistence for artifact manifests, files, node
+inputs, and node outputs, colocated with shared execution tables in the
+Workflow Ledger.
+_Avoid_: execution repository, scientific publication
 
 **Node Placement**:
 The execution location for a workflow node, either inline in the workflow orchestrator or in a separate remote Modal function.
@@ -474,4 +482,5 @@ _Avoid_: temporary scratch, local cache
 - "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for shared child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
 - "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each durable coordinator may persist it separately and **Workload Publications** remain authoritative for scientific completion.
+- "Workflow Ledger" can mean either the physical per-run database or a workflow-specific implementation of execution state. Resolved: it names the physical database; shared execution tables come from the execution kernel, while the **Workflow Artifact Store** owns only workflow artifact records.
 - "positions marked for RFdiffusion to generate scaffolds for" can mean every RFdiffusion output residue or only de novo contig residues. Resolved: use **LigandMPNN Redesign Set** for de novo output residues and exclude copied motif residues.

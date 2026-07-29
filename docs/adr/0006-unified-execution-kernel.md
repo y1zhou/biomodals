@@ -118,13 +118,21 @@ execution repository should own run, node, task, dispatch-batch,
 worker-assignment, and provider-call tables and transitions inside that file.
 It deliberately has no attempt table or attempt foreign key. Workflow code
 should retain only its artifact records, run-directory lifecycle, and Modal
-Volume synchronization. The current `WorkflowLedger` may serve as a
-short-lived migration facade between incremental commits, then be removed.
+Volume synchronization.
 
 The repository scope and ledger decomposition were accepted on 2026-07-29.
-The accepted end state removes the migration facade: the workflow runtime
-composes the shared execution repository and a narrow Workflow Artifact Store
-over the same connection. The physical `ledger.sqlite3` file remains.
+The workflow runtime composes the shared execution repository and a narrow
+Workflow Artifact Store over the same connection. The physical
+`ledger.sqlite3` file remains.
+
+The workflow cutover policy was accepted on 2026-07-29. Kernel modules and
+tests are built beside the unchanged workflow execution implementation. There
+is no `WorkflowLedger` compatibility facade, dual schema, dual write, or
+attempt-preserving adapter. Once the kernel replacement is complete, one
+cutover commit switches the workflow composition root, deletes the old
+execution methods and attempt model, and rejects old unfinished ledgers.
+Rollback reverts that commit and recreates unfinished runs; scientific
+publications remain reusable.
 
 The repository implementation was accepted on 2026-07-29. The first kernel
 uses one concrete `SqliteExecutionRepository` over a host-supplied SQLite

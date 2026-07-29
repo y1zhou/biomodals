@@ -644,19 +644,14 @@ This leaves one SQLite file per workflow run, not an execution database beside
 a workflow database. The file contains shared execution tables and
 workflow-specific artifact tables on the same connection.
 
-During migration, `WorkflowLedger` can be a short-lived facade between
-incremental commits so the runtime does not change in one large step. It must
-not become a permanent pass-through interface duplicating every execution
-repository method. Once callers use the kernel, either:
-
-- rename the remaining workflow-specific implementation to
-  `WorkflowRunStore`; or
-- delete the facade and let the workflow runtime compose the shared execution
-  repository with a narrow artifact store directly.
-
-The preferred end state is the second option if composition remains readable.
-The deletion test is that removing `WorkflowLedger` must not redistribute
-generic SQL or transition logic back into workflow callers.
+The kernel implementation and its tests are built alongside the current
+workflow runtime, but the current `WorkflowLedger` is never adapted into a
+compatibility facade and never dual-writes the new schema. One direct cutover
+commit switches the workflow composition root to
+`SqliteExecutionRepository` plus a narrow `WorkflowArtifactStore`, deletes the
+old execution methods and attempt model, and rejects old unfinished ledgers.
+The deletion test is that removing the old `WorkflowLedger` class must not
+redistribute generic SQL or transition logic back into workflow callers.
 
 The service follows the same pattern. The user-facing Service Job points to an
 Execution Run. `job_operations`, persisted `JobOperationState`, and persisted
@@ -834,27 +829,27 @@ Each fault test uses a deterministic injected failure point and asserts both
 the durable rows and the number of fake paid calls. Merely asserting a final
 status is insufficient.
 
-### Phase 1 — repair recovery semantics in place
+### Phase 1 — repair independent safety semantics
 
 Deliverables:
 
 - map availability-check exceptions to `unknown`;
-- preclaim workflow remote submission and preserve submission outcome unknown;
-- finalize a successful workflow call, processed result, artifacts, Task, and
-  Node under one recoverable synchronization protocol;
 - stop cancelling attached child calls from the orchestrator exit hook and
   checkpoint best-effort instead;
-- add explicit tests that no restart automatically duplicates uncertain work.
+- add characterization tests for the current preclaim, attachment,
+  finalization, and interruption gaps without adding new legacy execution
+  state.
 
 Exit gate:
 
-- existing workflow APIs pass, and every injected crash has a deterministic,
-  cost-safe recovery outcome.
+- cache-check failures cannot authorize work;
+- orchestrator shutdown cannot cancel child calls without explicit user
+  cancellation;
+- fault tests describe the required kernel behavior before extraction.
 
 Rollback:
 
-- revert the implementation commit. Unfinished ledgers created with the
-  reverted schema may be recreated; they need not remain readable.
+- revert either focused safety commit; neither changes the ledger schema.
 
 ### Phase 2 — extract immutable plans and graph algorithms
 
@@ -862,9 +857,8 @@ Deliverables:
 
 - add immutable `ExecutionPlan`, `NodePlan`, and dependency validation;
 - extract deterministic readiness and terminal-reachability functions;
-- adapt the pure GROMACS operation plan and workflow builder to the same graph
-  representation, replacing internal types directly where that simplifies the
-  interface;
+- build pure GROMACS and workflow adapters beside their current execution
+  paths and prove graph equivalence without switching either composition root;
 - keep dynamic work represented as a Node-owned Task factory, not mutable DAG
   vertices.
 
@@ -878,58 +872,139 @@ Rollback:
 
 - revert the implementation commit; do not retain a runtime selection flag.
 
-### Phase 3 — extract the provider-call state machine
+### Phase 3 — build durable single-submission state
 
 Deliverables:
 
-- move the proven preclaim/attach/recover transitions into
-  `SqliteExecutionRepository` and behind the provider port;
+- add `SqliteExecutionRepository` tables and transitions for Execution Runs,
+  Nodes, Tasks, and Provider Calls over a host-supplied SQLite connection;
+- persist immutable Task plans and enforce one submission claim per Task per
+  Execution Run;
+- implement preclaim, spawn, attachment, observation, collection,
+  cancellation, and unknown-outcome recovery behind the provider port;
 - use `ModalJobSubmitter` as the behavioral baseline for uncertain spawn;
-- add thin async service and sync workflow coordinator loops;
-- replace service `job_operations` and workflow `remote_calls` with shared
-  execution tables as each host migrates;
-- add the explicit offline service-state transition command;
 - expose a common read-only execution snapshot for logs and diagnostics.
 
 Exit gate:
 
-- GROMACS API timelines, log call IDs, cancellation, and result archives are
-  unchanged;
-- workflow call recovery and cancellation are unchanged or safer;
-- all provider behavior is exercised through fakes in CI.
+- every paid-call transition and crash boundary is exercised through fakes in
+  CI;
+- database constraints reject a second submission for the same Task;
+- provider redelivery retains one Task and Provider Call identity;
+- no production host has switched to the new repository yet.
 
 Rollback:
 
-- revert the host migration commit. Do not retain a runtime migration switch
-  after a host uses the shared repository.
+- revert the kernel commits; no host schema or runtime path has changed.
 
-### Phase 4 — add durable Tasks, batches, and budgets
+### Phase 4 — add dispatch, budgets, and remote coordination
 
 Deliverables:
 
-- persist immutable Task plans before submission;
-- add explicit Task-to-call and Task-to-assignment links with database
-  constraints enforcing at most one submission per Task per Execution Run;
+- add Dispatch Batches, Worker Assignments, idempotent claim requests, and
+  explicit Task-to-call or Task-to-assignment links;
 - move bounded batching and permit accounting into execution internals;
-- make PPIFlow the first runtime-discovered Task consumer;
-- represent partial candidate outcomes without making a Node successful by
-  implication;
 - persist coordinator-scoped permit allocations and recovery without adding a
-  distributed lease abstraction.
+  distributed lease abstraction;
+- add reusable sync and async coordinator loops;
+- add the run-scoped Modal coordinator binding with one-container routing,
+  serialized SQLite and Volume checkpoints, detached execution, lifecycle
+  methods, and preemption recovery;
+- keep provider workers behind idempotent claim and completion methods and
+  prevent them from opening SQLite directly.
 
 Exit gate:
 
-- interrupted PPIFlow stages reuse validated candidate publications and do not
-  repeat uncertain calls;
-- stable candidate IDs and manifests are byte- or semantic-equivalent;
-- resource tests prove that one call batch consumes the intended permits.
+- direct, batched, and pull-worker fake workloads obey the same
+  single-submission rule;
+- lost claim and completion responses replay idempotently;
+- resource tests prove that one call batch consumes the intended permits;
+- remote-coordinator assumptions pass a manual Modal smoke test before host
+  adoption.
 
 Rollback:
 
-- revert the implementation commit and recreate incompatible unfinished
-  workflow runs. Keep validated app-owned publications for reuse.
+- revert the kernel dispatch and remote-binding commits; no host has cut over.
 
-### Phase 5 — adapt AlphaFold3 without changing scientific authority
+### Phase 5 — cut over fixed consumers and deployed CLI runs
+
+Deliverables:
+
+- migrate GROMACS service execution from `job_operations` to the shared
+  repository while preserving its fixed parallel DAG, stage projection, logs,
+  cancellation, and result archive;
+- add the explicit offline service-state transition that preserves users and
+  configuration while recreating Job and execution state;
+- update OpenAPI and frontend-facing service projections with the backend
+  cutover;
+- switch the workflow composition root in one commit to
+  `SqliteExecutionRepository` plus `WorkflowArtifactStore`;
+- in that same workflow cutover, delete the old `WorkflowLedger` execution
+  methods, attempt fields and tables, generic execution policy, and
+  attempt-based paths without a facade or dual write;
+- preserve workflow DAG hashes, artifact contracts, Volume synchronization,
+  display, and scientific publication reuse;
+- make `biomodals app run` and `biomodals workflow run` resolve an exact
+  deployed coordinator version, start a remote ledger and detached coordinator
+  loop, and create no local execution database;
+- accept an explicit `--version` or resolve `modal app history --json` once,
+  then persist and use only the exact Deployment Identity;
+- add shared `biomodals run status`, `cancel`, `resume`, and `restart`
+  lifecycle commands using explicit deployment and run flags;
+- keep local input staging, result retrieval, dry-run, help, and explicit
+  source-backed development mode in thin CLI clients.
+
+Exit gate:
+
+- GROMACS API behavior, OpenAPI, timelines, log IDs, cancellation, and archives
+  are unchanged except for the intentional execution schema replacement;
+- the workflow runtime contains no attempt state or compatibility facade and
+  passes DAG, recovery, artifact, and publication-equivalence tests;
+- a second CLI process can address the same version-pinned run, while
+  development mode clearly lacks cross-invocation recovery;
+- restart creates a Successor Execution Run and cannot replace active or
+  unknown predecessor work;
+- manual Modal tests validate deployment lookup, run-scoped routing,
+  preemption recovery, and terminal ledger reopening.
+
+Rollback:
+
+- revert service, workflow, and CLI cutover commits independently;
+- recreate incompatible unfinished Job or workflow execution state while
+  preserving scientific publications and app-owned outputs.
+
+### Phase 6 — adopt runtime-discovered PPIFlow Tasks
+
+Deliverables:
+
+- translate each fixed PPIFlow stage into an Execution Node whose Task factory
+  discovers stable candidate Tasks at runtime;
+- retain candidate IDs, manifests, stage-specific inputs, joins, attrition,
+  and result ordering as workload-owned contracts;
+- use Task and batch state rather than bare `bounded_map` orchestration for
+  durable candidate scheduling;
+- represent per-candidate outcomes and configured aggregation policy without
+  inferring Node success from a partial batch;
+- apply the existing run-level concurrency configuration through kernel
+  permits;
+- reuse validated candidate publications after interruption or in a Successor
+  Execution Run.
+
+Exit gate:
+
+- candidate identities and manifests remain byte- or semantic-equivalent;
+- interrupted stages do not repeat uncertain calls;
+- partial candidate failures retain the same successful publications and
+  deterministic joins;
+- PPIFlow becomes the first production proof of runtime Task discovery without
+  a mutable DAG.
+
+Rollback:
+
+- revert the PPIFlow adapter commit; validated candidate publications remain
+  reusable and no scientific format changes.
+
+### Phase 7 — adapt AlphaFold3 without changing scientific authority
 
 Model the existing pipeline rather than replacing it:
 
@@ -954,7 +1029,7 @@ Deliverables:
 - persist the one-call-to-many-seed mapping and per-seed outcomes;
 - make a Successor Execution Run the only retry path while retaining current
   scientific request and workload run identities;
-- route the Local Entrypoint through a remote run-scoped coordinator;
+- route the Local Entrypoint through its deployment-local remote coordinator;
 - let service and workflow hosts execute the same plan through their parent
   coordinator without creating a nested ledger;
 - preserve current CLI inputs, outputs, and direct Child App Call behavior.
@@ -965,160 +1040,58 @@ Exit gate:
   paths, seed reuse, ranking order, and retrieval archives remain unchanged;
 - an overlapping seed request performs only its missing seed work;
 - partial search and seed failures preserve the same reusable publications;
-- no automatic paid retry is introduced.
+- no automatic paid retry or nested execution ledger is introduced.
 
 Rollback:
 
-- adapters can return control to the existing pure pipelines because no marker
-  or publication format changes in this phase.
+- revert the AlphaFold3 adapters; marker and publication formats require no
+  reverse migration.
 
-### Phase 6 — replace generic App-Local Scheduler mechanics
+### Phase 8 — replace app-local schedulers and remove duplication
 
-Adopt two concrete dispatch adapters only after durable Tasks and batches are
-proven:
+Adopt two concrete dispatch adapters only after the kernel and dynamic Task
+model are proven:
 
 1. BoltzGen exercises bounded direct fan-out, where each workload run key is
    one Task and one GPU Provider Call.
-2. Rosetta exercises a SQLite-backed pull worker pool, where several Provider
-   Calls claim Task microbatches from one Dispatch Batch through the
-   coordinator.
+2. Rosetta exercises the SQLite-backed pull worker pool, where several
+   Provider Calls claim Task microbatches from one Dispatch Batch.
 
 Deliverables:
 
-- add a reusable direct-fan-out adapter that admits ready Tasks as permits
-  become available;
-- add a reusable run-scoped remote coordinator and pull-work adapter for
-  idempotent claims, worker-call attachment, and outcome reconciliation;
-- keep only workload hooks, Modal decorators, and Volume bindings in each
-  deployment's thin Coordinator Adapter;
-- bind each Direct CLI App Run to a distinct App Run Ledger in the app's
-  configured durable Volume;
-- add durable Worker Assignments so lost claim responses are harmless and
-  preempted provider inputs recover their current Tasks;
-- keep SQLite single-writer: workers return outcome records or publish
-  outputs, and only the coordinator commits execution transitions;
-- remove BoltzGen's generic `bounded_map` orchestration and use Task state to
-  prevent duplicate work within one coordinator;
-- retain or replace BoltzGen's output lock only as a cross-coordinator
-  publication claim;
-- remove Rosetta's generic queue and worker-pool lifecycle from workload code
-  and use ready Task rows as the remote work-stealing queue;
-- preserve deterministic result ordering and existing CLI behavior.
+- adapt BoltzGen to reusable bounded direct fan-out and Task state;
+- retain its output lock only if needed as a cross-coordinator publication
+  claim, never as the scheduler queue;
+- adapt Rosetta to ready Task rows, idempotent claims, durable Worker
+  Assignments, and call-bound work recovery;
+- remove Modal Queue, Modal Dict, output-file scheduling, and generic
+  worker-pool lifecycle from execution coordination;
+- preserve workload commands, Task payloads, scientific result validation,
+  deterministic output ordering, and CLI behavior;
+- remove GROMACS-local readiness duplication, workflow-specific paid-call
+  transitions, PPIFlow bare concurrency scheduling, AlphaFold3 generic bounded
+  outcome loops, BoltzGen incomplete-run fan-out, Rosetta queue orchestration,
+  and repeated claim mechanics only after their replacements pass equivalence
+  tests;
+- publish the final supported execution inspection surface and delete stale
+  adapters, migration notes, and dead scheduler helpers.
 
 Exit gate:
 
-- interrupted BoltzGen runs reuse validated completed runs and do not duplicate
-  an uncertain GPU call;
-- Rosetta workers balance Tasks dynamically, and every Task is reconciled
-  independently after partial worker failure;
-- worker exit callbacks can be dropped without changing any recovery result;
-- a coordinator restart reconstructs permits, batches, and attached worker
-  calls from the SQLite ledger;
-- workload modules contain scientific execution and validation rather than
-  generic concurrent scheduling loops.
+- interrupted BoltzGen runs reuse validated publications without duplicating an
+  uncertain GPU call;
+- Rosetta workers balance Tasks dynamically and reconcile each Task after
+  partial worker failure;
+- worker exit callbacks can be dropped without changing recovery;
+- each execution concern has one implementation or a documented
+  workload-specific reason to differ;
+- no compatibility facade, migration switch, dead adapter, Modal queue, or
+  duplicate generic scheduler remains.
 
 Rollback:
 
-- revert each workload-adoption commit independently; validated outputs remain
-  reusable and no publication format changes are required.
-
-### Phase 7 — make WorkflowRuntime a host and remove duplication
-
-Deliverables:
-
-- delegate graph traversal, Task scheduling, call lifecycle, availability
-  policy, and budgets from `WorkflowRuntime` to the execution kernel;
-- retain workflow-specific artifact materialization, Volume synchronization,
-  display, run layout, and Workflow Artifact Store;
-- migrate remaining durable fan-out consumers;
-- remove the temporary `WorkflowLedger` migration facade after callers
-  compose the shared execution repository and Workflow Artifact Store;
-- delete the legacy `attempts` table, `current_attempt_id`, attempt foreign
-  keys, attempt counters, generic `NodeExecutionPolicy`, attempt status fields,
-  and `attempts/<attempt-id>/` path segment;
-- key node and Task staging paths directly by their stable identities;
-- remove replaced coordinator loops and stale planned documentation;
-- publish the final supported execution inspection surface.
-
-Likely deletion candidates, only after equivalence:
-
-- GROMACS-local readiness and all-completed algorithms;
-- workflow-specific paid-call transition logic;
-- AlphaFold3 `_bounded_remote_outcomes` and claimed seed-batch loops;
-- PPIFlow durable candidate scheduling through bare `bounded_map`;
-- BoltzGen incomplete-run fan-out and same-coordinator output locking;
-- Rosetta queue population, worker-pool sizing, and cleanup orchestration;
-- repeated generation-claim mechanics that have converged on the common port.
-
-Exit gate:
-
-- each concern has one implementation or a documented workload-specific
-  reason to differ;
-- the physical `ledger.sqlite3` contains shared execution tables and
-  workflow-specific artifact tables without a second execution state machine;
-- no `WorkflowLedger` migration facade remains;
-- no migration switch or dead adapter remains.
-
-Rollback:
-
-- phase commits remain independently revertible; scientific publications
-  require no reverse migration. Old local databases and unfinished workflow
-  runs may require explicit recreation.
-
-### Phase 8 — switch the CLI launch contract
-
-Deliverables:
-
-- make `biomodals app run` and `biomodals workflow run` resolve the
-  deployment-local coordinator at an exact app or workflow version;
-- accept an explicit `--version` override or parse `modal app history --json`
-  once to select the current deployed version;
-- preflight and persist the resulting Environment, deployment name, and
-  numeric version before admitting any Task;
-- use only exact versioned Function and Cls lookups after resolution;
-- retain workload-specific argument parsing and local input staging in thin
-  Local Entrypoints without creating local execution state;
-- submit one detached coordinator loop per remote top-level run so progress
-  does not depend on the CLI process remaining connected;
-- add an explicit development mode for source-backed ephemeral execution and
-  label its lack of cross-invocation resume;
-- keep help, shell, and workflow dry-run behavior local and free of paid calls;
-- print the Execution Run ID, Workload Run Key when present, Deployment
-  Identity, and coordinator FunctionCall ID needed for inspection and recovery;
-- add shared `biomodals run status`, `cancel`, `resume`, and `restart`
-  commands backed by the standard deployment-local `ExecutionCoordinator`;
-- require `--environment`, `--deployment-name`, `--deployment-version`, and
-  `--execution-run-id` on lifecycle commands, with
-  `--coordinator-call-id` as an optional observation hint;
-- do not add an encoded reference format, reference parser, or local registry;
-- update CLI command builders, help, README examples, and characterization
-  tests together.
-
-Exit gate:
-
-- default app and workflow runs never place their coordinator in an ephemeral
-  deployment;
-- a second CLI process can address the same run-scoped coordinator using the
-  recorded Deployment Identity and Execution Run ID;
-- app and workflow fields exercise the same generic lifecycle commands;
-- mismatched deployment or run fields fail before state mutation;
-- a rolling deployment after admission cannot change any Provider Call target;
-- unavailable or unretained versions fail before new paid work rather than
-  falling back to a floating latest handle;
-- attached calls from a now-unavailable deployment remain observable by
-  FunctionCall ID and their publications are still validated;
-- an explicit restart creates a linked Successor Execution Run and schedules
-  only Tasks whose publications remain missing and whose predecessor ownership
-  is conclusively terminal;
-- development mode remains useful for source iteration but cannot be mistaken
-  for a resumable deployed run;
-- dry-run and help start no remote execution.
-
-Rollback:
-
-- restore the old ephemeral command builders only before users depend on the
-  new durable CLI run contract. Remote ledgers and publications need no
-  conversion.
+- revert each workload-adoption commit independently; validated publications
+  remain reusable and require no reverse migration.
 
 ## Suggested incremental commits
 
@@ -1126,21 +1099,20 @@ Use small commits in dependency order:
 
 1. `docs: plan unified task scheduler`
 2. `workflow: fix availability uncertainty`
-3. `workflow: harden call recovery`
+3. `workflow: preserve calls on exit`
 4. `execution: add plans and graph`
-5. `service: adopt execution graph`
-6. `workflow: adopt execution graph`
-7. `execution: add call lifecycle`
-8. `service: adopt call lifecycle`
-9. `workflow: adopt call lifecycle`
-10. `execution: add durable task state`
-11. `ppiflow: adopt durable task fanout`
-12. `alphafold3: adopt execution adapters`
-13. `execution: add dispatch coordinators`
+5. `execution: add durable task state`
+6. `execution: add call lifecycle`
+7. `execution: add dispatch coordinators`
+8. `service: transition execution state`
+9. `service: adopt execution kernel`
+10. `cli: target deployed coordinators`
+11. `workflow: cut over execution kernel`
+12. `ppiflow: adopt durable task fanout`
+13. `alphafold3: adopt execution adapters`
 14. `boltzgen: adopt direct task fanout`
 15. `rosetta: adopt sqlite work pool`
-16. `cli: target deployed coordinators`
-17. `execution: remove duplicate schedulers`
+16. `execution: remove duplicate schedulers`
 
 Split a commit further whenever its predecessor and replacement cannot be
 reviewed side by side. Never combine an AlphaFold3 scientific contract change
@@ -1175,46 +1147,30 @@ prek run --files \
 
 Rollback: revert the commit; it has no schema or durable-state effect.
 
-#### `workflow: harden remote call recovery`
+#### `workflow: preserve calls on exit`
 
 Files:
 
-- `src/biomodals/workflow/core/ledger.py`
-- `src/biomodals/workflow/core/_runtime/remote_calls.py`
-- `src/biomodals/workflow/core/_runtime/node_runner.py`
 - `src/biomodals/workflow/core/orchestrator.py`
-- `tests/workflow/test_ledger.py`
-- `tests/workflow/test_runtime.py`
 - `tests/workflow/test_orchestrator.py`
 
 Change:
 
-- record a durable submission identity before invoking the provider;
-- attach the returned call ID to that identity;
-- leave an unattached or interrupted submission explicitly outcome-unknown;
-- finalize the processed result, artifacts, Task, Node, and Provider Call in
-  one host transaction and Volume synchronization boundary;
-- replace exit-time child cancellation with best-effort drain and checkpoint;
-- remove the earlier transition that marks a call succeeded before its result
-  is recoverable;
-- add the fault-injection cases from the Phase 0 inventory.
+- remove exit-time child cancellation from the Modal lifecycle hook;
+- retain runtime closure and the best-effort Volume commit;
+- leave explicit user cancellation behavior unchanged;
+- prove repeated exit-hook calls never cancel attached children.
 
 Verification:
 
 ```text
-uv run pytest tests/workflow/test_ledger.py tests/workflow/test_runtime.py
+uv run pytest tests/workflow/test_orchestrator.py
 prek run --files \
-  src/biomodals/workflow/core/ledger.py \
-  src/biomodals/workflow/core/_runtime/remote_calls.py \
-  src/biomodals/workflow/core/_runtime/node_runner.py \
   src/biomodals/workflow/core/orchestrator.py \
-  tests/workflow/test_ledger.py \
-  tests/workflow/test_runtime.py \
   tests/workflow/test_orchestrator.py
 ```
 
-Rollback: revert the commit and recreate any unfinished workflow ledger
-written by it. No compatibility reader is required.
+Rollback: revert the commit; it has no schema effect.
 
 ## Verification matrix
 
@@ -1293,8 +1249,7 @@ after each decision:
 2. **Repository scope and Workflow Ledger decomposition — accepted
    2026-07-29**: repositories follow durable coordinator boundaries. The
    physical workflow ledger remains, but its generic tables and transitions
-   move to the shared execution repository. After migration, the
-   `WorkflowLedger` facade is removed and workflow code retains a narrow
+   move to the shared execution repository. Workflow code retains a narrow
    Workflow Artifact Store and Volume lifecycle.
 3. **Repository implementation — accepted 2026-07-29**: the kernel provides
    one concrete `SqliteExecutionRepository` over a host-supplied connection
@@ -1425,6 +1380,12 @@ after each decision:
     output, and the `attempts/<attempt-id>/` path layer. Task, Node, Provider
     Call, and artifact records retain the one result, error, timing, and output
     state needed by the single-submission model.
+28. **Direct workflow cutover — accepted 2026-07-29**: build and test the
+    kernel beside the unchanged workflow execution implementation, then switch
+    the workflow composition root in one cutover commit. Do not add a
+    `WorkflowLedger` compatibility facade, dual schema, dual writes, or
+    attempt-preserving adapter. Delete the replaced execution implementation
+    and reject old unfinished ledgers at cutover.
 
 ## Definition of ready for implementation
 

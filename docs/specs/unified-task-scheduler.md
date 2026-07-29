@@ -194,30 +194,45 @@ consumer with an async abstraction or running nested event loops.
 
 ### Durable execution state
 
-The kernel requires an Execution State Repository; an in-memory repository is
-only a test implementation. Centralization applies to the state model,
-transition rules, and persistence operations, not to one database process or
-file for all Biomodals activity.
+Every coordinator that promises restart or recovery requires an Execution
+State Repository. Centralization applies to the state model, transition rules,
+and persistence operations, not to one database process or file for all
+Biomodals activity. A deliberately non-resumable one-shot entrypoint may use a
+transient repository, but it must not present transient state as durable.
 
-The recommended implementation is one reusable SQLite repository for
-single-writer coordinators, embedded as separate instances:
+Repository scope follows the coordinator boundary:
 
-| Host | Proposed location | Execution authority | Separate authority |
+| Coordinator | Repository scope | Execution authority | Separate authority |
 | --- | --- | --- | --- |
-| API service | Execution tables in `service.sqlite3` | Job-owned Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, admission, runtime configuration, and result cache remain service-owned |
-| Workflow | Execution tables in the per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
-| App coordinator | Per-run coordinator repository at a workload-selected durable location | Invocation Tasks, Task Attempts, batches, and calls | AlphaFold3 claims and validated publications remain scientific authority |
+| API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Job-owned Nodes, Tasks, Task Attempts, call IDs, and observed state | Users, admission, runtime configuration, and result cache remain service-owned |
+| Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, Task Attempts, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
+| Nested app coordinator | None for a simple app call; a durable repository only when the app independently schedules recoverable child work | Nested Tasks, Task Attempts, batches, and child calls | AlphaFold3 claims and validated publications remain scientific authority |
 
-Provider workers do not write SQLite. A single coordinator applies transitions
-and commits them using its host's transaction and Volume synchronization
+An ordinary API request therefore updates only the service database. It does
+not create a database for the called app. If the service starts a remote
+workflow orchestrator, the service repository tracks that child coordinator
+call and the workflow's existing per-run ledger tracks the internal DAG. Those
+repositories describe different scheduling levels; they do not duplicate the
+same Tasks.
+
+Likewise, a simple direct app invocation does not create a SQLite file merely
+because it uses a kernel plan or provider adapter. A complex app such as
+AlphaFold3 needs another durable repository only if its app-owned coordinator
+promises restartable tracking of its internal search and seed Tasks. If the
+service directly owns those Tasks instead, they live only in the service
+repository.
+
+Provider workers do not write SQLite. A single coordinator applies
+transitions and commits them using its transaction and Volume synchronization
 boundary. Modal Dict remains appropriate for distributed writer claims; it is
 not a replacement for the coordinator's attempt and call ledger.
 
-The common repository should be embeddable into a host-owned transaction. That
-lets service admission and initial execution state be committed atomically,
-while a workflow can commit execution rows together with its Volume-backed
-ledger. If a host cannot share a transaction, its adapter must implement the
-same prepare/publish/finalize recovery protocol.
+The recommended implementation is a reusable SQLite repository for
+single-writer durable coordinators. It should be embeddable into a host-owned
+transaction. That lets service admission and initial execution state be
+committed atomically, while a workflow can commit execution rows together with
+its Volume-backed ledger. If a host cannot share a transaction, its adapter
+must implement the same prepare/publish/finalize recovery protocol.
 
 ### Paid-call lifecycle
 
@@ -557,19 +572,23 @@ after each decision:
 1. **Authority boundary — accepted 2026-07-29**: the kernel owns execution
    mechanics and its durable state contract, while host stores and scientific
    publications retain their established authority.
-2. **Repository implementation**: should the kernel provide one reusable,
-   embeddable SQLite execution repository, instantiated separately by service,
-   workflow, and app coordinators? Recommendation: yes.
-3. **Surface stability**: should `biomodals.execution` be a supported Python
+2. **Repository scope**: should repositories follow durable coordinator
+   boundaries: one database for the API service, the existing per-run database
+   for each workflow orchestrator, and no app-owned database unless an app
+   independently schedules recoverable nested Tasks? Recommendation: yes.
+3. **Repository implementation**: should the kernel provide one reusable,
+   embeddable SQLite execution repository for those durable coordinators?
+   Recommendation: yes.
+4. **Surface stability**: should `biomodals.execution` be a supported Python
    package with a deliberately small public surface, while adapters remain
    internal until two consumers use them? Recommendation: yes.
-4. **Distributed resource limits**: should the first extraction define a lease
+5. **Distributed resource limits**: should the first extraction define a lease
    port but defer a Modal Dict-backed global lease implementation?
    Recommendation: yes, until a concrete cross-container limit requires it.
-5. **Migration scope**: should service database changes be additive and
+6. **Migration scope**: should service database changes be additive and
    migratable while in-progress workflow runs keep their documented restart
    policy? Recommendation: yes.
-6. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
+7. **First dynamic consumer**: should PPIFlow adopt durable Tasks before
    AlphaFold3? Recommendation: yes; it exercises fan-out with lower scientific
    and cache risk.
 
@@ -578,7 +597,7 @@ after each decision:
 Implementation begins only when:
 
 - ADR 0006 is accepted;
-- the six decision gates are resolved;
+- the seven decision gates are resolved;
 - the proposed execution terms are reconciled into `CONTEXT.md`;
 - Phase 0 compatibility fixtures and fault-injection points are enumerated as
   test cases;

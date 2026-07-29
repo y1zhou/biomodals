@@ -36,8 +36,8 @@ _Avoid_: Task, workflow node, app
 
 **Execution State Repository**:
 A durable record of Execution Runs, Nodes, Tasks, Task Attempts, and Provider
-Calls governed by the execution kernel's transition contract. Each host may
-use a separate physical repository.
+Calls governed by the execution kernel's transition contract. Each durable
+coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
 **Workload Publication**:
@@ -473,5 +473,5 @@ _Avoid_: temporary scratch, local cache
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.
 - "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Task Budget** for shared child-work limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
-- "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each host may persist it separately and **Workload Publications** remain authoritative for scientific completion.
+- "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each durable coordinator may persist it separately and **Workload Publications** remain authoritative for scientific completion.
 - "positions marked for RFdiffusion to generate scaffolds for" can mean every RFdiffusion output residue or only de novo contig residues. Resolved: use **LigandMPNN Redesign Set** for de novo output residues and exclude copied motif residues.

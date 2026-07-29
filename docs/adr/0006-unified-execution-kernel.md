@@ -19,6 +19,13 @@ instances implement that contract so an API service, a per-run workflow, and
 an app coordinator do not depend on one shared database. The exact reusable
 repository implementation remains a pending design decision.
 
+Repository scope follows the coordinator boundary, not each API request,
+application call, or Modal function. The API service uses one long-lived
+database for all service-owned execution runs. A workflow keeps its existing
+per-run ledger because its remote workflow orchestrator is a separate durable
+coordinator. An app needs another repository only if it independently owns
+nested, recoverable scheduling; simple app calls do not create databases.
+
 ## Considered options
 
 - Expanding `WorkflowRuntime` into the universal scheduler would reuse its DAG

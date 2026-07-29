@@ -13,6 +13,19 @@ One invocation of an immutable execution plan, whether started by an API Job,
 a workflow, or an app entrypoint.
 _Avoid_: API Job, workflow definition
 
+**Deployment-Blocked Run** [planned]:
+A terminal, incomplete Execution Run whose immutable Deployment Identity is no
+longer available for coordinator or Provider Call lookup. It remains
+inspectable but admits no new work and cannot change deployment in place.
+_Avoid_: state unknown, cancelled run, resumable run
+
+**Successor Execution Run** [planned]:
+A new Execution Run created by an explicit restart of a terminal or
+Deployment-Blocked Run. It records its predecessor, uses a newly resolved
+Deployment Identity, revalidates Workload Publications, and schedules only
+missing work.
+_Avoid_: in-place migration, Task Attempt, provider retry
+
 **Execution Node**:
 A fixed semantic step in an execution DAG that may discover one or more Tasks
 when it becomes ready.

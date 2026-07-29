@@ -102,6 +102,8 @@ These existing decisions remain binding during the refactor:
   development mode without cross-invocation resume.
 - A CLI version override is optional. Without one, deployment history is
   resolved once and the resulting exact version is persisted before work.
+- An incomplete run never changes Deployment Identity. If its version becomes
+  unavailable, an explicit restart creates a linked successor run.
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Child App Calls use their service, workflow, or app-run parent's execution
@@ -170,6 +172,13 @@ Tasks. Repeating its stable request ID returns the same Worker Assignments.
 
 **Deployment Identity** is the Modal Environment, deployed app or workflow
 name, and exact numeric deployment version fixed before run admission.
+
+**Deployment-Blocked Run** is a terminal, incomplete run whose Deployment
+Identity is unavailable. It remains inspectable and admits no new work.
+
+**Successor Execution Run** is a new, explicitly authorized run linked to a
+terminal predecessor. It uses a new Deployment Identity and reuses only
+validated Workload Publications.
 
 **Publication** is workload-owned durable evidence that a Task's scientific
 output is complete. The kernel records the observation but does not prescribe
@@ -405,6 +414,13 @@ This allows a large fan-out run to retain all successful results and rerun only
 its failed remainder. A local, non-provider Task may opt into a separate
 bounded automatic retry policy declared in its immutable plan.
 
+A deployment restart is different from a successor Task Attempt. When the
+pinned Deployment Identity is unavailable, the predecessor Execution Run
+becomes Deployment-Blocked and immutable. An explicit restart builds a new
+plan under a new Deployment Identity, records the predecessor Run ID, and
+revalidates the same workload publications before creating Tasks. It never
+copies mutable attempt or permit state into the successor.
+
 An exit hook may commit workload checkpoints and emit an advisory
 `interrupted` event containing the call, slot, and Task IDs. The coordinator
 does not treat receipt as failure, and correctness does not depend on receipt.
@@ -428,6 +444,7 @@ Execution tables may store only data needed to reconstruct and manage actual
 work:
 
 - stable run, node, task, attempt, and call identifiers;
+- an optional predecessor Run ID for explicit restart lineage;
 - the immutable Deployment Identity used to recover provider calls;
 - immutable plan and task fingerprints;
 - dependency edges and legal execution states;
@@ -718,9 +735,10 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
-| `tests/execution/test_ownership.py` | Same-input replacement retains ownership; active or unknown predecessor blocks; only terminal predecessor permits a successor |
-| `tests/execution/test_dispatch.py` | Duplicate and lost queue delivery, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
+| `tests/execution/test_remote_coordinator.py` | Duplicate run, claim, and completion commands are idempotent; replacement reloads checkpoints; different Run IDs remain isolated |
+| `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner succession, and unknown-owner blocking |
 | `tests/execution/test_retry.py` | Safe redelivery stays in one attempt; terminal paid failure needs later authorization; resume reuses valid publications |
+| `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; unavailable versions block; restart creates a linked run and reuses publications |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task Attempt, Node, and Provider Call finalize atomically |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
@@ -984,6 +1002,10 @@ Exit gate:
 - a rolling deployment after admission cannot change any Provider Call target;
 - unavailable or unretained versions fail before new paid work rather than
   falling back to a floating latest handle;
+- attached calls from a now-unavailable deployment remain observable by
+  FunctionCall ID and their publications are still validated;
+- an explicit restart creates a linked Successor Execution Run and schedules
+  only Tasks whose publications remain missing;
 - development mode remains useful for source iteration but cannot be mistaken
   for a resumable deployed run;
 - dry-run and help start no remote execution.
@@ -1129,6 +1151,7 @@ authorized smoke test after local and CI gates pass.
 | One coordinator must understand every workload | Ship a thin binding with each app or workflow deployment; keep shared mechanics in the kernel |
 | Latest deployment changes between CLI calls | Resolve history once, persist the exact Deployment Identity, and use only versioned handles |
 | Version-pinned lookup is unsupported or expired | Preflight workspace support and exact availability; fail closed with the recorded identity |
+| A newer deployment mutates an old run | Make Deployment Identity immutable; create a linked successor after publication revalidation |
 | Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
@@ -1236,9 +1259,14 @@ after each decision:
     `modal app history --json` once and pins the current deployed version.
     Environment, deployment name, and numeric version are preflighted and
     persisted before admission; later lookups never float to latest.
-19. **Expired deployment recovery — pending**: define whether an incomplete
-    run whose pinned version leaves Modal's retention window fails closed or
-    may resume in place under a newer deployment.
+19. **Expired deployment recovery — accepted 2026-07-29**: an Execution Run
+    never changes Deployment Identity. Existing calls remain observable by ID.
+    An incomplete run with an unavailable version becomes Deployment-Blocked.
+    Explicit restart creates a linked Successor Execution Run on a new version,
+    revalidates publications, and schedules only missing Tasks.
+20. **Remote ledger storage — pending**: choose whether Direct CLI App Run
+    ledgers share one execution-state Volume per Modal Environment or live in
+    deployment-specific Volumes.
 
 ## Definition of ready for implementation
 

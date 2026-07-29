@@ -61,6 +61,16 @@ exact version; a missing or unretained version fails closed rather than
 falling back to the latest deployment. Modal support for version-pinned
 lookups is therefore a deployment prerequisite.
 
+The expired-deployment policy was accepted on 2026-07-29. An Execution Run
+never changes its Deployment Identity in place. The kernel continues to
+observe already attached calls by FunctionCall ID and validates any resulting
+Workload Publications. If the pinned coordinator version is unavailable while
+the run remains incomplete, the run becomes Deployment-Blocked and admits no
+new work. This is a terminal run state. An explicit restart creates a
+Successor Execution Run with a newly resolved Deployment Identity and
+predecessor link. It revalidates publications and schedules only missing Tasks;
+the predecessor repository remains read-only and inspectable.
+
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
 execution repository should own run, node, task, attempt, and provider-call
@@ -192,6 +202,9 @@ only for work still missing.
   immediately switching to exact versioned lookups provides the same pin.
 - Calling an unversioned handle throughout a run would be simpler, but Modal
   may route later calls to a newer deployment during a rolling update.
+- Migrating an incomplete run to a newer deployment in place would preserve
+  its Run ID, but would mix plan, adapter, schema, and coordinator versions
+  inside one execution authority.
 - A small execution kernel with one embeddable SQLite implementation and
   explicit provider and workload adapters reuses the common algorithms while
   allowing each host to preserve its transaction and durability model.

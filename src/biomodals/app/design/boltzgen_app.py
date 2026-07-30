@@ -20,8 +20,8 @@ import orjson
 from biomodals.app.config import AppConfig
 from biomodals.app.design.boltzgen.execution_contracts import (
     acquire_output_claim,
+    boltzgen_output_claim_key,
     is_boltzgen_run_complete,
-    release_output_claim,
     write_boltzgen_task_publication,
     write_collection_publication,
 )
@@ -77,6 +77,10 @@ runtime_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+BOLTZGEN_OUTPUT_CLAIMS = modal.Dict.from_name(
+    f"{CONF.name}-output-claims",
+    create_if_missing=True,
+)
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_boltzgen_task"})
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
@@ -422,12 +426,16 @@ def run_boltzgen_task(
         task_fingerprint=task_fingerprint,
     ):
         return str(out_dir)
-    claim_dir = acquire_output_claim(
-        out_path,
+    out_path.mkdir(parents=True, exist_ok=True)
+    acquire_output_claim(
+        BOLTZGEN_OUTPUT_CLAIMS,
+        claim_key=boltzgen_output_claim_key(
+            out_path,
+            output_root=CONF.output_volume_mountpoint,
+        ),
         owner=claim_owner,
         replace_owner=replace_claim_owner,
     )
-    CONF.output_volume.commit()
 
     cmd = [
         "boltzgen",
@@ -460,7 +468,6 @@ def run_boltzgen_task(
             task_fingerprint=task_fingerprint,
         )
         CONF.output_volume.commit()
-        release_output_claim(claim_dir, owner=claim_owner)
     finally:
         CONF.output_volume.commit()
     return str(out_dir)

@@ -10,6 +10,7 @@ import pytest
 from biomodals.app.design import boltzgen_app
 from biomodals.app.design.boltzgen.execution_contracts import (
     acquire_output_claim,
+    boltzgen_output_claim_key,
     is_boltzgen_run_complete,
     write_boltzgen_task_publication,
 )
@@ -27,25 +28,46 @@ class FakeVolume:
         self.reloads += 1
 
 
+class FakeClaimStore:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def get(self, key: str, default=None):
+        return self.values.get(key, default)
+
+    def put(self, key: str, value: str, *, skip_if_exists: bool = False) -> bool:
+        if skip_if_exists and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+
 def test_claim_requires_same_owner_or_explicit_terminal_replacement(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "run"
+    store = FakeClaimStore()
+    claim_key = boltzgen_output_claim_key(run_dir, output_root=tmp_path)
 
-    claim = acquire_output_claim(run_dir, owner="call-1")
-    assert acquire_output_claim(run_dir, owner="call-1") == claim
+    acquire_output_claim(store, claim_key=claim_key, owner="call-1")
+    acquire_output_claim(store, claim_key=claim_key, owner="call-1")
     with pytest.raises(RuntimeError, match="another Provider Call"):
-        acquire_output_claim(run_dir, owner="call-2")
+        acquire_output_claim(store, claim_key=claim_key, owner="call-2")
 
-    assert (
+    acquire_output_claim(
+        store,
+        claim_key=claim_key,
+        owner="call-2",
+        replace_owner="call-1",
+    )
+    with pytest.raises(RuntimeError, match="another Provider Call"):
         acquire_output_claim(
-            run_dir,
-            owner="call-2",
+            store,
+            claim_key=claim_key,
+            owner="call-3",
             replace_owner="call-1",
         )
-        == claim
-    )
-    assert (claim / "owner").read_text() == "call-2"
+    assert not (run_dir / ".lock").exists()
 
 
 def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
@@ -53,6 +75,7 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     volume = FakeVolume()
+    claim_store = FakeClaimStore()
     out_dir = tmp_path / "run"
     monkeypatch.setattr(
         boltzgen_app,
@@ -63,6 +86,7 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
             output_volume_name="outputs",
         ),
     )
+    monkeypatch.setattr(boltzgen_app, "BOLTZGEN_OUTPUT_CLAIMS", claim_store)
 
     def fail(*args, **kwargs):
         del args, kwargs
@@ -79,7 +103,7 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
             task_fingerprint=task_fingerprint,
         )
 
-    assert (out_dir / ".lock" / "owner").read_text() == "call-1"
+    assert "call-1" in claim_store.values.values()
 
     def finish(*args, **kwargs):
         del args, kwargs
@@ -102,7 +126,7 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
         out_dir,
         task_fingerprint="b" * 64,
     )
-    assert not (out_dir / ".lock").exists()
+    assert "call-1" in claim_store.values.values()
 
 
 def test_task_publication_rejects_corrupt_final_evidence(tmp_path: Path) -> None:

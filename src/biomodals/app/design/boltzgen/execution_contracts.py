@@ -10,14 +10,13 @@ from typing import Any
 import orjson
 
 from biomodals.helper.app_run import AppRunLayout
-from biomodals.helper.shell import warmup_directory
 
 COLLECTION_PUBLICATION_SCHEMA_VERSION = 1
 TASK_PUBLICATION_SCHEMA_VERSION = 1
-_CLAIM_OWNER_FILENAME = "owner"
 _TASK_PUBLICATION_PATH = PurePosixPath(".biomodals") / "task.json"
 _FINAL_PDF_PATH = PurePosixPath("final_ranked_designs") / "results_overview.pdf"
 _HASH_CHUNK_BYTES = 1024 * 1024
+_OUTPUT_CLAIM_PREFIX = "boltzgen-output"
 
 
 def boltzgen_run_root(
@@ -97,51 +96,49 @@ def write_boltzgen_task_publication(
     temporary.replace(marker)
 
 
-def acquire_output_claim(
-    run_dir: Path,
+def boltzgen_output_claim_key(
+    run_dir: str | Path,
     *,
+    output_root: str | Path,
+) -> str:
+    """Return one stable workload-owned claim key for an output directory."""
+    root = Path(output_root).resolve()
+    relative = Path(run_dir).resolve().relative_to(root).as_posix()
+    digest = sha256(relative.encode()).hexdigest()
+    return f"{_OUTPUT_CLAIM_PREFIX}:{digest}"
+
+
+def acquire_output_claim(
+    claim_store: Any,
+    *,
+    claim_key: str,
     owner: str,
     replace_owner: str | None = None,
-) -> Path:
-    """Acquire one filesystem publication claim without using it as a queue."""
+) -> None:
+    """Atomically elect one Provider Call to publish a BoltzGen output."""
+    if not claim_key:
+        raise ValueError("BoltzGen output claim key cannot be empty")
     if not owner:
         raise ValueError("BoltzGen output claim owner cannot be empty")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    claim_dir = run_dir / ".lock"
-    owner_path = claim_dir / _CLAIM_OWNER_FILENAME
-    try:
-        claim_dir.mkdir()
-        owner_path.write_text(owner, encoding="utf-8")
-        return claim_dir
-    except FileExistsError:
-        try:
-            existing_owner = owner_path.read_text(encoding="utf-8")
-        except OSError as error:
-            raise RuntimeError(
-                f"BoltzGen output is claimed without readable ownership: {run_dir}"
-            ) from error
-        if existing_owner == owner:
-            warmup_directory(run_dir)
-            return claim_dir
-        if replace_owner is None or existing_owner != replace_owner:
-            raise RuntimeError(
-                f"BoltzGen output is already claimed by another Provider Call: "
-                f"{run_dir}"
-            ) from None
-        temporary_owner = owner_path.with_suffix(".next")
-        temporary_owner.write_text(owner, encoding="utf-8")
-        temporary_owner.replace(owner_path)
-        warmup_directory(run_dir)
-        return claim_dir
 
+    root_key = f"{claim_key}:root"
+    if claim_store.put(root_key, owner, skip_if_exists=True):
+        return
+    current_owner = _current_output_claim_owner(claim_store, claim_key)
+    if current_owner == owner:
+        return
+    if replace_owner is None or current_owner != replace_owner:
+        raise RuntimeError(
+            "BoltzGen output is already claimed by another Provider Call"
+        )
 
-def release_output_claim(claim_dir: Path, *, owner: str) -> None:
-    """Remove a claim only after its owner has published complete output."""
-    owner_path = claim_dir / _CLAIM_OWNER_FILENAME
-    if owner_path.read_text(encoding="utf-8") != owner:
-        raise RuntimeError("BoltzGen output claim ownership changed")
-    owner_path.unlink()
-    claim_dir.rmdir()
+    successor_key = _output_claim_successor_key(claim_key, current_owner)
+    if claim_store.put(successor_key, owner, skip_if_exists=True):
+        return
+    if _current_output_claim_owner(claim_store, claim_key) != owner:
+        raise RuntimeError(
+            "BoltzGen output is already claimed by another Provider Call"
+        )
 
 
 def collection_publication_path(
@@ -219,6 +216,30 @@ def _contained_path(
     path = root_path.joinpath(*relative.parts).resolve()
     path.relative_to(root_path)
     return path
+
+
+def _current_output_claim_owner(claim_store: Any, claim_key: str) -> str:
+    current = claim_store.get(f"{claim_key}:root", None)
+    if not isinstance(current, str) or not current:
+        raise RuntimeError("BoltzGen output claim has invalid ownership")
+    visited: set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        successor = claim_store.get(
+            _output_claim_successor_key(claim_key, current),
+            None,
+        )
+        if successor is None:
+            return current
+        if not isinstance(successor, str) or not successor:
+            raise RuntimeError("BoltzGen output claim has invalid ownership")
+        current = successor
+    raise RuntimeError("BoltzGen output claim contains an ownership cycle")
+
+
+def _output_claim_successor_key(claim_key: str, owner: str) -> str:
+    owner_digest = sha256(owner.encode()).hexdigest()
+    return f"{claim_key}:successor:{owner_digest}"
 
 
 def _hash_file(path: Path) -> tuple[int, str]:

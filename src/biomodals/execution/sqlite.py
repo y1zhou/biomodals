@@ -771,6 +771,53 @@ class SqliteExecutionRepository:
             self._suspend_for_unknown_result(execution_run_id, now=now)
         return self.get_node(execution_run_id, node_key)
 
+    def fail_node(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        message: str,
+        now: int,
+    ) -> ExecutionNodeRecord:
+        """Fail caller-owned discovery or publication after ownership concludes."""
+        if not message:
+            raise ValueError("Node failure message cannot be empty")
+        node = self.get_node(execution_run_id, node_key)
+        if node.status == NodeStatus.FAILED and node.error_message == message:
+            return node
+        if node.status != NodeStatus.RUNNING:
+            raise ValueError(f"cannot fail {node.status.value} Node")
+        tasks = self.list_tasks(execution_run_id, node_key)
+        if any(not task.status.is_terminal for task in tasks):
+            raise ValueError("cannot fail Node while Tasks remain active")
+        calls = [
+            call
+            for call in self.list_provider_calls(execution_run_id)
+            if call.node_key == node_key and not call.status.is_terminal
+        ]
+        if calls:
+            raise ValueError("cannot fail Node while Provider Calls remain active")
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET discovery_complete = 1,
+                status = ?,
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (
+                NodeStatus.FAILED.value,
+                message,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+            ),
+        )
+        return self.get_node(execution_run_id, node_key)
+
     def record_task_result_observation(
         self,
         execution_run_id: UUID,

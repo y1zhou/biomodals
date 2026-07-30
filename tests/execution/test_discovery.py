@@ -202,3 +202,37 @@ def test_allowed_empty_discovery_waits_for_explicit_result_validation() -> None:
     assert node.discovery_complete
     assert node.status == NodeStatus.RUNNING
     assert node.error_message is None
+
+
+def test_caller_can_fail_discovery_without_inventing_a_task() -> None:
+    repository = _repository()
+
+    failed = repository.fail_node(
+        RUN_ID,
+        "inference",
+        message="Could not enumerate candidate inputs",
+        now=102,
+    )
+
+    assert failed.status == NodeStatus.FAILED
+    assert failed.discovery_complete
+    assert failed.error_message == "Could not enumerate candidate inputs"
+    assert repository.list_tasks(RUN_ID, "inference") == ()
+
+
+def test_caller_cannot_fail_a_node_while_tasks_remain_active() -> None:
+    repository = _repository()
+    repository.discover_tasks(
+        RUN_ID,
+        "inference",
+        (TaskPlan(task_key="seed-5", scientific_payload={"seed": 5}),),
+        now=102,
+    )
+
+    with pytest.raises(ValueError, match="Tasks remain active"):
+        repository.fail_node(
+            RUN_ID,
+            "inference",
+            message="Aggregate publication failed",
+            now=103,
+        )

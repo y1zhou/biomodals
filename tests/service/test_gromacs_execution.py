@@ -137,6 +137,14 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
         for _ in range(4):
             adapter.begin_wave()
             await coordinator.advance(JOB_ID)
+            if len(adapter.spawn_waves) == 1:
+                running = store.get_job_by_id(JOB_ID)
+                assert running is not None
+                assert running.state == JobState.RUNNING
+                assert [operation.operation for operation in running.operations] == [
+                    "prepare_tpr_gpu"
+                ]
+                assert running.operations[0].modal_call_id == "fc-0"
 
         assert adapter.spawn_waves == [
             ["prepare_tpr_gpu"],
@@ -165,6 +173,14 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
         job = store.get_job_by_id(JOB_ID)
         assert job is not None
         assert job.state == JobState.SUCCEEDED
+        assert [operation.operation for operation in job.operations] == [
+            "prepare_tpr_gpu",
+            "collect_traj_stats:nvt_",
+            "collect_traj_stats:npt_",
+            "production_run_gpu",
+            "collect_traj_stats:production_",
+            "prepare_result",
+        ]
         assert job.result_archive_schema_version == GROMACS_ARCHIVE_SCHEMA_VERSION
 
     asyncio.run(scenario())

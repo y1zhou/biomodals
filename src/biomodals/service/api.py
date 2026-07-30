@@ -168,7 +168,7 @@ def create_deployed_app() -> FastAPI:
     settings.install_modal_credentials()
 
     from biomodals.service.gromacs import (
-        GromacsReconciler,
+        GromacsExecutionCoordinator,
         ModalGromacsAdapter,
         create_registration,
     )
@@ -184,7 +184,7 @@ def create_deployed_app() -> FastAPI:
     lifecycle_locks = JobLifecycleLocks()
     registration = create_registration(
         adapter,
-        reconciler=GromacsReconciler(
+        reconciler=GromacsExecutionCoordinator(
             store,
             adapter,
             lifecycle_locks=lifecycle_locks,

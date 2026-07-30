@@ -119,9 +119,9 @@ class ModalGromacsAdapter:
         """Poll one attached Modal call without blocking."""
         return await self.provider.poll(modal_call_id, operation=operation)
 
-    async def cancel(self, modal_call_id: str) -> None:
+    async def cancel(self, provider_call_handle_id: str) -> None:
         """Cancel one Modal call graph."""
-        await self.provider.cancel(modal_call_id)
+        await self.provider.cancel(provider_call_handle_id)
 
     async def open_operation_logs(
         self,

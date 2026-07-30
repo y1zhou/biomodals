@@ -11,7 +11,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
@@ -19,12 +18,18 @@ import httpx
 import pytest
 from fastapi import APIRouter, FastAPI
 
+from biomodals.execution.modal import (
+    ModalCallObservation,
+    ModalCallObservationKind,
+    ModalDefiniteSubmissionError,
+    ModalSubmissionOutcomeUnknownError,
+)
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease
 from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
-from biomodals.service.gromacs.modal import GromacsReconciler
+from biomodals.service.gromacs.results import FinalArchive
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     OperationLogRequest,
@@ -91,6 +96,7 @@ class FakeGromacsAdapter:
                 datetime | None,
             ]
         ] = []
+        self._execution_calls: dict[str, object] = {}
 
     async def preflight(
         self,
@@ -133,12 +139,58 @@ class FakeGromacsAdapter:
             operation=("prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"),
         )
 
+    async def resolve(self, binding):
+        self.submission_configurations.append((
+            binding.app_name,
+            binding.environment,
+            binding.app_version,
+        ))
+        return binding
+
+    async def spawn(self, function, *, args, kwargs):
+        options = GromacsJobOptions(
+            simulation_time_ns=int(kwargs.get("simulation_time_ns", 5)),
+            run_pdbfixer=bool(kwargs.get("run_pdbfixer", False)),
+            cpu_only=function.function_name.endswith("_cpu"),
+        )
+        self.submissions.append((
+            bytes(kwargs.get("pdb_content", b"")),
+            str(kwargs["run_name"]),
+            options,
+        ))
+        if self.unknown_failures_remaining:
+            self.unknown_failures_remaining -= 1
+            raise ModalSubmissionOutcomeUnknownError("provider outcome unknown")
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise ModalDefiniteSubmissionError("provider rejected submission")
+        call_id = f"fc-{len(self.submissions)}"
+        self._execution_calls[call_id] = function
+        return call_id
+
+    async def observe(self, provider_call_handle_id):
+        return ModalCallObservation(ModalCallObservationKind.RUNNING)
+
     async def cancel(self, modal_call_id: str) -> None:
         self.cancellations.append(modal_call_id)
 
     async def recover_archive(self, job) -> None:
         self.recovery_attempts.append(job.job_id)
         raise AssertionError("an unsubmitted cancellation must not touch Modal")
+
+    async def publish_archive(self, job, *, completed_at):
+        return FinalArchive(
+            state=JobState.SUCCEEDED,
+            volume_name="Gromacs-outputs",
+            path=f"api-results/{job.run_name}/result.zip",
+            filename=f"{job.run_name}.zip",
+            size_bytes=len(self.artifact_content),
+            sha256=hashlib.sha256(self.artifact_content).hexdigest(),
+            warnings_json="[]",
+        )
+
+    async def cleanup_intermediates(self, job) -> None:
+        return None
 
     async def read_artifact(self, _job):
         self.downloads += 1
@@ -1911,7 +1963,7 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert replay.json()["job_id"] == first.json()["job_id"]
     assert first.json()["workload"] == "gromacs"
     assert first.json()["display_name"] == "First simulation"
-    assert first.json()["state"] == "queued"
+    assert first.json()["state"] == "running"
     assert first.json()["stage"]["code"] == "prepare_simulation"
     assert first.json()["stage"]["function_name"] == "prepare_tpr_cpu"
     assert first.json()["stage"]["started_at"]
@@ -2145,7 +2197,7 @@ def test_gromacs_simulation_time_accepts_200_ns_and_rejects_201(
     assert adapter.submissions[0][2].simulation_time_ns == 200
 
 
-def test_failed_spawn_can_retry_the_same_stable_run(
+def test_failed_spawn_is_terminal_in_the_same_execution_run(
     tmp_path: Path,
 ) -> None:
     client, auth, _store, adapter = _service(tmp_path)
@@ -2160,9 +2212,9 @@ def test_failed_spawn_can_retry_the_same_stable_run(
     assert failed.status_code == 503
     assert failed.json()["code"] == "compute_unavailable"
     assert retried.status_code == 202
-    assert retried.json()["state"] == "queued"
-    assert len(adapter.submissions) == 2
-    assert adapter.submissions[0][1] == adapter.submissions[1][1]
+    assert retried.json()["state"] == "failed"
+    assert retried.json()["job_id"]
+    assert len(adapter.submissions) == 1
     assert adapter.submissions[0][1] == (
         f"first-simulation-{UUID(retried.json()['job_id']).hex}"
     )
@@ -2240,10 +2292,10 @@ def test_admin_can_resolve_state_unknown_after_manual_provider_review(
     assert repeated.json()["code"] == "job_state_changed"
 
 
-def test_cancel_after_failed_spawn_finishes_without_modal_access(
+def test_failed_spawn_cannot_be_cancelled_or_resubmitted(
     tmp_path: Path,
 ) -> None:
-    client, auth, store, adapter = _service(tmp_path)
+    client, auth, _store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
     csrf_token = _login(client, "alice@example.com")
     adapter.failures_remaining = 1
@@ -2253,27 +2305,15 @@ def test_cancel_after_failed_spawn_finishes_without_modal_access(
 
     [job] = _jobs(client.get("/api/v1/jobs"))
     job_id = UUID(str(job["job_id"]))
-    cancelling = client.post(
+    rejected = client.post(
         f"/api/v1/jobs/{job_id}/cancel",
         headers=_unsafe_headers(csrf_token),
     )
-    assert cancelling.status_code == 202
-    assert cancelling.json()["state"] == "cancel_requested"
-
-    asyncio.run(
-        GromacsReconciler(
-            store,
-            cast(Any, adapter),
-            now=lambda: 1_800_000_001,
-        ).reconcile()
-    )
-
-    cancelled = client.get(f"/api/v1/jobs/{job_id}")
-    assert cancelled.status_code == 200
-    assert cancelled.json()["state"] == "cancelled"
-    assert cancelled.json()["completed_at"] == "2027-01-15T08:00:01Z"
+    assert rejected.status_code == 409
+    assert rejected.json()["code"] == "job_not_cancellable"
+    terminal = client.get(f"/api/v1/jobs/{job_id}")
+    assert terminal.json()["state"] == "failed"
     assert adapter.cancellations == []
-    assert adapter.recovery_attempts == []
 
 
 def test_my_jobs_and_job_lookup_are_private_to_the_cookie_owner(

@@ -22,6 +22,7 @@ from fastapi import (
     UploadFile,
 )
 
+from biomodals.execution.modal import ModalSubmissionOutcomeUnknownError
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.gromacs.contracts import (
@@ -30,7 +31,11 @@ from biomodals.service.gromacs.contracts import (
     artifact_request_sha256,
     gromacs_run_name,
 )
-from biomodals.service.gromacs.plan import prepare_operation
+from biomodals.service.gromacs.execution import (
+    GromacsExecutionAdapter,
+    GromacsExecutionCoordinator,
+)
+from biomodals.service.gromacs.plan import execution_plan
 from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
@@ -49,22 +54,13 @@ from biomodals.service.jobs import (
     WorkloadRegistration,
     can_view_job_logs,
 )
-from biomodals.service.runtime_config import (
-    ModalConfigurationSnapshot,
-    RuntimeConfiguration,
-)
+from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     IdempotencyConflictError,
-    InitialModalOperation,
     JobLimitExceededError,
-    JobOperationState,
     JobRecord,
     ServiceStore,
     UserNotFoundError,
-)
-from biomodals.service.submission import (
-    ModalJobSubmitter,
-    SubmittedModalOperation,
 )
 from biomodals.service.workloads import GROMACS_WORKLOAD
 
@@ -97,23 +93,8 @@ class SubmissionForbiddenResponse(CodedErrorResponse):
     code: Literal["account_disabled", "csrf_invalid", "origin_not_allowed"]
 
 
-class GromacsAdapter(Protocol):
-    """Narrow Modal boundary used by this workload router."""
-
-    async def submit(
-        self,
-        pdb_content: bytes,
-        options: GromacsJobOptions,
-        *,
-        run_name: str,
-        modal_configuration: ModalConfigurationSnapshot,
-    ) -> SubmittedModalOperation:
-        """Spawn one detached scientific job."""
-        ...
-
-    async def cancel(self, modal_call_id: str) -> None:
-        """Request cancellation of one provider call graph."""
-        ...
+class GromacsAdapter(GromacsExecutionAdapter, Protocol):
+    """Complete GROMACS service boundary used by routes and coordination."""
 
 
 async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
@@ -226,12 +207,14 @@ def create_router(
         admission_configuration = configuration.admission_configuration("gromacs")
         now = int(time.time())
         new_job_id = uuid4()
-        operation = prepare_operation(cpu_only=options.cpu_only)
-        submission_token = uuid4().hex
-        initial_operation = InitialModalOperation(
-            operation=operation,
-            run_name=gromacs_run_name(normalized_name, new_job_id),
-            submission_token=submission_token,
+        execution_run_id = uuid4()
+        run_name = gromacs_run_name(normalized_name, new_job_id)
+        plan = execution_plan(
+            cpu_only=options.cpu_only,
+            workload_run_key=run_name,
+            pdb_sha256=hashlib.sha256(pdb_content).hexdigest(),
+            simulation_time_ns=options.simulation_time_ns,
+            run_pdbfixer=options.run_pdbfixer,
         )
         try:
             admission = store.admit_job(
@@ -244,7 +227,11 @@ def create_router(
                 configuration=admission_configuration,
                 now=now,
                 new_job_id=new_job_id,
-                initial_operation=initial_operation,
+                execution_plan=plan,
+                execution_run_id=execution_run_id,
+                max_active_provider_calls=3,
+                max_active_gpu_provider_calls=1,
+                input_content=pdb_content,
             )
         except IdempotencyConflictError as exc:
             raise CodedAPIError(409, "idempotency_conflict", str(exc)) from exc
@@ -269,32 +256,19 @@ def create_router(
             request_id_from(request),
         )
 
-        run_name = admission.job.run_name or gromacs_run_name(
-            admission.job.display_name,
-            admission.job.job_id,
-        )
-        submitter = ModalJobSubmitter(store, lifecycle_locks)
-
-        async def spawn(claimed_job: JobRecord) -> SubmittedModalOperation:
-            return await adapter.submit(
-                pdb_content,
-                options,
-                run_name=run_name,
-                modal_configuration=claimed_job.modal_configuration,
-            )
-
         try:
-            result = await submitter.submit(
-                admission.job,
-                operation=operation,
-                run_name=run_name,
-                submission_token=(
-                    submission_token if admission.created else uuid4().hex
-                ),
-                spawn=spawn,
-                cancel=adapter.cancel,
-                operation_preclaimed=admission.created,
-                require_enabled_owner=True,
+            coordinator = GromacsExecutionCoordinator(
+                store,
+                adapter,
+                lifecycle_locks=lifecycle_locks,
+            )
+            await coordinator.advance(admission.job.job_id)
+        except ModalSubmissionOutcomeUnknownError:
+            LOGGER.warning(
+                "event=submission_outcome_unknown job_id=%s workload=gromacs "
+                "request_id=%s",
+                admission.job.job_id,
+                request_id_from(request),
             )
         except Exception as exc:
             LOGGER.exception(
@@ -308,20 +282,9 @@ def create_router(
                 "GROMACS compute is temporarily unavailable",
             ) from exc
 
-        job = result.job
-        if result.attached:
-            stage = JobView.from_record(
-                job,
-                definition=GROMACS_WORKLOAD,
-            ).stage
-            LOGGER.info(
-                "event=stage_attached job_id=%s workload=gromacs stage=%s "
-                "function=%s request_id=%s",
-                job.job_id,
-                stage.code if stage is not None else "none",
-                operation.partition(":")[0],
-                request_id_from(request),
-            )
+        job = store.get_job_by_id(admission.job.job_id)
+        if job is None:  # pragma: no cover - admission owns the row
+            raise RuntimeError("Admitted GROMACS Job disappeared")
         return JobView.from_record(
             job,
             definition=GROMACS_WORKLOAD,
@@ -351,16 +314,11 @@ def create_registration(
     """Explicitly register GROMACS routes and lifecycle hooks."""
 
     async def cancel(store: ServiceStore, job: JobRecord) -> None:
-        first_error: Exception | None = None
-        for call in store.list_operations(job.job_id):
-            if call.state != JobOperationState.RUNNING or call.modal_call_id is None:
-                continue
-            try:
-                await adapter.cancel(call.modal_call_id)
-            except Exception as exc:
-                first_error = first_error or exc
-        if first_error is not None:
-            raise first_error
+        await GromacsExecutionCoordinator(
+            store,
+            adapter,
+            lifecycle_locks=lifecycle_locks,
+        ).cancel_job(job.job_id)
 
     if reconciler is not None and lifecycle_locks is None:
         raise ValueError("A reconciler must share the route lifecycle locks")

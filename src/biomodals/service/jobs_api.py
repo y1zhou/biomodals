@@ -369,6 +369,9 @@ def create_jobs_router(
                     job.job_id,
                     request_id_from(request),
                 )
+            refreshed = store.get_job(session.principal.user_id, job_id)
+            if refreshed is not None:
+                job = refreshed
         return job_view(job, session)
 
     async def prepare_cached_artifact(job: JobRecord, *, request_id: str) -> None:

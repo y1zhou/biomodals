@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
@@ -15,7 +17,10 @@ from biomodals.execution import (
     RunStatus,
     TaskStatus,
 )
-from biomodals.execution.modal import ModalCallObservation
+from biomodals.execution.modal import (
+    ModalCallObservation,
+    ModalDefiniteSubmissionError,
+)
 from biomodals.execution.scheduler import (
     TaskDispatchDescriptor,
     form_fixed_batches,
@@ -36,6 +41,7 @@ from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 
 _RESULT_ENVELOPE_SCHEMA_VERSION = 1
+LOGGER = logging.getLogger(__name__)
 
 
 class GromacsExecutionAdapter(Protocol):
@@ -67,6 +73,9 @@ class GromacsExecutionAdapter(Protocol):
     ) -> FinalArchive:
         """Publish and validate the user-facing result archive."""
 
+    async def cleanup_intermediates(self, job: JobRecord) -> None:
+        """Remove remote files that can be reconstructed from publications."""
+
 
 class GromacsExecutionCoordinator:
     """Advance one service-owned GROMACS Execution Run by one provider wave."""
@@ -78,12 +87,61 @@ class GromacsExecutionCoordinator:
         *,
         lifecycle_locks: JobLifecycleLocks | None = None,
         now: Callable[[], int] | None = None,
+        intermediate_retention_days: int | None = None,
+        max_concurrent_jobs: int = 4,
     ) -> None:
         """Bind service metadata, Modal calls, and result publication."""
         self.store = store
         self.adapter = adapter
         self.lifecycle_locks = lifecycle_locks or JobLifecycleLocks()
         self._now = now or (lambda: int(time.time()))
+        if intermediate_retention_days is not None and intermediate_retention_days < 1:
+            raise ValueError("intermediate_retention_days must be positive")
+        if type(max_concurrent_jobs) is not int or max_concurrent_jobs < 1:
+            raise ValueError("max_concurrent_jobs must be positive")
+        self.max_concurrent_jobs = max_concurrent_jobs
+        self.intermediate_retention_seconds = (
+            intermediate_retention_days * 24 * 60 * 60
+            if intermediate_retention_days is not None
+            else None
+        )
+
+    async def reconcile(self) -> None:
+        """Advance every active GROMACS Execution Run once."""
+        jobs = iter(self.store.list_reconcilable_jobs("gromacs"))
+
+        async def worker() -> None:
+            for job in jobs:
+                try:
+                    await self.advance(job.job_id)
+                except Exception:
+                    LOGGER.exception(
+                        "Could not reconcile GROMACS job %s",
+                        job.job_id,
+                    )
+
+        await asyncio.gather(*(worker() for _ in range(self.max_concurrent_jobs)))
+        await self._cleanup_intermediates()
+
+    async def cancel_job(self, job_id: UUID) -> None:
+        """Durably cancel one Run and every conclusively attached call."""
+        async with self.lifecycle_locks.for_job(job_id):
+            job = self.store.get_job_by_id(job_id)
+            if job is None:
+                raise LookupError(f"Job not found: {job_id}")
+            if job.execution_run_id is None:
+                raise ValueError("Job is not linked to an Execution Run")
+            with self.store.async_execution_runtime(self.adapter) as runtime:
+                run = await runtime.cancel_run(
+                    job.execution_run_id,
+                    now=self._now(),
+                )
+                run = runtime.repository.finalize_run_from_results(
+                    job.execution_run_id,
+                    now=self._now(),
+                )
+                runtime.checkpoint()
+            self._project_terminal_or_running_job(job, run.status)
 
     async def advance(self, job_id: UUID) -> None:
         """Reconcile existing calls, admit one ready wave, and publish results."""
@@ -128,10 +186,23 @@ class GromacsExecutionCoordinator:
                         runtime,
                         job,
                     )
-                    await self._submit_ready_remote_tasks(
-                        runtime,
-                        job,
-                    )
+                    try:
+                        await self._submit_ready_remote_tasks(
+                            runtime,
+                            job,
+                        )
+                    except ModalDefiniteSubmissionError:
+                        self._reconcile_running_nodes(runtime, execution_run_id)
+                        runtime.repository.skip_unreachable_nodes(
+                            execution_run_id,
+                            now=self._now(),
+                        )
+                        runtime.repository.finalize_run_from_results(
+                            execution_run_id,
+                            now=self._now(),
+                        )
+                        runtime.checkpoint()
+                        raise
                     self._reconcile_running_nodes(runtime, execution_run_id)
                     runtime.repository.skip_unreachable_nodes(
                         execution_run_id,
@@ -432,6 +503,22 @@ class GromacsExecutionCoordinator:
                 JobState.CANCELLED,
                 now=self._now(),
             )
+
+    async def _cleanup_intermediates(self) -> None:
+        if self.intermediate_retention_seconds is None:
+            return
+        now = self._now()
+        jobs = self.store.list_intermediate_cleanup_candidates(
+            "gromacs",
+            completed_before=now - self.intermediate_retention_seconds,
+        )
+        for job in jobs:
+            try:
+                await self.adapter.cleanup_intermediates(job)
+            except Exception:
+                LOGGER.exception("Could not clean intermediates for job %s", job.job_id)
+                continue
+            self.store.mark_intermediates_cleaned(job.job_id, now=now)
 
 
 def _result_envelope(result: Any) -> dict[str, object]:

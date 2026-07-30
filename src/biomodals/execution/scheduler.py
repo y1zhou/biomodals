@@ -1,15 +1,218 @@
 """Pure DAG readiness and admission decisions."""
 
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 
 from biomodals.execution.model import (
     AvailabilityStatus,
     ExecutionPlan,
     NodeAggregationPolicy,
     NodeStatus,
+    ProviderBinding,
     RunStatus,
     TaskStatus,
 )
+
+
+@dataclass(frozen=True)
+class NodeAdmissionRank:
+    """Graph-critical ordering values for one required Node."""
+
+    depth: int
+    unblocking_span: int
+
+
+@dataclass(frozen=True)
+class TaskDispatchDescriptor:
+    """Operational fixed-batch inputs for one ready Task."""
+
+    node_key: str
+    node_ordinal: int
+    task_key: str
+    task_ordinal: int
+    binding: ProviderBinding
+    compatibility_key: str
+    max_tasks_per_call: int
+    depth: int
+    unblocking_span: int
+
+
+@dataclass(frozen=True)
+class ProviderCallCandidate:
+    """One side-effect-free candidate for Provider Call admission."""
+
+    candidate_key: str
+    node_key: str
+    node_ordinal: int
+    task_keys: tuple[str, ...]
+    task_ordinal: int
+    binding: ProviderBinding
+    compatibility_key: str
+    depth: int
+    unblocking_span: int
+
+
+def required_node_ranks(
+    plan: ExecutionPlan,
+    *,
+    required_node_keys: set[str],
+    unfinished_node_keys: set[str],
+) -> dict[str, NodeAdmissionRank]:
+    """Calculate depth and unfinished descendant span in one required closure."""
+    depths: dict[str, int] = {}
+    for node in plan.nodes:
+        if node.node_key not in required_node_keys:
+            continue
+        dependency_depths = [
+            depths[dependency.node_key]
+            for dependency in node.dependencies
+            if dependency.node_key in required_node_keys
+        ]
+        depths[node.node_key] = max(dependency_depths) + 1 if dependency_depths else 0
+
+    dependents: dict[str, list[str]] = defaultdict(list)
+    for node in plan.nodes:
+        if node.node_key not in required_node_keys:
+            continue
+        for dependency in node.dependencies:
+            if dependency.node_key in required_node_keys:
+                dependents[dependency.node_key].append(node.node_key)
+
+    def unfinished_descendants(node_key: str) -> set[str]:
+        found: set[str] = set()
+        remaining = list(dependents[node_key])
+        while remaining:
+            descendant = remaining.pop()
+            if descendant in found:
+                continue
+            found.add(descendant)
+            remaining.extend(dependents[descendant])
+        return found & unfinished_node_keys
+
+    return {
+        node.node_key: NodeAdmissionRank(
+            depth=depths[node.node_key],
+            unblocking_span=len(unfinished_descendants(node.node_key)),
+        )
+        for node in plan.nodes
+        if node.node_key in required_node_keys
+    }
+
+
+def form_fixed_batches(
+    tasks: tuple[TaskDispatchDescriptor, ...],
+) -> tuple[ProviderCallCandidate, ...]:
+    """Group compatible Tasks into immutable bounded fixed-call candidates."""
+    grouped: dict[
+        tuple[str, ProviderBinding, str, int],
+        list[TaskDispatchDescriptor],
+    ] = {}
+    for task in tasks:
+        if task.max_tasks_per_call <= 0:
+            raise ValueError("max_tasks_per_call must be positive")
+        group_key = (
+            task.node_key,
+            task.binding,
+            task.compatibility_key,
+            task.max_tasks_per_call,
+        )
+        grouped.setdefault(group_key, []).append(task)
+
+    candidates: list[ProviderCallCandidate] = []
+    for group in grouped.values():
+        ordered = sorted(group, key=lambda task: task.task_ordinal)
+        batch_size = ordered[0].max_tasks_per_call
+        for offset in range(0, len(ordered), batch_size):
+            batch = ordered[offset : offset + batch_size]
+            first = batch[0]
+            candidates.append(
+                ProviderCallCandidate(
+                    candidate_key=(
+                        f"{first.node_key}:{first.binding.function_name}:"
+                        f"{first.compatibility_key}:{first.task_ordinal}"
+                    ),
+                    node_key=first.node_key,
+                    node_ordinal=first.node_ordinal,
+                    task_keys=tuple(task.task_key for task in batch),
+                    task_ordinal=first.task_ordinal,
+                    binding=first.binding,
+                    compatibility_key=first.compatibility_key,
+                    depth=first.depth,
+                    unblocking_span=first.unblocking_span,
+                )
+            )
+    return tuple(candidates)
+
+
+def select_admissible_candidates(
+    candidates: Iterable[ProviderCallCandidate],
+    *,
+    available_total_slots: int,
+    available_gpu_slots: int,
+) -> tuple[ProviderCallCandidate, ...]:
+    """Greedily fill feasible call slots in deterministic priority order."""
+    if available_total_slots < 0 or available_gpu_slots < 0:
+        raise ValueError("available Provider Call slots cannot be negative")
+    ordered = _order_admission_candidates(tuple(candidates))
+    selected: list[ProviderCallCandidate] = []
+    gpu_slots = available_gpu_slots
+    for candidate in ordered:
+        if len(selected) >= available_total_slots:
+            break
+        if candidate.binding.uses_gpu:
+            if gpu_slots == 0:
+                continue
+            gpu_slots -= 1
+        selected.append(candidate)
+    return tuple(selected)
+
+
+def _order_admission_candidates(
+    candidates: tuple[ProviderCallCandidate, ...],
+) -> tuple[ProviderCallCandidate, ...]:
+    graph_bands: dict[tuple[int, int], list[ProviderCallCandidate]] = defaultdict(list)
+    for candidate in candidates:
+        graph_bands[(candidate.depth, candidate.unblocking_span)].append(candidate)
+
+    ordered: list[ProviderCallCandidate] = []
+    for graph_rank in sorted(graph_bands, reverse=True):
+        encounter_order = sorted(
+            graph_bands[graph_rank],
+            key=lambda candidate: (
+                candidate.node_ordinal,
+                candidate.task_ordinal,
+            ),
+        )
+        for uses_gpu in (True, False):
+            resource_class = [
+                candidate
+                for candidate in encounter_order
+                if candidate.binding.uses_gpu == uses_gpu
+            ]
+            cohorts: dict[
+                tuple[str, ...],
+                list[ProviderCallCandidate],
+            ] = {}
+            for candidate in resource_class:
+                cohorts.setdefault(_image_cohort_key(candidate.binding), []).append(
+                    candidate
+                )
+            for cohort in cohorts.values():
+                ordered.extend(cohort)
+    return tuple(ordered)
+
+
+def _image_cohort_key(binding: ProviderBinding) -> tuple[str, ...]:
+    if binding.runtime_image_key is not None:
+        return ("image", binding.runtime_image_key)
+    return (
+        "binding",
+        binding.environment,
+        binding.app_name,
+        str(binding.app_version),
+        binding.function_name,
+    )
 
 
 def ready_node_keys(

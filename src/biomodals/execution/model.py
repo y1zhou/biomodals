@@ -149,6 +149,12 @@ class ResultProvenance(StrEnum):
     CURRENT_RUN = "current_run"
 
 
+class WorkStatusReason(StrEnum):
+    """Closed reason shared by pruned Node and Task terminal states."""
+
+    RESULT_ALREADY_SATISFIED = "result_already_satisfied"
+
+
 @dataclass(frozen=True)
 class DeploymentIdentity:
     """Exact deployed coordinator location fixed for one Execution Run."""
@@ -330,6 +336,7 @@ class ExecutionNodeRecord:
     aggregation_policy: NodeAggregationPolicy
     allow_empty_result: bool
     status: NodeStatus
+    status_reason: WorkStatusReason | None
     discovery_complete: bool
     result_observation: AvailabilityStatus | None
     result_observed_at: int | None
@@ -353,10 +360,12 @@ class ExecutionTaskRecord:
     scientific_payload: Any
     execution_payload: Any
     status: TaskStatus
+    status_reason: WorkStatusReason | None
     result_observation: AvailabilityStatus | None
     result_observed_at: int | None
     result_provenance: ResultProvenance | None
     provider_call_id: UUID | None
+    local_owned: bool
     error_message: str | None
     created_at: int
     updated_at: int

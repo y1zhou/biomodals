@@ -9,6 +9,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionPlan,
+    NodeAggregationPolicy,
     NodePlan,
     ProviderBinding,
     SqliteExecutionRepository,
@@ -39,6 +40,7 @@ def create_repository(
     task_count: int = 3,
     max_active_provider_calls: int = 3,
     max_active_gpu_provider_calls: int = 2,
+    aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL,
 ) -> SqliteExecutionRepository:
     """Return a running Node with cache-missing discovered Tasks."""
     connection = sqlite3.connect(":memory:")
@@ -48,7 +50,12 @@ def create_repository(
         execution_run_id=RUN_ID,
         plan=ExecutionPlan(
             workload_name="alphafold3",
-            nodes=(NodePlan(node_key="inference"),),
+            nodes=(
+                NodePlan(
+                    node_key="inference",
+                    aggregation_policy=aggregation_policy,
+                ),
+            ),
         ),
         deployment=DeploymentIdentity(
             "production",

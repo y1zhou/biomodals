@@ -21,6 +21,7 @@ from biomodals.execution.model import (
     RunStatusReason,
     TaskPlan,
     TaskStatus,
+    WorkStatusReason,
 )
 from biomodals.execution.scheduler import (
     aggregate_task_outcome,
@@ -58,6 +59,7 @@ __all__ = [
     "SqliteExecutionRepository",
     "TaskPlan",
     "TaskStatus",
+    "WorkStatusReason",
     "aggregate_task_outcome",
     "propagated_skip_node_keys",
     "ready_node_keys",

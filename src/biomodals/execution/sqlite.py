@@ -29,7 +29,9 @@ from biomodals.execution.model import (
     RunStatusReason,
     TaskPlan,
     TaskStatus,
+    WorkStatusReason,
 )
+from biomodals.execution.scheduler import aggregate_task_outcome, terminal_run_outcome
 
 EXECUTION_SCHEMA_VERSION = 1
 
@@ -146,6 +148,7 @@ _SCHEMA_STATEMENTS = (
         aggregation_policy TEXT NOT NULL,
         allow_empty_result INTEGER NOT NULL CHECK (allow_empty_result IN (0, 1)),
         status TEXT NOT NULL,
+        status_reason TEXT,
         discovery_complete INTEGER NOT NULL DEFAULT 0
             CHECK (discovery_complete IN (0, 1)),
         result_observation TEXT,
@@ -215,6 +218,7 @@ _SCHEMA_STATEMENTS = (
         scientific_payload_json TEXT NOT NULL,
         execution_payload_json TEXT NOT NULL,
         status TEXT NOT NULL,
+        status_reason TEXT,
         result_observation TEXT,
         result_observed_at INTEGER,
         result_provenance TEXT,
@@ -749,6 +753,7 @@ class SqliteExecutionRepository:
                 task.status != TaskStatus.PENDING
                 or task.result_observation != AvailabilityStatus.MISSING
                 or task.provider_call_id is not None
+                or task.local_owned
             ):
                 raise ValueError(
                     f"Task {task.task_key!r} is not ready for Provider Call ownership"
@@ -842,6 +847,348 @@ class SqliteExecutionRepository:
         return ProviderCallPreclaim(
             call=self.get_provider_call(provider_call_id),
             spawn_authorized=True,
+        )
+
+    def acquire_local_task(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        task_key: str,
+        *,
+        now: int,
+    ) -> bool:
+        """Acquire or recover publication-gated coordinator-local work."""
+        run = self.get_run(execution_run_id)
+        if run.status != RunStatus.RUNNING:
+            return False
+        task = self.get_task(execution_run_id, node_key, task_key)
+        if task.status.is_terminal:
+            return False
+        if task.result_observation != AvailabilityStatus.MISSING:
+            return False
+        if task.status == TaskStatus.RUNNING:
+            return task.local_owned and task.provider_call_id is None
+        if task.status != TaskStatus.PENDING or task.provider_call_id is not None:
+            return False
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                local_owned = 1,
+                started_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+            """,
+            (
+                TaskStatus.RUNNING.value,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+                task_key,
+            ),
+        )
+        return True
+
+    def fail_task(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        task_key: str,
+        *,
+        message: str,
+        now: int,
+    ) -> ExecutionTaskRecord:
+        """Record one conclusive workload or publication failure."""
+        task = self.get_task(execution_run_id, node_key, task_key)
+        if task.status == TaskStatus.FAILED:
+            return task
+        if task.status.is_terminal:
+            raise ValueError(f"cannot fail terminal Task {task.status.value}")
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+            """,
+            (
+                TaskStatus.FAILED.value,
+                message,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+                task_key,
+            ),
+        )
+        return self.get_task(execution_run_id, node_key, task_key)
+
+    def reconcile_node_tasks(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        now: int,
+    ) -> ExecutionNodeRecord:
+        """Apply fail-fast admission stopping and terminal Task aggregation."""
+        node = self.get_node(execution_run_id, node_key)
+        if node.status.is_terminal:
+            return node
+        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+            raise ValueError("Node Tasks cannot be aggregated before discovery")
+        tasks = self.list_tasks(execution_run_id, node_key)
+        if node.aggregation_policy == NodeAggregationPolicy.FAIL_FAST and any(
+            task.status == TaskStatus.FAILED for task in tasks
+        ):
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND status = ?
+                    AND provider_call_id IS NULL
+                    AND local_owned = 0
+                """,
+                (
+                    TaskStatus.SKIPPED.value,
+                    now,
+                    now,
+                    str(execution_run_id),
+                    node_key,
+                    TaskStatus.PENDING.value,
+                ),
+            )
+            tasks = self.list_tasks(execution_run_id, node_key)
+        outcome = aggregate_task_outcome(
+            node.aggregation_policy,
+            tuple(task.status for task in tasks),
+        )
+        if outcome is None:
+            return self.get_node(execution_run_id, node_key)
+        error_message = (
+            "One or more Tasks failed" if outcome == NodeStatus.FAILED else None
+        )
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET status = ?,
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (
+                outcome.value,
+                error_message,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+            ),
+        )
+        return self.get_node(execution_run_id, node_key)
+
+    def prune_unrequired_nodes(
+        self,
+        execution_run_id: UUID,
+        *,
+        required_node_keys: set[str],
+        now: int,
+    ) -> tuple[UUID, ...]:
+        """Prune unnecessary work and return calls needing cancellation."""
+        active_calls: list[UUID] = []
+        for node in self.list_nodes(execution_run_id):
+            if node.node_key in required_node_keys or node.status.is_terminal:
+                continue
+            if node.status == NodeStatus.PENDING:
+                self._connection.execute(
+                    """
+                    UPDATE execution_nodes
+                    SET status = ?,
+                        status_reason = ?,
+                        completed_at = ?,
+                        updated_at = ?
+                    WHERE execution_run_id = ? AND node_key = ?
+                    """,
+                    (
+                        NodeStatus.SKIPPED.value,
+                        WorkStatusReason.RESULT_ALREADY_SATISFIED.value,
+                        now,
+                        now,
+                        str(execution_run_id),
+                        node.node_key,
+                    ),
+                )
+                continue
+
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    status_reason = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND status = ?
+                    AND provider_call_id IS NULL
+                    AND local_owned = 0
+                """,
+                (
+                    TaskStatus.SKIPPED.value,
+                    WorkStatusReason.RESULT_ALREADY_SATISFIED.value,
+                    now,
+                    now,
+                    str(execution_run_id),
+                    node.node_key,
+                    TaskStatus.PENDING.value,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    status_reason = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND status = ?
+                    AND (
+                        local_owned = 1
+                        OR provider_call_id IN (
+                            SELECT provider_call_id
+                            FROM execution_provider_calls
+                            WHERE status IN (?, ?, ?)
+                        )
+                    )
+                """,
+                (
+                    TaskStatus.CANCELLED.value,
+                    WorkStatusReason.RESULT_ALREADY_SATISFIED.value,
+                    now,
+                    now,
+                    str(execution_run_id),
+                    node.node_key,
+                    TaskStatus.RUNNING.value,
+                    ProviderCallStatus.SUCCEEDED.value,
+                    ProviderCallStatus.FAILED.value,
+                    ProviderCallStatus.CANCELLED.value,
+                ),
+            )
+            rows = self._connection.execute(
+                """
+                SELECT provider_call_id
+                FROM execution_provider_calls
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND status NOT IN (?, ?, ?)
+                ORDER BY created_at, rowid
+                """,
+                (
+                    str(execution_run_id),
+                    node.node_key,
+                    ProviderCallStatus.SUCCEEDED.value,
+                    ProviderCallStatus.FAILED.value,
+                    ProviderCallStatus.CANCELLED.value,
+                ),
+            ).fetchall()
+            active_calls.extend(UUID(row["provider_call_id"]) for row in rows)
+            self._complete_pruned_node_if_conclusive(
+                execution_run_id,
+                node.node_key,
+                now=now,
+            )
+        return tuple(active_calls)
+
+    def cancel_pruned_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Record conclusive cancellation during result-driven pruning."""
+        call = self.cancel_provider_call(
+            provider_call_id,
+            message="Result was already satisfied",
+            now=now,
+        )
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status_reason = ?
+            WHERE provider_call_id = ? AND status = ?
+            """,
+            (
+                WorkStatusReason.RESULT_ALREADY_SATISFIED.value,
+                str(provider_call_id),
+                TaskStatus.CANCELLED.value,
+            ),
+        )
+        self._complete_pruned_node_if_conclusive(
+            call.execution_run_id,
+            call.node_key,
+            now=now,
+        )
+        return self.get_provider_call(provider_call_id)
+
+    def finalize_run_from_results(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Persist the strict terminal-boundary outcome after owner cleanup."""
+        run = self.get_run(execution_run_id)
+        if run.status.is_terminal:
+            return run
+        nodes = self.list_nodes(execution_run_id)
+        if not all(node.status.is_terminal for node in nodes):
+            return run
+        if self.active_provider_call_counts(execution_run_id).total:
+            return run
+        outcome = terminal_run_outcome(
+            run.plan,
+            {node.node_key: node.status for node in nodes},
+        )
+        if outcome is None:
+            return run
+        if run.status == RunStatus.PENDING:
+            run = self._transition_run(
+                execution_run_id,
+                RunStatus.RUNNING,
+                reason=None,
+                message=None,
+                now=now,
+                explicit_resume=False,
+            )
+        if run.status not in {
+            RunStatus.RUNNING,
+            RunStatus.CANCEL_REQUESTED,
+            RunStatus.STATE_UNKNOWN,
+        }:
+            return run
+        return self._transition_run(
+            execution_run_id,
+            outcome,
+            reason=(
+                RunStatusReason.REQUIRED_WORK_FAILED
+                if outcome == RunStatus.FAILED
+                else None
+            ),
+            message=(
+                "Required scientific work failed"
+                if outcome == RunStatus.FAILED
+                else None
+            ),
+            now=now,
+            explicit_resume=False,
         )
 
     def active_provider_call_counts(
@@ -1297,6 +1644,70 @@ class SqliteExecutionRepository:
             completed_at=row["completed_at"],
         )
 
+    def _complete_pruned_node_if_conclusive(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        now: int,
+    ) -> None:
+        active_call = self._connection.execute(
+            """
+            SELECT 1
+            FROM execution_provider_calls
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status NOT IN (?, ?, ?)
+            LIMIT 1
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                ProviderCallStatus.SUCCEEDED.value,
+                ProviderCallStatus.FAILED.value,
+                ProviderCallStatus.CANCELLED.value,
+            ),
+        ).fetchone()
+        unfinished_task = self._connection.execute(
+            """
+            SELECT 1
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        if active_call is not None or unfinished_task is not None:
+            return
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET status = ?,
+                status_reason = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status = ?
+            """,
+            (
+                NodeStatus.CANCELLED.value,
+                WorkStatusReason.RESULT_ALREADY_SATISFIED.value,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+                NodeStatus.RUNNING.value,
+            ),
+        )
+
     def _set_provider_call_status(
         self,
         provider_call_id: UUID,
@@ -1446,6 +1857,11 @@ class SqliteExecutionRepository:
             aggregation_policy=NodeAggregationPolicy(row["aggregation_policy"]),
             allow_empty_result=bool(row["allow_empty_result"]),
             status=NodeStatus(row["status"]),
+            status_reason=(
+                None
+                if row["status_reason"] is None
+                else WorkStatusReason(row["status_reason"])
+            ),
             discovery_complete=bool(row["discovery_complete"]),
             result_observation=(
                 None
@@ -1568,6 +1984,11 @@ def _task_from_row(row: sqlite3.Row) -> ExecutionTaskRecord:
         scientific_payload=json.loads(row["scientific_payload_json"]),
         execution_payload=json.loads(row["execution_payload_json"]),
         status=TaskStatus(row["status"]),
+        status_reason=(
+            None
+            if row["status_reason"] is None
+            else WorkStatusReason(row["status_reason"])
+        ),
         result_observation=(
             None
             if row["result_observation"] is None
@@ -1582,6 +2003,7 @@ def _task_from_row(row: sqlite3.Row) -> ExecutionTaskRecord:
         provider_call_id=(
             None if row["provider_call_id"] is None else UUID(row["provider_call_id"])
         ),
+        local_owned=bool(row["local_owned"]),
         error_message=row["error_message"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],

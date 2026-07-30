@@ -103,7 +103,7 @@ class RemoteWorkflowTask:
 
     task_key: str
     scientific_payload: Any
-    call: RemoteNodeCall
+    execution_payload: Any = None
 
     def __post_init__(self) -> None:
         """Reject missing Task identity before the discovery transaction."""
@@ -119,6 +119,14 @@ class RemoteTaskWorkflowNode:
         context: NodeRunContext,
     ) -> tuple[RemoteWorkflowTask, ...]:
         """Return the complete deterministic Task collection for this Node."""
+        raise NotImplementedError
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Prepare one persisted Task for provider submission."""
         raise NotImplementedError
 
     def process_remote_task_result(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from biomodals.execution import NodeAggregationPolicy
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import ArtifactKind, ArtifactSelector
 from biomodals.workflow.core.nodes import WorkflowNode
@@ -39,6 +40,8 @@ class WorkflowNodeSpec:
 
     node_id: str
     node: WorkflowNode
+    aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL
+    allow_empty_result: bool = False
     inputs: dict[str, ArtifactSelector] = field(default_factory=dict)
     control_dependencies: set[str] = field(default_factory=set)
 
@@ -67,6 +70,8 @@ class Workflow:
         id: str,
         inputs: dict[str, ArtifactSelector] | None = None,
         depends_on: list[NodeHandle | str] | None = None,
+        aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL,
+        allow_empty_result: bool = False,
     ) -> NodeHandle:
         """Add one node to the workflow and return its handle."""
         node_id = sanitize_filename(id)
@@ -80,6 +85,8 @@ class Workflow:
         self._nodes[node_id] = WorkflowNodeSpec(
             node_id=node_id,
             node=node,
+            aggregation_policy=aggregation_policy,
+            allow_empty_result=allow_empty_result,
             inputs=inputs or {},
             control_dependencies=control_dependencies,
         )

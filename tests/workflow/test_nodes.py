@@ -11,7 +11,6 @@ from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
 from biomodals.workflow.core.nodes import (
     AppBackedNode,
     NodeRunContext,
-    RemoteNodeCall,
     RemoteTaskWorkflowNode,
     RemoteWorkflowTask,
 )
@@ -47,21 +46,16 @@ def test_remote_task_node_declares_data_without_modal_submission() -> None:
     task = RemoteWorkflowTask(
         task_key="candidate-a",
         scientific_payload={"candidate_id": "candidate-a"},
-        call=RemoteNodeCall(
-            function_name="score_candidate",
-            uses_gpu=True,
-            kwargs={"candidate_id": "candidate-a"},
-        ),
+        execution_payload={"candidate_path": "inputs/candidate-a.pdb"},
     )
 
     assert task.task_key == "candidate-a"
-    assert task.call.function_name == "score_candidate"
+    assert task.execution_payload == {"candidate_path": "inputs/candidate-a.pdb"}
     assert not hasattr(RemoteTaskWorkflowNode, "submit_remote")
     with pytest.raises(ValueError, match="cannot be empty"):
         RemoteWorkflowTask(
             task_key="",
             scientific_payload={},
-            call=task.call,
         )
 
 

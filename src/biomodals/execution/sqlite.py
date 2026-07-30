@@ -1551,32 +1551,12 @@ class SqliteExecutionRepository:
             return node
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             raise ValueError("Node Tasks cannot be aggregated before discovery")
+        self.apply_task_failure_policy(
+            execution_run_id,
+            node_key,
+            now=now,
+        )
         tasks = self.list_tasks(execution_run_id, node_key)
-        if node.aggregation_policy == NodeAggregationPolicy.FAIL_FAST and any(
-            task.status == TaskStatus.FAILED for task in tasks
-        ):
-            self._connection.execute(
-                """
-                UPDATE execution_tasks
-                SET status = ?,
-                    completed_at = ?,
-                    updated_at = ?
-                WHERE execution_run_id = ?
-                    AND node_key = ?
-                    AND status = ?
-                    AND provider_call_id IS NULL
-                    AND local_owned = 0
-                """,
-                (
-                    TaskStatus.SKIPPED.value,
-                    now,
-                    now,
-                    str(execution_run_id),
-                    node_key,
-                    TaskStatus.PENDING.value,
-                ),
-            )
-            tasks = self.list_tasks(execution_run_id, node_key)
         outcome = aggregate_task_outcome(
             node.aggregation_policy,
             tuple(task.status for task in tasks),
@@ -1605,6 +1585,56 @@ class SqliteExecutionRepository:
             ),
         )
         return self.get_node(execution_run_id, node_key)
+
+    def apply_task_failure_policy(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        now: int,
+    ) -> tuple[str, ...]:
+        """Stop unowned sibling admission after a fail-fast Task failure."""
+        node = self.get_node(execution_run_id, node_key)
+        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+            raise ValueError("Node Task policy cannot run before discovery")
+        tasks = self.list_tasks(execution_run_id, node_key)
+        if node.aggregation_policy != NodeAggregationPolicy.FAIL_FAST or not any(
+            task.status == TaskStatus.FAILED for task in tasks
+        ):
+            return ()
+        skipped = tuple(
+            task.task_key
+            for task in tasks
+            if task.status == TaskStatus.PENDING
+            and task.provider_call_id is None
+            and task.worker_provider_call_id is None
+            and not task.local_owned
+        )
+        if not skipped:
+            return ()
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status = ?
+                AND provider_call_id IS NULL
+                AND worker_provider_call_id IS NULL
+                AND local_owned = 0
+            """,
+            (
+                TaskStatus.SKIPPED.value,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+                TaskStatus.PENDING.value,
+            ),
+        )
+        return skipped
 
     def skip_unreachable_nodes(
         self,

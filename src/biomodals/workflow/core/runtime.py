@@ -17,13 +17,17 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionRuntime,
+    NodeAggregationPolicy,
     NodeStatus,
     ProviderBinding,
+    ProviderCallRecord,
     ProviderCallStatus,
     RunStatus,
+    RunStatusReason,
     SqliteExecutionRepository,
     TaskPlan,
     TaskStatus,
+    aggregate_task_outcome,
     drive_execution_run,
     ready_node_keys,
     required_node_keys,
@@ -36,6 +40,7 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
+from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import AppRunResult, AppRunStatus, WorkflowArtifact
 from biomodals.workflow.core._runtime.volume_sync import (
     WorkflowVolume,
@@ -53,7 +58,9 @@ from biomodals.workflow.core.execution import execution_plan, node_task_plan
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
     RemoteNodeCall,
+    RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
+    RemoteWorkflowTask,
 )
 from biomodals.workflow.core.run_store import WorkflowRunStore
 
@@ -87,10 +94,16 @@ class WorkflowModalDriver(Protocol):
 
 
 @dataclass(frozen=True)
+class _PreparedTask:
+    plan: TaskPlan
+    observation: AvailabilityStatus
+
+
+@dataclass(frozen=True)
 class _PreparedNode:
     node_id: str
     context: NodeRunContext
-    invocation: RemoteNodeCall | None
+    tasks: tuple[_PreparedTask, ...]
     error: Exception | None = None
 
 
@@ -289,20 +302,42 @@ class WorkflowRuntime:
 
     def _recover_publications(self) -> None:
         repository = self.store.execution
+        definition = self._require_definition()
         node_observations: list[tuple[str, AvailabilityStatus]] = []
-        task_observations: list[tuple[str, AvailabilityStatus]] = []
+        task_observations: list[tuple[str, str, AvailabilityStatus]] = []
         for node in repository.list_nodes(self.execution_run_id):
             observation = self._publication_observation(node.node_key)
             if node.status == NodeStatus.PENDING:
                 node_observations.append((node.node_key, observation))
             elif node.status == NodeStatus.RUNNING and node.discovery_complete:
-                task = repository.get_task(
-                    self.execution_run_id,
-                    node.node_key,
-                    _TASK_KEY,
-                )
-                if not task.status.is_terminal:
-                    task_observations.append((node.node_key, observation))
+                implementation = definition.nodes[node.node_key].node
+                if isinstance(implementation, RemoteTaskWorkflowNode):
+                    for task in repository.list_tasks(
+                        self.execution_run_id,
+                        node.node_key,
+                    ):
+                        if task.status.is_terminal:
+                            continue
+                        task_observations.append((
+                            node.node_key,
+                            task.task_key,
+                            self._task_publication_observation(
+                                node.node_key,
+                                task.task_key,
+                            ),
+                        ))
+                else:
+                    task = repository.get_task(
+                        self.execution_run_id,
+                        node.node_key,
+                        _TASK_KEY,
+                    )
+                    if not task.status.is_terminal:
+                        task_observations.append((
+                            node.node_key,
+                            _TASK_KEY,
+                            observation,
+                        ))
 
         if not node_observations and not task_observations:
             return
@@ -316,11 +351,16 @@ class WorkflowRuntime:
                     observation,
                     now=self._now(),
                 )
-            for node_id, observation in task_observations:
+            for node_id, task_key, observation in task_observations:
+                if observation == AvailabilityStatus.MISSING:
+                    self.store.artifacts.discard_task_publication(
+                        node_id,
+                        task_key,
+                    )
                 self.store.execution.record_task_result_observation(
                     self.execution_run_id,
                     node_id,
-                    _TASK_KEY,
+                    task_key,
                     observation,
                     now=self._now(),
                 )
@@ -366,13 +406,38 @@ class WorkflowRuntime:
                 call.status == ProviderCallStatus.SUCCEEDED
                 and call.node_key in required
             ):
-                self._publish_provider_result(call.node_key, call.result_envelope)
+                self._publish_provider_result(call)
 
     def _publish_provider_result(
         self,
-        node_id: str,
-        envelope: object,
+        call: ProviderCallRecord,
     ) -> None:
+        node_id = call.node_key
+        envelope = call.result_envelope
+        node = self._require_definition().nodes[node_id].node
+        if isinstance(node, RemoteTaskWorkflowNode):
+            if len(call.task_keys) != 1:
+                for task_key in call.task_keys:
+                    task = self.store.execution.get_task(
+                        self.execution_run_id,
+                        node_id,
+                        task_key,
+                    )
+                    if not task.status.is_terminal:
+                        self._fail_discovered_task(
+                            node_id,
+                            task_key,
+                            "Remote Task Node received an unsupported batched result",
+                        )
+                return
+            task_key = call.task_keys[0]
+            self._publish_provider_task_result(
+                node_id,
+                task_key,
+                envelope,
+                node,
+            )
+            return
         task = self.store.execution.get_task(
             self.execution_run_id,
             node_id,
@@ -380,7 +445,6 @@ class WorkflowRuntime:
         )
         if task.status.is_terminal:
             return
-        node = self._require_definition().nodes[node_id].node
         if not isinstance(node, RemoteWorkflowNode):
             self._fail_task(node_id, "Provider result belongs to a local Node")
             return
@@ -394,6 +458,50 @@ class WorkflowRuntime:
             self._fail_task(node_id, f"Could not decode provider result: {error}")
             return
         self._publish_result(node_id, result)
+
+    def _publish_provider_task_result(
+        self,
+        node_id: str,
+        task_key: str,
+        envelope: object,
+        node: RemoteTaskWorkflowNode,
+    ) -> None:
+        task = self.store.execution.get_task(
+            self.execution_run_id,
+            node_id,
+            task_key,
+        )
+        if task.status.is_terminal:
+            return
+        try:
+            task_definition = RemoteWorkflowTask(
+                task_key=task.task_key,
+                scientific_payload=task.scientific_payload,
+                execution_payload=task.execution_payload,
+            )
+            invocation = node.prepare_remote_task(
+                self._node_context(
+                    self._require_definition(),
+                    node_id,
+                    task_key=task_key,
+                ),
+                task_definition,
+            )
+            result = AppRunResult.model_validate(
+                node.process_remote_task_result(
+                    task_key,
+                    _raw_result(envelope),
+                    invocation.metadata,
+                )
+            )
+        except Exception as error:
+            self._fail_discovered_task(
+                node_id,
+                task_key,
+                f"Could not decode provider result: {error}",
+            )
+            return
+        self._publish_task_result(node_id, task_key, result)
 
     def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
         repository = self.store.execution
@@ -420,38 +528,31 @@ class WorkflowRuntime:
                     item.node_id,
                     item.context.inputs,
                 )
-                self.store.execution.discover_tasks(
-                    self.execution_run_id,
-                    item.node_id,
-                    (
-                        TaskPlan(
-                            task_key=_TASK_KEY,
-                            scientific_payload=node_task_plan(
-                                item.node_id
-                            ).scientific_payload,
-                            execution_payload=_execution_payload(item.invocation),
-                        ),
-                    ),
-                    now=self._now(),
-                )
-                self.store.execution.record_task_result_observation(
-                    self.execution_run_id,
-                    item.node_id,
-                    _TASK_KEY,
-                    AvailabilityStatus.MISSING,
-                    now=self._now(),
-                )
                 if item.error is not None:
-                    self.store.execution.fail_task(
+                    self.store.execution.fail_node(
                         self.execution_run_id,
                         item.node_id,
-                        _TASK_KEY,
                         message=f"Could not prepare workflow Node: {item.error}",
                         now=self._now(),
                     )
-                    self.store.execution.reconcile_node_tasks(
+                    continue
+                self.store.execution.discover_tasks(
+                    self.execution_run_id,
+                    item.node_id,
+                    tuple(task.plan for task in item.tasks),
+                    now=self._now(),
+                )
+                for task in item.tasks:
+                    if task.observation == AvailabilityStatus.MISSING:
+                        self.store.artifacts.discard_task_publication(
+                            item.node_id,
+                            task.plan.task_key,
+                        )
+                    self.store.execution.record_task_result_observation(
                         self.execution_run_id,
                         item.node_id,
+                        task.plan.task_key,
+                        task.observation,
                         now=self._now(),
                     )
         self._checkpoint()
@@ -463,14 +564,40 @@ class WorkflowRuntime:
     ) -> _PreparedNode:
         context = self._node_context(definition, node_id)
         node = definition.nodes[node_id].node
-        if not isinstance(node, RemoteWorkflowNode):
-            return _PreparedNode(node_id, context, None)
         try:
-            invocation = node.prepare_remote(context)
-            _json_value(_execution_payload(invocation))
+            if isinstance(node, RemoteTaskWorkflowNode):
+                discovered = node.discover_remote_tasks(context)
+                tasks = tuple(
+                    _PreparedTask(
+                        plan=TaskPlan(
+                            task_key=task.task_key,
+                            scientific_payload=_json_value(task.scientific_payload),
+                            execution_payload=_json_value(task.execution_payload),
+                        ),
+                        observation=self._task_publication_observation(
+                            node_id,
+                            task.task_key,
+                        ),
+                    )
+                    for task in discovered
+                )
+                return _PreparedNode(node_id, context, tasks)
+            invocation = (
+                node.prepare_remote(context)
+                if isinstance(node, RemoteWorkflowNode)
+                else None
+            )
+            task = _PreparedTask(
+                plan=TaskPlan(
+                    task_key=_TASK_KEY,
+                    scientific_payload=node_task_plan(node_id).scientific_payload,
+                    execution_payload=_execution_payload(invocation),
+                ),
+                observation=AvailabilityStatus.MISSING,
+            )
+            return _PreparedNode(node_id, context, (task,))
         except Exception as error:
-            return _PreparedNode(node_id, context, None, error)
-        return _PreparedNode(node_id, context, invocation)
+            return _PreparedNode(node_id, context, (), error)
 
     def _run_local_tasks(self, definition: WorkflowDefinition) -> None:
         for node_record in self.store.execution.list_nodes(self.execution_run_id):
@@ -480,7 +607,7 @@ class WorkflowRuntime:
             ):
                 continue
             node = definition.nodes[node_record.node_key].node
-            if isinstance(node, RemoteWorkflowNode):
+            if isinstance(node, RemoteWorkflowNode | RemoteTaskWorkflowNode):
                 continue
             task = self.store.execution.get_task(
                 self.execution_run_id,
@@ -528,7 +655,7 @@ class WorkflowRuntime:
             required_node_keys=required,
             unfinished_node_keys=unfinished,
         )
-        invocations: dict[str, RemoteNodeCall] = {}
+        invocations: dict[tuple[str, str], RemoteNodeCall] = {}
         descriptors: list[TaskDispatchDescriptor] = []
         for node_id, node_record in nodes.items():
             if (
@@ -538,55 +665,70 @@ class WorkflowRuntime:
             ):
                 continue
             node = definition.nodes[node_id].node
-            if not isinstance(node, RemoteWorkflowNode):
+            if not isinstance(node, RemoteWorkflowNode | RemoteTaskWorkflowNode):
                 continue
-            task = repository.get_task(
-                self.execution_run_id,
-                node_id,
-                _TASK_KEY,
-            )
-            if (
-                task.status != TaskStatus.PENDING
-                or task.result_observation != AvailabilityStatus.MISSING
-            ):
-                continue
-            try:
-                invocation = node.prepare_remote(
-                    self._node_context(definition, node_id)
-                )
-                payload = _json_value(_execution_payload(invocation))
-                if payload != task.execution_payload:
-                    raise ValueError(
-                        "Remote Node preparation changed after Task discovery"
+            for task in repository.list_tasks(self.execution_run_id, node_id):
+                if (
+                    task.status != TaskStatus.PENDING
+                    or task.result_observation != AvailabilityStatus.MISSING
+                ):
+                    continue
+                try:
+                    if isinstance(node, RemoteTaskWorkflowNode):
+                        invocation = node.prepare_remote_task(
+                            self._node_context(
+                                definition,
+                                node_id,
+                                task_key=task.task_key,
+                            ),
+                            RemoteWorkflowTask(
+                                task_key=task.task_key,
+                                scientific_payload=task.scientific_payload,
+                                execution_payload=task.execution_payload,
+                            ),
+                        )
+                        _json_value(_execution_payload(invocation))
+                    else:
+                        invocation = node.prepare_remote(
+                            self._node_context(definition, node_id)
+                        )
+                        payload = _json_value(_execution_payload(invocation))
+                        if payload != task.execution_payload:
+                            raise ValueError(
+                                "Remote Node preparation changed after Task discovery"
+                            )
+                except Exception as error:
+                    self._fail_discovered_task(
+                        node_id,
+                        task.task_key,
+                        f"Could not prepare provider call: {error}",
                     )
-            except Exception as error:
-                self._fail_task(node_id, f"Could not prepare provider call: {error}")
-                continue
-            rank = ranks[node_id]
-            binding = ProviderBinding(
-                environment=run.deployment.environment,
-                app_name=run.deployment.deployment_name,
-                app_version=run.deployment.deployment_version,
-                function_name=invocation.function_name,
-                uses_gpu=invocation.uses_gpu,
-                runtime_image_key=invocation.runtime_image_key,
-            )
-            invocations[node_id] = invocation
-            descriptors.append(
-                TaskDispatchDescriptor(
-                    node_key=node_id,
-                    node_ordinal=node_record.ordinal,
-                    task_key=_TASK_KEY,
-                    task_ordinal=task.ordinal,
-                    binding=binding,
-                    compatibility_key=(
-                        invocation.compatibility_key or invocation.function_name
-                    ),
-                    max_tasks_per_call=1,
-                    depth=rank.depth,
-                    unblocking_span=rank.unblocking_span,
+                    continue
+                rank = ranks[node_id]
+                binding = ProviderBinding(
+                    environment=run.deployment.environment,
+                    app_name=run.deployment.deployment_name,
+                    app_version=run.deployment.deployment_version,
+                    function_name=invocation.function_name,
+                    uses_gpu=invocation.uses_gpu,
+                    runtime_image_key=invocation.runtime_image_key,
                 )
-            )
+                invocations[(node_id, task.task_key)] = invocation
+                descriptors.append(
+                    TaskDispatchDescriptor(
+                        node_key=node_id,
+                        node_ordinal=node_record.ordinal,
+                        task_key=task.task_key,
+                        task_ordinal=task.ordinal,
+                        binding=binding,
+                        compatibility_key=(
+                            invocation.compatibility_key or invocation.function_name
+                        ),
+                        max_tasks_per_call=1,
+                        depth=rank.depth,
+                        unblocking_span=rank.unblocking_span,
+                    )
+                )
 
         counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = select_admissible_candidates(
@@ -601,12 +743,13 @@ class WorkflowRuntime:
             ),
         )
         for candidate in selected:
-            invocation = invocations[candidate.node_key]
+            [task_key] = candidate.task_keys
+            invocation = invocations[(candidate.node_key, task_key)]
             self._provider.repository = self.store.execution
             self._provider.submit_fixed_batch(
                 self.execution_run_id,
                 candidate,
-                submission_token=f"{candidate.node_key}:{_TASK_KEY}",
+                submission_token=f"{candidate.node_key}:{task_key}",
                 args=invocation.args,
                 kwargs=invocation.kwargs,
                 now=self._now(),
@@ -657,6 +800,60 @@ class WorkflowRuntime:
                 )
         self._checkpoint()
 
+    def _publish_task_result(
+        self,
+        node_id: str,
+        task_key: str,
+        result: AppRunResult,
+    ) -> None:
+        if result.status != AppRunStatus.SUCCEEDED:
+            self._fail_discovered_task(
+                node_id,
+                task_key,
+                _node_error_message(result),
+            )
+            return
+        context = self._node_context(
+            self._require_definition(),
+            node_id,
+            task_key=task_key,
+        )
+        materialized = materialize_app_run_result(
+            result=result,
+            workflow_volume_name=self.workflow_volume_name,
+            result_dir=context.work_dir,
+            artifact_dir=self.store.output_root / "artifacts",
+            producing_node_id=node_id,
+            artifact_id_scope=task_key,
+            volume_root=self.volume_root,
+        )
+        observation = self._artifact_observation(tuple(materialized.artifacts))
+        with self.store.transaction():
+            self.store.artifacts.record_task_publication(
+                node_id,
+                task_key,
+                result=materialized.result,
+                artifacts=tuple(materialized.artifacts),
+                now=self._now(),
+            )
+            if observation == AvailabilityStatus.MISSING:
+                self.store.execution.fail_task(
+                    self.execution_run_id,
+                    node_id,
+                    task_key,
+                    message="Published workflow Task result is unavailable",
+                    now=self._now(),
+                )
+            else:
+                self.store.execution.record_task_result_observation(
+                    self.execution_run_id,
+                    node_id,
+                    task_key,
+                    observation,
+                    now=self._now(),
+                )
+        self._checkpoint()
+
     def _fail_task(self, node_id: str, message: str) -> None:
         with self.store.transaction():
             self.store.execution.fail_task(
@@ -681,15 +878,44 @@ class WorkflowRuntime:
             )
         self._checkpoint()
 
-    def _reconcile_nodes_and_run(self) -> None:
+    def _fail_discovered_task(
+        self,
+        node_id: str,
+        task_key: str,
+        message: str,
+    ) -> None:
+        """Fail one prepared Task without collapsing its independent siblings."""
         with self.store.transaction():
-            for node in self.store.execution.list_nodes(self.execution_run_id):
-                if node.status == NodeStatus.RUNNING and node.discovery_complete:
-                    self.store.execution.reconcile_node_tasks(
-                        self.execution_run_id,
-                        node.node_key,
-                        now=self._now(),
-                    )
+            self.store.execution.fail_task(
+                self.execution_run_id,
+                node_id,
+                task_key,
+                message=message,
+                now=self._now(),
+            )
+        self._checkpoint()
+
+    def _reconcile_nodes_and_run(self) -> None:
+        definition = self._require_definition()
+        for node in self.store.execution.list_nodes(self.execution_run_id):
+            if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+                continue
+            implementation = definition.nodes[node.node_key].node
+            if isinstance(implementation, RemoteTaskWorkflowNode):
+                self._finalize_remote_task_node(
+                    node.node_key,
+                    node.aggregation_policy,
+                    node.allow_empty_result,
+                    implementation,
+                )
+                continue
+            with self.store.transaction():
+                self.store.execution.reconcile_node_tasks(
+                    self.execution_run_id,
+                    node.node_key,
+                    now=self._now(),
+                )
+        with self.store.transaction():
             self.store.execution.skip_unreachable_nodes(
                 self.execution_run_id,
                 now=self._now(),
@@ -699,11 +925,231 @@ class WorkflowRuntime:
                 now=self._now(),
             )
 
+    def _finalize_remote_task_node(
+        self,
+        node_id: str,
+        aggregation_policy: NodeAggregationPolicy,
+        allow_empty_result: bool,
+        implementation: RemoteTaskWorkflowNode,
+    ) -> None:
+        with self.store.transaction():
+            skipped = self.store.execution.apply_task_failure_policy(
+                self.execution_run_id,
+                node_id,
+                now=self._now(),
+            )
+        if skipped:
+            self._checkpoint()
+        tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
+        empty_result = not tasks
+        outcome = (
+            NodeStatus.SUCCEEDED
+            if empty_result and allow_empty_result
+            else aggregate_task_outcome(
+                aggregation_policy,
+                tuple(task.status for task in tasks),
+            )
+        )
+        if outcome is None:
+            return
+        if outcome == NodeStatus.CANCELLED:
+            with self.store.transaction():
+                self.store.execution.reconcile_node_tasks(
+                    self.execution_run_id,
+                    node_id,
+                    now=self._now(),
+                )
+            return
+
+        existing = self.store.artifacts.load_node_result(node_id)
+        if existing is not None:
+            observation = self._artifact_observation(
+                self.store.artifacts.load_node_output_artifacts(node_id)
+            )
+            if observation == AvailabilityStatus.MISSING:
+                with self.store.transaction():
+                    self.store.artifacts.discard_node_publication(node_id)
+            elif observation == AvailabilityStatus.UNKNOWN:
+                with self.store.transaction():
+                    self.store.execution.transition_run(
+                        self.execution_run_id,
+                        RunStatus.SUSPENDED,
+                        reason=RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+                        message=f"Could not validate workflow Node {node_id!r}",
+                        now=self._now(),
+                    )
+                return
+            else:
+                if existing.status != _app_status_for_node(outcome):
+                    self._fail_node_publication(
+                        node_id,
+                        "Persisted Node publication status does not match "
+                        "terminal Task outcomes",
+                    )
+                    return
+                with self.store.transaction():
+                    if empty_result:
+                        self.store.execution.record_node_result_observation(
+                            self.execution_run_id,
+                            node_id,
+                            AvailabilityStatus.AVAILABLE,
+                            now=self._now(),
+                        )
+                    else:
+                        self.store.execution.reconcile_node_tasks(
+                            self.execution_run_id,
+                            node_id,
+                            now=self._now(),
+                        )
+                return
+
+        results: dict[str, AppRunResult] = {}
+        errors: dict[str, str] = {}
+        task_artifacts: list[WorkflowArtifact] = []
+        for task in tasks:
+            if task.status == TaskStatus.SUCCEEDED:
+                result = self.store.artifacts.load_task_result(
+                    node_id,
+                    task.task_key,
+                )
+                if result is None:
+                    self._fail_node_publication(
+                        node_id,
+                        f"Successful Task {task.task_key!r} has no publication",
+                    )
+                    return
+                results[task.task_key] = result
+                task_artifacts.extend(
+                    self.store.artifacts.load_task_output_artifacts(
+                        node_id,
+                        task.task_key,
+                    )
+                )
+            else:
+                errors[task.task_key] = (
+                    task.error_message or f"Task ended as {task.status.value}"
+                )
+        try:
+            finalization = AppRunResult.model_validate(
+                implementation.finalize_remote_tasks(
+                    self._node_context(self._require_definition(), node_id),
+                    results,
+                    errors,
+                )
+            )
+            expected_status = _app_status_for_node(outcome)
+            if finalization.status != expected_status:
+                raise ValueError(
+                    f"finalizer returned {finalization.status.value}; "
+                    f"expected {expected_status.value}"
+                )
+            materialized = materialize_app_run_result(
+                result=finalization,
+                workflow_volume_name=self.workflow_volume_name,
+                result_dir=(
+                    self.store.output_root / "nodes" / node_id / "result" / "aggregate"
+                ),
+                artifact_dir=self.store.output_root / "artifacts",
+                producing_node_id=node_id,
+                artifact_id_scope="aggregate",
+                volume_root=self.volume_root,
+            )
+            combined_result = materialized.result.model_copy(
+                update={
+                    "outputs": [
+                        output
+                        for result in results.values()
+                        for output in result.outputs
+                    ]
+                    + materialized.result.outputs,
+                    "logs": [
+                        output for result in results.values() for output in result.logs
+                    ]
+                    + materialized.result.logs,
+                    "warnings": [
+                        warning
+                        for result in results.values()
+                        for warning in result.warnings
+                    ]
+                    + materialized.result.warnings,
+                }
+            )
+            artifacts = (*task_artifacts, *materialized.artifacts)
+            observation = self._artifact_observation(artifacts)
+        except Exception as error:
+            self._fail_node_publication(
+                node_id,
+                f"Could not finalize workflow Node: {error}",
+            )
+            return
+
+        with self.store.transaction():
+            self.store.artifacts.record_node_publication(
+                node_id,
+                result=combined_result,
+                artifacts=artifacts,
+                now=self._now(),
+            )
+            if observation == AvailabilityStatus.AVAILABLE:
+                if empty_result:
+                    self.store.execution.record_node_result_observation(
+                        self.execution_run_id,
+                        node_id,
+                        AvailabilityStatus.AVAILABLE,
+                        now=self._now(),
+                    )
+                else:
+                    self.store.execution.reconcile_node_tasks(
+                        self.execution_run_id,
+                        node_id,
+                        now=self._now(),
+                    )
+            elif observation == AvailabilityStatus.MISSING:
+                self.store.execution.fail_node(
+                    self.execution_run_id,
+                    node_id,
+                    message="Published workflow Node result is unavailable",
+                    now=self._now(),
+                )
+            else:
+                self.store.execution.transition_run(
+                    self.execution_run_id,
+                    RunStatus.SUSPENDED,
+                    reason=RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+                    message=f"Could not validate workflow Node {node_id!r}",
+                    now=self._now(),
+                )
+        self._checkpoint()
+
+    def _fail_node_publication(self, node_id: str, message: str) -> None:
+        with self.store.transaction():
+            self.store.execution.fail_node(
+                self.execution_run_id,
+                node_id,
+                message=message,
+                now=self._now(),
+            )
+        self._checkpoint()
+
     def _publication_observation(self, node_id: str) -> AvailabilityStatus:
         result = self.store.artifacts.load_node_result(node_id)
-        if result is None:
+        if result is None or result.status != AppRunStatus.SUCCEEDED:
             return AvailabilityStatus.MISSING
         artifacts = self.store.artifacts.load_node_output_artifacts(node_id)
+        return self._artifact_observation(artifacts)
+
+    def _task_publication_observation(
+        self,
+        node_id: str,
+        task_key: str,
+    ) -> AvailabilityStatus:
+        result = self.store.artifacts.load_task_result(node_id, task_key)
+        if result is None or result.status != AppRunStatus.SUCCEEDED:
+            return AvailabilityStatus.MISSING
+        artifacts = self.store.artifacts.load_task_output_artifacts(
+            node_id,
+            task_key,
+        )
         return self._artifact_observation(artifacts)
 
     def _artifact_observation(
@@ -729,6 +1175,8 @@ class WorkflowRuntime:
         self,
         definition: WorkflowDefinition,
         node_id: str,
+        *,
+        task_key: str = _TASK_KEY,
     ) -> NodeRunContext:
         spec = definition.nodes[node_id]
         inputs = {
@@ -736,15 +1184,20 @@ class WorkflowRuntime:
             for input_name, selector in spec.inputs.items()
         }
         node_root = self.store.output_root / "nodes" / node_id
-        work_dir = node_root / "result"
-        cache_dir = node_root / "cache"
+        if task_key == _TASK_KEY:
+            work_dir = node_root / "result"
+            cache_dir = node_root / "cache"
+        else:
+            task_root = node_root / "tasks" / sanitize_filename(task_key)
+            work_dir = task_root / "result"
+            cache_dir = task_root / "cache"
         work_dir.mkdir(parents=True, exist_ok=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
         return NodeRunContext(
             execution_run_id=self.execution_run_id,
             workload_run_key=self._require_workload_run_key(),
             node_id=node_id,
-            task_key=_TASK_KEY,
+            task_key=task_key,
             work_dir=work_dir,
             cache_dir=cache_dir,
             inputs=inputs,
@@ -813,6 +1266,16 @@ def _node_error_message(result: AppRunResult) -> str:
     if result.status == AppRunStatus.PARTIAL:
         return "Node returned partial status"
     return "Node returned failed status"
+
+
+def _app_status_for_node(status: NodeStatus) -> AppRunStatus:
+    if status == NodeStatus.SUCCEEDED:
+        return AppRunStatus.SUCCEEDED
+    if status == NodeStatus.PARTIAL:
+        return AppRunStatus.PARTIAL
+    if status == NodeStatus.FAILED:
+        return AppRunStatus.FAILED
+    raise ValueError(f"Node status {status.value} has no App result status")
 
 
 def _app_result_for_run(

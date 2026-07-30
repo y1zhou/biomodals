@@ -2,15 +2,18 @@
 
 # ruff: noqa: D101, D102, D103, D107
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
 from biomodals.execution import (
     DeploymentIdentity,
+    NodeAggregationPolicy,
     NodeStatus,
     ProviderCallStatus,
     RunStatus,
+    TaskStatus,
 )
 from biomodals.execution.modal import (
     ModalCallObservation,
@@ -30,7 +33,9 @@ from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
     RemoteNodeCall,
+    RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
+    RemoteWorkflowTask,
     WorkflowNativeNode,
 )
 from biomodals.workflow.core.runtime import WorkflowRuntime
@@ -69,6 +74,75 @@ class RemoteTextNode(RemoteWorkflowNode):
         )
 
 
+@dataclass
+class RemoteFanoutNode(RemoteTaskWorkflowNode):
+    texts: tuple[str, ...]
+    finalized_results: list[tuple[tuple[str, ...], tuple[str, ...]]] = field(
+        default_factory=list,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        return tuple(
+            RemoteWorkflowTask(
+                task_key=f"candidate-{ordinal}",
+                scientific_payload={"text": text},
+                execution_payload={"text": text},
+            )
+            for ordinal, text in enumerate(self.texts)
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        payload = dict(task.execution_payload)
+        return RemoteNodeCall(
+            function_name="run_candidate",
+            uses_gpu=False,
+            kwargs={
+                "task_key": task.task_key,
+                "text": payload["text"],
+            },
+            metadata={"task_key": context.task_key},
+            runtime_image_key="fanout",
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        self.finalized_results.append((tuple(results), tuple(errors)))
+        status = (
+            AppRunStatus.PARTIAL
+            if results and errors
+            else AppRunStatus.SUCCEEDED
+            if not errors
+            else AppRunStatus.FAILED
+        )
+        return AppRunResult(
+            status=status,
+            outputs=[
+                AppOutput(
+                    name="summary",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=",".join(results).encode(),
+                        filename="summary.txt",
+                        media_type="text/plain",
+                    ),
+                )
+            ],
+        )
+
+
 class FakeModalDriver:
     def __init__(self) -> None:
         self.events: list[str] = []
@@ -98,6 +172,32 @@ class FakeModalDriver:
 
     def cancel(self, provider_call_handle_id):
         self.cancelled.append(provider_call_handle_id)
+
+
+class FanoutModalDriver(FakeModalDriver):
+    def __init__(self, *, failing_tasks: set[str] | None = None) -> None:
+        super().__init__()
+        self.failing_tasks = failing_tasks or set()
+
+    def spawn(self, function, *, args, kwargs):
+        task_key = str(kwargs["task_key"])
+        call_id = f"fc-{task_key}"
+        self.events.append(f"spawn:{task_key}")
+        self.results[call_id] = _text_result(str(kwargs["text"]))
+        return call_id
+
+    def observe(self, provider_call_handle_id):
+        task_key = provider_call_handle_id.removeprefix("fc-")
+        self.events.append(f"observe:{task_key}")
+        if task_key in self.failing_tasks:
+            return ModalCallObservation(
+                ModalCallObservationKind.FAILED,
+                message=f"{task_key} failed",
+            )
+        return ModalCallObservation(
+            ModalCallObservationKind.SUCCEEDED,
+            result=self.results[provider_call_handle_id],
+        )
 
 
 class FakeVolume:
@@ -261,6 +361,128 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
     ]
     assert volume.commits > 0
     assert volume.reloads > 0
+
+
+def test_remote_task_node_discovers_and_publishes_independent_tasks(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("fanout")
+    node = RemoteFanoutNode(("alpha", "beta"))
+    fanout = workflow.add_node(node, id="fanout")
+    downstream = TextNode("joined")
+    workflow.add_node(
+        downstream,
+        id="downstream",
+        inputs={"candidates": fanout.outputs(kind=ArtifactKind.REPORT)},
+    )
+    driver = FanoutModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+
+    result = runtime.run(workload_run_key="fanout")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert driver.events[:4] == [
+        "resolve:main/DemoWorkflow/7/run_candidate",
+        "spawn:candidate-0",
+        "resolve:main/DemoWorkflow/7/run_candidate",
+        "spawn:candidate-1",
+    ]
+    tasks = runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    assert [task.task_key for task in tasks] == ["candidate-0", "candidate-1"]
+    assert [task.status for task in tasks] == [
+        TaskStatus.SUCCEEDED,
+        TaskStatus.SUCCEEDED,
+    ]
+    assert node.finalized_results == [
+        (("candidate-0", "candidate-1"), ()),
+    ]
+    task_artifact_ids = [
+        runtime.store.artifacts.load_task_output_artifacts(
+            "fanout",
+            task.task_key,
+        )[0].artifact_id
+        for task in tasks
+    ]
+    assert len(set(task_artifact_ids)) == 2
+    assert {
+        artifact.artifact_id for artifact in downstream.seen[0].inputs["candidates"]
+    }.issuperset(task_artifact_ids)
+
+
+def test_remote_task_node_can_publish_partial_outcomes(tmp_path: Path) -> None:
+    workflow = Workflow("partial-fanout")
+    node = RemoteFanoutNode(("alpha", "beta"))
+    workflow.add_node(
+        node,
+        id="fanout",
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+    driver = FanoutModalDriver(failing_tasks={"candidate-1"})
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+
+    result = runtime.run(workload_run_key="partial-fanout")
+
+    assert result.status == AppRunStatus.PARTIAL
+    assert runtime.store.execution.get_node(RUN_ID, "fanout").status == (
+        NodeStatus.PARTIAL
+    )
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED]
+    assert node.finalized_results == [
+        (("candidate-0",), ("candidate-1",)),
+    ]
+    assert runtime.store.artifacts.load_task_result("fanout", "candidate-0") is not None
+    assert runtime.store.artifacts.load_task_result("fanout", "candidate-1") is None
+
+
+def test_remote_task_node_fail_fast_stops_unowned_siblings(tmp_path: Path) -> None:
+    workflow = Workflow("fail-fast-fanout")
+    node = RemoteFanoutNode(("alpha", "beta", "gamma"))
+    workflow.add_node(
+        node,
+        id="fanout",
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    driver = FanoutModalDriver(failing_tasks={"candidate-0"})
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_calls=1,
+        max_gpu_calls=1,
+    )
+
+    result = runtime.run(workload_run_key="fail-fast-fanout")
+
+    assert result.status == AppRunStatus.FAILED
+    assert [event for event in driver.events if event.startswith("spawn:")] == [
+        "spawn:candidate-0"
+    ]
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    ] == [TaskStatus.FAILED, TaskStatus.SKIPPED, TaskStatus.SKIPPED]
+    assert node.finalized_results == [
+        ((), ("candidate-0", "candidate-1", "candidate-2")),
+    ]
+
+
+def test_remote_task_node_requires_explicit_empty_publication(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("empty-fanout")
+    node = RemoteFanoutNode(())
+    workflow.add_node(node, id="fanout", allow_empty_result=True)
+    driver = FanoutModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+
+    result = runtime.run(workload_run_key="empty-fanout")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert runtime.store.execution.list_tasks(RUN_ID, "fanout") == ()
+    assert node.finalized_results == [((), ())]
+    assert not any(event.startswith("spawn:") for event in driver.events)
+    assert runtime.store.artifacts.load_node_result("fanout") is not None
 
 
 def test_durable_provider_envelope_is_published_without_another_spawn(
@@ -447,6 +669,7 @@ def test_missing_copied_publication_is_discarded_and_recomputed(
     assert len(node.seen) == 1
     publication = runtime.store.artifacts.load_node_result("terminal")
     assert publication is not None
+    assert isinstance(publication.outputs[0].storage, VolumePath)
     assert publication.outputs[0].storage.path != "missing/result.txt"
 
 

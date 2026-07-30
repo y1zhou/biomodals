@@ -7,6 +7,7 @@ from dataclasses import fields
 import pytest
 
 import biomodals.workflow as workflow_api
+from biomodals.execution import NodeAggregationPolicy
 from biomodals.schema import ArtifactKind
 from biomodals.workflow import Workflow
 from biomodals.workflow.core.builder import NodeHandle
@@ -86,7 +87,13 @@ def test_cycles_raise_value_error() -> None:
 def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None:
     workflow = Workflow("demo")
     first = workflow.add_node(DummyNode(), id="first")
-    workflow.add_node(DummyNode(), id="second", depends_on=[first])
+    workflow.add_node(
+        DummyNode(),
+        id="second",
+        depends_on=[first],
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+        allow_empty_result=True,
+    )
     definition = workflow.validate()
 
     plan = execution_plan(definition, workload_run_key="run-1")
@@ -97,6 +104,8 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
     assert [dependency.node_key for dependency in plan.nodes[1].dependencies] == [
         "first"
     ]
+    assert plan.nodes[1].aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
+    assert plan.nodes[1].allow_empty_result is True
     assert plan.scientific_payload["dag_hash"]
 
 

@@ -24,6 +24,8 @@ def execution_plan(
                 for dependency in encounter_order
                 if dependency in definition.dependencies[node_id]
             ),
+            aggregation_policy=definition.nodes[node_id].aggregation_policy,
+            allow_empty_result=definition.nodes[node_id].allow_empty_result,
         )
         for node_id in encounter_order
     )

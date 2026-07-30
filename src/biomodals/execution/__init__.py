@@ -1,5 +1,9 @@
 """Durable task scheduling for Biomodals workloads."""
 
+from biomodals.execution.coordinator import (
+    drive_execution_run,
+    resume_execution_run,
+)
 from biomodals.execution.model import (
     ActiveProviderCallCounts,
     AvailabilityStatus,
@@ -72,9 +76,11 @@ __all__ = [
     "WorkerAssignmentRecord",
     "WorkStatusReason",
     "aggregate_task_outcome",
+    "drive_execution_run",
     "propagated_skip_node_keys",
     "ready_node_keys",
     "required_node_keys",
+    "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",
 ]

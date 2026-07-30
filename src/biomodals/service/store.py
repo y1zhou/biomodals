@@ -1317,6 +1317,13 @@ class ServiceStore:
                 raise ValueError("Initial Job submission token must not be empty")
             if initial_operation.lease_seconds < 1:
                 raise ValueError("Initial Job lease must be positive")
+        job_run_name = (
+            run_name
+            if initial_operation is not None
+            else (
+                execution_plan.workload_run_key if execution_plan is not None else None
+            )
+        )
         with self._transaction() as conn:
             existing = conn.execute(
                 """
@@ -1463,7 +1470,7 @@ class ServiceStore:
                     modal_environment.strip(),
                     modal_app_name.strip(),
                     modal_app_version,
-                    run_name if initial_operation is not None else None,
+                    job_run_name,
                     now,
                     now,
                 ),

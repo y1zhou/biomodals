@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from biomodals.service.config import ServiceSettings
+from biomodals.service.gromacs.plan import execution_plan
 from biomodals.service.runtime_config import RuntimeConfiguration, SettingOverrideError
 from biomodals.service.store import ServiceStore
 from biomodals.service.workloads import GROMACS_WORKLOAD
@@ -211,6 +212,16 @@ def test_admission_resolves_database_settings_inside_store_transaction(
         request_hash="a" * 64,
         parameters_json="{}",
         configuration=admission_configuration,
+        execution_plan=execution_plan(
+            cpu_only=True,
+            workload_run_key="simulation-1",
+            pdb_sha256="b" * 64,
+            simulation_time_ns=5,
+            run_pdbfixer=False,
+        ),
+        execution_run_id=uuid4(),
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=0,
         now=2,
     ).job
 

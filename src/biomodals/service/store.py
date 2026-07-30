@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from uuid import UUID, uuid4
 
 import orjson
@@ -71,10 +71,6 @@ class JobNotCancellableError(RuntimeError):
     """Raised when cancellation is requested for a terminal job."""
 
 
-class JobSubmissionConflictError(RuntimeError):
-    """Raised when a stale submitter tries to attach a provider call."""
-
-
 class JobStateResolutionError(RuntimeError):
     """Raised when an Administrator resolves a Job in another state."""
 
@@ -120,47 +116,14 @@ class JobOperationExecutor(StrEnum):
     LOCAL = "local"
 
 
-PROVIDER_TRACKED_JOB_STATES = (
-    JobState.QUEUED,
-    JobState.RUNNING,
-    JobState.FINALIZING,
-    JobState.CANCEL_REQUESTED,
-)
-ACTIVE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.STATE_UNKNOWN)
-TERMINAL_JOB_STATES = (
-    JobState.SUCCEEDED,
-    JobState.PARTIAL,
-    JobState.FAILED,
-    JobState.CANCELLED,
-)
-RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 5
-_RESULT_PACKAGING_OPERATION = "result_packaging"
-_JOB_OPERATIONS_TABLE_SQL = """
-CREATE TABLE job_operations (
-    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-    operation TEXT NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    executor TEXT NOT NULL CHECK (executor IN ('modal', 'local')),
-    modal_call_id TEXT UNIQUE,
-    state TEXT NOT NULL CHECK (
-        state IN (
-            'submitting', 'running', 'completed', 'failed',
-            'cancelled', 'state_unknown'
-        )
-    ),
-    submission_token TEXT,
-    submission_lease_until INTEGER,
-    started_at INTEGER,
-    completed_at INTEGER,
-    PRIMARY KEY (job_id, operation),
-    UNIQUE (job_id, ordinal)
+_SERVICE_SCHEMA_VERSION = 4
+_ACTIVE_RUN_STATUSES = tuple(status for status in RunStatus if not status.is_terminal)
+_RECONCILABLE_RUN_STATUSES = (
+    RunStatus.PENDING,
+    RunStatus.RUNNING,
+    RunStatus.CANCEL_REQUESTED,
 )
-"""
-_JOB_OPERATIONS_ACTIVE_INDEX_SQL = """
-CREATE INDEX job_operations_active ON job_operations(job_id, state)
-"""
 
 
 class UserStatus(StrEnum):
@@ -244,8 +207,6 @@ class JobRecord:
     state_unknown_at: int | None
     state_unknown_reason: JobStateUnknownReason | None
     finalization_started_at: int | None
-    finalization_retry_started_at: int | None
-    finalization_retry_count: int
     blocked_at: int | None
     next_retry_at: int | None
     blocking_category: str | None
@@ -342,16 +303,6 @@ class JobOperationRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class InitialModalOperation:
-    """First paid operation durably leased in the Job admission transaction."""
-
-    operation: str
-    run_name: str
-    submission_token: str
-    lease_seconds: int = 120
-
-
-@dataclass(frozen=True, slots=True)
 class WorkloadConfigurationRecord:
     """Optional database overrides for one fixed API workload."""
 
@@ -406,7 +357,7 @@ class ServiceStore:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if created:
                 conn.executescript(
-                    f"""
+                    """
                     BEGIN IMMEDIATE;
 
                     CREATE TABLE users (
@@ -447,19 +398,18 @@ class ServiceStore:
                     CREATE TABLE jobs (
                         job_id TEXT PRIMARY KEY,
                         owner_user_id TEXT NOT NULL REFERENCES users(user_id),
-                        execution_run_id TEXT UNIQUE,
+                        execution_run_id TEXT NOT NULL UNIQUE
+                            REFERENCES execution_runs(execution_run_id),
                         workload TEXT NOT NULL,
                         display_name TEXT NOT NULL,
                         idempotency_key TEXT NOT NULL,
                         request_hash TEXT NOT NULL,
                         parameters_json TEXT NOT NULL,
                         artifact_request_sha256 TEXT,
-                        state TEXT NOT NULL,
-                        modal_environment TEXT NOT NULL,
-                        modal_app_name TEXT NOT NULL,
-                        modal_app_version INTEGER NOT NULL
-                            CHECK (modal_app_version >= 1),
-                        run_name TEXT,
+                        result_state TEXT CHECK (
+                            result_state IS NULL
+                            OR result_state IN ('succeeded', 'partial')
+                        ),
                         result_volume_name TEXT,
                         result_volume_path TEXT,
                         result_filename TEXT,
@@ -475,23 +425,10 @@ class ServiceStore:
                         error_message TEXT,
                         created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL,
-                        completed_at INTEGER,
                         cancel_requested_at INTEGER,
-                        state_unknown_at INTEGER,
-                        state_unknown_reason TEXT CHECK (
-                            state_unknown_reason IS NULL OR state_unknown_reason IN (
-                                'submission_outcome_unknown',
-                                'provider_outcome_unknown',
-                                'cancellation_outcome_unknown'
-                            )
-                        ),
-                        finalization_started_at INTEGER,
-                        finalization_retry_started_at INTEGER,
-                        finalization_retry_count INTEGER NOT NULL DEFAULT 0,
-                        blocked_at INTEGER,
+                        result_blocked_at INTEGER,
+                        result_blocking_category TEXT,
                         next_retry_at INTEGER,
-                        blocking_category TEXT,
-                        result_previous_state TEXT,
                         result_cached INTEGER NOT NULL DEFAULT 0
                             CHECK (result_cached IN (0, 1)),
                         intermediates_cleaned_at INTEGER,
@@ -499,17 +436,13 @@ class ServiceStore:
                     );
                     CREATE INDEX jobs_owner_created
                         ON jobs(owner_user_id, created_at DESC);
-                    CREATE INDEX jobs_active
-                        ON jobs(state, owner_user_id, workload);
+                    CREATE INDEX jobs_workload ON jobs(workload);
 
                     CREATE TABLE job_inputs (
                         job_id TEXT PRIMARY KEY REFERENCES jobs(job_id)
                             ON DELETE CASCADE,
                         content BLOB NOT NULL
                     );
-
-                    {_JOB_OPERATIONS_TABLE_SQL};
-                    {_JOB_OPERATIONS_ACTIVE_INDEX_SQL};
 
                     CREATE TABLE service_settings (
                         key TEXT PRIMARY KEY,
@@ -599,19 +532,18 @@ class ServiceStore:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT blocking_category, COUNT(*) AS count,
-                       MIN(blocked_at) AS oldest_blocked_at
+                SELECT result_blocking_category, COUNT(*) AS count,
+                       MIN(result_blocked_at) AS oldest_blocked_at
                 FROM jobs
-                WHERE state = ? AND blocking_category IS NOT NULL
-                      AND blocked_at IS NOT NULL
-                GROUP BY blocking_category
-                ORDER BY blocking_category
-                """,
-                (JobState.BLOCKED.value,),
+                WHERE result_blocking_category IS NOT NULL
+                      AND result_blocked_at IS NOT NULL
+                GROUP BY result_blocking_category
+                ORDER BY result_blocking_category
+                """
             ).fetchall()
         return [
             BlockedJobSummary(
-                category=str(row["blocking_category"]),
+                category=str(row["result_blocking_category"]),
                 count=int(row["count"]),
                 oldest_blocked_at=int(row["oldest_blocked_at"]),
             )
@@ -1271,38 +1203,17 @@ class ServiceStore:
         parameters_json: str,
         artifact_request_sha256: str | None = None,
         configuration: JobAdmissionConfiguration,
+        execution_plan: ExecutionPlan,
+        execution_run_id: UUID,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
         now: int,
         new_job_id: UUID | None = None,
-        initial_operation: InitialModalOperation | None = None,
-        execution_plan: ExecutionPlan | None = None,
-        execution_run_id: UUID | None = None,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
         input_content: bytes | None = None,
     ) -> JobAdmission:
         """Atomically apply idempotency and every active Job admission limit."""
         workload = configuration.workload
-        if initial_operation is not None and execution_plan is not None:
-            raise ValueError(
-                "Initial legacy operation and Execution Plan are mutually exclusive"
-            )
-        execution_parameters = (
-            execution_run_id,
-            max_active_provider_calls,
-            max_active_gpu_provider_calls,
-        )
-        if execution_plan is None:
-            if any(value is not None for value in execution_parameters):
-                raise ValueError("Execution Run parameters require an Execution Plan")
-        elif (
-            execution_run_id is None
-            or max_active_provider_calls is None
-            or max_active_gpu_provider_calls is None
-        ):
-            raise ValueError(
-                "Execution Plan admission requires complete Run parameters"
-            )
-        elif execution_plan.workload_name != workload:
+        if execution_plan.workload_name != workload:
             raise ValueError("Execution Plan workload does not match Job workload")
         if input_content is not None and not input_content:
             raise ValueError("Staged Job input cannot be empty")
@@ -1314,25 +1225,6 @@ class ServiceStore:
             )
         ):
             raise ValueError("Artifact request SHA-256 must be lowercase hexadecimal")
-        if initial_operation is not None:
-            operation = initial_operation.operation.strip()
-            run_name = initial_operation.run_name.strip()
-            submission_token = initial_operation.submission_token.strip()
-            if not operation:
-                raise ValueError("Initial Job operation must not be empty")
-            if not run_name:
-                raise ValueError("Initial Job run name must not be empty")
-            if not submission_token:
-                raise ValueError("Initial Job submission token must not be empty")
-            if initial_operation.lease_seconds < 1:
-                raise ValueError("Initial Job lease must be positive")
-        job_run_name = (
-            run_name
-            if initial_operation is not None
-            else (
-                execution_plan.workload_run_key if execution_plan is not None else None
-            )
-        )
         with self._transaction() as conn:
             existing = conn.execute(
                 """
@@ -1410,15 +1302,28 @@ class ServiceStore:
             if type(modal_app_version) is not int or modal_app_version < 1:
                 raise ValueError("Modal App version must be positive")
 
-            placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
-            states = tuple(state.value for state in ACTIVE_JOB_STATES)
+            placeholders = ", ".join("?" for _ in _ACTIVE_RUN_STATUSES)
+            states = tuple(state.value for state in _ACTIVE_RUN_STATUSES)
             user_active_count = int(
                 conn.execute(
                     f"""
                     SELECT COUNT(*) FROM jobs
-                    WHERE owner_user_id = ? AND state IN ({placeholders})
+                    JOIN execution_runs USING (execution_run_id)
+                    WHERE owner_user_id = ?
+                      AND (
+                          execution_runs.status IN ({placeholders})
+                          OR (
+                              execution_runs.status IN (?, ?)
+                              AND jobs.result_state IS NULL
+                          )
+                      )
                     """,  # noqa: S608 - placeholders are generated, not user input
-                    (str(owner_user_id), *states),
+                    (
+                        str(owner_user_id),
+                        *states,
+                        RunStatus.SUCCEEDED.value,
+                        RunStatus.PARTIAL.value,
+                    ),
                 ).fetchone()[0]
             )
             if user_active_count >= user_active_job_limit:
@@ -1429,9 +1334,22 @@ class ServiceStore:
                 conn.execute(
                     f"""
                     SELECT COUNT(*) FROM jobs
-                    WHERE workload = ? AND state IN ({placeholders})
+                    JOIN execution_runs USING (execution_run_id)
+                    WHERE workload = ?
+                      AND (
+                          execution_runs.status IN ({placeholders})
+                          OR (
+                              execution_runs.status IN (?, ?)
+                              AND jobs.result_state IS NULL
+                          )
+                      )
                     """,  # noqa: S608 - placeholders are generated, not user input
-                    (workload, *states),
+                    (
+                        workload,
+                        *states,
+                        RunStatus.SUCCEEDED.value,
+                        RunStatus.PARTIAL.value,
+                    ),
                 ).fetchone()[0]
             )
             if workload_active_count >= workload_active_job_limit:
@@ -1442,9 +1360,19 @@ class ServiceStore:
             global_active_count = int(
                 conn.execute(
                     f"""
-                    SELECT COUNT(*) FROM jobs WHERE state IN ({placeholders})
+                    SELECT COUNT(*) FROM jobs
+                    JOIN execution_runs USING (execution_run_id)
+                    WHERE execution_runs.status IN ({placeholders})
+                       OR (
+                           execution_runs.status IN (?, ?)
+                           AND jobs.result_state IS NULL
+                       )
                     """,  # noqa: S608 - placeholders are generated, not user input
-                    states,
+                    (
+                        *states,
+                        RunStatus.SUCCEEDED.value,
+                        RunStatus.PARTIAL.value,
+                    ),
                 ).fetchone()[0]
             )
             if global_active_count >= global_active_job_limit:
@@ -1453,33 +1381,38 @@ class ServiceStore:
                 )
 
             job_id = new_job_id or uuid4()
+            SqliteExecutionRepository(conn).create_run(
+                execution_run_id=execution_run_id,
+                plan=execution_plan,
+                deployment=DeploymentIdentity(
+                    modal_environment.strip(),
+                    modal_app_name.strip(),
+                    modal_app_version,
+                ),
+                max_active_provider_calls=max_active_provider_calls,
+                max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+                now=now,
+            )
             conn.execute(
                 """
                 INSERT INTO jobs (
                     job_id, owner_user_id, execution_run_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json,
-                    artifact_request_sha256, state,
-                    modal_environment, modal_app_name, modal_app_version,
-                    run_name, created_at, updated_at
+                    artifact_request_sha256, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
                     str(job_id),
                     str(owner_user_id),
-                    (None if execution_run_id is None else str(execution_run_id)),
+                    str(execution_run_id),
                     workload,
                     display_name,
                     idempotency_key,
                     request_hash,
                     parameters_json,
                     artifact_request_sha256,
-                    JobState.QUEUED.value,
-                    modal_environment.strip(),
-                    modal_app_name.strip(),
-                    modal_app_version,
-                    job_run_name,
                     now,
                     now,
                 ),
@@ -1488,43 +1421,6 @@ class ServiceStore:
                 conn.execute(
                     "INSERT INTO job_inputs (job_id, content) VALUES (?, ?)",
                     (str(job_id), input_content),
-                )
-            if execution_plan is not None:
-                SqliteExecutionRepository(conn).create_run(
-                    execution_run_id=cast(UUID, execution_run_id),
-                    plan=execution_plan,
-                    deployment=DeploymentIdentity(
-                        modal_environment.strip(),
-                        modal_app_name.strip(),
-                        modal_app_version,
-                    ),
-                    max_active_provider_calls=cast(
-                        int,
-                        max_active_provider_calls,
-                    ),
-                    max_active_gpu_provider_calls=cast(
-                        int,
-                        max_active_gpu_provider_calls,
-                    ),
-                    now=now,
-                )
-            if initial_operation is not None:
-                conn.execute(
-                    """
-                    INSERT INTO job_operations (
-                        job_id, operation, ordinal, executor, modal_call_id, state,
-                        submission_token, submission_lease_until,
-                        started_at, completed_at
-                    ) VALUES (?, ?, 0, ?, NULL, ?, ?, ?, NULL, NULL)
-                    """,
-                    (
-                        str(job_id),
-                        operation,
-                        JobOperationExecutor.MODAL.value,
-                        JobOperationState.SUBMITTING.value,
-                        submission_token,
-                        now + initial_operation.lease_seconds,
-                    ),
                 )
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -1618,21 +1514,45 @@ class ServiceStore:
 
     def count_active_jobs(self, workload: str | None = None) -> int:
         """Count Jobs that consume admission capacity."""
-        placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
-        states = tuple(state.value for state in ACTIVE_JOB_STATES)
+        placeholders = ", ".join("?" for _ in _ACTIVE_RUN_STATUSES)
+        states = tuple(state.value for state in _ACTIVE_RUN_STATUSES)
         with self._connection() as conn:
             if workload is None:
                 row = conn.execute(
-                    f"SELECT COUNT(*) FROM jobs WHERE state IN ({placeholders})",  # noqa: S608
-                    states,
+                    f"""
+                    SELECT COUNT(*) FROM jobs
+                    JOIN execution_runs USING (execution_run_id)
+                    WHERE execution_runs.status IN ({placeholders})
+                       OR (
+                           execution_runs.status IN (?, ?)
+                           AND jobs.result_state IS NULL
+                       )
+                    """,  # noqa: S608
+                    (
+                        *states,
+                        RunStatus.SUCCEEDED.value,
+                        RunStatus.PARTIAL.value,
+                    ),
                 ).fetchone()
             else:
                 row = conn.execute(
                     f"""
                     SELECT COUNT(*) FROM jobs
-                    WHERE state IN ({placeholders}) AND workload = ?
+                    JOIN execution_runs USING (execution_run_id)
+                    WHERE (
+                        execution_runs.status IN ({placeholders})
+                        OR (
+                            execution_runs.status IN (?, ?)
+                            AND jobs.result_state IS NULL
+                        )
+                    ) AND workload = ?
                     """,  # noqa: S608
-                    (*states, workload),
+                    (
+                        *states,
+                        RunStatus.SUCCEEDED.value,
+                        RunStatus.PARTIAL.value,
+                        workload,
+                    ),
                 ).fetchone()
             return int(row[0])
 
@@ -1640,19 +1560,28 @@ class ServiceStore:
         self,
         workload: str | None = None,
     ) -> list[JobRecord]:
-        """List non-terminal jobs, optionally restricted to one workload."""
-        placeholders = ", ".join("?" for _ in RECONCILABLE_JOB_STATES)
+        """List automatically advanceable jobs for the workload coordinator."""
+        placeholders = ", ".join("?" for _ in _RECONCILABLE_RUN_STATUSES)
         workload_clause = "" if workload is None else " AND workload = ?"
         parameters: tuple[str, ...] = (
-            *(state.value for state in RECONCILABLE_JOB_STATES),
+            *(state.value for state in _RECONCILABLE_RUN_STATUSES),
+            RunStatus.SUCCEEDED.value,
+            RunStatus.PARTIAL.value,
             *((workload,) if workload is not None else ()),
         )
         with self._connection() as conn:
             rows = conn.execute(
                 f"""
-                SELECT * FROM jobs
-                WHERE state IN ({placeholders}){workload_clause}
-                ORDER BY created_at, job_id
+                SELECT jobs.* FROM jobs
+                JOIN execution_runs USING (execution_run_id)
+                WHERE (
+                    execution_runs.status IN ({placeholders})
+                    OR (
+                        execution_runs.status IN (?, ?)
+                        AND jobs.result_state IS NULL
+                    )
+                ){workload_clause}
+                ORDER BY jobs.created_at, jobs.job_id
                 """,  # noqa: S608 - placeholders are generated, not user input
                 parameters,
             ).fetchall()
@@ -1668,18 +1597,18 @@ class ServiceStore:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT * FROM jobs
+                SELECT jobs.* FROM jobs
+                JOIN execution_runs USING (execution_run_id)
                 WHERE workload = ?
-                  AND state IN (?, ?)
-                  AND completed_at <= ?
-                  AND run_name IS NOT NULL
+                  AND execution_runs.status IN (?, ?)
+                  AND execution_runs.completed_at <= ?
                   AND intermediates_cleaned_at IS NULL
-                ORDER BY completed_at, job_id
+                ORDER BY execution_runs.completed_at, jobs.job_id
                 """,
                 (
                     workload,
-                    JobState.SUCCEEDED.value,
-                    JobState.PARTIAL.value,
+                    RunStatus.SUCCEEDED.value,
+                    RunStatus.PARTIAL.value,
                     completed_before,
                 ),
             ).fetchall()
@@ -1692,14 +1621,18 @@ class ServiceStore:
                 """
                 UPDATE jobs
                 SET intermediates_cleaned_at = ?, updated_at = ?
-                WHERE job_id = ? AND state IN (?, ?)
+                WHERE job_id = ?
+                  AND execution_run_id IN (
+                      SELECT execution_run_id FROM execution_runs
+                      WHERE status IN (?, ?)
+                  )
                 """,
                 (
                     now,
                     now,
                     str(job_id),
-                    JobState.SUCCEEDED.value,
-                    JobState.PARTIAL.value,
+                    RunStatus.SUCCEEDED.value,
+                    RunStatus.PARTIAL.value,
                 ),
             )
             row = conn.execute(
@@ -1757,297 +1690,6 @@ class ServiceStore:
         finally:
             conn.close()
 
-    def list_operations(self, job_id: UUID) -> list[JobOperationRecord]:
-        """List every durable remote or local operation for one Job."""
-        with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM job_operations
-                WHERE job_id = ?
-                ORDER BY ordinal
-                """,
-                (str(job_id),),
-            ).fetchall()
-            return [_operation_from_row(row) for row in rows]
-
-    def claim_modal_operation(
-        self,
-        job_id: UUID,
-        *,
-        operation: str,
-        submission_token: str,
-        now: int,
-        run_name: str | None = None,
-        lease_seconds: int = 120,
-        require_enabled_owner: bool = False,
-    ) -> JobOperationRecord | None:
-        """Lease one not-yet-started Modal operation exactly once."""
-        operation = operation.strip()
-        if not operation:
-            raise ValueError("Job operation must not be empty")
-        if not submission_token:
-            raise ValueError("Submission token must not be empty")
-        if run_name is not None and not run_name.strip():
-            raise ValueError("Run name must not be empty")
-        if lease_seconds < 1:
-            raise ValueError("lease_seconds must be positive")
-        with self._transaction() as conn:
-            job = conn.execute(
-                """
-                SELECT jobs.state, jobs.run_name, users.status AS owner_status
-                FROM jobs
-                JOIN users ON users.user_id = jobs.owner_user_id
-                WHERE jobs.job_id = ?
-                """,
-                (str(job_id),),
-            ).fetchone()
-            if job is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            if JobState(job["state"]) not in {JobState.QUEUED, JobState.RUNNING}:
-                return None
-            if (
-                require_enabled_owner
-                and job["owner_status"] != UserStatus.ENABLED.value
-            ):
-                return None
-            if run_name is not None and job["run_name"] not in {None, run_name}:
-                return None
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO job_operations (
-                    job_id, operation, ordinal, executor, modal_call_id, state,
-                    submission_token, submission_lease_until,
-                    started_at, completed_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL)
-                """,
-                (
-                    str(job_id),
-                    operation,
-                    _next_operation_ordinal(conn, job_id),
-                    JobOperationExecutor.MODAL.value,
-                    JobOperationState.SUBMITTING.value,
-                    submission_token,
-                    now + lease_seconds,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            conn.execute(
-                """
-                UPDATE jobs
-                SET run_name = COALESCE(run_name, ?), updated_at = ?
-                WHERE job_id = ?
-                """,
-                (run_name, now, str(job_id)),
-            )
-            row = conn.execute(
-                """
-                SELECT * FROM job_operations
-                WHERE job_id = ? AND operation = ?
-                """,
-                (str(job_id), operation),
-            ).fetchone()
-            return _operation_from_row(row)
-
-    def release_operation(
-        self,
-        job_id: UUID,
-        *,
-        operation: str,
-        submission_token: str,
-        now: int,
-    ) -> JobRecord:
-        """Release a claim known not to have started remote work."""
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                DELETE FROM job_operations
-                WHERE job_id = ? AND operation = ?
-                  AND state = ? AND submission_token = ?
-                """,
-                (
-                    str(job_id),
-                    operation,
-                    JobOperationState.SUBMITTING.value,
-                    submission_token,
-                ),
-            )
-            if cursor.rowcount == 1:
-                conn.execute(
-                    "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
-                    (now, str(job_id)),
-                )
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            return _job_from_row_with_operations(conn, row)
-
-    def attach_modal_call(
-        self,
-        job_id: UUID,
-        *,
-        operation: str,
-        modal_call_id: str,
-        submission_token: str,
-        now: int,
-    ) -> JobRecord:
-        """Attach a detached Modal call to its leased Job operation."""
-        with self._transaction() as conn:
-            try:
-                cursor = conn.execute(
-                    """
-                    UPDATE job_operations
-                    SET modal_call_id = ?, state = ?, submission_token = NULL,
-                        submission_lease_until = NULL, started_at = ?
-                    WHERE job_id = ? AND operation = ?
-                      AND state = ? AND submission_token = ?
-                    """,
-                    (
-                        modal_call_id,
-                        JobOperationState.RUNNING.value,
-                        now,
-                        str(job_id),
-                        operation,
-                        JobOperationState.SUBMITTING.value,
-                        submission_token,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise JobSubmissionConflictError(
-                    f"Modal call is already attached for job {job_id}"
-                ) from exc
-            job = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if job is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            if cursor.rowcount != 1:
-                raise JobSubmissionConflictError(
-                    f"Job operation changed concurrently for job {job_id}"
-                )
-            conn.execute(
-                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
-                (now, str(job_id)),
-            )
-            updated = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            return _job_from_row_with_operations(conn, updated)
-
-    def record_operation_outcome(
-        self,
-        job_id: UUID,
-        *,
-        operation: str,
-        expected_modal_call_id: str,
-        outcome: JobOperationState,
-        now: int,
-    ) -> JobRecord | None:
-        """Record one observed terminal operation outcome exactly once."""
-        if outcome not in {
-            JobOperationState.COMPLETED,
-            JobOperationState.FAILED,
-            JobOperationState.CANCELLED,
-        }:
-            raise ValueError("Job operation outcome must be terminal")
-        with self._transaction() as conn:
-            call = conn.execute(
-                """
-                SELECT * FROM job_operations
-                WHERE job_id = ? AND operation = ?
-                """,
-                (str(job_id), operation),
-            ).fetchone()
-            job = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if job is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            if call is None or call["modal_call_id"] != expected_modal_call_id:
-                return None
-            if call["state"] == outcome.value:
-                return _job_from_row_with_operations(conn, job)
-            if call["state"] != JobOperationState.RUNNING.value:
-                return None
-            cursor = conn.execute(
-                """
-                UPDATE job_operations
-                SET state = ?, completed_at = ?
-                WHERE job_id = ? AND operation = ?
-                  AND modal_call_id = ? AND state = ?
-                """,
-                (
-                    outcome.value,
-                    now,
-                    str(job_id),
-                    operation,
-                    expected_modal_call_id,
-                    JobOperationState.RUNNING.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            conn.execute(
-                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
-                (now, str(job_id)),
-            )
-            updated = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            return _job_from_row_with_operations(conn, updated)
-
-    def record_operation_submission_failure(
-        self,
-        job_id: UUID,
-        *,
-        operation: str,
-        submission_token: str,
-        now: int,
-    ) -> JobRecord | None:
-        """Persist a rejected submission without inventing a started stage."""
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE job_operations
-                SET state = ?, submission_token = NULL,
-                    submission_lease_until = NULL, completed_at = ?
-                WHERE job_id = ? AND operation = ?
-                  AND state = ? AND submission_token = ?
-                """,
-                (
-                    JobOperationState.FAILED.value,
-                    now,
-                    str(job_id),
-                    operation,
-                    JobOperationState.SUBMITTING.value,
-                    submission_token,
-                ),
-            )
-            job = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if job is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            if cursor.rowcount != 1:
-                return None
-            conn.execute(
-                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
-                (now, str(job_id)),
-            )
-            updated = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            return _job_from_row_with_operations(conn, updated)
-
     def request_cancel(
         self,
         owner_user_id: UUID,
@@ -2065,222 +1707,36 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            if row["execution_run_id"] is not None:
-                repository = SqliteExecutionRepository(conn)
-                run = repository.get_run(UUID(row["execution_run_id"]))
-                if run.status == RunStatus.CANCEL_REQUESTED:
-                    snapshot = repository.snapshot(run.execution_run_id)
-                    return _job_from_row(
-                        row,
-                        _operations_from_execution_snapshot(
-                            snapshot,
-                            job_id,
-                        ),
-                        snapshot=snapshot,
-                    )
-                if run.status.is_terminal:
-                    raise JobNotCancellableError(f"Job is already {run.status.value}")
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET cancel_requested_at = COALESCE(cancel_requested_at, ?),
-                        updated_at = ?
-                    WHERE job_id = ?
-                    """,
-                    (now, now, str(job_id)),
-                )
-                updated = conn.execute(
-                    "SELECT * FROM jobs WHERE job_id = ?",
-                    (str(job_id),),
-                ).fetchone()
+            repository = SqliteExecutionRepository(conn)
+            run = repository.get_run(UUID(row["execution_run_id"]))
+            if run.status == RunStatus.CANCEL_REQUESTED:
                 snapshot = repository.snapshot(run.execution_run_id)
                 return _job_from_row(
-                    updated,
+                    row,
                     _operations_from_execution_snapshot(snapshot, job_id),
                     snapshot=snapshot,
                 )
-            state = JobState(row["state"])
-            if state == JobState.CANCEL_REQUESTED:
-                return _job_from_row_with_operations(conn, row)
-            if state not in (JobState.QUEUED, JobState.RUNNING):
-                raise JobNotCancellableError(f"Job is already {state.value}")
+            if run.status.is_terminal:
+                raise JobNotCancellableError(f"Job is already {run.status.value}")
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, cancel_requested_at = ?, updated_at = ?
+                SET cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                    updated_at = ?
                 WHERE job_id = ?
                 """,
-                (JobState.CANCEL_REQUESTED.value, now, now, str(job_id)),
+                (now, now, str(job_id)),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-            return _job_from_row_with_operations(conn, updated)
-
-    def set_job_state(
-        self,
-        job_id: UUID,
-        state: JobState,
-        *,
-        now: int,
-    ) -> JobRecord:
-        """Set the state observed by the background reconciler."""
-        if state in (JobState.SUCCEEDED, JobState.PARTIAL):
-            raise ValueError("Use complete_job to record successful output")
-        if state == JobState.FAILED:
-            raise ValueError("Use fail_job to record a safe failure")
-        if state == JobState.BLOCKED:
-            raise ValueError("Use block_job to record a recoverable failure")
-        if state == JobState.STATE_UNKNOWN:
-            raise ValueError("Use mark_state_unknown to record remote ambiguity")
-        with self._transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            current_state = JobState(row["state"])
-            if current_state in TERMINAL_JOB_STATES:
-                return _job_from_row_with_operations(conn, row)
-            if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row_with_operations(conn, row)
-            if (
-                current_state == JobState.CANCEL_REQUESTED
-                and state not in TERMINAL_JOB_STATES
-            ):
-                return _job_from_row_with_operations(conn, row)
-            finalization_started_at = row["finalization_started_at"]
-            if state == JobState.FINALIZING:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO job_operations (
-                        job_id, operation, ordinal, executor, modal_call_id, state,
-                        submission_token, submission_lease_until,
-                        started_at, completed_at
-                    ) VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, ?, NULL)
-                    """,
-                    (
-                        str(job_id),
-                        _RESULT_PACKAGING_OPERATION,
-                        _next_operation_ordinal(conn, job_id),
-                        JobOperationExecutor.LOCAL.value,
-                        JobOperationState.RUNNING.value,
-                        now,
-                    ),
-                )
-                finalization_started_at = finalization_started_at or now
-            elif state == JobState.CANCELLED:
-                conn.execute(
-                    """
-                    UPDATE job_operations
-                    SET state = ?, submission_token = NULL,
-                        submission_lease_until = NULL,
-                        completed_at = COALESCE(completed_at, ?)
-                    WHERE job_id = ? AND state IN (?, ?)
-                    """,
-                    (
-                        JobOperationState.CANCELLED.value,
-                        now,
-                        str(job_id),
-                        JobOperationState.SUBMITTING.value,
-                        JobOperationState.RUNNING.value,
-                    ),
-                )
-            conn.execute(
-                """
-                UPDATE jobs
-                SET state = ?, updated_at = ?, completed_at = ?,
-                    finalization_started_at = ?
-                WHERE job_id = ?
-                """,
-                (
-                    state.value,
-                    now,
-                    now if state in TERMINAL_JOB_STATES else None,
-                    finalization_started_at,
-                    str(job_id),
-                ),
+            snapshot = repository.snapshot(run.execution_run_id)
+            return _job_from_row(
+                updated,
+                _operations_from_execution_snapshot(snapshot, job_id),
+                snapshot=snapshot,
             )
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            return _job_from_row_with_operations(conn, row)
-
-    def mark_state_unknown(
-        self,
-        job_id: UUID,
-        *,
-        reason: JobStateUnknownReason,
-        now: int,
-        uncertain_operations: Iterable[str] = (),
-    ) -> JobRecord:
-        """Stop automation when the existence of remote work is ambiguous."""
-        uncertain = tuple(dict.fromkeys(uncertain_operations))
-        with self._transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            current_state = JobState(row["state"])
-            if current_state not in {
-                *PROVIDER_TRACKED_JOB_STATES,
-                JobState.STATE_UNKNOWN,
-            }:
-                return _job_from_row_with_operations(conn, row)
-            if current_state != JobState.STATE_UNKNOWN:
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET state = ?, state_unknown_at = ?, state_unknown_reason = ?,
-                        updated_at = ?
-                    WHERE job_id = ?
-                    """,
-                    (
-                        JobState.STATE_UNKNOWN.value,
-                        now,
-                        reason.value,
-                        now,
-                        str(job_id),
-                    ),
-                )
-            conn.execute(
-                """
-                UPDATE job_operations
-                SET state = ?, submission_token = NULL,
-                    submission_lease_until = NULL
-                WHERE job_id = ? AND state = ?
-                """,
-                (
-                    JobOperationState.STATE_UNKNOWN.value,
-                    str(job_id),
-                    JobOperationState.SUBMITTING.value,
-                ),
-            )
-            for operation in uncertain:
-                conn.execute(
-                    """
-                    UPDATE job_operations
-                    SET state = ?, submission_token = NULL,
-                        submission_lease_until = NULL
-                    WHERE job_id = ? AND operation = ? AND state = ?
-                    """,
-                    (
-                        JobOperationState.STATE_UNKNOWN.value,
-                        str(job_id),
-                        operation,
-                        JobOperationState.RUNNING.value,
-                    ),
-                )
-            updated = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            return _job_from_row_with_operations(conn, updated)
 
     def resolve_state_unknown(self, job_id: UUID, *, now: int) -> JobRecord:
         """Mark one manually reviewed state-unknown Job as failed."""
@@ -2291,147 +1747,55 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            if row["execution_run_id"] is not None:
-                repository = SqliteExecutionRepository(conn)
-                execution_run_id = UUID(row["execution_run_id"])
-                run = repository.get_run(execution_run_id)
-                if run.status != RunStatus.STATE_UNKNOWN:
-                    raise JobStateResolutionError(
-                        f"Job is {run.status.value}, not state_unknown"
-                    )
-                for call in repository.list_provider_calls(execution_run_id):
-                    if not call.status.is_terminal:
-                        repository.fail_provider_call(
-                            call.provider_call_id,
-                            message=(
-                                "An administrator could not confirm the remote "
-                                "compute state"
-                            ),
-                            now=now,
-                        )
-                for node in repository.list_nodes(execution_run_id):
-                    if node.status == NodeStatus.RUNNING and node.discovery_complete:
-                        repository.reconcile_node_tasks(
-                            execution_run_id,
-                            node.node_key,
-                            now=now,
-                        )
-                repository.skip_unreachable_nodes(execution_run_id, now=now)
-                repository.finalize_run_from_results(execution_run_id, now=now)
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET state = ?, error_code = ?, error_message = ?,
-                        updated_at = ?, completed_at = ?
-                    WHERE job_id = ?
-                    """,
-                    (
-                        JobState.FAILED.value,
-                        "compute_failed",
-                        (
-                            "An administrator could not confirm the remote "
-                            "compute state."
-                        ),
-                        now,
-                        now,
-                        str(job_id),
-                    ),
-                )
-                updated = conn.execute(
-                    "SELECT * FROM jobs WHERE job_id = ?",
-                    (str(job_id),),
-                ).fetchone()
-                snapshot = repository.snapshot(execution_run_id)
-                return _job_from_row(
-                    updated,
-                    _operations_from_execution_snapshot(snapshot, job_id),
-                    snapshot=snapshot,
-                )
-            current_state = JobState(row["state"])
-            if current_state != JobState.STATE_UNKNOWN:
+            repository = SqliteExecutionRepository(conn)
+            execution_run_id = UUID(row["execution_run_id"])
+            run = repository.get_run(execution_run_id)
+            if run.status != RunStatus.STATE_UNKNOWN:
                 raise JobStateResolutionError(
-                    f"Job is {current_state.value}, not state_unknown"
+                    f"Job is {run.status.value}, not state_unknown"
                 )
-            conn.execute(
-                """
-                UPDATE job_operations
-                SET state = ?, submission_token = NULL,
-                    submission_lease_until = NULL,
-                    completed_at = COALESCE(completed_at, ?)
-                WHERE job_id = ? AND state IN (?, ?, ?)
-                """,
-                (
-                    JobOperationState.FAILED.value,
-                    now,
-                    str(job_id),
-                    JobOperationState.SUBMITTING.value,
-                    JobOperationState.RUNNING.value,
-                    JobOperationState.STATE_UNKNOWN.value,
-                ),
-            )
+            for call in repository.list_provider_calls(execution_run_id):
+                if not call.status.is_terminal:
+                    repository.fail_provider_call(
+                        call.provider_call_id,
+                        message=(
+                            "An administrator could not confirm the remote "
+                            "compute state"
+                        ),
+                        now=now,
+                    )
+            for node in repository.list_nodes(execution_run_id):
+                if node.status == NodeStatus.RUNNING and node.discovery_complete:
+                    repository.reconcile_node_tasks(
+                        execution_run_id,
+                        node.node_key,
+                        now=now,
+                    )
+            repository.skip_unreachable_nodes(execution_run_id, now=now)
+            repository.finalize_run_from_results(execution_run_id, now=now)
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, error_code = ?, error_message = ?,
-                    updated_at = ?, completed_at = ?
-                WHERE job_id = ? AND state = ?
+                SET error_code = ?, error_message = ?, updated_at = ?
+                WHERE job_id = ?
                 """,
                 (
-                    JobState.FAILED.value,
                     "compute_failed",
                     "An administrator could not confirm the remote compute state.",
                     now,
-                    now,
                     str(job_id),
-                    JobState.STATE_UNKNOWN.value,
                 ),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-            return _job_from_row_with_operations(conn, updated)
-
-    def schedule_finalization_retry(
-        self,
-        job_id: UUID,
-        *,
-        now: int,
-        next_retry_at: int,
-    ) -> JobRecord:
-        """Persist a bounded retry schedule without losing compute outputs."""
-        with self._transaction() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET state = ?, finalization_started_at = COALESCE(
-                        finalization_started_at, ?
-                    ),
-                    finalization_retry_started_at = COALESCE(
-                        finalization_retry_started_at, ?
-                    ),
-                    finalization_retry_count = finalization_retry_count + 1,
-                    next_retry_at = ?, updated_at = ?
-                WHERE job_id = ? AND state IN (?, ?)
-                """,
-                (
-                    JobState.FINALIZING.value,
-                    now,
-                    now,
-                    next_retry_at,
-                    now,
-                    str(job_id),
-                    JobState.FINALIZING.value,
-                    JobState.BLOCKED.value,
-                ),
+            snapshot = repository.snapshot(execution_run_id)
+            return _job_from_row(
+                updated,
+                _operations_from_execution_snapshot(snapshot, job_id),
+                snapshot=snapshot,
             )
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?",
-                (str(job_id),),
-            ).fetchone()
-            if row is None:
-                raise JobNotFoundError(f"Job not found: {job_id}")
-            return _job_from_row_with_operations(conn, row)
 
     def block_job(
         self,
@@ -2442,7 +1806,7 @@ class ServiceStore:
         next_retry_at: int,
         previous_state: JobState | None = None,
     ) -> JobRecord:
-        """Preserve outputs while recording a safe recoverable category."""
+        """Record a recoverable service result-delivery failure."""
         if not category.strip():
             raise ValueError("Blocking category must not be empty")
         with self._transaction() as conn:
@@ -2452,31 +1816,34 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            current_state = JobState(row["state"])
-            if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row_with_operations(conn, row)
-            if current_state in {JobState.FAILED, JobState.CANCELLED}:
-                return _job_from_row_with_operations(conn, row)
-            if current_state in {JobState.SUCCEEDED, JobState.PARTIAL}:
-                if previous_state != current_state:
-                    raise ValueError(
-                        "A completed Result can only block with its current state"
-                    )
+            repository = SqliteExecutionRepository(conn)
+            snapshot = repository.snapshot(UUID(row["execution_run_id"]))
+            current_state = _job_state_from_execution(snapshot)
+            result_state = row["result_state"]
+            if result_state == JobState.PARTIAL.value:
+                current_state = JobState.PARTIAL
+            if current_state not in {JobState.SUCCEEDED, JobState.PARTIAL}:
+                return _job_from_row(
+                    row,
+                    _operations_from_execution_snapshot(snapshot, job_id),
+                    snapshot=snapshot,
+                )
+            if previous_state != current_state:
+                raise ValueError(
+                    "A completed Result can only block with its current state"
+                )
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, blocked_at = COALESCE(blocked_at, ?),
-                    next_retry_at = ?, blocking_category = ?,
-                    result_previous_state = COALESCE(result_previous_state, ?),
+                SET result_blocked_at = COALESCE(result_blocked_at, ?),
+                    next_retry_at = ?, result_blocking_category = ?,
                     updated_at = ?
                 WHERE job_id = ?
                 """,
                 (
-                    JobState.BLOCKED.value,
                     now,
                     next_retry_at,
                     category,
-                    previous_state.value if previous_state is not None else None,
                     now,
                     str(job_id),
                 ),
@@ -2487,7 +1854,11 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            return _job_from_row_with_operations(conn, row)
+            return _job_from_row(
+                row,
+                _operations_from_execution_snapshot(snapshot, job_id),
+                snapshot=snapshot,
+            )
 
     def complete_job(
         self,
@@ -2504,7 +1875,7 @@ class ServiceStore:
         result_cached: bool = False,
         now: int,
     ) -> JobRecord:
-        """Record a verified immutable archive and its terminal job state."""
+        """Record service-owned metadata for one verified immutable archive."""
         if state not in (JobState.SUCCEEDED, JobState.PARTIAL):
             raise ValueError("Completed jobs must be succeeded or partial")
         if (
@@ -2519,74 +1890,16 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            current_state = JobState(row["state"])
-            if current_state == JobState.STATE_UNKNOWN:
-                return _job_from_row_with_operations(conn, row)
-            if current_state in (JobState.SUCCEEDED, JobState.PARTIAL):
-                if result_cached and not bool(row["result_cached"]):
-                    conn.execute(
-                        "UPDATE jobs SET result_cached = 1 WHERE job_id = ?",
-                        (str(job_id),),
-                    )
-                    row = conn.execute(
-                        "SELECT * FROM jobs WHERE job_id = ?",
-                        (str(job_id),),
-                    ).fetchone()
-                return _job_from_row_with_operations(conn, row)
-            conn.execute(
-                """
-                UPDATE job_operations
-                SET state = ?, submission_token = NULL,
-                    submission_lease_until = NULL,
-                    started_at = COALESCE(started_at, ?),
-                    completed_at = COALESCE(completed_at, ?)
-                WHERE job_id = ? AND state IN (?, ?)
-                """,
-                (
-                    JobOperationState.COMPLETED.value,
-                    now,
-                    now,
-                    str(job_id),
-                    JobOperationState.SUBMITTING.value,
-                    JobOperationState.RUNNING.value,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO job_operations (
-                    job_id, operation, ordinal, executor, modal_call_id, state,
-                    submission_token, submission_lease_until,
-                    started_at, completed_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?)
-                ON CONFLICT(job_id, operation) DO UPDATE SET
-                    state = excluded.state,
-                    submission_token = NULL,
-                    submission_lease_until = NULL,
-                    started_at = COALESCE(job_operations.started_at, excluded.started_at),
-                    completed_at = excluded.completed_at
-                """,
-                (
-                    str(job_id),
-                    _RESULT_PACKAGING_OPERATION,
-                    _next_operation_ordinal(conn, job_id),
-                    JobOperationExecutor.LOCAL.value,
-                    JobOperationState.COMPLETED.value,
-                    row["finalization_started_at"] or now,
-                    now,
-                ),
-            )
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, result_volume_name = ?, result_volume_path = ?,
+                SET result_state = ?, result_volume_name = ?, result_volume_path = ?,
                     result_filename = ?, result_size_bytes = ?,
                     result_sha256 = ?, result_archive_schema_version = ?,
                     warnings_json = ?, error_code = NULL,
-                    error_message = NULL, updated_at = ?,
-                    completed_at = COALESCE(completed_at, ?), blocked_at = NULL,
-                    next_retry_at = NULL,
-                    blocking_category = NULL, result_previous_state = NULL,
-                    result_cached = ?
+                    error_message = NULL, updated_at = ?, result_cached = ?,
+                    result_blocked_at = NULL,
+                    result_blocking_category = NULL, next_retry_at = NULL
                 WHERE job_id = ?
                 """,
                 (
@@ -2598,7 +1911,6 @@ class ServiceStore:
                     result_sha256,
                     result_archive_schema_version,
                     warnings_json,
-                    now,
                     now,
                     int(result_cached),
                     str(job_id),
@@ -2618,7 +1930,7 @@ class ServiceStore:
         error_message: str,
         now: int,
     ) -> JobRecord:
-        """Record a caller-sanitized terminal failure without provider details."""
+        """Record a caller-sanitized service error without changing execution."""
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
@@ -2626,40 +1938,15 @@ class ServiceStore:
             ).fetchone()
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
-            if JobState(row["state"]) in (
-                *TERMINAL_JOB_STATES,
-                JobState.STATE_UNKNOWN,
-            ):
-                return _job_from_row_with_operations(conn, row)
-            conn.execute(
-                """
-                UPDATE job_operations
-                SET state = ?, submission_token = NULL,
-                    submission_lease_until = NULL,
-                    completed_at = COALESCE(completed_at, ?)
-                WHERE job_id = ? AND state IN (?, ?, ?)
-                """,
-                (
-                    JobOperationState.FAILED.value,
-                    now,
-                    str(job_id),
-                    JobOperationState.SUBMITTING.value,
-                    JobOperationState.RUNNING.value,
-                    JobOperationState.STATE_UNKNOWN.value,
-                ),
-            )
             conn.execute(
                 """
                 UPDATE jobs
-                SET state = ?, error_code = ?, error_message = ?,
-                    updated_at = ?, completed_at = ?
+                SET error_code = ?, error_message = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
                 (
-                    JobState.FAILED.value,
                     error_code,
                     error_message,
-                    now,
                     now,
                     str(job_id),
                 ),
@@ -2708,29 +1995,6 @@ def _user_from_row(row: sqlite3.Row) -> UserRecord:
     )
 
 
-def _operation_from_row(row: sqlite3.Row) -> JobOperationRecord:
-    return JobOperationRecord(
-        job_id=UUID(row["job_id"]),
-        operation=str(row["operation"]),
-        ordinal=int(row["ordinal"]),
-        executor=JobOperationExecutor(row["executor"]),
-        modal_call_id=row["modal_call_id"],
-        state=JobOperationState(row["state"]),
-        submission_token=row["submission_token"],
-        submission_lease_until=row["submission_lease_until"],
-        started_at=row["started_at"],
-        completed_at=row["completed_at"],
-    )
-
-
-def _next_operation_ordinal(conn: sqlite3.Connection, job_id: UUID) -> int:
-    row = conn.execute(
-        "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM job_operations WHERE job_id = ?",
-        (str(job_id),),
-    ).fetchone()
-    return int(row[0])
-
-
 def _jobs_from_rows(
     conn: sqlite3.Connection,
     rows: list[sqlite3.Row],
@@ -2738,41 +2002,18 @@ def _jobs_from_rows(
     if not rows:
         return []
     repository = SqliteExecutionRepository(conn)
-    snapshots = {
-        str(row["job_id"]): repository.snapshot(UUID(row["execution_run_id"]))
-        for row in rows
-        if row["execution_run_id"] is not None
-    }
-    job_ids = [str(row["job_id"]) for row in rows]
-    placeholders = ", ".join("?" for _ in job_ids)
-    operation_rows = conn.execute(
-        f"""
-        SELECT * FROM job_operations
-        WHERE job_id IN ({placeholders})
-        ORDER BY job_id, ordinal
-        """,  # noqa: S608 - placeholders are generated, not user input
-        job_ids,
-    ).fetchall()
-    operations: dict[str, list[JobOperationRecord]] = {job_id: [] for job_id in job_ids}
-    for operation_row in operation_rows:
-        operations[str(operation_row["job_id"])].append(
-            _operation_from_row(operation_row)
+    jobs: list[JobRecord] = []
+    for row in rows:
+        snapshot = repository.snapshot(UUID(row["execution_run_id"]))
+        job_id = UUID(row["job_id"])
+        jobs.append(
+            _job_from_row(
+                row,
+                _operations_from_execution_snapshot(snapshot, job_id),
+                snapshot=snapshot,
+            )
         )
-    return [
-        _job_from_row(
-            row,
-            (
-                _operations_from_execution_snapshot(
-                    snapshot,
-                    UUID(row["job_id"]),
-                )
-                if (snapshot := snapshots.get(str(row["job_id"]))) is not None
-                else tuple(operations[str(row["job_id"])])
-            ),
-            snapshot=snapshots.get(str(row["job_id"])),
-        )
-        for row in rows
-    ]
+    return jobs
 
 
 def _job_from_row_with_operations(
@@ -2786,68 +2027,54 @@ def _job_from_row(
     row: sqlite3.Row,
     operations: tuple[JobOperationRecord, ...],
     *,
-    snapshot: ExecutionSnapshot | None = None,
+    snapshot: ExecutionSnapshot,
 ) -> JobRecord:
-    state = (
-        _job_state_from_execution(snapshot)
-        if snapshot is not None
-        else JobState(row["state"])
-    )
-    updated_at = (
-        max(int(row["updated_at"]), snapshot.run.updated_at)
-        if snapshot is not None
-        else int(row["updated_at"])
-    )
+    state = _job_state_from_execution(snapshot)
+    if state in {JobState.SUCCEEDED, JobState.PARTIAL} and row["result_state"] is None:
+        state = JobState.FINALIZING
+    elif row["result_blocked_at"] is not None:
+        state = JobState.BLOCKED
+    elif state == JobState.SUCCEEDED and row["result_state"] == "partial":
+        state = JobState.PARTIAL
+    updated_at = max(int(row["updated_at"]), snapshot.run.updated_at)
     completed_at = (
         snapshot.run.completed_at
-        if snapshot is not None and snapshot.run.status.is_terminal
-        else row["completed_at"]
-    )
-    cancel_requested_at = row["cancel_requested_at"]
-    state_unknown_at = row["state_unknown_at"]
-    state_unknown_reason = (
-        JobStateUnknownReason(row["state_unknown_reason"])
-        if row["state_unknown_reason"] is not None
+        if snapshot.run.status.is_terminal and row["result_state"] is not None
         else None
     )
-    blocked_at = row["blocked_at"]
+    cancel_requested_at = row["cancel_requested_at"]
+    state_unknown_at = None
+    state_unknown_reason = None
+    blocked_at = row["result_blocked_at"]
     error_code = row["error_code"]
     error_message = row["error_message"]
-    if snapshot is not None:
-        if (
-            snapshot.run.status == RunStatus.CANCEL_REQUESTED
-            and cancel_requested_at is None
-        ):
-            cancel_requested_at = snapshot.run.updated_at
-        elif (
-            snapshot.run.status == RunStatus.STATE_UNKNOWN and state_unknown_at is None
-        ):
-            state_unknown_at = snapshot.run.updated_at
-        if snapshot.run.status == RunStatus.STATE_UNKNOWN:
-            state_unknown_reason = {
-                RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN: (
-                    JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
-                ),
-                RunStatusReason.PROVIDER_OUTCOME_UNKNOWN: (
-                    JobStateUnknownReason.PROVIDER_OUTCOME_UNKNOWN
-                ),
-                RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN: (
-                    JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN
-                ),
-            }.get(snapshot.run.status_reason)
-        elif snapshot.run.status == RunStatus.SUSPENDED and blocked_at is None:
-            blocked_at = snapshot.run.updated_at
-        elif snapshot.run.status == RunStatus.FAILED and error_code is None:
-            error_code = "compute_failed"
-            error_message = "The remote computation did not complete successfully."
+    if (
+        snapshot.run.status == RunStatus.CANCEL_REQUESTED
+        and cancel_requested_at is None
+    ):
+        cancel_requested_at = snapshot.run.updated_at
+    elif snapshot.run.status == RunStatus.STATE_UNKNOWN:
+        state_unknown_at = snapshot.run.updated_at
+        state_unknown_reason = {
+            RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN: (
+                JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
+            ),
+            RunStatusReason.PROVIDER_OUTCOME_UNKNOWN: (
+                JobStateUnknownReason.PROVIDER_OUTCOME_UNKNOWN
+            ),
+            RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN: (
+                JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN
+            ),
+        }.get(snapshot.run.status_reason)
+    elif snapshot.run.status == RunStatus.SUSPENDED and blocked_at is None:
+        blocked_at = snapshot.run.updated_at
+    elif snapshot.run.status == RunStatus.FAILED and error_code is None:
+        error_code = "compute_failed"
+        error_message = "The remote computation did not complete successfully."
     return JobRecord(
         job_id=UUID(row["job_id"]),
         owner_user_id=UUID(row["owner_user_id"]),
-        execution_run_id=(
-            UUID(row["execution_run_id"])
-            if row["execution_run_id"] is not None
-            else None
-        ),
+        execution_run_id=UUID(row["execution_run_id"]),
         workload=str(row["workload"]),
         display_name=str(row["display_name"]),
         idempotency_key=str(row["idempotency_key"]),
@@ -2855,10 +2082,10 @@ def _job_from_row(
         parameters_json=str(row["parameters_json"]),
         artifact_request_sha256=row["artifact_request_sha256"],
         state=state,
-        modal_environment=str(row["modal_environment"]),
-        modal_app_name=str(row["modal_app_name"]),
-        modal_app_version=int(row["modal_app_version"]),
-        run_name=row["run_name"],
+        modal_environment=snapshot.run.deployment.environment,
+        modal_app_name=snapshot.run.deployment.deployment_name,
+        modal_app_version=snapshot.run.deployment.deployment_version,
+        run_name=snapshot.run.plan.workload_run_key,
         operations=operations,
         result_volume_name=row["result_volume_name"],
         result_volume_path=row["result_volume_path"],
@@ -2875,15 +2102,23 @@ def _job_from_row(
         cancel_requested_at=cancel_requested_at,
         state_unknown_at=state_unknown_at,
         state_unknown_reason=state_unknown_reason,
-        finalization_started_at=row["finalization_started_at"],
-        finalization_retry_started_at=row["finalization_retry_started_at"],
-        finalization_retry_count=int(row["finalization_retry_count"]),
+        finalization_started_at=max(
+            (
+                node.started_at
+                for node in snapshot.nodes
+                if node.started_at is not None
+                and not any(
+                    call.node_key == node.node_key for call in snapshot.provider_calls
+                )
+            ),
+            default=None,
+        ),
         blocked_at=blocked_at,
         next_retry_at=row["next_retry_at"],
-        blocking_category=row["blocking_category"],
+        blocking_category=row["result_blocking_category"],
         result_previous_state=(
-            JobState(row["result_previous_state"])
-            if row["result_previous_state"] is not None
+            JobState(row["result_state"])
+            if row["result_blocked_at"] is not None and row["result_state"] is not None
             else None
         ),
         result_cached=bool(row["result_cached"]),

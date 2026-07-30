@@ -328,6 +328,7 @@ def create_jobs_router(
         existing = store.get_job(session.principal.user_id, job_id)
         if existing is None:
             raise _not_found()
+        cancellation_already_requested = existing.state == JobState.CANCEL_REQUESTED
         registration = workloads.get(existing.workload)
         lifecycle_lock = (
             registration.lifecycle_locks.for_job(job_id)
@@ -360,7 +361,11 @@ def create_jobs_router(
             stage.code if stage is not None else "none",
             request_id_from(request),
         )
-        if registration is not None and registration.cancel is not None:
+        if (
+            not cancellation_already_requested
+            and registration is not None
+            and registration.cancel is not None
+        ):
             try:
                 await registration.cancel(store, job)
             except Exception:

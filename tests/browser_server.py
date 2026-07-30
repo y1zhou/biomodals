@@ -10,27 +10,25 @@ import io
 import os
 import time
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
 
 import orjson
 
+from biomodals.execution.modal import (
+    ModalCallObservation,
+    ModalCallObservationKind,
+)
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import (
-    GromacsJobOptions,
-    GromacsReconciler,
+    GromacsExecutionCoordinator,
     create_registration,
 )
-from biomodals.service.gromacs.modal import FinalArchive, PollOutcome
+from biomodals.service.gromacs.modal import FinalArchive
 from biomodals.service.jobs import JobLifecycleLocks
-from biomodals.service.runtime_config import (
-    ModalConfigurationSnapshot,
-    RuntimeConfiguration,
-)
+from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobOperationRecord,
     JobOperationState,
@@ -42,13 +40,6 @@ from biomodals.service.store import (
 ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
 STAGE_SECONDS = 1.0
 EQUILIBRATION_ANALYSIS_SECONDS = 4.0
-
-
-@dataclass(frozen=True, slots=True)
-class _SubmittedCall:
-    modal_call_id: str
-    run_name: str
-    operation: str
 
 
 def _result_archive() -> bytes:
@@ -105,57 +96,44 @@ class _FakeGromacsAdapter:
         self.preflight_versions.append(app_version)
         self._write_stats()
 
-    def _call(self, run_name: str, operation: str) -> _SubmittedCall:
+    async def resolve(self, binding):
+        return binding
+
+    async def spawn(self, function, *, args, kwargs) -> str:
+        del args
+        operation = function.function_name
+        if operation == "collect_traj_stats":
+            operation = f"collect_traj_stats:{kwargs['traj_prefix']}"
         call_id = f"fake-{len(self.calls) + 1}"
         self.calls[call_id] = (time.monotonic(), operation)
+        if operation.startswith("prepare_tpr_"):
+            self.submit_calls += 1
+            self.submit_versions.append(function.app_version)
         self._write_stats()
-        return _SubmittedCall(call_id, run_name, operation)
+        return call_id
 
-    async def submit(
+    async def observe(
         self,
-        _pdb_content: bytes,
-        options: GromacsJobOptions,
-        *,
-        run_name: str,
-        modal_configuration: ModalConfigurationSnapshot,
-    ) -> _SubmittedCall:
-        self.submit_calls += 1
-        self.submit_versions.append(modal_configuration.app_version)
-        self._write_stats()
-        operation = "prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"
-        return self._call(run_name, operation)
-
-    async def submit_operation(
-        self,
-        job: JobRecord,
-        operation: str,
-    ) -> _SubmittedCall:
-        if job.run_name is None:
-            raise ValueError("Fake Job has no run name")
-        return self._call(job.run_name, operation)
-
-    async def poll(
-        self,
-        modal_call_id: str,
-        *,
-        operation: str | None = None,
-    ) -> PollOutcome:
-        if modal_call_id in self.cancelled:
-            return PollOutcome("cancelled")
-        started, submitted_operation = self.calls[modal_call_id]
-        effective_operation = operation or submitted_operation
+        provider_call_handle_id: str,
+    ) -> ModalCallObservation:
+        if provider_call_handle_id in self.cancelled:
+            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+        started, submitted_operation = self.calls[provider_call_handle_id]
         duration = (
             EQUILIBRATION_ANALYSIS_SECONDS
-            if effective_operation
+            if submitted_operation
             in {"collect_traj_stats:nvt_", "collect_traj_stats:npt_"}
             else STAGE_SECONDS
         )
         if time.monotonic() - started >= duration:
-            return PollOutcome("completed")
-        return PollOutcome("running")
+            return ModalCallObservation(
+                ModalCallObservationKind.SUCCEEDED,
+                result=f"/outputs/{submitted_operation}",
+            )
+        return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
-    async def cancel(self, modal_call_id: str) -> None:
-        self.cancelled.add(modal_call_id)
+    async def cancel(self, provider_call_handle_id: str) -> None:
+        self.cancelled.add(provider_call_handle_id)
         self._write_stats()
 
     async def publish_archive(
@@ -175,6 +153,13 @@ class _FakeGromacsAdapter:
             sha256=digest,
             warnings_json="[]",
         )
+
+    async def recover_archive(self, job: JobRecord) -> FinalArchive:
+        return await self.publish_archive(job, completed_at=0)
+
+    async def cleanup_intermediates(self, job: JobRecord) -> None:
+        del job
+        return None
 
     async def read_artifact(self, _job: JobRecord):
         yield self.archive
@@ -235,15 +220,15 @@ def _create_browser_app():
     adapter.secondary_password_link = secondary_link.url
     adapter._write_stats()
     lifecycle_locks = JobLifecycleLocks()
-    reconciler = GromacsReconciler(
+    reconciler = GromacsExecutionCoordinator(
         store,
-        cast(Any, adapter),
+        adapter,
         lifecycle_locks=lifecycle_locks,
     )
     cache = ArtifactCache(settings.cache_dir / "results")
     workloads = [
         create_registration(
-            cast(Any, adapter),
+            adapter,
             reconciler=reconciler,
             lifecycle_locks=lifecycle_locks,
             open_operation_logs=adapter.open_operation_logs,

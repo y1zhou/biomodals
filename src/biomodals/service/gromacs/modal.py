@@ -10,13 +10,7 @@ import modal
 from biomodals.execution import ProviderBinding
 from biomodals.execution.modal import AsyncModalCallDriver, ModalCallObservation
 from biomodals.service.artifacts import ArtifactCache
-from biomodals.service.gromacs.contracts import GromacsJobOptions
-from biomodals.service.gromacs.coordinator import GromacsReconciler
-from biomodals.service.gromacs.provider import (
-    ModalGromacsProvider,
-    PollOutcome,
-    SubmittedModalCall,
-)
+from biomodals.service.gromacs.plan import REQUIRED_FUNCTIONS
 from biomodals.service.gromacs.results import (
     ArchiveNotReadyError,
     FinalArchive,
@@ -26,7 +20,6 @@ from biomodals.service.gromacs.results import (
 )
 from biomodals.service.jobs import OperationLogRequest, operation_log_mode
 from biomodals.service.modal_logs import ModalCLILogSource
-from biomodals.service.runtime_config import ModalConfigurationSnapshot
 from biomodals.service.store import JobOperationRecord, JobRecord
 
 
@@ -44,11 +37,7 @@ class ModalGromacsAdapter:
     ) -> None:
         """Compose focused Modal compute and Result boundaries."""
         resolved_function_resolver = function_resolver or modal.Function.from_name
-        self.provider = ModalGromacsProvider(
-            output_volume_name=output_volume_name,
-            call_resolver=call_resolver,
-            function_resolver=resolved_function_resolver,
-        )
+        self.output_volume_name = output_volume_name
         self.execution = AsyncModalCallDriver(
             call_resolver=call_resolver,
             function_resolver=resolved_function_resolver,
@@ -84,44 +73,25 @@ class ModalGromacsAdapter:
         app_version: int,
     ) -> None:
         """Validate every required deployed Modal resource."""
-        await self.provider.preflight(app_name, environment_name, app_version)
-
-    async def submit(
-        self,
-        pdb_content: bytes,
-        options: GromacsJobOptions,
-        *,
-        run_name: str,
-        modal_configuration: ModalConfigurationSnapshot,
-    ) -> SubmittedModalCall:
-        """Submit initial preparation through the compute boundary."""
-        return await self.provider.submit(
-            pdb_content,
-            options,
-            run_name=run_name,
-            modal_configuration=modal_configuration,
+        volume = modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=environment_name,
         )
-
-    async def submit_operation(
-        self,
-        job: JobRecord,
-        operation: str,
-    ) -> SubmittedModalCall:
-        """Submit one dependency-ready successor operation."""
-        return await self.provider.submit_operation(job, operation)
-
-    async def poll(
-        self,
-        modal_call_id: str,
-        *,
-        operation: str | None = None,
-    ) -> PollOutcome:
-        """Poll one attached Modal call without blocking."""
-        return await self.provider.poll(modal_call_id, operation=operation)
+        await volume.hydrate.aio()
+        for function_name in REQUIRED_FUNCTIONS:
+            await self.execution.resolve(
+                ProviderBinding(
+                    environment=environment_name,
+                    app_name=app_name,
+                    app_version=app_version,
+                    function_name=function_name,
+                    uses_gpu=function_name.endswith("_gpu"),
+                )
+            )
 
     async def cancel(self, provider_call_handle_id: str) -> None:
-        """Cancel one Modal call graph."""
-        await self.provider.cancel(provider_call_handle_id)
+        """Cancel one kernel-owned Modal call."""
+        await self.execution.cancel(provider_call_handle_id)
 
     async def open_operation_logs(
         self,
@@ -190,10 +160,7 @@ class ModalGromacsAdapter:
 __all__ = [
     "ArchiveNotReadyError",
     "FinalArchive",
-    "GromacsReconciler",
     "GromacsResultInvalidError",
     "ModalGromacsAdapter",
-    "PollOutcome",
     "ResultIdentityMismatchError",
-    "SubmittedModalCall",
 ]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 from biomodals.execution import (
@@ -12,7 +11,6 @@ from biomodals.execution import (
     ProviderBinding,
     TaskPlan,
 )
-from biomodals.service.store import JobOperationRecord, JobOperationState
 
 NVT_ANALYSIS = "collect_traj_stats:nvt_"
 NPT_ANALYSIS = "collect_traj_stats:npt_"
@@ -149,54 +147,6 @@ def operation_provider_binding(
         uses_gpu=uses_gpu,
         runtime_image_key="gromacs-gpu" if uses_gpu else "gromacs-cpu",
     )
-
-
-def prepare_operation(*, cpu_only: bool) -> str:
-    """Select the established preparation function for one request."""
-    return _operation_plan(cpu_only=cpu_only)[0].operation
-
-
-def operation_dependencies(*, cpu_only: bool) -> dict[str, tuple[str, ...]]:
-    """Return the fixed GROMACS graph in stable display/submission order."""
-    return {
-        operation.operation: operation.dependencies
-        for operation in _operation_plan(cpu_only=cpu_only)
-    }
-
-
-def ready_operations(
-    *,
-    cpu_only: bool,
-    operations: Iterable[JobOperationRecord],
-) -> list[str]:
-    """Return every dependency-satisfied operation not yet in the ledger."""
-    dependencies = operation_dependencies(cpu_only=cpu_only)
-    operation_list = list(operations)
-    known = {operation.operation for operation in operation_list}
-    completed = {
-        operation.operation
-        for operation in operation_list
-        if operation.state == JobOperationState.COMPLETED
-    }
-    return [
-        operation
-        for operation, requirements in tuple(dependencies.items())[1:]
-        if operation not in known and all(item in completed for item in requirements)
-    ]
-
-
-def all_operations_completed(
-    *,
-    cpu_only: bool,
-    operations: Iterable[JobOperationRecord],
-) -> bool:
-    """Return whether every operation in the fixed plan completed."""
-    completed = {
-        operation.operation
-        for operation in operations
-        if operation.state == JobOperationState.COMPLETED
-    }
-    return set(operation_dependencies(cpu_only=cpu_only)).issubset(completed)
 
 
 def modal_invocation(

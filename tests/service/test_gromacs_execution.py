@@ -73,6 +73,12 @@ class FakeGromacsExecutionAdapter:
             warnings_json="[]",
         )
 
+    async def recover_archive(self, job):
+        return await self.publish_archive(job, completed_at=0)
+
+    async def cleanup_intermediates(self, job):
+        return None
+
 
 def _store(tmp_path: Path) -> tuple[ServiceStore, UUID]:
     store = ServiceStore(tmp_path / "service.sqlite3")

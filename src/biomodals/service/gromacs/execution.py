@@ -38,7 +38,7 @@ from biomodals.service.gromacs.plan import (
 )
 from biomodals.service.gromacs.results import FinalArchive
 from biomodals.service.jobs import JobLifecycleLocks
-from biomodals.service.store import JobRecord, JobState, ServiceStore
+from biomodals.service.store import JobRecord, ServiceStore
 
 _RESULT_ENVELOPE_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
@@ -72,6 +72,9 @@ class GromacsExecutionAdapter(Protocol):
         completed_at: int,
     ) -> FinalArchive:
         """Publish and validate the user-facing result archive."""
+
+    async def recover_archive(self, job: JobRecord) -> FinalArchive:
+        """Recover metadata for an already published immutable archive."""
 
     async def cleanup_intermediates(self, job: JobRecord) -> None:
         """Remove remote files that can be reconstructed from publications."""
@@ -229,6 +232,12 @@ class GromacsExecutionCoordinator:
 
             if clear_staged_input:
                 self.store.clear_job_input(job_id)
+            if (
+                archive is None
+                and job.result_filename is None
+                and snapshot.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}
+            ):
+                archive = await self.adapter.recover_archive(job)
             if archive is not None:
                 self._complete_job(job, archive)
             else:
@@ -484,23 +493,11 @@ class GromacsExecutionCoordinator:
         job: JobRecord,
         status: RunStatus,
     ) -> None:
-        if status == RunStatus.RUNNING and job.state == JobState.QUEUED:
-            self.store.set_job_state(
-                job.job_id,
-                JobState.RUNNING,
-                now=self._now(),
-            )
-        elif status == RunStatus.FAILED:
+        if status == RunStatus.FAILED:
             self.store.fail_job(
                 job.job_id,
                 error_code="compute_failed",
                 error_message="GROMACS could not complete the simulation.",
-                now=self._now(),
-            )
-        elif status == RunStatus.CANCELLED:
-            self.store.set_job_state(
-                job.job_id,
-                JobState.CANCELLED,
                 now=self._now(),
             )
 

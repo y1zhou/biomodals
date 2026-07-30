@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
+from threading import Lock
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -1906,6 +1907,11 @@ def run_ppiflow_rosetta_worker(
     layout = AppRunLayout.from_run_root(
         Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{run_name}-{run_id}"
     )
+    publication_lock = Lock()
+
+    def checkpoint_outputs() -> None:
+        with publication_lock:
+            ROSETTA_OUTPUT_VOLUME.commit()
 
     def claim(request_id: str, capacity: int):
         return coordinator.claim_tasks.remote(
@@ -1925,6 +1931,7 @@ def run_ppiflow_rosetta_worker(
                 task=task,
                 task_fingerprint=assignment.task_fingerprint,
                 run_command=run_command,
+                checkpoint_outputs=checkpoint_outputs,
             )
         except Exception as error:  # noqa: BLE001
             return AppRunResult(

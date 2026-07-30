@@ -1254,7 +1254,7 @@ def test_rosetta_worker_claims_executes_and_checkpoints_each_task(
         f"{provider_call_id}:complete:task-fingerprint",
     )
     assert completions[0][3].status == AppRunStatus.SUCCEEDED
-    assert commits == [True, True]
+    assert commits == [True, True, True]
 
 
 def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(

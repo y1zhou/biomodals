@@ -198,6 +198,7 @@ def test_rosetta_worker_uses_app_run_layout(
         captured["output_mode"] = output_mode
         captured["log_file"] = log_file
         Path(log_file).write_text("log\n", encoding="utf-8")
+        Path(cmd[-1], "result.pdb").write_text("ATOM\n", encoding="utf-8")
 
     monkeypatch.setattr(shell_helper, "run_command", fake_run_command)
 
@@ -230,4 +231,4 @@ def test_rosetta_worker_uses_app_run_layout(
     )
     assert completions[0][3]["status"] == "succeeded"
     assert summary == {"claimed_tasks": 1, "claim_requests": 2}
-    assert output_volume.commit_count == 2
+    assert output_volume.commit_count == 3

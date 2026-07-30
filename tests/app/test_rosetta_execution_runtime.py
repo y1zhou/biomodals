@@ -125,6 +125,8 @@ def _publish_assignment(runtime, assignment) -> dict[str, object]:
     def run_command(command, *, output_mode, log_file):
         del command, output_mode
         Path(log_file).write_text("log\n", encoding="utf-8")
+        output = runtime.run_root / task.output_dir / "result.pdb"
+        output.write_text("ATOM\n", encoding="utf-8")
 
     return execute_rosetta_task(
         run_root=runtime.run_root,

@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101, D102, D103, D107, S106
 
+import sqlite3
 from dataclasses import dataclass
 
 import pytest
@@ -97,6 +98,41 @@ def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> N
     assert duplicate == first
     assert checkpoints == [0, 1]
     assert driver.spawn_count == 1
+
+
+def test_checkpoint_may_replace_a_volume_backed_repository(tmp_path) -> None:
+    ledger_path = tmp_path / "ledger.sqlite3"
+    connection = sqlite3.connect(ledger_path)
+    repository = create_repository(connection=connection, task_count=1)
+    connection.commit()
+    driver = FakeModalDriver()
+    active_connection = connection
+
+    def checkpoint():
+        nonlocal active_connection
+        active_connection.commit()
+        active_connection.close()
+        active_connection = sqlite3.connect(ledger_path)
+        return type(repository)(active_connection)
+
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=checkpoint,
+    )
+
+    call = runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(),
+        submission_token="batch",
+        now=110,
+    )
+
+    assert call is not None
+    assert call.status == ProviderCallStatus.ATTACHED
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+    assert runtime.repository is not repository
 
 
 def test_resolution_failure_happens_before_durable_preclaim() -> None:

@@ -37,13 +37,14 @@ CPU_BINDING = ProviderBinding(
 
 def create_repository(
     *,
+    connection: sqlite3.Connection | None = None,
     task_count: int = 3,
     max_active_provider_calls: int = 3,
     max_active_gpu_provider_calls: int = 2,
     aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL,
 ) -> SqliteExecutionRepository:
     """Return a running Node with cache-missing discovered Tasks."""
-    connection = sqlite3.connect(":memory:")
+    connection = connection or sqlite3.connect(":memory:")
     repository = SqliteExecutionRepository(connection)
     repository.initialize_schema()
     repository.create_run(

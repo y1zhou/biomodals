@@ -124,6 +124,53 @@ _RECONCILABLE_RUN_STATUSES = (
     RunStatus.RUNNING,
     RunStatus.CANCEL_REQUESTED,
 )
+_LEGACY_SERVICE_SCHEMA_VERSION = 3
+_JOB_TABLES_SQL = """
+CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL REFERENCES users(user_id),
+    execution_run_id TEXT NOT NULL UNIQUE
+        REFERENCES execution_runs(execution_run_id),
+    workload TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    artifact_request_sha256 TEXT,
+    result_state TEXT CHECK (
+        result_state IS NULL OR result_state IN ('succeeded', 'partial')
+    ),
+    result_volume_name TEXT,
+    result_volume_path TEXT,
+    result_filename TEXT,
+    result_size_bytes INTEGER,
+    result_sha256 TEXT,
+    result_archive_schema_version INTEGER CHECK (
+        result_archive_schema_version IS NULL
+        OR result_archive_schema_version >= 1
+    ),
+    warnings_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    cancel_requested_at INTEGER,
+    result_blocked_at INTEGER,
+    result_blocking_category TEXT,
+    next_retry_at INTEGER,
+    result_cached INTEGER NOT NULL DEFAULT 0
+        CHECK (result_cached IN (0, 1)),
+    intermediates_cleaned_at INTEGER,
+    UNIQUE (owner_user_id, workload, idempotency_key)
+);
+CREATE INDEX jobs_owner_created ON jobs(owner_user_id, created_at DESC);
+CREATE INDEX jobs_workload ON jobs(workload);
+
+CREATE TABLE job_inputs (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+    content BLOB NOT NULL
+);
+"""
 
 
 class UserStatus(StrEnum):
@@ -357,7 +404,7 @@ class ServiceStore:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if created:
                 conn.executescript(
-                    """
+                    f"""
                     BEGIN IMMEDIATE;
 
                     CREATE TABLE users (
@@ -395,54 +442,7 @@ class ServiceStore:
                     );
                     CREATE INDEX sessions_user ON sessions(user_id);
 
-                    CREATE TABLE jobs (
-                        job_id TEXT PRIMARY KEY,
-                        owner_user_id TEXT NOT NULL REFERENCES users(user_id),
-                        execution_run_id TEXT NOT NULL UNIQUE
-                            REFERENCES execution_runs(execution_run_id),
-                        workload TEXT NOT NULL,
-                        display_name TEXT NOT NULL,
-                        idempotency_key TEXT NOT NULL,
-                        request_hash TEXT NOT NULL,
-                        parameters_json TEXT NOT NULL,
-                        artifact_request_sha256 TEXT,
-                        result_state TEXT CHECK (
-                            result_state IS NULL
-                            OR result_state IN ('succeeded', 'partial')
-                        ),
-                        result_volume_name TEXT,
-                        result_volume_path TEXT,
-                        result_filename TEXT,
-                        result_size_bytes INTEGER,
-                        result_sha256 TEXT,
-                        result_archive_schema_version INTEGER
-                            CHECK (
-                                result_archive_schema_version IS NULL
-                                OR result_archive_schema_version >= 1
-                            ),
-                        warnings_json TEXT,
-                        error_code TEXT,
-                        error_message TEXT,
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL,
-                        cancel_requested_at INTEGER,
-                        result_blocked_at INTEGER,
-                        result_blocking_category TEXT,
-                        next_retry_at INTEGER,
-                        result_cached INTEGER NOT NULL DEFAULT 0
-                            CHECK (result_cached IN (0, 1)),
-                        intermediates_cleaned_at INTEGER,
-                        UNIQUE (owner_user_id, workload, idempotency_key)
-                    );
-                    CREATE INDEX jobs_owner_created
-                        ON jobs(owner_user_id, created_at DESC);
-                    CREATE INDEX jobs_workload ON jobs(workload);
-
-                    CREATE TABLE job_inputs (
-                        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id)
-                            ON DELETE CASCADE,
-                        content BLOB NOT NULL
-                    );
+                    {_JOB_TABLES_SQL}
 
                     CREATE TABLE service_settings (
                         key TEXT PRIMARY KEY,
@@ -479,14 +479,65 @@ class ServiceStore:
             elif version != _SERVICE_SCHEMA_VERSION:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
-                    f"{version} at {self.path}; stop the service and initialize "
-                    "fresh state explicitly"
+                    f"{version} at {self.path}; stop the service and run "
+                    "'biomodals api transition-execution-state --yes'"
                 )
             conn.execute("PRAGMA journal_mode = WAL")
         self.path.chmod(0o600)
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
             if path.exists():
                 path.chmod(0o600)
+
+    def transition_execution_state(self) -> int:
+        """Replace legacy service Job execution state while preserving accounts."""
+        if not self.path.is_file() or self.path.is_symlink():
+            raise RuntimeError("Service database is unavailable")
+        required_tables = {
+            "users",
+            "password_tokens",
+            "sessions",
+            "jobs",
+            "job_operations",
+            "service_settings",
+            "workload_settings",
+        }
+        with self._connection() as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version != _LEGACY_SERVICE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Expected pre-release service database version "
+                    f"{_LEGACY_SERVICE_SCHEMA_VERSION}, found {version}"
+                )
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if tables != required_tables:
+                raise RuntimeError("Legacy service database schema is unexpected")
+            discarded_jobs = int(
+                conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            )
+            try:
+                conn.executescript(
+                    f"""
+                    BEGIN IMMEDIATE;
+                    DROP TABLE job_operations;
+                    DROP TABLE jobs;
+                    {_JOB_TABLES_SQL}
+                    """
+                )
+                SqliteExecutionRepository(conn).initialize_schema()
+                conn.execute(f"PRAGMA user_version = {_SERVICE_SCHEMA_VERSION}")
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+            conn.execute("PRAGMA journal_mode = WAL")
+        self.path.chmod(0o600)
+        return discarded_jobs
 
     def check_ready(self) -> None:
         """Verify the configured database and required schema without creating it."""

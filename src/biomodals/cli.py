@@ -25,6 +25,8 @@ from biomodals.helper.cli_command import (
 )
 from biomodals.helper.shell import run_command
 from biomodals.service.admin import app as admin_commands
+from biomodals.service.config import AdminSettings
+from biomodals.service.store import ServiceStore
 
 # ruff: noqa: S603
 
@@ -83,6 +85,38 @@ def serve_api(
         host=host,
         port=port,
         workers=1,
+    )
+
+
+@api_commands.command(
+    name="transition-execution-state",
+    help="Replace pre-release Job execution state with the current schema.",
+)
+def transition_execution_state(
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Confirm deletion of legacy Job history and local execution state.",
+        ),
+    ] = False,
+) -> None:
+    """Preserve accounts and settings while discarding legacy Job history."""
+    if not yes:
+        console.print(
+            "[bold red]Error[/bold red] This discards legacy Job history. "
+            "Re-run with '[green]--yes[/green]' after stopping the API service."
+        )
+        raise typer.Exit(code=1)
+    store = ServiceStore(AdminSettings.from_environment().database_path)
+    try:
+        discarded_jobs = store.transition_execution_state()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[bold red]Error[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        "Transitioned service execution state; "
+        f"discarded {discarded_jobs} legacy Job(s)."
     )
 
 

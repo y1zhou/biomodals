@@ -112,6 +112,22 @@ configuration as the server. Related commands include `reset-password`,
 active administrator cannot be disabled or demoted, and the first User must be
 created with `--admin`.
 
+### Pre-release execution-state transition
+
+The unified execution kernel intentionally does not migrate pre-release Job
+history. If startup reports service database version 3, stop the API process
+and run the explicit offline transition with the same configuration:
+
+```bash
+uv run biomodals api transition-execution-state --yes
+```
+
+The command preserves Users, password tokens, sessions, service settings, and
+per-workload settings. It discards legacy Jobs and their local execution
+history, then installs the current shared execution schema. Remote Modal
+Volumes and workload publications are not changed. The command rejects an
+unexpected source schema rather than guessing how to rewrite it.
+
 Administrators can manage Users, per-Tool Job Log visibility, and non-secret
 live Modal configuration in the web interface. Modal runtime setting precedence
 is process environment, database Admin value, configured `.env` file, then

@@ -2,10 +2,12 @@
 
 Status: accepted.
 
-Biomodals should introduce a provider-aware execution kernel under
-`biomodals.execution` for DAG traversal, task readiness, paid-call attachment
-and recovery, cache-observation policy, batching, and Provider Call limits. The
-kernel should embed its execution tables into host-owned databases without
+Biomodals should introduce a Modal execution kernel under
+`biomodals.execution` for durable DAG and Task scheduling, Modal-call
+attachment and recovery, batching, and Provider Call limits. Workload code
+continues to construct plans, validate caches, prepare inputs, decode results,
+and publish outputs, then reports its observations and outcomes to the kernel.
+The kernel should embed its execution tables into host-owned databases without
 replacing `ServiceStore` domain state, workflow artifact records, or
 AlphaFold3's claims and publications. A service Job remains the user-facing
 admission and result envelope; workflows retain the physical per-run ledger;
@@ -38,10 +40,11 @@ coordinator instead of introducing a nested execution database.
 The deployment-binding policy was accepted on 2026-07-29. There is no
 universal execution-coordinator Modal app. Each app and workflow deployment
 includes a thin Deployment Coordinator Adapter that binds the shared kernel
-to its workload hooks, Volumes, and provider configuration. The containing
-deployment version pins the coordinator code and workload adapter together.
-The shared kernel contains reusable Modal coordination mechanics but declares
-no app object, workload registry, or deployment-global Volume.
+to caller-owned Task construction and result processing, its Volumes, and
+Modal configuration. The containing deployment version pins that code
+together. The shared kernel contains reusable Modal coordination mechanics but
+declares no app object, workload-handler protocol, workload registry, provider
+plugin system, or deployment-global Volume.
 
 The CLI deployment-lifetime policy was accepted on 2026-07-29. Both
 `biomodals app run` and `biomodals workflow run` submit to an exact named
@@ -137,8 +140,9 @@ creating state; a mismatch requires a new root Run. File identity uses content
 digests rather than paths. Operational concurrency, batching, resource
 allocation, and Deployment Identity may change without changing the
 fingerprint. Deployment Identity is not itself scientific cache identity, but
-a new deployment may reuse publications only if its workload adapter accepts
-the stored plan and all result-affecting version declarations still match.
+a new deployment may reuse publications only if its caller-owned workload code
+accepts the stored plan and all result-affecting version declarations still
+match.
 
 Keeping a workflow's physical `ledger.sqlite3` file does not preserve a
 separate workflow implementation of generic execution state. The shared
@@ -252,22 +256,22 @@ uncertain ownership.
 The empty-result policy was accepted on 2026-07-29. `NodePlan` has
 `allow_empty_result: bool = False`, and that result-affecting declaration is
 included in the Workload Plan Fingerprint. Discovering zero Tasks fails a Node
-whose flag is false. When it is true, the kernel invokes the workload
-finalizer with the empty result set; the workload must publish and validate an
-explicit complete empty Node result. `available` succeeds the Node, `unknown`
-suspends under the result-validation policy, and a missing or invalid
-post-finalization publication fails the Node. Task aggregation policy does not
-infer an outcome for an empty set, and no synthetic Task row is created.
+whose flag is false. When it is true, caller-owned workload code must publish
+and validate an explicit complete empty Node result, then record the
+observation. `available` succeeds the Node, `unknown` suspends under the
+result-validation policy, and a missing or invalid publication fails the Node.
+Task aggregation policy does not infer an outcome for an empty set, and no
+synthetic Task row is created.
 
-The Task-discovery checkpoint policy was accepted on 2026-07-30. A workload's
-read-only `discover_tasks(node, inputs)` hook returns the complete finite set
-of `TaskPlan` values for that Node, each with a unique stable Node-local key
-and deterministic fingerprint. The repository validates and inserts all
-Tasks and marks the Node `discovery_complete` in one transaction. The host
+The Task-discovery checkpoint policy was accepted on 2026-07-30. Caller-owned
+workload code constructs the complete finite sequence of `TaskPlan` values for
+a Node, each with a unique stable Node-local key and deterministic fingerprint,
+and gives that sequence to the kernel. The repository validates and inserts
+all Tasks and marks the Node `discovery_complete` in one transaction. The host
 crosses its durability boundary before any Task may acquire a Provider Call,
 Worker Assignment, or local owner. A crash before that boundary exposes no
-paid work and recovery rediscovers the complete set; a crash after it reloads
-the persisted set and never invokes discovery again for that Node in the same
+paid work and the caller reconstructs the complete set; a crash after it
+reloads the persisted set and never reconstructs it for that Node in the same
 Run. Empty discovery follows `allow_empty_result`. The first kernel version
 does not support streaming, incremental, or worker-side Task discovery, so a
 worker can never observe a half-populated SQLite queue.
@@ -298,20 +302,18 @@ Intermediate lifecycle history remains available for diagnosis but is not an
 all-Node vote on the scientific outcome. This generalizes the workflow
 runtime's existing terminal-pruning behavior to every kernel consumer.
 
-The Node-result observation policy was accepted on 2026-07-29. Every workload
-adapter exposes a lightweight `observe_node_result(node)` hook that can run
-before dependency inputs or Tasks are prepared and returns the shared
-`available`, `missing`, or `unknown` vocabulary. `available` means the
-complete workload publication validated and may mark the Node `succeeded`;
-`missing` authorizes backward expansion into its dependencies; and `unknown`
-blocks new work. A workload with no aggregate reusable publication
-deliberately returns `missing`. Partial publications are not complete Node
-hits, although their successful Task publications may be reused later inside
-the repair closure. The kernel records the observation time and whether Node
-completion was cache-validated or produced in this Run; scientific evidence,
-markers, manifests, and validation logic remain workload-owned. This hook is
-part of the workload port and does not add a fake terminal Task or another
-top-level kernel abstraction.
+The Node-result observation policy was accepted on 2026-07-29. Caller-owned
+workload code validates the Node publication before preparing dependency
+inputs or Tasks and records the shared `available`, `missing`, or `unknown`
+observation with the kernel. `available` means the complete workload
+publication validated and may mark the Node `succeeded`; `missing` authorizes
+backward expansion into its dependencies; and `unknown` blocks new work. A
+workload with no aggregate reusable publication deliberately records
+`missing`. Partial publications are not complete Node hits, although their
+successful Task publications may be reused later inside the repair closure.
+The kernel records the observation time and whether Node completion was
+cache-validated or produced in this Run; scientific evidence, markers,
+manifests, and validation logic remain workload-owned.
 
 The unknown-result policy was accepted on 2026-07-29. An `unknown` Node or
 Task result observation leaves that record nonterminal, stops new admission,
@@ -590,7 +592,7 @@ on 2026-07-29. The kernel stores no Task Attempt identity or counter. Within
 one Execution Run, each Task is admitted once and receives at most one
 Provider Call submission or Worker Assignment. Modal may redeliver and
 re-execute the same provider input, and interrupted Coordinator-Local Tasks
-may re-enter the same local hook under the policy below, so the kernel does
+may re-enter the same local operation under the policy below, so the kernel does
 not claim exactly-once execution. A conclusive provider or workload failure
 terminates the Task; the Node aggregation policy then determines the Node
 outcome, while terminal scientific results determine the Run outcome.
@@ -603,18 +605,32 @@ calls block replacement work.
 
 The coordinator-local recovery policy was accepted on 2026-07-30. A
 Coordinator-Local Task acquires durable local ownership, consumes no Provider
-Call slot, and runs a workload hook in the exclusive coordinator process. The
-hook must use Task-specific staging and atomic publication or otherwise be
-idempotent. A conclusive hook or validation failure terminally fails the Task
-and is never replayed in that Run. If the coordinator disappears while the
-Task remains `running`, its replacement first observes the Task publication:
-`available` completes the same Task without execution, `missing` permits
-re-entry of the same local hook, and `unknown` suspends the Run with
+Call slot, and lets caller-owned code run a local operation in the exclusive
+coordinator process. That code must use Task-specific staging and atomic
+publication or otherwise be idempotent. A conclusive local or validation
+failure terminally fails the Task and is never replayed in that Run. If the
+coordinator disappears while the Task remains `running`, its replacement first
+observes the Task publication: `available` completes the same Task without
+execution, `missing` permits re-entry of the same local operation, and
+`unknown` suspends the Run with
 `result_validation_unknown`. Repeated infrastructure interruptions may
 therefore re-enter one Task without creating an attempt or a second scheduler
-admission. Explicit cancellation prevents replay. A local hook with an
+admission. Explicit cancellation prevents replay. Local code with an
 uncontrolled non-idempotent external side effect is invalid and must instead
 use an idempotency key or a tracked Provider Call.
+
+The caller-driven kernel boundary was accepted on 2026-07-30. The first kernel
+is a Modal scheduling library, not a workload framework. Existing app and
+workflow code constructs Nodes and Tasks, validates caches, prepares Modal
+arguments, normalizes returned Result Envelopes, publishes scientific output,
+and records observations and Task outcomes through ordinary runtime
+operations. The kernel validates and persists those inputs, computes DAG
+readiness, admits and observes Modal calls, enforces call limits, and applies
+legal recovery transitions. It defines no per-Node handler hierarchy, workload
+protocol, callback registry, provider plugin system, or generic scientific
+input/output layer. Its small internal Modal seam exists only for deterministic
+tests. Common workload helpers may be extracted later from demonstrated
+duplication without expanding the scheduler contract first.
 
 ## Considered options
 
@@ -663,9 +679,12 @@ use an idempotency key or a tracked Provider Call.
 - Retaining Task Attempt rows would support retries inside one Execution Run,
   but would duplicate run lineage and complicate cost safety. A failed Run and
   an explicit Successor Execution Run provide one retry boundary.
-- A small execution kernel with one embeddable SQLite implementation and
-  explicit provider and workload adapters reuses the common algorithms while
-  allowing each host to preserve its transaction and durability model.
+- A per-Node workload-handler hierarchy would let the kernel invoke cache,
+  parsing, publication, and finalization callbacks, but would turn a scheduling
+  library into an application framework before repeated handler shapes exist.
+- A small caller-driven Modal execution kernel with one embeddable SQLite
+  implementation reuses the common scheduling algorithms while allowing each
+  host to preserve its transaction, durability, and ordinary workload code.
 
 ## Consequences
 
@@ -675,7 +694,8 @@ calls. One provider call may serve several tasks, and a cache hit may complete
 a task without a provider call. Workloads continue to define scientific
 identity, cache validation, input and output contracts, function arguments,
 resource requirements, and publication rules. The kernel determines when
-those hooks run and how their observations affect scheduling.
+Tasks are eligible, when Modal calls may be admitted, and how caller-reported
+observations affect scheduling.
 
 Execution identity is deliberately operational. A Service Job, workflow
 request, GROMACS run name, or AlphaFold run identity may refer to it, but none

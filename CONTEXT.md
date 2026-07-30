@@ -143,10 +143,10 @@ to exactly one Node.
 _Avoid_: workflow node, thread, untracked work item
 
 **Coordinator-Local Task** [planned]:
-A Task whose workload hook executes inside the exclusive Execution
+A Task whose caller-owned local operation executes inside the exclusive Execution
 Coordinator without a Provider Call or call slot. After coordinator
 interruption, recovery observes its publication first and may re-enter the
-same idempotent hook only when the result is authoritatively missing.
+same idempotent operation only when the result is authoritatively missing.
 _Avoid_: client-side run, untracked finalizer, failed-Task retry
 
 **Task Fingerprint** [planned]:
@@ -180,7 +180,7 @@ _Avoid_: partial, cached, submitting, attached, state unknown
 Within one Execution Run, the kernel admits each Task once and creates at most
 one Provider Call submission or Worker Assignment for it. Provider redelivery
 may re-execute the same call, and an interrupted Coordinator-Local Task may
-re-enter its same hook after publication observation, so this rule does not
+re-enter its same operation after publication observation, so this rule does not
 claim exactly-once execution. A conclusive failure terminates the Task; retry
 requires a Successor Execution Run.
 _Avoid_: exactly-once execution, same-run retry, attempt counter
@@ -268,6 +268,14 @@ Assignments, and Provider Calls governed by the execution kernel's transition
 contract. Each durable coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
+**Execution Kernel** [planned]:
+The caller-driven `biomodals.execution` library that validates and schedules a
+durable Task DAG, orchestrates Modal calls, enforces Run-level call limits, and
+recovers execution state. App and workflow code constructs Tasks, validates
+caches, prepares inputs, processes Result Envelopes, publishes outputs, and
+records observations and outcomes through ordinary runtime operations.
+_Avoid_: workload framework, scientific parser, callback registry, provider plugin
+
 **App Run Ledger** [planned]:
 The physical per-run SQLite Execution State Repository for a Direct CLI App
 Run, stored at
@@ -302,8 +310,9 @@ _Avoid_: worker pool, timeout lease, service database
 
 **Deployment Coordinator Adapter** [planned]:
 A thin Modal binding included in each app or workflow deployment. It binds the
-shared execution kernel to that deployment's workload hooks, Volumes, and
-configuration without introducing a universal coordinator service.
+shared execution kernel to that deployment's caller-owned task construction,
+result processing, Volumes, and configuration without introducing a universal
+coordinator service or workload-handler framework.
 _Avoid_: execution kernel, workload registry, API service
 
 **Deployment Identity** [planned]:

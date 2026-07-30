@@ -469,6 +469,20 @@ different batching. Dispatch metadata stays outside scientific fingerprints
 unless it changes scientific meaning. There is no dynamic batching optimizer,
 cross-Node batch, or workload-owned durable scheduling state.
 
+The pull-worker sizing policy was accepted on 2026-07-30. A workload declares
+one positive `claim_capacity`, meaning the maximum number of Tasks a worker
+may own concurrently. For an eligible pull-worker Node, the kernel derives
+`desired_workers = ceil(nonterminal_tasks / claim_capacity)` and creates at
+most `max(0, desired_workers - nonterminal_worker_calls)` new call candidates
+before applying DAG priority and the Run's remaining total and GPU call slots.
+Pending and assigned-but-unfinished Tasks count; cache-satisfied and terminal
+Tasks do not. Unknown worker calls remain nonterminal and count
+conservatively. Workers may claim repeatedly to rebalance uneven durations.
+The coordinator does not cancel excess workers when the target shrinks; they
+finish owned work and exit when no unowned Task remains. A claim race may
+produce a successful zero-Task call. The kernel adds no per-Node worker limit,
+adaptive throughput controller, lease, or idle timeout.
+
 The state-transition policy was accepted on 2026-07-29. The service preserves
 users, authentication data, and administrator configuration while recreating
 the Job and execution schema without old Job history. Existing workflow

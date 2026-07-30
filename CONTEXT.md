@@ -221,6 +221,14 @@ coordinator. Ready Task rows are the queue, and durable Worker Assignments
 record ownership before payload delivery.
 _Avoid_: fixed batch, Modal Queue, timeout lease
 
+**Pull-Worker Pool Size** [planned]:
+The derived target
+`ceil(nonterminal_node_tasks / claim_capacity)` for a pull-worker Node. New
+worker candidates equal that target minus the Node's existing nonterminal
+worker Provider Calls, bounded by the Run's total and GPU call slots. It is not
+a separate configured limit.
+_Avoid_: per-Node worker cap, adaptive autoscaler, idle timeout
+
 **Worker Assignment** [planned]:
 A durable SQLite record linking one Task to the Provider Call and worker claim
 responsible for it. The coordinator commits and checkpoints the assignment

@@ -1011,6 +1011,33 @@ returns payloads. The worker may repeat the same request after a lost response
 and may claim another microbatch after reporting completion. No Task moves to
 a different call after assignment in the same Execution Run.
 
+The workload declares one positive `claim_capacity`, the maximum Tasks a
+worker can own concurrently. Pool size is derived rather than separately
+configured:
+
+```text
+desired_workers =
+    ceil(nonterminal_tasks_in_node / claim_capacity)
+
+new_worker_candidates =
+    max(0, desired_workers - nonterminal_worker_calls_in_node)
+```
+
+The scheduler then applies DAG priority and the remaining total and GPU call
+slots. Pending Tasks and assigned-but-unfinished Tasks count toward the
+numerator. Cache-satisfied, succeeded, failed, cancelled, and skipped Tasks do
+not. `submitting`, `attached`, `running`, `outcome_unknown`, and
+`state_unknown` worker calls count against the desired pool and the Run's call
+limits.
+
+A worker may claim repeatedly, which provides work stealing when Task
+durations differ. The coordinator does not cancel already-admitted workers
+when the desired count falls. They finish owned work and exit once no unowned
+Task remains. Because claims are serialized, a worker can lose a race, receive
+no Tasks, and return successfully. The kernel adds no separate
+`max_worker_calls`, utilization feedback loop, lease, or idle timeout; Modal
+decorator limits still govern actual provider containers.
+
 #### Policy persistence and scientific identity
 
 One Run persists its dispatch mode, compatibility descriptors, provider
@@ -1399,7 +1426,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover total and GPU active-call counts |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
-| `tests/execution/test_dispatch.py` | Fixed batches preserve compatibility and encounter order, bind Tasks atomically, and never repack; pull workers replay lost claims, preserve active assignments across preemption, fail unfinished work with a terminal owner, and block unknown ownership |
+| `tests/execution/test_dispatch.py` | Fixed batches preserve compatibility and encounter order, bind Tasks atomically, and never repack; pull-worker counts derive from unfinished Tasks and claim capacity, existing and unknown calls suppress excess admission, lost claims replay, assignments survive preemption, terminal owners fail unfinished work, and zero-Task claim races exit cleanly |
 | `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and seven reason codes exist; legal transitions, terminality, status-reason constraints, coordinator and result-validation suspension, unknown-state blocking, deployment failure reason, and service projections are deterministic |
@@ -1545,6 +1572,8 @@ Deliverables:
   explicit Task-to-call or Task-to-assignment links;
 - implement fixed-batch preclaim with an immutable complete Task-to-call
   mapping and pull-worker admission with assignment deferred to claims;
+- derive pull-worker candidates from unfinished Task count, positive claim
+  capacity, and existing nonterminal worker calls without another limit;
 - enforce total and GPU Provider Call ceilings atomically at submission
   preclaim;
 - derive active call-slot counts from nonterminal Provider Calls without an
@@ -2231,6 +2260,16 @@ after each decision:
     Operational batching is excluded from scientific fingerprints unless it
     changes scientific meaning. There is no dynamic batch optimizer,
     cross-Node batch, Modal Queue, or workload-owned durable scheduler.
+53. **Derived pull-worker pool size — accepted 2026-07-30**: a pull Node's
+    desired worker count is the ceiling of its nonterminal Task count divided
+    by positive workload-declared claim capacity. New candidates equal the
+    positive difference between that target and existing nonterminal worker
+    calls, then remain subject to DAG priority and total/GPU call slots.
+    Pending and assigned unfinished Tasks count; terminal Tasks do not.
+    Unknown calls count conservatively. Workers repeatedly claim, are not
+    cancelled as the target shrinks, and may exit successfully without a Task
+    after a claim race. There is no per-Node worker cap, feedback autoscaler,
+    lease, or idle timeout.
 
 ## Definition of ready for implementation
 

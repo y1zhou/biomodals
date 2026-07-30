@@ -722,13 +722,21 @@ GPU-decorated function also consumes one GPU slot. CPU, RAM, accelerator type,
 GPU count, and actual Modal container packing remain provider-owned.
 _Avoid_: Task limit, resource vector, Modal decorator, cross-run global cap
 
+**Runtime Image Key** [planned]:
+An opaque, stable operational value declared by a resolved provider binding
+when two call candidates use the same deployed runtime image. The scheduler
+uses it only to form best-effort admission cohorts; it neither inspects Modal
+decorators nor promises container reuse across Functions.
+_Avoid_: scientific image version, Provider Call ID, warm-container guarantee
+
 **DAG Admission Priority** [planned]:
 The deterministic, Snakemake-inspired ordering used to fill every feasible
 Provider Call slot in one coordinator scheduling cycle. Ready work is ranked
 first by greater dependency depth, then by the number of required unfinished
-descendant Nodes it can help unblock, then by persisted Node and Task encounter
-ordinals. The ordinals preserve plan and discovery order across recovery but
-do not become scientific identity.
+descendant Nodes it can help unblock. Within an equal graph rank, GPU
+candidates precede CPU candidates, stable Runtime Image Key cohorts stay
+together, and persisted Node and Task encounter ordinals break remaining
+ties. These values are operational and do not become scientific identity.
 _Avoid_: one-call-per-Node pass, round-robin fairness, unordered set iteration, configurable priority weights
 
 **Workflow Runtime**:

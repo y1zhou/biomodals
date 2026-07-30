@@ -543,7 +543,7 @@ fingerprinting Tasks.
 | Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
-| Dispatch | Durable fixed batches, direct fan-out, pull claims, worker-call tracking, and returned outcome routing | Provider binding, Task payloads, compatibility keys, and per-Task decoding |
+| Dispatch | Durable fixed batches, direct fan-out, pull claims, worker-call tracking, stable image cohorts, and returned outcome routing | Provider binding, Runtime Image Key, Task payloads, compatibility keys, and per-Task decoding |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Stable grouping by compatibility and encounter order, immutable call mapping, and outcome distribution | Positive maximum Tasks per call and whether batching changes scientific identity |
 | Resources | Run-scoped total and GPU Provider Call admission counts | Service admission, Modal decorators, deployment limits, cross-coordinator policy |
@@ -971,6 +971,7 @@ Calls remain the unit counted by remote-call limits.
 The workload supplies operational dispatch descriptors for ready Tasks:
 
 - the resolved provider binding and whether it uses a GPU;
+- an optional opaque Runtime Image Key;
 - a stable compatibility key;
 - a positive `max_tasks_per_call`;
 - provider argument construction for an ordered Task collection;
@@ -1041,10 +1042,10 @@ decorator limits still govern actual provider containers.
 #### Policy persistence and scientific identity
 
 One Run persists its dispatch mode, compatibility descriptors, provider
-bindings, GPU declarations, and maximum batch or claim sizes as operational
-policy. Resume reloads that policy. A Successor Execution Run may choose
-different operational batching or worker counts while reusing validated
-scientific publications.
+bindings, GPU declarations, Runtime Image Keys, and maximum batch or claim
+sizes as operational policy. Resume reloads that policy. A Successor Execution
+Run may choose different operational batching or worker counts while reusing
+validated scientific publications.
 
 These values are excluded from Workload Plan and Task Fingerprints unless they
 change scientific meaning. Any result-affecting ordering or batching parameter
@@ -1121,24 +1122,58 @@ immutable. Each discovered Task similarly stores its position in the returned
 ordinal; a batch uses the ordinal of its first constituent Task. Pull-worker
 call candidates enumerate the Node's ready Tasks in the same order.
 
-Ready Provider Call candidates are sorted by this tuple:
+The scheduler processes candidates in this order:
 
 ```text
-(-depth, -unblocking_span, node_ordinal, task_ordinal)
+greater depth
+  -> greater unblocking_span
+    -> GPU candidates, then CPU candidates
+      -> stable Runtime Image Key cohorts
+        -> node_ordinal, then task_ordinal
 ```
 
-The coordinator walks that sequence once, preclaiming candidates that fit the
-remaining total and GPU ceilings until no total slot or feasible ready work
-remains. A GPU candidate skipped because the GPU ceiling is full does not
-prevent a lower-ranked CPU candidate from using a total slot. The GPU ceiling
-is an upper bound, not a quota: graph priority may fill total slots with CPU
-work before lower-ranked GPU work.
+Depth and unblocking span form the graph rank. Resource and image preferences
+apply only among candidates with the same graph rank: lower-ranked GPU work
+never displaces graph-critical CPU work.
+
+Within an equal graph-rank band, all GPU candidates are considered before CPU
+candidates. Within each resource class, the scheduler stably groups candidates
+by Runtime Image Key. Image cohorts are ordered by the earliest encountered
+candidate they contain, and candidates retain encounter order within the
+cohort. For example:
+
+```text
+encounter: A(image-x), B(image-y), C(image-x), D(image-y)
+cohorted:  A(image-x), C(image-x), B(image-y), D(image-y)
+```
+
+The resolved provider binding supplies the opaque Runtime Image Key. An absent
+key is treated as unique to that binding. The key and `uses_gpu` are persisted
+operational metadata and are excluded from Workload Plan and Task
+Fingerprints.
+
+The coordinator walks the resulting sequence once, preclaiming candidates
+that fit the remaining total and GPU ceilings until no total slot or feasible
+ready work remains. With five total slots, two feasible GPU candidates, and
+any number of equal-graph-rank CPU candidates, it admits both GPU candidates
+and then three CPU candidates. A GPU candidate skipped because the GPU ceiling
+is full does not prevent a CPU candidate from using a total slot. The GPU
+ceiling is an upper bound, not a quota.
+
+Admission operates on Provider Call candidates rather than raw Tasks. Two
+compatible GPU Tasks may already form one fixed-batch candidate and therefore
+consume one GPU and one total slot.
 
 Encounter ordinals are persisted so recovery does not depend on SQLite row
-order, Python set iteration, completion timing, or random identifiers. They
-are operational and excluded from Workload Plan and Task Fingerprints. If
-order changes scientific meaning, the workload must encode that order in its
-normalized scientific payload instead.
+order, Python set iteration, completion timing, or random identifiers. Runtime
+image cohorting never uses currently active calls as a signal, never holds a
+slot open, and never changes provider autoscaling settings. Modal documents
+[Image layer caching](https://modal.com/docs/guide/custom-container)
+separately from [Function and Class container
+lifecycle](https://modal.com/docs/guide/lifecycle-functions), so the kernel
+does not promise warm-container reuse across different Functions sharing an
+Image. If execution order changes scientific meaning, the workload must encode
+that order in its normalized scientific payload instead.
 
 The ready set is finite because Node Task discovery is checkpointed as one
 complete finite Sequence. Consequently, this policy needs no round-robin
@@ -1437,7 +1472,7 @@ Phase 0 test inventory:
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
 | `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; no owner is admitted before host durability; recovery reloads persisted fingerprints without polling-time recomputation |
 | `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; terminal calls release them |
-| `tests/execution/test_admission.py` | One cycle fills every feasible slot; deeper Nodes rank first, then larger unfinished descendant spans, then persisted Node and Task encounter order; GPU saturation skips only GPU candidates; recovery reproduces the same pending order |
+| `tests/execution/test_admission.py` | One cycle fills every feasible slot; depth and unfinished descendant span remain primary; equal graph ranks schedule GPU before CPU, stably cohort Runtime Image Keys, then use persisted encounter order; GPU saturation skips only GPU candidates; active-call timing does not change recovery order |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1498,6 +1533,8 @@ Deliverables:
   fingerprints, without streaming or provider dependencies;
 - preserve ordered Node-plan and Task-discovery encounter ordinals as
   operational metadata, outside scientific fingerprints;
+- define pure equal-graph-rank ordering for GPU-first resource classes and
+  stable Runtime Image Key cohorts without provider introspection;
 - define pure fixed-batch grouping by Node, provider binding, compatibility
   key, encounter order, and positive maximum batch size;
 - compute Task fingerprints once from fixed canonical JSON and keep
@@ -1545,6 +1582,8 @@ Deliverables:
   atomically, then cross host durability before admitting owners;
 - persist Node and Task encounter ordinals rather than relying on row, set, or
   completion order;
+- persist resolved `uses_gpu` and Runtime Image Key dispatch metadata outside
+  scientific fingerprints;
 - implement preclaim, spawn, attachment, observation, collection,
   cancellation, and unknown-outcome recovery behind the provider port;
 - reuse `ModalJobSubmitter`'s preclaim, attachment, and unknown-spawn
@@ -1579,7 +1618,8 @@ Deliverables:
 - derive active call-slot counts from nonterminal Provider Calls without an
   allocation table or distributed lease abstraction;
 - greedily fill every feasible slot in one cycle using depth, unfinished
-  descendant span, and persisted encounter order;
+  descendant span, GPU-first resource classes, stable image cohorts, and
+  persisted encounter order;
 - add reusable sync and async coordinator loops;
 - add the run-scoped Modal coordinator binding with one-container routing,
   serialized SQLite and Volume checkpoints, detached execution, lifecycle
@@ -1868,6 +1908,7 @@ Rollback: revert the commit; it has no schema effect.
 | Dispatch | Fixed preclaim assignment, direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from total/GPU call slots, one slot per active call, conservative unknown-state retention |
+| Scheduling | Graph rank before resource class; GPU before CPU within a rank; stable image cohorts before encounter order; no active-image or slot-reservation heuristic |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
 | Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, coordinator resume, and successor restart behavior |
 | PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, and successor publication reuse |
@@ -2243,12 +2284,13 @@ after each decision:
 51. **DAG-priority admission — accepted 2026-07-30**: one scheduling cycle
     greedily fills every feasible total-call slot. Candidates rank by greater
     depth in the required result or repair closure, then by more distinct
-    required unfinished descendants, then by persisted Node and Task encounter
-    ordinals. GPU saturation skips infeasible GPU candidates while CPU
-    candidates may continue. The GPU limit is a ceiling rather than a quota.
-    Encounter order is operational and excluded from scientific fingerprints;
-    there is no one-call-per-Node pass, fairness cursor, aging, priority
-    weights, preemption, or scheduler plugin.
+    required unfinished descendants. Decision 54 inserts GPU and Runtime Image
+    Key preferences before persisted Node and Task encounter ordinals within
+    an equal graph rank. GPU saturation skips infeasible GPU candidates while
+    CPU candidates may continue. The GPU limit is a ceiling rather than a
+    quota. Encounter order is operational and excluded from scientific
+    fingerprints; there is no one-call-per-Node pass, fairness cursor, aging,
+    priority weights, preemption, or scheduler plugin.
 52. **Two dispatch modes — accepted 2026-07-30**: workloads declare provider
     bindings, GPU use, compatibility keys, positive maximum batch or claim
     sizes, argument construction, and per-Task decoding. For fixed batches,
@@ -2270,6 +2312,16 @@ after each decision:
     cancelled as the target shrinks, and may exit successfully without a Task
     after a claim race. There is no per-Node worker cap, feedback autoscaler,
     lease, or idle timeout.
+54. **GPU-first stable image cohorts — accepted 2026-07-30**: depth and
+    unfinished downstream span remain the primary graph rank. Within an equal
+    rank, feasible GPU call candidates precede CPU candidates; each resource
+    class is stably grouped by an opaque workload-declared Runtime Image Key
+    before final encounter ordering. Image groups follow their earliest
+    member, and members preserve encounter order. Missing image keys are
+    unique per provider binding. Cohorting never reserves a slot, uses active
+    calls as a signal, changes provider autoscaling, or promises cross-Function
+    warm-container reuse. `uses_gpu` and image keys are persisted operational
+    metadata excluded from scientific fingerprints.
 
 ## Definition of ready for implementation
 

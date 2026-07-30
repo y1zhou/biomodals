@@ -441,16 +441,19 @@ The admission-order policy was accepted on 2026-07-30. The coordinator uses a
 Snakemake-inspired greedy selection: every scheduling cycle fills as many
 currently feasible total and GPU Provider Call slots as ready work permits,
 without an artificial one-call-per-Node pass. Ready call candidates are
-ordered lexicographically by greater Node depth in the required DAG closure,
-then by the greater number of required unfinished descendant Nodes reachable
-from that Node, then by stable encounter order. `ExecutionPlan` records each
-Node's sequence ordinal and Task discovery records each Task's sequence
-ordinal; batches retain the first constituent Task's ordinal. These ordinals
-are operational, excluded from scientific fingerprints, and reused after
-coordinator recovery. If a higher-ranked GPU candidate cannot fit the
-remaining GPU slots, selection continues to feasible CPU candidates rather
-than leaving total slots idle. The kernel adds no fairness cursor, priority
-weights, preemption, or scheduler plugin surface.
+partitioned first by greater Node depth in the required DAG closure and then
+by the greater number of required unfinished descendant Nodes reachable from
+that Node. Within an equal graph-rank band, GPU candidates precede CPU
+candidates. Each resource class is stably grouped by a workload-declared
+Runtime Image Key: image cohorts are ordered by their first encountered
+candidate, and candidates retain encounter order within a cohort.
+`ExecutionPlan` records each Node's sequence ordinal and Task discovery records
+each Task's sequence ordinal; batches retain the first constituent Task's
+ordinal. These values are operational, excluded from scientific fingerprints,
+and reused after coordinator recovery. If a GPU candidate cannot fit the
+remaining GPU slots, selection continues to CPU candidates rather than
+leaving total slots idle. The kernel adds no active-image heuristic, fairness
+cursor, priority weights, preemption, or scheduler plugin surface.
 
 The dispatch-batching policy was accepted on 2026-07-30. The kernel implements
 exactly two remote dispatch mechanics. In fixed-batch dispatch, the workload
@@ -482,6 +485,17 @@ The coordinator does not cancel excess workers when the target shrinks; they
 finish owned work and exit when no unowned Task remains. A claim race may
 produce a successful zero-Task call. The kernel adds no per-Node worker limit,
 adaptive throughput controller, lease, or idle timeout.
+
+The GPU and runtime-image tie-break policy was accepted on 2026-07-30. DAG
+depth and downstream unblocking span remain primary, so lower-ranked GPU work
+never displaces graph-critical CPU work. For equal graph rank, all feasible
+GPU candidates are considered before CPU candidates. Within each resource
+class, stable image cohorts precede final Node and Task encounter ordering.
+The resolved provider binding supplies an opaque Runtime Image Key; an absent
+key is treated as unique to that binding. Cohorting is best effort and never
+holds a slot open. It does not infer provider placement, favor whichever image
+happens to be active, or promise that different Modal Functions sharing an
+Image reuse a container.
 
 The state-transition policy was accepted on 2026-07-29. The service preserves
 users, authentication data, and administrator configuration while recreating

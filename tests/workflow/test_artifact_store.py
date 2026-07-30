@@ -243,6 +243,73 @@ def test_exact_publication_replay_is_idempotent_but_divergence_is_rejected() -> 
         )
 
 
+def test_task_publications_are_durable_idempotent_and_node_reusable() -> None:
+    connection, _, artifacts = _stores()
+    result, artifact = _publication()
+
+    artifacts.record_task_publication(
+        "design",
+        "candidate-1",
+        result=result,
+        artifacts=(artifact,),
+        now=100,
+    )
+    artifacts.record_task_publication(
+        "design",
+        "candidate-1",
+        result=result,
+        artifacts=(artifact,),
+        now=200,
+    )
+    artifacts.record_node_publication(
+        "design",
+        result=result,
+        artifacts=(artifact,),
+        now=200,
+    )
+    connection.commit()
+
+    assert artifacts.list_task_publication_keys("design") == ("candidate-1",)
+    assert artifacts.load_task_result("design", "candidate-1") == result
+    assert artifacts.load_task_output_artifacts(
+        "design",
+        "candidate-1",
+    ) == (artifact,)
+    assert artifacts.load_node_output_artifacts("design") == (artifact,)
+
+    artifacts.discard_node_publication("design")
+    connection.commit()
+    assert artifacts.load_artifact(artifact.artifact_id) == artifact
+    assert artifacts.load_task_result("design", "candidate-1") == result
+
+    artifacts.discard_task_publication("design", "candidate-1")
+    connection.commit()
+    assert artifacts.load_task_result("design", "candidate-1") is None
+    with pytest.raises(FileNotFoundError):
+        artifacts.load_artifact(artifact.artifact_id)
+
+
+def test_task_publication_rejects_divergent_replay() -> None:
+    _, _, artifacts = _stores()
+    result, artifact = _publication()
+    artifacts.record_task_publication(
+        "design",
+        "candidate-1",
+        result=result,
+        artifacts=(artifact,),
+        now=100,
+    )
+
+    with pytest.raises(ValueError, match="Task publication already exists"):
+        artifacts.record_task_publication(
+            "design",
+            "candidate-1",
+            result=result.model_copy(update={"warnings": ["changed"]}),
+            artifacts=(artifact,),
+            now=200,
+        )
+
+
 def test_invalid_copied_publication_can_be_discarded_before_replacement() -> None:
     connection, _, artifacts = _stores()
     result, artifact = _publication()

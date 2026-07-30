@@ -21,6 +21,8 @@ WORKFLOW_ARTIFACT_TABLES = (
     "workflow_node_inputs",
     "workflow_node_outputs",
     "workflow_node_results",
+    "workflow_task_outputs",
+    "workflow_task_results",
 )
 
 
@@ -73,6 +75,23 @@ class WorkflowArtifactStore:
                 UNIQUE (node_key, input_name, ordinal)
             );
 
+            CREATE TABLE IF NOT EXISTS workflow_task_outputs (
+                node_key TEXT NOT NULL,
+                task_key TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                artifact_id TEXT NOT NULL UNIQUE
+                    REFERENCES workflow_artifacts(artifact_id),
+                PRIMARY KEY (node_key, task_key, ordinal)
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_task_results (
+                node_key TEXT NOT NULL,
+                task_key TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                completed_at INTEGER NOT NULL,
+                PRIMARY KEY (node_key, task_key)
+            );
+
             CREATE TABLE IF NOT EXISTS workflow_node_outputs (
                 node_key TEXT NOT NULL,
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
@@ -91,6 +110,8 @@ class WorkflowArtifactStore:
                 ON workflow_artifacts(producing_node_key);
             CREATE INDEX IF NOT EXISTS workflow_node_inputs_artifact
                 ON workflow_node_inputs(artifact_id);
+            CREATE INDEX IF NOT EXISTS workflow_task_outputs_task
+                ON workflow_task_outputs(node_key, task_key);
             """
         )
 
@@ -176,6 +197,137 @@ class WorkflowArtifactStore:
             return None
         return AppRunResult.model_validate_json(row["result_json"])
 
+    def record_task_publication(
+        self,
+        node_key: str,
+        task_key: str,
+        *,
+        result: AppRunResult,
+        artifacts: tuple[WorkflowArtifact, ...],
+        now: int,
+    ) -> None:
+        """Atomically stage one immutable Task result and its artifacts."""
+        if not task_key:
+            raise ValueError("Workflow Task key cannot be empty")
+        _raise_for_inline_bytes_result(result)
+        for artifact in artifacts:
+            if artifact.producing_node_id != node_key:
+                raise ValueError("Workflow artifact producer does not match Node")
+
+        existing_result = self.load_task_result(node_key, task_key)
+        if existing_result is not None:
+            existing_artifacts = self.load_task_output_artifacts(node_key, task_key)
+            if existing_result == result and existing_artifacts == artifacts:
+                return
+            raise ValueError(
+                f"Workflow Task publication already exists: {node_key}/{task_key}"
+            )
+
+        for artifact in artifacts:
+            self._insert_artifact(artifact, now=now)
+        self._connection.executemany(
+            """
+            INSERT INTO workflow_task_outputs (
+                node_key,
+                task_key,
+                ordinal,
+                artifact_id
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (node_key, task_key, ordinal, artifact.artifact_id)
+                for ordinal, artifact in enumerate(artifacts)
+            ],
+        )
+        self._connection.execute(
+            """
+            INSERT INTO workflow_task_results (
+                node_key,
+                task_key,
+                result_json,
+                completed_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (node_key, task_key, result.model_dump_json(), now),
+        )
+
+    def load_task_result(
+        self,
+        node_key: str,
+        task_key: str,
+    ) -> AppRunResult | None:
+        """Load one materialized Task result, if publication completed."""
+        row = self._connection.execute(
+            """
+            SELECT result_json
+            FROM workflow_task_results
+            WHERE node_key = ? AND task_key = ?
+            """,
+            (node_key, task_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return AppRunResult.model_validate_json(row["result_json"])
+
+    def load_task_output_artifacts(
+        self,
+        node_key: str,
+        task_key: str,
+    ) -> tuple[WorkflowArtifact, ...]:
+        """Load one Task publication's artifacts in output encounter order."""
+        rows = self._connection.execute(
+            """
+            SELECT artifact_id
+            FROM workflow_task_outputs
+            WHERE node_key = ? AND task_key = ?
+            ORDER BY ordinal
+            """,
+            (node_key, task_key),
+        ).fetchall()
+        return tuple(self.load_artifact(str(row["artifact_id"])) for row in rows)
+
+    def list_task_publication_keys(self, node_key: str) -> tuple[str, ...]:
+        """Return Task keys with durable results in stable lexical order."""
+        rows = self._connection.execute(
+            """
+            SELECT task_key
+            FROM workflow_task_results
+            WHERE node_key = ?
+            ORDER BY task_key
+            """,
+            (node_key,),
+        ).fetchall()
+        return tuple(str(row["task_key"]) for row in rows)
+
+    def discard_task_publication(self, node_key: str, task_key: str) -> None:
+        """Remove one invalid Task publication without deleting shared artifacts."""
+        artifact_rows = self._connection.execute(
+            """
+            SELECT artifact_id
+            FROM workflow_task_outputs
+            WHERE node_key = ? AND task_key = ?
+            """,
+            (node_key, task_key),
+        ).fetchall()
+        artifact_ids = tuple(str(row["artifact_id"]) for row in artifact_rows)
+        self._connection.execute(
+            """
+            DELETE FROM workflow_task_results
+            WHERE node_key = ? AND task_key = ?
+            """,
+            (node_key, task_key),
+        )
+        self._connection.execute(
+            """
+            DELETE FROM workflow_task_outputs
+            WHERE node_key = ? AND task_key = ?
+            """,
+            (node_key, task_key),
+        )
+        self._delete_unreferenced_artifacts(artifact_ids)
+
     def discard_node_publication(self, node_key: str) -> None:
         """Remove one conclusively invalid publication before replacement work."""
         artifact_rows = self._connection.execute(
@@ -195,10 +347,7 @@ class WorkflowArtifactStore:
             "DELETE FROM workflow_node_outputs WHERE node_key = ?",
             (node_key,),
         )
-        self._connection.executemany(
-            "DELETE FROM workflow_artifacts WHERE artifact_id = ?",
-            [(artifact_id,) for artifact_id in artifact_ids],
-        )
+        self._delete_unreferenced_artifacts(artifact_ids)
 
     def load_artifact(self, artifact_id: str) -> WorkflowArtifact:
         """Load one artifact manifest by stable identity."""
@@ -242,6 +391,17 @@ class WorkflowArtifactStore:
         )
 
     def _insert_artifact(self, artifact: WorkflowArtifact, *, now: int) -> None:
+        try:
+            existing = self.load_artifact(artifact.artifact_id)
+        except FileNotFoundError:
+            pass
+        else:
+            if existing != artifact:
+                raise ValueError(
+                    "Workflow artifact identity was reused for different content: "
+                    f"{artifact.artifact_id}"
+                )
+            return
         self._connection.execute(
             """
             INSERT INTO workflow_artifacts (
@@ -295,6 +455,29 @@ class WorkflowArtifactStore:
                 for ordinal, file in enumerate(artifact.files)
             ],
         )
+
+    def _delete_unreferenced_artifacts(
+        self,
+        artifact_ids: tuple[str, ...],
+    ) -> None:
+        for artifact_id in artifact_ids:
+            self._connection.execute(
+                """
+                DELETE FROM workflow_artifacts
+                WHERE artifact_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workflow_node_outputs
+                      WHERE artifact_id = ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workflow_task_outputs
+                      WHERE artifact_id = ?
+                  )
+                """,
+                (artifact_id, artifact_id, artifact_id),
+            )
 
     def _artifact_from_row(self, row: sqlite3.Row) -> WorkflowArtifact:
         file_rows = self._connection.execute(

@@ -1,15 +1,21 @@
-"""Standalone contract tests for the Rosetta app."""
+"""Standalone contracts for the Rosetta app."""
 
 # ruff: noqa: D103
 
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 from biomodals.app.bioinfo import rosetta_app
+from biomodals.execution import PullTaskClaim, RunStatus, WorkerAssignmentRecord
 from biomodals.helper import shell as shell_helper
 
+WORKLOAD_UUID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+EXECUTION_RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+PROVIDER_CALL_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 
-def test_rosetta_no_local_output_reports_volume_path(
+
+def test_rosetta_no_local_output_uses_remote_coordinator(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -17,8 +23,7 @@ def test_rosetta_no_local_output_reports_volume_path(
     input_pdb = tmp_path / "demo.pdb"
     input_pdb.write_text("ATOM\n", encoding="utf-8")
     uploaded = []
-    queued = []
-    deleted = []
+    captured = {}
 
     class FakeBatch:
         def __enter__(self):
@@ -34,56 +39,91 @@ def test_rosetta_no_local_output_reports_volume_path(
         def batch_upload(self):
             return FakeBatch()
 
-    class FakeQueue:
-        def put(self, item):
-            queued.append(item)
+    class CoordinatorMethod:
+        def spawn(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-coordinator",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=RunStatus.SUCCEEDED,
+                        status_reason=None,
+                        status_message=None,
+                    )
+                ),
+            )
 
+    class Coordinator:
+        run = CoordinatorMethod()
+
+    def stage(output_volume, execution_run_id, request):
+        captured["staged"] = (output_volume, execution_run_id, request)
+
+    def coordinator_handle(**kwargs):
+        captured["coordinator"] = kwargs
+        return Coordinator()
+
+    generated_ids = iter((WORKLOAD_UUID, EXECUTION_RUN_ID))
+    output_volume = FakeVolume()
     monkeypatch.setattr(
         rosetta_app,
         "CONF",
         SimpleNamespace(
             name="Rosetta",
-            output_volume=FakeVolume(),
+            version="2025.51",
+            output_volume=output_volume,
             output_volume_mountpoint="/biomodals-outputs",
             output_volume_name="Rosetta-outputs",
         ),
     )
+    monkeypatch.setattr(rosetta_app, "uuid4", lambda: next(generated_ids))
+    monkeypatch.setattr(rosetta_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         rosetta_app,
-        "uuid4",
-        lambda: SimpleNamespace(hex="abc123"),
-    )
-    monkeypatch.setattr(
-        rosetta_app.modal,
-        "Queue",
-        SimpleNamespace(
-            from_name=lambda *args, **kwargs: FakeQueue(),
-            objects=SimpleNamespace(delete=lambda name: deleted.append(name)),
-        ),
+        "_execution_coordinator_handle",
+        coordinator_handle,
     )
     monkeypatch.setattr(
         rosetta_app,
-        "run_rosetta",
-        SimpleNamespace(remote=lambda *args: None),
+        "load_execution_request_from_volume",
+        lambda output, execution_run_id: captured["staged"][2],
     )
 
-    rosetta_app.submit_rosetta_task(
+    entrypoint = rosetta_app.submit_rosetta_task.info
+    assert entrypoint is not None and entrypoint.raw_f is not None
+    entrypoint.raw_f(
         rosetta_binary="relax",
         input_pdb=str(input_pdb),
         out_dir=None,
     )
 
-    assert uploaded[0] == (input_pdb.resolve(), "/demo-abc123/inputs/1/demo.pdb")
-    assert uploaded[1][1] == "/demo-abc123/inputs/tasks.parquet"
-    assert queued[0]["pdb"] == "inputs/1/demo.pdb"
-    assert deleted == ["Rosetta-queue-abc123"]
+    workload_run_key = f"demo-{WORKLOAD_UUID.hex}"
+    assert uploaded[0] == (
+        input_pdb.resolve(),
+        f"/{workload_run_key}/inputs/1/demo.pdb",
+    )
+    assert uploaded[1][1] == f"/{workload_run_key}/inputs/tasks.parquet"
+    _, staged_run_id, request = captured["staged"]
+    assert staged_run_id == EXECUTION_RUN_ID
+    assert request.workload_run_key == workload_run_key
+    assert request.tasks[0].pdb == "inputs/1/demo.pdb"
+    assert captured["run_kwargs"] == {"development": True}
+    assert captured["coordinator"] == {
+        "execution_run_id": EXECUTION_RUN_ID,
+        "deployment": rosetta_app.DeploymentIdentity("main", "Rosetta", 1),
+        "use_deployed_coordinator": False,
+    }
+    output = capsys.readouterr().out
+    assert f"Execution Run ID: {EXECUTION_RUN_ID}" in output
     assert (
-        "Results saved to 'demo-abc123' in volume 'Rosetta-outputs'"
-        in capsys.readouterr().out
+        f"Results saved to '{workload_run_key}' in volume 'Rosetta-outputs'" in output
     )
 
 
-def test_run_rosetta_uses_app_run_layout(tmp_path: Path, monkeypatch) -> None:
+def test_rosetta_worker_uses_app_run_layout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     captured = {}
 
     class FakeVolume:
@@ -93,48 +133,82 @@ def test_run_rosetta_uses_app_run_layout(tmp_path: Path, monkeypatch) -> None:
         def commit(self) -> None:
             self.commit_count += 1
 
-    class FakeQueue:
-        def __init__(self) -> None:
-            self.items = [
-                {
-                    "index": 1,
-                    "binary": "/usr/bin/relax",
-                    "pdb": "inputs/1/demo.pdb",
-                    "rosetta_script": "inputs/_script/script.xml",
-                    "flags_file": "inputs/_flags/options.flags",
-                }
-            ]
+    task = rosetta_app.RosettaTaskSpec(
+        task_key="1",
+        index=1,
+        binary="/usr/bin/relax",
+        pdb="inputs/1/demo.pdb",
+        rosetta_script="inputs/_script/script.xml",
+        flags_file="inputs/_flags/options.flags",
+        output_dir="outputs/1",
+        worker_log="logs/1.log",
+        expected_files=(),
+        input_sha256="a" * 64,
+        script_sha256="b" * 64,
+        flags_sha256="c" * 64,
+    )
+    assignment = WorkerAssignmentRecord(
+        execution_run_id=EXECUTION_RUN_ID,
+        node_key="rosetta-tasks",
+        task_key=task.task_key,
+        task_fingerprint="fingerprint",
+        execution_payload=task.to_dict(),
+        provider_call_id=PROVIDER_CALL_ID,
+        request_id="claim",
+        ordinal=0,
+        created_at=1,
+    )
+    claim_count = 0
+    completions = []
 
-        def get(self, block=False):
-            if self.items:
-                return self.items.pop(0)
-            return None
+    def claim(provider_call_id, request_id, capacity):
+        nonlocal claim_count
+        captured.setdefault("claims", []).append((
+            provider_call_id,
+            request_id,
+            capacity,
+        ))
+        assignments = (assignment,) if claim_count == 0 else ()
+        claim_count += 1
+        return PullTaskClaim(
+            request_id=request_id,
+            provider_call_id=PROVIDER_CALL_ID,
+            assignments=assignments,
+        )
+
+    def complete(provider_call_id, task_key, request_id, result):
+        completions.append((provider_call_id, task_key, request_id, result))
 
     output_volume = FakeVolume()
     monkeypatch.setattr(
         rosetta_app,
         "CONF",
         SimpleNamespace(
-            name="Rosetta",
             output_volume=output_volume,
             output_volume_mountpoint=str(tmp_path),
         ),
     )
-    monkeypatch.setattr(
-        rosetta_app.modal,
-        "Queue",
-        SimpleNamespace(from_name=lambda *args, **kwargs: FakeQueue()),
+    coordinator = SimpleNamespace(
+        claim_tasks=SimpleNamespace(remote=claim),
+        complete_task=SimpleNamespace(remote=complete),
     )
 
     def fake_run_command(cmd, *, output_mode, log_file):
         captured["cmd"] = cmd
         captured["output_mode"] = output_mode
         captured["log_file"] = log_file
-        return []
+        Path(log_file).write_text("log\n", encoding="utf-8")
 
     monkeypatch.setattr(shell_helper, "run_command", fake_run_command)
 
-    rosetta_app.run_rosetta.get_raw_f()("demo", "abc123", 1)
+    summary = rosetta_app.run_rosetta_worker.get_raw_f()(
+        coordinator=coordinator,
+        provider_call_id=str(PROVIDER_CALL_ID),
+        run_name="demo",
+        run_id="abc123",
+        claim_capacity=1,
+        max_parallel=1,
+    )
 
     run_root = tmp_path / "demo-abc123"
     assert captured["cmd"] == [
@@ -149,6 +223,11 @@ def test_run_rosetta_uses_app_run_layout(tmp_path: Path, monkeypatch) -> None:
     ]
     assert captured["output_mode"] == "capture"
     assert captured["log_file"] == run_root / "logs" / "1.log"
-    assert (run_root / "outputs" / "1").is_dir()
-    assert (run_root / "logs").is_dir()
-    assert output_volume.commit_count == 1
+    assert completions[0][0:3] == (
+        str(PROVIDER_CALL_ID),
+        "1",
+        f"{PROVIDER_CALL_ID}:complete:fingerprint",
+    )
+    assert completions[0][3]["status"] == "succeeded"
+    assert summary == {"claimed_tasks": 1, "claim_requests": 2}
+    assert output_volume.commit_count == 2

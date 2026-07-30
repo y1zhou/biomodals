@@ -142,6 +142,13 @@ Node whose cached publication and outcome can be observed. Every Task belongs
 to exactly one Node.
 _Avoid_: workflow node, thread, untracked work item
 
+**Coordinator-Local Task** [planned]:
+A Task whose workload hook executes inside the exclusive Execution
+Coordinator without a Provider Call or call slot. After coordinator
+interruption, recovery observes its publication first and may re-enter the
+same idempotent hook only when the result is authoritatively missing.
+_Avoid_: client-side run, untracked finalizer, failed-Task retry
+
 **Task Fingerprint** [planned]:
 The kernel-computed SHA-256 digest of compact canonical JSON containing the
 Workload Plan Fingerprint, Node key, Task key, and workload-normalized
@@ -170,11 +177,12 @@ needed that ancestor work.
 _Avoid_: partial, cached, submitting, attached, state unknown
 
 **Single-Submission Rule** [planned]:
-Within one Execution Run, the kernel schedules each Task once and submits at
-most one Provider Call or Worker Assignment for it. Provider redelivery may
-re-execute that same call, so this rule does not claim exactly-once execution.
-A conclusive failure terminates the Task; retry requires a Successor Execution
-Run.
+Within one Execution Run, the kernel admits each Task once and creates at most
+one Provider Call submission or Worker Assignment for it. Provider redelivery
+may re-execute the same call, and an interrupted Coordinator-Local Task may
+re-enter its same hook after publication observation, so this rule does not
+claim exactly-once execution. A conclusive failure terminates the Task; retry
+requires a Successor Execution Run.
 _Avoid_: exactly-once execution, same-run retry, attempt counter
 
 **Submission Preclaim** [planned]:

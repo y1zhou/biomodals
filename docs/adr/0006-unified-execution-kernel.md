@@ -567,17 +567,34 @@ reassignment.
 
 The single-submission policy superseded the earlier attempt-based retry policy
 on 2026-07-29. The kernel stores no Task Attempt identity or counter. Within
-one Execution Run, each Task is scheduled once and receives at most one
+one Execution Run, each Task is admitted once and receives at most one
 Provider Call submission or Worker Assignment. Modal may redeliver and
-re-execute the same provider input, so the kernel does not claim exactly-once
-execution. A conclusive provider or workload failure terminates the Task; the
-Node aggregation policy then determines the Node outcome, while terminal
-scientific results determine the Run outcome. `resume` reconciles interrupted
-coordination and may submit Tasks that were never submitted, but it never
-resubmits failed Tasks. Retrying failed work requires an explicit `restart`,
-which creates a Successor Execution Run, revalidates Workload Publications,
-and schedules only missing Tasks whose predecessor ownership is conclusively
-terminal. Active or unknown predecessor calls block replacement work.
+re-execute the same provider input, and interrupted Coordinator-Local Tasks
+may re-enter the same local hook under the policy below, so the kernel does
+not claim exactly-once execution. A conclusive provider or workload failure
+terminates the Task; the Node aggregation policy then determines the Node
+outcome, while terminal scientific results determine the Run outcome.
+`resume` reconciles interrupted coordination and may submit Tasks that were
+never submitted, but it never resubmits failed Tasks. Retrying failed work
+requires an explicit `restart`, which creates a Successor Execution Run,
+revalidates Workload Publications, and schedules only missing Tasks whose
+predecessor ownership is conclusively terminal. Active or unknown predecessor
+calls block replacement work.
+
+The coordinator-local recovery policy was accepted on 2026-07-30. A
+Coordinator-Local Task acquires durable local ownership, consumes no Provider
+Call slot, and runs a workload hook in the exclusive coordinator process. The
+hook must use Task-specific staging and atomic publication or otherwise be
+idempotent. A conclusive hook or validation failure terminally fails the Task
+and is never replayed in that Run. If the coordinator disappears while the
+Task remains `running`, its replacement first observes the Task publication:
+`available` completes the same Task without execution, `missing` permits
+re-entry of the same local hook, and `unknown` suspends the Run with
+`result_validation_unknown`. Repeated infrastructure interruptions may
+therefore re-enter one Task without creating an attempt or a second scheduler
+admission. Explicit cancellation prevents replay. A local hook with an
+uncontrolled non-idempotent external side effect is invalid and must instead
+use an idempotency key or a tracked Provider Call.
 
 ## Considered options
 

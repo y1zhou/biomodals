@@ -49,7 +49,9 @@ In particular:
    without opening or writing the repository themselves.
 9. Each scheduling cycle greedily fills every feasible Provider Call slot in
    deterministic DAG-priority order.
-10. Service, workflow, and app CLI entrypoints remain functionally testable;
+10. Interrupted coordinator-local work is re-entered only after its
+    publication is authoritatively missing; conclusive failure never replays.
+11. Service, workflow, and app CLI entrypoints remain functionally testable;
    internal imports and unfinished schemas carry no compatibility promise.
 
 ## Current execution authorities
@@ -85,9 +87,11 @@ These existing decisions remain binding during the refactor:
   changes create Tasks inside a Node, not new Nodes.
 - A claim coordinates writers; it is never proof of completion. A validated
   marker or publication remains authoritative.
-- A Task receives at most one scheduler submission in an Execution Run.
-  Retrying failed paid work requires a Successor Execution Run, and active or
-  unknown predecessor ownership blocks replacement.
+- A Task receives at most one scheduler admission in an Execution Run and at
+  most one Provider Call submission or Worker Assignment. Retrying failed paid
+  or local work requires a Successor Execution Run. Interrupted
+  Coordinator-Local Tasks may re-enter the same hook only after publication
+  observation, and active or unknown predecessor ownership blocks replacement.
 - Only the repository call that creates a durable `submitting` Provider Call
   may invoke spawn. Duplicate or recovered callers never resubmit it.
 - Scientific and cache identity excludes operational concurrency, placement,
@@ -223,6 +227,11 @@ can be reasoned about. Every Task belongs to exactly one Node, and Tasks may be
 discovered only when their containing Node starts. Each has a stable
 Node-local key and deterministic fingerprint.
 
+**Coordinator-Local Task** is a Task executed by a workload hook inside the
+exclusive coordinator process. It uses no Provider Call or call slot and may
+re-enter the same idempotent hook after coordinator interruption only when its
+publication is authoritatively missing.
+
 **Task Fingerprint** is computed by the kernel once at discovery:
 
 ```text
@@ -239,10 +248,11 @@ kernel uses compact sorted-key JSON, rejects non-finite numbers, and persists
 the digest. File inputs are already represented by content digests.
 Operational execution payloads are separate and excluded.
 
-**Single-Submission Rule** means the kernel schedules each Task once and
-creates at most one Provider Call submission or Worker Assignment for it in
-one Execution Run. Provider redelivery can re-execute that same call, so this
-is not an exactly-once execution claim.
+**Single-Submission Rule** means the kernel admits each Task once and creates
+at most one Provider Call submission or Worker Assignment for it in one
+Execution Run. Provider redelivery can re-execute that same call, and
+coordinator recovery can re-enter one interrupted Coordinator-Local Task, so
+this is not an exactly-once execution claim.
 
 **Provider Call** is one concrete remote worker invocation, including its
 durable provider call ID and observed lifecycle. It belongs to one Node and
@@ -480,6 +490,12 @@ came from cache validation or execution as provenance, not as a `cached`
 status. Individual Tasks are never `partial`; the Node aggregation policy
 derives partiality.
 
+A `running` Coordinator-Local Task has no independently surviving remote
+owner. If its coordinator disappears, the exclusive replacement observes its
+publication before deciding whether the same hook may be re-entered. Missing
+output authorizes recovery of that same Task, not a transition back to
+`pending`, a new attempt, or a second scheduler admission.
+
 Result pruning applies the same ownership boundary at Task granularity:
 
 - do not create rows for Tasks that were never discovered;
@@ -543,6 +559,7 @@ fingerprinting Tasks.
 | Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
+| Local execution | Durable ownership, publication-first recovery, and hook invocation order | Idempotent hook logic, Task-specific staging, atomic publication |
 | Dispatch | Durable fixed batches, direct fan-out, pull claims, worker-call tracking, stable image cohorts, and returned outcome routing | Provider binding, Runtime Image Key, Task payloads, compatibility keys, and per-Task decoding |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Stable grouping by compatibility and encounter order, immutable call mapping, and outcome distribution | Positive maximum Tasks per call and whether batching changes scientific identity |
@@ -1320,6 +1337,53 @@ committed before the Task and call are made durably terminal. If a store
 cannot make those changes in one transaction, its adapter must use a
 recoverable prepare/publish/finalize protocol.
 
+### Coordinator-local execution lifecycle
+
+A workload may bind a Task to a coordinator-local hook instead of remote
+dispatch. This is appropriate for deterministic operations such as result
+assembly or archive preparation that need durable timeline and dependency
+state but no separate Provider Call.
+
+The normal Task publication observation runs first:
+
+- `available` succeeds the Task without executing the hook;
+- `unknown` suspends the Run with `result_validation_unknown`;
+- only `missing` permits local ownership and execution.
+
+For `missing`, the repository durably marks the Task `running` with
+coordinator-local ownership before invoking the hook. The hook consumes no
+total or GPU call slot. It writes only to Task-specific staging until its
+result is complete, publishes atomically or idempotently, and returns enough
+information for the workload validator to observe the publication. The kernel
+marks the Task `succeeded` only after validation returns `available`.
+Post-hook `unknown` suspends the Run. Conclusive hook failure, invalid output,
+or authoritative post-publication `missing` terminally fails the Task.
+
+A hard interruption can leave the Task `running` after its process and local
+stack disappear. Under the exclusive coordinator topology, no old local hook
+continues concurrently when the replacement starts. Recovery does not create
+a Task Attempt or move the Task back to `pending`; it observes the publication:
+
+- `available` commits success without re-execution;
+- `missing` re-enters the same hook for the same Task;
+- `unknown` suspends the Run and admits no work.
+
+Repeated infrastructure interruptions may re-enter the hook repeatedly until
+the publication validates. This is crash recovery, not failure retry. A caught
+or otherwise conclusive hook failure remains `failed`, and `resume` cannot
+re-enter it. Explicit cancellation also prevents re-entry and follows the
+normal Task cancellation path.
+
+The workload contract therefore requires coordinator-local hooks to tolerate
+re-entry through idempotence or Task-keyed staging and atomic publication. A
+hook with an uncontrolled non-idempotent external side effect is not eligible
+for coordinator-local execution; it must use an external idempotency key or a
+tracked Provider Call. The kernel stores no local attempt counter, local call
+record, or additional status. Coordinator-local versus provider execution is
+persisted operational placement for one Run and is excluded from scientific
+fingerprints; a Successor Run may change placement only while preserving the
+same publication contract.
+
 Dynamic Task discovery never treats an empty collection as vacuous success.
 Every `NodePlan` carries `allow_empty_result: bool = False`, which is included
 in the Workload Plan Fingerprint:
@@ -1462,7 +1526,8 @@ Phase 0 test inventory:
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
 | `tests/execution/test_dispatch.py` | Fixed batches preserve compatibility and encounter order, bind Tasks atomically, and never repack; pull-worker counts derive from unfinished Tasks and claim capacity, existing and unknown calls suppress excess admission, lost claims replay, assignments survive preemption, terminal owners fail unfinished work, and zero-Task claim races exit cleanly |
-| `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
+| `tests/execution/test_single_submission.py` | Each Task gets one admission and at most one remote owner per Run; provider redelivery and interrupted local-hook re-entry retain Task identity; resume never retries conclusive failure; restart reuses valid publications and submits only conclusively unowned missing work |
+| `tests/execution/test_local_task.py` | Cache success skips the hook; repeated interruption before and after publication re-enters only authoritatively missing work; available recovery commits success; unknown validation suspends; conclusive failure and cancellation never replay; local work consumes no call slot |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and seven reason codes exist; legal transitions, terminality, status-reason constraints, coordinator and result-validation suspension, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
@@ -1480,7 +1545,7 @@ Phase 0 test inventory:
 | `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; non-successful terminals define a backward repair closure; valid publications are reused; unknown or invalid predecessor state fails closed |
 | `tests/execution/test_restart_compatibility.py` | Result-affecting input, content, and declared version changes reject successor creation; operational policy and Deployment Identity changes remain compatible; generic and launch-time restart use the same fingerprint |
 | `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
-| `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves |
+| `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves; Prepare result remains coordinator-local, consumes no call slot, and uses publication-gated interruption recovery |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
 | `tests/app/test_alphafold3_production_contracts.py` | Search, run, request, marker, and seed-batch identities remain unchanged |
 
@@ -1584,6 +1649,8 @@ Deliverables:
   completion order;
 - persist resolved `uses_gpu` and Runtime Image Key dispatch metadata outside
   scientific fingerprints;
+- implement durable coordinator-local ownership without a Task Attempt or
+  Provider Call record;
 - implement preclaim, spawn, attachment, observation, collection,
   cancellation, and unknown-outcome recovery behind the provider port;
 - reuse `ModalJobSubmitter`'s preclaim, attachment, and unknown-spawn
@@ -1621,6 +1688,8 @@ Deliverables:
   descendant span, GPU-first resource classes, stable image cohorts, and
   persisted encounter order;
 - add reusable sync and async coordinator loops;
+- recover interrupted coordinator-local Tasks by observing publication before
+  any idempotent hook re-entry;
 - add the run-scoped Modal coordinator binding with one-container routing,
   serialized SQLite and Volume checkpoints, detached execution, lifecycle
   methods, and preemption recovery;
@@ -1906,6 +1975,7 @@ Rollback: revert the commit; it has no schema effect.
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
 | Batching | Compatibility grouping, maximum-size chunking, immutable call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
 | Dispatch | Fixed preclaim assignment, direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
+| Local execution | Durable local ownership, no call slot, staged publication, repeated crash recovery, unknown suspension, no replay after conclusive failure |
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from total/GPU call slots, one slot per active call, conservative unknown-state retention |
 | Scheduling | Graph rank before resource class; GPU before CPU within a rank; stable image cohorts before encounter order; no active-image or slot-reservation heuristic |
@@ -2023,12 +2093,14 @@ after each decision:
     payload delivery. A terminal owner fails unfinished Tasks; no successor
     assignment is created in the same Execution Run.
 13. **Single submission and retry boundary — accepted 2026-07-29**: the
-    kernel stores no Task Attempt identity. Each Task receives at most one
-    Provider Call submission or Worker Assignment in an Execution Run.
-    Provider redelivery may re-execute the same call, so exactly-once execution
-    is not promised. `resume` never retries failed Tasks. Explicit `restart`
-    creates a Successor Execution Run, revalidates publications, and submits
-    only missing work whose predecessor ownership is conclusively terminal.
+    kernel stores no Task Attempt identity. Each Task is admitted once and
+    receives at most one Provider Call submission or Worker Assignment in an
+    Execution Run. Provider redelivery may re-execute the same call, and
+    decision 55 permits publication-gated re-entry of an interrupted
+    Coordinator-Local Task, so exactly-once execution is not promised.
+    `resume` never retries failed Tasks. Explicit `restart` creates a Successor
+    Execution Run, revalidates publications, and submits only missing work
+    whose predecessor ownership is conclusively terminal.
 14. **Task queue storage — accepted 2026-07-29**: SQLite is the only durable
     queue and assignment store. The design adds neither Modal Dict nor Modal
     Queue; remote workers claim bounded microbatches through the run-scoped
@@ -2322,6 +2394,16 @@ after each decision:
     calls as a signal, changes provider autoscaling, or promises cross-Function
     warm-container reuse. `uses_gpu` and image keys are persisted operational
     metadata excluded from scientific fingerprints.
+55. **Coordinator-local Task recovery — accepted 2026-07-30**: a
+    Coordinator-Local Task acquires durable local ownership, consumes no call
+    slot, and runs an idempotent or atomically publishing workload hook.
+    Conclusive failure terminally fails it. After coordinator interruption,
+    the exclusive replacement observes publication first: `available`
+    succeeds without execution, `missing` permits re-entry of the same hook
+    and Task, and `unknown` suspends the Run. Repeated infrastructure
+    interruption may re-enter the hook without creating an attempt or second
+    admission. Cancellation prevents replay. Uncontrolled non-idempotent
+    external side effects require an idempotency key or tracked Provider Call.
 
 ## Definition of ready for implementation
 

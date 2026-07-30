@@ -13,7 +13,9 @@ import pytest
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionRunNotFoundError,
+    NodeStatus,
     ProviderBinding,
+    ResultProvenance,
     RunStatus,
     RunStatusReason,
 )
@@ -26,7 +28,9 @@ from biomodals.workflow.core.nodes import NodeRunContext
 from biomodals.workflow.core.run_store import WorkflowRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 DEPLOYMENT = DeploymentIdentity("main", "DemoWorkflow", 7)
+SUCCESSOR_DEPLOYMENT = DeploymentIdentity("main", "DemoWorkflow", 8)
 
 
 class FakeVolume:
@@ -56,7 +60,8 @@ class FakeHandle:
 class TextNode(WorkflowNativeNode):
     text: str
 
-    def run(self, _context: NodeRunContext) -> AppRunResult:
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        del context
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -227,7 +232,7 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
         development_function_handles={"compute": handle},
     )
 
-    driver = calls["modal_driver"]
+    driver = cast(Any, calls["modal_driver"])
     resolved = driver.resolve(
         ProviderBinding("development", "DemoWorkflow", 1, "compute", False)
     )
@@ -271,7 +276,7 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
         development_function_handles={"check_external": checker},
     )
 
-    resolved_checker = calls["external_artifact_checker"]
+    resolved_checker = cast(Any, calls["external_artifact_checker"])
     assert resolved_checker.__self__ is checker
     assert checker.hydrated is True
     assert calls["strict_external_artifact_checks"] is True
@@ -299,6 +304,151 @@ def test_status_and_terminal_cancel_are_read_only_kernel_views(
     assert status.run.status == RunStatus.SUCCEEDED
     assert cancelled.run.status == RunStatus.SUCCEEDED
     assert status.run.deployment == DEPLOYMENT
+
+
+def test_restart_creates_an_idempotent_successor_from_cached_publications(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("demo")
+    workflow.add_node(TextNode("complete"), id="write")
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    first = raw_cls.restart._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+    second = raw_cls.restart._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert first.status == AppRunStatus.SUCCEEDED
+    assert second.status == AppRunStatus.SUCCEEDED
+    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    successor = store.execution.get_run(SUCCESSOR_ID)
+    node = store.execution.get_node(SUCCESSOR_ID, "write")
+    publication = store.artifacts.load_node_output_artifacts("write")
+    assert successor.predecessor_execution_run_id == RUN_ID
+    assert successor.deployment == SUCCESSOR_DEPLOYMENT
+    assert successor.status == RunStatus.SUCCEEDED
+    assert node.status == NodeStatus.SUCCEEDED
+    assert node.result_provenance == ResultProvenance.CACHE
+    assert str(RUN_ID) in publication[0].storage.path
+    assert (
+        store.connection.execute(
+            "SELECT COUNT(*) FROM workflow_node_results"
+        ).fetchone()[0]
+        == 1
+    )
+    store.close()
+
+
+def test_restart_recomputes_a_missing_predecessor_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("demo")
+    workflow.add_node(TextNode("replacement"), id="write")
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    predecessor_store = WorkflowRunStore(tmp_path, RUN_ID)
+    publication = predecessor_store.artifacts.load_node_output_artifacts("write")[0]
+    predecessor_store.close()
+    (tmp_path / publication.storage.path).unlink()
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    result = raw_cls.restart._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    successor_store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    node = successor_store.execution.get_node(SUCCESSOR_ID, "write")
+    task = successor_store.execution.get_task(SUCCESSOR_ID, "write", "node")
+    publication = successor_store.artifacts.load_node_output_artifacts("write")[0]
+    assert node.status == NodeStatus.SUCCEEDED
+    assert task.result_provenance == ResultProvenance.CURRENT_RUN
+    assert str(SUCCESSOR_ID) in publication.storage.path
+    successor_store.close()
+
+
+def test_restart_rejects_a_mismatched_predecessor_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=Workflow("demo"),
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    with pytest.raises(ValueError, match="Predecessor Deployment Identity"):
+        raw_cls.restart._get_raw_f()(
+            successor_coordinator,
+            predecessor_execution_run_id=str(RUN_ID),
+            predecessor_deployment_environment=DEPLOYMENT.environment,
+            predecessor_deployment_name=DEPLOYMENT.deployment_name,
+            predecessor_deployment_version=DEPLOYMENT.deployment_version + 1,
+        )
 
 
 def test_status_does_not_create_state_for_an_unknown_run(

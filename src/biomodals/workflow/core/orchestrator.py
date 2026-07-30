@@ -2,6 +2,7 @@
 
 import os
 import pickle
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,9 @@ from biomodals.app.config import AppConfig
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionRunNotFoundError,
+    ExecutionRunRecord,
     ExecutionSnapshot,
+    NodeStatus,
     ProviderBinding,
 )
 from biomodals.execution.modal import (
@@ -28,7 +31,7 @@ from biomodals.helper.constant import (
     WORKFLOW_ORCHESTRATOR_VOLUME,
     WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
 )
-from biomodals.schema import AppRunResult
+from biomodals.schema import AppRunResult, WorkflowArtifact
 from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.execution import execution_plan
 from biomodals.workflow.core.run_store import WorkflowRunStore
@@ -206,6 +209,81 @@ class ExecutionCoordinator:
                 self._close_runtime()
                 OUT_VOLUME.commit()
 
+    @modal.method()
+    def restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> AppRunResult:
+        """Create and drive a successor from one conclusive terminal Run."""
+        predecessor_id = UUID(predecessor_execution_run_id)
+        successor_id, deployment = self._identity()
+        if successor_id == predecessor_id:
+            raise ValueError("Successor Execution Run ID must be new")
+        predecessor_deployment = DeploymentIdentity(
+            environment=predecessor_deployment_environment,
+            deployment_name=predecessor_deployment_name,
+            deployment_version=predecessor_deployment_version,
+        )
+        with self._lock():
+            OUT_VOLUME.reload()
+            predecessor, predecessor_plan, publications = self._load_successor_source(
+                predecessor_id,
+                predecessor_deployment,
+            )
+            candidate = WorkflowCoordinatorPlan(
+                workflow=predecessor_plan.workflow,
+                workload_run_key=predecessor_plan.workload_run_key,
+                max_active_provider_calls=(
+                    predecessor_plan.max_active_provider_calls
+                    if max_active_provider_calls is None
+                    else max_active_provider_calls
+                ),
+                max_active_gpu_provider_calls=(
+                    predecessor_plan.max_active_gpu_provider_calls
+                    if max_active_gpu_provider_calls is None
+                    else max_active_gpu_provider_calls
+                ),
+                strict_external_artifact_checks=(
+                    predecessor_plan.strict_external_artifact_checks
+                ),
+                external_artifact_checker_function_name=(
+                    predecessor_plan.external_artifact_checker_function_name
+                ),
+            )
+            successor_execution_plan = execution_plan(
+                candidate.workflow.validate(),
+                workload_run_key=candidate.workload_run_key,
+            )
+            if (
+                successor_execution_plan.workload_plan_fingerprint
+                != predecessor.plan.workload_plan_fingerprint
+            ):
+                raise ValueError(
+                    "Target deployment changed the Workload Plan Fingerprint"
+                )
+            plan = self._persist_or_verify_plan(candidate)
+            self._persist_or_verify_successor(
+                predecessor=predecessor,
+                plan=plan,
+                deployment=deployment,
+                publications=publications,
+            )
+            runtime = self._open_runtime(plan, resolve_external_checker=True)
+        try:
+            return runtime.run(
+                workload_run_key=plan.workload_run_key,
+                synchronize=self._lock,
+            )
+        finally:
+            with self._lock():
+                self._close_runtime()
+                OUT_VOLUME.commit()
+
     @modal.exit()
     def exit(self) -> None:
         """Persist pending workflow state without cancelling child calls."""
@@ -300,6 +378,104 @@ class ExecutionCoordinator:
         )
         self._runtime = runtime
         return runtime
+
+    def _load_successor_source(
+        self,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity,
+    ) -> tuple[
+        ExecutionRunRecord,
+        WorkflowCoordinatorPlan,
+        tuple[tuple[str, AppRunResult, tuple[WorkflowArtifact, ...]], ...],
+    ]:
+        store = WorkflowRunStore(
+            Path(CONF.output_volume_mountpoint),
+            predecessor_execution_run_id,
+        )
+        if not store.ledger_path.is_file():
+            raise ExecutionRunNotFoundError(str(predecessor_execution_run_id))
+        try:
+            predecessor = store.execution.validate_successor_source(
+                predecessor_execution_run_id
+            )
+            if predecessor.deployment != predecessor_deployment:
+                raise ValueError(
+                    "Predecessor Deployment Identity does not match Execution Run"
+                )
+            plan = _decode_plan(store.read_workflow_plan())
+            persisted_plan = execution_plan(
+                plan.workflow.validate(),
+                workload_run_key=plan.workload_run_key,
+            )
+            if persisted_plan != predecessor.plan:
+                raise ValueError(
+                    "Predecessor workflow plan does not match its Execution Run"
+                )
+            publications = []
+            for node in store.execution.list_nodes(predecessor_execution_run_id):
+                if node.status != NodeStatus.SUCCEEDED:
+                    continue
+                result = store.artifacts.load_node_result(node.node_key)
+                if result is None:
+                    continue
+                publications.append((
+                    node.node_key,
+                    result,
+                    store.artifacts.load_node_output_artifacts(node.node_key),
+                ))
+            return predecessor, plan, tuple(publications)
+        finally:
+            store.close()
+
+    def _persist_or_verify_successor(
+        self,
+        *,
+        predecessor: ExecutionRunRecord,
+        plan: WorkflowCoordinatorPlan,
+        deployment: DeploymentIdentity,
+        publications: tuple[
+            tuple[str, AppRunResult, tuple[WorkflowArtifact, ...]], ...
+        ],
+    ) -> None:
+        execution_run_id, _ = self._identity()
+        store = self._run_store()
+        try:
+            with store.transaction():
+                try:
+                    existing = store.execution.get_run(execution_run_id)
+                except ExecutionRunNotFoundError:
+                    existing = store.execution.create_run(
+                        execution_run_id=execution_run_id,
+                        predecessor_execution_run_id=(predecessor.execution_run_id),
+                        plan=predecessor.plan,
+                        deployment=deployment,
+                        max_active_provider_calls=plan.max_active_provider_calls,
+                        max_active_gpu_provider_calls=plan.effective_gpu_limit,
+                        now=int(time.time()),
+                    )
+                    for node_key, result, artifacts in publications:
+                        store.artifacts.record_node_publication(
+                            node_key,
+                            result=result,
+                            artifacts=artifacts,
+                            now=int(time.time()),
+                        )
+                if (
+                    existing.predecessor_execution_run_id
+                    != predecessor.execution_run_id
+                    or existing.plan != predecessor.plan
+                    or existing.deployment != deployment
+                    or existing.max_active_provider_calls
+                    != plan.max_active_provider_calls
+                    or existing.max_active_gpu_provider_calls
+                    != plan.effective_gpu_limit
+                ):
+                    raise ValueError(
+                        "Persisted successor does not match restart request"
+                    )
+        finally:
+            store.close()
+        OUT_VOLUME.commit()
 
     def _modal_driver(self) -> ModalCallDriver:
         handles = getattr(self, "_development_function_handles", None)

@@ -76,7 +76,7 @@ class JobStateResolutionError(RuntimeError):
 
 
 class JobState(StrEnum):
-    """Durable provider-neutral job states."""
+    """Browser-facing state projected from execution and result delivery."""
 
     QUEUED = "queued"
     RUNNING = "running"
@@ -99,7 +99,7 @@ class JobStateUnknownReason(StrEnum):
 
 
 class JobOperationState(StrEnum):
-    """Durable state of one operation used to advance a Job."""
+    """Browser-facing operation state projected from kernel records."""
 
     SUBMITTING = "submitting"
     RUNNING = "running"
@@ -335,7 +335,7 @@ class JobStageRecord:
 
 @dataclass(frozen=True, slots=True)
 class JobOperationRecord:
-    """One durable remote or local operation in a Job graph."""
+    """One projected remote or local operation in a Job graph."""
 
     job_id: UUID
     operation: str

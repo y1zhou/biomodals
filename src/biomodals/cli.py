@@ -517,8 +517,6 @@ def run_modal_app(
 
     Use with: `biomodals app run <app-name> [OPTIONS] -- [app-options]`.
     """
-    # TODO(workflows): add workflow run semantics separately from Modal app runs
-    # so workflow-* names can stage workflow inputs before invoking orchestrators.
     import os
 
     app = _load_entry("app", app_name_or_path)

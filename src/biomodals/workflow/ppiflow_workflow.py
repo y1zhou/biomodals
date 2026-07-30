@@ -4603,8 +4603,8 @@ def submit_ppiflow_workflow(
             Modal function call id for asynchronous collection.
         max_parallel: Maximum number of active provider calls in the Execution
             Run. The configured candidate concurrency may lower this value.
-        max_child_calls: Additional compatibility cap for PPIFlow stages that
-            have not yet moved their internal fan-out into kernel Tasks.
+        max_child_calls: Compatibility cap applied to stage fan-out settings
+            and the Run-level active Provider Call limit.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced app-owned volume artifacts
             before reusing completed workflow nodes.

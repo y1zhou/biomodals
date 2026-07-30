@@ -17,7 +17,7 @@ The target is one place to reason about:
 - safe submission, attachment, polling, cancellation, and recovery;
 - cache observations and the decision to reuse or compute;
 - input preparation and output collection boundaries;
-- batching and run-level resource budgets;
+- batching and Run-level total/GPU Provider Call limits;
 - reusable direct-fan-out and SQLite-backed pull worker-pool dispatch.
 
 It is not one place to encode every workload's scientific semantics or persist
@@ -42,7 +42,8 @@ In particular:
    outcome-unknown record.
 5. A successful call is not terminally committed before its decoded result and
    workload publication are durably recoverable.
-6. Parallel tasks run when their dependencies and resource budget allow it.
+6. Parallel tasks run when their dependencies and Provider Call slots allow
+   it.
 7. One provider call may represent a batch of independently identified tasks.
 8. Several provider calls may claim work from one SQLite-backed Dispatch Batch
    without opening or writing the repository themselves.
@@ -92,7 +93,8 @@ These existing decisions remain binding during the refactor:
 - A successor requires the same Workload Plan Fingerprint over normalized
   result-affecting inputs and declared scientific versions. Changed science
   requires a new root Run.
-- Workflow node parallelism and child-call task budgets are different limits.
+- Workflow Node parallelism and Run-level Provider Call limits are different
+  controls.
 - AlphaFold3 raw searches, assemblies, templates, and seeds retain their
   current identities and Volume layouts.
 - GROMACS continues to call the deployed app's established functions. The
@@ -282,7 +284,7 @@ The kernel uses exactly nine Run statuses:
 | Status | Terminal | Meaning |
 | --- | --- | --- |
 | `pending` | No | The immutable plan is persisted and no Task has been dispatched |
-| `running` | No | The DAG is advancing or waiting on dependencies, permits, publications, or attached calls |
+| `running` | No | The DAG is advancing or waiting on dependencies, call slots, publications, or attached calls |
 | `cancel_requested` | No | Explicit cancellation is durable and attached work is being reconciled |
 | `suspended` | No | A coordinator error or unknown result validation stopped admission until explicit resume |
 | `state_unknown` | No | Provider submission, call state, or cancellation outcome cannot be established; replacement is forbidden |
@@ -531,7 +533,7 @@ fingerprinting Tasks.
 | Dispatch | Durable batches, direct fan-out, pull claims, worker-call tracking, returned outcome routing | Task payloads and batch compatibility |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
 | Batching | Mapping Tasks to call batches and distributing outcomes | Batch compatibility and workload-specific limits |
-| Resources | Coordinator-scoped run budget and persisted permit accounting | Service admission, Modal resources, deployment limits, cross-coordinator policy |
+| Resources | Run-scoped total and GPU Provider Call admission counts | Service admission, Modal decorators, deployment limits, cross-coordinator policy |
 | Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
 | Presentation | Stable snapshots/events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
 
@@ -557,7 +559,7 @@ src/biomodals/execution/
     scheduler.py          # ready-node/task selection
     submission.py         # paid-call lifecycle
     batching.py           # task-to-call grouping
-    resources.py          # budgets and permit accounting
+    resources.py          # total and GPU Provider Call admission limits
 ```
 
 The initial internal interface should be no larger than:
@@ -751,11 +753,12 @@ A graceful interruption handler performs best-effort draining:
 4. leave attached child Provider Calls running;
 5. exit without projecting the Run as cancelled.
 
-A replacement Attempt reloads the latest durable repository, reconstructs
-active permits and batches, resolves attached calls by ID, and resumes
-observation. Correctness must also survive a hard kill before the handler runs
-or finishes. Lifecycle hooks and background Volume commits reduce lost
-progress but are not correctness boundaries.
+A replacement Attempt reloads the latest durable repository, derives active
+total and GPU call counts from nonterminal Provider Calls, reconstructs
+batches, resolves attached calls by ID, and resumes observation. Correctness
+must also survive a hard kill before the handler runs or finishes. Lifecycle
+hooks and background Volume commits reduce lost progress but are not
+correctness boundaries.
 
 For a Volume-backed repository, a local SQLite commit is not sufficient when
 ordering state against a provider side effect. Required preclaims and call
@@ -800,10 +803,10 @@ Worker recovery is driven by provider-call state and publication validation,
 not elapsed time:
 
 - preemption or a rescheduled container retains the same Provider Call, Task,
-  permit allocation, and Worker Assignment;
+  active call slot, and Worker Assignment;
 - a normal result may carry independent per-Task outcomes for a batch;
 - a conclusive terminal call failure fails its unfinished Tasks and releases
-  their permits;
+  its total and optional GPU call slots;
 - a successful call with a missing or invalid expected publication fails the
   affected Task;
 - unknown call state preserves `state_unknown` and forbids replacement work.
@@ -815,7 +818,7 @@ operation, the coordinator:
 
 1. returns an existing result if `request_id` was already processed;
 2. selects ready Tasks that fit the worker's capacity;
-3. records their Worker Assignments and permit allocation;
+3. records their Worker Assignments against the already-admitted worker call;
 4. commits SQLite and crosses the explicit Volume durability boundary;
 5. only then returns the Task payloads.
 
@@ -827,10 +830,10 @@ retains its work. A conclusively failed owner call fails its unfinished Tasks;
 no different Provider Call may claim them in the same Execution Run.
 
 Workers publish their outputs before sending an idempotent completion report.
-The coordinator records individual Task outcomes and releases permits in one
-serialized transaction. A lost completion response is harmless, and
-publication validation reconciles output that became durable before its
-completion report.
+The coordinator records individual Task outcomes in one serialized
+transaction. The worker call retains its single active slot until that call
+becomes terminal. A lost completion response is harmless, and publication
+validation reconciles output that became durable before its completion report.
 
 Provider redelivery is not a second kernel submission. A claim request may
 repeat automatically before or after a Worker Assignment is committed, and
@@ -847,7 +850,7 @@ Workload Publication before creating Tasks. Satisfied work remains complete;
 missing work becomes eligible only when the predecessor Provider Call or
 Worker Assignment is conclusively terminal. Active or unknown predecessor
 ownership blocks replacement work. The successor copies no mutable Task,
-assignment, call, or permit state.
+assignment, or call state.
 
 An exit hook may commit workload checkpoints and emit an advisory
 `interrupted` event containing the call, slot, and Task IDs. The coordinator
@@ -885,7 +888,8 @@ work:
 - Node result observation timestamps and cache-versus-current-Run completion
   provenance, without workload publication contents;
 - execution timestamps, Run `status_reason` and `status_message`, Task and Node
-  errors, single-submission state, and resource permits;
+  errors, single-submission state, Run call limits, and each call's GPU
+  classification;
 - workload execution payloads required to reconstruct a Task.
 
 They must not store:
@@ -945,24 +949,37 @@ it is disposable and never becomes a second authority.
 
 ### Resource ownership
 
-The first kernel manages resources only inside one Execution Run owned by one
-coordinator. Its SQLite state records:
+The first kernel has exactly two remote-admission limits inside one Execution
+Run:
 
-- the resolved Run-Level Task Budget;
-- permit cost for an admitted Task or Provider Call batch;
-- active permit allocations tied to Tasks and Provider Calls;
-- release or recovery of allocations when calls become terminal or unknown.
+- `max_active_provider_calls`: a positive ceiling on all nonterminal Provider
+  Calls;
+- `max_active_gpu_provider_calls`: a nonnegative ceiling on the subset bound
+  to functions with a GPU allocation, no greater than the total ceiling.
 
-Permit allocation is atomic with the transition that admits work, so a
-coordinator restart can reconstruct the active count from durable execution
-rows. Batching policy decides whether permits account for a container, a Task,
-or another workload-defined unit, but the meaning is fixed in the immutable
-Task plan before submission.
+The resolved provider binding declares `uses_gpu: bool`, which is persisted on
+the Provider Call and excluded from scientific fingerprints. The kernel does
+not inspect Modal decorators. Under the serialized writer, submission preclaim
+atomically counts nonterminal calls, checks the total and optional GPU ceiling,
+and creates the `submitting` call only when both slots are available.
+
+Every nonterminal Provider Call consumes exactly one total slot. A GPU call
+also consumes exactly one GPU slot. `submitting`, `outcome_unknown`, and
+`state_unknown` retain those slots because a container may exist. A terminal
+call releases its slots automatically by leaving the derived active count;
+there is no allocation table or variable permit cost.
+
+A call that owns a batch of Tasks still consumes one slot, and each pull
+worker call consumes one slot regardless of how many Tasks it claims. Local
+coordinator work consumes none. These limits bound in-flight remote calls and
+conservatively approximate container fan-out. Modal may pack concurrent calls
+into fewer containers, and its decorators remain authoritative for CPU, RAM,
+accelerator type, GPU device count, timeout, and deployment container limits.
 
 The kernel does not own:
 
 - per-user, per-tool, or service-wide active-Job admission limits;
-- the administrator settings from which a service resolves a Run budget;
+- the administrator settings from which a service resolves Run call limits;
 - Modal CPU, GPU, memory, timeout, accelerator, or deployment concurrency;
 - limits shared across different coordinators or Execution Runs.
 
@@ -1136,7 +1153,7 @@ Nodes declare one of three workload-selected aggregation policies:
   siblings become `skipped`, already-owned Tasks continue without
   cancellation, and the Node becomes `failed` after every owner is
   conclusive;
-- `collect_all`: admit every Task subject to resource budgets; all successes
+- `collect_all`: admit every Task subject to Provider Call limits; all successes
   produce `succeeded`, while any failure produces `failed`;
 - `allow_partial`: admit every Task; all successes produce `succeeded`, some
   successes and some failures produce `partial`, and no successes produce
@@ -1250,7 +1267,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | A crash after durable claim but before attachment does not submit replacement work |
 | `tests/workflow/test_runtime.py` | A recorded call ID is resolved and collected instead of resubmitted |
 | `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
-| `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover their permits |
+| `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover total and GPU active-call counts |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
 | `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner failure without same-run reassignment, and unknown-owner blocking |
@@ -1263,6 +1280,7 @@ Phase 0 test inventory:
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
 | `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; no owner is admitted before host durability; recovery reloads persisted fingerprints without polling-time recomputation |
+| `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; terminal calls release them |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1383,15 +1401,16 @@ Rollback:
 
 - revert the kernel commits; no host schema or runtime path has changed.
 
-### Phase 4 — add dispatch, budgets, and remote coordination
+### Phase 4 — add dispatch, call limits, and remote coordination
 
 Deliverables:
 
 - add Dispatch Batches, Worker Assignments, idempotent claim requests, and
   explicit Task-to-call or Task-to-assignment links;
-- move bounded batching and permit accounting into execution internals;
-- persist coordinator-scoped permit allocations and recovery without adding a
-  distributed lease abstraction;
+- enforce total and GPU Provider Call ceilings atomically at submission
+  preclaim;
+- derive active call-slot counts from nonterminal Provider Calls without an
+  allocation table or distributed lease abstraction;
 - add reusable sync and async coordinator loops;
 - add the run-scoped Modal coordinator binding with one-container routing,
   serialized SQLite and Volume checkpoints, detached execution, lifecycle
@@ -1404,7 +1423,8 @@ Exit gate:
 - direct, batched, and pull-worker fake workloads obey the same
   single-submission rule;
 - lost claim and completion responses replay idempotently;
-- resource tests prove that one call batch consumes the intended permits;
+- resource tests prove that every active call consumes one total slot and GPU
+  calls also consume one GPU slot, independent of Task batch size;
 - remote-coordinator assumptions pass a manual Modal smoke test before host
   adoption.
 
@@ -1481,8 +1501,8 @@ Deliverables:
   durable candidate scheduling;
 - represent per-candidate outcomes and configured aggregation policy without
   inferring Node success from a partial batch;
-- apply the existing run-level concurrency configuration through kernel
-  permits;
+- map the existing run-level concurrency configuration to total and GPU
+  Provider Call limits;
 - reuse validated candidate publications after interruption or in a Successor
   Execution Run.
 
@@ -1678,7 +1698,7 @@ Rollback: revert the commit; it has no schema effect.
 | Batching | Call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
 | Dispatch | Direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
-| Resources | Node parallelism independent from Task permits, batched permit accounting, no permit leak on failure |
+| Resources | Node parallelism independent from total/GPU call slots, one slot per active call, conservative unknown-state retention |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
 | Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, coordinator resume, and successor restart behavior |
 | PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, and successor publication reuse |
@@ -1712,7 +1732,7 @@ authorized smoke test after local and CI gates pass.
 | One Volume couples unrelated app ledgers | Store app ledgers in deployment-specific Volumes and reserve a kernel-owned path namespace |
 | A workload name collides with execution state | Generate an opaque Execution Run ID and keep workload keys only in immutable plan input |
 | CLI identity flags are treated as authority | Verify Deployment Identity and Execution Run ID against the ledger before observing or mutating state |
-| Resource limits are mistaken for Modal decorators | Separate operational requirements from run-level permit accounting |
+| Call limits are mistaken for Modal resource decorators | Document call-count ceilings as conservative fan-out controls; decorators remain authoritative for actual resources and container packing |
 | One ledger becomes a cross-context bottleneck | Embed the same execution tables into coordinator-owned databases |
 | Refactor changes scientific or user-visible behavior accidentally | Scientific, cost-safety, CLI-operation, and result regression tests |
 
@@ -1759,10 +1779,11 @@ after each decision:
    one-way Execution Run ID and service-owned metadata but no duplicate compute
    state. `JobState`, timelines, filters, limits, and counts derive from
    execution rows.
-6. **Resource scope — accepted 2026-07-29**: the kernel persists permit
-   accounting only within one Execution Run and coordinator. Service admission
-   and Modal resources remain with their current owners; no distributed lease
-   interface is added without a concrete cross-coordinator requirement.
+6. **Resource scope — accepted and refined 2026-07-30**: the kernel enforces
+   total and GPU-subset Provider Call ceilings only within one Execution Run
+   and coordinator. Service admission and Modal resources remain with their
+   current owners; no distributed lease interface is added without a concrete
+   cross-coordinator requirement.
 7. **State transition — accepted 2026-07-29**: preserve service-owned users,
    authentication, and administrator configuration; recreate Service Job and
    execution state without old Job history; reject and restart old workflow
@@ -1779,7 +1800,8 @@ after each decision:
 10. **Coordinator interruption — accepted 2026-07-29**: preemption suspends
     scheduling without cancelling child calls. A Coordinator Attempt drains
     and checkpoints best-effort, correctness survives hard interruption, and
-    a replacement recovers attached calls and permits from durable state.
+    a replacement recovers attached calls and derives active total/GPU counts
+    from durable state.
 11. **Single-writer topology — accepted 2026-07-29**: a Volume-backed remote
     coordinator is parameterized by Execution Run ID and pinned deployment
     version. Its provider pool is capped at one container, and concurrent
@@ -2040,6 +2062,15 @@ after each decision:
     load the stored digest. Successor reuse also requires publication
     validation. There is no pluggable codec, hash registry, or large-file
     hashing in the kernel.
+50. **Total and GPU Provider Call limits — accepted 2026-07-30**: each Run
+    stores `max_active_provider_calls` and
+    `max_active_gpu_provider_calls`. Every nonterminal call consumes one total
+    slot; a call whose resolved binding declares `uses_gpu` also consumes one
+    GPU slot. Preclaim checks both derived counts atomically. Unknown calls
+    retain slots and terminal calls release them. Batches and pull workers cost
+    one slot per Provider Call; local work costs none. The kernel has no
+    variable permit cost or resource vector and does not model Modal decorator
+    resources or actual container packing.
 
 ## Definition of ready for implementation
 

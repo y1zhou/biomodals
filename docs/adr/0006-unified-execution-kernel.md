@@ -4,7 +4,7 @@ Status: accepted.
 
 Biomodals should introduce a provider-aware execution kernel under
 `biomodals.execution` for DAG traversal, task readiness, paid-call attachment
-and recovery, cache-observation policy, batching, and resource budgets. The
+and recovery, cache-observation policy, batching, and Provider Call limits. The
 kernel should embed its execution tables into host-owned databases without
 replacing `ServiceStore` domain state, workflow artifact records, or
 AlphaFold3's claims and publications. A service Job remains the user-facing
@@ -241,8 +241,8 @@ The Node aggregation policy was accepted on 2026-07-29. Every Node declares
 exactly one of `fail_fast`, `collect_all`, or `allow_partial`. On the first
 Task failure, `fail_fast` stops admitting pending siblings, marks unowned
 siblings `skipped`, lets already-owned work finish without cancellation, and
-then fails the Node. `collect_all` admits every Task subject to resource
-budgets and fails the Node if any Task fails. `allow_partial` also admits every
+then fails the Node. `collect_all` admits every Task subject to Provider Call
+limits and fails the Node if any Task fails. `allow_partial` also admits every
 Task: all successes produce `succeeded`, a mixture of successes and failures
 produces `partial`, and no successes produces `failed`. Cache-validated Tasks
 count as successes. Explicit Run cancellation and result pruning take
@@ -414,11 +414,28 @@ ownership. Provider resolution and input preparation happen before preclaim.
 Retrying failed Tasks requires a Successor Execution Run.
 
 The resource scope was accepted on 2026-07-29. The first kernel persists and
-enforces Task and Provider Call permits within one Execution Run and
+enforces Provider Call admission limits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal
 CPU, GPU, memory, timeout, and deployment limits remain workload-owned.
 Cross-coordinator and cross-run global enforcement, including a shared-lease
 interface, is deferred until a concrete requirement exists.
+
+The concrete call-limit policy was accepted on 2026-07-30. Each Run stores
+`max_active_provider_calls` and `max_active_gpu_provider_calls`, with the GPU
+limit nonnegative and no greater than the positive total limit. A workload's
+resolved provider binding declares whether its target function has a GPU
+allocation; the kernel persists that boolean on the Provider Call but does not
+inspect or reproduce Modal decorators. Every nonterminal call consumes one
+total slot, and a GPU call also consumes one GPU slot. The serialized preclaim
+checks both counts atomically before creating `submitting`; terminal status
+releases the slot by removing the call from the derived active count.
+`outcome_unknown` and `state_unknown` retain their slots conservatively. A
+single call containing many Tasks and each pull-worker call consume one slot;
+local work consumes none. The kernel stores no variable permit cost, named
+resource pool, or allocation table. These operational limits are excluded
+from scientific fingerprints and conservatively bound in-flight remote calls,
+not actual Modal container packing or CPU, RAM, accelerator type, or GPU
+device count.
 
 The state-transition policy was accepted on 2026-07-29. The service preserves
 users, authentication data, and administrator configuration while recreating
@@ -443,8 +460,8 @@ one Coordinator Attempt but does not cancel its Execution Runs or attached
 child Provider Calls. The Attempt stops admitting work and checkpoints
 best-effort during graceful shutdown; correctness also survives a hard kill
 from the last durable checkpoint. A replacement Attempt reloads execution
-state, reconstructs permits, and resolves attached calls by ID. Only an
-explicit user cancellation authorizes cancelling child calls.
+state, reconstructs active call-slot counts, and resolves attached calls by
+ID. Only an explicit user cancellation authorizes cancelling child calls.
 
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by
@@ -483,9 +500,10 @@ the same provider input. Pull workers use stable, idempotent claim request IDs.
 The coordinator transactionally records an assignment, crosses the Volume
 durability boundary, and only then returns its Task payload; a repeated request
 returns the same assignment. A conclusively failed owner call fails its
-unfinished Tasks and releases their permits, but no other call may claim those
-Tasks in the same Execution Run. Lifecycle exit hooks may checkpoint work or
-emit diagnostics, but they never authorize reassignment.
+unfinished Tasks and releases its active call slot by becoming terminal, but
+no other call may claim those Tasks in the same Execution Run. Lifecycle exit
+hooks may checkpoint work or emit diagnostics, but they never authorize
+reassignment.
 
 The single-submission policy superseded the earlier attempt-based retry policy
 on 2026-07-29. The kernel stores no Task Attempt identity or counter. Within

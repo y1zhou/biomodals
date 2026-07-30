@@ -880,18 +880,24 @@ class SqliteExecutionRepository:
         submission_token: str,
         binding: ProviderBinding,
         compatibility_key: str,
+        max_tasks_per_call: int = 1,
         now: int,
     ) -> ProviderCallPreclaim | None:
         """Atomically own one fixed Task batch and reserve one call slot."""
         if not submission_token:
             raise ValueError("submission token cannot be empty")
+        if max_tasks_per_call <= 0:
+            raise ValueError("max_tasks_per_call must be positive")
         if not task_keys:
             raise ValueError("fixed Provider Call batch cannot be empty")
+        if len(task_keys) > max_tasks_per_call:
+            raise ValueError("fixed Provider Call batch exceeds max_tasks_per_call")
         if len(task_keys) != len(set(task_keys)):
             raise ValueError("fixed Provider Call batch contains duplicate Tasks")
         preclaim_json = _dump_json({
             "binding": _binding_json_value(binding),
             "compatibility_key": compatibility_key,
+            "max_tasks_per_call": max_tasks_per_call,
             "node_key": node_key,
             "task_keys": task_keys,
         })

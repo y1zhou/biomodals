@@ -69,6 +69,7 @@ def _candidate(task_index: int = 0) -> ProviderCallCandidate:
         compatibility_key="af3",
         depth=0,
         unblocking_span=0,
+        max_tasks_per_call=1,
     )
 
 

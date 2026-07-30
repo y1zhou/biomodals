@@ -1,7 +1,10 @@
-"""Pure fixed-batch construction tests."""
+"""Fixed-batch construction and policy persistence tests."""
 
-# ruff: noqa: D103
+# ruff: noqa: D103, S106
 
+import sqlite3
+
+import orjson
 import pytest
 
 from biomodals.execution import ProviderBinding
@@ -11,6 +14,8 @@ from biomodals.execution.scheduler import (
     form_fixed_batches,
     form_pull_worker_candidates,
 )
+
+from .provider_call_helpers import RUN_ID, create_repository
 
 GPU = ProviderBinding(
     "production",
@@ -66,13 +71,14 @@ def test_fixed_batches_preserve_compatibility_and_encounter_order() -> None:
             batch.compatibility_key,
             batch.task_keys,
             batch.task_ordinal,
+            batch.max_tasks_per_call,
         )
         for batch in batches
     ] == [
-        ("run_inference", "same-model", ("seed-0", "seed-2"), 0),
-        ("run_inference", "same-model", ("seed-3",), 3),
-        ("run_inference", "other-model", ("seed-1",), 1),
-        ("run_search", "same-model", ("search-0",), 4),
+        ("run_inference", "same-model", ("seed-0", "seed-2"), 0, 2),
+        ("run_inference", "same-model", ("seed-3",), 3, 2),
+        ("run_inference", "other-model", ("seed-1",), 1, 2),
+        ("run_search", "same-model", ("search-0",), 4, 2),
     ]
 
 
@@ -97,6 +103,60 @@ def test_fixed_batches_never_span_nodes() -> None:
 def test_fixed_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError, match="max_tasks_per_call must be positive"):
         form_fixed_batches((_task("seed-0", 0, max_tasks_per_call=0),))
+
+
+def test_fixed_batch_policy_is_durable_and_immutable_within_a_run() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=3)
+
+    with pytest.raises(
+        ValueError,
+        match="fixed Provider Call batch exceeds max_tasks_per_call",
+    ):
+        repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            ("seed-0", "seed-1"),
+            submission_token="oversized",
+            binding=GPU,
+            compatibility_key="same-model",
+            max_tasks_per_call=1,
+            now=110,
+        )
+
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0", "seed-1"),
+        submission_token="batch",
+        binding=GPU,
+        compatibility_key="same-model",
+        max_tasks_per_call=2,
+        now=111,
+    )
+
+    assert claim is not None
+    policy_json = connection.execute(
+        """
+        SELECT policy_json
+        FROM execution_dispatch_batches
+        WHERE dispatch_batch_id = ?
+        """,
+        (str(claim.call.dispatch_batch_id),),
+    ).fetchone()[0]
+    assert orjson.loads(policy_json)["max_tasks_per_call"] == 2
+
+    with pytest.raises(ValueError, match="different work"):
+        repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            ("seed-0", "seed-1"),
+            submission_token="batch",
+            binding=GPU,
+            compatibility_key="same-model",
+            max_tasks_per_call=3,
+            now=112,
+        )
 
 
 def test_pull_worker_candidates_fill_the_derived_pool_gap() -> None:

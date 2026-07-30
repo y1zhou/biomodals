@@ -95,6 +95,8 @@ class ExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
+        if candidate.max_tasks_per_call is None:
+            raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
         function = self._resolve_provider(
             execution_run_id,
             candidate.binding,
@@ -136,6 +138,8 @@ class ExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Preclaim and spawn once using an already hydrated exact binding."""
+        if candidate.max_tasks_per_call is None:
+            raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
         preclaim = self.repository.preclaim_fixed_batch(
             execution_run_id,
             candidate.node_key,
@@ -143,6 +147,7 @@ class ExecutionRuntime:
             submission_token=submission_token,
             binding=candidate.binding,
             compatibility_key=candidate.compatibility_key,
+            max_tasks_per_call=candidate.max_tasks_per_call,
             now=now,
         )
         if preclaim is None:
@@ -485,6 +490,8 @@ class AsyncExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
+        if candidate.max_tasks_per_call is None:
+            raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
         function = await self._resolve_provider(
             execution_run_id,
             candidate.binding,
@@ -499,6 +506,7 @@ class AsyncExecutionRuntime:
             submission_token=submission_token,
             binding=candidate.binding,
             compatibility_key=candidate.compatibility_key,
+            max_tasks_per_call=candidate.max_tasks_per_call,
             now=now,
         )
         if preclaim is None:

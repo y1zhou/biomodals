@@ -67,6 +67,7 @@ class ProviderCallCandidate:
     compatibility_key: str
     depth: int
     unblocking_span: int
+    max_tasks_per_call: int | None = None
 
 
 def required_node_ranks(
@@ -164,6 +165,7 @@ def form_fixed_batches(
                     compatibility_key=first.compatibility_key,
                     depth=first.depth,
                     unblocking_span=first.unblocking_span,
+                    max_tasks_per_call=batch_size,
                 )
             )
     return tuple(candidates)

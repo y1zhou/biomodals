@@ -7,8 +7,10 @@ from uuid import UUID
 import pytest
 
 from biomodals.service.gromacs.plan import (
+    PREPARE_RESULT,
     REQUIRED_FUNCTIONS,
     all_operations_completed,
+    execution_plan,
     modal_invocation,
     operation_dependencies,
     ready_operations,
@@ -106,3 +108,55 @@ def test_invocations_reproduce_the_established_modal_function_contract() -> None
         "run_name": "simulation-1",
         "save_processed_traj": True,
     }
+
+
+def test_execution_plan_preserves_parallel_gromacs_dag() -> None:
+    plan = execution_plan(
+        cpu_only=False,
+        workload_run_key="protein-md-1234",
+        pdb_sha256="abc123",
+        simulation_time_ns=20,
+        run_pdbfixer=True,
+    )
+
+    assert plan.workload_name == "gromacs"
+    assert plan.workload_run_key == "protein-md-1234"
+    assert plan.node_keys == (
+        "prepare_tpr_gpu",
+        "collect_traj_stats:nvt_",
+        "collect_traj_stats:npt_",
+        "production_run_gpu",
+        "collect_traj_stats:production_",
+        PREPARE_RESULT,
+    )
+    assert {dependency.node_key for dependency in plan.nodes[-1].dependencies} == {
+        "collect_traj_stats:nvt_",
+        "collect_traj_stats:npt_",
+        "collect_traj_stats:production_",
+    }
+    assert plan.terminal_node_keys == (PREPARE_RESULT,)
+    assert plan.scientific_payload == {
+        "cpu_only": False,
+        "pdb_sha256": "abc123",
+        "run_pdbfixer": True,
+        "simulation_time_ns": 20,
+    }
+
+
+def test_execution_plan_fingerprint_excludes_workload_run_name() -> None:
+    first = execution_plan(
+        cpu_only=True,
+        workload_run_key="first-name",
+        pdb_sha256="abc123",
+        simulation_time_ns=5,
+        run_pdbfixer=False,
+    )
+    second = execution_plan(
+        cpu_only=True,
+        workload_run_key="another-name",
+        pdb_sha256="abc123",
+        simulation_time_ns=5,
+        run_pdbfixer=False,
+    )
+
+    assert first.workload_plan_fingerprint == second.workload_plan_fingerprint

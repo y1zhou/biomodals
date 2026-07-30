@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
 from biomodals.service.store import JobOperationRecord, JobOperationState
 
 NVT_ANALYSIS = "collect_traj_stats:nvt_"
 NPT_ANALYSIS = "collect_traj_stats:npt_"
 PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
 FINAL_OPERATION = PRODUCTION_ANALYSIS
+PREPARE_RESULT = "prepare_result"
 REQUIRED_FUNCTIONS = (
     "prepare_tpr_cpu",
     "prepare_tpr_gpu",
@@ -18,6 +20,7 @@ REQUIRED_FUNCTIONS = (
     "production_run_cpu",
     "production_run_gpu",
 )
+_EXECUTION_PLAN_SCHEMA_VERSION = "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,54 @@ def _operation_plan(*, cpu_only: bool) -> tuple[PlannedOperation, ...]:
             "production_",
             save_processed_traj=True,
         ),
+    )
+
+
+def execution_plan(
+    *,
+    cpu_only: bool,
+    workload_run_key: str,
+    pdb_sha256: str,
+    simulation_time_ns: int,
+    run_pdbfixer: bool,
+) -> ExecutionPlan:
+    """Express the established service workflow as one immutable kernel plan."""
+    operations = _operation_plan(cpu_only=cpu_only)
+    analysis_nodes = (
+        NVT_ANALYSIS,
+        NPT_ANALYSIS,
+        PRODUCTION_ANALYSIS,
+    )
+    nodes = tuple(
+        NodePlan(
+            node_key=operation.operation,
+            dependencies=tuple(
+                NodeDependency(node_key=dependency)
+                for dependency in operation.dependencies
+            ),
+        )
+        for operation in operations
+    ) + (
+        NodePlan(
+            node_key=PREPARE_RESULT,
+            dependencies=tuple(
+                NodeDependency(node_key=dependency) for dependency in analysis_nodes
+            ),
+        ),
+    )
+    return ExecutionPlan(
+        workload_name="gromacs",
+        workload_run_key=workload_run_key,
+        nodes=nodes,
+        scientific_payload={
+            "cpu_only": cpu_only,
+            "pdb_sha256": pdb_sha256,
+            "run_pdbfixer": run_pdbfixer,
+            "simulation_time_ns": simulation_time_ns,
+        },
+        scientific_versions={
+            "biomodals.gromacs.execution_plan": _EXECUTION_PLAN_SCHEMA_VERSION,
+        },
     )
 
 

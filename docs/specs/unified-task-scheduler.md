@@ -2,7 +2,7 @@
 
 # Unified task scheduler refactor plan
 
-Status: accepted architecture; execution topology under review.
+Status: accepted; ready for implementation.
 
 This plan consolidates the execution and recovery findings from the API
 service, reusable workflow runtime, PPIFlow fan-out, and AlphaFold3 search and
@@ -2518,4 +2518,5 @@ Implementation begins only when:
   fault-injection points are enumerated as test cases;
 - the first two implementation commits have exact file and rollback scopes.
 
-Implementation remains paused until the remaining decision gates are resolved.
+The grilling session is complete. Implementation may proceed in the phased,
+incremental order above.

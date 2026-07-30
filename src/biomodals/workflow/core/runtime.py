@@ -707,6 +707,8 @@ class WorkflowRuntime:
             work_dir=work_dir,
             cache_dir=cache_dir,
             inputs=inputs,
+            volume_root=self.volume_root,
+            workflow_volume_name=self.workflow_volume_name,
         )
 
     def _checkpoint(self) -> SqliteExecutionRepository:

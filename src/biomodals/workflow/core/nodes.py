@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -22,6 +22,26 @@ class NodeRunContext:
     work_dir: Path
     cache_dir: Path
     inputs: dict[str, list[WorkflowArtifact]]
+    volume_root: Path | None = None
+    workflow_volume_name: str | None = None
+
+    def resolve_workflow_artifact(self, artifact: WorkflowArtifact) -> Path:
+        """Resolve one workflow-owned artifact without allowing path traversal."""
+        if self.volume_root is None or self.workflow_volume_name is None:
+            raise RuntimeError("Workflow volume context is unavailable")
+        if artifact.storage.volume_name != self.workflow_volume_name:
+            raise ValueError(
+                f"Artifact {artifact.artifact_id!r} is not stored in the "
+                "workflow volume"
+            )
+        relative = PurePosixPath(artifact.storage.path)
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ValueError("Workflow artifact path must be relative and contained")
+        path = self.volume_root.joinpath(*relative.parts).resolve()
+        path.relative_to(self.volume_root.resolve())
+        return path
 
 
 @dataclass(frozen=True)

@@ -54,7 +54,6 @@ from biomodals.app.fold.alphafold3.execution_publications import (
 )
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
-    load_execution_request,
     stage_execution_request,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
@@ -852,15 +851,14 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
+        candidate_request_bytes: bytes,
     ) -> ExecutionSnapshot:
         """Create a Successor Run while inferring predecessor identity."""
-        execution_run_id, _deployment = self._identity()
         return self._adapter().restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
-            candidate_request=load_execution_request(
-                Path(CONF.output_volume_mountpoint),
-                execution_run_id,
+            candidate_request=AlphaFold3ExecutionRequest.from_bytes(
+                candidate_request_bytes
             ),
         )
 
@@ -1078,17 +1076,17 @@ def submit_alphafold3_task(
         deployment_name,
         deployment_version,
     )
-    stage_execution_request(
-        CONF.output_volume,
-        execution_run_id,
-        request,
-    )
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
         use_deployed_coordinator=use_deployed_coordinator,
     )
     if restart_from is None:
+        stage_execution_request(
+            CONF.output_volume,
+            execution_run_id,
+            request,
+        )
         call = coordinator.run.spawn(
             development=not use_deployed_coordinator,
         )
@@ -1096,6 +1094,7 @@ def submit_alphafold3_task(
         predecessor_execution_run_id = UUID(restart_from)
         call = coordinator.restart_from.spawn(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
+            candidate_request_bytes=request.to_bytes(),
         )
     print(f"Execution Run ID: {execution_run_id}")
     print(

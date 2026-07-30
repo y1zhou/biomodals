@@ -6,6 +6,7 @@ import ast
 import inspect
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import orjson
@@ -585,7 +586,9 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
     monkeypatch.setattr(
         alphafold3_app,
         "stage_execution_request",
-        lambda output, run_id, request: None,
+        lambda output, run_id, request: pytest.fail(
+            "restart staged successor state before compatibility validation"
+        ),
     )
     monkeypatch.setattr(
         alphafold3_app,
@@ -621,19 +624,36 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
         restart_from=predecessor,
     )
 
-    assert captured["restart"] == {
-        "predecessor_execution_run_id": predecessor,
-    }
+    restart = cast(dict[str, object], captured["restart"])
+    assert restart["predecessor_execution_run_id"] == predecessor
+    candidate_bytes = restart["candidate_request_bytes"]
+    assert isinstance(candidate_bytes, bytes)
+    candidate = alphafold3_app.AlphaFold3ExecutionRequest.from_bytes(candidate_bytes)
+    assert candidate.config.name == "exact"
+    assert candidate.execution_plan.workload_plan_fingerprint
 
 
-def test_coordinator_launch_restart_forwards_the_staged_candidate(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The launch convenience validates the request staged for its new Run."""
+def test_coordinator_launch_restart_forwards_candidate_bytes() -> None:
+    """The launch convenience validates candidate bytes before staging state."""
     predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     successor = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-    candidate = object()
+    candidate = alphafold3_app.AlphaFold3ExecutionRequest.prepare(
+        AF3Config(
+            name="successor",
+            modelSeeds=[11],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(id="A", sequence="ACDE"),
+                )
+            ],
+        ),
+        search_msa=False,
+        search_protein_templates=False,
+        max_parallel_search_workers=2,
+        max_num_gpus=1,
+        recycle=1,
+        sample=1,
+    )
     captured: dict[str, object] = {}
 
     class Adapter:
@@ -641,22 +661,6 @@ def test_coordinator_launch_restart_forwards_the_staged_candidate(
             captured.update(kwargs)
             return "snapshot"
 
-    monkeypatch.setattr(
-        alphafold3_app.CONF,
-        "output_volume_mountpoint",
-        str(tmp_path),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "load_execution_request",
-        lambda root, execution_run_id: (
-            captured.update(
-                loaded_root=root,
-                loaded_execution_run_id=execution_run_id,
-            )
-            or candidate
-        ),
-    )
     raw_cls = alphafold3_app.ExecutionCoordinator._get_user_cls()
     instance = raw_cls()
     instance.execution_run_id = successor
@@ -666,12 +670,14 @@ def test_coordinator_launch_restart_forwards_the_staged_candidate(
     instance._coordinator_adapter = Adapter()
     instance._development = False
 
-    result = raw_cls.restart_from._get_raw_f()(instance, predecessor)
+    result = raw_cls.restart_from._get_raw_f()(
+        instance,
+        predecessor,
+        candidate.to_bytes(),
+    )
 
     assert result == "snapshot"
     assert captured == {
-        "loaded_root": tmp_path,
-        "loaded_execution_run_id": alphafold3_app.UUID(successor),
         "predecessor_execution_run_id": alphafold3_app.UUID(predecessor),
         "predecessor_deployment": None,
         "candidate_request": candidate,

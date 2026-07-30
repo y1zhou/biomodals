@@ -11,6 +11,7 @@ from biomodals.app.design import boltzgen_app
 from biomodals.app.design.boltzgen.execution_contracts import (
     acquire_output_claim,
     is_boltzgen_run_complete,
+    write_boltzgen_task_publication,
 )
 
 
@@ -69,11 +70,13 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
 
     monkeypatch.setattr(boltzgen_app, "run_command", fail)
     worker = boltzgen_app.run_boltzgen_task.get_raw_f()
+    task_fingerprint = "a" * 64
     with pytest.raises(RuntimeError, match="preempted"):
         worker(
             out_dir=str(out_dir),
             input_yaml_path=str(tmp_path / "input.yaml"),
             claim_owner="call-1",
+            task_fingerprint=task_fingerprint,
         )
 
     assert (out_dir / ".lock" / "owner").read_text() == "call-1"
@@ -89,6 +92,37 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
         out_dir=str(out_dir),
         input_yaml_path=str(tmp_path / "input.yaml"),
         claim_owner="call-1",
+        task_fingerprint=task_fingerprint,
     ) == str(out_dir)
-    assert is_boltzgen_run_complete(out_dir)
+    assert is_boltzgen_run_complete(
+        out_dir,
+        task_fingerprint=task_fingerprint,
+    )
+    assert not is_boltzgen_run_complete(
+        out_dir,
+        task_fingerprint="b" * 64,
+    )
     assert not (out_dir / ".lock").exists()
+
+
+def test_task_publication_rejects_corrupt_final_evidence(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    final_pdf = run_dir / "final_ranked_designs" / "results_overview.pdf"
+    final_pdf.parent.mkdir(parents=True)
+    final_pdf.write_bytes(b"pdf")
+    fingerprint = "a" * 64
+
+    write_boltzgen_task_publication(
+        run_dir,
+        task_fingerprint=fingerprint,
+    )
+
+    assert is_boltzgen_run_complete(
+        run_dir,
+        task_fingerprint=fingerprint,
+    )
+    final_pdf.write_bytes(b"corrupt")
+    assert not is_boltzgen_run_complete(
+        run_dir,
+        task_fingerprint=fingerprint,
+    )

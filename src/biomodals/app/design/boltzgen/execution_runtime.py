@@ -276,6 +276,7 @@ class BoltzGenExecutionRuntime:
                         self._task_observation(
                             node.node_key,
                             planned[task.task_key],
+                            task.fingerprint,
                         ),
                     ))
         if not task_observations:
@@ -308,16 +309,9 @@ class BoltzGenExecutionRuntime:
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         try:
             if node_key == DESIGN_RUNS_NODE:
-                available = all(
-                    is_boltzgen_run_complete(
-                        boltzgen_run_root(
-                            self.output_root,
-                            self.request.run_name,
-                            run_id,
-                        )
-                    )
-                    for run_id in self.request.run_ids
-                )
+                # This Node has no aggregate publication. Individual Task
+                # publications are validated after atomic Task discovery.
+                return AvailabilityStatus.MISSING
             elif node_key == COLLECT_RESULTS_NODE:
                 available = (
                     load_collection_publication(
@@ -336,6 +330,7 @@ class BoltzGenExecutionRuntime:
         self,
         node_key: str,
         item: _PlannedTask,
+        task_fingerprint: str,
     ) -> AvailabilityStatus:
         if node_key == DESIGN_RUNS_NODE:
             if item.run_id is None:
@@ -346,7 +341,8 @@ class BoltzGenExecutionRuntime:
                         self.output_root,
                         self.request.run_name,
                         item.run_id,
-                    )
+                    ),
+                    task_fingerprint=task_fingerprint,
                 )
             except OSError:
                 return AvailabilityStatus.UNKNOWN
@@ -406,9 +402,6 @@ class BoltzGenExecutionRuntime:
         )
         for node_key in ready:
             planned = self._planned_tasks(node_key)
-            observations = tuple(
-                self._task_observation(node_key, item) for item in planned
-            )
             with self.store.transaction():
                 repository.start_node(
                     self.execution_run_id,
@@ -421,6 +414,12 @@ class BoltzGenExecutionRuntime:
                     tuple(item.plan for item in planned),
                     now=self._now(),
                 )
+            repository = self._checkpoint()
+            observations = tuple(
+                self._task_observation(node_key, item, record.fingerprint)
+                for item, record in zip(planned, records, strict=True)
+            )
+            with self.store.transaction():
                 for record, observation in zip(
                     records,
                     observations,
@@ -584,6 +583,11 @@ class BoltzGenExecutionRuntime:
     ) -> dict[str, object]:
         if node_key == DESIGN_RUNS_NODE:
             replace_claim_owner = dict(self.request.replace_claim_owners).get(task_key)
+            task = self.store.execution.get_task(
+                self.execution_run_id,
+                node_key,
+                task_key,
+            )
             return {
                 "out_dir": str(
                     boltzgen_run_root(
@@ -600,11 +604,22 @@ class BoltzGenExecutionRuntime:
                 "steps": self.request.steps,
                 "extra_args": self.request.extra_args,
                 "replace_claim_owner": replace_claim_owner,
+                "task_fingerprint": task.fingerprint,
             }
         if node_key == COLLECT_RESULTS_NODE:
+            design_tasks = self.store.execution.list_tasks(
+                self.execution_run_id,
+                DESIGN_RUNS_NODE,
+            )
+            task_fingerprints = {
+                task.task_key: task.fingerprint for task in design_tasks
+            }
+            if set(task_fingerprints) != set(self.request.run_ids):
+                raise RuntimeError("BoltzGen design Task fingerprints are incomplete")
             return {
                 "run_name": self.request.run_name,
                 "run_ids": list(self.request.run_ids),
+                "task_fingerprints": task_fingerprints,
                 "protocol": self.request.protocol,
                 "num_designs": self.request.num_designs,
                 "budget": self.request.budget,

@@ -22,6 +22,7 @@ from biomodals.app.design.boltzgen.execution_contracts import (
     acquire_output_claim,
     is_boltzgen_run_complete,
     release_output_claim,
+    write_boltzgen_task_publication,
     write_collection_publication,
 )
 from biomodals.app.design.boltzgen.execution_coordinator import (
@@ -298,6 +299,7 @@ def get_run_ids(
 def collect_boltzgen_data(
     run_name: str,
     run_ids: list[str],
+    task_fingerprints: dict[str, str],
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
     budget: int = 10,
@@ -318,7 +320,16 @@ def collect_boltzgen_data(
     config_dir.mkdir(parents=True, exist_ok=True)
 
     all_run_dirs = [outdir / x for x in run_ids]
-    incomplete = [d.name for d in all_run_dirs if not is_boltzgen_run_complete(d)]
+    if set(task_fingerprints) != set(run_ids):
+        raise ValueError("BoltzGen Task fingerprints do not match the requested runs")
+    incomplete = [
+        run_dir.name
+        for run_dir in all_run_dirs
+        if not is_boltzgen_run_complete(
+            run_dir,
+            task_fingerprint=task_fingerprints[run_dir.name],
+        )
+    ]
     if incomplete:
         raise RuntimeError(
             "Cannot collect incomplete BoltzGen Tasks: " + ", ".join(incomplete)
@@ -389,13 +400,13 @@ def collect_boltzgen_data(
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True, model_volume=True, is_huggingface=True),
-    retries=modal.Retries(initial_delay=4.0, max_retries=10),
     single_use_containers=True,
 )
 def run_boltzgen_task(
     out_dir: str,
     input_yaml_path: str,
     claim_owner: str,
+    task_fingerprint: str,
     protocol: str = "nanobody-anything",
     num_designs: int = 10,
     budget: int = 1,
@@ -406,7 +417,10 @@ def run_boltzgen_task(
     """Run one independently tracked BoltzGen Task."""
     CONF.output_volume.reload()
     out_path = Path(out_dir)
-    if is_boltzgen_run_complete(out_path):
+    if is_boltzgen_run_complete(
+        out_path,
+        task_fingerprint=task_fingerprint,
+    ):
         return str(out_dir)
     claim_dir = acquire_output_claim(
         out_path,
@@ -440,6 +454,12 @@ def run_boltzgen_task(
         run_command(cmd, output_mode="capture", log_file=log_path, cwd=out_path)
         if not is_boltzgen_run_complete(out_path):
             raise RuntimeError("BoltzGen returned without its final publication")
+        CONF.output_volume.commit()
+        write_boltzgen_task_publication(
+            out_path,
+            task_fingerprint=task_fingerprint,
+        )
+        CONF.output_volume.commit()
         release_output_claim(claim_dir, owner=claim_owner)
     finally:
         CONF.output_volume.commit()

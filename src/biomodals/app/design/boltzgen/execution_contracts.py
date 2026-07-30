@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -12,7 +13,11 @@ from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.shell import warmup_directory
 
 COLLECTION_PUBLICATION_SCHEMA_VERSION = 1
+TASK_PUBLICATION_SCHEMA_VERSION = 1
 _CLAIM_OWNER_FILENAME = "owner"
+_TASK_PUBLICATION_PATH = PurePosixPath(".biomodals") / "task.json"
+_FINAL_PDF_PATH = PurePosixPath("final_ranked_designs") / "results_overview.pdf"
+_HASH_CHUNK_BYTES = 1024 * 1024
 
 
 def boltzgen_run_root(
@@ -24,14 +29,72 @@ def boltzgen_run_root(
     return AppRunLayout.from_run_root(Path(output_root) / run_name).outputs_dir / run_id
 
 
-def is_boltzgen_run_complete(run_dir: Path) -> bool:
-    """Return whether a BoltzGen run directory contains the final outputs."""
-    final_dir = run_dir / "final_ranked_designs"
+def is_boltzgen_run_complete(
+    run_dir: Path,
+    *,
+    task_fingerprint: str | None = None,
+) -> bool:
+    """Return whether a BoltzGen run has its established final publication."""
+    final_pdf = run_dir.joinpath(*_FINAL_PDF_PATH.parts)
+    if not run_dir.is_dir() or not final_pdf.is_file():
+        return False
+    if task_fingerprint is None:
+        return True
+    marker = run_dir.joinpath(*_TASK_PUBLICATION_PATH.parts)
+    if not marker.is_file():
+        return False
+    try:
+        value: Any = orjson.loads(marker.read_bytes())
+    except (OSError, orjson.JSONDecodeError):
+        return False
+    if not (
+        isinstance(value, dict)
+        and value.get("schema_version") == TASK_PUBLICATION_SCHEMA_VERSION
+        and value.get("status") == "complete"
+        and value.get("task_fingerprint") == task_fingerprint
+        and value.get("artifact_path") == _FINAL_PDF_PATH.as_posix()
+        and isinstance(value.get("artifact_size_bytes"), int)
+        and not isinstance(value.get("artifact_size_bytes"), bool)
+        and isinstance(value.get("artifact_sha256"), str)
+    ):
+        return False
+    size_bytes, digest = _hash_file(final_pdf)
     return (
-        run_dir.exists()
-        and final_dir.exists()
-        and (final_dir / "results_overview.pdf").is_file()
+        size_bytes == value["artifact_size_bytes"]
+        and digest == value["artifact_sha256"]
     )
+
+
+def write_boltzgen_task_publication(
+    run_dir: Path,
+    *,
+    task_fingerprint: str,
+) -> None:
+    """Publish fingerprint-bound evidence for one completed design Task."""
+    if len(task_fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in task_fingerprint
+    ):
+        raise ValueError("BoltzGen Task fingerprint must be lowercase SHA-256")
+    final_pdf = run_dir.joinpath(*_FINAL_PDF_PATH.parts)
+    if not final_pdf.is_file():
+        raise RuntimeError("BoltzGen returned without its final publication")
+    size_bytes, digest = _hash_file(final_pdf)
+    marker = run_dir.joinpath(*_TASK_PUBLICATION_PATH.parts)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    content = orjson.dumps(
+        {
+            "schema_version": TASK_PUBLICATION_SCHEMA_VERSION,
+            "status": "complete",
+            "task_fingerprint": task_fingerprint,
+            "artifact_path": _FINAL_PDF_PATH.as_posix(),
+            "artifact_size_bytes": size_bytes,
+            "artifact_sha256": digest,
+        },
+        option=orjson.OPT_SORT_KEYS,
+    )
+    temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
+    temporary.write_bytes(content)
+    temporary.replace(marker)
 
 
 def acquire_output_claim(
@@ -156,3 +219,13 @@ def _contained_path(
     path = root_path.joinpath(*relative.parts).resolve()
     path.relative_to(root_path)
     return path
+
+
+def _hash_file(path: Path) -> tuple[int, str]:
+    digest = sha256()
+    size_bytes = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(_HASH_CHUNK_BYTES):
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    return size_bytes, digest.hexdigest()

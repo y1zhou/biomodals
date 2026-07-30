@@ -8,6 +8,7 @@ from uuid import UUID
 
 from biomodals.app.design.boltzgen.execution_contracts import (
     boltzgen_run_root,
+    write_boltzgen_task_publication,
     write_collection_publication,
 )
 from biomodals.app.design.boltzgen.execution_request import (
@@ -18,7 +19,12 @@ from biomodals.app.design.boltzgen.execution_request import (
 from biomodals.app.design.boltzgen.execution_runtime import (
     BoltzGenExecutionRuntime,
 )
-from biomodals.execution import DeploymentIdentity, ProviderCallStatus, RunStatus
+from biomodals.execution import (
+    DeploymentIdentity,
+    ProviderCallStatus,
+    RunStatus,
+    TaskPlan,
+)
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -71,13 +77,14 @@ class RecordingCallDriver:
 def _request(
     *,
     run_ids: tuple[str, ...] = ("run-a", "run-b"),
+    protocol: str = "nanobody-anything",
 ) -> BoltzGenExecutionRequest:
     return prepare_execution_request(
         run_name="example",
         run_ids=run_ids,
         yaml_content=b"name: example\n",
         additional_files={},
-        protocol="nanobody-anything",
+        protocol=protocol,
         num_designs=10,
         budget=5,
         steps=None,
@@ -110,10 +117,28 @@ def _runtime(
     )
 
 
-def _publish_run(tmp_path: Path, run_id: str) -> None:
+def _task_fingerprint(request: BoltzGenExecutionRequest, run_id: str) -> str:
+    return TaskPlan(
+        task_key=run_id,
+        scientific_payload={"run_id": run_id},
+    ).fingerprint(
+        workload_plan_fingerprint=(request.execution_plan.workload_plan_fingerprint),
+        node_key=DESIGN_RUNS_NODE,
+    )
+
+
+def _publish_run(
+    tmp_path: Path,
+    request: BoltzGenExecutionRequest,
+    run_id: str,
+) -> None:
     final = boltzgen_run_root(tmp_path, "example", run_id) / "final_ranked_designs"
     final.mkdir(parents=True, exist_ok=True)
     (final / "results_overview.pdf").write_bytes(b"pdf")
+    write_boltzgen_task_publication(
+        final.parent,
+        task_fingerprint=_task_fingerprint(request, run_id),
+    )
 
 
 def test_missing_runs_are_admitted_once_as_independent_gpu_calls(
@@ -135,15 +160,24 @@ def test_missing_runs_are_admitted_once_as_independent_gpu_calls(
         kwargs = cast(dict[str, object], spawn["kwargs"])
         assert function.function_name == "run_boltzgen_task"
         assert kwargs["claim_owner"] == str(call.provider_call_id)
+        assert (
+            kwargs["task_fingerprint"]
+            == runtime.store.execution.get_task(
+                RUN_ID,
+                DESIGN_RUNS_NODE,
+                call.task_keys[0],
+            ).fingerprint
+        )
     runtime.close()
 
 
 def test_cached_run_is_reused_and_only_missing_run_is_submitted(
     tmp_path: Path,
 ) -> None:
-    _publish_run(tmp_path, "run-a")
+    request = _request()
+    _publish_run(tmp_path, request, "run-a")
     driver = RecordingCallDriver()
-    runtime = _runtime(tmp_path, driver=driver)
+    runtime = _runtime(tmp_path, request=request, driver=driver)
     runtime._initialize()
 
     runtime.advance_once()
@@ -154,17 +188,37 @@ def test_cached_run_is_reused_and_only_missing_run_is_submitted(
     runtime.close()
 
 
-def test_collection_waits_for_all_design_publications(tmp_path: Path) -> None:
-    _publish_run(tmp_path, "run-a")
-    _publish_run(tmp_path, "run-b")
+def test_task_publication_from_other_science_is_not_reused(tmp_path: Path) -> None:
+    original = _request()
+    _publish_run(tmp_path, original, "run-a")
+    changed = _request(protocol="protein-anything")
     driver = RecordingCallDriver()
-    runtime = _runtime(tmp_path, driver=driver)
+    runtime = _runtime(tmp_path, request=changed, driver=driver)
     runtime._initialize()
 
+    runtime.advance_once()
+
+    assert len(driver.spawns) == 2
+    runtime.close()
+
+
+def test_collection_waits_for_all_design_publications(tmp_path: Path) -> None:
+    request = _request()
+    _publish_run(tmp_path, request, "run-a")
+    _publish_run(tmp_path, request, "run-b")
+    driver = RecordingCallDriver()
+    runtime = _runtime(tmp_path, request=request, driver=driver)
+    runtime._initialize()
+
+    runtime.advance_once()
     runtime.advance_once()
     assert len(driver.spawns) == 1
     function = cast(Any, driver.spawns[0]["function"])
     assert function.function_name == "collect_boltzgen_data"
+    kwargs = cast(dict[str, object], driver.spawns[0]["kwargs"])
+    assert kwargs["task_fingerprints"] == {
+        run_id: _task_fingerprint(request, run_id) for run_id in request.run_ids
+    }
     runtime.advance_once()
     assert len(driver.spawns) == 1
     runtime.close()

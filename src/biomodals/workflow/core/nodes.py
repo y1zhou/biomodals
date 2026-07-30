@@ -55,11 +55,14 @@ class RemoteNodeCall:
     metadata: dict[str, Any] = field(default_factory=dict)
     runtime_image_key: str | None = None
     compatibility_key: str | None = None
+    max_tasks_per_call: int = 1
 
     def __post_init__(self) -> None:
         """Reject an incomplete provider target before Task discovery."""
         if not self.function_name:
             raise ValueError("Remote workflow function name cannot be empty")
+        if self.max_tasks_per_call < 1:
+            raise ValueError("max_tasks_per_call must be positive")
 
 
 class WorkflowNode(Protocol):
@@ -129,6 +132,16 @@ class RemoteTaskWorkflowNode:
         """Prepare one persisted Task for provider submission."""
         raise NotImplementedError
 
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[RemoteWorkflowTask, ...],
+    ) -> RemoteNodeCall:
+        """Prepare one provider call for a compatible fixed Task batch."""
+        if len(tasks) != 1:
+            raise ValueError("This workflow Node does not support Task batching")
+        return self.prepare_remote_task(context, tasks[0])
+
     def process_remote_task_result(
         self,
         task_key: str,
@@ -137,6 +150,18 @@ class RemoteTaskWorkflowNode:
     ) -> AppRunResult:
         """Normalize one durable provider result for Task publication."""
         return AppRunResult.model_validate(result)
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        """Decode one fixed-call result into every owned Task outcome."""
+        if len(task_keys) != 1:
+            raise ValueError("This workflow Node does not support Task batching")
+        task_key = task_keys[0]
+        return {task_key: self.process_remote_task_result(task_key, result, metadata)}
 
     def finalize_remote_tasks(
         self,

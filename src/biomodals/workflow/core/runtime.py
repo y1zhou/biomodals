@@ -417,24 +417,9 @@ class WorkflowRuntime:
         envelope = call.result_envelope
         node = self._require_definition().nodes[node_id].node
         if isinstance(node, RemoteTaskWorkflowNode):
-            if len(call.task_keys) != 1:
-                for task_key in call.task_keys:
-                    task = self.store.execution.get_task(
-                        self.execution_run_id,
-                        node_id,
-                        task_key,
-                    )
-                    if not task.status.is_terminal:
-                        self._fail_discovered_task(
-                            node_id,
-                            task_key,
-                            "Remote Task Node received an unsupported batched result",
-                        )
-                return
-            task_key = call.task_keys[0]
-            self._publish_provider_task_result(
+            self._publish_provider_task_results(
                 node_id,
-                task_key,
+                call.task_keys,
                 envelope,
                 node,
             )
@@ -460,49 +445,68 @@ class WorkflowRuntime:
             return
         self._publish_result(node_id, result)
 
-    def _publish_provider_task_result(
+    def _publish_provider_task_results(
         self,
         node_id: str,
-        task_key: str,
+        task_keys: tuple[str, ...],
         envelope: object,
         node: RemoteTaskWorkflowNode,
     ) -> None:
-        task = self.store.execution.get_task(
-            self.execution_run_id,
-            node_id,
-            task_key,
+        tasks = tuple(
+            self.store.execution.get_task(
+                self.execution_run_id,
+                node_id,
+                task_key,
+            )
+            for task_key in task_keys
         )
-        if task.status.is_terminal:
+        unfinished = tuple(task for task in tasks if not task.status.is_terminal)
+        if not unfinished:
             return
         try:
-            task_definition = RemoteWorkflowTask(
-                task_key=task.task_key,
-                scientific_payload=task.scientific_payload,
-                execution_payload=task.execution_payload,
+            task_definitions = tuple(
+                RemoteWorkflowTask(
+                    task_key=task.task_key,
+                    scientific_payload=task.scientific_payload,
+                    execution_payload=task.execution_payload,
+                )
+                for task in tasks
             )
-            invocation = node.prepare_remote_task(
+            invocation = node.prepare_remote_task_batch(
                 self._node_context(
                     self._require_definition(),
                     node_id,
-                    task_key=task_key,
+                    task_key=task_keys[0],
                 ),
-                task_definition,
+                task_definitions,
             )
-            result = AppRunResult.model_validate(
-                node.process_remote_task_result(
-                    task_key,
-                    _raw_result(envelope),
-                    invocation.metadata,
+            decoded = node.process_remote_task_batch_result(
+                task_keys,
+                _raw_result(envelope),
+                invocation.metadata,
+            )
+            if set(decoded) != set(task_keys):
+                raise ValueError(
+                    "Batched provider result Task keys do not match call ownership"
                 )
-            )
+            results = {
+                task_key: AppRunResult.model_validate(result)
+                for task_key, result in decoded.items()
+            }
         except Exception as error:
-            self._fail_discovered_task(
-                node_id,
-                task_key,
-                f"Could not decode provider result: {error}",
-            )
+            for task in unfinished:
+                self._fail_discovered_task(
+                    node_id,
+                    task.task_key,
+                    f"Could not decode provider result: {error}",
+                )
             return
-        self._publish_task_result(node_id, task_key, result)
+        for task in unfinished:
+            self._publish_task_result(
+                node_id,
+                task.task_key,
+                results[task.task_key],
+            )
 
     def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
         repository = self.store.execution
@@ -736,7 +740,7 @@ class WorkflowRuntime:
                         compatibility_key=(
                             invocation.compatibility_key or invocation.function_name
                         ),
-                        max_tasks_per_call=1,
+                        max_tasks_per_call=invocation.max_tasks_per_call,
                         depth=rank.depth,
                         unblocking_span=rank.unblocking_span,
                     )
@@ -755,13 +759,61 @@ class WorkflowRuntime:
             ),
         )
         for candidate in selected:
-            [task_key] = candidate.task_keys
-            invocation = invocations[(candidate.node_key, task_key)]
+            node = definition.nodes[candidate.node_key].node
+            if len(candidate.task_keys) == 1:
+                invocation = invocations[(candidate.node_key, candidate.task_keys[0])]
+            elif isinstance(node, RemoteTaskWorkflowNode):
+                task_definitions = tuple(
+                    RemoteWorkflowTask(
+                        task_key=task.task_key,
+                        scientific_payload=task.scientific_payload,
+                        execution_payload=task.execution_payload,
+                    )
+                    for task_key in candidate.task_keys
+                    for task in (
+                        repository.get_task(
+                            self.execution_run_id,
+                            candidate.node_key,
+                            task_key,
+                        ),
+                    )
+                )
+                invocation = node.prepare_remote_task_batch(
+                    self._node_context(
+                        definition,
+                        candidate.node_key,
+                        task_key=candidate.task_keys[0],
+                    ),
+                    task_definitions,
+                )
+                invocation_binding = ProviderBinding(
+                    environment=run.deployment.environment,
+                    app_name=run.deployment.deployment_name,
+                    app_version=run.deployment.deployment_version,
+                    function_name=invocation.function_name,
+                    uses_gpu=invocation.uses_gpu,
+                    runtime_image_key=invocation.runtime_image_key,
+                )
+                if (
+                    invocation_binding != candidate.binding
+                    or (invocation.compatibility_key or invocation.function_name)
+                    != candidate.compatibility_key
+                    or invocation.max_tasks_per_call < len(candidate.task_keys)
+                ):
+                    for task_key in candidate.task_keys:
+                        self._fail_discovered_task(
+                            candidate.node_key,
+                            task_key,
+                            "Batched provider preparation changed its dispatch contract",
+                        )
+                    continue
+            else:  # pragma: no cover - scheduler never batches ordinary Nodes
+                raise RuntimeError("Only remote Task Nodes may own batched calls")
             self._provider.repository = self.store.execution
             self._provider.submit_fixed_batch(
                 self.execution_run_id,
                 candidate,
-                submission_token=f"{candidate.node_key}:{task_key}",
+                submission_token=candidate.candidate_key,
                 args=invocation.args,
                 kwargs=invocation.kwargs,
                 now=self._now(),

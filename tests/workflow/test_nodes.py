@@ -11,6 +11,7 @@ from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
 from biomodals.workflow.core.nodes import (
     AppBackedNode,
     NodeRunContext,
+    RemoteNodeCall,
     RemoteTaskWorkflowNode,
     RemoteWorkflowTask,
 )
@@ -56,6 +57,12 @@ def test_remote_task_node_declares_data_without_modal_submission() -> None:
         RemoteWorkflowTask(
             task_key="",
             scientific_payload={},
+        )
+    with pytest.raises(ValueError, match="max_tasks_per_call must be positive"):
+        RemoteNodeCall(
+            function_name="run_candidate",
+            uses_gpu=False,
+            max_tasks_per_call=0,
         )
 
 

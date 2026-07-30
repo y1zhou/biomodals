@@ -5,6 +5,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 from biomodals.execution import (
@@ -143,6 +144,58 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
         )
 
 
+@dataclass
+class BatchedRemoteFanoutNode(RemoteFanoutNode):
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        payload = dict(task.execution_payload)
+        return RemoteNodeCall(
+            function_name="run_candidate_batch",
+            uses_gpu=True,
+            kwargs={"task_keys": [task.task_key], "texts": [payload["text"]]},
+            metadata={"task_keys": [context.task_key]},
+            runtime_image_key="fanout",
+            compatibility_key="same-batch",
+            max_tasks_per_call=2,
+        )
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[RemoteWorkflowTask, ...],
+    ) -> RemoteNodeCall:
+        return RemoteNodeCall(
+            function_name="run_candidate_batch",
+            uses_gpu=True,
+            kwargs={
+                "task_keys": [task.task_key for task in tasks],
+                "texts": [dict(task.execution_payload)["text"] for task in tasks],
+            },
+            metadata={"task_keys": [task.task_key for task in tasks]},
+            runtime_image_key="fanout",
+            compatibility_key="same-batch",
+            max_tasks_per_call=2,
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: object,
+        metadata: Mapping[str, object],
+    ) -> Mapping[str, AppRunResult]:
+        assert metadata["task_keys"] == list(task_keys)
+        if not isinstance(result, Mapping):
+            raise TypeError("batch result must be a mapping")
+        result_by_task = cast(Mapping[str, object], result)
+        return {
+            task_key: AppRunResult.model_validate(result_by_task[task_key])
+            for task_key in task_keys
+        }
+
+
 class FakeModalDriver:
     def __init__(self) -> None:
         self.events: list[str] = []
@@ -198,6 +251,20 @@ class FanoutModalDriver(FakeModalDriver):
             ModalCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
+
+
+class BatchedFanoutModalDriver(FakeModalDriver):
+    def spawn(self, function, *, args, kwargs):
+        del function, args
+        task_keys = tuple(kwargs["task_keys"])
+        texts = tuple(kwargs["texts"])
+        call_id = "fc-" + "-".join(task_keys)
+        self.events.append("spawn:" + ",".join(task_keys))
+        self.results[call_id] = {
+            task_key: _text_result(str(text)).model_dump(mode="json")
+            for task_key, text in zip(task_keys, texts, strict=True)
+        }
+        return call_id
 
 
 class FakeVolume:
@@ -407,6 +474,31 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
     assert {
         artifact.artifact_id for artifact in downstream.seen[0].inputs["candidates"]
     }.issuperset(task_artifact_ids)
+
+
+def test_remote_task_node_batches_compatible_tasks_into_one_call(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("batched-fanout")
+    node = BatchedRemoteFanoutNode(("alpha", "beta"))
+    workflow.add_node(node, id="fanout")
+    driver = BatchedFanoutModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+
+    result = runtime.run(workload_run_key="batched-fanout")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert [event for event in driver.events if event.startswith("spawn:")] == [
+        "spawn:candidate-0,candidate-1"
+    ]
+    [provider_call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert provider_call.task_keys == ("candidate-0", "candidate-1")
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED]
+    assert node.finalized_results == [
+        (("candidate-0", "candidate-1"), ()),
+    ]
 
 
 def test_remote_task_node_can_publish_partial_outcomes(tmp_path: Path) -> None:

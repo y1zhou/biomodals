@@ -35,7 +35,11 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
     WorkStatusReason,
 )
-from biomodals.execution.scheduler import aggregate_task_outcome, terminal_run_outcome
+from biomodals.execution.scheduler import (
+    aggregate_task_outcome,
+    propagated_skip_node_keys,
+    terminal_run_outcome,
+)
 
 EXECUTION_SCHEMA_VERSION = 1
 
@@ -1547,6 +1551,45 @@ class SqliteExecutionRepository:
             ),
         )
         return self.get_node(execution_run_id, node_key)
+
+    def skip_unreachable_nodes(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> tuple[ExecutionNodeRecord, ...]:
+        """Persist dependency-derived skips in immutable plan order."""
+        run = self.get_run(execution_run_id)
+        if run.status != RunStatus.RUNNING:
+            return ()
+        nodes = self.list_nodes(execution_run_id)
+        skipped_keys = propagated_skip_node_keys(
+            run.plan,
+            {node.node_key: node.status for node in nodes},
+        )
+        for node_key in skipped_keys:
+            self._connection.execute(
+                """
+                UPDATE execution_nodes
+                SET status = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND status = ?
+                """,
+                (
+                    NodeStatus.SKIPPED.value,
+                    now,
+                    now,
+                    str(execution_run_id),
+                    node_key,
+                    NodeStatus.PENDING.value,
+                ),
+            )
+        return tuple(
+            self.get_node(execution_run_id, node_key) for node_key in skipped_keys
+        )
 
     def prune_unrequired_nodes(
         self,

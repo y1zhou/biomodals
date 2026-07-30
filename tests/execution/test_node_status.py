@@ -9,12 +9,14 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionPlan,
+    NodeDependency,
     NodePlan,
     NodeStatus,
     ResultProvenance,
     RunStatus,
     RunStatusReason,
     SqliteExecutionRepository,
+    TaskPlan,
 )
 
 RUN_ID = UUID("d4e4744e-aacf-4478-92d6-a58681805162")
@@ -113,3 +115,57 @@ def test_available_running_node_publication_records_current_run_provenance() -> 
     assert node.result_provenance == ResultProvenance.CURRENT_RUN
     assert node.started_at == 105
     assert node.completed_at == 110
+
+
+def test_dependency_failure_durably_skips_every_unreachable_successor() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SqliteExecutionRepository(connection)
+    repository.initialize_schema()
+    repository.create_run(
+        execution_run_id=RUN_ID,
+        plan=ExecutionPlan(
+            workload_name="demo",
+            nodes=(
+                NodePlan(node_key="prepare"),
+                NodePlan(
+                    node_key="simulate",
+                    dependencies=(NodeDependency("prepare"),),
+                ),
+                NodePlan(
+                    node_key="result",
+                    dependencies=(NodeDependency("simulate"),),
+                ),
+            ),
+        ),
+        deployment=DeploymentIdentity("production", "biomodals-demo", 3),
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=1,
+        now=100,
+    )
+    repository.start_node(RUN_ID, "prepare", now=101)
+    repository.discover_tasks(
+        RUN_ID,
+        "prepare",
+        (TaskPlan("task", {"input": "x"}),),
+        now=102,
+    )
+    repository.record_task_result_observation(
+        RUN_ID,
+        "prepare",
+        "task",
+        AvailabilityStatus.MISSING,
+        now=103,
+    )
+    repository.fail_task(
+        RUN_ID,
+        "prepare",
+        "task",
+        message="preparation failed",
+        now=104,
+    )
+    repository.reconcile_node_tasks(RUN_ID, "prepare", now=105)
+
+    skipped = repository.skip_unreachable_nodes(RUN_ID, now=106)
+
+    assert [node.node_key for node in skipped] == ["simulate", "result"]
+    assert all(node.status == NodeStatus.SKIPPED for node in skipped)

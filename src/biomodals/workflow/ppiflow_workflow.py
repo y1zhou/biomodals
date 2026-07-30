@@ -15,7 +15,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import modal
 import polars as pl
@@ -23,13 +23,24 @@ import yaml
 from uniaf3.schema.alphafold3 import AF3Protein, AF3SequenceEntry
 
 from biomodals.app.bioinfo import rosetta_app
+from biomodals.app.bioinfo.rosetta.execution_contracts import (
+    RosettaTaskSpec,
+    execute_rosetta_task,
+    validate_task_publication_from_volume,
+)
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
 from biomodals.app.fold.alphafold3.modal_adapters import (
     InProcessInferenceExecutor,
 )
 from biomodals.app.score import af3score_app, dockq_app
-from biomodals.execution import DeploymentIdentity, NodeAggregationPolicy
+from biomodals.execution import (
+    AvailabilityStatus,
+    DeploymentIdentity,
+    NodeAggregationPolicy,
+    WorkerAssignmentRecord,
+)
+from biomodals.execution.pull_worker import drive_pull_worker
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     AppRunLayout,
@@ -40,7 +51,6 @@ from biomodals.helper.app_run import (
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
-from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import (
     AppConfig,
     AppOutput,
@@ -56,6 +66,8 @@ from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
     RemoteNodeCall,
+    RemotePullTaskWorkflowNode,
+    RemotePullWorkerCall,
     RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
     RemoteWorkflowTask,
@@ -89,6 +101,7 @@ PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
     "outputs/**/*.cif",
 )
 APP_RUN_OUTPUT_STRUCTURE_PATTERNS = PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS
+_ROSETTA_PLAN_SCHEMA_VERSION = 1
 
 DEPENDENCY_APPS = (
     "ppiflow",
@@ -122,6 +135,9 @@ ligandmpnn_task_image = ligandmpnn_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
 flowpacker_task_image = flowpacker_app.runtime_image.add_local_python_source(
+    "biomodals.workflow"
+)
+rosetta_task_image = rosetta_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
 dockq_task_image = dockq_app.runtime_image.add_local_python_source("biomodals.workflow")
@@ -203,6 +219,7 @@ ALPHAFOLD3_TASK_VOLUME_MOUNTS = {
         version=2,
     ),
 }
+ROSETTA_TASK_VOLUME_MOUNTS = rosetta_app.CONF.mounts(output_volume=True)
 
 
 def _reload_ppiflow_source_volumes() -> None:
@@ -1086,6 +1103,88 @@ def stage_af3score_inputs(
     ]
 
 
+def _rosetta_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
+    """Serialize one immutable PPIFlow Rosetta Task plan."""
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list):
+        raise TypeError("Rosetta plan Tasks must be a list")
+    return AppOutput(
+        name="rosetta_task_plan",
+        kind=ArtifactKind.TABLE,
+        storage=InlineBytes(
+            data=json.dumps(plan, indent=2, sort_keys=True).encode("utf-8"),
+            filename="rosetta_task_plan.json",
+            media_type="application/json",
+        ),
+        metadata={
+            "task_count": len(tasks),
+            "run_name": str(plan["run_name"]),
+            "run_id": str(plan["run_id"]),
+        },
+    )
+
+
+def _load_rosetta_plan(path: Path) -> dict[str, object]:
+    """Load and validate one materialized PPIFlow Rosetta Task plan."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != _ROSETTA_PLAN_SCHEMA_VERSION
+    ):
+        raise ValueError("PPIFlow Rosetta task plan schema is unsupported")
+    tasks = value.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("PPIFlow Rosetta task plan has no Tasks")
+    specs = tuple(RosettaTaskSpec.from_dict(task) for task in tasks)
+    if len(specs) != value.get("num_jobs"):
+        raise ValueError("PPIFlow Rosetta Task count does not match its plan")
+    for field_name in (
+        "worker_count",
+        "claim_capacity",
+        "max_parallel_per_worker",
+    ):
+        field_value = value.get(field_name)
+        if not isinstance(field_value, int) or field_value < 1:
+            raise ValueError(f"PPIFlow Rosetta {field_name} must be positive")
+    return cast(dict[str, object], value)
+
+
+def _read_rosetta_plan_artifacts(
+    artifacts: Sequence[WorkflowArtifact],
+) -> dict[str, object]:
+    """Load the single Rosetta plan from a materialized workflow artifact."""
+    if len(artifacts) != 1:
+        raise ValueError(f"Expected one Rosetta task plan, found {len(artifacts)}")
+    return _load_rosetta_plan(
+        ppiflow_staging.artifact_mount_path(
+            artifacts[0],
+            PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        )
+    )
+
+
+def _rosetta_worker_policy(
+    num_jobs: int,
+    config: Mapping[str, object],
+) -> tuple[int, int, int]:
+    """Preserve Rosetta's pod cap while deriving pull-worker microbatches."""
+    if num_jobs < 1:
+        raise ValueError("Rosetta requires at least one Task")
+    num_cpu_per_pod = min(30, num_jobs)
+    max_num_pods = max(1, _config_int(config, "max_num_pods", 1))
+    if config.get("max_child_calls") is not None:
+        max_num_pods = min(
+            max_num_pods,
+            _config_int(config, "max_child_calls", 1),
+        )
+    worker_count = min(
+        max_num_pods,
+        (num_jobs + num_cpu_per_pod - 1) // num_cpu_per_pod,
+    )
+    claim_capacity = (num_jobs + worker_count - 1) // worker_count
+    return worker_count, claim_capacity, min(30, claim_capacity)
+
+
 @app.function(
     image=runtime_image,
     cpu=0.125,
@@ -1093,25 +1192,23 @@ def stage_af3score_inputs(
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
 )
-def stage_rosetta_inputs(
+def prepare_ppiflow_rosetta_stage(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None = None,
+    config: dict[str, object],
+    step_name: str,
     run_name: str,
     run_id: str,
-    rosetta_binary: str,
-    rosetta_script: str | None = None,
-    flags_file: str | None = None,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> dict[str, object]:
-    """Stage selected structures and enqueue Rosetta jobs."""
+    node_id: str,
+) -> AppRunResult:
+    """Stage Rosetta inputs and publish a finite pull-worker Task plan."""
     _reload_ppiflow_source_volumes()
     selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts=artifacts,
         volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=patterns,
-        max_files=max_files,
+        patterns=None,
+        max_files=_optional_config_int(config, "max_structures"),
     )
     candidate_structures = ppiflow_staging.candidate_structure_files_from_selected(
         selected,
@@ -1121,68 +1218,109 @@ def stage_rosetta_inputs(
             step_name="RosettaInput",
         ),
     )
+    if not candidate_structures:
+        raise ValueError(f"{step_name} requires at least one Rosetta input")
     safe_run_name = sanitize_filename(run_name)
-    safe_run_id = sanitize_filename(run_id)
+    safe_run_id = sanitize_filename(f"{run_id}-{node_id}")
     layout = AppRunLayout.from_run_root(
         Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{safe_run_name}-{safe_run_id}"
     )
-    if layout.run_root.exists():
-        shutil.rmtree(layout.run_root)
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    rosetta_script = config.get("rosetta_script")
+    if rosetta_script is not None and not isinstance(rosetta_script, str):
+        raise TypeError("rosetta_script must be text")
+    script_content = (
+        None
+        if not rosetta_script
+        else _resolve_rosetta_config_text(rosetta_script, "rosetta_script")
+    )
     remote_script = None
-    if rosetta_script:
+    if script_content is not None:
         remote_script = "inputs/_script/workflow.xml"
         script_path = layout.run_root / remote_script
         script_path.parent.mkdir(parents=True, exist_ok=True)
-        script_path.write_text(
-            _resolve_rosetta_config_text(rosetta_script, "rosetta_script"),
-            encoding="utf-8",
-        )
+        script_path.write_text(script_content, encoding="utf-8")
+    flags_file = config.get("flags_file")
+    if flags_file is not None and not isinstance(flags_file, str):
+        raise TypeError("flags_file must be text")
+    flags_content = (
+        None
+        if not flags_file
+        else _resolve_rosetta_config_text(flags_file, "flags_file")
+    )
     remote_flags = None
-    if flags_file:
+    if flags_content is not None:
         remote_flags = "inputs/_flags/workflow.flags"
         flags_path = layout.run_root / remote_flags
         flags_path.parent.mkdir(parents=True, exist_ok=True)
-        flags_path.write_text(
-            _resolve_rosetta_config_text(flags_file, "flags_file"),
-            encoding="utf-8",
-        )
+        flags_path.write_text(flags_content, encoding="utf-8")
 
-    queue = modal.Queue.from_name(
-        f"{rosetta_app.CONF.name}-queue-{safe_run_id}",
-        create_if_missing=True,
-    )
     rosetta_rows = ppiflow_staging.rosetta_job_manifest_rows(
         candidate_structures,
-        rosetta_binary=rosetta_binary,
+        rosetta_binary=str(config.get("rosetta_binary", "relax")),
         rosetta_script=remote_script,
         flags_file=remote_flags,
     )
+    task_specs = []
     for row, structure in zip(rosetta_rows, candidate_structures, strict=True):
         remote_pdb = str(row["pdb"])
         pdb_path = layout.run_root / remote_pdb
         pdb_path.parent.mkdir(parents=True, exist_ok=True)
         pdb_path.write_bytes(structure.data)
-        queue.put({
-            "index": int(row["index"]),
-            "candidate_id": str(row["candidate_id"]),
-            "binary": str(row["binary"]),
-            "pdb": remote_pdb,
-            "rosetta_script": remote_script,
-            "flags_file": remote_flags,
-        })
+        task_specs.append(
+            RosettaTaskSpec(
+                task_key=str(row["candidate_id"]),
+                index=_config_int(row, "index", 0),
+                binary=str(row["binary"]),
+                pdb=remote_pdb,
+                rosetta_script=remote_script,
+                flags_file=remote_flags,
+                output_dir=str(row["expected_output_dir"]),
+                worker_log=str(row["worker_log"]),
+                expected_files=(str(row["expected_score_file"]),),
+                input_sha256=hashlib.sha256(structure.data).hexdigest(),
+                script_sha256=(
+                    None
+                    if script_content is None
+                    else hashlib.sha256(script_content.encode()).hexdigest()
+                ),
+                flags_sha256=(
+                    None
+                    if flags_content is None
+                    else hashlib.sha256(flags_content.encode()).hexdigest()
+                ),
+                candidate_id=str(row["candidate_id"]),
+            )
+        )
     job_manifest = ppiflow_staging.write_rosetta_job_manifest(
         rosetta_rows,
         layout.run_root / "rosetta_job_manifest.csv",
     )
-    ROSETTA_OUTPUT_VOLUME.commit()
-    return {
+    worker_count, claim_capacity, max_parallel = _rosetta_worker_policy(
+        len(task_specs),
+        config,
+    )
+    plan: dict[str, object] = {
+        "schema_version": _ROSETTA_PLAN_SCHEMA_VERSION,
         "run_name": safe_run_name,
         "run_id": safe_run_id,
         "run_root": str(layout.run_root),
-        "num_jobs": len(selected),
         "job_manifest": str(job_manifest),
+        "num_jobs": len(task_specs),
+        "worker_count": worker_count,
+        "claim_capacity": claim_capacity,
+        "max_parallel_per_worker": max_parallel,
+        "tasks": [task.to_dict() for task in task_specs],
     }
+    ROSETTA_OUTPUT_VOLUME.commit()
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[_rosetta_plan_artifact(plan)],
+        metrics={
+            "staged_candidates": len(task_specs),
+            "worker_count": worker_count,
+        },
+    )
 
 
 def _af3score_task_spec_value(task_spec: object, name: str) -> object:
@@ -1714,6 +1852,164 @@ def run_ppiflow_refold_candidate(
     )
 
 
+def _rosetta_task_receipt(
+    task: RosettaTaskSpec,
+    task_fingerprint: str,
+) -> AppOutput:
+    """Return a small workflow-owned receipt for one validated Rosetta Task."""
+    return AppOutput(
+        name="rosetta_task_receipt",
+        kind=ArtifactKind.REPORT,
+        storage=InlineBytes(
+            data=json.dumps(
+                {
+                    "task_key": task.task_key,
+                    "task_fingerprint": task_fingerprint,
+                    "candidate_id": task.candidate_id,
+                    "expected_files": list(task.expected_files),
+                },
+                sort_keys=True,
+            ).encode(),
+            filename=f"{sanitize_filename(task.task_key)}.json",
+            media_type="application/json",
+        ),
+        metadata={"candidate_id": task.candidate_id or task.task_key},
+    )
+
+
+@app.function(
+    image=rosetta_task_image,
+    cpu=(0.125, 30.125),
+    memory=(1024, 43008),
+    timeout=CONF.timeout,
+    volumes=ROSETTA_TASK_VOLUME_MOUNTS,
+)
+def run_ppiflow_rosetta_worker(
+    coordinator,
+    provider_call_id: str,
+    run_name: str,
+    run_id: str,
+    claim_capacity: int,
+    max_parallel: int,
+) -> dict[str, int]:
+    """Pull Rosetta Tasks from the workflow coordinator until none remain."""
+    from biomodals.helper.shell import run_command
+
+    layout = AppRunLayout.from_run_root(
+        Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{run_name}-{run_id}"
+    )
+
+    def claim(request_id: str, capacity: int):
+        return coordinator.claim_tasks.remote(
+            provider_call_id,
+            request_id,
+            capacity,
+        )
+
+    def execute(assignment: WorkerAssignmentRecord) -> AppRunResult:
+        payload = assignment.execution_payload
+        if not isinstance(payload, Mapping):
+            raise TypeError("Rosetta worker Task payload must be an object")
+        task = RosettaTaskSpec.from_dict(payload.get("task"))
+        try:
+            execute_rosetta_task(
+                run_root=layout.run_root,
+                task=task,
+                task_fingerprint=assignment.task_fingerprint,
+                run_command=run_command,
+            )
+        except Exception as error:  # noqa: BLE001
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[str(error) or type(error).__name__],
+                metrics={"candidate_id": task.candidate_id or task.task_key},
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[_rosetta_task_receipt(task, assignment.task_fingerprint)],
+            metrics={"candidate_id": task.candidate_id or task.task_key},
+        )
+
+    def complete(
+        assignment: WorkerAssignmentRecord,
+        request_id: str,
+        result: AppRunResult,
+    ) -> None:
+        ROSETTA_OUTPUT_VOLUME.commit()
+        coordinator.complete_task.remote(
+            provider_call_id,
+            assignment.task_key,
+            request_id,
+            result,
+        )
+
+    summary = drive_pull_worker(
+        provider_call_id=UUID(provider_call_id),
+        claim_capacity=claim_capacity,
+        claim=claim,
+        execute=execute,
+        complete=complete,
+        max_parallel=max_parallel,
+    )
+    ROSETTA_OUTPUT_VOLUME.commit()
+    return asdict(summary)
+
+
+def _rosetta_task_outcomes_artifact(
+    results: Mapping[str, AppRunResult],
+    errors: Mapping[str, str],
+) -> AppOutput:
+    """Serialize terminal pull-Task outcomes for the remote finalizer."""
+    return AppOutput(
+        name="rosetta_task_outcomes",
+        kind=ArtifactKind.TABLE,
+        storage=InlineBytes(
+            data=json.dumps(
+                {
+                    "schema_version": _ROSETTA_PLAN_SCHEMA_VERSION,
+                    "succeeded": sorted(results),
+                    "errors": {
+                        task_key: errors[task_key] for task_key in sorted(errors)
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode(),
+            filename="rosetta_task_outcomes.json",
+            media_type="application/json",
+        ),
+    )
+
+
+def _read_rosetta_task_outcomes(
+    artifacts: Sequence[WorkflowArtifact],
+) -> tuple[set[str], dict[str, str]]:
+    """Load one materialized Rosetta pull-Task outcome summary."""
+    if len(artifacts) != 1:
+        raise ValueError(
+            f"Expected one Rosetta Task outcome artifact, found {len(artifacts)}"
+        )
+    path = ppiflow_staging.artifact_mount_path(
+        artifacts[0],
+        PPI_FLOW_SOURCE_VOLUME_ROOTS,
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != _ROSETTA_PLAN_SCHEMA_VERSION
+        or not isinstance(value.get("succeeded"), list)
+        or not isinstance(value.get("errors"), dict)
+    ):
+        raise ValueError("PPIFlow Rosetta Task outcomes are invalid")
+    succeeded = {str(task_key) for task_key in value["succeeded"]}
+    errors = {
+        str(task_key): str(message) for task_key, message in value["errors"].items()
+    }
+    if succeeded & errors.keys():
+        raise ValueError("Rosetta Task outcomes contain conflicting statuses")
+    return succeeded, errors
+
+
 @app.function(
     image=runtime_image,
     cpu=0.125,
@@ -1721,84 +2017,49 @@ def run_ppiflow_refold_candidate(
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
 )
-def run_ppiflow_rosetta_stage(
+def finalize_ppiflow_rosetta_stage(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
+    plan_artifacts: list[WorkflowArtifact],
+    outcome_artifacts: list[WorkflowArtifact],
     config: dict[str, object],
     step_name: str,
-    run_name: str,
     run_id: str,
     node_id: str,
 ) -> AppRunResult:
-    """Stage Rosetta candidates, run worker pods, and classify outputs."""
-    # TODO: tune CPU/memory/timeout and pod sizing once Rosetta stage telemetry exists.
-    staged = stage_rosetta_inputs.get_raw_f()(
-        artifacts=artifacts,
-        candidate_manifests=candidate_manifests,
-        run_name=run_name,
-        run_id=sanitize_filename(f"{run_id}-{node_id}"),
-        rosetta_binary=str(config.get("rosetta_binary", "relax")),
-        rosetta_script=config.get("rosetta_script"),
-        flags_file=config.get("flags_file"),
-        patterns=None,
-        max_files=_optional_config_int(config, "max_structures"),
+    """Validate Rosetta publications and emit the existing stage artifacts."""
+    _reload_ppiflow_source_volumes()
+    plan = _read_rosetta_plan_artifacts(plan_artifacts)
+    succeeded_tasks, task_errors = _read_rosetta_task_outcomes(outcome_artifacts)
+    task_specs = tuple(
+        RosettaTaskSpec.from_dict(task) for task in cast(list[object], plan["tasks"])
     )
-    num_jobs = int(staged["num_jobs"])
-    if num_jobs < 1:
-        raise ValueError(f"{step_name} requires at least one Rosetta input")
+    expected_task_keys = {task.task_key for task in task_specs}
+    if succeeded_tasks | task_errors.keys() != expected_task_keys:
+        raise ValueError("Rosetta Task outcomes do not match the staged plan")
 
-    num_cpu_per_pod = min(30, max(1, num_jobs))
-    max_num_pods = max(1, _config_int(config, "max_num_pods", 1))
-    if config.get("max_child_calls") is not None:
-        max_num_pods = min(max_num_pods, _config_int(config, "max_child_calls", 1))
-    num_pods = min(max_num_pods, (num_jobs + num_cpu_per_pod - 1) // num_cpu_per_pod)
-
-    def run_pod(_) -> str | None:
-        try:
-            rosetta_app.run_rosetta.remote(
-                str(staged["run_name"]),
-                str(staged["run_id"]),
-                num_cpu_per_pod,
-            )
-            return None
-        except Exception as exc:  # noqa: BLE001
-            return str(exc)
-
-    worker_errors = [
-        error
-        for error in bounded_map(range(num_pods), run_pod, max_parallel=num_pods)
-        if error is not None
-    ]
-    ROSETTA_OUTPUT_VOLUME.reload()
-    cleanup_warnings = []
-    try:
-        modal.Queue.objects.delete(f"{rosetta_app.CONF.name}-queue-{staged['run_id']}")
-    except Exception as exc:  # noqa: BLE001
-        cleanup_warnings.append(f"queue cleanup failed: {exc}")
-
-    run_root = Path(str(staged["run_root"]))
-    job_manifest = Path(str(staged["job_manifest"]))
+    run_root = Path(str(plan["run_root"]))
+    job_manifest = Path(str(plan["job_manifest"]))
     row_frame = pl.read_csv(job_manifest, infer_schema_length=0)
     rows = []
-    outcomes = []
+    successful_candidates = 0
+    warnings = []
     for row in row_frame.iter_rows(named=True):
         candidate_id = str(row["candidate_id"])
         expected_score = run_root / str(row["expected_score_file"])
         log_path = run_root / str(row["worker_log"])
-        status = (
-            AppRunStatus.SUCCEEDED
-            if expected_score.is_file() and not worker_errors
-            else AppRunStatus.FAILED
-        )
-        error = None if status == AppRunStatus.SUCCEEDED else "; ".join(worker_errors)
-        outcomes.append(
-            ppiflow_coordinators.CandidateOutcome(
-                candidate_id,
-                status,
-                error=error or None,
+        success = candidate_id in succeeded_tasks and expected_score.is_file()
+        status = AppRunStatus.SUCCEEDED if success else AppRunStatus.FAILED
+        error = task_errors.get(candidate_id)
+        if error is None and not success:
+            error = (
+                "Rosetta Task reported success without its expected score file"
+                if candidate_id in succeeded_tasks
+                else "Rosetta Task did not publish a result"
             )
-        )
+        if success:
+            successful_candidates += 1
+        elif error is not None:
+            warnings.append(f"{candidate_id}: {error}")
         rows.append(
             ppiflow_manifests.candidate_manifest_row(
                 candidate_id=candidate_id,
@@ -1808,13 +2069,13 @@ def run_ppiflow_rosetta_stage(
                 candidate_status=status.value,
                 source_path=str(row["pdb"]),
                 derived_path=str(row["expected_output_dir"]),
-                error=error or None,
+                error=error,
                 files=[
                     ppiflow_manifests.candidate_file_record(
                         role="score",
                         volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
                         app_volume_path=str(
-                            Path(str(staged["run_name"]) + "-" + str(staged["run_id"]))
+                            Path(str(plan["run_name"]) + "-" + str(plan["run_id"]))
                             / str(row["expected_score_file"])
                         ),
                         expected=True,
@@ -1823,13 +2084,16 @@ def run_ppiflow_rosetta_stage(
                         role="worker_log",
                         volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
                         app_volume_path=str(
-                            Path(str(staged["run_name"]) + "-" + str(staged["run_id"]))
+                            Path(str(plan["run_name"]) + "-" + str(plan["run_id"]))
                             / str(row["worker_log"])
                         ),
                         expected=log_path.is_file(),
                     ),
                 ],
-                summary={"index": row["index"], "num_pods": num_pods},
+                summary={
+                    "index": row["index"],
+                    "num_pods": _config_int(plan, "worker_count", 0),
+                },
             )
         )
 
@@ -1839,42 +2103,45 @@ def run_ppiflow_rosetta_stage(
         step_name=step_name,
         rows=rows,
     )
-    status = ppiflow_coordinators.status_from_candidate_outcomes(outcomes)
-    warnings = [
-        f"{outcome.candidate_id}: {outcome.error}"
-        for outcome in outcomes
-        if outcome.error
-    ] + cleanup_warnings
     return AppRunResult(
-        status=status,
+        status=(
+            AppRunStatus.SUCCEEDED if successful_candidates else AppRunStatus.FAILED
+        ),
         outputs=[
             volume_app_output(
                 name="rosetta_outputs",
                 kind=ArtifactKind.STRUCTURES,
-                remote_path=str(staged["run_root"]),
+                remote_path=str(plan["run_root"]),
                 mount_root=ROSETTA_OUTPUT_MOUNTPOINT,
                 volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
                 metadata={
                     "step_name": step_name,
-                    "run_name": str(staged["run_name"]),
-                    "run_id": str(staged["run_id"]),
-                    "num_jobs": num_jobs,
-                    "num_pods": num_pods,
+                    "run_name": str(plan["run_name"]),
+                    "run_id": str(plan["run_id"]),
+                    "num_jobs": _config_int(plan, "num_jobs", 0),
+                    "num_pods": _config_int(plan, "worker_count", 0),
                     "structure_patterns": APP_RUN_OUTPUT_STRUCTURE_PATTERNS,
                 },
             ),
             volume_app_output(
                 name="rosetta_job_manifest",
                 kind=ArtifactKind.TABLE,
-                remote_path=str(staged["job_manifest"]),
+                remote_path=str(plan["job_manifest"]),
                 mount_root=ROSETTA_OUTPUT_MOUNTPOINT,
                 volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
                 media_type="text/csv",
-                metadata={"step_name": step_name, "rows": num_jobs},
+                metadata={
+                    "step_name": step_name,
+                    "rows": _config_int(plan, "num_jobs", 0),
+                },
             ),
             manifest_output,
         ],
         warnings=warnings,
+        metrics={
+            "successful_candidates": successful_candidates,
+            "failed_candidates": len(rows) - successful_candidates,
+        },
     )
 
 
@@ -2258,16 +2525,16 @@ class AF3ScoreNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class _RosettaNode(_ConfiguredAppStepNode):
-    """Base class for PPIFlow Rosetta steps."""
+class RosettaPrepareNode(_ConfiguredAppStepNode):
+    """Stage PPIFlow candidates and publish a finite Rosetta Task plan."""
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare Rosetta staging and workers as one workflow stage call."""
+        """Prepare the Rosetta input and job manifests without nested calls."""
         structures = context.inputs.get("structures") or []
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
         return RemoteNodeCall(
-            function_name="run_ppiflow_rosetta_stage",
+            function_name="prepare_ppiflow_rosetta_stage",
             uses_gpu=False,
             kwargs={
                 "artifacts": structures,
@@ -2278,6 +2545,146 @@ class _RosettaNode(_ConfiguredAppStepNode):
                 "run_id": context.workload_run_key,
                 "node_id": context.node_id,
             },
+            runtime_image_key="rosetta-stage-cpu",
+        )
+
+
+@dataclass
+class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
+    """Execute staged Rosetta candidates through kernel-owned pull Tasks."""
+
+    def _plan(self, context: NodeRunContext) -> dict[str, object]:
+        artifacts = context.inputs.get("rosetta_plan") or []
+        if len(artifacts) != 1:
+            raise ValueError(f"Expected one Rosetta task plan, found {len(artifacts)}")
+        return _load_rosetta_plan(context.resolve_workflow_artifact(artifacts[0]))
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Discover the complete staged Rosetta Task set in manifest order."""
+        plan = self._plan(context)
+        run_root = (
+            Path(str(plan["run_root"]))
+            .relative_to(ROSETTA_OUTPUT_MOUNTPOINT)
+            .as_posix()
+        )
+        return tuple(
+            RemoteWorkflowTask(
+                task_key=task.task_key,
+                scientific_payload=task.scientific_payload,
+                execution_payload={
+                    "task": task.to_dict(),
+                    "run_root": run_root,
+                },
+            )
+            for task in (
+                RosettaTaskSpec.from_dict(value)
+                for value in cast(list[object], plan["tasks"])
+            )
+        )
+
+    def prepare_pull_worker(
+        self,
+        context: NodeRunContext,
+    ) -> RemotePullWorkerCall:
+        """Bind the derived worker pool to the workflow's Rosetta function."""
+        plan = self._plan(context)
+        return RemotePullWorkerCall(
+            function_name="run_ppiflow_rosetta_worker",
+            uses_gpu=False,
+            claim_capacity=_config_int(plan, "claim_capacity", 0),
+            kwargs={
+                "run_name": str(plan["run_name"]),
+                "run_id": str(plan["run_id"]),
+                "claim_capacity": _config_int(plan, "claim_capacity", 0),
+                "max_parallel": _config_int(
+                    plan,
+                    "max_parallel_per_worker",
+                    0,
+                ),
+            },
+            runtime_image_key="rosetta-cpu",
+            compatibility_key=f"{plan['run_name']}:{plan['run_id']}",
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[WorkflowArtifact, ...],
+    ) -> AvailabilityStatus:
+        """Revalidate the fingerprint-bound Rosetta marker and required files."""
+        del context, result, artifacts
+        payload = task.execution_payload
+        if not isinstance(payload, Mapping):
+            raise TypeError("Rosetta Task execution payload must be an object")
+        spec = RosettaTaskSpec.from_dict(payload.get("task"))
+        run_root = payload.get("run_root")
+        if not isinstance(run_root, str):
+            raise TypeError("Rosetta Task run_root must be text")
+        try:
+            available = validate_task_publication_from_volume(
+                ROSETTA_OUTPUT_VOLUME,
+                run_root,
+                spec,
+                expected_fingerprint,
+            )
+        except Exception:  # noqa: BLE001
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Publish a deterministic outcome summary for remote finalization."""
+        del context
+        status = (
+            AppRunStatus.PARTIAL
+            if results and errors
+            else AppRunStatus.SUCCEEDED
+            if not errors
+            else AppRunStatus.FAILED
+        )
+        return AppRunResult(
+            status=status,
+            outputs=[_rosetta_task_outcomes_artifact(results, errors)],
+            warnings=[f"{task_key}: {errors[task_key]}" for task_key in sorted(errors)],
+            metrics={
+                "successful_candidates": len(results),
+                "failed_candidates": len(errors),
+            },
+        )
+
+
+@dataclass
+class _RosettaNode(_ConfiguredAppStepNode):
+    """Finalize one PPIFlow Rosetta stage from durable Task outcomes."""
+
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Validate remote outputs and publish the established stage contract."""
+        plan_artifacts = context.inputs.get("rosetta_plan") or []
+        outcome_artifacts = context.inputs.get("rosetta_outcomes") or []
+        if not plan_artifacts or not outcome_artifacts:
+            raise ValueError(f"{self.step_name} requires Rosetta Task results")
+        return RemoteNodeCall(
+            function_name="finalize_ppiflow_rosetta_stage",
+            uses_gpu=False,
+            kwargs={
+                "plan_artifacts": plan_artifacts,
+                "outcome_artifacts": outcome_artifacts,
+                "config": self.config,
+                "step_name": self.step_name,
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+            },
+            runtime_image_key="rosetta-finalize-cpu",
         )
 
 
@@ -3597,6 +4004,42 @@ def _add_af3score_nodes(
     )
 
 
+def _add_rosetta_nodes(
+    *,
+    workflow: Workflow,
+    node_id: str,
+    step_name: str,
+    finalizer_class: type[_RosettaNode],
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    accept_partial_from: list[Any] | None,
+):
+    """Add prepare, pull-worker, and publication Nodes for Rosetta."""
+    prepare = workflow.add_node(
+        RosettaPrepareNode(step_name, config),
+        id=f"{node_id}-prepare",
+        inputs=inputs,
+        accept_partial_from=accept_partial_from,
+    )
+    workers = workflow.add_node(
+        RosettaWorkerNode(step_name, config),
+        id=f"{node_id}-workers",
+        inputs={
+            "rosetta_plan": prepare.outputs(kind=ArtifactKind.TABLE),
+        },
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+    return workflow.add_node(
+        finalizer_class(step_name, config),
+        id=node_id,
+        inputs={
+            "rosetta_plan": prepare.outputs(kind=ArtifactKind.TABLE),
+            "rosetta_outcomes": workers.outputs(kind=ArtifactKind.TABLE),
+        },
+        accept_partial_from=[workers],
+    )
+
+
 def _add_stage2_nodes(
     *,
     workflow: Workflow,
@@ -3611,16 +4054,16 @@ def _add_stage2_nodes(
     tail = upstream
     partial_tail = upstream if upstream_allows_partial else None
     if _step_enabled(enabled, "RosettaFixStep"):
-        tail = workflow.add_node(
-            RosettaFixNode(
+        tail = _add_rosetta_nodes(
+            workflow=workflow,
+            node_id="stage2-rosetta-fix",
+            step_name="RosettaFixStep",
+            finalizer_class=RosettaFixNode,
+            config=_step_cfg_with_candidate_concurrency(
+                steps,
                 "RosettaFixStep",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "RosettaFixStep",
-                    candidate_concurrency,
-                ),
+                candidate_concurrency,
             ),
-            id="stage2-rosetta-fix",
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -3777,16 +4220,16 @@ def _add_stage2_nodes(
         inputs = _structure_inputs(filtered)
         if dockq is not None:
             inputs["dockq"] = dockq.outputs(kind=ArtifactKind.SCORES)
-        relaxed = workflow.add_node(
-            RosettaRelaxNode(
+        relaxed = _add_rosetta_nodes(
+            workflow=workflow,
+            node_id="stage2-rosetta-relax",
+            step_name="RosettaRelaxStep",
+            finalizer_class=RosettaRelaxNode,
+            config=_step_cfg_with_candidate_concurrency(
+                steps,
                 "RosettaRelaxStep",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "RosettaRelaxStep",
-                    candidate_concurrency,
-                ),
+                candidate_concurrency,
             ),
-            id="stage2-rosetta-relax",
             inputs=inputs,
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -4156,7 +4599,9 @@ def submit_ppiflow_workflow(
             "prepare_ppiflow_af3score_stage": prepare_ppiflow_af3score_stage,
             "run_ppiflow_af3score_batch": run_ppiflow_af3score_batch,
             "postprocess_ppiflow_af3score_stage": (postprocess_ppiflow_af3score_stage),
-            "run_ppiflow_rosetta_stage": run_ppiflow_rosetta_stage,
+            "prepare_ppiflow_rosetta_stage": prepare_ppiflow_rosetta_stage,
+            "run_ppiflow_rosetta_worker": run_ppiflow_rosetta_worker,
+            "finalize_ppiflow_rosetta_stage": finalize_ppiflow_rosetta_stage,
             "run_ppiflow_refold_candidate": run_ppiflow_refold_candidate,
             "run_ppiflow_dockq_stage": run_ppiflow_dockq_stage,
             "filter_ppiflow_artifacts": filter_ppiflow_artifacts,

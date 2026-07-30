@@ -445,7 +445,7 @@ def rosetta_job_manifest_rows(
     rosetta_script: str | None = None,
     flags_file: str | None = None,
 ) -> list[dict[str, object]]:
-    """Build PPIFlow-owned Rosetta queue/job manifest rows."""
+    """Build PPIFlow-owned Rosetta job manifest rows."""
     rows = []
     for index, structure in enumerate(structures, start=1):
         input_pdb = f"inputs/{index}/{sanitize_filename(structure.candidate_id)}.pdb"

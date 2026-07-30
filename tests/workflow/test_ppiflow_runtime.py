@@ -3,6 +3,7 @@
 # ruff: noqa: D101, D102, D103, D107
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -27,6 +28,7 @@ from biomodals.schema import (
     ArtifactKind,
     InlineBytes,
 )
+from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.core import NodeRunContext, Workflow, WorkflowNativeNode
 from biomodals.workflow.core.runtime import WorkflowRuntime
 from biomodals.workflow.ppiflow import manifests
@@ -34,6 +36,8 @@ from biomodals.workflow.ppiflow_workflow import (
     LigandMPNNNode,
     PPIFlowPartialNode,
     ReFoldNode,
+    RosettaTaskSpec,
+    RosettaWorkerNode,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -95,10 +99,45 @@ class CandidateSourceNode(WorkflowNativeNode):
         )
 
 
+@dataclass
+class RosettaPlanSourceNode(WorkflowNativeNode):
+    tasks: tuple[RosettaTaskSpec, ...]
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        run_root = (
+            Path(ppiflow_workflow.ROSETTA_OUTPUT_MOUNTPOINT) / "rosetta-run-rosetta-id"
+        )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="rosetta_task_plan",
+                    kind=ArtifactKind.TABLE,
+                    storage=InlineBytes(
+                        data=json.dumps({
+                            "schema_version": 1,
+                            "run_name": "rosetta-run",
+                            "run_id": "rosetta-id",
+                            "run_root": str(run_root),
+                            "job_manifest": str(run_root / "rosetta_job_manifest.csv"),
+                            "num_jobs": len(self.tasks),
+                            "worker_count": 1,
+                            "claim_capacity": len(self.tasks),
+                            "max_parallel_per_worker": len(self.tasks),
+                            "tasks": [task.to_dict() for task in self.tasks],
+                        }).encode(),
+                        filename="rosetta_task_plan.json",
+                        media_type="application/json",
+                    ),
+                )
+            ],
+        )
+
+
 class FakeModalDriver:
     def __init__(self) -> None:
         self.events: list[str] = []
-        self.results: dict[str, AppRunResult] = {}
+        self.results: dict[str, object] = {}
 
     def resolve(self, binding):
         self.events.append(f"resolve:{binding.function_name}")
@@ -135,6 +174,15 @@ class FakeModalDriver:
 
     def cancel(self, provider_call_handle_id):
         del provider_call_handle_id
+
+
+class RosettaPullModalDriver(FakeModalDriver):
+    def spawn(self, function, *, args, kwargs):
+        del args
+        self.events.append(f"spawn:{function}")
+        call_id = "fc-rosetta-worker"
+        self.results[call_id] = {"claimed_tasks": 2, "claim_requests": 2}
+        return call_id
 
 
 @pytest.mark.parametrize(
@@ -223,3 +271,115 @@ def test_ppiflow_candidates_are_independent_kernel_tasks(
         "candidate-a",
         "candidate-b",
     ]
+
+
+def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks = tuple(
+        RosettaTaskSpec(
+            task_key=candidate_id,
+            index=index,
+            binary="relax",
+            pdb=f"inputs/{index}/{candidate_id}.pdb",
+            rosetta_script=None,
+            flags_file=None,
+            output_dir=f"outputs/{index}",
+            worker_log=f"logs/{index}.log",
+            expected_files=(f"outputs/{index}/score.sc",),
+            input_sha256=f"{index}" * 64,
+            candidate_id=candidate_id,
+        )
+        for index, candidate_id in enumerate(
+            ("candidate-a", "candidate-b"),
+            start=1,
+        )
+    )
+    workflow = Workflow("ppiflow-rosetta-pull")
+    source = workflow.add_node(RosettaPlanSourceNode(tasks), id="prepare")
+    workflow.add_node(
+        RosettaWorkerNode("RosettaRelaxStep", {}),
+        id="workers",
+        inputs={
+            "rosetta_plan": source.outputs(kind=ArtifactKind.TABLE),
+        },
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "validate_task_publication_from_volume",
+        lambda *_args: True,
+    )
+    driver = RosettaPullModalDriver()
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        modal_driver=driver,
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
+        pull_worker_coordinator="run-pool",
+        now=iter(range(100, 1000)).__next__,
+        poll_interval_seconds=0,
+    )
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "ppiflow-rosetta-pull"
+    runtime._ensure_run(definition, "ppiflow-rosetta-pull")
+    for _ in range(3):
+        runtime.advance_once()
+        calls = runtime.store.execution.list_provider_calls(RUN_ID)
+        if calls:
+            break
+    [call] = calls
+    claim = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+    )
+    assert [assignment.task_key for assignment in claim.assignments] == [
+        "candidate-a",
+        "candidate-b",
+    ]
+    runtime.complete_pull_task(
+        call.provider_call_id,
+        "candidate-a",
+        request_id="complete-a",
+        result=AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="receipt",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=b"candidate-a",
+                        filename="candidate-a.txt",
+                        media_type="text/plain",
+                    ),
+                )
+            ],
+        ),
+    )
+    runtime.complete_pull_task(
+        call.provider_call_id,
+        "candidate-b",
+        request_id="complete-b",
+        result=AppRunResult(
+            status=AppRunStatus.FAILED,
+            warnings=["Rosetta failed"],
+        ),
+    )
+
+    result = runtime.run(workload_run_key="ppiflow-rosetta-pull")
+
+    assert result.status == AppRunStatus.PARTIAL
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "workers")
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED]
+    assert runtime.store.execution.get_node(RUN_ID, "workers").status == (
+        NodeStatus.PARTIAL
+    )
+    assert driver.events.count("spawn:run_ppiflow_rosetta_worker") == 1

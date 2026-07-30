@@ -17,6 +17,8 @@ import pytest
 import zstandard as zstd
 
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
+from biomodals.execution import PullTaskClaim, WorkerAssignmentRecord
+from biomodals.helper import shell as shell_helper
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
@@ -30,6 +32,7 @@ from biomodals.schema import (
 from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.core import (
     NodeRunContext,
+    RemotePullTaskWorkflowNode,
     RemoteWorkflowNode,
 )
 from biomodals.workflow.core._runtime import hashing
@@ -206,7 +209,15 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     )
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
-        "run_ppiflow_rosetta_stage",
+        "prepare_ppiflow_rosetta_stage",
+    )
+    assert "ROSETTA_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_rosetta_worker",
+    )
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "finalize_ppiflow_rosetta_stage",
     )
 
 
@@ -968,19 +979,70 @@ def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
     assert result.status == AppRunStatus.PARTIAL
 
 
-def test_rosetta_step_submits_stage_wrapper(
+def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
     tmp_path: Path,
 ) -> None:
-    node = ppiflow_workflow.RosettaRelaxNode(
+    task = ppiflow_workflow.RosettaTaskSpec(
+        task_key="candidate-a",
+        index=1,
+        binary="relax",
+        pdb="inputs/1/candidate-a.pdb",
+        rosetta_script=None,
+        flags_file=None,
+        output_dir="outputs/1",
+        worker_log="logs/1.log",
+        expected_files=("outputs/1/score.sc",),
+        input_sha256="a" * 64,
+        candidate_id="candidate-a",
+    )
+    plan_path = tmp_path / "rosetta-plan.json"
+    plan_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "run_name": "rosetta-run",
+            "run_id": "rosetta-id",
+            "run_root": str(
+                Path(ppiflow_workflow.ROSETTA_OUTPUT_MOUNTPOINT)
+                / "rosetta-run-rosetta-id"
+            ),
+            "job_manifest": str(
+                Path(ppiflow_workflow.ROSETTA_OUTPUT_MOUNTPOINT)
+                / "rosetta-run-rosetta-id"
+                / "rosetta_job_manifest.csv"
+            ),
+            "num_jobs": 1,
+            "worker_count": 1,
+            "claim_capacity": 1,
+            "max_parallel_per_worker": 1,
+            "tasks": [task.to_dict()],
+        }),
+        encoding="utf-8",
+    )
+    plan_artifact = WorkflowArtifact(
+        artifact_id="rosetta-plan",
+        producing_node_id="stage2-rosetta-relax-prepare",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=plan_path.name,
+            media_type="application/json",
+        ),
+    )
+    outcome_artifact = plan_artifact.model_copy(
+        update={
+            "artifact_id": "rosetta-outcomes",
+            "producing_node_id": "stage2-rosetta-relax-workers",
+        }
+    )
+    prepare_node = ppiflow_workflow.RosettaPrepareNode(
         "RosettaRelaxStep",
         {"run_name": "rosetta-run", "rosetta_binary": "relax", "max_num_pods": 1},
     )
-
-    submission = node.prepare_remote(
+    prepare_call = prepare_node.prepare_remote(
         NodeRunContext(
             execution_run_id=RUN_ID,
             workload_run_key="run-1",
-            node_id="stage2-rosetta-relax",
+            node_id="stage2-rosetta-relax-prepare",
             task_key="node",
             work_dir=tmp_path / "result",
             cache_dir=tmp_path / "cache",
@@ -992,16 +1054,209 @@ def test_rosetta_step_submits_stage_wrapper(
             },
         )
     )
-
-    assert submission.function_name == "run_ppiflow_rosetta_stage"
-    assert submission.kwargs["run_name"] == "rosetta-run"
-    assert submission.kwargs["config"]["rosetta_binary"] == "relax"
-    assert submission.kwargs["candidate_manifests"] == [
+    assert prepare_call.function_name == "prepare_ppiflow_rosetta_stage"
+    assert prepare_call.kwargs["run_name"] == "rosetta-run"
+    assert prepare_call.kwargs["config"]["rosetta_binary"] == "relax"
+    assert prepare_call.kwargs["candidate_manifests"] == [
         _upstream_structure_artifact(kind=ArtifactKind.TABLE)
     ]
 
+    worker_node = ppiflow_workflow.RosettaWorkerNode(
+        "RosettaRelaxStep",
+        {"run_name": "rosetta-run"},
+    )
+    worker_context = NodeRunContext(
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
+        node_id="stage2-rosetta-relax-workers",
+        task_key="node",
+        work_dir=tmp_path / "worker-result",
+        cache_dir=tmp_path / "worker-cache",
+        inputs={"rosetta_plan": [plan_artifact]},
+        volume_root=tmp_path,
+        workflow_volume_name="workflow-volume",
+    )
+    assert isinstance(worker_node, RemotePullTaskWorkflowNode)
+    [discovered] = worker_node.discover_remote_tasks(worker_context)
+    assert discovered.task_key == "candidate-a"
+    assert discovered.scientific_payload == task.scientific_payload
+    worker_call = worker_node.prepare_pull_worker(worker_context)
+    assert worker_call.function_name == "run_ppiflow_rosetta_worker"
+    assert worker_call.claim_capacity == 1
+    assert worker_call.kwargs["max_parallel"] == 1
 
-def test_rosetta_stage_records_partial_candidate_manifest(
+    finalizer = ppiflow_workflow.RosettaRelaxNode(
+        "RosettaRelaxStep",
+        {"run_name": "rosetta-run"},
+    )
+    finalizer_call = finalizer.prepare_remote(
+        replace(
+            worker_context,
+            node_id="stage2-rosetta-relax",
+            inputs={
+                "rosetta_plan": [plan_artifact],
+                "rosetta_outcomes": [outcome_artifact],
+            },
+        )
+    )
+    assert finalizer_call.function_name == "finalize_ppiflow_rosetta_stage"
+    assert finalizer_call.kwargs["plan_artifacts"] == [plan_artifact]
+    assert finalizer_call.kwargs["outcome_artifacts"] == [outcome_artifact]
+
+
+def test_rosetta_prepare_publishes_deterministic_task_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root, _ = _local_transform_environment(monkeypatch, tmp_path)
+    structures = source_root / "upstream" / "results"
+    structures.mkdir(parents=True)
+    (structures / "b.pdb").write_text("ATOM B\n", encoding="utf-8")
+    (structures / "a.pdb").write_text("ATOM A\n", encoding="utf-8")
+    rosetta_root = tmp_path / "rosetta"
+    commits = []
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ROSETTA_OUTPUT_MOUNTPOINT",
+        str(rosetta_root),
+    )
+    monkeypatch.setattr(ppiflow_workflow, "ROSETTA_OUTPUT_VOLUME_NAME", "rosetta-vol")
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ROSETTA_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: commits.append(True)),
+    )
+    run_root = rosetta_root / "rosetta-run-run-1-stage2-rosetta-relax-prepare"
+    preserved_output = run_root / "outputs" / "1" / "score.sc"
+    preserved_output.parent.mkdir(parents=True)
+    preserved_output.write_text("CACHED\n", encoding="utf-8")
+    preserved_marker = run_root / ".biomodals" / "tasks" / "existing.json"
+    preserved_marker.parent.mkdir(parents=True)
+    preserved_marker.write_text("{}\n", encoding="utf-8")
+
+    result = ppiflow_workflow.prepare_ppiflow_rosetta_stage.get_raw_f()(
+        artifacts=[_upstream_structure_artifact()],
+        candidate_manifests=[],
+        config={"rosetta_binary": "relax", "max_num_pods": 2},
+        step_name="RosettaRelaxStep",
+        run_name="rosetta-run",
+        run_id="run-1",
+        node_id="stage2-rosetta-relax-prepare",
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    [output] = result.outputs
+    assert isinstance(output.storage, InlineBytes)
+    plan = json.loads(output.storage.data)
+    assert plan["num_jobs"] == 2
+    assert plan["worker_count"] == 1
+    assert plan["claim_capacity"] == 2
+    assert [task["candidate_id"] for task in plan["tasks"]] == ["a", "b"]
+    assert [task["index"] for task in plan["tasks"]] == [1, 2]
+    assert [task["input_sha256"] for task in plan["tasks"]] == [
+        hashlib.sha256(b"ATOM A\n").hexdigest(),
+        hashlib.sha256(b"ATOM B\n").hexdigest(),
+    ]
+    assert Path(plan["job_manifest"]).is_file()
+    assert preserved_output.read_text(encoding="utf-8") == "CACHED\n"
+    assert preserved_marker.read_text(encoding="utf-8") == "{}\n"
+    assert commits == [True]
+    source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
+    assert "modal.Queue" not in source
+
+
+def test_rosetta_worker_claims_executes_and_checkpoints_each_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_call_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    task = ppiflow_workflow.RosettaTaskSpec(
+        task_key="candidate-a",
+        index=1,
+        binary="relax",
+        pdb="inputs/1/candidate-a.pdb",
+        rosetta_script=None,
+        flags_file=None,
+        output_dir="outputs/1",
+        worker_log="logs/1.log",
+        expected_files=("outputs/1/score.sc",),
+        input_sha256="a" * 64,
+        candidate_id="candidate-a",
+    )
+    assignment = WorkerAssignmentRecord(
+        execution_run_id=RUN_ID,
+        node_key="stage2-rosetta-relax-workers",
+        task_key=task.task_key,
+        task_fingerprint="task-fingerprint",
+        execution_payload={"task": task.to_dict(), "run_root": "unused"},
+        provider_call_id=provider_call_id,
+        request_id="claim",
+        ordinal=0,
+        created_at=1,
+    )
+    claim_count = 0
+    completions = []
+
+    def claim(call_id, request_id, capacity):
+        nonlocal claim_count
+        assignments = (assignment,) if claim_count == 0 else ()
+        claim_count += 1
+        return PullTaskClaim(
+            request_id=request_id,
+            provider_call_id=provider_call_id,
+            assignments=assignments,
+        )
+
+    def complete(call_id, task_key, request_id, result):
+        completions.append((call_id, task_key, request_id, result))
+
+    coordinator = SimpleNamespace(
+        claim_tasks=SimpleNamespace(remote=claim),
+        complete_task=SimpleNamespace(remote=complete),
+    )
+    commits = []
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ROSETTA_OUTPUT_MOUNTPOINT",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ROSETTA_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: commits.append(True)),
+    )
+
+    def run_command(command, *, output_mode, log_file):
+        assert output_mode == "capture"
+        Path(command[-1], "score.sc").write_text("SCORE\n", encoding="utf-8")
+        Path(log_file).write_text("worker log\n", encoding="utf-8")
+
+    monkeypatch.setattr(shell_helper, "run_command", run_command)
+    run_root = tmp_path / "rosetta-run-rosetta-id"
+    input_pdb = run_root / task.pdb
+    input_pdb.parent.mkdir(parents=True)
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+
+    summary = ppiflow_workflow.run_ppiflow_rosetta_worker.get_raw_f()(
+        coordinator=coordinator,
+        provider_call_id=str(provider_call_id),
+        run_name="rosetta-run",
+        run_id="rosetta-id",
+        claim_capacity=1,
+        max_parallel=1,
+    )
+
+    assert summary == {"claimed_tasks": 1, "claim_requests": 2}
+    assert completions[0][0:3] == (
+        str(provider_call_id),
+        "candidate-a",
+        f"{provider_call_id}:complete:task-fingerprint",
+    )
+    assert completions[0][3].status == AppRunStatus.SUCCEEDED
+    assert commits == [True, True]
+
+
+def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1032,20 +1287,69 @@ def test_rosetta_stage_records_partial_candidate_manifest(
         },
     ]).write_csv(job_manifest)
 
-    def fake_stage_rosetta(**kwargs):
-        _ = kwargs
-        return {
+    tasks = [
+        ppiflow_workflow.RosettaTaskSpec(
+            task_key=candidate_id,
+            index=index,
+            binary="relax",
+            pdb=f"inputs/{index}/{candidate_id}.pdb",
+            rosetta_script=None,
+            flags_file=None,
+            output_dir=f"outputs/{index}",
+            worker_log=f"logs/{index}.log",
+            expected_files=(f"outputs/{index}/score.sc",),
+            input_sha256=f"{index}" * 64,
+            candidate_id=candidate_id,
+        )
+        for index, candidate_id in enumerate(
+            ("candidate-a", "candidate-b"),
+            start=1,
+        )
+    ]
+    plan_path = workflow_root / "rosetta-plan.json"
+    plan_path.write_text(
+        json.dumps({
+            "schema_version": 1,
             "run_name": "rosetta-run",
             "run_id": "rosetta-id",
             "run_root": str(run_root),
             "num_jobs": 2,
             "job_manifest": str(job_manifest),
-        }
-
-    monkeypatch.setattr(
-        ppiflow_workflow,
-        "stage_rosetta_inputs",
-        SimpleNamespace(get_raw_f=lambda: fake_stage_rosetta),
+            "worker_count": 1,
+            "claim_capacity": 2,
+            "max_parallel_per_worker": 2,
+            "tasks": [task.to_dict() for task in tasks],
+        }),
+        encoding="utf-8",
+    )
+    outcomes_path = workflow_root / "rosetta-outcomes.json"
+    outcomes_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "succeeded": ["candidate-a"],
+            "errors": {"candidate-b": "worker failed"},
+        }),
+        encoding="utf-8",
+    )
+    plan_artifact = WorkflowArtifact(
+        artifact_id="rosetta-plan",
+        producing_node_id="stage2-rosetta-relax-prepare",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=plan_path.name,
+            media_type="application/json",
+        ),
+    )
+    outcomes_artifact = WorkflowArtifact(
+        artifact_id="rosetta-outcomes",
+        producing_node_id="stage2-rosetta-relax-workers",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=outcomes_path.name,
+            media_type="application/json",
+        ),
     )
     monkeypatch.setattr(
         ppiflow_workflow,
@@ -1058,27 +1362,17 @@ def test_rosetta_stage_records_partial_candidate_manifest(
         "ROSETTA_OUTPUT_VOLUME",
         SimpleNamespace(reload=lambda: None),
     )
-    monkeypatch.setattr(
-        ppiflow_workflow,
-        "bounded_map",
-        lambda items, _worker, *, max_parallel: [None for _ in items],
-    )
-    monkeypatch.setattr(
-        ppiflow_workflow.modal,
-        "Queue",
-        SimpleNamespace(objects=SimpleNamespace(delete=lambda _name: None)),
-    )
 
-    result = ppiflow_workflow.run_ppiflow_rosetta_stage.get_raw_f()(
-        artifacts=[_upstream_structure_artifact()],
+    result = ppiflow_workflow.finalize_ppiflow_rosetta_stage.get_raw_f()(
+        plan_artifacts=[plan_artifact],
+        outcome_artifacts=[outcomes_artifact],
         config={"rosetta_binary": "relax", "max_num_pods": 1},
         step_name="RosettaRelaxStep",
-        run_name="rosetta-run",
         run_id="run-1",
         node_id="stage2-rosetta-relax",
     )
 
-    assert result.status == AppRunStatus.PARTIAL
+    assert result.status == AppRunStatus.SUCCEEDED
     assert [output.name for output in result.outputs] == [
         "rosetta_outputs",
         "rosetta_job_manifest",
@@ -1091,6 +1385,11 @@ def test_rosetta_stage_records_partial_candidate_manifest(
         {"candidate_id": "candidate-a", "candidate_status": "succeeded"},
         {"candidate_id": "candidate-b", "candidate_status": "failed"},
     ]
+    assert result.metrics == {
+        "successful_candidates": 1,
+        "failed_candidates": 1,
+    }
+    assert result.warnings == ["candidate-b: worker failed"]
 
 
 def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> None:
@@ -1813,6 +2112,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage1-af3score-batches",
         "stage1-af3score",
         "stage1-filter",
+        "stage2-rosetta-fix-prepare",
+        "stage2-rosetta-fix-workers",
         "stage2-rosetta-fix",
         "stage2-fixed-positions",
         "stage2-partial-ppiflow",
@@ -1824,6 +2125,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-filter",
         "stage2-alphafold3-refold",
         "stage2-dockq",
+        "stage2-rosetta-relax-prepare",
+        "stage2-rosetta-relax-workers",
         "stage2-rosetta-relax",
         "stage2-rank",
         "stage2-report",
@@ -1838,6 +2141,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "AF3ScoreBatchNode",
         "AF3ScoreNode",
         "FilterStructuresNode",
+        "RosettaPrepareNode",
+        "RosettaWorkerNode",
         "RosettaFixNode",
         "FixedPositionsNode",
         "PPIFlowPartialNode",
@@ -1849,11 +2154,21 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "FilterStructuresNode",
         "ReFoldNode",
         "DockQNode",
+        "RosettaPrepareNode",
+        "RosettaWorkerNode",
         "RosettaRelaxNode",
         "RankNode",
         "ReportNode",
     ]
     assert definition.dependencies["stage2-fixed-positions"] == {"stage2-rosetta-fix"}
+    assert definition.dependencies["stage2-rosetta-fix-prepare"] == {"stage1-filter"}
+    assert definition.dependencies["stage2-rosetta-fix-workers"] == {
+        "stage2-rosetta-fix-prepare"
+    }
+    assert definition.dependencies["stage2-rosetta-fix"] == {
+        "stage2-rosetta-fix-prepare",
+        "stage2-rosetta-fix-workers",
+    }
     assert definition.dependencies["stage1-af3score-batches"] == {
         "stage1-af3score-prepare"
     }
@@ -1893,9 +2208,16 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     assert definition.nodes["stage2-dockq"].partial_dependencies == {
         "stage2-alphafold3-refold"
     }
-    assert definition.dependencies["stage2-rosetta-relax"] == {
+    assert definition.dependencies["stage2-rosetta-relax-prepare"] == {
         "stage2-filter",
         "stage2-dockq",
+    }
+    assert definition.dependencies["stage2-rosetta-relax-workers"] == {
+        "stage2-rosetta-relax-prepare"
+    }
+    assert definition.dependencies["stage2-rosetta-relax"] == {
+        "stage2-rosetta-relax-prepare",
+        "stage2-rosetta-relax-workers",
     }
     assert definition.dependencies["stage2-rank"] == {
         "stage2-af3score",
@@ -1957,7 +2279,7 @@ def test_ppiflow_candidate_manifest_edges_select_manifest_role() -> None:
         "stage1-ligandmpnn": "stage1-ppiflow-design",
         "stage1-af3score-prepare": "stage1-ligandmpnn",
         "stage1-filter": "stage1-ligandmpnn",
-        "stage2-rosetta-fix": "stage1-filter",
+        "stage2-rosetta-fix-prepare": "stage1-filter",
         "stage2-fixed-positions": "stage2-rosetta-fix",
         "stage2-partial-ppiflow": "stage2-fixed-positions",
         "stage2-ligandmpnn": "stage2-partial-ppiflow",
@@ -1965,7 +2287,7 @@ def test_ppiflow_candidate_manifest_edges_select_manifest_role() -> None:
         "stage2-filter": "stage2-ligandmpnn",
         "stage2-alphafold3-refold": "stage2-filter",
         "stage2-dockq": "stage2-filter",
-        "stage2-rosetta-relax": "stage2-filter",
+        "stage2-rosetta-relax-prepare": "stage2-filter",
         "stage2-rank": "stage2-rosetta-relax",
     }
     for node_id, source_node_id in expected_manifest_sources.items():
@@ -1997,8 +2319,11 @@ def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> No
 
     definition = workflow.validate()
 
+    assert "stage1-filter" in _manifest_ancestor_chain(
+        definition,
+        "stage2-rosetta-fix-prepare",
+    )
     stage1_retained_path = [
-        "stage2-rosetta-fix",
         "stage2-fixed-positions",
         "stage2-partial-ppiflow",
         "stage2-ligandmpnn",
@@ -2006,16 +2331,22 @@ def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> No
         "stage2-filter",
     ]
     for node_id in stage1_retained_path:
-        assert "stage1-filter" in _manifest_ancestor_chain(definition, node_id)
+        assert "stage2-rosetta-fix" in _manifest_ancestor_chain(
+            definition,
+            node_id,
+        )
 
     stage2_retained_path = [
         "stage2-alphafold3-refold",
         "stage2-dockq",
-        "stage2-rosetta-relax",
-        "stage2-rank",
+        "stage2-rosetta-relax-prepare",
     ]
     for node_id in stage2_retained_path:
         assert "stage2-filter" in _manifest_ancestor_chain(definition, node_id)
+    assert "stage2-rosetta-relax" in _manifest_ancestor_chain(
+        definition,
+        "stage2-rank",
+    )
 
 
 def test_ppiflow_candidate_concurrency_is_copied_to_node_configs() -> None:
@@ -2104,19 +2435,30 @@ RosettaFixStep: {}
 
     assert list(definition.nodes) == [
         "stage2-existing-input",
+        "stage2-rosetta-fix-prepare",
+        "stage2-rosetta-fix-workers",
         "stage2-rosetta-fix",
     ]
     assert isinstance(
         definition.nodes["stage2-existing-input"].node,
         ppiflow_workflow.ExistingStructuresNode,
     )
-    assert definition.dependencies["stage2-rosetta-fix"] == {"stage2-existing-input"}
+    assert definition.dependencies["stage2-rosetta-fix-prepare"] == {
+        "stage2-existing-input"
+    }
+    assert definition.dependencies["stage2-rosetta-fix-workers"] == {
+        "stage2-rosetta-fix-prepare"
+    }
+    assert definition.dependencies["stage2-rosetta-fix"] == {
+        "stage2-rosetta-fix-prepare",
+        "stage2-rosetta-fix-workers",
+    }
     assert (
-        definition.nodes["stage2-rosetta-fix"].inputs["candidate_manifest"].kind
+        definition.nodes["stage2-rosetta-fix-prepare"].inputs["candidate_manifest"].kind
         == ArtifactKind.TABLE
     )
     assert (
-        definition.nodes["stage2-rosetta-fix"].inputs["candidate_manifest"].role
+        definition.nodes["stage2-rosetta-fix-prepare"].inputs["candidate_manifest"].role
         == ppiflow_manifests.MANIFEST_FILE_ROLE
     )
     assert isinstance(
@@ -2162,13 +2504,16 @@ RankStep: {}
     assert definition.nodes["stage2-existing-input"].node.config["manifest_path"] == (
         "manifests/candidate_manifest.parquet"
     )
+    assert "stage2-existing-input" in _manifest_ancestor_chain(
+        definition,
+        "stage2-rosetta-fix-prepare",
+    )
     for node_id in [
-        "stage2-rosetta-fix",
         "stage2-fixed-positions",
         "stage2-partial-ppiflow",
         "stage2-ligandmpnn",
     ]:
-        assert "stage2-existing-input" in _manifest_ancestor_chain(
+        assert "stage2-rosetta-fix" in _manifest_ancestor_chain(
             definition,
             node_id,
         )

@@ -700,6 +700,15 @@ GPU-decorated function also consumes one GPU slot. CPU, RAM, accelerator type,
 GPU count, and actual Modal container packing remain provider-owned.
 _Avoid_: Task limit, resource vector, Modal decorator, cross-run global cap
 
+**DAG Admission Priority** [planned]:
+The deterministic, Snakemake-inspired ordering used to fill every feasible
+Provider Call slot in one coordinator scheduling cycle. Ready work is ranked
+first by greater dependency depth, then by the number of required unfinished
+descendant Nodes it can help unblock, then by persisted Node and Task encounter
+ordinals. The ordinals preserve plan and discovery order across recovery but
+do not become scientific identity.
+_Avoid_: one-call-per-Node pass, round-robin fairness, unordered set iteration, configurable priority weights
+
 **Workflow Runtime**:
 The reusable library that validates a workflow DAG, schedules workflow nodes, tracks durable run state, and materializes workflow artifacts.
 _Avoid_: engine

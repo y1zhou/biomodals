@@ -437,6 +437,21 @@ from scientific fingerprints and conservatively bound in-flight remote calls,
 not actual Modal container packing or CPU, RAM, accelerator type, or GPU
 device count.
 
+The admission-order policy was accepted on 2026-07-30. The coordinator uses a
+Snakemake-inspired greedy selection: every scheduling cycle fills as many
+currently feasible total and GPU Provider Call slots as ready work permits,
+without an artificial one-call-per-Node pass. Ready call candidates are
+ordered lexicographically by greater Node depth in the required DAG closure,
+then by the greater number of required unfinished descendant Nodes reachable
+from that Node, then by stable encounter order. `ExecutionPlan` records each
+Node's sequence ordinal and Task discovery records each Task's sequence
+ordinal; batches retain the first constituent Task's ordinal. These ordinals
+are operational, excluded from scientific fingerprints, and reused after
+coordinator recovery. If a higher-ranked GPU candidate cannot fit the
+remaining GPU slots, selection continues to feasible CPU candidates rather
+than leaving total slots idle. The kernel adds no fairness cursor, priority
+weights, preemption, or scheduler plugin surface.
+
 The state-transition policy was accepted on 2026-07-29. The service preserves
 users, authentication data, and administrator configuration while recreating
 the Job and execution schema without old Job history. Existing workflow

@@ -47,7 +47,9 @@ In particular:
 7. One provider call may represent a batch of independently identified tasks.
 8. Several provider calls may claim work from one SQLite-backed Dispatch Batch
    without opening or writing the repository themselves.
-9. Service, workflow, and app CLI entrypoints remain functionally testable;
+9. Each scheduling cycle greedily fills every feasible Provider Call slot in
+   deterministic DAG-priority order.
+10. Service, workflow, and app CLI entrypoints remain functionally testable;
    internal imports and unfinished schemas carry no compatibility promise.
 
 ## Current execution authorities
@@ -492,9 +494,10 @@ null reason; Task failure diagnostics remain in its error record.
 The workload port exposes a read-only
 `discover_tasks(node, inputs) -> Sequence[TaskPlan]` hook. It returns the
 complete finite Task set for a Node. The kernel validates unique stable
-Node-local keys, computes each Task Fingerprint once, then atomically inserts
-every Task and marks the Node `discovery_complete`. Resume loads persisted
-fingerprints and does not recompute them during status polling or provider
+Node-local keys, assigns each Task its zero-based encounter ordinal from that
+Sequence, computes each Task Fingerprint once, then atomically inserts every
+Task and marks the Node `discovery_complete`. Resume loads persisted ordinals
+and fingerprints and does not recompute them during status polling or provider
 observation.
 
 No Task can acquire a Provider Call, Worker Assignment, or local owner until
@@ -507,9 +510,10 @@ sets follow `allow_empty_result`.
 
 The first kernel version has no streaming, incremental, paginated, or
 worker-side discovery. This deliberately keeps SQLite's ready queue complete
-and prevents workers from observing a partially discovered Node. Scientific
-ordering, when relevant, belongs in stable Task payloads rather than provider
-admission order.
+and prevents workers from observing a partially discovered Node. Encounter
+order is an operational admission tie-break only. Scientific ordering, when
+relevant, belongs in stable Task payloads and therefore in the Task
+Fingerprint rather than in the encounter ordinal.
 
 `TaskPlan` keeps its normalized scientific payload separate from the
 operational execution payload used to prepare provider arguments. The latter
@@ -525,8 +529,8 @@ fingerprinting Tasks.
 
 | Concern | Execution kernel owns | Workload or host owns |
 | --- | --- | --- |
-| DAG | Validation, topological readiness, terminal reachability | Nodes, dependencies, semantic labels |
-| Task planning | Immutable task records, canonical fingerprint calculation, dependency links | Task discovery, normalized scientific payload, and content digests |
+| DAG | Validation, topological readiness, terminal reachability, and deterministic admission rank | Ordered Nodes, dependencies, semantic labels |
+| Task planning | Immutable task records, encounter ordinals, canonical fingerprint calculation, dependency links | Ordered Task discovery, normalized scientific payload, and content digests |
 | Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
@@ -556,7 +560,7 @@ src/biomodals/execution/
   runtime.py              # composition facade after primitives stabilize
   modal.py                # reusable remote-coordinator mechanics, no app globals
   _internal/
-    scheduler.py          # ready-node/task selection
+    scheduler.py          # DAG-priority ready-work selection
     submission.py         # paid-call lifecycle
     batching.py           # task-to-call grouping
     resources.py          # total and GPU Provider Call admission limits
@@ -990,6 +994,57 @@ semantics before introducing another storage seam. The existing ADR principle
 still applies: a hard distributed limit cannot be implemented by pretending
 separate in-process counters are global.
 
+### DAG-priority admission
+
+The coordinator fills all currently feasible Provider Call slots in one
+scheduling cycle. It does not admit at most one call per Node and then require
+another pass. This follows Snakemake's useful scheduling shape—greedily select
+a feasible set from ready work—while keeping Biomodals' ranking deliberately
+small and specific to its result-driven DAG.
+
+After result observation determines the current required DAG or Successor
+Repair Closure, the plan layer annotates each required Node with:
+
+- `depth`: the longest dependency path from a required source Node to this
+  Node, where a larger value means farther downstream and closer to a
+  scientific terminal result;
+- `unblocking_span`: the number of distinct required, unfinished descendant
+  Nodes reachable from this Node;
+- `node_ordinal`: the zero-based position at which the Node occurs in the
+  ordered `ExecutionPlan`.
+
+The first two values are recalculated only when the required closure or a Node
+terminal outcome changes, not during provider polling. `node_ordinal` is
+immutable. Each discovered Task similarly stores its position in the returned
+`TaskPlan` Sequence as `task_ordinal`. A direct-call candidate uses its Task
+ordinal; a batch uses the ordinal of its first constituent Task. Pull-worker
+call candidates enumerate the Node's ready Tasks in the same order.
+
+Ready Provider Call candidates are sorted by this tuple:
+
+```text
+(-depth, -unblocking_span, node_ordinal, task_ordinal)
+```
+
+The coordinator walks that sequence once, preclaiming candidates that fit the
+remaining total and GPU ceilings until no total slot or feasible ready work
+remains. A GPU candidate skipped because the GPU ceiling is full does not
+prevent a lower-ranked CPU candidate from using a total slot. The GPU ceiling
+is an upper bound, not a quota: graph priority may fill total slots with CPU
+work before lower-ranked GPU work.
+
+Encounter ordinals are persisted so recovery does not depend on SQLite row
+order, Python set iteration, completion timing, or random identifiers. They
+are operational and excluded from Workload Plan and Task Fingerprints. If
+order changes scientific meaning, the workload must encode that order in its
+normalized scientific payload instead.
+
+The ready set is finite because Node Task discovery is checkpointed as one
+complete finite Sequence. Consequently, this policy needs no round-robin
+cursor, aging, priority weights, per-Node quota, preemption, or scheduler
+plugin. A high-ranked Node may fill every available call slot; lower-ranked
+finite work becomes eligible as those calls finish.
+
 ### Workflow Ledger decomposition
 
 The existing physical workflow `ledger.sqlite3` file remains useful. The
@@ -1281,6 +1336,7 @@ Phase 0 test inventory:
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
 | `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; no owner is admitted before host durability; recovery reloads persisted fingerprints without polling-time recomputation |
 | `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; terminal calls release them |
+| `tests/execution/test_admission.py` | One cycle fills every feasible slot; deeper Nodes rank first, then larger unfinished descendant spans, then persisted Node and Task encounter order; GPU saturation skips only GPU candidates; recovery reproduces the same pending order |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
@@ -1339,6 +1395,8 @@ Deliverables:
   aggregation decisions;
 - define finite Node-owned Task discovery with stable keys and deterministic
   fingerprints, without streaming or provider dependencies;
+- preserve ordered Node-plan and Task-discovery encounter ordinals as
+  operational metadata, outside scientific fingerprints;
 - compute Task fingerprints once from fixed canonical JSON and keep
   operational execution payloads outside scientific identity;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
@@ -1382,6 +1440,8 @@ Deliverables:
   Execution Run;
 - insert each Node's complete Task set and `discovery_complete` marker
   atomically, then cross host durability before admitting owners;
+- persist Node and Task encounter ordinals rather than relying on row, set, or
+  completion order;
 - implement preclaim, spawn, attachment, observation, collection,
   cancellation, and unknown-outcome recovery behind the provider port;
 - reuse `ModalJobSubmitter`'s preclaim, attachment, and unknown-spawn
@@ -1411,6 +1471,8 @@ Deliverables:
   preclaim;
 - derive active call-slot counts from nonterminal Provider Calls without an
   allocation table or distributed lease abstraction;
+- greedily fill every feasible slot in one cycle using depth, unfinished
+  descendant span, and persisted encounter order;
 - add reusable sync and async coordinator loops;
 - add the run-scoped Modal coordinator binding with one-container routing,
   serialized SQLite and Volume checkpoints, detached execution, lifecycle
@@ -2071,6 +2133,15 @@ after each decision:
     one slot per Provider Call; local work costs none. The kernel has no
     variable permit cost or resource vector and does not model Modal decorator
     resources or actual container packing.
+51. **DAG-priority admission — accepted 2026-07-30**: one scheduling cycle
+    greedily fills every feasible total-call slot. Candidates rank by greater
+    depth in the required result or repair closure, then by more distinct
+    required unfinished descendants, then by persisted Node and Task encounter
+    ordinals. GPU saturation skips infeasible GPU candidates while CPU
+    candidates may continue. The GPU limit is a ceiling rather than a quota.
+    Encounter order is operational and excluded from scientific fingerprints;
+    there is no one-call-per-Node pass, fairness cursor, aging, priority
+    weights, preemption, or scheduler plugin.
 
 ## Definition of ready for implementation
 

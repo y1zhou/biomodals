@@ -12,16 +12,21 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
 import modal
 import polars as pl
 import yaml
+from uniaf3.schema.alphafold3 import AF3Protein, AF3SequenceEntry
 
 from biomodals.app.bioinfo import rosetta_app
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
+from biomodals.app.fold.alphafold3.modal_adapters import (
+    InProcessInferenceExecutor,
+)
 from biomodals.app.score import af3score_app, dockq_app
 from biomodals.execution import DeploymentIdentity, NodeAggregationPolicy
 from biomodals.helper import patch_image_for_helper
@@ -118,6 +123,9 @@ flowpacker_task_image = flowpacker_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
 dockq_task_image = dockq_app.runtime_image.add_local_python_source("biomodals.workflow")
+alphafold3_task_image = alphafold3_app.runtime_image.add_local_python_source(
+    "biomodals.workflow"
+)
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
@@ -167,6 +175,19 @@ FLOWPACKER_TASK_VOLUME_MOUNTS = {
         output_volume=True,
         model_volume=True,
         model_ro=False,
+    ),
+}
+ALPHAFOLD3_TASK_VOLUME_MOUNTS = {
+    **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    **alphafold3_app.CONF.mounts(
+        output_volume=True,
+        model_volume=True,
+        model_ro=True,
+    ),
+    alphafold3_app._JAX_CACHE_MOUNTPOINT: modal.Volume.from_name(  # noqa: SLF001
+        alphafold3_app._JAX_CACHE_MOUNTPOINT.name,  # noqa: SLF001
+        create_if_missing=True,
+        version=2,
     ),
 }
 
@@ -1435,11 +1456,12 @@ def run_ppiflow_partial_candidate(
 
 
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
+    image=alphafold3_task_image,
+    gpu=alphafold3_app.CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 131072),
     timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    volumes=ALPHAFOLD3_TASK_VOLUME_MOUNTS,
 )
 def run_ppiflow_refold_candidate(
     *,
@@ -2664,24 +2686,54 @@ def _run_one_refold_candidate(
         run_name=run_name,
         config=config,
     )
-    json_bytes = conf.model_dump_json().encode("utf-8")
-    # TODO(af3-sharded-msa): Migrate this refold stage to a workflow-compatible
-    # adapter for AlphaFold3's request-scoped API. `run_data_pipeline` was
-    # removed, and `run_inference_pipeline` now publishes seed-addressed Volume
-    # artifacts instead of returning tarball bytes. The legacy calls below are
-    # intentionally retained until that migration is implemented.
     if bool(config.get("search_msa", False)):
-        json_bytes = alphafold3_app.run_data_pipeline.remote(
-            json_bytes=json_bytes,
-            copy_msa_to_ssd=True,
+        raise ValueError(
+            "PPIFlow ReFold does not yet support AlphaFold3 MSA search; "
+            "provide an af3_config_json with populated fields or leave "
+            "search_msa disabled"
         )
-    function_call = alphafold3_app.run_inference_pipeline.spawn(
-        json_bytes=json_bytes,
-        recycle=int(config.get("recycle", 10)),
-        sample=int(config.get("sample", 5)),
-        model_seeds=list(conf.modelSeeds),
+    enriched = alphafold3_app._search_msa_and_templates(  # noqa: SLF001
+        conf,
+        search_msa=False,
+        search_templates=False,
     )
-    tarball_bytes = function_call.get()
+    prepared = alphafold3_app.prepare_inference_run(
+        enriched,
+        recycle=_config_int(config, "recycle", 10),
+        sample=_config_int(config, "sample", 5),
+    )
+    publication = alphafold3_app.RequestPublication.from_prepared(prepared)
+    manifest = alphafold3_app.load_request_manifest(
+        alphafold3_app.CONF.output_volume,
+        publication,
+    )
+    if manifest is None:
+        alphafold3_app.stage_inference_run(
+            alphafold3_app.CONF.output_volume,
+            prepared,
+        )
+        executor = InProcessInferenceExecutor(
+            claim_function=alphafold3_app.claim_seed_prediction_work.get_raw_f(),
+            inspect_function=alphafold3_app.inspect_seed_prediction_cache.get_raw_f(),
+            worker_function=alphafold3_app.run_inference_pipeline.get_raw_f(),
+            summary_function=alphafold3_app.finalize_inference_summary.get_raw_f(),
+            request_function=alphafold3_app.finalize_inference_request.get_raw_f(),
+        )
+        result = alphafold3_app.coordinate_seed_predictions(
+            prepared,
+            executor,
+            num_containers=1,
+            active_wait_timeout_seconds=MAX_TIMEOUT + 900,
+        )
+        manifest = alphafold3_app.request_manifest_from_result(result)
+    with TemporaryDirectory(prefix="biomodals-ppiflow-refold-") as temp_dir:
+        archive_path = alphafold3_app.create_request_archive(
+            alphafold3_app.CONF.output_volume,
+            manifest,
+            output_dir=temp_dir,
+            display_name=run_name,
+        )
+        tarball_bytes = archive_path.read_bytes()
     metric_rows = ppiflow_tables.refold_metric_rows_from_json_files(
         ppiflow_staging.files_from_tar_zst_bytes(
             tarball_bytes,
@@ -2976,8 +3028,8 @@ def _af3_config_for_refold(
             int(seed) for seed in _parse_seed_values(config.get("model_seeds", [1]))
         ],
         sequences=[
-            alphafold3_app.AF3SequenceEntry(
-                protein=alphafold3_app.AF3Protein(
+            AF3SequenceEntry(
+                protein=AF3Protein(
                     id=chain_id,
                     sequence="".join(sequence),
                 )

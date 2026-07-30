@@ -167,14 +167,14 @@ def test_ppiflow_workflow_declares_app_dependency() -> None:
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
 
-    for function_name in (
+    assert "ALPHAFOLD3_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
         "run_ppiflow_refold_candidate",
+    )
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+        source,
         "run_ppiflow_dockq_stage",
-    ):
-        assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
-            source,
-            function_name,
-        )
+    )
     assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _decorator_block(
         source,
         "run_ppiflow_partial_candidate",

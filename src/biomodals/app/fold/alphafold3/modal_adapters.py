@@ -512,3 +512,107 @@ class ModalInferenceExecutor(InferenceExecutor):
             prepared.sample_count,
             prepared.display_name,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class InProcessInferenceExecutor(InferenceExecutor):
+    """Run the established inference functions inside one tracked container."""
+
+    claim_function: Callable[[str, list[int], int], dict[str, object]]
+    inspect_function: Callable[[str, list[int], int], list[dict[str, object]]]
+    worker_function: Callable[
+        [str, str, dict[str, object], list[dict[str, object]]],
+        dict[str, object],
+    ]
+    summary_function: Callable[
+        [str, str, dict[str, object]],
+        dict[str, object],
+    ]
+    request_function: Callable[
+        [str, str, list[int], list[int], int, str],
+        dict[str, object],
+    ]
+
+    def claim_seeds(
+        self,
+        run_id: str,
+        seeds: tuple[int, ...],
+        *,
+        sample_count: int,
+    ) -> SeedClaimPlan:
+        return seed_claim_plan_from_dict(
+            self.claim_function(run_id, list(seeds), sample_count)
+        )
+
+    def inspect_seeds(
+        self,
+        run_id: str,
+        seeds: tuple[int, ...],
+        *,
+        sample_count: int,
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(self.inspect_function(run_id, list(seeds), sample_count))
+
+    def run_claimed(
+        self,
+        prepared: PreparedInferenceRun,
+        claimed_seeds: tuple[ClaimedSeed, ...],
+        *,
+        max_workers: int,
+        poll_timeout_seconds: int,
+    ) -> InferenceBatchOutcome:
+        del poll_timeout_seconds
+        published: set[int] = set()
+        reused: set[int] = set()
+        failures: list[dict[str, object]] = []
+        for batch in partition_claimed_seeds(claimed_seeds, max_workers):
+            try:
+                result = self.worker_function(
+                    prepared.run_id,
+                    prepared.request_id,
+                    prepared.staged_input.to_record(),
+                    [item.to_dict() for item in batch],
+                )
+            except Exception as exc:
+                failures.append(_worker_failure(batch, type(exc).__name__, str(exc)))
+                continue
+            allowed = {item.seed for item in batch}
+            batch_published = _worker_seeds(result.get("published_seeds"), allowed)
+            batch_reused = _worker_seeds(result.get("reused_seeds"), allowed)
+            if result.get("run_id") != prepared.run_id or (
+                batch_published is None or batch_reused is None
+            ):
+                failures.append(
+                    _worker_failure(batch, "InvalidWorkerResult", repr(result))
+                )
+                continue
+            published.update(batch_published)
+            reused.update(batch_reused)
+        return InferenceBatchOutcome(
+            published_seeds=frozenset(published),
+            reused_seeds=frozenset(reused),
+            failures=tuple(failures),
+        )
+
+    def finalize_summary(
+        self,
+        prepared: PreparedInferenceRun,
+    ) -> dict[str, object]:
+        return self.summary_function(
+            prepared.run_id,
+            prepared.request_id,
+            prepared.staged_input.to_record(),
+        )
+
+    def finalize_request(
+        self,
+        prepared: PreparedInferenceRun,
+    ) -> dict[str, object]:
+        return self.request_function(
+            prepared.run_id,
+            prepared.request_id,
+            list(prepared.submitted_seeds),
+            list(prepared.normalized_seeds),
+            prepared.sample_count,
+            prepared.display_name,
+        )

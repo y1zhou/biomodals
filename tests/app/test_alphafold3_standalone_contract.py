@@ -26,6 +26,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     prepare_inference_run,
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
+    InProcessInferenceExecutor,
     ModalInferenceExecutor,
     ModalSearchExecutor,
     execute_profile_setup,
@@ -470,6 +471,88 @@ def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
         2,
         "composition",
     )
+
+
+def test_in_process_inference_executor_uses_direct_function_bodies() -> None:
+    prepared = prepare_inference_run(
+        AF3Config(
+            name="direct",
+            modelSeeds=[1, 2],
+            sequences=[
+                AF3SequenceEntry(
+                    protein=AF3Protein(
+                        id="A",
+                        sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
+                        templates=[],
+                    )
+                )
+            ],
+        ),
+        recycle=3,
+        sample=2,
+    )
+    claimed = tuple(
+        ClaimedSeed(
+            seed=seed,
+            claim=GenerationClaim(
+                scope_key=f"seed:{prepared.run_id}:{seed}",
+                generation_id=f"generation-{seed}",
+                owner={},
+            ),
+        )
+        for seed in (1, 2)
+    )
+    worker_batches: list[list[int]] = []
+
+    def worker(
+        run_id: str,
+        request_id: str,
+        staged_input_record: dict[str, object],
+        claim_records: list[dict[str, object]],
+    ) -> dict[str, object]:
+        assert (run_id, request_id) == (prepared.run_id, prepared.request_id)
+        assert staged_input_record == prepared.staged_input.to_record()
+        seeds = [int(record["seed"]) for record in claim_records]
+        worker_batches.append(seeds)
+        return {
+            "run_id": run_id,
+            "published_seeds": seeds,
+            "reused_seeds": [],
+        }
+
+    executor = InProcessInferenceExecutor(
+        claim_function=lambda run_id, seeds, sample_count: SeedClaimPlan(
+            reused_seeds=(),
+            owned=claimed,
+            active=(),
+        ).to_dict(),
+        inspect_function=lambda run_id, seeds, sample_count: [
+            {"run_id": run_id, "seed": seed, "status": "reused"} for seed in seeds
+        ],
+        worker_function=worker,
+        summary_function=lambda run_id, request_id, staged: {
+            "status": "complete",
+        },
+        request_function=(
+            lambda run_id, request_id, submitted, normalized, sample_count, name: {
+                "status": "complete",
+            }
+        ),
+    )
+
+    outcome = executor.run_claimed(
+        prepared,
+        claimed,
+        max_workers=1,
+        poll_timeout_seconds=7,
+    )
+
+    assert worker_batches == [[1, 2]]
+    assert outcome.published_seeds == frozenset({1, 2})
+    assert outcome.reused_seeds == frozenset()
+    assert outcome.failures == ()
 
 
 def test_inference_staging_is_marker_last_and_reusable() -> None:

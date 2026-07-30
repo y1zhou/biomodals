@@ -9,12 +9,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import orjson
 
 from biomodals.execution import (
+    AsyncExecutionRuntime,
     DeploymentIdentity,
     ExecutionPlan,
     SqliteExecutionRepository,
@@ -1684,6 +1685,30 @@ class ServiceStore:
         """Open one atomic kernel-state transaction in the service database."""
         with self._transaction() as conn:
             yield SqliteExecutionRepository(conn)
+
+    @contextmanager
+    def async_execution_runtime(
+        self,
+        modal_driver: Any,
+    ) -> Iterator[AsyncExecutionRuntime]:
+        """Open one API-hosted runtime with commit as its durability boundary."""
+        conn = sqlite3.connect(self.path, timeout=5, isolation_level="DEFERRED")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            yield AsyncExecutionRuntime(
+                SqliteExecutionRepository(conn),
+                modal_driver=modal_driver,
+                checkpoint=conn.commit,
+            )
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            conn.close()
 
     def list_operations(self, job_id: UUID) -> list[JobOperationRecord]:
         """List every durable remote or local operation for one Job."""

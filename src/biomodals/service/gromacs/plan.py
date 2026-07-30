@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
+from biomodals.execution import (
+    ExecutionPlan,
+    NodeDependency,
+    NodePlan,
+    ProviderBinding,
+    TaskPlan,
+)
 from biomodals.service.store import JobOperationRecord, JobOperationState
 
 NVT_ANALYSIS = "collect_traj_stats:nvt_"
@@ -112,6 +118,36 @@ def execution_plan(
         scientific_versions={
             "biomodals.gromacs.execution_plan": _EXECUTION_PLAN_SCHEMA_VERSION,
         },
+    )
+
+
+def operation_task_plan(operation: str) -> TaskPlan:
+    """Represent one GROMACS service stage as one scientific Task."""
+    return TaskPlan(
+        task_key="operation",
+        scientific_payload={"operation": operation},
+    )
+
+
+def operation_provider_binding(
+    operation: str,
+    *,
+    environment: str,
+    app_name: str,
+    app_version: int,
+) -> ProviderBinding:
+    """Bind one remote operation to its exact deployed GROMACS function."""
+    function_name = operation.partition(":")[0]
+    if function_name not in REQUIRED_FUNCTIONS:
+        raise ValueError(f"Unsupported GROMACS operation: {operation}")
+    uses_gpu = function_name.endswith("_gpu")
+    return ProviderBinding(
+        environment=environment,
+        app_name=app_name,
+        app_version=app_version,
+        function_name=function_name,
+        uses_gpu=uses_gpu,
+        runtime_image_key="gromacs-gpu" if uses_gpu else "gromacs-cpu",
     )
 
 

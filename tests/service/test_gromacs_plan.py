@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 
+from biomodals.execution import ProviderBinding
 from biomodals.service.gromacs.plan import (
     PREPARE_RESULT,
     REQUIRED_FUNCTIONS,
@@ -13,6 +14,8 @@ from biomodals.service.gromacs.plan import (
     execution_plan,
     modal_invocation,
     operation_dependencies,
+    operation_provider_binding,
+    operation_task_plan,
     ready_operations,
 )
 from biomodals.service.store import (
@@ -160,3 +163,37 @@ def test_execution_plan_fingerprint_excludes_workload_run_name() -> None:
     )
 
     assert first.workload_plan_fingerprint == second.workload_plan_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("operation_name", "uses_gpu", "function_name"),
+    [
+        ("prepare_tpr_gpu", True, "prepare_tpr_gpu"),
+        ("prepare_tpr_cpu", False, "prepare_tpr_cpu"),
+        ("production_run_gpu", True, "production_run_gpu"),
+        ("collect_traj_stats:nvt_", False, "collect_traj_stats"),
+    ],
+)
+def test_operation_binding_keeps_resources_out_of_scientific_identity(
+    operation_name: str,
+    uses_gpu: bool,
+    function_name: str,
+) -> None:
+    binding = operation_provider_binding(
+        operation_name,
+        environment="production",
+        app_name="Gromacs",
+        app_version=23,
+    )
+
+    assert binding == ProviderBinding(
+        environment="production",
+        app_name="Gromacs",
+        app_version=23,
+        function_name=function_name,
+        uses_gpu=uses_gpu,
+        runtime_image_key=("gromacs-gpu" if uses_gpu else "gromacs-cpu"),
+    )
+    assert operation_task_plan(operation_name).scientific_payload == {
+        "operation": operation_name
+    }

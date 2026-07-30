@@ -671,14 +671,14 @@ def test_rosetta_stage_records_partial_candidate_manifest(
         SimpleNamespace(reload=lambda: None),
     )
     monkeypatch.setattr(
-        ppiflow_workflow.rosetta_app,
-        "run_rosetta",
-        _FakeModalFunction("fc-rosetta-worker", None),
+        ppiflow_workflow,
+        "bounded_map",
+        lambda items, _worker, *, max_parallel: [None for _ in items],
     )
     monkeypatch.setattr(
-        ppiflow_workflow.modal.Queue.objects,
-        "delete",
-        lambda name: None,
+        ppiflow_workflow.modal,
+        "Queue",
+        SimpleNamespace(objects=SimpleNamespace(delete=lambda _name: None)),
     )
 
     result = ppiflow_workflow.run_ppiflow_rosetta_stage.get_raw_f()(
@@ -1190,14 +1190,14 @@ PPIFlowStep:
         encoding="utf-8",
     )
 
-    class UnexpectedWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class UnexpectedExecutionCoordinator:
+        def __init__(self, **_kwargs) -> None:
             raise AssertionError("dry-run should not construct the orchestrator")
 
     monkeypatch.setattr(
         ppiflow_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        UnexpectedWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        UnexpectedExecutionCoordinator,
     )
 
     raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f
@@ -1252,8 +1252,9 @@ PPIFlowStep:
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
             )
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
@@ -1263,8 +1264,8 @@ PPIFlowStep:
     )
     monkeypatch.setattr(
         ppiflow_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f
@@ -1277,11 +1278,11 @@ PPIFlowStep:
     )
 
     assert "force" not in calls["staging"]
-    UUID(str(calls["spawn"]["execution_run_id"]))
+    UUID(str(calls["coordinator"]["execution_run_id"]))
     assert calls["spawn"]["workload_run_key"] == "demo"
-    assert calls["spawn"]["deployment_environment"] == "development"
-    assert calls["spawn"]["deployment_name"] == ppiflow_workflow.CONF.name
-    assert calls["spawn"]["deployment_version"] == 1
+    assert calls["coordinator"]["deployment_environment"] == "development"
+    assert calls["coordinator"]["deployment_name"] == ppiflow_workflow.CONF.name
+    assert calls["coordinator"]["deployment_version"] == 1
     assert "force" not in calls["spawn"]
 
 
@@ -1877,14 +1878,15 @@ PPIFlowStep:
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
             )
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         ppiflow_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f
@@ -1898,6 +1900,7 @@ PPIFlowStep:
     )
 
     assert calls["spawn"]["strict_external_artifact_checks"] is True
-    checker = calls["spawn"]["external_artifact_checker"]
-    assert callable(checker)
-    assert "check_ppiflow_external_artifact" in repr(checker)
+    assert (
+        calls["spawn"]["external_artifact_checker_function_name"]
+        == "check_ppiflow_external_artifact"
+    )

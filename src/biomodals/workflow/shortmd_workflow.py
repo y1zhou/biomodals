@@ -793,14 +793,15 @@ def submit_shortmd_workflow(
         return
 
     execution_run_id = uuid4()
-    orchestrator_handle = orchestrator.WorkflowOrchestrator()
+    coordinator = orchestrator.ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment="development",
+        deployment_name=CONF.name,
+        deployment_version=1,
+    )
     orchestrator_kwargs = {
         "workflow": workflow,
-        "execution_run_id": str(execution_run_id),
         "workload_run_key": resolved_run_id,
-        "deployment_environment": "development",
-        "deployment_name": CONF.name,
-        "deployment_version": 1,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
         "development_function_handles": {
@@ -811,19 +812,20 @@ def submit_shortmd_workflow(
             "production_run_cpu": gromacs_app.production_run_cpu,
             "production_run_gpu": gromacs_app.production_run_gpu,
             "collect_traj_stats": gromacs_app.collect_traj_stats,
+            "check_shortmd_external_artifact": check_shortmd_external_artifact,
         },
     }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker"] = (
-            check_shortmd_external_artifact.remote
+        orchestrator_kwargs["external_artifact_checker_function_name"] = (
+            "check_shortmd_external_artifact"
         )
     print(
         f"Submitting ShortMD workflow '{resolved_run_id}' with "
         f"{len(input_pdbs)} input PDB(s), {replicates} replicate(s) each",
         flush=True,
     )
-    function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    function_call = coordinator.run.spawn(**orchestrator_kwargs)
     print(f"Execution Run ID: {execution_run_id}", flush=True)
     print(
         "Coordinator FunctionCall ID: "

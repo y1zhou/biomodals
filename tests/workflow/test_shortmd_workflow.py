@@ -691,7 +691,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
 def test_shortmd_app_includes_orchestrator_class() -> None:
     functions = shortmd_workflow.app._local_state.functions
 
-    assert "WorkflowOrchestrator.*" in functions
+    assert "ExecutionCoordinator.*" in functions
     assert "prepare_tpr_cpu" in functions
     assert "prepare_tpr_gpu" in functions
     assert "production_run_cpu" in functions
@@ -717,14 +717,15 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
             )
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
@@ -753,11 +754,11 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         "production_gpu_function",
         "stats_function",
     }.isdisjoint(replicate_node.__dict__)
-    UUID(str(calls["spawn"]["execution_run_id"]))
+    UUID(str(calls["coordinator"]["execution_run_id"]))
     assert calls["spawn"]["workload_run_key"] == "shortmd-run"
-    assert calls["spawn"]["deployment_environment"] == "development"
-    assert calls["spawn"]["deployment_name"] == shortmd_workflow.CONF.name
-    assert calls["spawn"]["deployment_version"] == 1
+    assert calls["coordinator"]["deployment_environment"] == "development"
+    assert calls["coordinator"]["deployment_name"] == shortmd_workflow.CONF.name
+    assert calls["coordinator"]["deployment_version"] == 1
     assert calls["spawn"]["max_active_provider_calls"] == 3
     assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
     assert set(calls["spawn"]["development_function_handles"]) == {
@@ -768,6 +769,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         "production_run_cpu",
         "production_run_gpu",
         "collect_traj_stats",
+        "check_shortmd_external_artifact",
     }
     stdout = strip_ansi(capsys.readouterr().out)
     assert "Submitting ShortMD workflow 'shortmd-run'" in stdout
@@ -792,14 +794,15 @@ def test_submit_shortmd_workflow_can_enable_strict_external_checks(
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
             )
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
@@ -813,9 +816,10 @@ def test_submit_shortmd_workflow_can_enable_strict_external_checks(
     )
 
     assert calls["spawn"]["strict_external_artifact_checks"] is True
-    checker = calls["spawn"]["external_artifact_checker"]
-    assert callable(checker)
-    assert "check_shortmd_external_artifact" in repr(checker)
+    assert (
+        calls["spawn"]["external_artifact_checker_function_name"]
+        == "check_shortmd_external_artifact"
+    )
 
 
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
@@ -827,14 +831,14 @@ def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     input_dir.mkdir()
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
 
-    class UnexpectedWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class UnexpectedExecutionCoordinator:
+        def __init__(self, **_kwargs) -> None:
             pytest.fail("dry-run should not construct the orchestrator")
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        UnexpectedWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        UnexpectedExecutionCoordinator,
     )
 
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
@@ -877,14 +881,15 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
             calls["spawn"] = kwargs
             return FakeFunctionCall("call-1")
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f

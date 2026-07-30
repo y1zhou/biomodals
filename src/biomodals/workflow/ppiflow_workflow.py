@@ -3237,14 +3237,15 @@ def submit_ppiflow_workflow(
     )
 
     execution_run_id = uuid4()
-    orchestrator_handle = orchestrator.WorkflowOrchestrator()
+    coordinator = orchestrator.ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment="development",
+        deployment_name=CONF.name,
+        deployment_version=1,
+    )
     orchestrator_kwargs = {
         "workflow": workflow,
-        "execution_run_id": str(execution_run_id),
         "workload_run_key": resolved_run_id,
-        "deployment_environment": "development",
-        "deployment_name": CONF.name,
-        "deployment_version": 1,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
         "development_function_handles": {
@@ -3260,19 +3261,20 @@ def submit_ppiflow_workflow(
             "derive_ppiflow_fixed_positions": derive_ppiflow_fixed_positions,
             "rank_ppiflow_artifacts": rank_ppiflow_artifacts,
             "normalize_ppiflow_stage2_input": normalize_ppiflow_stage2_input,
+            "check_ppiflow_external_artifact": check_ppiflow_external_artifact,
         },
     }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker"] = (
-            check_ppiflow_external_artifact.remote
+        orchestrator_kwargs["external_artifact_checker_function_name"] = (
+            "check_ppiflow_external_artifact"
         )
     print(
         f"Submitting PPIFlow workflow '{resolved_run_id}' with "
         f"{len(workflow.validate().nodes)} node(s)",
         flush=True,
     )
-    function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    function_call = coordinator.run.spawn(**orchestrator_kwargs)
     print(f"Execution Run ID: {execution_run_id}", flush=True)
     print(
         "Coordinator FunctionCall ID: "

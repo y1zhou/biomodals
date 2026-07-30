@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -26,6 +27,7 @@ from biomodals.execution import (
     drive_execution_run,
     ready_node_keys,
     required_node_keys,
+    resume_execution_run,
 )
 from biomodals.execution.modal import ModalCallDriver
 from biomodals.execution.scheduler import (
@@ -152,13 +154,15 @@ class WorkflowRuntime:
         self._definition: WorkflowDefinition | None = None
         self._workload_run_key: str | None = None
 
-    def run(self, *, workload_run_key: str) -> AppRunResult:
+    def run(
+        self,
+        *,
+        workload_run_key: str,
+        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> AppRunResult:
         """Create or recover this Run and drive it until it cannot advance."""
-        definition = self.workflow.validate()
-        self._definition = definition
-        self._workload_run_key = workload_run_key
-        self._volume_sync.reload()
-        repository = self._ensure_run(definition, workload_run_key)
+        with synchronize():
+            repository = self._initialize(workload_run_key)
         snapshot = drive_execution_run(
             repository,
             self.execution_run_id,
@@ -166,6 +170,33 @@ class WorkflowRuntime:
             checkpoint=self._checkpoint,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
+            synchronize=synchronize,
+        )
+        return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
+
+    def resume(
+        self,
+        *,
+        workload_run_key: str,
+        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> AppRunResult:
+        """Explicitly resume this persisted Run, then drive it."""
+        with synchronize():
+            repository = self._initialize(workload_run_key)
+            resume_execution_run(
+                repository,
+                self.execution_run_id,
+                checkpoint=self._checkpoint,
+                now=self._now(),
+            )
+        snapshot = drive_execution_run(
+            self.store.execution,
+            self.execution_run_id,
+            advance_once=self.advance_once,
+            checkpoint=self._checkpoint,
+            now=self._now,
+            poll_interval_seconds=self.poll_interval_seconds,
+            synchronize=synchronize,
         )
         return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
 
@@ -215,6 +246,14 @@ class WorkflowRuntime:
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""
         self.store.close()
+
+    def _initialize(self, workload_run_key: str) -> SqliteExecutionRepository:
+        """Load the workflow definition and create or verify its Run."""
+        definition = self.workflow.validate()
+        self._definition = definition
+        self._workload_run_key = workload_run_key
+        self._volume_sync.reload()
+        return self._ensure_run(definition, workload_run_key)
 
     def _ensure_run(
         self,

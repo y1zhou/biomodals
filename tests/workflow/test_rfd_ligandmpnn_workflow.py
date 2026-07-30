@@ -509,14 +509,15 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
             calls["spawn"] = kwargs
             return FakeFunctionCall("call-1")
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs: object) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
@@ -546,17 +547,18 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert isinstance(mpnn_node, LigandMPNNDesignNode)
     assert rfd_node.run_name == "demo-rfd001"
     assert mpnn_node.settings.seeds == (7, 11)
-    UUID(str(calls["spawn"]["execution_run_id"]))
+    UUID(str(calls["coordinator"]["execution_run_id"]))
     assert calls["spawn"]["workload_run_key"] == "demo"
-    assert calls["spawn"]["deployment_environment"] == "development"
-    assert calls["spawn"]["deployment_name"] == rfd_ligandmpnn_workflow.CONF.name
-    assert calls["spawn"]["deployment_version"] == 1
+    assert calls["coordinator"]["deployment_environment"] == "development"
+    assert calls["coordinator"]["deployment_name"] == rfd_ligandmpnn_workflow.CONF.name
+    assert calls["coordinator"]["deployment_version"] == 1
     assert calls["spawn"]["max_active_provider_calls"] == 3
     assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
     assert set(calls["spawn"]["development_function_handles"]) == {
         "rfdiffusion_infer",
         "select_rfdiffusion_design",
         "ligandmpnn_run",
+        "check_rfd_ligandmpnn_external_artifact",
     }
     stdout = strip_ansi(capsys.readouterr().out)
     assert "Submitting RFDLigandMPNNWorkflow 'demo'" in stdout
@@ -576,14 +578,15 @@ def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
             calls["spawn"] = kwargs
             return FakeFunctionCall("call-1")
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs: object) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
@@ -601,9 +604,10 @@ def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
 
     spawn_kwargs = calls["spawn"]
     assert spawn_kwargs["strict_external_artifact_checks"] is True
-    checker = spawn_kwargs["external_artifact_checker"]
-    assert callable(checker)
-    assert "check_rfd_ligandmpnn_external_artifact" in repr(checker)
+    assert (
+        spawn_kwargs["external_artifact_checker_function_name"]
+        == "check_rfd_ligandmpnn_external_artifact"
+    )
 
 
 def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(
@@ -614,14 +618,14 @@ def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(
     input_pdb = tmp_path / "input.pdb"
     input_pdb.write_text("ATOM\n", encoding="utf-8")
 
-    class UnexpectedWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class UnexpectedExecutionCoordinator:
+        def __init__(self, **_kwargs: object) -> None:
             pytest.fail("dry-run should not construct the orchestrator")
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        UnexpectedWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        UnexpectedExecutionCoordinator,
     )
 
     raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f

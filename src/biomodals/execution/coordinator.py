@@ -33,7 +33,7 @@ def drive_execution_run(
     now: Callable[[], int] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     poll_interval_seconds: float = 1.0,
-    synchronize: Callable[[], AbstractContextManager[None]] = nullcontext,
+    synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
 ) -> ExecutionSnapshot:
     """Advance one Run, releasing its optional host lock between cycles."""
     if poll_interval_seconds < 0:

@@ -632,25 +632,30 @@ def submit_rfd_ligandmpnn_workflow(
         print_workflow_dag(workflow.validate())
         return
     execution_run_id = uuid4()
+    coordinator = orchestrator.ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment="development",
+        deployment_name=CONF.name,
+        deployment_version=1,
+    )
     orchestrator_kwargs = {
         "workflow": workflow,
-        "execution_run_id": str(execution_run_id),
         "workload_run_key": resolved_run_id,
-        "deployment_environment": "development",
-        "deployment_name": CONF.name,
-        "deployment_version": 1,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
         "development_function_handles": {
             "rfdiffusion_infer": rfdiffusion_app.rfdiffusion_infer,
             "select_rfdiffusion_design": select_rfdiffusion_design,
             "ligandmpnn_run": ligandmpnn_app.ligandmpnn_run,
+            "check_rfd_ligandmpnn_external_artifact": (
+                check_rfd_ligandmpnn_external_artifact
+            ),
         },
     }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker"] = (
-            check_rfd_ligandmpnn_external_artifact.remote
+        orchestrator_kwargs["external_artifact_checker_function_name"] = (
+            "check_rfd_ligandmpnn_external_artifact"
         )
     total_structures = num_rfdiffusion_trajectories * num_rfdiffusion_designs
     print(
@@ -661,8 +666,7 @@ def submit_rfd_ligandmpnn_workflow(
         f"{total_structures} LigandMPNN node(s)",
         flush=True,
     )
-    orchestrator_handle = orchestrator.WorkflowOrchestrator()
-    fc = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    fc = coordinator.run.spawn(**orchestrator_kwargs)
     print(f"Execution Run ID: {execution_run_id}", flush=True)
     print(
         f"Coordinator FunctionCall ID: {getattr(fc, 'object_id', fc)}",

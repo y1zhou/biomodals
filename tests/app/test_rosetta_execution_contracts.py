@@ -11,6 +11,7 @@ from biomodals.app.bioinfo.rosetta.execution_contracts import (
     RosettaTaskSpec,
     execute_rosetta_task,
     validate_task_publication,
+    validate_task_publication_from_volume,
 )
 
 
@@ -91,3 +92,51 @@ def test_missing_declared_output_never_publishes_success(tmp_path: Path) -> None
         )
 
     assert not validate_task_publication(tmp_path, task, "fingerprint")
+
+
+def test_volume_probe_revalidates_marker_and_required_files(
+    tmp_path: Path,
+) -> None:
+    task = _task(expected_files=("outputs/1/score.sc",))
+
+    def run_command(command, *, output_mode, log_file):
+        del command, output_mode
+        Path(log_file).write_text("log\n", encoding="utf-8")
+        score = tmp_path / "outputs" / "1" / "score.sc"
+        score.parent.mkdir(parents=True, exist_ok=True)
+        score.write_text("score\n", encoding="utf-8")
+
+    execute_rosetta_task(
+        run_root=tmp_path,
+        task=task,
+        task_fingerprint="fingerprint",
+        run_command=run_command,
+    )
+
+    class VolumeReader:
+        def read_file(self, path: str):
+            selected = tmp_path.parent / path
+            if not selected.is_file():
+                raise FileNotFoundError(path)
+            yield selected.read_bytes()
+
+    volume = VolumeReader()
+    assert validate_task_publication_from_volume(
+        volume,
+        tmp_path.name,
+        task,
+        "fingerprint",
+    )
+    assert not validate_task_publication_from_volume(
+        volume,
+        tmp_path.name,
+        task,
+        "different",
+    )
+    (tmp_path / "outputs" / "1" / "score.sc").unlink()
+    assert not validate_task_publication_from_volume(
+        volume,
+        tmp_path.name,
+        task,
+        "fingerprint",
+    )

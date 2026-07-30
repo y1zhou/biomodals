@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import orjson
 
 PUBLICATION_SCHEMA_VERSION = 1
+_MAX_PUBLICATION_BYTES = 64 * 1024
+
+
+class _VolumeReader(Protocol):
+    def read_file(self, path: str) -> Iterable[bytes]:
+        """Yield chunks for one Volume-relative file."""
 
 
 @dataclass(frozen=True)
@@ -154,17 +160,51 @@ def validate_task_publication(
     except (OSError, orjson.JSONDecodeError):
         return False
     return (
-        isinstance(value, dict)
-        and value.get("schema_version") == PUBLICATION_SCHEMA_VERSION
-        and value.get("status") == "complete"
-        and value.get("task_key") == task.task_key
-        and value.get("task_fingerprint") == task_fingerprint
+        _publication_payload_matches(value, task, task_fingerprint)
         and Path(run_root).joinpath(*_relative_path(task.output_dir).parts).is_dir()
         and Path(run_root).joinpath(*_relative_path(task.worker_log).parts).is_file()
         and all(
             Path(run_root).joinpath(*_relative_path(path).parts).is_file()
             for path in task.expected_files
         )
+    )
+
+
+def validate_task_publication_from_volume(
+    volume: _VolumeReader,
+    run_root: str | PurePosixPath,
+    task: RosettaTaskSpec,
+    task_fingerprint: str,
+) -> bool:
+    """Validate one Task through a remote Volume's bounded read interface."""
+    relative_root = _relative_path(str(run_root))
+    marker_path = (
+        relative_root
+        / ".biomodals"
+        / "tasks"
+        / f"{sha256(task.task_key.encode()).hexdigest()}.json"
+    )
+    try:
+        marker = _read_volume_file(
+            volume,
+            marker_path.as_posix(),
+            max_bytes=_MAX_PUBLICATION_BYTES,
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        value: Any = orjson.loads(marker)
+    except orjson.JSONDecodeError:
+        return False
+    if not _publication_payload_matches(value, task, task_fingerprint):
+        return False
+    required = (task.worker_log, *task.expected_files)
+    return all(
+        _volume_file_exists(
+            volume,
+            (relative_root / _relative_path(path)).as_posix(),
+        )
+        for path in required
     )
 
 
@@ -208,6 +248,48 @@ def _execution_result(task: RosettaTaskSpec) -> dict[str, object]:
         "worker_log": task.worker_log,
         "expected_files": list(task.expected_files),
     }
+
+
+def _publication_payload_matches(
+    value: object,
+    task: RosettaTaskSpec,
+    task_fingerprint: str,
+) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("schema_version") == PUBLICATION_SCHEMA_VERSION
+        and value.get("status") == "complete"
+        and value.get("task_key") == task.task_key
+        and value.get("task_fingerprint") == task_fingerprint
+        and value.get("output_dir") == task.output_dir
+        and value.get("worker_log") == task.worker_log
+        and value.get("expected_files") == list(task.expected_files)
+    )
+
+
+def _read_volume_file(
+    volume: _VolumeReader,
+    path: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    content = bytearray()
+    for chunk in volume.read_file(path):
+        if not isinstance(chunk, bytes):
+            raise TypeError(f"Volume returned non-bytes for {path}")
+        if len(content) + len(chunk) > max_bytes:
+            raise ValueError(f"Volume file exceeds {max_bytes} bytes: {path}")
+        content.extend(chunk)
+    return bytes(content)
+
+
+def _volume_file_exists(volume: _VolumeReader, path: str) -> bool:
+    try:
+        iterator = iter(volume.read_file(path))
+        next(iterator, None)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _relative_path(value: str) -> PurePosixPath:

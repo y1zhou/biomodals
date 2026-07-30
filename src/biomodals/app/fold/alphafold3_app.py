@@ -425,7 +425,11 @@ def _msa_search_runtime(
         ),
     },
 )
-def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
+def search_database_msa(
+    database_id: str,
+    sequence: str,
+    generation_id: str | None = None,
+) -> dict[str, object]:
     """Search one fixed sharded database with database-level resume."""
     return run_database_search(
         _msa_search_runtime(
@@ -434,6 +438,7 @@ def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
         ),
         database_id,
         sequence,
+        generation_id=generation_id,
     )
 
 
@@ -459,6 +464,7 @@ def assemble_sequence_msas(
     sequence: str,
     include_unpaired: bool,
     include_paired: bool,
+    generation_id: str | None = None,
 ) -> dict[str, object]:
     """Assemble requested fields with pinned upstream deduplication."""
     if polymer not in {"protein", "rna"}:
@@ -474,6 +480,7 @@ def assemble_sequence_msas(
             include_unpaired=include_unpaired,
             include_paired=include_paired,
         ),
+        generation_id=generation_id,
     )
 
 
@@ -524,6 +531,7 @@ def search_protein_templates(
     unpaired_msa_reference: dict[str, object] | None,
     publish_canonical: bool,
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
+    generation_id: str | None = None,
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
     return run_template_search(
@@ -551,6 +559,7 @@ def search_protein_templates(
             publish_canonical=publish_canonical,
             max_template_date=max_template_date,
         ),
+        generation_id=generation_id,
     )
 
 

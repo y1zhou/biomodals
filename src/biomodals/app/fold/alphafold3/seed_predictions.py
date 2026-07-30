@@ -14,7 +14,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -383,6 +383,7 @@ def claim_seed_predictions(
     seeds: tuple[int, ...],
     *,
     sample_count: int,
+    generation_ids: Mapping[int, str] | None = None,
 ) -> SeedClaimPlan:
     """Reuse marked seeds and atomically claim every currently missing seed."""
     selected_run = validate_run_id(run_id)
@@ -391,6 +392,11 @@ def claim_seed_predictions(
     validate_inference_workload(list(selected_seeds), selected_samples)
     if not selected_seeds or len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("claim inputs must be a non-empty unique seed set")
+    selected_generations: dict[int, str] = {}
+    if generation_ids is not None:
+        if set(generation_ids) != set(selected_seeds):
+            raise ValueError("generation_ids must contain exactly the requested seeds")
+        selected_generations = {seed: generation_ids[seed] for seed in selected_seeds}
     runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
     reused: list[int] = []
@@ -412,7 +418,7 @@ def claim_seed_predictions(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_seed_claim_scope(selected_run, seed),
-                generation_id=uuid.uuid4().hex,
+                generation_id=selected_generations.get(seed, uuid.uuid4().hex),
                 identity=_seed_claim_identity(selected_run, seed),
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,

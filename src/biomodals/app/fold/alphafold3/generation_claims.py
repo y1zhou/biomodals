@@ -220,6 +220,22 @@ def acquire_generation_claim(
             selected_scope,
             predecessor_generation,
         )
+        if predecessor_generation == selected_generation:
+            if predecessor.get("identity") != identity:
+                raise ValueError(
+                    f"Generation {selected_generation!r} already owns "
+                    f"{selected_scope!r} with a different identity"
+                )
+            if predecessor_status is not None:
+                raise LostGenerationError(
+                    f"Generation {selected_generation!r} for "
+                    f"{selected_scope!r} is already terminal"
+                )
+            return GenerationClaim(
+                selected_scope,
+                selected_generation,
+                predecessor,
+            )
         if predecessor_status is None:
             started_at = cast(
                 int | float,

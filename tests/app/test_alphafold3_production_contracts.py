@@ -1916,6 +1916,83 @@ def test_generation_claims_fence_active_and_terminal_writers() -> None:
     }
 
 
+def test_generation_claim_replays_the_same_live_owner() -> None:
+    """Provider redelivery may recover one stable generation without takeover."""
+    store = FakeClaimStore()
+    first = acquire_generation_claim(
+        store,
+        scope_key="raw:Protein:sequence:small_bfd",
+        generation_id="execution-task",
+        identity={"search": "one"},
+        container_id="container-a",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_000,
+        now_text="first-start",
+    )
+
+    replay = acquire_generation_claim(
+        store,
+        scope_key=first.scope_key,
+        generation_id=first.generation_id,
+        identity={"search": "one"},
+        container_id="replacement-container",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_001,
+        now_text="replay-start",
+    )
+
+    assert replay == first
+    with pytest.raises(ValueError, match="different identity"):
+        acquire_generation_claim(
+            store,
+            scope_key=first.scope_key,
+            generation_id=first.generation_id,
+            identity={"search": "changed"},
+            container_id="replacement-container",
+            maximum_age_seconds=100,
+            now_epoch_seconds=1_002,
+            now_text="replay-start",
+        )
+
+
+def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
+    """Coordinator-owned seed Tasks reacquire their live writer claims."""
+    runtime = InferenceRuntime(
+        output_root=tmp_path,
+        volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        summary_maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+    )
+    generations = {1: "execution-seed-1", 2: "execution-seed-2"}
+
+    first = claim_seed_predictions(
+        runtime,
+        "a" * 64,
+        (1, 2),
+        sample_count=1,
+        generation_ids=generations,
+    )
+    replay = claim_seed_predictions(
+        runtime,
+        "a" * 64,
+        (1, 2),
+        sample_count=1,
+        generation_ids=generations,
+    )
+
+    assert tuple(item.claim.generation_id for item in first.owned) == (
+        "execution-seed-1",
+        "execution-seed-2",
+    )
+    assert replay == first
+
+
 def test_generation_claims_adapt_legacy_owners() -> None:
     """A stage may preserve an append-only chain created before canonical owners."""
     store = FakeClaimStore()

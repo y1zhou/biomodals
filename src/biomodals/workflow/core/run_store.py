@@ -16,6 +16,7 @@ from biomodals.workflow.core.artifact_store import (
 )
 
 LEDGER_FILENAME = "ledger.sqlite3"
+WORKFLOW_PLAN_FILENAME = "workflow-plan.pkl"
 _LEGACY_TABLES = {
     "artifact_files",
     "artifacts",
@@ -60,6 +61,11 @@ class WorkflowRunStore:
     def ledger_path(self) -> Path:
         """Return the per-Run SQLite repository path."""
         return self.state_root / LEDGER_FILENAME
+
+    @property
+    def workflow_plan_path(self) -> Path:
+        """Return the trusted internal workflow-plan path."""
+        return self.state_root / WORKFLOW_PLAN_FILENAME
 
     @property
     def output_root(self) -> Path:
@@ -123,6 +129,23 @@ class WorkflowRunStore:
         """Close the active connection without inventing an implicit commit."""
         with self._lock:
             self._close()
+
+    def write_workflow_plan(self, content: bytes) -> None:
+        """Atomically create the immutable workflow plan for this Run."""
+        if not content:
+            raise ValueError("workflow plan cannot be empty")
+        with self._lock:
+            if self.workflow_plan_path.exists():
+                raise FileExistsError(str(self.workflow_plan_path))
+            self.state_root.mkdir(parents=True, exist_ok=True)
+            temporary_path = self.workflow_plan_path.with_suffix(".pkl.tmp")
+            temporary_path.write_bytes(content)
+            temporary_path.replace(self.workflow_plan_path)
+
+    def read_workflow_plan(self) -> bytes:
+        """Read the trusted internal workflow plan for this Run."""
+        with self._lock:
+            return self.workflow_plan_path.read_bytes()
 
     def _connect(self) -> sqlite3.Connection:
         if self._volume_sync_active:

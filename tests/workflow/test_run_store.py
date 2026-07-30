@@ -63,6 +63,27 @@ def test_run_store_uses_execution_identity_and_shared_schema(tmp_path: Path) -> 
     assert "attempts" not in tables
 
 
+def test_run_store_atomically_creates_one_immutable_workflow_plan(
+    tmp_path: Path,
+) -> None:
+    store = WorkflowRunStore(tmp_path, RUN_ID)
+
+    store.write_workflow_plan(b"serialized plan")
+
+    assert store.read_workflow_plan() == b"serialized plan"
+    assert store.workflow_plan_path == store.state_root / "workflow-plan.pkl"
+    assert not store.workflow_plan_path.with_suffix(".pkl.tmp").exists()
+    with pytest.raises(FileExistsError):
+        store.write_workflow_plan(b"replacement")
+
+
+def test_run_store_rejects_an_empty_workflow_plan(tmp_path: Path) -> None:
+    store = WorkflowRunStore(tmp_path, RUN_ID)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        store.write_workflow_plan(b"")
+
+
 def test_transaction_rolls_back_both_repository_views(tmp_path: Path) -> None:
     store = WorkflowRunStore(tmp_path, RUN_ID)
 

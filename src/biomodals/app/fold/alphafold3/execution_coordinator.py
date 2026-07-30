@@ -118,12 +118,20 @@ class AlphaFold3ExecutionCoordinator:
         *,
         predecessor_execution_run_id: UUID,
         predecessor_deployment: DeploymentIdentity | None,
+        candidate_request: AlphaFold3ExecutionRequest | None = None,
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor Run from conclusive state."""
         if predecessor_execution_run_id == self.execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
+        if candidate_request is not None and (
+            max_active_provider_calls is not None
+            or max_active_gpu_provider_calls is not None
+        ):
+            raise ValueError(
+                "Candidate request and generic restart overrides are mutually exclusive"
+            )
         with self._drive_lock:
             with self._writer_lock:
                 self.output_volume.reload()
@@ -152,17 +160,19 @@ class AlphaFold3ExecutionCoordinator:
                 finally:
                     predecessor_store.close()
 
-                request = _restart_request(
-                    predecessor_request,
-                    predecessor_max_active_provider_calls=(
-                        predecessor.max_active_provider_calls
-                    ),
-                    predecessor_max_active_gpu_provider_calls=(
-                        predecessor.max_active_gpu_provider_calls
-                    ),
-                    max_active_provider_calls=max_active_provider_calls,
-                    max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-                )
+                request = candidate_request
+                if request is None:
+                    request = _restart_request(
+                        predecessor_request,
+                        predecessor_max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                        ),
+                        predecessor_max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                        ),
+                        max_active_provider_calls=max_active_provider_calls,
+                        max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+                    )
                 if (
                     request.execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint

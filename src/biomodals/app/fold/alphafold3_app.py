@@ -44,7 +44,6 @@ from uuid import UUID
 
 import modal
 import orjson
-from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.config import AppConfig
 from biomodals.app.fold.alphafold3.execution_coordinator import (
@@ -55,23 +54,20 @@ from biomodals.app.fold.alphafold3.execution_publications import (
 )
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
+    load_execution_request,
     stage_execution_request,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     LoadedInferenceInput,
-    PreparedInferenceRun,
     load_staged_inference_input,
     materialize_local_input,
     sanitize_af3_name,
 )
-from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
 from biomodals.app.fold.alphafold3.invocation_cache import (
     load_invocation_manifest,
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
-    ModalInferenceExecutor,
-    ModalSearchExecutor,
     execute_profile_setup,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
@@ -115,9 +111,6 @@ from biomodals.app.fold.alphafold3.request_results import (
     create_request_archive,
     publish_request_results,
     request_publication_from_manifest,
-)
-from biomodals.app.fold.alphafold3.search_pipeline import (
-    resolve_msa_and_templates,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
@@ -597,29 +590,6 @@ def search_protein_templates(
     return _coordinator_result(result, execution_result_path)
 
 
-def _search_msa_and_templates(
-    config: AF3Config,
-    *,
-    search_msa: bool = True,
-    search_templates: bool = True,
-    max_parallel_search_workers: int = 4,
-) -> AF3Config:
-    """Resolve MSA/template fields through the production Modal adapter."""
-    return resolve_msa_and_templates(
-        config,
-        ModalSearchExecutor(
-            inspect_msa_function=inspect_msa_search_cache,
-            raw_search_function=search_database_msa,
-            msa_assembly_function=assemble_sequence_msas,
-            inspect_templates_function=inspect_protein_template_cache,
-            template_search_function=search_protein_templates,
-        ),
-        search_msa=search_msa,
-        search_protein_templates=search_templates,
-        max_parallel_search_workers=max_parallel_search_workers,
-    )
-
-
 ##########################################
 # Inference functions
 ##########################################
@@ -791,28 +761,6 @@ def finalize_inference_request(
     return _coordinator_result(result, execution_result_path)
 
 
-def _predict_structures(
-    prepared: PreparedInferenceRun,
-    num_containers: int,
-    *,
-    poll_timeout: int = 30,
-) -> dict[str, object]:
-    """Reconcile predictions through the production Modal adapter."""
-    return coordinate_seed_predictions(
-        prepared,
-        ModalInferenceExecutor(
-            claim_function=claim_seed_prediction_work,
-            inspect_function=inspect_seed_prediction_cache,
-            worker_function=run_inference_pipeline,
-            summary_function=finalize_inference_summary,
-            request_function=finalize_inference_request,
-        ),
-        num_containers=num_containers,
-        active_wait_timeout_seconds=MAX_TIMEOUT + 900,
-        worker_poll_timeout_seconds=poll_timeout,
-    )
-
-
 ##########################################
 # Deployment-local execution coordinator
 ##########################################
@@ -906,9 +854,14 @@ class ExecutionCoordinator:
         predecessor_execution_run_id: str,
     ) -> ExecutionSnapshot:
         """Create a Successor Run while inferring predecessor identity."""
+        execution_run_id, _deployment = self._identity()
         return self._adapter().restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
+            candidate_request=load_execution_request(
+                Path(CONF.output_volume_mountpoint),
+                execution_run_id,
+            ),
         )
 
     @modal.exit()

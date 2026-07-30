@@ -89,21 +89,26 @@ class FakeRuntime:
             return self.store.execution.snapshot(self.execution_run_id)
 
 
-def _request() -> AlphaFold3ExecutionRequest:
+def _request(
+    *,
+    sequence: str = "ACDE",
+    max_parallel_search_workers: int = 2,
+    max_num_gpus: int = 1,
+) -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
         AF3Config(
             name="example",
             modelSeeds=[1],
             sequences=[
                 AF3SequenceEntry(
-                    protein=AF3Protein(id="A", sequence="ACDE"),
+                    protein=AF3Protein(id="A", sequence=sequence),
                 )
             ],
         ),
         search_msa=False,
         search_protein_templates=False,
-        max_parallel_search_workers=2,
-        max_num_gpus=1,
+        max_parallel_search_workers=max_parallel_search_workers,
+        max_num_gpus=max_num_gpus,
         recycle=10,
         sample=1,
     )
@@ -127,6 +132,46 @@ def _coordinator(
         inference_runtime=cast(Any, object()),
         poll_interval_seconds=0,
     )
+
+
+def _persist_failed_predecessor(
+    tmp_path: Path,
+    request: AlphaFold3ExecutionRequest,
+) -> None:
+    persist_execution_request(tmp_path, PREDECESSOR_ID, request)
+    predecessor_store = AppExecutionRunStore(tmp_path, PREDECESSOR_ID)
+    with predecessor_store.transaction():
+        predecessor_store.execution.create_run(
+            execution_run_id=PREDECESSOR_ID,
+            plan=request.execution_plan,
+            deployment=DEPLOYMENT,
+            max_active_provider_calls=request.max_active_provider_calls,
+            max_active_gpu_provider_calls=request.max_num_gpus,
+            now=1,
+        )
+        predecessor_store.execution.start_node(
+            PREDECESSOR_ID,
+            "stage-request-input",
+            now=2,
+        )
+        predecessor_store.execution.discover_tasks(
+            PREDECESSOR_ID,
+            "stage-request-input",
+            (),
+            now=3,
+        )
+        predecessor_store.execution.skip_unreachable_nodes(
+            PREDECESSOR_ID,
+            now=4,
+        )
+        predecessor_store.execution.finalize_run_from_results(
+            PREDECESSOR_ID,
+            now=5,
+        )
+    assert (
+        predecessor_store.execution.get_run(PREDECESSOR_ID).status == RunStatus.FAILED
+    )
+    predecessor_store.close()
 
 
 def test_root_run_loads_staged_request_and_binds_remote_ledger(
@@ -172,40 +217,7 @@ def test_restart_links_a_new_ledger_and_only_changes_operational_limits(
         FakeRuntime,
     )
     request = _request()
-    persist_execution_request(tmp_path, PREDECESSOR_ID, request)
-    predecessor_store = AppExecutionRunStore(tmp_path, PREDECESSOR_ID)
-    with predecessor_store.transaction():
-        predecessor_store.execution.create_run(
-            execution_run_id=PREDECESSOR_ID,
-            plan=request.execution_plan,
-            deployment=DEPLOYMENT,
-            max_active_provider_calls=request.max_active_provider_calls,
-            max_active_gpu_provider_calls=request.max_num_gpus,
-            now=1,
-        )
-        predecessor_store.execution.start_node(
-            PREDECESSOR_ID,
-            "stage-request-input",
-            now=2,
-        )
-        predecessor_store.execution.discover_tasks(
-            PREDECESSOR_ID,
-            "stage-request-input",
-            (),
-            now=3,
-        )
-        predecessor_store.execution.skip_unreachable_nodes(
-            PREDECESSOR_ID,
-            now=4,
-        )
-        predecessor_store.execution.finalize_run_from_results(
-            PREDECESSOR_ID,
-            now=5,
-        )
-    assert (
-        predecessor_store.execution.get_run(PREDECESSOR_ID).status == RunStatus.FAILED
-    )
-    predecessor_store.close()
+    _persist_failed_predecessor(tmp_path, request)
     volume = FakeVolume()
     coordinator = _coordinator(
         tmp_path,
@@ -231,6 +243,76 @@ def test_restart_links_a_new_ledger_and_only_changes_operational_limits(
         ).execution_plan
         == request.execution_plan
     )
+
+
+def test_launch_restart_uses_candidate_operational_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch restart keeps candidate policy after validating its science."""
+    FakeRuntime.created.clear()
+    monkeypatch.setattr(
+        coordinator_module,
+        "AlphaFold3ExecutionRuntime",
+        FakeRuntime,
+    )
+    predecessor_request = _request()
+    _persist_failed_predecessor(tmp_path, predecessor_request)
+    candidate_request = _request(
+        max_parallel_search_workers=4,
+        max_num_gpus=3,
+    )
+    persist_execution_request(tmp_path, SUCCESSOR_ID, candidate_request)
+    coordinator = _coordinator(
+        tmp_path,
+        FakeVolume(),
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+    )
+
+    snapshot = coordinator.restart(
+        predecessor_execution_run_id=PREDECESSOR_ID,
+        predecessor_deployment=None,
+        candidate_request=candidate_request,
+    )
+
+    assert snapshot.run.plan == predecessor_request.execution_plan
+    assert snapshot.run.max_active_provider_calls == 4
+    assert snapshot.run.max_active_gpu_provider_calls == 3
+    assert FakeRuntime.created[0]["request"] == candidate_request
+
+
+def test_launch_restart_rejects_changed_science_before_creating_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed launch candidate cannot create a Successor Run ledger."""
+    monkeypatch.setattr(
+        coordinator_module,
+        "AlphaFold3ExecutionRuntime",
+        FakeRuntime,
+    )
+    _persist_failed_predecessor(tmp_path, _request())
+    candidate_request = _request(sequence="ACDF")
+    persist_execution_request(tmp_path, SUCCESSOR_ID, candidate_request)
+    coordinator = _coordinator(
+        tmp_path,
+        FakeVolume(),
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+    )
+
+    with pytest.raises(ValueError, match="Workload Plan Fingerprint"):
+        coordinator.restart(
+            predecessor_execution_run_id=PREDECESSOR_ID,
+            predecessor_deployment=None,
+            candidate_request=candidate_request,
+        )
+
+    assert not AppExecutionRunStore(
+        tmp_path,
+        SUCCESSOR_ID,
+    ).ledger_path.exists()
 
 
 def test_restart_rejects_a_gpu_limit_above_the_total_limit() -> None:

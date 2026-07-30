@@ -6,14 +6,14 @@ import ast
 import inspect
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import orjson
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold import alphafold3_app
-from biomodals.app.fold.alphafold3 import modal_adapters, upstream_inference
+from biomodals.app.fold.alphafold3 import upstream_inference
 from biomodals.app.fold.alphafold3.generation_claims import (
     GenerationClaim,
     finish_generation_claim,
@@ -26,17 +26,9 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
     InProcessInferenceExecutor,
-    ModalInferenceExecutor,
-    ModalSearchExecutor,
     execute_profile_setup,
     publish_invocation_receipt,
     stage_inference_run,
-)
-from biomodals.app.fold.alphafold3.msa_search import (
-    MsaArtifactReference,
-    MsaAssemblyTask,
-    RawSearchTask,
-    sequence_cache_relpath,
 )
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
 from biomodals.app.fold.alphafold3.seed_predictions import (
@@ -45,7 +37,6 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SeedClaimPlan,
     guard_seed_prediction_claims,
 )
-from biomodals.app.fold.alphafold3.template_search import TemplateTask
 
 
 class _ClaimStore:
@@ -184,290 +175,6 @@ def test_profile_setup_adapter_fans_out_missing_profiles() -> None:
     build_starmap.assert_called_once_with(
         ((spec.database_id, 8, "keep"),),
         return_exceptions=True,
-    )
-
-
-def test_modal_search_executor_marshals_remote_fanout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The production adapter should preserve task payloads and worker caps."""
-    budgets: list[int] = []
-
-    def fake_bounded_map(items, worker, *, max_parallel):
-        budgets.append(max_parallel)
-        return [worker(item) for item in items]
-
-    inspect_msa = Mock(
-        return_value=(
-            [{"status": "missing"}, {"status": "missing"}],
-            [{"status": "missing"}],
-        )
-    )
-    run_raw = Mock(side_effect=({"status": "published"}, RuntimeError("search failed")))
-    run_assembly = Mock(return_value={"status": "published"})
-    inspect_templates = Mock(return_value=[{"status": "missing"}])
-    run_template = Mock(return_value={"status": "published"})
-    monkeypatch.setattr(modal_adapters, "bounded_map", fake_bounded_map)
-    executor = ModalSearchExecutor(
-        inspect_msa_function=SimpleNamespace(remote=inspect_msa),
-        raw_search_function=SimpleNamespace(remote=run_raw),
-        msa_assembly_function=SimpleNamespace(remote=run_assembly),
-        inspect_templates_function=SimpleNamespace(remote=inspect_templates),
-        template_search_function=SimpleNamespace(remote=run_template),
-    )
-    raw_tasks = (
-        RawSearchTask(database_id="small_bfd", sequence="ACDE"),
-        RawSearchTask(database_id="uniref90", sequence="FGHI"),
-    )
-    assembly_tasks = (
-        MsaAssemblyTask(
-            polymer="protein",
-            sequence="ACDE",
-            include_unpaired=True,
-            include_paired=False,
-        ),
-    )
-    assert executor.inspect_msa(raw_tasks, assembly_tasks) == (
-        (
-            {"status": "missing"},
-            {"status": "missing"},
-        ),
-        ({"status": "missing"},),
-    )
-    raw_outcomes = executor.run_raw(raw_tasks, max_parallel=2)
-    assert raw_outcomes[0] == {"status": "published"}
-    assert isinstance(raw_outcomes[1], RuntimeError)
-    assert executor.run_assemblies(assembly_tasks, max_parallel=3) == (
-        {"status": "published"},
-    )
-
-    unpaired_msa = b">query\nACDE\n"
-    reference = MsaArtifactReference.from_content(
-        sequence_cache_relpath("protein", "ACDE") / "unpaired.a3m",
-        unpaired_msa,
-    )
-    template_tasks = (
-        TemplateTask(
-            sequence="ACDE",
-            unpaired_msa=None,
-            unpaired_msa_reference=reference,
-            publish_canonical=True,
-            max_template_date="2021-09-30",
-        ),
-    )
-    assert executor.inspect_templates(template_tasks) == ({"status": "missing"},)
-    assert executor.run_templates(template_tasks, max_parallel=4) == (
-        {"status": "published"},
-    )
-
-    assert budgets == [2, 3, 4]
-    inspect_msa.assert_called_once_with(
-        [
-            ("small_bfd", "ACDE"),
-            ("uniref90", "FGHI"),
-        ],
-        [("protein", "ACDE", True, False)],
-    )
-    assert run_raw.call_args_list == [
-        call("small_bfd", "ACDE"),
-        call("uniref90", "FGHI"),
-    ]
-    run_assembly.assert_called_once_with("protein", "ACDE", True, False)
-    inspect_templates.assert_called_once_with([
-        (
-            "ACDE",
-            template_tasks[0].unpaired_msa_sha256,
-            "2021-09-30",
-        )
-    ])
-    run_template.assert_called_once_with(
-        "ACDE",
-        None,
-        reference.to_record(),
-        True,
-        "2021-09-30",
-    )
-
-
-def test_modal_search_executor_logs_worker_progress(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    def fake_bounded_map(items, worker, *, max_parallel):
-        del max_parallel
-        return [worker(item) for item in items]
-
-    times = iter((0.0, 168.0, 200.0, 262.0))
-    monkeypatch.setattr(modal_adapters, "bounded_map", fake_bounded_map)
-    monkeypatch.setattr(modal_adapters, "monotonic", lambda: next(times))
-    executor = ModalSearchExecutor(
-        inspect_msa_function=SimpleNamespace(),
-        raw_search_function=SimpleNamespace(
-            remote=Mock(return_value={"status": "published"})
-        ),
-        msa_assembly_function=SimpleNamespace(),
-        inspect_templates_function=SimpleNamespace(),
-        template_search_function=SimpleNamespace(
-            remote=Mock(return_value={"status": "published", "templates": []})
-        ),
-    )
-    sequence = "ACDEFGHIKLMNPQRSTVWYACDE"
-    template = TemplateTask(
-        sequence=sequence,
-        unpaired_msa=f">query\n{sequence}\n",
-        unpaired_msa_reference=None,
-        publish_canonical=False,
-    )
-
-    executor.run_raw(
-        (RawSearchTask(database_id="uniref90", sequence=sequence),),
-        max_parallel=1,
-    )
-    executor.run_templates((template,), max_parallel=1)
-
-    assert capsys.readouterr().out.splitlines() == [
-        "🧬 MSA query finished: "
-        "query=ACDEFGHIKLMNPQRS… (24 residues), database=uniref90, "
-        "status=published, elapsed=2m 48s.",
-        "🧬 Protein template search finished: "
-        "query=ACDEFGHIKLMNPQRS… (24 residues), database=pdb_seqres, "
-        "status=published, elapsed=1m 2s.",
-    ]
-
-
-def test_modal_inference_executor_routes_spawn_poll_and_finalizers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The production adapter should marshal claims, workers, and publication."""
-    prepared = prepare_inference_run(
-        AF3Config(
-            name="composition",
-            modelSeeds=[1, 2],
-            sequences=[
-                AF3SequenceEntry(
-                    protein=AF3Protein(
-                        id="A",
-                        sequence="ACDE",
-                        unpairedMsa="",
-                        pairedMsa="",
-                        templates=[],
-                    )
-                )
-            ],
-        ),
-        recycle=3,
-        sample=2,
-    )
-    claimed = tuple(
-        ClaimedSeed(
-            seed=seed,
-            claim=GenerationClaim(
-                scope_key=f"seed:{prepared.run_id}:{seed}",
-                generation_id=f"generation-{seed}",
-                owner={},
-            ),
-        )
-        for seed in (1, 2)
-    )
-    spawned_seeds: list[int] = []
-    poll_timeouts: list[int] = []
-
-    class FakeFunctionCall:
-        def __init__(self, result: dict[str, object], *, timeout_once: bool) -> None:
-            self.result = result
-            self.timeout_once = timeout_once
-
-        def get(self, *, timeout: int) -> dict[str, object]:
-            poll_timeouts.append(timeout)
-            if self.timeout_once:
-                self.timeout_once = False
-                raise TimeoutError
-            return self.result
-
-    def spawn_worker(
-        run_id: str,
-        request_id: str,
-        staged_input_record: dict[str, object],
-        claim_records: list[dict[str, object]],
-    ) -> FakeFunctionCall:
-        assert (run_id, request_id) == (prepared.run_id, prepared.request_id)
-        assert staged_input_record == prepared.staged_input.to_record()
-        seed = claim_records[0].get("seed")
-        assert isinstance(seed, int)
-        spawned_seeds.append(seed)
-        return FakeFunctionCall(
-            {
-                "run_id": run_id,
-                "published_seeds": [seed] if seed == 1 else [],
-                "reused_seeds": [seed] if seed == 2 else [],
-            },
-            timeout_once=seed == 1,
-        )
-
-    claim_remote = Mock(
-        return_value=SeedClaimPlan(
-            reused_seeds=(2,),
-            owned=(claimed[0],),
-            active=(),
-        ).to_dict()
-    )
-    inspect_remote = Mock(
-        side_effect=lambda _run_id, seeds, _sample: [
-            {"status": "reused", "seed": seed} for seed in seeds
-        ]
-    )
-    summary_remote = Mock(return_value={"status": "complete"})
-    request_remote = Mock(return_value={"status": "complete"})
-    spawn_remote = Mock(side_effect=spawn_worker)
-    executor = ModalInferenceExecutor(
-        claim_function=SimpleNamespace(remote=claim_remote),
-        inspect_function=SimpleNamespace(remote=inspect_remote),
-        worker_function=SimpleNamespace(spawn=spawn_remote),
-        summary_function=SimpleNamespace(remote=summary_remote),
-        request_function=SimpleNamespace(remote=request_remote),
-    )
-    assert executor.claim_seeds(
-        prepared.run_id,
-        (1, 2),
-        sample_count=2,
-    ) == SeedClaimPlan(reused_seeds=(2,), owned=(claimed[0],), active=())
-    assert executor.inspect_seeds(
-        prepared.run_id,
-        (1, 2),
-        sample_count=2,
-    ) == (
-        {"status": "reused", "seed": 1},
-        {"status": "reused", "seed": 2},
-    )
-
-    outcome = executor.run_claimed(
-        prepared,
-        claimed,
-        max_workers=2,
-        poll_timeout_seconds=7,
-    )
-    assert outcome.published_seeds == frozenset({1})
-    assert outcome.reused_seeds == frozenset({2})
-    assert outcome.failures == ()
-    assert spawned_seeds == [1, 2]
-    assert poll_timeouts == [7, 7, 7]
-
-    assert executor.finalize_summary(prepared) == {"status": "complete"}
-    assert executor.finalize_request(prepared) == {"status": "complete"}
-    claim_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
-    inspect_remote.assert_called_once_with(prepared.run_id, [1, 2], 2)
-    summary_remote.assert_called_once_with(
-        prepared.run_id,
-        prepared.request_id,
-        prepared.staged_input.to_record(),
-    )
-    request_remote.assert_called_once_with(
-        prepared.run_id,
-        prepared.request_id,
-        [1, 2],
-        [1, 2],
-        2,
-        "composition",
     )
 
 
@@ -916,6 +623,58 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
 
     assert captured["restart"] == {
         "predecessor_execution_run_id": predecessor,
+    }
+
+
+def test_coordinator_launch_restart_forwards_the_staged_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch convenience validates the request staged for its new Run."""
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    successor = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    candidate = object()
+    captured: dict[str, object] = {}
+
+    class Adapter:
+        def restart(self, **kwargs):
+            captured.update(kwargs)
+            return "snapshot"
+
+    monkeypatch.setattr(
+        alphafold3_app.CONF,
+        "output_volume_mountpoint",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "load_execution_request",
+        lambda root, execution_run_id: (
+            captured.update(
+                loaded_root=root,
+                loaded_execution_run_id=execution_run_id,
+            )
+            or candidate
+        ),
+    )
+    raw_cls = alphafold3_app.ExecutionCoordinator._get_user_cls()
+    instance = raw_cls()
+    instance.execution_run_id = successor
+    instance.deployment_environment = "main"
+    instance.deployment_name = "AlphaFold3"
+    instance.deployment_version = 8
+    instance._coordinator_adapter = Adapter()
+    instance._development = False
+
+    result = raw_cls.restart_from._get_raw_f()(instance, predecessor)
+
+    assert result == "snapshot"
+    assert captured == {
+        "loaded_root": tmp_path,
+        "loaded_execution_run_id": alphafold3_app.UUID(successor),
+        "predecessor_execution_run_id": alphafold3_app.UUID(predecessor),
+        "predecessor_deployment": None,
+        "candidate_request": candidate,
     }
 
 

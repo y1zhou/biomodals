@@ -30,8 +30,14 @@ from biomodals.app.bioinfo.rosetta.execution_contracts import (
 )
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
+from biomodals.app.fold.alphafold3.inference_pipeline import (
+    coordinate_seed_predictions,
+)
 from biomodals.app.fold.alphafold3.modal_adapters import (
     InProcessInferenceExecutor,
+)
+from biomodals.app.fold.alphafold3.search_pipeline import (
+    resolve_msa_and_templates,
 )
 from biomodals.app.score import af3score_app, dockq_app
 from biomodals.execution import (
@@ -3486,10 +3492,11 @@ def _run_one_refold_candidate(
             "provide an af3_config_json with populated fields or leave "
             "search_msa disabled"
         )
-    enriched = alphafold3_app._search_msa_and_templates(  # noqa: SLF001
+    enriched = resolve_msa_and_templates(
         conf,
+        cast(Any, None),
         search_msa=False,
-        search_templates=False,
+        search_protein_templates=False,
     )
     prepared = alphafold3_app.prepare_inference_run(
         enriched,
@@ -3513,7 +3520,7 @@ def _run_one_refold_candidate(
             summary_function=alphafold3_app.finalize_inference_summary.get_raw_f(),
             request_function=alphafold3_app.finalize_inference_request.get_raw_f(),
         )
-        result = alphafold3_app.coordinate_seed_predictions(
+        result = coordinate_seed_predictions(
             prepared,
             executor,
             num_containers=1,

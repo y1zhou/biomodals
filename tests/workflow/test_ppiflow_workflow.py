@@ -3,6 +3,7 @@
 # ruff: noqa: D103
 
 import hashlib
+import json
 import pickle
 import tarfile
 from dataclasses import replace
@@ -191,9 +192,17 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
         source,
         "run_ppiflow_flowpacker_stage",
     )
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _decorator_block(
         source,
-        "run_ppiflow_af3score_stage",
+        "prepare_ppiflow_af3score_stage",
+    )
+    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_af3score_batch",
+    )
+    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "postprocess_ppiflow_af3score_stage",
     )
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
@@ -713,17 +722,18 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
 
 def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    node = ppiflow_workflow.AF3ScoreNode(
+    prepare_node = ppiflow_workflow.AF3ScorePrepareNode(
         "AF3scoreStep_stage1",
         {"run_name": "af3-run", "num_jobs": 4, "prepare_workers": 2},
     )
 
-    submission = node.prepare_remote(
+    submission = prepare_node.prepare_remote(
         NodeRunContext(
             execution_run_id=RUN_ID,
             workload_run_key="run-1",
-            node_id="stage1-af3score",
+            node_id="stage1-af3score-prepare",
             task_key="node",
             work_dir=tmp_path / "result",
             cache_dir=tmp_path / "cache",
@@ -736,7 +746,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
         )
     )
 
-    assert submission.function_name == "run_ppiflow_af3score_stage"
+    assert submission.function_name == "prepare_ppiflow_af3score_stage"
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
     assert submission.kwargs["candidate_manifests"] == [
         _upstream_structure_artifact(kind=ArtifactKind.TABLE)
@@ -744,6 +754,83 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert submission.kwargs["run_name"] == "af3-run"
     assert submission.kwargs["config"]["num_jobs"] == 4
     assert submission.kwargs["config"]["prepare_workers"] == 2
+
+    plan_path = tmp_path / "af3score_task_plan.json"
+    plan_path.write_text(
+        json.dumps({
+            "run_name": "af3-run",
+            "input_files": ["candidate-a.pdb", "candidate-b.pdb"],
+            "candidates": [
+                {
+                    "candidate_id": candidate_id,
+                    "input_name": f"{candidate_id}.pdb",
+                    "scientific_payload": {
+                        "candidate_id": candidate_id,
+                        "content_sha256": candidate_id,
+                    },
+                    "chunk": {
+                        "batch_name": "batch-0",
+                        "batch_json_dir": "/af3/batch/json",
+                        "batch_pdb_dir": "/af3/batch/pdb",
+                        "task_count": 2,
+                    },
+                }
+                for candidate_id in ("candidate-a", "candidate-b")
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUME_ROOTS",
+        {"workflow-volume": str(tmp_path)},
+    )
+    plan_artifact = WorkflowArtifact(
+        artifact_id="af3score-plan",
+        producing_node_id="stage1-af3score-prepare",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=plan_path.name,
+            media_type="application/json",
+        ),
+    )
+    batch_node = ppiflow_workflow.AF3ScoreBatchNode(
+        "AF3scoreStep_stage1",
+        {"run_name": "af3-run"},
+    )
+    batch_context = NodeRunContext(
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
+        node_id="stage1-af3score-batches",
+        task_key="candidate-a",
+        work_dir=tmp_path / "batch-result",
+        cache_dir=tmp_path / "batch-cache",
+        inputs={"af3score_plan": [plan_artifact]},
+    )
+    tasks = batch_node.discover_remote_tasks(batch_context)
+    batch_call = batch_node.prepare_remote_task_batch(batch_context, tasks)
+    assert [task.task_key for task in tasks] == ["candidate-a", "candidate-b"]
+    assert batch_call.function_name == "run_ppiflow_af3score_batch"
+    assert batch_call.max_tasks_per_call == 2
+    assert batch_call.kwargs["task_keys"] == ["candidate-a", "candidate-b"]
+
+    postprocess_node = ppiflow_workflow.AF3ScoreNode(
+        "AF3scoreStep_stage1",
+        {"run_name": "af3-run"},
+    )
+    postprocess_call = postprocess_node.prepare_remote(
+        NodeRunContext(
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
+            node_id="stage1-af3score",
+            task_key="node",
+            work_dir=tmp_path / "post-result",
+            cache_dir=tmp_path / "post-cache",
+            inputs={"af3score_plan": [plan_artifact]},
+        )
+    )
+    assert postprocess_call.function_name == "postprocess_ppiflow_af3score_stage"
 
 
 def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
@@ -800,6 +887,71 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     assert commits == [True]
 
 
+def test_af3score_prepare_publishes_candidate_to_batch_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_pdb_dir = tmp_path / "batch" / "pdb"
+    batch_pdb_dir.mkdir(parents=True)
+    for candidate_id in ("candidate-a", "candidate-b"):
+        (batch_pdb_dir / f"{candidate_id}.pdb").write_text(
+            "ATOM\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_stage_af3score_candidate_inputs",
+        lambda **_kwargs: [
+            {
+                "candidate_id": candidate_id,
+                "input_name": f"{candidate_id}.pdb",
+                "scientific_payload": {
+                    "candidate_id": candidate_id,
+                    "content_sha256": candidate_id,
+                },
+            }
+            for candidate_id in ("candidate-a", "candidate-b")
+        ],
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.af3score_app,
+        "af3score_prepare",
+        _FakeModalFunction(
+            "fc-prepare",
+            SimpleNamespace(
+                pending=2,
+                chunk_specs=[
+                    SimpleNamespace(
+                        batch_name="batch-0",
+                        batch_json_dir=str(tmp_path / "batch" / "json"),
+                        batch_pdb_dir=str(batch_pdb_dir),
+                    )
+                ],
+            ),
+        ),
+    )
+
+    result = ppiflow_workflow.prepare_ppiflow_af3score_stage.get_raw_f()(
+        artifacts=[_upstream_structure_artifact()],
+        candidate_manifests=[],
+        config={"num_jobs": 2},
+        step_name="AF3scoreStep_stage1",
+        run_name="af3-run",
+    )
+
+    [output] = result.outputs
+    assert isinstance(output.storage, InlineBytes)
+    plan = json.loads(output.storage.data)
+    assert [candidate["candidate_id"] for candidate in plan["candidates"]] == [
+        "candidate-a",
+        "candidate-b",
+    ]
+    assert {candidate["chunk"]["batch_name"] for candidate in plan["candidates"]} == {
+        "batch-0"
+    }
+    assert {candidate["chunk"]["task_count"] for candidate in plan["candidates"]} == {2}
+
+
 def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
     af3score_stage = _FakeModalFunction(
         "fc-af3score-stage",
@@ -810,18 +962,8 @@ def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
         {"run_name": "af3-run"},
     )
 
-    call = node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id="stage1-af3score",
-            task_key="node",
-            work_dir=tmp_path / "result",
-            cache_dir=tmp_path / "cache",
-            inputs={"structures": [_upstream_structure_artifact()]},
-        )
-    )
-    result = node.process_remote_result(af3score_stage.result, call.metadata)
+    del tmp_path
+    result = node.process_remote_result(af3score_stage.result, {})
 
     assert result.status == AppRunStatus.PARTIAL
 
@@ -1667,6 +1809,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage1-ppiflow-design",
         "stage1-ligandmpnn",
         "stage1-flowpacker",
+        "stage1-af3score-prepare",
+        "stage1-af3score-batches",
         "stage1-af3score",
         "stage1-filter",
         "stage2-rosetta-fix",
@@ -1674,6 +1818,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-partial-ppiflow",
         "stage2-ligandmpnn",
         "stage2-flowpacker",
+        "stage2-af3score-prepare",
+        "stage2-af3score-batches",
         "stage2-af3score",
         "stage2-filter",
         "stage2-alphafold3-refold",
@@ -1688,6 +1834,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "PPIFlowDesignNode",
         "LigandMPNNNode",
         "FlowPackerNode",
+        "AF3ScorePrepareNode",
+        "AF3ScoreBatchNode",
         "AF3ScoreNode",
         "FilterStructuresNode",
         "RosettaFixNode",
@@ -1695,6 +1843,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "PPIFlowPartialNode",
         "LigandMPNNNode",
         "FlowPackerNode",
+        "AF3ScorePrepareNode",
+        "AF3ScoreBatchNode",
         "AF3ScoreNode",
         "FilterStructuresNode",
         "ReFoldNode",
@@ -1704,6 +1854,13 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "ReportNode",
     ]
     assert definition.dependencies["stage2-fixed-positions"] == {"stage2-rosetta-fix"}
+    assert definition.dependencies["stage1-af3score-batches"] == {
+        "stage1-af3score-prepare"
+    }
+    assert definition.dependencies["stage1-af3score"] == {
+        "stage1-af3score-prepare",
+        "stage1-af3score-batches",
+    }
     assert definition.dependencies["stage2-partial-ppiflow"] == {
         "stage2-fixed-positions"
     }
@@ -1798,13 +1955,13 @@ def test_ppiflow_candidate_manifest_edges_select_manifest_role() -> None:
 
     expected_manifest_sources = {
         "stage1-ligandmpnn": "stage1-ppiflow-design",
-        "stage1-af3score": "stage1-ligandmpnn",
+        "stage1-af3score-prepare": "stage1-ligandmpnn",
         "stage1-filter": "stage1-ligandmpnn",
         "stage2-rosetta-fix": "stage1-filter",
         "stage2-fixed-positions": "stage2-rosetta-fix",
         "stage2-partial-ppiflow": "stage2-fixed-positions",
         "stage2-ligandmpnn": "stage2-partial-ppiflow",
-        "stage2-af3score": "stage2-ligandmpnn",
+        "stage2-af3score-prepare": "stage2-ligandmpnn",
         "stage2-filter": "stage2-ligandmpnn",
         "stage2-alphafold3-refold": "stage2-filter",
         "stage2-dockq": "stage2-filter",
@@ -1845,7 +2002,7 @@ def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> No
         "stage2-fixed-positions",
         "stage2-partial-ppiflow",
         "stage2-ligandmpnn",
-        "stage2-af3score",
+        "stage2-af3score-prepare",
         "stage2-filter",
     ]
     for node_id in stage1_retained_path:

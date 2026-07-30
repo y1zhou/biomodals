@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -13,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import modal
@@ -32,6 +33,7 @@ from biomodals.execution import DeploymentIdentity, NodeAggregationPolicy
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     AppRunLayout,
+    has_completed_output_files,
     volume_app_output,
     volume_path_from_mount_path,
 )
@@ -123,6 +125,9 @@ flowpacker_task_image = flowpacker_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
 dockq_task_image = dockq_app.runtime_image.add_local_python_source("biomodals.workflow")
+af3score_task_image = af3score_app.runtime_image.add_local_python_source(
+    "biomodals.workflow"
+)
 alphafold3_task_image = alphafold3_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
@@ -175,6 +180,14 @@ FLOWPACKER_TASK_VOLUME_MOUNTS = {
         output_volume=True,
         model_volume=True,
         model_ro=False,
+    ),
+}
+AF3SCORE_TASK_VOLUME_MOUNTS = {
+    **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    **af3score_app.CONF.mounts(
+        output_volume=True,
+        model_volume=True,
+        model_mount_subdir=False,
     ),
 }
 ALPHAFOLD3_TASK_VOLUME_MOUNTS = {
@@ -995,6 +1008,57 @@ def rank_ppiflow_artifacts(
     )
 
 
+def _stage_af3score_candidate_inputs(
+    *,
+    artifacts: list[WorkflowArtifact],
+    candidate_manifests: list[WorkflowArtifact] | None,
+    run_name: str,
+    patterns: Sequence[str] | None = None,
+    max_files: int | None = None,
+) -> list[dict[str, object]]:
+    """Stage candidate-keyed PDBs and retain their scientific identities."""
+    _reload_ppiflow_source_volumes()
+    selected = ppiflow_staging.select_structure_files_from_artifacts(
+        artifacts=artifacts,
+        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        patterns=patterns,
+        max_files=max_files,
+    )
+    candidates = ppiflow_staging.candidate_structure_files_from_selected(
+        selected,
+        manifest_frame=_candidate_manifest_frame_from_inputs(
+            candidate_manifests or [],
+            selected,
+            step_name="AF3ScoreInput",
+        ),
+    )
+    layout = AppRunLayout.from_run_root(
+        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
+    )
+    if layout.inputs_dir.exists():
+        shutil.rmtree(layout.inputs_dir)
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[dict[str, object]] = []
+    input_names: set[str] = set()
+    for candidate in candidates:
+        pdb_name = f"{sanitize_filename(candidate.candidate_id)}.pdb"
+        if pdb_name in input_names:
+            raise ValueError(f"Duplicate AF3Score staged input name: {pdb_name}")
+        (layout.inputs_dir / pdb_name).write_bytes(candidate.data)
+        input_names.add(pdb_name)
+        staged.append({
+            "candidate_id": candidate.candidate_id,
+            "input_name": pdb_name,
+            "scientific_payload": {
+                "candidate_id": candidate.candidate_id,
+                "content_sha256": hashlib.sha256(candidate.data).hexdigest(),
+                "source_path": candidate.source_path,
+            },
+        })
+    AF3SCORE_OUTPUT_VOLUME.commit()
+    return staged
+
+
 @app.function(
     image=runtime_image,
     cpu=0.125,
@@ -1010,28 +1074,16 @@ def stage_af3score_inputs(
     max_files: int | None = None,
 ) -> list[str]:
     """Stage selected PDB files into AF3Score's input directory."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts=artifacts,
-        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=patterns,
-        max_files=max_files,
-    )
-    layout = AppRunLayout.from_run_root(
-        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
-    )
-    if layout.inputs_dir.exists():
-        shutil.rmtree(layout.inputs_dir)
-    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
-    input_names = []
-    for file_name, file_bytes in selected:
-        pdb_name = f"{sanitize_filename(ppiflow_tables.candidate_key(file_name))}.pdb"
-        if pdb_name in input_names:
-            raise ValueError(f"Duplicate AF3Score staged input name: {pdb_name}")
-        (layout.inputs_dir / pdb_name).write_bytes(file_bytes)
-        input_names.append(pdb_name)
-    AF3SCORE_OUTPUT_VOLUME.commit()
-    return input_names
+    return [
+        str(record["input_name"])
+        for record in _stage_af3score_candidate_inputs(
+            artifacts=artifacts,
+            candidate_manifests=None,
+            run_name=run_name,
+            patterns=patterns,
+            max_files=max_files,
+        )
+    ]
 
 
 @app.function(
@@ -1133,104 +1185,251 @@ def stage_rosetta_inputs(
     }
 
 
+def _af3score_task_spec_value(task_spec: object, name: str) -> object:
+    """Read one field from AF3Score's dataclass or a serialized test double."""
+    if isinstance(task_spec, Mapping):
+        return cast(Mapping[str, object], task_spec)[name]
+    return getattr(task_spec, name)
+
+
+def _af3score_chunk_payload(chunk: object) -> dict[str, str]:
+    """Normalize one AF3Score chunk without exposing its dataclass to the ledger."""
+    if isinstance(chunk, Mapping):
+        payload = cast(Mapping[str, object], chunk)
+        return {
+            "batch_json_dir": str(payload["batch_json_dir"]),
+            "batch_name": str(payload["batch_name"]),
+            "batch_pdb_dir": str(payload["batch_pdb_dir"]),
+        }
+    chunk_spec = cast(af3score_app.ChunkSpec, chunk)
+    return {
+        "batch_json_dir": str(chunk_spec.batch_json_dir),
+        "batch_name": str(chunk_spec.batch_name),
+        "batch_pdb_dir": str(chunk_spec.batch_pdb_dir),
+    }
+
+
+def _af3score_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
+    """Serialize one operational AF3Score plan for downstream Task discovery."""
+    candidates = plan["candidates"]
+    if not isinstance(candidates, Sequence):
+        raise TypeError("AF3Score plan candidates must be a sequence")
+    return AppOutput(
+        name="af3score_task_plan",
+        kind=ArtifactKind.TABLE,
+        storage=InlineBytes(
+            data=json.dumps(plan, indent=2, sort_keys=True).encode("utf-8"),
+            filename="af3score_task_plan.json",
+            media_type="application/json",
+        ),
+        metadata={
+            "candidate_count": len(candidates),
+            "run_name": str(plan["run_name"]),
+        },
+    )
+
+
+def _read_af3score_plan_artifacts(
+    artifacts: Sequence[WorkflowArtifact],
+) -> dict[str, object]:
+    """Load the single prepared AF3Score plan from a workflow artifact."""
+    if len(artifacts) != 1:
+        raise ValueError(f"Expected one AF3Score task plan, found {len(artifacts)}")
+    path = ppiflow_staging.artifact_mount_path(
+        artifacts[0],
+        PPI_FLOW_SOURCE_VOLUME_ROOTS,
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("AF3Score task plan must be a JSON object")
+    return value
+
+
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
+    image=af3score_task_image,
+    cpu=(0.125, 16.125),
+    memory=(1024, 32768),
     timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    volumes=AF3SCORE_TASK_VOLUME_MOUNTS,
 )
-def run_ppiflow_af3score_stage(
+def prepare_ppiflow_af3score_stage(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None = None,
     config: dict[str, object],
     step_name: str,
     run_name: str,
-    run_id: str,
-    node_id: str,
 ) -> AppRunResult:
-    """Run AF3Score prepare/GPU/postprocess as one workflow stage call."""
-    # TODO: tune CPU/memory/timeout once AF3Score candidate-stage telemetry exists.
-    input_names = stage_af3score_inputs.get_raw_f()(
+    """Stage AF3Score candidates and publish its finite GPU Task plan."""
+    staged = _stage_af3score_candidate_inputs(
         artifacts=artifacts,
+        candidate_manifests=candidate_manifests,
         run_name=run_name,
         patterns=_patterns_from_config(config, default=("*.pdb",)),
         max_files=_optional_config_int(config, "max_structures"),
     )
+    input_names = [str(record["input_name"]) for record in staged]
     if not input_names:
         raise ValueError(f"{step_name} requires at least one AF3Score input")
-    manifest_frame = _candidate_manifest_frame_from_inputs(
-        candidate_manifests or [],
-        [(input_name, b"") for input_name in input_names],
-        step_name=step_name,
-    )
-    input_candidates = ppiflow_staging.candidate_structure_files_from_selected(
-        [(input_name, b"") for input_name in input_names],
-        manifest_frame=manifest_frame,
-    )
-
-    af3score_app.af3score_manage_lock.remote(run_name=run_name, acquire=True)
-    try:
-        task_spec = af3score_app.af3score_prepare.remote(
-            run_name=run_name,
-            input_files=input_names,
-            num_jobs=_config_int(
+    task_spec = af3score_app.af3score_prepare.get_raw_f()(
+        run_name=run_name,
+        input_files=input_names,
+        num_jobs=_config_int(
+            config,
+            "num_jobs",
+            _config_int(
                 config,
-                "num_jobs",
-                _config_int(
-                    config,
-                    "max_batches",
-                    _config_int(config, "max_child_calls", 10),
-                ),
+                "max_batches",
+                _config_int(config, "max_child_calls", 10),
             ),
-            prepare_workers=_config_int(config, "prepare_workers", 8),
+        ),
+        prepare_workers=_config_int(config, "prepare_workers", 8),
+    )
+    chunks_by_input: dict[str, dict[str, str]] = {}
+    raw_chunks = _af3score_task_spec_value(task_spec, "chunk_specs")
+    if not isinstance(raw_chunks, Sequence):
+        raise TypeError("AF3Score chunk_specs must be a sequence")
+    for raw_chunk in raw_chunks:
+        chunk = _af3score_chunk_payload(raw_chunk)
+        for path in sorted(Path(chunk["batch_pdb_dir"]).glob("*.pdb")):
+            if path.name in chunks_by_input:
+                raise ValueError(f"AF3Score input {path.name!r} appears in two batches")
+            chunks_by_input[path.name] = chunk
+    pending_value = _af3score_task_spec_value(task_spec, "pending")
+    if not isinstance(pending_value, int):
+        raise TypeError("AF3Score pending Task count must be an integer")
+    pending = pending_value
+    if len(chunks_by_input) != pending:
+        raise ValueError(
+            "AF3Score prepared Task count does not match its batch directories: "
+            f"{pending} pending, {len(chunks_by_input)} mapped"
         )
-        raw_chunk_specs = (
-            task_spec.get("chunk_specs", [])
-            if isinstance(task_spec, Mapping)
-            else getattr(task_spec, "chunk_specs", [])
-        )
-        chunk_specs = (
-            list(raw_chunk_specs)
-            if isinstance(raw_chunk_specs, Sequence)
-            and not isinstance(raw_chunk_specs, str | bytes)
-            else []
-        )
-        max_parallel = _config_int(config, "max_child_calls", len(chunk_specs))
+    candidates = [
+        record | {"chunk": chunks_by_input.get(str(record["input_name"]))}
+        for record in staged
+    ]
+    chunk_sizes: dict[str, int] = {}
+    for candidate in candidates:
+        chunk = candidate["chunk"]
+        if isinstance(chunk, Mapping):
+            chunk_payload = cast(Mapping[str, object], chunk)
+            batch_name = str(chunk_payload["batch_name"])
+            chunk_sizes[batch_name] = chunk_sizes.get(batch_name, 0) + 1
+    for candidate in candidates:
+        chunk = candidate["chunk"]
+        if isinstance(chunk, dict):
+            chunk_payload = cast(dict[str, object], chunk)
+            chunk_payload["task_count"] = chunk_sizes[str(chunk_payload["batch_name"])]
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            _af3score_plan_artifact({
+                "candidates": candidates,
+                "input_files": input_names,
+                "run_name": run_name,
+            })
+        ],
+    )
 
-        def run_chunk(chunk):
-            batch_name = (
-                chunk["batch_name"] if isinstance(chunk, Mapping) else chunk.batch_name
-            )
-            batch_json_dir = (
-                chunk["batch_json_dir"]
-                if isinstance(chunk, Mapping)
-                else chunk.batch_json_dir
-            )
-            batch_pdb_dir = (
-                chunk["batch_pdb_dir"]
-                if isinstance(chunk, Mapping)
-                else chunk.batch_pdb_dir
-            )
-            return af3score_app.af3score_run.remote(
-                run_name=run_name,
-                batch_name=batch_name,
-                batch_json_dir=batch_json_dir,
-                batch_pdb_dir=batch_pdb_dir,
-            )
 
-        bounded_map(chunk_specs, run_chunk, max_parallel=max_parallel)
-        metrics = af3score_app.af3score_postprocess.remote(
-            run_name=run_name,
-            input_files=input_names,
+@app.function(
+    image=af3score_task_image,
+    gpu=af3score_app.CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=CONF.timeout,
+    volumes=AF3SCORE_TASK_VOLUME_MOUNTS,
+)
+def run_ppiflow_af3score_batch(
+    *,
+    run_name: str,
+    batch_name: str,
+    batch_json_dir: str,
+    batch_pdb_dir: str,
+    task_keys: list[str],
+    input_names: list[str],
+) -> dict[str, dict[str, object]]:
+    """Run one AF3Score GPU batch and report each owned scientific Task."""
+    if len(task_keys) != len(input_names) or not task_keys:
+        raise ValueError(
+            "AF3Score batch Task keys and inputs must be nonempty and align"
         )
-    finally:
-        af3score_app.af3score_manage_lock.remote(run_name=run_name, acquire=False)
+    af3score_app.af3score_run.get_raw_f()(
+        run_name=run_name,
+        batch_name=batch_name,
+        batch_json_dir=batch_json_dir,
+        batch_pdb_dir=batch_pdb_dir,
+    )
+    layout = AppRunLayout.from_run_root(
+        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
+    )
+    results: dict[str, dict[str, object]] = {}
+    for task_key, input_name in zip(task_keys, input_names, strict=True):
+        input_id = Path(input_name).stem
+        complete = has_completed_output_files(
+            layout.outputs_dir,
+            input_id,
+            sample_subdir=af3score_app.APP_INFO.completion_sample_subdir,
+            required_files=af3score_app.APP_INFO.completion_required_files,
+        )
+        result = (
+            AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name=f"af3score_{sanitize_filename(task_key)}",
+                        kind=ArtifactKind.SCORES,
+                        storage=volume_path_from_mount_path(
+                            str(layout.outputs_dir / input_id),
+                            AF3SCORE_OUTPUT_MOUNTPOINT,
+                            AF3SCORE_OUTPUT_VOLUME_NAME,
+                        ),
+                        metadata={
+                            "candidate_id": task_key,
+                            "input_name": input_name,
+                            "run_name": run_name,
+                        },
+                    )
+                ],
+            )
+            if complete
+            else AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[f"AF3Score output is incomplete for {task_key!r}"],
+            )
+        )
+        results[task_key] = result.model_dump(mode="json")
+    return results
 
+
+@app.function(
+    image=af3score_task_image,
+    cpu=(0.125, 16.125),
+    memory=(1024, 16384),
+    timeout=CONF.timeout,
+    volumes=AF3SCORE_TASK_VOLUME_MOUNTS,
+)
+def postprocess_ppiflow_af3score_stage(
+    *,
+    plan_artifacts: list[WorkflowArtifact],
+    step_name: str,
+    run_id: str,
+    node_id: str,
+) -> AppRunResult:
+    """Postprocess a kernel-completed AF3Score Task collection."""
+    plan = _read_af3score_plan_artifacts(plan_artifacts)
+    run_name = str(plan["run_name"])
+    input_files = plan["input_files"]
+    candidates = plan["candidates"]
+    if not isinstance(input_files, list) or not isinstance(candidates, list):
+        raise TypeError("AF3Score task plan contains invalid candidate data")
+    metrics = af3score_app.af3score_postprocess.get_raw_f()(
+        run_name=run_name,
+        input_files=[str(value) for value in input_files],
+    )
     metrics_csv = str(metrics["metrics_csv"])
     status = ppiflow_tables.score_table_status(
-        requested_count=len(input_names),
+        requested_count=len(input_files),
         usable_rows=int(metrics.get("metrics_rows", 0)),
         failed_count=int(metrics.get("failed", 0)),
     )
@@ -1240,12 +1439,12 @@ def run_ppiflow_af3score_stage(
         step_name=step_name,
         rows=[
             ppiflow_manifests.candidate_manifest_row(
-                candidate_id=input_candidate.candidate_id,
+                candidate_id=str(candidate_payload["candidate_id"]),
                 stage_name=step_name,
                 stage_role="score",
                 operation_mode="af3score",
                 candidate_status=status.value,
-                source_path=input_candidate.file_name,
+                source_path=str(candidate_payload["input_name"]),
                 derived_path=metrics_csv,
                 files=[
                     ppiflow_manifests.candidate_file_record(
@@ -1260,7 +1459,9 @@ def run_ppiflow_af3score_stage(
                 ],
                 summary=metrics,
             )
-            for input_candidate in input_candidates
+            for candidate in candidates
+            if isinstance(candidate, Mapping)
+            for candidate_payload in (cast(Mapping[str, object], candidate),)
         ],
     )
     return AppRunResult(
@@ -1879,16 +2080,16 @@ class FlowPackerNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class AF3ScoreNode(_ConfiguredAppStepNode):
-    """AF3Score structure scoring step."""
+class AF3ScorePrepareNode(_ConfiguredAppStepNode):
+    """Prepare finite AF3Score candidate Tasks without nested Modal calls."""
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare AF3Score as one recoverable workflow stage call."""
+        """Prepare AF3Score inputs and its durable Task plan."""
         structures = context.inputs.get("structures") or []
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
         return RemoteNodeCall(
-            function_name="run_ppiflow_af3score_stage",
+            function_name="prepare_ppiflow_af3score_stage",
             uses_gpu=False,
             kwargs={
                 "artifacts": structures,
@@ -1896,9 +2097,163 @@ class AF3ScoreNode(_ConfiguredAppStepNode):
                 "config": self.config,
                 "step_name": self.step_name,
                 "run_name": self._run_name(context),
+            },
+            runtime_image_key="af3score-cpu",
+        )
+
+
+@dataclass
+class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+    """Schedule candidate Tasks through AF3Score's prepared GPU batches."""
+
+    def _plan(self, context: NodeRunContext) -> dict[str, object]:
+        return _read_af3score_plan_artifacts(context.inputs.get("af3score_plan") or [])
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Discover one Task per candidate that still needs GPU scoring."""
+        plan = self._plan(context)
+        candidates = plan.get("candidates")
+        if not isinstance(candidates, list):
+            raise TypeError("AF3Score task plan candidates must be a list")
+        run_name = str(plan["run_name"])
+        tasks = []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                raise TypeError("AF3Score candidate plan entries must be objects")
+            candidate_payload = cast(Mapping[str, object], candidate)
+            chunk = candidate_payload.get("chunk")
+            if chunk is None:
+                continue
+            if not isinstance(chunk, Mapping):
+                raise TypeError("AF3Score candidate chunk must be an object")
+            candidate_id = str(candidate_payload["candidate_id"])
+            tasks.append(
+                RemoteWorkflowTask(
+                    task_key=candidate_id,
+                    scientific_payload=candidate_payload["scientific_payload"],
+                    execution_payload={
+                        "candidate_id": candidate_id,
+                        "chunk": dict(chunk),
+                        "input_name": str(candidate_payload["input_name"]),
+                        "run_name": run_name,
+                    },
+                )
+            )
+        return tuple(tasks)
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Prepare the single-Task tail of one AF3Score batch."""
+        return self.prepare_remote_task_batch(context, (task,))
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[RemoteWorkflowTask, ...],
+    ) -> RemoteNodeCall:
+        """Prepare one direct AF3Score GPU call for compatible Tasks."""
+        if not tasks:
+            raise ValueError("AF3Score provider batch cannot be empty")
+        payloads: list[Mapping[str, object]] = []
+        chunks: list[Mapping[str, object]] = []
+        for task in tasks:
+            if not isinstance(task.execution_payload, Mapping):
+                raise TypeError("AF3Score Task execution payload must be an object")
+            payload = cast(Mapping[str, object], task.execution_payload)
+            if str(payload["candidate_id"]) != task.task_key:
+                raise ValueError("AF3Score Task identity does not match its payload")
+            chunk = payload.get("chunk")
+            if not isinstance(chunk, Mapping):
+                raise TypeError("AF3Score Task chunk must be an object")
+            payloads.append(payload)
+            chunks.append(cast(Mapping[str, object], chunk))
+        first = payloads[0]
+        first_chunk = chunks[0]
+        batch_name = str(first_chunk["batch_name"])
+        run_name = str(first["run_name"])
+        if any(
+            str(payload["run_name"]) != run_name or chunk != first_chunk
+            for payload, chunk in zip(payloads, chunks, strict=True)
+        ):
+            raise ValueError("AF3Score provider batch mixes incompatible chunks")
+        task_count = first_chunk["task_count"]
+        if not isinstance(task_count, int):
+            raise TypeError("AF3Score batch Task count must be an integer")
+        return RemoteNodeCall(
+            function_name="run_ppiflow_af3score_batch",
+            uses_gpu=True,
+            kwargs={
+                "run_name": run_name,
+                "batch_name": batch_name,
+                "batch_json_dir": str(first_chunk["batch_json_dir"]),
+                "batch_pdb_dir": str(first_chunk["batch_pdb_dir"]),
+                "task_keys": [task.task_key for task in tasks],
+                "input_names": [str(payload["input_name"]) for payload in payloads],
+            },
+            runtime_image_key="af3score-gpu",
+            compatibility_key=f"{run_name}:{batch_name}",
+            max_tasks_per_call=task_count,
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        """Decode AF3Score's per-candidate outcomes from one GPU call."""
+        del metadata
+        if not isinstance(result, Mapping):
+            raise TypeError("AF3Score batch result must be an object")
+        result_by_task = cast(Mapping[str, object], result)
+        return {
+            task_key: AppRunResult.model_validate(result_by_task[task_key])
+            for task_key in task_keys
+        }
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Record the aggregate batch outcome; postprocessing publishes scores."""
+        del context
+        return AppRunResult(
+            status=AppRunStatus.FAILED if errors else AppRunStatus.SUCCEEDED,
+            warnings=[f"{key}: {errors[key]}" for key in sorted(errors)],
+            metrics={
+                "failed_candidates": len(errors),
+                "scored_candidates": len(results),
+            },
+        )
+
+
+@dataclass
+class AF3ScoreNode(_ConfiguredAppStepNode):
+    """Postprocess kernel-completed AF3Score candidate Tasks."""
+
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare one CPU postprocessing call after all GPU batches finish."""
+        plan_artifacts = context.inputs.get("af3score_plan") or []
+        if not plan_artifacts:
+            raise ValueError(f"{self.step_name} requires an AF3Score task plan")
+        return RemoteNodeCall(
+            function_name="postprocess_ppiflow_af3score_stage",
+            uses_gpu=False,
+            kwargs={
+                "plan_artifacts": plan_artifacts,
+                "step_name": self.step_name,
                 "run_id": context.workload_run_key,
                 "node_id": context.node_id,
             },
+            runtime_image_key="af3score-cpu",
         )
 
 
@@ -3171,16 +3526,15 @@ def _add_stage1_nodes(
 
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage1"):
-        score = workflow.add_node(
-            AF3ScoreNode(
+        score = _add_af3score_nodes(
+            workflow=workflow,
+            node_id="stage1-af3score",
+            step_name="AF3scoreStep_stage1",
+            config=_step_cfg_with_candidate_concurrency(
+                steps,
                 "AF3scoreStep_stage1",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "AF3scoreStep_stage1",
-                    candidate_concurrency,
-                ),
+                candidate_concurrency,
             ),
-            id="stage1-af3score",
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -3207,6 +3561,40 @@ def _add_stage1_nodes(
             kind=ArtifactKind.TABLE
         )
     return tail, partial_tail is not None
+
+
+def _add_af3score_nodes(
+    *,
+    workflow: Workflow,
+    node_id: str,
+    step_name: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    accept_partial_from: list[Any] | None,
+):
+    """Add prepare, fixed-batch GPU, and postprocess Nodes for AF3Score."""
+    prepare = workflow.add_node(
+        AF3ScorePrepareNode(step_name, config),
+        id=f"{node_id}-prepare",
+        inputs=inputs,
+        accept_partial_from=accept_partial_from,
+    )
+    batches = workflow.add_node(
+        AF3ScoreBatchNode(step_name, config),
+        id=f"{node_id}-batches",
+        inputs={
+            "af3score_plan": prepare.outputs(kind=ArtifactKind.TABLE),
+        },
+        allow_empty_result=True,
+    )
+    return workflow.add_node(
+        AF3ScoreNode(step_name, config),
+        id=node_id,
+        inputs={
+            "af3score_plan": prepare.outputs(kind=ArtifactKind.TABLE),
+        },
+        depends_on=[batches],
+    )
 
 
 def _add_stage2_nodes(
@@ -3313,16 +3701,15 @@ def _add_stage2_nodes(
 
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage2"):
-        score = workflow.add_node(
-            AF3ScoreNode(
+        score = _add_af3score_nodes(
+            workflow=workflow,
+            node_id="stage2-af3score",
+            step_name="AF3scoreStep_stage2",
+            config=_step_cfg_with_candidate_concurrency(
+                steps,
                 "AF3scoreStep_stage2",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "AF3scoreStep_stage2",
-                    candidate_concurrency,
-                ),
+                candidate_concurrency,
             ),
-            id="stage2-af3score",
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -3766,7 +4153,9 @@ def submit_ppiflow_workflow(
             "run_ppiflow_partial_candidate": run_ppiflow_partial_candidate,
             "run_ppiflow_ligandmpnn_candidate": run_ppiflow_ligandmpnn_candidate,
             "run_ppiflow_flowpacker_stage": run_ppiflow_flowpacker_stage,
-            "run_ppiflow_af3score_stage": run_ppiflow_af3score_stage,
+            "prepare_ppiflow_af3score_stage": prepare_ppiflow_af3score_stage,
+            "run_ppiflow_af3score_batch": run_ppiflow_af3score_batch,
+            "postprocess_ppiflow_af3score_stage": (postprocess_ppiflow_af3score_stage),
             "run_ppiflow_rosetta_stage": run_ppiflow_rosetta_stage,
             "run_ppiflow_refold_candidate": run_ppiflow_refold_candidate,
             "run_ppiflow_dockq_stage": run_ppiflow_dockq_stage,

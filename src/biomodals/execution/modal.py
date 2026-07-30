@@ -148,3 +148,89 @@ class ModalCallDriver:
     def cancel(self, provider_call_handle_id: str) -> None:
         """Request cancellation of one attached Function Call."""
         self._call_resolver(provider_call_handle_id).cancel()
+
+
+class AsyncModalCallDriver:
+    """Async Modal SDK boundary for API-hosted execution coordination."""
+
+    def __init__(
+        self,
+        *,
+        function_resolver: Callable[..., Any] = modal.Function.from_name,
+        call_resolver: Callable[[str], Any] = modal.FunctionCall.from_id,
+    ) -> None:
+        """Inject external Modal handle constructors for deterministic tests."""
+        self._function_resolver = function_resolver
+        self._call_resolver = call_resolver
+
+    async def resolve(self, binding: ProviderBinding) -> Any:
+        """Hydrate one exact deployed function before durable preclaim."""
+        function = self._function_resolver(
+            binding.app_name,
+            binding.function_name,
+            environment_name=binding.environment,
+            version=binding.app_version,
+        )
+        await function.hydrate.aio()
+        return function
+
+    async def spawn(
+        self,
+        function: Any,
+        *,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> str:
+        """Spawn once and return the durable Function Call ID."""
+        try:
+            call = await function.spawn.aio(*args, **dict(kwargs))
+            return str(call.object_id)
+        except _DEFINITE_SUBMISSION_ERRORS as error:
+            raise ModalDefiniteSubmissionError(str(error)) from error
+        except Exception as error:
+            raise ModalSubmissionOutcomeUnknownError(
+                "Modal did not return a durable Function Call ID"
+            ) from error
+
+    async def observe(
+        self,
+        provider_call_handle_id: str,
+    ) -> ModalCallObservation:
+        """Poll one retained call result without clearing it."""
+        call = self._call_resolver(provider_call_handle_id)
+        try:
+            result = await call.get.aio(timeout=0)
+        except (TimeoutError, modal.exception.TimeoutError):
+            return ModalCallObservation(ModalCallObservationKind.RUNNING)
+        except modal.exception.InputCancellation as error:
+            return ModalCallObservation(
+                ModalCallObservationKind.CANCELLED,
+                message=str(error),
+            )
+        except (
+            modal.exception.OutputExpiredError,
+            *_INCONCLUSIVE_SERVICE_ERRORS,
+        ) as error:
+            return ModalCallObservation(
+                ModalCallObservationKind.STATE_UNKNOWN,
+                message=str(error),
+            )
+        except _CONCLUSIVE_EXECUTION_ERRORS as error:
+            return ModalCallObservation(
+                ModalCallObservationKind.FAILED,
+                message=str(error),
+            )
+        except Exception as error:
+            return ModalCallObservation(
+                ModalCallObservationKind.STATE_UNKNOWN,
+                message=str(error),
+            )
+        return ModalCallObservation(
+            ModalCallObservationKind.SUCCEEDED,
+            result=result,
+        )
+
+    async def cancel(self, provider_call_handle_id: str) -> None:
+        """Request cancellation of one attached Function Call."""
+        call = self._call_resolver(provider_call_handle_id)
+        await call.cancel.aio()

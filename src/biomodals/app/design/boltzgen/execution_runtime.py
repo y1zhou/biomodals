@@ -36,6 +36,7 @@ from biomodals.execution import (
     drive_execution_run,
     ready_node_keys,
     required_node_keys,
+    result_probe_frontier,
     resume_execution_run,
 )
 from biomodals.execution.scheduler import (
@@ -211,15 +212,54 @@ class BoltzGenExecutionRuntime:
 
     def _recover_publications(self) -> None:
         repository = self.store.execution
-        node_observations = []
+        run = repository.get_run(self.execution_run_id)
+        observations: dict[str, AvailabilityStatus | None] = {}
+        for node in repository.list_nodes(self.execution_run_id):
+            if node.status == NodeStatus.SUCCEEDED:
+                observations[node.node_key] = AvailabilityStatus.AVAILABLE
+            elif node.status.is_terminal:
+                observations[node.node_key] = AvailabilityStatus.MISSING
+            else:
+                observations[node.node_key] = None
+
+        while frontier := result_probe_frontier(run.plan, observations):
+            observed = [
+                (node_key, self._node_observation(node_key)) for node_key in frontier
+            ]
+            with self.store.transaction():
+                for node_key, observation in observed:
+                    repository.record_node_result_observation(
+                        self.execution_run_id,
+                        node_key,
+                        observation,
+                        now=self._now(),
+                    )
+                    observations[node_key] = observation
+            repository = self._checkpoint()
+            if any(
+                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
+            ):
+                return
+
+        required = required_node_keys(
+            run.plan,
+            {
+                node_key: (
+                    AvailabilityStatus.MISSING if observation is None else observation
+                )
+                for node_key, observation in observations.items()
+            },
+        )
+        if required is None:
+            return
+
         task_observations = []
         for node in repository.list_nodes(self.execution_run_id):
-            if node.status == NodeStatus.PENDING:
-                node_observations.append((
-                    node.node_key,
-                    self._node_observation(node.node_key),
-                ))
-            elif node.status == NodeStatus.RUNNING and node.discovery_complete:
+            if (
+                node.node_key in required
+                and node.status == NodeStatus.RUNNING
+                and node.discovery_complete
+            ):
                 planned = {
                     item.plan.task_key: item
                     for item in self._planned_tasks(node.node_key)
@@ -238,16 +278,9 @@ class BoltzGenExecutionRuntime:
                             planned[task.task_key],
                         ),
                     ))
-        if not node_observations and not task_observations:
+        if not task_observations:
             return
         with self.store.transaction():
-            for node_key, observation in node_observations:
-                repository.record_node_result_observation(
-                    self.execution_run_id,
-                    node_key,
-                    observation,
-                    now=self._now(),
-                )
             for node_key, task_key, observation in task_observations:
                 call = self._task_call(node_key, task_key)
                 if (

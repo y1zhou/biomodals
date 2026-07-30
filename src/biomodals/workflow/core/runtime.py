@@ -34,6 +34,7 @@ from biomodals.execution import (
     drive_execution_run,
     ready_node_keys,
     required_node_keys,
+    result_probe_frontier,
     resume_execution_run,
 )
 from biomodals.execution.modal import ModalCallDriver
@@ -424,13 +425,57 @@ class WorkflowRuntime:
     def _recover_publications(self) -> None:
         repository = self.store.execution
         definition = self._require_definition()
-        node_observations: list[tuple[str, AvailabilityStatus]] = []
+        run = repository.get_run(self.execution_run_id)
+        observations: dict[str, AvailabilityStatus | None] = {}
+        for node in repository.list_nodes(self.execution_run_id):
+            if node.status == NodeStatus.SUCCEEDED:
+                observations[node.node_key] = AvailabilityStatus.AVAILABLE
+            elif node.status.is_terminal:
+                observations[node.node_key] = AvailabilityStatus.MISSING
+            else:
+                observations[node.node_key] = None
+
+        while frontier := result_probe_frontier(run.plan, observations):
+            observed = [
+                (node_id, self._publication_observation(node_id))
+                for node_id in frontier
+            ]
+            with self.store.transaction():
+                for node_id, observation in observed:
+                    if observation == AvailabilityStatus.MISSING:
+                        self.store.artifacts.discard_node_publication(node_id)
+                    self.store.execution.record_node_result_observation(
+                        self.execution_run_id,
+                        node_id,
+                        observation,
+                        now=self._now(),
+                    )
+                    observations[node_id] = observation
+            repository = self._checkpoint()
+            if any(
+                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
+            ):
+                return
+
+        required = required_node_keys(
+            run.plan,
+            {
+                node_key: (
+                    AvailabilityStatus.MISSING if observation is None else observation
+                )
+                for node_key, observation in observations.items()
+            },
+        )
+        if required is None:
+            return
+
         task_observations: list[tuple[str, str, AvailabilityStatus]] = []
         for node in repository.list_nodes(self.execution_run_id):
-            observation = self._publication_observation(node.node_key)
-            if node.status == NodeStatus.PENDING:
-                node_observations.append((node.node_key, observation))
-            elif node.status == NodeStatus.RUNNING and node.discovery_complete:
+            if (
+                node.node_key in required
+                and node.status == NodeStatus.RUNNING
+                and node.discovery_complete
+            ):
                 implementation = definition.nodes[node.node_key].node
                 if isinstance(implementation, RemoteTaskWorkflowNode):
                     for task in repository.list_tasks(
@@ -467,24 +512,20 @@ class WorkflowRuntime:
                         _TASK_KEY,
                     )
                     if not task.status.is_terminal:
+                        observation = observations[node.node_key]
+                        if observation is None:
+                            raise RuntimeError(
+                                f"Workflow Node {node.node_key!r} was not probed"
+                            )
                         task_observations.append((
                             node.node_key,
                             _TASK_KEY,
                             observation,
                         ))
 
-        if not node_observations and not task_observations:
+        if not task_observations:
             return
         with self.store.transaction():
-            for node_id, observation in node_observations:
-                if observation == AvailabilityStatus.MISSING:
-                    self.store.artifacts.discard_node_publication(node_id)
-                self.store.execution.record_node_result_observation(
-                    self.execution_run_id,
-                    node_id,
-                    observation,
-                    now=self._now(),
-                )
             for node_id, task_key, observation in task_observations:
                 if observation == AvailabilityStatus.MISSING:
                     self.store.artifacts.discard_task_publication(

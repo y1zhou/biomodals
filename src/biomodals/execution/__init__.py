@@ -39,6 +39,7 @@ from biomodals.execution.scheduler import (
     propagated_skip_node_keys,
     ready_node_keys,
     required_node_keys,
+    result_probe_frontier,
     terminal_run_outcome,
 )
 from biomodals.execution.sqlite import (
@@ -84,6 +85,7 @@ __all__ = [
     "propagated_skip_node_keys",
     "ready_node_keys",
     "required_node_keys",
+    "result_probe_frontier",
     "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",

@@ -951,7 +951,34 @@ def test_cached_terminal_publication_prunes_its_ancestor_closure(
         storage=storage,
         files=[ArtifactFile(path="result.txt", size_bytes=6)],
     )
+    uncheckable_ancestor_storage = VolumePath(
+        volume_name="External-outputs",
+        path="ancestor/result.txt",
+        media_type="text/plain",
+    )
     with runtime.store.transaction():
+        runtime.store.artifacts.record_node_publication(
+            "ancestor",
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="text",
+                        kind=ArtifactKind.REPORT,
+                        storage=uncheckable_ancestor_storage,
+                    )
+                ],
+            ),
+            artifacts=(
+                WorkflowArtifact(
+                    artifact_id="ancestor-text",
+                    producing_node_id="ancestor",
+                    kind=ArtifactKind.REPORT,
+                    storage=uncheckable_ancestor_storage,
+                ),
+            ),
+            now=98,
+        )
         runtime.store.artifacts.record_node_publication(
             "terminal",
             result=cached_result,

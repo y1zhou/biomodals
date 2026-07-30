@@ -11,6 +11,7 @@ from biomodals.app.design.boltzgen.execution_contracts import (
     write_collection_publication,
 )
 from biomodals.app.design.boltzgen.execution_request import (
+    DESIGN_RUNS_NODE,
     BoltzGenExecutionRequest,
     prepare_execution_request,
 )
@@ -169,7 +170,10 @@ def test_collection_waits_for_all_design_publications(tmp_path: Path) -> None:
     runtime.close()
 
 
-def test_terminal_collection_publication_prunes_all_calls(tmp_path: Path) -> None:
+def test_terminal_collection_publication_prunes_all_calls(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     request = _request()
     write_collection_publication(
         tmp_path,
@@ -183,6 +187,14 @@ def test_terminal_collection_publication_prunes_all_calls(tmp_path: Path) -> Non
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
     runtime._initialize()
+    original_observation = runtime._node_observation
+
+    def observe_only_terminal(node_key: str):
+        if node_key == DESIGN_RUNS_NODE:
+            raise AssertionError("cached terminal result must prune ancestor probes")
+        return original_observation(node_key)
+
+    monkeypatch.setattr(runtime, "_node_observation", observe_only_terminal)
 
     runtime.advance_once()
 

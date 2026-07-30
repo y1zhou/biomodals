@@ -355,6 +355,37 @@ def required_node_keys(
     return tuple(node.node_key for node in plan.nodes if node.node_key in required)
 
 
+def result_probe_frontier(
+    plan: ExecutionPlan,
+    observations: Mapping[str, AvailabilityStatus | None],
+) -> tuple[str, ...]:
+    """Return the next terminal-first publication probes for one DAG.
+
+    ``None`` means that a Node has not yet been observed in this probe cycle.
+    Missing publications expand the walk into their dependencies, while
+    available and unknown publications stop that branch.
+    """
+    nodes = {node.node_key: node for node in plan.nodes}
+    frontier: list[str] = []
+    visited: set[str] = set()
+
+    def visit(node_key: str) -> None:
+        if node_key in visited:
+            return
+        visited.add(node_key)
+        observation = observations[node_key]
+        if observation is None:
+            frontier.append(node_key)
+            return
+        if observation == AvailabilityStatus.MISSING:
+            for dependency in nodes[node_key].dependencies:
+                visit(dependency.node_key)
+
+    for node_key in plan.terminal_node_keys:
+        visit(node_key)
+    return tuple(frontier)
+
+
 def terminal_run_outcome(
     plan: ExecutionPlan,
     node_statuses: Mapping[str, NodeStatus],

@@ -19,6 +19,7 @@ from biomodals.execution import (
     TaskStatus,
     WorkStatusReason,
     required_node_keys,
+    result_probe_frontier,
 )
 
 RUN_ID = UUID("d4e4744e-aacf-4478-92d6-a58681805162")
@@ -81,6 +82,20 @@ def test_unknown_result_observation_authorizes_no_work() -> None:
         )
         is None
     )
+
+
+def test_result_probe_frontier_stops_at_available_ancestor() -> None:
+    plan = _linear_plan()
+    observations: dict[str, AvailabilityStatus | None] = {
+        node_key: None for node_key in plan.node_keys
+    }
+
+    assert result_probe_frontier(plan, observations) == ("summary",)
+    observations["summary"] = AvailabilityStatus.MISSING
+    assert result_probe_frontier(plan, observations) == ("compute",)
+    observations["compute"] = AvailabilityStatus.AVAILABLE
+    assert result_probe_frontier(plan, observations) == ()
+    assert observations["input"] is None
 
 
 def _repository() -> SqliteExecutionRepository:

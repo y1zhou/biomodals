@@ -43,6 +43,7 @@ class FakeVolume:
 class RecordingCallDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
+        self.cancelled: set[str] = set()
 
     def resolve(self, binding):
         return binding
@@ -58,11 +59,12 @@ class RecordingCallDriver:
         return handle
 
     def observe(self, provider_call_handle_id: str):
-        del provider_call_handle_id
+        if provider_call_handle_id in self.cancelled:
+            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
         return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     def cancel(self, provider_call_handle_id: str) -> None:
-        raise AssertionError(provider_call_handle_id)
+        self.cancelled.add(provider_call_handle_id)
 
 
 def _request(
@@ -188,4 +190,25 @@ def test_terminal_collection_publication_prunes_all_calls(tmp_path: Path) -> Non
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert snapshot.provider_calls == ()
     assert driver.spawns == []
+    runtime.close()
+
+
+def test_cancel_requested_run_reconciles_provider_cancellation(
+    tmp_path: Path,
+) -> None:
+    driver = RecordingCallDriver()
+    runtime = _runtime(tmp_path, driver=driver)
+    runtime._initialize()
+    runtime.advance_once()
+
+    requested = runtime.cancel()
+    assert requested.run.status == RunStatus.CANCEL_REQUESTED
+
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.run.status == RunStatus.CANCELLED
+    assert {call.status for call in snapshot.provider_calls} == {
+        ProviderCallStatus.CANCELLED
+    }
     runtime.close()

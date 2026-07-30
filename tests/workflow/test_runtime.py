@@ -309,6 +309,14 @@ class FakeModalDriver:
         self.cancelled.append(provider_call_handle_id)
 
 
+class CancellingModalDriver(FakeModalDriver):
+    def observe(self, provider_call_handle_id):
+        self.events.append(f"observe:{provider_call_handle_id}")
+        if provider_call_handle_id in self.cancelled:
+            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+        return ModalCallObservation(ModalCallObservationKind.RUNNING)
+
+
 class FanoutModalDriver(FakeModalDriver):
     def __init__(self, *, failing_tasks: set[str] | None = None) -> None:
         super().__init__()
@@ -525,6 +533,30 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
     ]
     assert volume.commits > 0
     assert volume.reloads > 0
+
+
+def test_cancel_requested_workflow_reconciles_provider_cancellation(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("cancel")
+    workflow.add_node(RemoteTextNode("remote", "run_remote"), id="remote")
+    driver = CancellingModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+    runtime._initialize("cancel")
+    runtime.advance_once()
+
+    runtime.cancel()
+    assert runtime.store.execution.get_run(RUN_ID).status == (
+        RunStatus.CANCEL_REQUESTED
+    )
+
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.run.status == RunStatus.CANCELLED
+    assert {call.status for call in snapshot.provider_calls} == {
+        ProviderCallStatus.CANCELLED
+    }
 
 
 def test_remote_task_node_discovers_and_publishes_independent_tasks(

@@ -216,6 +216,11 @@ class RosettaExecutionRuntime:
         self._recover_publications()
         self._reconcile_nodes_and_run()
         run = self.store.execution.get_run(self.execution_run_id)
+        if run.status == RunStatus.CANCEL_REQUESTED:
+            self._reconcile_provider_calls(set(run.plan.node_keys))
+            self._recover_publications()
+            self._reconcile_nodes_and_run()
+            return
         if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
             return
         required = self._required_nodes()

@@ -17,7 +17,12 @@ from biomodals.app.bioinfo.rosetta.execution_request import (
 from biomodals.app.bioinfo.rosetta.execution_runtime import (
     RosettaExecutionRuntime,
 )
-from biomodals.execution import DeploymentIdentity, RunStatus, TaskStatus
+from biomodals.execution import (
+    DeploymentIdentity,
+    ProviderCallStatus,
+    RunStatus,
+    TaskStatus,
+)
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -40,6 +45,7 @@ class RecordingDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
         self.succeeded = False
+        self.cancelled: set[str] = set()
 
     def resolve(self, binding):
         return binding
@@ -55,7 +61,8 @@ class RecordingDriver:
         return handle
 
     def observe(self, provider_call_handle_id: str):
-        del provider_call_handle_id
+        if provider_call_handle_id in self.cancelled:
+            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
         if self.succeeded:
             return ModalCallObservation(
                 ModalCallObservationKind.SUCCEEDED,
@@ -64,7 +71,7 @@ class RecordingDriver:
         return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     def cancel(self, provider_call_handle_id: str) -> None:
-        del provider_call_handle_id
+        self.cancelled.add(provider_call_handle_id)
 
 
 def _request() -> RosettaExecutionRequest:
@@ -212,4 +219,25 @@ def test_one_worker_failure_is_recorded_without_losing_sibling_success(
         TaskStatus.SUCCEEDED,
     ]
     assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED
+    runtime.close()
+
+
+def test_cancel_requested_run_reconciles_worker_cancellation(
+    tmp_path: Path,
+) -> None:
+    driver = RecordingDriver()
+    runtime = _runtime(tmp_path, driver)
+    runtime._initialize()
+    runtime.advance_once()
+
+    requested = runtime.cancel()
+    assert requested.run.status == RunStatus.CANCEL_REQUESTED
+
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.run.status == RunStatus.CANCELLED
+    assert {call.status for call in snapshot.provider_calls} == {
+        ProviderCallStatus.CANCELLED
+    }
     runtime.close()

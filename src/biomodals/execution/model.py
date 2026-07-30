@@ -1,5 +1,6 @@
 """Immutable execution plans and lifecycle values."""
 
+import json
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -458,12 +459,20 @@ class ExecutionSnapshot:
 
 
 def _canonical_json_sha256(value: Any) -> str:
-    """Hash one JSON-compatible value using the kernel's fixed encoding."""
-    return sha256(canonical_json_bytes(value)).hexdigest()
+    """Hash one JSON-compatible value using the specified fixed encoding."""
+    _validate_json_value(value)
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return sha256(encoded).hexdigest()
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Encode one JSON-compatible value with the kernel's fixed encoding."""
+    """Encode operational persistence JSON with deterministic key order."""
     _validate_json_value(value)
     return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 

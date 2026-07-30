@@ -86,6 +86,24 @@ def test_task_fingerprint_rejects_non_finite_numbers() -> None:
         )
 
 
+def test_task_fingerprint_uses_the_fixed_standard_library_encoding() -> None:
+    task = TaskPlan(
+        task_key="seed-1",
+        scientific_payload={
+            "large": 2**80,
+            "tiny": 1e-7,
+        },
+    )
+
+    assert (
+        task.fingerprint(
+            workload_plan_fingerprint="plan-digest",
+            node_key="inference",
+        )
+        == "689e49411139200030ea58f5f1f0a331321dc2bc0e77b67ef885f9f8cc4724e0"
+    )
+
+
 def test_discovery_persists_complete_ordered_task_set_and_fingerprints() -> None:
     repository = _repository()
     task_plans = (

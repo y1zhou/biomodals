@@ -27,7 +27,7 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
     WorkStatusReason,
 )
-from biomodals.execution.runtime import ExecutionRuntime
+from biomodals.execution.runtime import AsyncExecutionRuntime, ExecutionRuntime
 from biomodals.execution.scheduler import (
     aggregate_task_outcome,
     propagated_skip_node_keys,
@@ -44,6 +44,7 @@ from biomodals.execution.sqlite import (
 __all__ = [
     "ActiveProviderCallCounts",
     "AvailabilityStatus",
+    "AsyncExecutionRuntime",
     "DeploymentIdentity",
     "DispatchMode",
     "ExecutionNodeRecord",

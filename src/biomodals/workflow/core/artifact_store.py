@@ -176,6 +176,30 @@ class WorkflowArtifactStore:
             return None
         return AppRunResult.model_validate_json(row["result_json"])
 
+    def discard_node_publication(self, node_key: str) -> None:
+        """Remove one conclusively invalid publication before replacement work."""
+        artifact_rows = self._connection.execute(
+            """
+            SELECT artifact_id
+            FROM workflow_node_outputs
+            WHERE node_key = ?
+            """,
+            (node_key,),
+        ).fetchall()
+        artifact_ids = tuple(str(row["artifact_id"]) for row in artifact_rows)
+        self._connection.execute(
+            "DELETE FROM workflow_node_results WHERE node_key = ?",
+            (node_key,),
+        )
+        self._connection.execute(
+            "DELETE FROM workflow_node_outputs WHERE node_key = ?",
+            (node_key,),
+        )
+        self._connection.executemany(
+            "DELETE FROM workflow_artifacts WHERE artifact_id = ?",
+            [(artifact_id,) for artifact_id in artifact_ids],
+        )
+
     def load_artifact(self, artifact_id: str) -> WorkflowArtifact:
         """Load one artifact manifest by stable identity."""
         row = self._connection.execute(

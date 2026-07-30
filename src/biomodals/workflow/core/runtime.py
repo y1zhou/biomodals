@@ -308,6 +308,8 @@ class WorkflowRuntime:
             return
         with self.store.transaction():
             for node_id, observation in node_observations:
+                if observation == AvailabilityStatus.MISSING:
+                    self.store.artifacts.discard_node_publication(node_id)
                 self.store.execution.record_node_result_observation(
                     self.execution_run_id,
                     node_id,

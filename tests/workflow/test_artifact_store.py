@@ -243,6 +243,36 @@ def test_exact_publication_replay_is_idempotent_but_divergence_is_rejected() -> 
         )
 
 
+def test_invalid_copied_publication_can_be_discarded_before_replacement() -> None:
+    connection, _, artifacts = _stores()
+    result, artifact = _publication()
+    artifacts.record_node_publication(
+        "design",
+        result=result,
+        artifacts=(artifact,),
+        now=100,
+    )
+    connection.commit()
+
+    artifacts.discard_node_publication("design")
+    connection.commit()
+
+    assert artifacts.load_node_result("design") is None
+    assert artifacts.load_node_output_artifacts("design") == ()
+    with pytest.raises(FileNotFoundError):
+        artifacts.load_artifact(artifact.artifact_id)
+
+    replacement = result.model_copy(update={"warnings": ["recomputed"]})
+    artifacts.record_node_publication(
+        "design",
+        result=replacement,
+        artifacts=(artifact,),
+        now=200,
+    )
+    connection.commit()
+    assert artifacts.load_node_result("design") == replacement
+
+
 def test_input_links_and_artifact_order_survive_round_trip() -> None:
     connection, _, artifacts = _stores()
     result, first = _publication()

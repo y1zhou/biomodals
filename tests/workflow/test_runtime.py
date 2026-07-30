@@ -399,6 +399,57 @@ def test_cached_terminal_publication_prunes_its_ancestor_closure(
     assert terminal_node.seen == []
 
 
+def test_missing_copied_publication_is_discarded_and_recomputed(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("repair-cache")
+    node = TextNode("recomputed")
+    workflow.add_node(node, id="terminal")
+    runtime = _runtime(tmp_path, workflow)
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "repair-cache"
+    runtime._ensure_run(definition, "repair-cache")
+    storage = VolumePath(
+        volume_name="Workflow-outputs",
+        path="missing/result.txt",
+        media_type="text/plain",
+    )
+    with runtime.store.transaction():
+        runtime.store.artifacts.record_node_publication(
+            "terminal",
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="text",
+                        kind=ArtifactKind.REPORT,
+                        storage=storage,
+                    )
+                ],
+            ),
+            artifacts=(
+                WorkflowArtifact(
+                    artifact_id="terminal-text",
+                    producing_node_id="terminal",
+                    kind=ArtifactKind.REPORT,
+                    storage=storage,
+                    files=[ArtifactFile(path="result.txt")],
+                ),
+            ),
+            now=99,
+        )
+    runtime._checkpoint()
+
+    result = runtime.run(workload_run_key="repair-cache")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert len(node.seen) == 1
+    publication = runtime.store.artifacts.load_node_result("terminal")
+    assert publication is not None
+    assert publication.outputs[0].storage.path != "missing/result.txt"
+
+
 def test_unchecked_external_publication_suspends_instead_of_authorizing_work(
     tmp_path: Path,
 ) -> None:

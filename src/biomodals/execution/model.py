@@ -1,12 +1,14 @@
 """Immutable execution plans and lifecycle values."""
 
-import json
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any
 from uuid import UUID
+
+import orjson
 
 
 class RunStatus(StrEnum):
@@ -457,11 +459,30 @@ class ExecutionSnapshot:
 
 def _canonical_json_sha256(value: Any) -> str:
     """Hash one JSON-compatible value using the kernel's fixed encoding."""
-    encoded = json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return sha256(encoded).hexdigest()
+    return sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Encode one JSON-compatible value with the kernel's fixed encoding."""
+    _validate_json_value(value)
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
+
+
+def _validate_json_value(value: Any) -> None:
+    if value is None or isinstance(value, str | bool | int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Out of range float values are not JSON compliant")
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            _validate_json_value(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            _validate_json_value(item)
+        return
+    raise TypeError(f"{type(value).__name__} is not JSON serializable")

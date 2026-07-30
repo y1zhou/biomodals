@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import json
 import os
 import shlex
 import shutil
@@ -18,6 +17,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import modal
+import orjson
 import polars as pl
 import yaml
 from uniaf3.schema.alphafold3 import AF3Protein, AF3SequenceEntry
@@ -1114,7 +1114,10 @@ def _rosetta_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
         name="rosetta_task_plan",
         kind=ArtifactKind.TABLE,
         storage=InlineBytes(
-            data=json.dumps(plan, indent=2, sort_keys=True).encode("utf-8"),
+            data=orjson.dumps(
+                plan,
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            ),
             filename="rosetta_task_plan.json",
             media_type="application/json",
         ),
@@ -1128,7 +1131,7 @@ def _rosetta_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
 
 def _load_rosetta_plan(path: Path) -> dict[str, object]:
     """Load and validate one materialized PPIFlow Rosetta Task plan."""
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = orjson.loads(path.read_bytes())
     if (
         not isinstance(value, dict)
         or value.get("schema_version") != _ROSETTA_PLAN_SCHEMA_VERSION
@@ -1358,7 +1361,10 @@ def _af3score_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
         name="af3score_task_plan",
         kind=ArtifactKind.TABLE,
         storage=InlineBytes(
-            data=json.dumps(plan, indent=2, sort_keys=True).encode("utf-8"),
+            data=orjson.dumps(
+                plan,
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            ),
             filename="af3score_task_plan.json",
             media_type="application/json",
         ),
@@ -1379,7 +1385,7 @@ def _read_af3score_plan_artifacts(
         artifacts[0],
         PPI_FLOW_SOURCE_VOLUME_ROOTS,
     )
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = orjson.loads(path.read_bytes())
     if not isinstance(value, dict):
         raise ValueError("AF3Score task plan must be a JSON object")
     return value
@@ -1863,15 +1869,15 @@ def _rosetta_task_receipt(
         name="rosetta_task_receipt",
         kind=ArtifactKind.REPORT,
         storage=InlineBytes(
-            data=json.dumps(
+            data=orjson.dumps(
                 {
                     "task_key": task.task_key,
                     "task_fingerprint": task_fingerprint,
                     "candidate_id": task.candidate_id,
                     "expected_files": list(task.expected_files),
                 },
-                sort_keys=True,
-            ).encode(),
+                option=orjson.OPT_SORT_KEYS,
+            ),
             filename=f"{sanitize_filename(task.task_key)}.json",
             media_type="application/json",
         ),
@@ -1966,7 +1972,7 @@ def _rosetta_task_outcomes_artifact(
         name="rosetta_task_outcomes",
         kind=ArtifactKind.TABLE,
         storage=InlineBytes(
-            data=json.dumps(
+            data=orjson.dumps(
                 {
                     "schema_version": _ROSETTA_PLAN_SCHEMA_VERSION,
                     "succeeded": sorted(results),
@@ -1974,9 +1980,8 @@ def _rosetta_task_outcomes_artifact(
                         task_key: errors[task_key] for task_key in sorted(errors)
                     },
                 },
-                indent=2,
-                sort_keys=True,
-            ).encode(),
+                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+            ),
             filename="rosetta_task_outcomes.json",
             media_type="application/json",
         ),
@@ -1995,7 +2000,7 @@ def _read_rosetta_task_outcomes(
         artifacts[0],
         PPI_FLOW_SOURCE_VOLUME_ROOTS,
     )
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = orjson.loads(path.read_bytes())
     if (
         not isinstance(value, dict)
         or value.get("schema_version") != _ROSETTA_PLAN_SCHEMA_VERSION

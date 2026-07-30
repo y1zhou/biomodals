@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
+
+import orjson
 
 
 def _modal_base_command(
@@ -95,8 +96,8 @@ def select_modal_deployment_version(
 ) -> int:
     """Select or validate one numeric version from Modal history JSON."""
     try:
-        history = json.loads(history_json)
-    except json.JSONDecodeError as error:
+        history = orjson.loads(history_json)
+    except orjson.JSONDecodeError as error:
         raise ValueError("Modal app history did not return valid JSON") from error
     if not isinstance(history, list) or not history:
         raise ValueError("Modal app history contains no deployed versions")

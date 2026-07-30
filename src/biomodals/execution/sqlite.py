@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Mapping
 from typing import Any
 from uuid import UUID, uuid4
+
+import orjson
 
 from biomodals.execution.model import (
     ActiveProviderCallCounts,
@@ -34,6 +35,7 @@ from biomodals.execution.model import (
     TaskStatus,
     WorkerAssignmentRecord,
     WorkStatusReason,
+    canonical_json_bytes,
 )
 from biomodals.execution.scheduler import (
     aggregate_task_outcome,
@@ -1064,7 +1066,7 @@ class SqliteExecutionRepository:
         })
         preclaim_json = _dump_json({
             "mode": DispatchMode.PULL_WORKER.value,
-            "policy": json.loads(policy_json),
+            "policy": orjson.loads(policy_json),
             "submission_token": submission_token,
         })
         existing = self._connection.execute(
@@ -2489,7 +2491,7 @@ class SqliteExecutionRepository:
             result_envelope=(
                 None
                 if row["result_envelope_json"] is None
-                else json.loads(row["result_envelope_json"])
+                else orjson.loads(row["result_envelope_json"])
             ),
             error_message=row["error_message"],
             task_keys=tuple(task["task_key"] for task in task_rows),
@@ -2542,7 +2544,7 @@ class SqliteExecutionRepository:
                     node_key=row["node_key"],
                     task_key=row["task_key"],
                     task_fingerprint=row["fingerprint"],
-                    execution_payload=json.loads(row["execution_payload_json"]),
+                    execution_payload=orjson.loads(row["execution_payload_json"]),
                     provider_call_id=UUID(row["provider_call_id"]),
                     request_id=row["request_id"],
                     ordinal=row["ordinal"],
@@ -2937,27 +2939,15 @@ def _dump_plan(plan: ExecutionPlan) -> str:
         "workload_name": plan.workload_name,
         "workload_run_key": plan.workload_run_key,
     }
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    return canonical_json_bytes(value).decode()
 
 
 def _dump_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    return canonical_json_bytes(value).decode()
 
 
 def _load_plan(value: str) -> ExecutionPlan:
-    decoded: dict[str, Any] = json.loads(value)
+    decoded: dict[str, Any] = orjson.loads(value)
     return ExecutionPlan(
         workload_name=decoded["workload_name"],
         workload_run_key=decoded["workload_run_key"],
@@ -2988,8 +2978,8 @@ def _task_from_row(row: sqlite3.Row) -> ExecutionTaskRecord:
         task_key=row["task_key"],
         ordinal=row["ordinal"],
         fingerprint=row["fingerprint"],
-        scientific_payload=json.loads(row["scientific_payload_json"]),
-        execution_payload=json.loads(row["execution_payload_json"]),
+        scientific_payload=orjson.loads(row["scientific_payload_json"]),
+        execution_payload=orjson.loads(row["execution_payload_json"]),
         status=TaskStatus(row["status"]),
         status_reason=(
             None

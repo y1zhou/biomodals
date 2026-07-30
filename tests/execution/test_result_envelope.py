@@ -84,6 +84,7 @@ def test_conclusive_call_failure_fails_only_unfinished_owned_tasks() -> None:
         submission_token="batch",
         binding=GPU_BINDING,
         compatibility_key="gpu",
+        max_tasks_per_call=2,
         now=110,
     )
     assert claim is not None

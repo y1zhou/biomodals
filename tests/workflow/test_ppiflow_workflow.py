@@ -3,7 +3,6 @@
 # ruff: noqa: D103
 
 import hashlib
-import json
 import pickle
 import tarfile
 from dataclasses import replace
@@ -12,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import orjson
 import polars as pl
 import pytest
 import yaml
@@ -769,7 +769,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
 
     plan_path = tmp_path / "af3score_task_plan.json"
     plan_path.write_text(
-        json.dumps({
+        orjson.dumps({
             "run_name": "af3-run",
             "input_files": ["candidate-a.pdb", "candidate-b.pdb"],
             "candidates": [
@@ -789,7 +789,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
                 }
                 for candidate_id in ("candidate-a", "candidate-b")
             ],
-        }),
+        }).decode(),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -953,7 +953,7 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
 
     [output] = result.outputs
     assert isinstance(output.storage, InlineBytes)
-    plan = json.loads(output.storage.data)
+    plan = orjson.loads(output.storage.data)
     assert [candidate["candidate_id"] for candidate in plan["candidates"]] == [
         "candidate-a",
         "candidate-b",
@@ -998,7 +998,7 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
     )
     plan_path = tmp_path / "rosetta-plan.json"
     plan_path.write_text(
-        json.dumps({
+        orjson.dumps({
             "schema_version": 1,
             "run_name": "rosetta-run",
             "run_id": "rosetta-id",
@@ -1016,7 +1016,7 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
             "claim_capacity": 1,
             "max_parallel_per_worker": 1,
             "tasks": [task.to_dict()],
-        }),
+        }).decode(),
         encoding="utf-8",
     )
     plan_artifact = WorkflowArtifact(
@@ -1148,7 +1148,7 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     assert result.status == AppRunStatus.SUCCEEDED
     [output] = result.outputs
     assert isinstance(output.storage, InlineBytes)
-    plan = json.loads(output.storage.data)
+    plan = orjson.loads(output.storage.data)
     assert plan["num_jobs"] == 2
     assert plan["worker_count"] == 1
     assert plan["claim_capacity"] == 2
@@ -1309,7 +1309,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
     ]
     plan_path = workflow_root / "rosetta-plan.json"
     plan_path.write_text(
-        json.dumps({
+        orjson.dumps({
             "schema_version": 1,
             "run_name": "rosetta-run",
             "run_id": "rosetta-id",
@@ -1320,16 +1320,16 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
             "claim_capacity": 2,
             "max_parallel_per_worker": 2,
             "tasks": [task.to_dict() for task in tasks],
-        }),
+        }).decode(),
         encoding="utf-8",
     )
     outcomes_path = workflow_root / "rosetta-outcomes.json"
     outcomes_path.write_text(
-        json.dumps({
+        orjson.dumps({
             "schema_version": 1,
             "succeeded": ["candidate-a"],
             "errors": {"candidate-b": "worker failed"},
-        }),
+        }).decode(),
         encoding="utf-8",
     )
     plan_artifact = WorkflowArtifact(

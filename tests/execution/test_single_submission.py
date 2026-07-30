@@ -19,6 +19,7 @@ def test_only_new_durable_preclaim_authorizes_spawn() -> None:
         submission_token="batch-0",
         binding=GPU_BINDING,
         compatibility_key="model-weights-v3",
+        max_tasks_per_call=2,
         now=110,
     )
     duplicate = repository.preclaim_fixed_batch(
@@ -28,6 +29,7 @@ def test_only_new_durable_preclaim_authorizes_spawn() -> None:
         submission_token="batch-0",
         binding=GPU_BINDING,
         compatibility_key="model-weights-v3",
+        max_tasks_per_call=2,
         now=111,
     )
 

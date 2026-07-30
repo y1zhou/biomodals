@@ -18,8 +18,13 @@ from biomodals.app.fold.alphafold3.execution_runtime import (
     AlphaFold3ExecutionRuntime,
     _result_envelope,
 )
+from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
 from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
-from biomodals.app.fold.alphafold3.seed_predictions import InferenceRuntime
+from biomodals.app.fold.alphafold3.seed_predictions import (
+    ClaimedSeed,
+    InferenceRuntime,
+    SeedClaimPlan,
+)
 from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
 from biomodals.execution import (
     DeploymentIdentity,
@@ -299,4 +304,103 @@ def test_seed_claim_is_not_acquired_before_deployment_preflight(
     assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
     claims = cast(FakeClaims, runtime.inference_runtime.claims)
     assert claims.values == {}
+    runtime.close()
+
+
+def test_completed_invocation_prunes_every_ancestor_without_a_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal scientific result makes a repeated root Run a cache success."""
+    runtime = _runtime(tmp_path)
+    monkeypatch.setattr(
+        execution_runtime,
+        "load_invocation_manifest",
+        lambda *args, **kwargs: {"status": "complete"},
+    )
+    runtime._initialize()
+
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert snapshot.provider_calls == ()
+    assert snapshot.nodes[-1].status == NodeStatus.SUCCEEDED
+    assert all(node.status.is_terminal for node in snapshot.nodes)
+    runtime.close()
+
+
+def test_overlapping_seed_request_submits_only_the_missing_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical seed markers remain the authority for cross-Run reuse."""
+    driver = RecordingCallDriver()
+    runtime = _runtime(
+        tmp_path,
+        request=_request(seeds=[1, 2], max_num_gpus=2),
+        driver=driver,
+    )
+    monkeypatch.setattr(
+        execution_runtime,
+        "load_staged_inference_input",
+        lambda *args, **kwargs: SimpleNamespace(recycle=10),
+    )
+
+    def inspect(runtime, run_id, seeds, *, sample_count, reload_volume=True):
+        del runtime, sample_count, reload_volume
+        return [
+            (
+                {"status": "reused", "run_id": run_id, "seed": seed}
+                if seed == 1
+                else {"status": "missing", "run_id": run_id, "seed": seed}
+            )
+            for seed in seeds
+        ]
+
+    def claim(
+        runtime,
+        run_id,
+        seeds,
+        *,
+        sample_count,
+        generation_ids,
+        reload_volume,
+    ):
+        del runtime, sample_count, reload_volume
+        owned = tuple(
+            ClaimedSeed(
+                seed=seed,
+                claim=GenerationClaim(
+                    scope_key=f"seed:{run_id}:{seed}",
+                    generation_id=generation_ids[seed],
+                    owner={"identity": {"run_id": run_id, "seed": seed}},
+                ),
+            )
+            for seed in seeds
+        )
+        return SeedClaimPlan(reused_seeds=(), owned=owned, active=())
+
+    monkeypatch.setattr(execution_runtime, "inspect_seed_predictions", inspect)
+    monkeypatch.setattr(execution_runtime, "claim_seed_predictions", claim)
+    runtime._initialize()
+
+    for _ in range(6):
+        runtime.advance_once()
+
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert len(calls) == 1
+    assert calls[0].task_keys == ("seed:2",)
+    assert len(driver.spawns) == 1
+    kwargs = cast(dict[str, Any], driver.spawns[0]["kwargs"])
+    claimed = cast(list[dict[str, object]], kwargs["claimed_seed_records"])
+    assert claimed[0]["seed"] == 2
+    assert (
+        runtime.store.execution.get_task(
+            RUN_ID,
+            "seed-predictions",
+            "seed:1",
+        ).status.value
+        == "succeeded"
+    )
     runtime.close()

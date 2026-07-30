@@ -102,3 +102,22 @@ def test_nonterminal_predecessor_fails_closed() -> None:
             max_active_gpu_provider_calls=2,
             now=120,
         )
+
+
+def test_successor_lineage_may_cross_physical_repositories() -> None:
+    predecessor_repository = _repository()
+    predecessor = predecessor_repository.validate_successor_source(PREDECESSOR_ID)
+    successor_repository = SqliteExecutionRepository(sqlite3.connect(":memory:"))
+    successor_repository.initialize_schema()
+
+    successor = successor_repository.create_run(
+        execution_run_id=SUCCESSOR_ID,
+        predecessor_execution_run_id=predecessor.execution_run_id,
+        plan=predecessor.plan,
+        deployment=DeploymentIdentity("prod", "af3-coordinator", 8),
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=2,
+        now=120,
+    )
+
+    assert successor.predecessor_execution_run_id == PREDECESSOR_ID

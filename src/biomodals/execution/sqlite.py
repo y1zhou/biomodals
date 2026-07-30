@@ -122,8 +122,7 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE execution_runs (
         execution_run_id TEXT PRIMARY KEY,
-        predecessor_execution_run_id TEXT
-            REFERENCES execution_runs(execution_run_id),
+        predecessor_execution_run_id TEXT,
         workload_name TEXT NOT NULL,
         workload_run_key TEXT,
         workload_plan_fingerprint TEXT NOT NULL,
@@ -479,6 +478,28 @@ class SqliteExecutionRepository:
         """Create an explicit compatible retry boundary with no copied state."""
         if execution_run_id == predecessor_execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
+        predecessor = self.validate_successor_source(predecessor_execution_run_id)
+        if (
+            plan is not None
+            and plan.workload_plan_fingerprint
+            != predecessor.plan.workload_plan_fingerprint
+        ):
+            raise ValueError("Workload Plan Fingerprint does not match predecessor")
+        return self.create_run(
+            execution_run_id=execution_run_id,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            plan=predecessor.plan,
+            deployment=deployment,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            now=now,
+        )
+
+    def validate_successor_source(
+        self,
+        predecessor_execution_run_id: UUID,
+    ) -> ExecutionRunRecord:
+        """Return a predecessor only when replacement work is conclusively safe."""
         predecessor = self.get_run(predecessor_execution_run_id)
         if not predecessor.status.is_terminal:
             raise ValueError("predecessor Run is not terminal")
@@ -497,21 +518,7 @@ class SqliteExecutionRepository:
             task.status.is_terminal for task in tasks
         ):
             raise ValueError("predecessor execution state is not conclusive")
-        if (
-            plan is not None
-            and plan.workload_plan_fingerprint
-            != predecessor.plan.workload_plan_fingerprint
-        ):
-            raise ValueError("Workload Plan Fingerprint does not match predecessor")
-        return self.create_run(
-            execution_run_id=execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            plan=predecessor.plan,
-            deployment=deployment,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-            now=now,
-        )
+        return predecessor
 
     def get_run(self, execution_run_id: UUID) -> ExecutionRunRecord:
         """Load one Execution Run by its opaque identity."""

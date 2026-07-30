@@ -2,7 +2,27 @@
 
 # Unified task scheduler refactor plan
 
-Status: accepted; ready for implementation.
+Status: accepted; implementation in progress.
+
+Implemented so far:
+
+- the shared model, SQLite repository, deterministic admission, fixed-batch
+  and pull-worker dispatch, Modal call boundary, cancellation, restart, and
+  coordinator loops;
+- the GROMACS service cutover and explicit pre-release service-state
+  transition;
+- the workflow ledger decomposition, remote workflow coordinator, deployed
+  workflow CLI lifecycle, and successor recovery;
+- PPIFlow runtime Task discovery for ReFold, Partial, and LigandMPNN, plus
+  directly tracked initial-design, FlowPacker, and DockQ calls.
+
+Still pending:
+
+- AlphaFold3 search and inference adoption;
+- BoltzGen direct Task fan-out;
+- Rosetta pull-worker adoption and removal of its Modal Queue;
+- remote per-run coordination for direct `biomodals app run`;
+- manual Modal smoke tests after the remaining caller adapters are complete.
 
 This plan consolidates the execution and recovery findings from the API
 service, reusable workflow runtime, PPIFlow fan-out, and AlphaFold3 search and

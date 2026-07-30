@@ -14,19 +14,19 @@ a workflow, or an app entrypoint. It has one opaque Execution Run ID that is
 independent of workload naming and scientific identity.
 _Avoid_: API Job, workflow definition
 
-**Execution Run ID** [planned]:
+**Execution Run ID**:
 A kernel-generated UUID identifying exactly one Execution Run. It is generated
 before admission and used for repository keys, coordinator routing, lineage,
 and ledger paths.
 _Avoid_: Workload Run Key, Service Job ID, display name
 
-**Workload Run Key** [planned]:
+**Workload Run Key**:
 An optional workload-owned name or scientific key that influences provider
 arguments, output paths, or publication identity. Successor Execution Runs may
 reuse it, and the kernel stores it only as immutable workload plan input.
 _Avoid_: Execution Run ID, ledger path, display label alone
 
-**Workload Plan Fingerprint** [planned]:
+**Workload Plan Fingerprint**:
 A stable digest of every normalized result-affecting input and declared
 scientific tool, model, adapter, or schema version for an Execution Run.
 Successor Execution Runs require the same fingerprint. File contents are
@@ -34,14 +34,14 @@ represented by content digests; operational concurrency, batching, resources,
 and Deployment Identity are excluded.
 _Avoid_: command-text hash, file path alone, Execution Run ID, deployment version alone
 
-**Execution Run Status** [planned]:
+**Execution Run Status**:
 The kernel lifecycle value for an Execution Run: `pending`, `running`,
 `cancel_requested`, `suspended`, `state_unknown`, `succeeded`, `partial`,
 `failed`, or `cancelled`. The first five are nonterminal and the final four are
 terminal. Structured reasons refine a status without creating another status.
 _Avoid_: queued, finalizing, blocked, interrupted
 
-**Execution Run Status Reason** [planned]:
+**Execution Run Status Reason**:
 The optional stable, machine-readable `status_reason` code that explains the
 current Execution Run Status. An optional human-readable `status_message`
 provides diagnostics but is never used for control flow. Task- and
@@ -53,7 +53,7 @@ summarize why its lifecycle changed. The initial reason vocabulary is:
 `required_work_failed`, and `deployment_unavailable`.
 _Avoid_: status-specific reason columns, free-text state machine, copied stack trace
 
-**Successor Execution Run** [planned]:
+**Successor Execution Run**:
 A new Execution Run created by an explicit restart of an eligible terminal
 Run. It records its predecessor, uses a newly resolved Deployment Identity and
 Execution Run ID, reuses the Workload Run Key when applicable, revalidates
@@ -62,7 +62,7 @@ Provider Call is conclusively terminal. It is the only way to retry failed
 provider work.
 _Avoid_: in-place migration, same-run retry, provider redelivery
 
-**Successor Repair Closure** [planned]:
+**Successor Repair Closure**:
 The union of the backward ancestor closures needed to repair predecessor
 terminal Nodes that were `partial`, `failed`, `skipped`, or `cancelled`, plus
 any previously successful terminal whose publication no longer validates.
@@ -71,14 +71,14 @@ successful Task publications are reused and only conclusively unowned missing
 work may be submitted in the Successor Execution Run.
 _Avoid_: rerun whole DAG, reopen predecessor, accept partial as complete
 
-**Suspended Run** [planned]:
+**Suspended Run**:
 A nonterminal Execution Run whose coordinator stopped after an application
 error or an unknown Node or Task publication observation. It admits no new
 work until explicit resume reconciles durable state and repeats any unresolved
 validation.
 _Avoid_: failed Task, provider state unknown, Modal preemption
 
-**State-Unknown Run** [planned]:
+**State-Unknown Run**:
 A nonterminal Execution Run whose provider submission, call state, or
 cancellation outcome cannot be established. It preserves ownership and forbids
 replacement work until explicit reconciliation or administrative resolution.
@@ -90,7 +90,7 @@ when it becomes ready. Its identity and dependencies do not change when
 provider batch size or concurrency changes.
 _Avoid_: Modal function, dynamic task, provider call
 
-**Execution Node Status** [planned]:
+**Execution Node Status**:
 The kernel lifecycle value for an Execution Node: `pending`, `running`,
 `succeeded`, `partial`, `failed`, `cancelled`, or `skipped`. Only `pending`
 and `running` are nonterminal. Readiness is derived rather than persisted, and
@@ -100,14 +100,14 @@ complete terminal result from ordinary dependency failure or explicit Run
 cancellation.
 _Avoid_: ready, cached, suspended, state unknown
 
-**Terminal Execution Node** [planned]:
+**Terminal Execution Node**:
 An Execution Node with no downstream dependency. Terminal Execution Nodes
 collectively define an Execution Run's scientific result boundary. Their
 validated publications determine the Run outcome; upstream Node history does
 not override a complete terminal result.
 _Avoid_: last executed node, designated result node, all-Node aggregation
 
-**Node Result Observation** [planned]:
+**Node Result Observation**:
 The workload-owned `available`, `missing`, or `unknown` answer from validating
 one Execution Node's complete publication before its dependencies or Tasks
 run. `available` prunes unnecessary ancestors, `missing` expands the backward
@@ -115,13 +115,13 @@ repair closure, and `unknown` blocks new work. A partial publication is not an
 available complete Node result.
 _Avoid_: boolean cache hit, fake terminal Task, kernel-owned scientific validator
 
-**Partial Dependency Acceptance** [planned]:
+**Partial Dependency Acceptance**:
 The immutable `accept_partial` boolean on one Node dependency edge. Success
 always satisfies the edge; a partial upstream Node satisfies it only when the
 edge opts in. Failed, cancelled, and skipped outcomes never satisfy it.
 _Avoid_: global partial mode, implicit best effort, accepted-status set
 
-**Node Aggregation Policy** [planned]:
+**Node Aggregation Policy**:
 The immutable `fail_fast`, `collect_all`, or `allow_partial` rule by which one
 Execution Node admits Tasks and derives its outcome. Fail-fast stops new
 admission without cancelling owned work; collect-all is strict after every
@@ -129,7 +129,7 @@ Task finishes; allow-partial succeeds partially only when at least one Task
 succeeds.
 _Avoid_: same-Run retry policy, implicit cancellation, arbitrary success threshold
 
-**Explicit Empty Result** [planned]:
+**Explicit Empty Result**:
 A workload-published and validated complete Node result created after a
 `NodePlan` with `allow_empty_result=True` discovers zero Tasks. The boolean is
 part of the Workload Plan Fingerprint. An empty in-memory collection alone is
@@ -142,14 +142,14 @@ Node whose cached publication and outcome can be observed. Every Task belongs
 to exactly one Node.
 _Avoid_: workflow node, thread, untracked work item
 
-**Coordinator-Local Task** [planned]:
+**Coordinator-Local Task**:
 A Task whose caller-owned local operation executes inside the exclusive Execution
 Coordinator without a Provider Call or call slot. After coordinator
 interruption, recovery observes its publication first and may re-enter the
 same idempotent operation only when the result is authoritatively missing.
 _Avoid_: client-side run, untracked finalizer, failed-Task retry
 
-**Task Fingerprint** [planned]:
+**Task Fingerprint**:
 The kernel-computed SHA-256 digest of compact canonical JSON containing the
 Workload Plan Fingerprint, Node key, Task key, and workload-normalized
 scientific payload. It is calculated once at discovery and persisted.
@@ -157,7 +157,7 @@ Operational execution payloads, provider kwargs, paths, batching, resources,
 and call identity are excluded.
 _Avoid_: workload-supplied opaque digest, whole-file hashing, polling-time recomputation
 
-**Task Discovery Checkpoint** [planned]:
+**Task Discovery Checkpoint**:
 The atomic per-Node repository transition that validates and inserts the
 complete finite set of `TaskPlan` records with unique stable Node-local keys,
 then marks discovery complete. The host durability boundary must be crossed
@@ -165,7 +165,7 @@ before any Task can acquire an execution owner. Recovery either rediscovers
 the whole set or reloads the whole set, never a partial queue.
 _Avoid_: incremental Task creation, half-discovered queue, worker-side discovery
 
-**Task Status** [planned]:
+**Task Status**:
 The kernel lifecycle value for a Task: `pending`, `running`, `succeeded`,
 `failed`, `cancelled`, or `skipped`. Only `pending` and `running` are
 nonterminal. A Task becomes `running` when durable local or provider ownership
@@ -176,7 +176,7 @@ Task skipped or an owned Task cancelled because its terminal result no longer
 needed that ancestor work.
 _Avoid_: partial, cached, submitting, attached, state unknown
 
-**Single-Submission Rule** [planned]:
+**Single-Submission Rule**:
 Within one Execution Run, the kernel admits each Task once and creates at most
 one Provider Call submission or Worker Assignment for it. Provider redelivery
 may re-execute the same call, and an interrupted Coordinator-Local Task may
@@ -185,7 +185,7 @@ claim exactly-once execution. A conclusive failure terminates the Task; retry
 requires a Successor Execution Run.
 _Avoid_: exactly-once execution, same-run retry, attempt counter
 
-**Submission Preclaim** [planned]:
+**Submission Preclaim**:
 The atomic repository operation that creates a Provider Call in `submitting`
 and durably assigns its Tasks before the external spawn side effect. Only the
 caller that created the row and crossed its host durability boundary receives
@@ -200,7 +200,7 @@ belongs to exactly one Node and may own zero or more of that Node's Tasks. A
 Modal Function Call is the current provider-specific implementation.
 _Avoid_: Task, Node, Coordinator Attempt, provider redelivery, app
 
-**Provider Call Status** [planned]:
+**Provider Call Status**:
 The kernel lifecycle value for a Provider Call: `submitting`, `attached`,
 `running`, `outcome_unknown`, `state_unknown`, `succeeded`, `failed`, or
 `cancelled`. The first five are nonterminal and preserve ownership; the final
@@ -209,7 +209,7 @@ whereas `state_unknown` does but cannot conclusively establish provider state,
 terminal result recovery, or cancellation.
 _Avoid_: planned, expired, retrying
 
-**Result Envelope** [planned]:
+**Result Envelope**:
 A small, durable, JSON-compatible operational record captured from a
 successfully returned Provider Call before that call becomes `succeeded`. It
 maps the call to Task-specific durable result references or conclusive outcome
@@ -220,28 +220,28 @@ envelope crosses the host durability boundary; unfinished Tasks remain
 `running` until their Workload Publications validate.
 _Avoid_: Workload Publication, result archive, raw scientific output
 
-**Dispatch Batch** [planned]:
+**Dispatch Batch**:
 A durable grouping of Tasks from one Node offered together to one Provider
 Call or to a shared pull worker pool. Fixed dispatch binds every constituent
 Task to one call during preclaim; pull-worker dispatch records actual
 Task-to-call ownership only through a committed Worker Assignment.
 _Avoid_: workflow node, provider call, scientific batch
 
-**Fixed-Batch Dispatch** [planned]:
+**Fixed-Batch Dispatch**:
 A dispatch mode in which the kernel groups ready Tasks from one Node by a
 workload-declared provider binding, compatibility key, and positive maximum
 batch size. It preserves Task encounter order, persists the complete
 Task-to-call mapping during preclaim, and never repacks that call afterward.
 _Avoid_: pull claim, scientific batch identity, scheduler optimizer
 
-**Pull-Worker Dispatch** [planned]:
+**Pull-Worker Dispatch**:
 A dispatch mode in which the kernel admits empty worker Provider Calls for one
 Node and those workers later claim bounded Task microbatches through the
 coordinator. Ready Task rows are the queue, and durable Worker Assignments
 record ownership before payload delivery.
 _Avoid_: fixed batch, Modal Queue, timeout lease
 
-**Pull-Worker Pool Size** [planned]:
+**Pull-Worker Pool Size**:
 The derived target
 `ceil(nonterminal_node_tasks / claim_capacity)` for a pull-worker Node. New
 worker candidates equal that target minus the Node's existing nonterminal
@@ -249,14 +249,14 @@ worker Provider Calls, bounded by the Run's total and GPU call slots. It is not
 a separate configured limit.
 _Avoid_: per-Node worker cap, adaptive autoscaler, idle timeout
 
-**Worker Assignment** [planned]:
+**Worker Assignment**:
 A durable SQLite record linking one Task to the Provider Call and worker claim
 responsible for it. The coordinator commits and checkpoints the assignment
 before returning its payload. Repeating the same claim request returns the
 same assignment.
 _Avoid_: queue item, timeout lease, retry, publication
 
-**Task Claim Request** [planned]:
+**Task Claim Request**:
 An idempotent request from a pull worker for a bounded set of ready Tasks.
 Its stable request ID lets a replacement worker recover the same committed
 Worker Assignments after a lost response or provider restart.
@@ -268,7 +268,7 @@ Assignments, and Provider Calls governed by the execution kernel's transition
 contract. Each durable coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
-**Execution Kernel** [planned]:
+**Execution Kernel**:
 The caller-driven `biomodals.execution` library that validates and schedules a
 durable Task DAG, orchestrates Modal calls, enforces Run-level call limits, and
 recovers execution state. App and workflow code constructs Tasks, validates
@@ -283,25 +283,25 @@ Run, stored at
 deployment's configured durable Volume.
 _Avoid_: scientific output directory, Workflow Ledger, shared execution Volume
 
-**Execution Coordinator** [planned]:
+**Execution Coordinator**:
 The logical scheduling authority that serializes transitions in an Execution
 State Repository and advances active Execution Runs independently of their
 launching clients. It outlives any process or container temporarily performing
 that work.
 _Avoid_: worker, SQLite writer container, Provider Call
 
-**Coordinator Attempt** [planned]:
+**Coordinator Attempt**:
 One continuous tenure in which a process or container actively advances an
 Execution Coordinator. An interruption ends the Attempt without cancelling
 the Coordinator's Runs or child Provider Calls.
 _Avoid_: Task, provider retry, Execution Run
 
-**Coordinator Interruption** [planned]:
+**Coordinator Interruption**:
 A non-user-requested loss or shutdown of the current Coordinator Attempt that
 requires a replacement Attempt to recover durable execution state.
 _Avoid_: Job cancellation, Task failure, Provider Call cancellation
 
-**Run-Scoped Coordinator Pool** [planned]:
+**Run-Scoped Coordinator Pool**:
 A provider-routed container pool created by a Deployment Coordinator Adapter
 and identified by an Execution Run ID and Deployment Identity. It admits at
 most one coordinator container for that identity; concurrent control requests
@@ -315,7 +315,7 @@ result processing, Volumes, and configuration without introducing a universal
 coordinator service or workload-handler framework.
 _Avoid_: execution kernel, workload registry, API service
 
-**Deployment Identity** [planned]:
+**Deployment Identity**:
 The Modal Environment, deployed app or workflow name, and exact numeric
 deployment version selected and persisted before an Execution Run admits work.
 An explicit CLI version wins; otherwise the CLI resolves current deployment
@@ -726,7 +726,7 @@ _Avoid_: raw input path, wildcard-only dependency
 A dependency between workflow nodes that enforces execution order without passing workflow artifacts.
 _Avoid_: dummy artifact
 
-**Dynamic Task Fan-Out** [planned]:
+**Dynamic Task Fan-Out**:
 A workflow node execution pattern where the DAG node is fixed but the number of per-input tasks is determined from upstream artifacts at runtime.
 _Avoid_: dynamic DAG
 
@@ -743,7 +743,7 @@ A tool-specific queue, worker pool, pod pool, or fan-out loop that directly
 coordinates an app's concurrent Tasks.
 _Avoid_: execution kernel, provider autoscaler
 
-**Run-Level Provider Call Limits** [planned]:
+**Run-Level Provider Call Limits**:
 The pair of coordinator-enforced `max_active_provider_calls` and
 `max_active_gpu_provider_calls` ceilings for one Execution Run. Every
 nonterminal Provider Call consumes one total slot; a call bound to a
@@ -753,14 +753,14 @@ its slots independently of unfinished Task publication. CPU, RAM, accelerator
 type, GPU count, and actual Modal container packing remain provider-owned.
 _Avoid_: Task limit, resource vector, Modal decorator, cross-run global cap
 
-**Runtime Image Key** [planned]:
+**Runtime Image Key**:
 An opaque, stable operational value declared by a resolved provider binding
 when two call candidates use the same deployed runtime image. The scheduler
 uses it only to form best-effort admission cohorts; it neither inspects Modal
 decorators nor promises container reuse across Functions.
 _Avoid_: scientific image version, Provider Call ID, warm-container guarantee
 
-**DAG Admission Priority** [planned]:
+**DAG Admission Priority**:
 The deterministic, Snakemake-inspired ordering used to fill every feasible
 Provider Call slot in one coordinator scheduling cycle. Ready work is ranked
 first by greater dependency depth, then by the number of required unfinished
@@ -803,7 +803,7 @@ _Avoid_: execution repository, scientific publication
 The execution location for a workflow node, either inline in the workflow orchestrator or in a separate remote Modal function.
 _Avoid_: runner location, execution site
 
-**Durable Node Cache** [planned]:
+**Durable Node Cache**:
 Volume-backed intermediate checkpoint state that workload code may use when
 Modal redelivers the same provider input or a Successor Execution Run schedules
 still-missing work.

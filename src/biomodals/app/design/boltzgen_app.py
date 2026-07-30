@@ -10,12 +10,30 @@
 # ruff: noqa: PLC0415
 import os
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 import orjson
 
 from biomodals.app.config import AppConfig
+from biomodals.app.design.boltzgen.execution_contracts import (
+    acquire_output_claim,
+    is_boltzgen_run_complete,
+    release_output_claim,
+    write_collection_publication,
+)
+from biomodals.app.design.boltzgen.execution_coordinator import (
+    BoltzGenExecutionCoordinator,
+)
+from biomodals.app.design.boltzgen.execution_request import (
+    load_execution_request_from_volume,
+    prepare_execution_request,
+    stage_execution_request,
+)
+from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution.modal import ModalCallDriver, deployed_execution_coordinator
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
@@ -26,7 +44,6 @@ from biomodals.helper.shell import (
     sanitize_filename,
     warmup_directory,
 )
-from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -58,6 +75,8 @@ runtime_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_boltzgen_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 
 ##########################################
@@ -83,16 +102,6 @@ def package_outputs_helper(
         paths_to_bundle=paths_to_bundle,
         tar_args=tar_args,
         num_threads=num_threads,
-    )
-
-
-def _is_boltzgen_run_complete(run_dir: Path) -> bool:
-    """Return whether a BoltzGen run directory contains the final outputs."""
-    final_dir = run_dir / "final_ranked_designs"
-    return (
-        run_dir.exists()
-        and final_dir.exists()
-        and (final_dir / "results_overview.pdf").exists()
     )
 
 
@@ -267,7 +276,7 @@ def get_run_ids(
             f"💊 No existing run directories found for run name '{run_name}'."
         )
     if skip_finished:
-        all_run_dirs = [d for d in all_run_dirs if not _is_boltzgen_run_complete(d)]
+        all_run_dirs = [d for d in all_run_dirs if not is_boltzgen_run_complete(d)]
 
     run_ids = [d.name for d in all_run_dirs]
     if focus_run_ids is not None:
@@ -295,9 +304,11 @@ def collect_boltzgen_data(
     extra_args: str | None = None,
     filter_results: bool = True,
     filter_rmsd_threshold: float = 4.0,
-    max_parallel_runs: int | None = None,
-) -> bytes | list[str]:
-    """Collect BoltzGen output data from multiple runs."""
+    publication_path: str = "",
+) -> dict[str, object]:
+    """Validate completed Tasks and publish their deterministic collection."""
+    if not publication_path:
+        raise ValueError("publication_path cannot be empty")
     out_vol = CONF.output_volume
     out_vol.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
@@ -306,7 +317,11 @@ def collect_boltzgen_data(
     config_dir.mkdir(parents=True, exist_ok=True)
 
     all_run_dirs = [outdir / x for x in run_ids]
-    run_dirs = [d for d in all_run_dirs if not _is_boltzgen_run_complete(d)]
+    incomplete = [d.name for d in all_run_dirs if not is_boltzgen_run_complete(d)]
+    if incomplete:
+        raise RuntimeError(
+            "Cannot collect incomplete BoltzGen Tasks: " + ", ".join(incomplete)
+        )
 
     kwargs = {
         "input_yaml_path": str(config_dir / f"{run_name}.yaml"),
@@ -321,39 +336,22 @@ def collect_boltzgen_data(
         with cli_args_json_path.open("wb") as f:
             f.write(orjson.dumps(kwargs, option=orjson.OPT_INDENT_2))
 
-    if run_dirs:
-        print(
-            f"💊 Launching or resuming {len(run_dirs)} incomplete BoltzGen runs "
-            f"out of {len(run_ids)} planned runs."
-        )
-
-        def run_one(boltzgen_dir: Path) -> str:
-            return BoltzGenRunner().boltzgen_run.remote(str(boltzgen_dir), **kwargs)
-
-        for boltzgen_dir in bounded_map(
-            run_dirs,
-            run_one,
-            max_parallel=max_parallel_runs,
-        ):
-            print(f"💊 BoltzGen run completed: {boltzgen_dir}")
-    else:
-        print("💊 All planned BoltzGen runs are already complete; skipping relaunch.")
-
-    out_vol.reload()
     vol_path = volume_path_from_mount_path(
         str(outdir), CONF.output_volume_mountpoint, CONF.output_volume_name
     )
+    publication: dict[str, object] = {
+        "run_name": run_name,
+        "run_ids": run_ids,
+        "filtered": filter_results,
+    }
     if filter_results:
-        # Rerun BoltzGen filters on all run IDs, and only download the designs
-        # that passed all filters (also limited by the `budget`)
         print(f"💊 Collecting BoltzGen outputs in {vol_path}...")
-        combine_multiple_runs.remote(run_name, run_ids)
+        combine_multiple_runs.get_raw_f()(run_name, run_ids)
         print("💊 Filtering combined BoltzGen designs...")
-        refilter_designs.remote(run_name, budget, filter_rmsd_threshold)
-        out_vol.reload()
+        refilter_designs.get_raw_f()(run_name, budget, filter_rmsd_threshold)
 
         print("💊 Packaging filtered BoltzGen outputs...")
-        tarball_bytes = package_outputs_helper.remote(
+        tarball_bytes = package_outputs_helper.get_raw_f()(
             layout.run_root / "pass-filter-designs",
             [
                 "all-designs.parquet",
@@ -362,14 +360,29 @@ def collect_boltzgen_data(
                 "refold-cif/",
             ],
         )
-        return tarball_bytes
+        archive_path = Path(CONF.output_volume_mountpoint).joinpath(
+            *Path(publication_path).with_suffix(".tar.zst").parts
+        )
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        archive_path.write_bytes(tarball_bytes)
+        publication.update({
+            "archive_path": str(
+                archive_path.relative_to(CONF.output_volume_mountpoint)
+            ),
+            "archive_size_bytes": len(tarball_bytes),
+        })
+    else:
+        print(f"💊 Results are available at: {vol_path}.")
+    record = write_collection_publication(
+        CONF.output_volume_mountpoint,
+        publication_path,
+        publication,
+    )
+    out_vol.commit()
+    return record
 
-    print("💊 Skipping refiltering of BoltzGen outputs.")
-    print(f"💊 Results are available at: {vol_path}.")
-    return run_ids
 
-
-@app.cls(
+@app.function(
     gpu=CONF.gpu,
     cpu=1.125,
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
@@ -378,102 +391,58 @@ def collect_boltzgen_data(
     retries=modal.Retries(initial_delay=4.0, max_retries=10),
     single_use_containers=True,
 )
-class BoltzGenRunner:
-    """Class to run BoltzGen on a YAML specification."""
-
-    @modal.method()
-    def boltzgen_run(
-        self,
-        out_dir: str,
-        input_yaml_path: str,
-        protocol: str = "nanobody-anything",
-        num_designs: int = 10,
-        budget: int = 1,
-        steps: str | None = None,
-        extra_args: str | None = None,
-    ) -> str:
-        """Run BoltzGen on a yaml specification.
-
-        Args:
-            out_dir: Output directory path
-            input_yaml_path: Path to YAML design specification file
-            protocol: Design protocol (protein-anything, peptide-anything, etc.)
-            num_designs: Number of designs to generate
-            budget: Number of designs to keep after filtering. This is not very useful
-                here because we are likely to run multiple parallel runs and combine later.
-            steps: Specific pipeline steps to run (e.g. "design inverse_folding")
-            extra_args: Additional CLI arguments as string
-
-        Returns:
-        -------
-            Path to output directory as string.
-        """
-        import time
-
-        CONF.output_volume.reload()
-        out_path = Path(out_dir)
-        if _is_boltzgen_run_complete(out_path):
-            return str(out_dir)
-
-        # Make lock directory to prevent other GPU workers running the same job
-        # Stale locks >1 day are ignored
-        out_path.mkdir(parents=True, exist_ok=True)
-        lock_dir = out_path / ".lock"
-        self.lock_dir = lock_dir
-        if lock_dir.exists() and (lock_dir.stat().st_mtime < (time.time() - 24 * 3600)):
-            print(f"💊 Removing stale lock for {out_dir}.")
-            lock_dir.rmdir()
-            CONF.output_volume.commit()
-        try:
-            lock_dir.mkdir(exist_ok=False)
-        except FileExistsError:
-            print(
-                f"💊 Another worker is already running BoltzGen for {out_dir}; skipping."
-            )
-            return str(out_dir)
-        finally:
-            CONF.output_volume.commit()
-
-        # Build command
-        cmd = [
-            "boltzgen",
-            "run",
-            str(input_yaml_path),
-            f"--protocol={protocol}",
-            f"--output={out_dir}",
-            f"--num_designs={num_designs}",
-            f"--budget={budget}",
-        ]
-
-        if steps:
-            cmd.extend(["--steps", *steps.split()])
-        if extra_args:
-            cmd.extend(extra_args.split())
-
-        # Handle preempted runs by continuing from existing output
-        if out_path.exists():
-            cmd.append("--reuse")
-            warmup_directory(out_path)
-
-        out_path.mkdir(parents=True, exist_ok=True)
-        log_path = out_path / "boltzgen-run.log"
-        log_vol_path = volume_path_from_mount_path(
-            str(log_path), CONF.output_volume_mountpoint, CONF.output_volume_name
-        )
-        print(f"💊 Running BoltzGen, saving logs to {log_vol_path}")
-        try:
-            run_command(cmd, output_mode="capture", log_file=log_path, cwd=out_path)
-        finally:
-            CONF.output_volume.commit()
+def run_boltzgen_task(
+    out_dir: str,
+    input_yaml_path: str,
+    claim_owner: str,
+    protocol: str = "nanobody-anything",
+    num_designs: int = 10,
+    budget: int = 1,
+    steps: str | None = None,
+    extra_args: str | None = None,
+    replace_claim_owner: str | None = None,
+) -> str:
+    """Run one independently tracked BoltzGen Task."""
+    CONF.output_volume.reload()
+    out_path = Path(out_dir)
+    if is_boltzgen_run_complete(out_path):
         return str(out_dir)
+    claim_dir = acquire_output_claim(
+        out_path,
+        owner=claim_owner,
+        replace_owner=replace_claim_owner,
+    )
+    CONF.output_volume.commit()
 
-    @modal.exit()
-    def clean_locks(self):
-        """Clean up any lock directories that might be left from preempted runs."""
-        if self.lock_dir.exists():
-            print(f"💊 Cleaning up lock directory {self.lock_dir}")
-            self.lock_dir.rmdir()
+    cmd = [
+        "boltzgen",
+        "run",
+        str(input_yaml_path),
+        f"--protocol={protocol}",
+        f"--output={out_dir}",
+        f"--num_designs={num_designs}",
+        f"--budget={budget}",
+    ]
+    if steps:
+        cmd.extend(["--steps", *steps.split()])
+    if extra_args:
+        cmd.extend(extra_args.split())
+    cmd.append("--reuse")
+    warmup_directory(out_path)
+
+    log_path = out_path / "boltzgen-run.log"
+    log_vol_path = volume_path_from_mount_path(
+        str(log_path), CONF.output_volume_mountpoint, CONF.output_volume_name
+    )
+    print(f"💊 Running BoltzGen, saving logs to {log_vol_path}")
+    try:
+        run_command(cmd, output_mode="capture", log_file=log_path, cwd=out_path)
+        if not is_boltzgen_run_complete(out_path):
+            raise RuntimeError("BoltzGen returned without its final publication")
+        release_output_claim(claim_dir, owner=claim_owner)
+    finally:
         CONF.output_volume.commit()
+    return str(out_dir)
 
 
 @app.function(
@@ -654,6 +623,179 @@ def refilter_designs(
 
 
 ##########################################
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    volumes=CONF.mounts(output_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with BoltzGen's worker functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh the output Volume before accepting lifecycle methods."""
+        self._coordinator_adapter = None
+        self._development = None
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionSnapshot:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionSnapshot:
+        """Read this Run's durable kernel snapshot."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionSnapshot:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionSnapshot:
+        """Resume this Run without retrying conclusive failures."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> ExecutionSnapshot:
+        """Create and drive one compatible Successor Run."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+    ) -> ExecutionSnapshot:
+        """Create a compatible Successor while inferring predecessor identity."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Checkpoint state without cancelling attached child calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+        else:
+            CONF.output_volume.commit()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return (
+            UUID(self.execution_run_id),
+            DeploymentIdentity(
+                self.deployment_environment,
+                self.deployment_name,
+                self.deployment_version,
+            ),
+        )
+
+    def _adapter(
+        self,
+        *,
+        development: bool = False,
+    ) -> BoltzGenExecutionCoordinator:
+        adapter = getattr(self, "_coordinator_adapter", None)
+        selected_mode = getattr(self, "_development", None)
+        if adapter is not None:
+            if selected_mode != development:
+                raise ValueError("Coordinator execution mode cannot change in place")
+            return adapter
+        execution_run_id, deployment = self._identity()
+        adapter = BoltzGenExecutionCoordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=Path(CONF.output_volume_mountpoint),
+            output_volume=CONF.output_volume,
+            modal_driver=_coordinator_modal_driver(development=development),
+        )
+        self._coordinator_adapter = adapter
+        self._development = development
+        return adapter
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source development handles."""
+    if not development:
+        return ModalCallDriver()
+    handles = {
+        "run_boltzgen_task": run_boltzgen_task,
+        "collect_boltzgen_data": collect_boltzgen_data,
+    }
+
+    def resolve(
+        _app_name: str,
+        function_name: str,
+        **_kwargs: object,
+    ):
+        try:
+            return handles[function_name]
+        except KeyError as error:
+            raise ValueError(
+                f"No BoltzGen development function {function_name!r}"
+            ) from error
+
+    return ModalCallDriver(function_resolver=resolve)
+
+
+def _execution_coordinator_handle(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    use_deployed_coordinator: bool,
+):
+    """Resolve this run's exact deployed or current-source coordinator."""
+    if use_deployed_coordinator:
+        return deployed_execution_coordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+        )
+    return ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment=deployment.environment,
+        deployment_name=deployment.deployment_name,
+        deployment_version=deployment.deployment_version,
+    )
+
+
+##########################################
 # Entrypoint for ephemeral usage
 ##########################################
 @app.local_entrypoint()
@@ -674,6 +816,11 @@ def submit_boltzgen_task(
     ignore_run_ids: str | None = None,
     filter_results: bool = False,
     filter_rmsd_threshold: float = 2.5,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run BoltzGen with results saved as a tarball to `out_dir`.
 
@@ -715,87 +862,178 @@ def submit_boltzgen_task(
         filter_rmsd_threshold: RMSD threshold for refiltering designs. This is
             only used if `filter_results` is true. The RMSD calculation is
             between the designed structure and the refolded structure.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            `biomodals app run` client supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
-    from pathlib import Path
-
     if download_models:
         boltzgen_download.remote(force=force_redownload)
         return
 
-    # NOTE: make sure names are unique for different inputs
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    predecessor_request = (
+        None
+        if predecessor_execution_run_id is None
+        else load_execution_request_from_volume(
+            CONF.output_volume,
+            predecessor_execution_run_id,
+        )
+    )
+    yaml_content: bytes | None = None
+    additional_files: dict[str, bytes] = {}
+    if input_yaml is not None:
+        yaml_path = Path(input_yaml).expanduser().resolve()
+        yaml_content = yaml_path.read_bytes()
+        additional_files = YAMLReferenceLoader(yaml_path).additional_files
+        if run_name is None:
+            run_name = yaml_path.stem
+    elif predecessor_request is not None:
+        if run_name is None:
+            run_name = predecessor_request.run_name
+    elif not salvage_mode:
+        raise ValueError("input_yaml must be provided for a new BoltzGen run.")
+
     if run_name is None:
-        if input_yaml is None:
-            raise ValueError("input_yaml must be provided if run_name is not set.")
-        run_name = Path(input_yaml).stem
-    else:
-        run_name = sanitize_filename(run_name)
+        raise ValueError("run_name must be provided when input_yaml is omitted.")
+    run_name = sanitize_filename(run_name)
 
-    # Prepare BoltzGen run inputs if we're not re-running incomplete jobs
-    if not salvage_mode:
-        # Find any file references in the yaml (path: something.cif)
-        # File paths in yaml are relative to the yaml file location
-        print("🧬 Checking if input yaml references additional files...")
-        if input_yaml is None:
-            raise ValueError("input_yaml must be provided for new BoltzGen runs.")
-        yaml_path = Path(input_yaml)
-        yml_parser = YAMLReferenceLoader(yaml_path)
-        if yml_parser.additional_files:
-            print(
-                f"🧬 Including additional referenced files: {list(yml_parser.additional_files.keys())}"
+    if predecessor_execution_run_id is None:
+        if yaml_content is None:
+            config_path = f"{run_name}/inputs/config/{run_name}.yaml"
+            try:
+                yaml_content = b"".join(CONF.output_volume.read_file(config_path))
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "Salvage mode could not load the staged BoltzGen YAML: "
+                    f"{config_path}"
+                ) from error
+            print(f"🧬 Salvage mode enabled; reusing staged inputs for {run_name}.")
+        else:
+            print("🧬 Checking if input yaml references additional files...")
+        if additional_files:
+            print(f"🧬 Including additional referenced files: {list(additional_files)}")
+
+        if not salvage_mode:
+            print(f"🧬 Staging BoltzGen inputs for yaml: {input_yaml}")
+            prepare_boltzgen_run.remote(
+                yaml_content=yaml_content,
+                run_name=run_name,
+                additional_files=additional_files,
             )
-
-        # TODO: use CONF.output_volume.batch_upload to avoid spinning up container
-        print(f"🧬 Submitting BoltzGen run for yaml: {input_yaml}")
-        yaml_str = yaml_path.read_bytes()
-
-        prepare_boltzgen_run.remote(
-            yaml_content=yaml_str,
-            run_name=run_name,
-            additional_files=yml_parser.additional_files,
+        run_ids = tuple(
+            get_run_ids.remote(
+                run_name=run_name,
+                num_parallel_runs=num_parallel_runs,
+                salvage_mode=salvage_mode,
+                focus_run_ids=focus_run_ids,
+                ignore_run_ids=ignore_run_ids,
+            )
         )
     else:
-        print(f"🧬 Salvage mode enabled; skipping input preparation for {run_name}.")
+        if predecessor_request is None:
+            raise RuntimeError("Predecessor request was not loaded")
+        run_ids = predecessor_request.run_ids
 
     budget = min(budget, num_designs)
-    run_ids = get_run_ids.remote(
-        run_name=run_name,
-        num_parallel_runs=num_parallel_runs,
-        salvage_mode=salvage_mode,
-        focus_run_ids=focus_run_ids,
-        ignore_run_ids=ignore_run_ids,
+    if yaml_content is None:
+        if predecessor_request is None:
+            raise RuntimeError("BoltzGen request has no scientific input")
+        request = replace(
+            predecessor_request,
+            max_active_provider_calls=num_parallel_runs,
+            max_active_gpu_provider_calls=num_parallel_runs,
+            replace_claim_owners=(),
+        )
+    else:
+        app_version = CONF.version
+        repo_commit_hash = CONF.repo_commit_hash
+        if app_version is None or repo_commit_hash is None:
+            raise RuntimeError("BoltzGen scientific version metadata is incomplete")
+        request = prepare_execution_request(
+            run_name=run_name,
+            run_ids=run_ids,
+            yaml_content=yaml_content,
+            additional_files=additional_files,
+            protocol=protocol,
+            num_designs=num_designs,
+            budget=budget,
+            steps=steps,
+            extra_args=extra_args,
+            filter_results=filter_results and (out_dir is not None),
+            filter_rmsd_threshold=filter_rmsd_threshold,
+            app_version=app_version,
+            repo_commit_hash=repo_commit_hash,
+            max_active_provider_calls=num_parallel_runs,
+            max_active_gpu_provider_calls=num_parallel_runs,
+        )
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
     )
-    print(f"🧬 Collecting BoltzGen data for runs {run_ids}")
-    outputs = collect_boltzgen_data.remote(
-        run_name=run_name,
-        run_ids=run_ids,
-        protocol=protocol,
-        num_designs=num_designs,
-        budget=budget,
-        steps=steps,
-        extra_args=extra_args,
-        filter_results=filter_results and (out_dir is not None),
-        filter_rmsd_threshold=filter_rmsd_threshold,
-        max_parallel_runs=num_parallel_runs,
+    if predecessor_execution_run_id is None:
+        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(
+            development=not use_deployed_coordinator,
+        )
+    else:
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            workload_plan_fingerprint=(
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            max_active_provider_calls=request.max_active_provider_calls,
+            max_active_gpu_provider_calls=(request.max_active_gpu_provider_calls),
+        )
+    print(f"Execution Run ID: {execution_run_id}")
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
+    )
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    snapshot = call.get()
+    if snapshot.run.status != RunStatus.SUCCEEDED:
+        diagnostic = snapshot.run.status_message or (
+            snapshot.run.status_reason.value
+            if snapshot.run.status_reason is not None
+            else snapshot.run.status.value
+        )
+        raise RuntimeError(
+            f"{CONF.name} Execution Run ended as "
+            f"{snapshot.run.status.value}: {diagnostic}"
+        )
+    completed_request = load_execution_request_from_volume(
+        CONF.output_volume,
+        execution_run_id,
     )
     if out_dir is None:
         return
 
     local_out_dir = Path(out_dir).expanduser().resolve()
     local_out_dir.mkdir(parents=True, exist_ok=True)
-    if filter_results:
-        if not isinstance(outputs, bytes):
-            raise TypeError("Expected filtered BoltzGen outputs as a tarball.")
-        (local_out_dir / f"{run_name}.tar.zst").write_bytes(outputs)
+    if completed_request.filter_results:
+        archive_path = completed_request.collection_publication_path.with_suffix(
+            ".tar.zst"
+        )
+        archive = b"".join(CONF.output_volume.read_file(archive_path.as_posix()))
+        (local_out_dir / f"{completed_request.run_name}.tar.zst").write_bytes(archive)
     else:
-        if not isinstance(outputs, list):
-            raise TypeError(
-                "Expected unfiltered BoltzGen outputs as a list of run IDs."
-            )
         (local_out_dir / "outputs").mkdir(exist_ok=True)
-        for run_id in outputs:
+        for run_id in completed_request.run_ids:
             run_out_dir: Path = local_out_dir / "outputs" / run_id
             run_out_dir.mkdir(parents=True, exist_ok=True)
-            remote_root_dir = f"{run_name}/outputs/{run_id}"
+            remote_root_dir = f"{completed_request.run_name}/outputs/{run_id}"
             print(f"🧬 Downloading results for run ID {run_id}...")
             for subdir in (
                 "boltzgen-run.log",

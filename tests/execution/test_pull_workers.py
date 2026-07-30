@@ -122,6 +122,29 @@ def test_claim_response_is_checkpointed_idempotent_and_ordered() -> None:
     assert tasks[4].worker_provider_call_id == third.call.provider_call_id
 
 
+def test_worker_can_claim_after_spawn_before_call_attachment() -> None:
+    repository = create_repository(task_count=1)
+    worker = repository.preclaim_pull_worker(
+        RUN_ID,
+        "inference",
+        submission_token="worker-starting",
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=1,
+        now=110,
+    )
+    assert worker is not None
+
+    claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="startup-race",
+        capacity=1,
+        now=111,
+    )
+
+    assert [assignment.task_key for assignment in claim.assignments] == ["seed-0"]
+
+
 def test_claim_request_conflicts_and_failed_owner_never_reassigns_tasks() -> None:
     repository = create_repository(task_count=3)
     first, second = _admit_workers(repository, 2)
@@ -200,3 +223,35 @@ def test_worker_completion_report_is_idempotent_and_publication_driven() -> None
             observation=AvailabilityStatus.MISSING,
             now=152,
         )
+
+
+def test_successful_worker_fails_any_unreported_assignment() -> None:
+    repository = create_repository(task_count=2)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+        now=140,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="complete-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=145,
+    )
+
+    repository.record_provider_call_result(
+        worker.call.provider_call_id,
+        result_envelope={"claimed_tasks": 2},
+        now=150,
+    )
+
+    assert {
+        task.task_key: task.status
+        for task in repository.list_tasks(RUN_ID, "inference")
+    } == {
+        "seed-0": TaskStatus.SUCCEEDED,
+        "seed-1": TaskStatus.FAILED,
+    }

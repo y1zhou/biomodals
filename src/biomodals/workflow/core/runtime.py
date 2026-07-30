@@ -16,12 +16,15 @@ from pydantic import BaseModel
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    DispatchMode,
     ExecutionRuntime,
+    ExecutionTaskRecord,
     NodeAggregationPolicy,
     NodeStatus,
     ProviderBinding,
     ProviderCallRecord,
     ProviderCallStatus,
+    PullTaskClaim,
     RunStatus,
     RunStatusReason,
     SqliteExecutionRepository,
@@ -35,8 +38,10 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import ModalCallDriver
 from biomodals.execution.scheduler import (
+    PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
     form_fixed_batches,
+    form_pull_worker_candidates,
     required_node_ranks,
     select_admissible_candidates,
 )
@@ -58,6 +63,8 @@ from biomodals.workflow.core.execution import execution_plan, node_task_plan
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
     RemoteNodeCall,
+    RemotePullTaskWorkflowNode,
+    RemotePullWorkerCall,
     RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
     RemoteWorkflowTask,
@@ -125,6 +132,7 @@ class WorkflowRuntime:
         strict_external_artifact_checks: bool = False,
         external_artifact_checker: ExternalArtifactChecker | None = None,
         external_volume_roots: Mapping[str, str | Path] | None = None,
+        pull_worker_coordinator: Any | None = None,
         now: Callable[[], int] | None = None,
         poll_interval_seconds: float = 1.0,
     ) -> None:
@@ -152,6 +160,7 @@ class WorkflowRuntime:
             else max_active_gpu_provider_calls
         )
         self.external_artifact_checker = external_artifact_checker
+        self.pull_worker_coordinator = pull_worker_coordinator
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
         self.store = WorkflowRunStore(self.volume_root, execution_run_id)
@@ -255,6 +264,97 @@ class WorkflowRuntime:
         """Request cancellation through the shared provider lifecycle."""
         self._provider.repository = self.store.execution
         self._provider.cancel_run(self.execution_run_id, now=self._now())
+
+    def attach(self, *, workload_run_key: str) -> None:
+        """Open and verify an existing Run for concurrent worker callbacks."""
+        self._initialize(workload_run_key)
+
+    def claim_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        *,
+        request_id: str,
+        capacity: int,
+    ) -> PullTaskClaim:
+        """Checkpoint one idempotent worker claim before returning its payloads."""
+        self._provider.repository = self.store.execution
+        return self._provider.claim_pull_tasks(
+            provider_call_id,
+            request_id=request_id,
+            capacity=capacity,
+            now=self._now(),
+        )
+
+    def complete_pull_task(
+        self,
+        provider_call_id: UUID,
+        task_key: str,
+        *,
+        request_id: str,
+        result: AppRunResult,
+    ) -> ExecutionTaskRecord:
+        """Publish one worker result and checkpoint its idempotent completion."""
+        result = AppRunResult.model_validate(result)
+        call = self.store.execution.get_provider_call(provider_call_id)
+        node = self._require_definition().nodes[call.node_key].node
+        if not isinstance(node, RemotePullTaskWorkflowNode):
+            raise ValueError("Provider Call does not belong to a pull-worker Node")
+        task = self.store.execution.get_task(
+            self.execution_run_id,
+            call.node_key,
+            task_key,
+        )
+        if result.status != AppRunStatus.SUCCEEDED:
+            with self.store.transaction():
+                completed = self.store.execution.record_pull_task_completion(
+                    provider_call_id,
+                    task_key,
+                    request_id=request_id,
+                    observation=AvailabilityStatus.MISSING,
+                    message=_node_error_message(result),
+                    now=self._now(),
+                )
+            self._checkpoint()
+            return completed
+
+        context = self._node_context(
+            self._require_definition(),
+            call.node_key,
+            task_key=task_key,
+        )
+        materialized = materialize_app_run_result(
+            result=result,
+            workflow_volume_name=self.workflow_volume_name,
+            result_dir=context.work_dir,
+            artifact_dir=self.store.output_root / "artifacts",
+            producing_node_id=call.node_key,
+            artifact_id_scope=task_key,
+            volume_root=self.volume_root,
+        )
+        observation = self._artifact_observation(tuple(materialized.artifacts))
+        with self.store.transaction():
+            self.store.artifacts.record_task_publication(
+                call.node_key,
+                task_key,
+                task_fingerprint=task.fingerprint,
+                result=materialized.result,
+                artifacts=tuple(materialized.artifacts),
+                now=self._now(),
+            )
+            completed = self.store.execution.record_pull_task_completion(
+                provider_call_id,
+                task_key,
+                request_id=request_id,
+                observation=observation,
+                message=(
+                    "Published workflow Task result is unavailable"
+                    if observation == AvailabilityStatus.MISSING
+                    else None
+                ),
+                now=self._now(),
+            )
+        self._checkpoint()
+        return completed
 
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""
@@ -416,6 +516,8 @@ class WorkflowRuntime:
         node_id = call.node_key
         envelope = call.result_envelope
         node = self._require_definition().nodes[node_id].node
+        if isinstance(node, RemotePullTaskWorkflowNode):
+            return
         if isinstance(node, RemoteTaskWorkflowNode):
             self._publish_provider_task_results(
                 node_id,
@@ -673,6 +775,9 @@ class WorkflowRuntime:
         )
         invocations: dict[tuple[str, str], RemoteNodeCall] = {}
         descriptors: list[TaskDispatchDescriptor] = []
+        pull_invocations: dict[str, RemotePullWorkerCall] = {}
+        pull_descriptors: list[PullWorkerDispatchDescriptor] = []
+        calls = repository.list_provider_calls(self.execution_run_id)
         for node_id, node_record in nodes.items():
             if (
                 node_id not in required
@@ -682,6 +787,59 @@ class WorkflowRuntime:
                 continue
             node = definition.nodes[node_id].node
             if not isinstance(node, RemoteWorkflowNode | RemoteTaskWorkflowNode):
+                continue
+            if isinstance(node, RemotePullTaskWorkflowNode):
+                try:
+                    invocation = node.prepare_pull_worker(
+                        self._node_context(definition, node_id)
+                    )
+                except Exception as error:
+                    self._fail_node_publication(
+                        node_id,
+                        f"Could not prepare pull worker: {error}",
+                    )
+                    continue
+                rank = ranks[node_id]
+                binding = ProviderBinding(
+                    environment=run.deployment.environment,
+                    app_name=run.deployment.deployment_name,
+                    app_version=run.deployment.deployment_version,
+                    function_name=invocation.function_name,
+                    uses_gpu=invocation.uses_gpu,
+                    runtime_image_key=invocation.runtime_image_key,
+                )
+                node_calls = [
+                    call
+                    for call in calls
+                    if call.node_key == node_id
+                    and call.dispatch_mode == DispatchMode.PULL_WORKER
+                ]
+                unfinished_task_count = sum(
+                    task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
+                    for task in repository.list_tasks(
+                        self.execution_run_id,
+                        node_id,
+                    )
+                )
+                pull_invocations[node_id] = invocation
+                pull_descriptors.append(
+                    PullWorkerDispatchDescriptor(
+                        node_key=node_id,
+                        node_ordinal=node_record.ordinal,
+                        binding=binding,
+                        compatibility_key=(
+                            invocation.compatibility_key or invocation.function_name
+                        ),
+                        claim_capacity=invocation.claim_capacity,
+                        unfinished_task_count=unfinished_task_count,
+                        nonterminal_worker_count=sum(
+                            not call.status.is_terminal for call in node_calls
+                        ),
+                        next_worker_ordinal=len(node_calls),
+                        depth=rank.depth,
+                        unblocking_span=rank.unblocking_span,
+                    )
+                )
                 continue
             for task in repository.list_tasks(self.execution_run_id, node_id):
                 if (
@@ -748,7 +906,10 @@ class WorkflowRuntime:
 
         counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = select_admissible_candidates(
-            form_fixed_batches(tuple(descriptors)),
+            (
+                *form_fixed_batches(tuple(descriptors)),
+                *form_pull_worker_candidates(tuple(pull_descriptors)),
+            ),
             available_total_slots=max(
                 0,
                 run.max_active_provider_calls - counts.total,
@@ -760,6 +921,35 @@ class WorkflowRuntime:
         )
         for candidate in selected:
             node = definition.nodes[candidate.node_key].node
+            if isinstance(node, RemotePullTaskWorkflowNode):
+                if self.pull_worker_coordinator is None:
+                    self._fail_node_publication(
+                        candidate.node_key,
+                        "Pull-worker coordinator handle is unavailable",
+                    )
+                    continue
+                invocation = pull_invocations[candidate.node_key]
+                kwargs = dict(invocation.kwargs)
+                if "coordinator" in kwargs:
+                    raise ValueError(
+                        "Pull-worker coordinator argument is runtime-owned"
+                    )
+                kwargs["coordinator"] = self.pull_worker_coordinator
+                self._provider.repository = self.store.execution
+                submitted = self._provider.submit_pull_worker(
+                    self.execution_run_id,
+                    node_key=candidate.node_key,
+                    submission_token=candidate.candidate_key,
+                    binding=candidate.binding,
+                    compatibility_key=candidate.compatibility_key,
+                    claim_capacity=invocation.claim_capacity,
+                    args=invocation.args,
+                    kwargs=kwargs,
+                    now=self._now(),
+                )
+                if submitted is None:
+                    return
+                continue
             if len(candidate.task_keys) == 1:
                 invocation = invocations[(candidate.node_key, candidate.task_keys[0])]
             elif isinstance(node, RemoteTaskWorkflowNode):

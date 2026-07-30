@@ -65,6 +65,26 @@ class RemoteNodeCall:
             raise ValueError("max_tasks_per_call must be positive")
 
 
+@dataclass(frozen=True)
+class RemotePullWorkerCall:
+    """One prepared pull-worker pool backed by durable Task claims."""
+
+    function_name: str
+    uses_gpu: bool
+    claim_capacity: int
+    args: tuple[Any, ...] = ()
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    runtime_image_key: str | None = None
+    compatibility_key: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject an invalid worker policy before any provider preclaim."""
+        if not self.function_name:
+            raise ValueError("Remote pull-worker function name cannot be empty")
+        if self.claim_capacity < 1:
+            raise ValueError("claim_capacity must be positive")
+
+
 class WorkflowNode(Protocol):
     """Protocol for one semantic workflow DAG vertex."""
 
@@ -175,6 +195,26 @@ class RemoteTaskWorkflowNode:
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Prevent bypassing the kernel's Task discovery and call ownership."""
         raise RuntimeError("Remote Task workflow Nodes must use the kernel")
+
+
+class RemotePullTaskWorkflowNode(RemoteTaskWorkflowNode):
+    """Remote Task Node whose calls dynamically claim bounded microbatches."""
+
+    def prepare_pull_worker(
+        self,
+        context: NodeRunContext,
+    ) -> RemotePullWorkerCall:
+        """Prepare the immutable worker-pool binding for this Node."""
+        raise NotImplementedError
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Prevent assigning pull Tasks during provider preclaim."""
+        del context, task
+        raise RuntimeError("Pull-worker Tasks are assigned through coordinator claims")
 
 
 class AppBackedNode(RemoteWorkflowNode):

@@ -39,6 +39,22 @@ class TaskDispatchDescriptor:
 
 
 @dataclass(frozen=True)
+class PullWorkerDispatchDescriptor:
+    """Operational inputs for one Node's derived pull-worker pool."""
+
+    node_key: str
+    node_ordinal: int
+    binding: ProviderBinding
+    compatibility_key: str
+    claim_capacity: int
+    unfinished_task_count: int
+    nonterminal_worker_count: int
+    next_worker_ordinal: int
+    depth: int
+    unblocking_span: int
+
+
+@dataclass(frozen=True)
 class ProviderCallCandidate:
     """One side-effect-free candidate for Provider Call admission."""
 
@@ -148,6 +164,48 @@ def form_fixed_batches(
                     compatibility_key=first.compatibility_key,
                     depth=first.depth,
                     unblocking_span=first.unblocking_span,
+                )
+            )
+    return tuple(candidates)
+
+
+def form_pull_worker_candidates(
+    descriptors: Iterable[PullWorkerDispatchDescriptor],
+) -> tuple[ProviderCallCandidate, ...]:
+    """Derive every currently useful pull-worker call candidate."""
+    candidates: list[ProviderCallCandidate] = []
+    for descriptor in descriptors:
+        if descriptor.claim_capacity <= 0:
+            raise ValueError("claim_capacity must be positive")
+        if descriptor.unfinished_task_count < 0:
+            raise ValueError("unfinished_task_count cannot be negative")
+        if descriptor.nonterminal_worker_count < 0:
+            raise ValueError("nonterminal_worker_count cannot be negative")
+        if descriptor.next_worker_ordinal < 0:
+            raise ValueError("next_worker_ordinal cannot be negative")
+        desired_workers = (
+            descriptor.unfinished_task_count + descriptor.claim_capacity - 1
+        ) // descriptor.claim_capacity
+        candidate_count = max(
+            0,
+            desired_workers - descriptor.nonterminal_worker_count,
+        )
+        for offset in range(candidate_count):
+            worker_ordinal = descriptor.next_worker_ordinal + offset
+            candidates.append(
+                ProviderCallCandidate(
+                    candidate_key=(
+                        f"{descriptor.node_key}:{descriptor.binding.function_name}:"
+                        f"{descriptor.compatibility_key}:worker-{worker_ordinal}"
+                    ),
+                    node_key=descriptor.node_key,
+                    node_ordinal=descriptor.node_ordinal,
+                    task_keys=(),
+                    task_ordinal=worker_ordinal,
+                    binding=descriptor.binding,
+                    compatibility_key=descriptor.compatibility_key,
+                    depth=descriptor.depth,
+                    unblocking_span=descriptor.unblocking_span,
                 )
             )
     return tuple(candidates)

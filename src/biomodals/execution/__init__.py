@@ -33,7 +33,9 @@ from biomodals.execution.model import (
 )
 from biomodals.execution.runtime import AsyncExecutionRuntime, ExecutionRuntime
 from biomodals.execution.scheduler import (
+    PullWorkerDispatchDescriptor,
     aggregate_task_outcome,
+    form_pull_worker_candidates,
     propagated_skip_node_keys,
     ready_node_keys,
     required_node_keys,
@@ -67,6 +69,7 @@ __all__ = [
     "ProviderCallPreclaim",
     "ProviderCallRecord",
     "PullTaskClaim",
+    "PullWorkerDispatchDescriptor",
     "ResultProvenance",
     "RunStatus",
     "RunStatusReason",
@@ -77,6 +80,7 @@ __all__ = [
     "WorkStatusReason",
     "aggregate_task_outcome",
     "drive_execution_run",
+    "form_pull_worker_candidates",
     "propagated_skip_node_keys",
     "ready_node_keys",
     "required_node_keys",

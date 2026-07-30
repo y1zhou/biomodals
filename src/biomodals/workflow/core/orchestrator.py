@@ -227,6 +227,46 @@ class ExecutionCoordinator:
                 OUT_VOLUME.commit()
 
     @modal.method()
+    def claim_tasks(
+        self,
+        provider_call_id: str,
+        request_id: str,
+        capacity: int,
+    ) -> Any:
+        """Return one checkpointed pull-worker Task claim."""
+        with self._lock():
+            self._require_ledger()
+            plan = self._load_plan()
+            runtime = self._open_runtime(plan, resolve_external_checker=False)
+            runtime.attach(workload_run_key=plan.workload_run_key)
+            return runtime.claim_pull_tasks(
+                UUID(provider_call_id),
+                request_id=request_id,
+                capacity=capacity,
+            )
+
+    @modal.method()
+    def complete_task(
+        self,
+        provider_call_id: str,
+        task_key: str,
+        request_id: str,
+        result: AppRunResult,
+    ) -> Any:
+        """Publish and checkpoint one pull-worker Task completion."""
+        with self._lock():
+            self._require_ledger()
+            plan = self._load_plan()
+            runtime = self._open_runtime(plan, resolve_external_checker=False)
+            runtime.attach(workload_run_key=plan.workload_run_key)
+            return runtime.complete_pull_task(
+                UUID(provider_call_id),
+                task_key,
+                request_id=request_id,
+                result=result,
+            )
+
+    @modal.method()
     def restart(
         self,
         predecessor_execution_run_id: str,
@@ -398,6 +438,7 @@ class ExecutionCoordinator:
                 else False
             ),
             external_artifact_checker=external_checker,
+            pull_worker_coordinator=self._worker_coordinator_handle(),
         )
         self._runtime = runtime
         return runtime
@@ -570,6 +611,16 @@ class ExecutionCoordinator:
                 ) from error
 
         return ModalCallDriver(function_resolver=resolve_development_function)
+
+    def _worker_coordinator_handle(self) -> Any:
+        """Return this same parameterized run pool for worker callbacks."""
+        execution_run_id, deployment = self._identity()
+        return ExecutionCoordinator(
+            execution_run_id=str(execution_run_id),
+            deployment_environment=deployment.environment,
+            deployment_name=deployment.deployment_name,
+            deployment_version=deployment.deployment_version,
+        )
 
     def _verified_snapshot(self) -> ExecutionSnapshot:
         execution_run_id, deployment = self._identity()

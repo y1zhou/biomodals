@@ -34,6 +34,8 @@ from biomodals.workflow.core.builder import Workflow
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
     RemoteNodeCall,
+    RemotePullTaskWorkflowNode,
+    RemotePullWorkerCall,
     RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
     RemoteWorkflowTask,
@@ -196,6 +198,63 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
         }
 
 
+@dataclass
+class PullFanoutNode(RemotePullTaskWorkflowNode):
+    texts: tuple[str, ...]
+    finalized_results: list[tuple[tuple[str, ...], tuple[str, ...]]] = field(
+        default_factory=list,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        return tuple(
+            RemoteWorkflowTask(
+                task_key=f"candidate-{ordinal}",
+                scientific_payload={"text": text},
+                execution_payload={"text": text},
+            )
+            for ordinal, text in enumerate(self.texts)
+        )
+
+    def prepare_pull_worker(
+        self,
+        context: NodeRunContext,
+    ) -> RemotePullWorkerCall:
+        return RemotePullWorkerCall(
+            function_name="run_pull_worker",
+            uses_gpu=False,
+            claim_capacity=2,
+            kwargs={"node_id": context.node_id},
+            runtime_image_key="pull-cpu",
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        self.finalized_results.append((tuple(results), tuple(errors)))
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED if not errors else AppRunStatus.PARTIAL,
+            outputs=[
+                AppOutput(
+                    name="summary",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=",".join(results).encode(),
+                        filename="summary.txt",
+                        media_type="text/plain",
+                    ),
+                )
+            ],
+        )
+
+
 class FakeModalDriver:
     def __init__(self) -> None:
         self.events: list[str] = []
@@ -251,6 +310,19 @@ class FanoutModalDriver(FakeModalDriver):
             ModalCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
+
+
+class PullModalDriver(FakeModalDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.spawn_kwargs: list[dict[str, object]] = []
+
+    def spawn(self, function, *, args, kwargs):
+        call_id = f"fc-pull-{len(self.spawn_kwargs)}"
+        self.events.append(f"spawn:{function}")
+        self.spawn_kwargs.append(dict(kwargs))
+        self.results[call_id] = {"claimed_tasks": 0}
+        return call_id
 
 
 class BatchedFanoutModalDriver(FakeModalDriver):
@@ -330,6 +402,7 @@ def _runtime(
     volume: FakeVolume | None = None,
     max_calls: int = 8,
     max_gpu_calls: int = 4,
+    pull_worker_coordinator: object | None = None,
 ) -> WorkflowRuntime:
     return WorkflowRuntime(
         workflow=workflow,
@@ -341,6 +414,7 @@ def _runtime(
         modal_driver=driver,
         max_active_provider_calls=max_calls,
         max_active_gpu_provider_calls=max_gpu_calls,
+        pull_worker_coordinator=pull_worker_coordinator,
         now=iter(range(100, 1000)).__next__,
         poll_interval_seconds=0,
     )
@@ -498,6 +572,60 @@ def test_remote_task_node_batches_compatible_tasks_into_one_call(
     ] == [TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED]
     assert node.finalized_results == [
         (("candidate-0", "candidate-1"), ()),
+    ]
+
+
+def test_pull_task_node_uses_durable_claims_and_worker_publications(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("pull-fanout")
+    node = PullFanoutNode(("alpha", "beta", "gamma"))
+    workflow.add_node(
+        node,
+        id="fanout",
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+    driver = PullModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_calls=2,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "pull-fanout"
+    runtime._ensure_run(definition, "pull-fanout")
+
+    runtime.advance_once()
+
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert len(calls) == 2
+    assert all(kwargs["coordinator"] == "run-pool" for kwargs in driver.spawn_kwargs)
+    for call_index, call in enumerate(calls):
+        claim = runtime.claim_pull_tasks(
+            call.provider_call_id,
+            request_id=f"claim-{call_index}",
+            capacity=2,
+        )
+        for assignment in claim.assignments:
+            runtime.complete_pull_task(
+                call.provider_call_id,
+                assignment.task_key,
+                request_id=f"complete-{assignment.task_key}",
+                result=_text_result(str(dict(assignment.execution_payload)["text"])),
+            )
+
+    runtime.advance_once()
+
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.SUCCEEDED
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED]
+    assert node.finalized_results == [
+        (("candidate-0", "candidate-1", "candidate-2"), ()),
     ]
 
 

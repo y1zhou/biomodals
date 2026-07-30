@@ -6,8 +6,10 @@ import pytest
 
 from biomodals.execution import ProviderBinding
 from biomodals.execution.scheduler import (
+    PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
     form_fixed_batches,
+    form_pull_worker_candidates,
 )
 
 GPU = ProviderBinding(
@@ -95,3 +97,45 @@ def test_fixed_batches_never_span_nodes() -> None:
 def test_fixed_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError, match="max_tasks_per_call must be positive"):
         form_fixed_batches((_task("seed-0", 0, max_tasks_per_call=0),))
+
+
+def test_pull_worker_candidates_fill_the_derived_pool_gap() -> None:
+    candidates = form_pull_worker_candidates((
+        PullWorkerDispatchDescriptor(
+            node_key="rosetta",
+            node_ordinal=3,
+            binding=CPU,
+            compatibility_key="rosetta-cpu",
+            claim_capacity=2,
+            unfinished_task_count=7,
+            nonterminal_worker_count=1,
+            next_worker_ordinal=4,
+            depth=2,
+            unblocking_span=1,
+        ),
+    ))
+
+    assert [candidate.candidate_key for candidate in candidates] == [
+        "rosetta:run_search:rosetta-cpu:worker-4",
+        "rosetta:run_search:rosetta-cpu:worker-5",
+        "rosetta:run_search:rosetta-cpu:worker-6",
+    ]
+    assert all(candidate.task_keys == () for candidate in candidates)
+
+
+def test_pull_worker_candidates_reject_invalid_capacity() -> None:
+    with pytest.raises(ValueError, match="claim_capacity must be positive"):
+        form_pull_worker_candidates((
+            PullWorkerDispatchDescriptor(
+                node_key="rosetta",
+                node_ordinal=0,
+                binding=CPU,
+                compatibility_key="rosetta-cpu",
+                claim_capacity=0,
+                unfinished_task_count=1,
+                nonterminal_worker_count=0,
+                next_worker_ordinal=0,
+                depth=0,
+                unblocking_span=0,
+            ),
+        ))

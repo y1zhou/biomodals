@@ -1271,8 +1271,11 @@ class SqliteExecutionRepository:
         if call.dispatch_mode != DispatchMode.PULL_WORKER:
             raise ValueError("Provider Call is not a pull worker")
         if call.status not in {
+            ProviderCallStatus.SUBMITTING,
             ProviderCallStatus.ATTACHED,
             ProviderCallStatus.RUNNING,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+            ProviderCallStatus.STATE_UNKNOWN,
         }:
             raise ValueError(f"cannot claim Tasks for {call.status.value} worker")
         batch = self._connection.execute(
@@ -2240,6 +2243,31 @@ class SqliteExecutionRepository:
                 str(provider_call_id),
             ),
         )
+        if call.dispatch_mode == DispatchMode.PULL_WORKER:
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    error_message = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND worker_provider_call_id = ?
+                    AND status IN (?, ?)
+                """,
+                (
+                    TaskStatus.FAILED.value,
+                    "Pull worker returned before reporting Task completion",
+                    now,
+                    now,
+                    str(call.execution_run_id),
+                    call.node_key,
+                    str(provider_call_id),
+                    TaskStatus.PENDING.value,
+                    TaskStatus.RUNNING.value,
+                ),
+            )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
         return self.get_provider_call(provider_call_id)
 

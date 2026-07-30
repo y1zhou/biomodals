@@ -10,6 +10,7 @@ from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
     ModalDefiniteSubmissionError,
+    ModalDeploymentUnavailableError,
     ModalSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.model import (
@@ -21,6 +22,8 @@ from biomodals.execution.model import (
     ProviderCallRecord,
     ProviderCallStatus,
     PullTaskClaim,
+    RunStatus,
+    RunStatusReason,
 )
 from biomodals.execution.scheduler import ProviderCallCandidate
 from biomodals.execution.sqlite import SqliteExecutionRepository
@@ -91,7 +94,13 @@ class ExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
-        function = self._modal.resolve(candidate.binding)
+        function = self._resolve_provider(
+            execution_run_id,
+            candidate.binding,
+            now=now,
+        )
+        if function is None:
+            return None
         preclaim = self.repository.preclaim_fixed_batch(
             execution_run_id,
             candidate.node_key,
@@ -127,7 +136,13 @@ class ExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Submit one pull worker with its durable owner identity."""
-        function = self._modal.resolve(binding)
+        function = self._resolve_provider(
+            execution_run_id,
+            binding,
+            now=now,
+        )
+        if function is None:
+            return None
         preclaim = self.repository.preclaim_pull_worker(
             execution_run_id,
             node_key,
@@ -365,6 +380,28 @@ class ExecutionRuntime:
             self.request_provider_call_cancellation(provider_call_id, now=now)
         return self.repository.get_run(execution_run_id)
 
+    def _resolve_provider(
+        self,
+        execution_run_id: UUID,
+        binding: ProviderBinding,
+        *,
+        now: int,
+    ) -> Any | None:
+        """Fail closed once no attached call still needs reconciliation."""
+        try:
+            return self._modal.resolve(binding)
+        except ModalDeploymentUnavailableError as error:
+            if self.repository.active_provider_call_counts(execution_run_id).total == 0:
+                self.repository.transition_run(
+                    execution_run_id,
+                    RunStatus.FAILED,
+                    reason=RunStatusReason.DEPLOYMENT_UNAVAILABLE,
+                    message=str(error),
+                    now=now,
+                )
+                self._checkpoint_state()
+            return None
+
     def _checkpoint_state(self) -> None:
         replacement = self._checkpoint()
         if replacement is not None:
@@ -401,7 +438,13 @@ class AsyncExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
-        function = await self._modal.resolve(candidate.binding)
+        function = await self._resolve_provider(
+            execution_run_id,
+            candidate.binding,
+            now=now,
+        )
+        if function is None:
+            return None
         preclaim = self.repository.preclaim_fixed_batch(
             execution_run_id,
             candidate.node_key,
@@ -576,6 +619,28 @@ class AsyncExecutionRuntime:
         for provider_call_id in provider_call_ids:
             await self.request_provider_call_cancellation(provider_call_id, now=now)
         return self.repository.get_run(execution_run_id)
+
+    async def _resolve_provider(
+        self,
+        execution_run_id: UUID,
+        binding: ProviderBinding,
+        *,
+        now: int,
+    ) -> Any | None:
+        """Fail closed once no attached call still needs reconciliation."""
+        try:
+            return await self._modal.resolve(binding)
+        except ModalDeploymentUnavailableError as error:
+            if self.repository.active_provider_call_counts(execution_run_id).total == 0:
+                self.repository.transition_run(
+                    execution_run_id,
+                    RunStatus.FAILED,
+                    reason=RunStatusReason.DEPLOYMENT_UNAVAILABLE,
+                    message=str(error),
+                    now=now,
+                )
+                self._checkpoint_state()
+            return None
 
     def _checkpoint_state(self) -> None:
         replacement = self._checkpoint()

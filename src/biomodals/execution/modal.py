@@ -21,6 +21,10 @@ class ModalSubmissionOutcomeUnknownError(RuntimeError):
     """Raised when a spawn may have started without returning a call ID."""
 
 
+class ModalDeploymentUnavailableError(RuntimeError):
+    """Raised when an exact deployed function version cannot be hydrated."""
+
+
 class ModalCallObservationKind(StrEnum):
     """Provider-neutral observations produced by the Modal boundary."""
 
@@ -67,6 +71,10 @@ _CONCLUSIVE_EXECUTION_ERRORS = (
     modal.exception.RemoteError,
     modal.exception.UserCodeException,
 )
+_DEPLOYMENT_UNAVAILABLE_ERRORS = (
+    modal.exception.InvalidError,
+    modal.exception.NotFoundError,
+)
 
 
 def deployed_execution_coordinator(
@@ -105,13 +113,20 @@ class ModalCallDriver:
 
     def resolve(self, binding: ProviderBinding) -> Any:
         """Hydrate one exact deployed function before durable preclaim."""
-        function = self._function_resolver(
-            binding.app_name,
-            binding.function_name,
-            environment_name=binding.environment,
-            version=binding.app_version,
-        )
-        function.hydrate()
+        try:
+            function = self._function_resolver(
+                binding.app_name,
+                binding.function_name,
+                environment_name=binding.environment,
+                version=binding.app_version,
+            )
+            function.hydrate()
+        except _DEPLOYMENT_UNAVAILABLE_ERRORS as error:
+            raise ModalDeploymentUnavailableError(
+                "Exact Modal deployment is unavailable: "
+                f"{binding.environment}/{binding.app_name}/"
+                f"v{binding.app_version}/{binding.function_name}"
+            ) from error
         return function
 
     def spawn(
@@ -187,13 +202,20 @@ class AsyncModalCallDriver:
 
     async def resolve(self, binding: ProviderBinding) -> Any:
         """Hydrate one exact deployed function before durable preclaim."""
-        function = self._function_resolver(
-            binding.app_name,
-            binding.function_name,
-            environment_name=binding.environment,
-            version=binding.app_version,
-        )
-        await function.hydrate.aio()
+        try:
+            function = self._function_resolver(
+                binding.app_name,
+                binding.function_name,
+                environment_name=binding.environment,
+                version=binding.app_version,
+            )
+            await function.hydrate.aio()
+        except _DEPLOYMENT_UNAVAILABLE_ERRORS as error:
+            raise ModalDeploymentUnavailableError(
+                "Exact Modal deployment is unavailable: "
+                f"{binding.environment}/{binding.app_name}/"
+                f"v{binding.app_version}/{binding.function_name}"
+            ) from error
         return function
 
     async def spawn(

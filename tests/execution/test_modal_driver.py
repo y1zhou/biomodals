@@ -5,6 +5,7 @@
 import asyncio
 from uuid import UUID
 
+import modal
 import pytest
 
 from biomodals.execution import DeploymentIdentity
@@ -12,6 +13,7 @@ from biomodals.execution.modal import (
     AsyncModalCallDriver,
     ModalCallDriver,
     ModalCallObservationKind,
+    ModalDeploymentUnavailableError,
     ModalSubmissionOutcomeUnknownError,
     deployed_execution_coordinator,
 )
@@ -103,6 +105,21 @@ def test_driver_classifies_ambiguous_spawn_failure() -> None:
             args=(),
             kwargs={},
         )
+
+
+def test_driver_classifies_an_unavailable_exact_version() -> None:
+    """A missing retained deployment is distinct from provider uncertainty."""
+
+    class MissingFunction(FakeFunction):
+        def hydrate(self):
+            raise modal.exception.NotFoundError("version expired")
+
+    driver = ModalCallDriver(
+        function_resolver=lambda *args, **kwargs: MissingFunction()
+    )
+
+    with pytest.raises(ModalDeploymentUnavailableError, match="v23"):
+        driver.resolve(GPU_BINDING)
 
 
 def test_driver_observes_timeout_as_running_and_retained_result_as_success() -> None:

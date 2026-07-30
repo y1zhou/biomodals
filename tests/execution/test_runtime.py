@@ -12,6 +12,7 @@ from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
     ModalDefiniteSubmissionError,
+    ModalDeploymentUnavailableError,
     ModalSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.runtime import ExecutionRuntime
@@ -32,11 +33,14 @@ class FakeModalDriver:
         self.observe_count = 0
         self.cancelled: list[str] = []
         self.spawn_kwargs: list[dict[str, object]] = []
+        self.resolve_error: Exception | None = None
         self.spawn_error: Exception | None = None
         self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     def resolve(self, binding):
         self.resolve_count += 1
+        if self.resolve_error is not None:
+            raise self.resolve_error
         return FakeResolvedFunction(binding.function_name)
 
     def spawn(self, function, *, args, kwargs):
@@ -54,13 +58,13 @@ class FakeModalDriver:
         self.cancelled.append(provider_call_handle_id)
 
 
-def _candidate() -> ProviderCallCandidate:
+def _candidate(task_index: int = 0) -> ProviderCallCandidate:
     return ProviderCallCandidate(
-        candidate_key="inference:0",
+        candidate_key=f"inference:{task_index}",
         node_key="inference",
         node_ordinal=0,
-        task_keys=("seed-0",),
-        task_ordinal=0,
+        task_keys=(f"seed-{task_index}",),
+        task_ordinal=task_index,
         binding=GPU_BINDING,
         compatibility_key="af3",
         depth=0,
@@ -158,6 +162,86 @@ def test_resolution_failure_happens_before_durable_preclaim() -> None:
         )
 
     assert repository.list_provider_calls(RUN_ID) == ()
+
+
+def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
+    """Conclusive version loss becomes the accepted terminal Run reason."""
+    repository = create_repository(task_count=1)
+
+    class UnavailableResolver(FakeModalDriver):
+        def resolve(self, binding):
+            raise ModalDeploymentUnavailableError("version 23 is unavailable")
+
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=UnavailableResolver(),
+        checkpoint=lambda: None,
+    )
+
+    assert (
+        runtime.submit_fixed_batch(
+            RUN_ID,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+        is None
+    )
+
+    run = repository.get_run(RUN_ID)
+    assert run.status.value == "failed"
+    assert run.status_reason is not None
+    assert run.status_reason.value == "deployment_unavailable"
+    assert repository.list_provider_calls(RUN_ID) == ()
+
+
+def test_unavailable_deployment_first_drains_attached_calls() -> None:
+    """Known child ownership remains observable before the Run fails closed."""
+    repository = create_repository(task_count=2)
+    driver = FakeModalDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+    first = runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(0),
+        submission_token="first",
+        now=110,
+    )
+    assert first is not None
+
+    driver.resolve_error = ModalDeploymentUnavailableError("version 23 is unavailable")
+    assert (
+        runtime.submit_fixed_batch(
+            RUN_ID,
+            _candidate(1),
+            submission_token="second",
+            now=120,
+        )
+        is None
+    )
+    assert repository.get_run(RUN_ID).status.value == "running"
+    assert len(repository.list_provider_calls(RUN_ID)) == 1
+
+    repository.fail_provider_call(
+        first.provider_call_id,
+        message="first call finished unsuccessfully",
+        now=130,
+    )
+    assert (
+        runtime.submit_fixed_batch(
+            RUN_ID,
+            _candidate(1),
+            submission_token="second",
+            now=140,
+        )
+        is None
+    )
+    reason = repository.get_run(RUN_ID).status_reason
+    assert reason is not None
+    assert reason.value == "deployment_unavailable"
 
 
 def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -> None:

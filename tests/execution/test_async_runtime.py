@@ -5,10 +5,11 @@
 import asyncio
 from dataclasses import dataclass
 
-from biomodals.execution import ProviderCallStatus
+from biomodals.execution import ProviderCallStatus, RunStatusReason
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
+    ModalDeploymentUnavailableError,
 )
 from biomodals.execution.runtime import AsyncExecutionRuntime
 from biomodals.execution.scheduler import ProviderCallCandidate
@@ -128,5 +129,37 @@ def test_async_runtime_requests_cancellation_without_inventing_completion() -> N
 
         assert requested.status == ProviderCallStatus.ATTACHED
         assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}"]
+
+    asyncio.run(scenario())
+
+
+def test_async_runtime_fails_a_missing_exact_deployment_before_preclaim() -> None:
+    """API-hosted coordination uses the same deployment-loss transition."""
+
+    async def scenario() -> None:
+        repository = create_repository(task_count=1)
+
+        class UnavailableDriver(AsyncFakeModalDriver):
+            async def resolve(self, binding):
+                raise ModalDeploymentUnavailableError("version expired")
+
+        runtime = AsyncExecutionRuntime(
+            repository,
+            modal_driver=UnavailableDriver(),
+            checkpoint=lambda: None,
+        )
+
+        assert (
+            await runtime.submit_fixed_batch(
+                RUN_ID,
+                _candidate(),
+                submission_token="batch",
+                now=110,
+            )
+            is None
+        )
+        run = repository.get_run(RUN_ID)
+        assert run.status_reason == RunStatusReason.DEPLOYMENT_UNAVAILABLE
+        assert repository.list_provider_calls(RUN_ID) == ()
 
     asyncio.run(scenario())

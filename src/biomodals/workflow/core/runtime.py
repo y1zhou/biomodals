@@ -810,7 +810,7 @@ class WorkflowRuntime:
             else:  # pragma: no cover - scheduler never batches ordinary Nodes
                 raise RuntimeError("Only remote Task Nodes may own batched calls")
             self._provider.repository = self.store.execution
-            self._provider.submit_fixed_batch(
+            submitted = self._provider.submit_fixed_batch(
                 self.execution_run_id,
                 candidate,
                 submission_token=candidate.candidate_key,
@@ -818,6 +818,8 @@ class WorkflowRuntime:
                 kwargs=invocation.kwargs,
                 now=self._now(),
             )
+            if submitted is None:
+                return
 
     def _publish_result(self, node_id: str, result: AppRunResult) -> None:
         if result.status != AppRunStatus.SUCCEEDED:

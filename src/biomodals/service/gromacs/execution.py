@@ -521,7 +521,7 @@ class GromacsExecutionCoordinator:
         )
         options = GromacsJobOptions.model_validate_json(job.parameters_json)
         for candidate in selected:
-            await runtime.submit_fixed_batch(
+            submitted = await runtime.submit_fixed_batch(
                 execution_run_id,
                 candidate,
                 submission_token=(f"{execution_run_id}:{candidate.node_key}:operation"),
@@ -532,6 +532,8 @@ class GromacsExecutionCoordinator:
                 ),
                 now=self._now(),
             )
+            if submitted is None:
+                return
 
     def _operation_kwargs(
         self,

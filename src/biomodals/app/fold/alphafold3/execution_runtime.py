@@ -712,7 +712,7 @@ class AlphaFold3ExecutionRuntime:
             )
             self._provider.repository = self.store.execution
             try:
-                self._provider.submit_fixed_batch(
+                submitted = self._provider.submit_fixed_batch(
                     self.execution_run_id,
                     selected_candidate,
                     submission_token=selected_candidate.candidate_key,
@@ -720,6 +720,8 @@ class AlphaFold3ExecutionRuntime:
                     kwargs=kwargs,
                     now=self._now(),
                 )
+                if submitted is None:
+                    return
             except (
                 ModalDefiniteSubmissionError,
                 ModalSubmissionOutcomeUnknownError,

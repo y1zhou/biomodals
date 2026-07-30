@@ -218,7 +218,7 @@ def test_orchestrator_enter_closes_stale_runtime_before_reload(monkeypatch) -> N
     assert volume.reload_count == 1
 
 
-def test_orchestrator_exit_cancels_active_remote_calls_once(monkeypatch) -> None:
+def test_orchestrator_exit_preserves_active_remote_calls(monkeypatch) -> None:
     volume = FakeVolume()
     monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
 
@@ -241,37 +241,10 @@ def test_orchestrator_exit_cancels_active_remote_calls_once(monkeypatch) -> None
     raw_cls.exit._get_raw_f()(instance)
     raw_cls.exit._get_raw_f()(instance)
 
-    assert runtime.cancel_count == 1
+    assert runtime.cancel_count == 0
     assert runtime.close_count == 1
     assert instance._runtime is None
     assert volume.commit_count == 2
-
-
-def test_orchestrator_exit_still_closes_and_commits_when_cancel_fails(
-    monkeypatch,
-) -> None:
-    volume = FakeVolume()
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
-
-    class FakeRuntime:
-        def __init__(self) -> None:
-            self.close_count = 0
-
-        def cancel_active_remote_calls(self, *, terminate_containers: bool) -> None:
-            raise RuntimeError("cancel failed")
-
-        def close(self) -> None:
-            self.close_count += 1
-
-    raw_cls, instance = _raw_orchestrator()
-    runtime = FakeRuntime()
-    instance._runtime = runtime
-
-    raw_cls.exit._get_raw_f()(instance)
-
-    assert runtime.close_count == 1
-    assert instance._runtime is None
-    assert volume.commit_count == 1
 
 
 def test_orchestrator_rejects_serialized_workflow_dict() -> None:

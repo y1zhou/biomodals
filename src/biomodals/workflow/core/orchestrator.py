@@ -52,7 +52,6 @@ class WorkflowOrchestrator:
     def enter(self) -> None:
         """Refresh the workflow volume before serving orchestrator methods."""
         self._close_runtime()
-        self._exit_cleanup_done = False
         OUT_VOLUME.reload()
 
     @modal.method()
@@ -89,24 +88,6 @@ class WorkflowOrchestrator:
     @modal.exit()
     def exit(self) -> None:
         """Persist any pending workflow volume writes on container shutdown."""
-        if not getattr(self, "_exit_cleanup_done", False):
-            self._exit_cleanup_done = True
-            runtime = getattr(self, "_runtime", None)
-            if runtime is not None:
-                cancel_active_remote_calls = getattr(
-                    runtime,
-                    "cancel_active_remote_calls",
-                    None,
-                )
-                if cancel_active_remote_calls is not None:
-                    try:
-                        cancel_active_remote_calls(terminate_containers=True)
-                    except Exception as exc:  # noqa: BLE001
-                        print(
-                            "[workflow] Remote call cleanup failed during "
-                            f"orchestrator exit: {exc}",
-                            flush=True,
-                        )
         self._close_runtime()
         OUT_VOLUME.commit()
 

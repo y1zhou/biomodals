@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-from uuid import UUID
 
 import orjson
 
@@ -18,13 +17,18 @@ MAX_EXECUTION_RESULT_BYTES = 1024 * 1024 * 1024
 
 
 def execution_result_path(
-    execution_run_id: UUID,
+    workload_plan_fingerprint: str,
     node_key: str,
     task_fingerprint: str,
 ) -> PurePosixPath:
-    """Return one deterministic app-owned result path outside kernel state."""
+    """Return one successor-reusable result path outside kernel state."""
     if (
-        not node_key
+        len(workload_plan_fingerprint) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in workload_plan_fingerprint
+        )
+        or not node_key
         or "/" in node_key
         or node_key in {".", ".."}
         or len(task_fingerprint) != 64
@@ -33,7 +37,7 @@ def execution_result_path(
         raise ValueError("Invalid AlphaFold3 execution result identity")
     return (
         PurePosixPath("execution-publications")
-        / str(execution_run_id)
+        / workload_plan_fingerprint
         / node_key
         / f"{task_fingerprint}.json"
     )
@@ -71,6 +75,25 @@ def load_execution_result(
         expected_path.as_posix(),
     )
     if content is None or len(content) > MAX_EXECUTION_RESULT_BYTES:
+        return None
+    try:
+        value = orjson.loads(content)
+    except orjson.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def load_execution_result_path(
+    output_root: Path,
+    expected_path: PurePosixPath,
+) -> dict[str, object] | None:
+    """Load one atomic result publication without a Run-local envelope."""
+    path = output_root.joinpath(*expected_path.parts)
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    if not 0 < len(content) <= MAX_EXECUTION_RESULT_BYTES:
         return None
     try:
         value = orjson.loads(content)

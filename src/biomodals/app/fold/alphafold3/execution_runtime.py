@@ -24,6 +24,7 @@ from biomodals.app.fold.alphafold3.execution_plan import (
 from biomodals.app.fold.alphafold3.execution_publications import (
     execution_result_path,
     load_execution_result,
+    load_execution_result_path,
 )
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
@@ -1110,9 +1111,12 @@ class AlphaFold3ExecutionRuntime:
         task_key: str,
     ) -> dict[str, object] | None:
         call = self._task_call(node_key, task_key)
-        if call is None or call.status != ProviderCallStatus.SUCCEEDED:
-            return None
-        return self._load_call_result(call)
+        if call is not None and call.status == ProviderCallStatus.SUCCEEDED:
+            return self._load_call_result(call)
+        return load_execution_result_path(
+            self.inference_runtime.output_root,
+            self._task_result_path(node_key, task_key),
+        )
 
     def _task_call(
         self,
@@ -1395,10 +1399,17 @@ class AlphaFold3ExecutionRuntime:
             )
         ).hexdigest()
         return execution_result_path(
-            self.execution_run_id,
+            self.request.execution_plan.workload_plan_fingerprint,
             node_key,
             digest,
         )
+
+    def _task_result_path(
+        self,
+        node_key: str,
+        task_key: str,
+    ) -> PurePosixPath:
+        return self._result_path(node_key, (task_key,))
 
     def _call_result_path(self, call: ProviderCallRecord) -> PurePosixPath:
         return self._result_path(call.node_key, call.task_keys)

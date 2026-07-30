@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+import hashlib
 import pickle
 import tarfile
 from dataclasses import replace
@@ -194,7 +195,6 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     for function_name in (
         "run_ppiflow_ligandmpnn_stage",
         "run_ppiflow_refold_candidate",
-        "run_ppiflow_partial_stage",
         "run_ppiflow_flowpacker_stage",
         "run_ppiflow_dockq_stage",
     ):
@@ -202,6 +202,10 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
             source,
             function_name,
         )
+    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_partial_candidate",
+    )
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
         "run_ppiflow_af3score_stage",
@@ -436,7 +440,7 @@ def test_flowpacker_step_prepares_selected_structures_for_kernel(
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
 
 
-def test_partial_step_defers_structure_selection_to_tracked_stage(
+def test_partial_step_prepares_one_kernel_candidate_task(
     tmp_path: Path,
 ) -> None:
     node = ppiflow_workflow.PPIFlowPartialNode(
@@ -453,20 +457,135 @@ def test_partial_step_defers_structure_selection_to_tracked_stage(
         },
     )
 
-    submission = node.prepare_remote(
+    submission = node.prepare_remote_task(
         NodeRunContext(
             execution_run_id=RUN_ID,
             workload_run_key="run-1",
             node_id="stage2-partial-ppiflow",
-            task_key="node",
+            task_key="candidate-1",
             work_dir=tmp_path / "result",
             cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
-        )
+        ),
+        ppiflow_workflow.RemoteWorkflowTask(
+            task_key="candidate-1",
+            scientific_payload={"candidate_id": "candidate-1"},
+            execution_payload={"candidate_id": "candidate-1"},
+        ),
     )
 
-    assert submission.function_name == "run_ppiflow_partial_stage"
+    assert submission.function_name == "run_ppiflow_partial_candidate"
+    assert submission.uses_gpu is True
+    assert submission.kwargs["candidate_id"] == "candidate-1"
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
+
+
+def test_partial_candidate_runs_science_in_kernel_owned_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    structure_dir = source_root / "upstream" / "results"
+    structure_dir.mkdir(parents=True)
+    structure_bytes = b"ATOM\n"
+    (structure_dir / "candidate.pdb").write_bytes(structure_bytes)
+    manifest_path = workflow_root / "candidate_manifest.parquet"
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="candidate-1",
+                stage_name="source",
+                stage_role="source",
+                operation_mode="source",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        volume_name="source-volume",
+                        app_volume_path="upstream/results/candidate.pdb",
+                        path="candidate.pdb",
+                        content_sha256=hashlib.sha256(structure_bytes).hexdigest(),
+                    )
+                ],
+            )
+        ],
+        manifest_path,
+    )
+    output_root = tmp_path / "ppiflow-output"
+    output_root.mkdir()
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_OUTPUT_MOUNTPOINT",
+        str(output_root),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: None),
+    )
+
+    calls = []
+
+    def run_raw(*, args, run_name):
+        calls.append((args, run_name))
+        run_root = output_root / run_name
+        structure = run_root / "outputs" / "designed.pdb"
+        structure.parent.mkdir(parents=True)
+        structure.write_bytes(b"MODEL\n")
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="ppiflow_outputs",
+                    kind=ArtifactKind.DIRECTORY,
+                    storage=VolumePath(
+                        volume_name=ppiflow_app.CONF.output_volume_name,
+                        path=run_name,
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "ppiflow_run_workflow",
+        SimpleNamespace(get_raw_f=lambda: run_raw),
+    )
+    result = ppiflow_workflow.run_ppiflow_partial_candidate.get_raw_f()(
+        artifacts=[_upstream_structure_artifact()],
+        candidate_manifests=[
+            WorkflowArtifact(
+                artifact_id="candidate-manifest",
+                producing_node_id="source",
+                kind=ArtifactKind.TABLE,
+                storage=VolumePath(
+                    volume_name="workflow-volume",
+                    path=manifest_path.relative_to(workflow_root).as_posix(),
+                ),
+            )
+        ],
+        candidate_id="candidate-1",
+        config={
+            "args": {
+                "name": "partial",
+                "specified_hotspots": "A1",
+                "input_pdb": "/placeholder.pdb",
+                "fixed_positions": "B1",
+            }
+        },
+        step_name="PartialStep",
+        run_name="partial-run",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] == "partial-run-candidate-1"
+    assert Path(calls[0][0].args.input_pdb).read_bytes() == structure_bytes
+    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+    [file_record] = result.outputs[0].metadata["candidate_files"]
+    assert file_record["app_volume_path"] == (
+        "partial-run-candidate-1/outputs/designed.pdb"
+    )
+    assert file_record["content_sha256"] == hashlib.sha256(b"MODEL\n").hexdigest()
 
 
 def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
@@ -1063,6 +1182,8 @@ def test_fixed_position_transform_parses_rosetta_residue_energies(
     assert result.outputs[0].metadata["fixed_positions_by_structure"] == {
         "design": "A10"
     }
+    assert result.outputs[2].metadata["rows"] == 1
+    assert result.outputs[2].metadata["manifest_schema_version"] == 1
 
 
 def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
@@ -1427,6 +1548,10 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-filter",
         "stage2-alphafold3-refold",
     }
+    assert (
+        definition.nodes["stage2-partial-ppiflow"].aggregation_policy
+        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
+    )
     assert (
         definition.nodes["stage2-alphafold3-refold"].aggregation_policy
         == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+import pytest
+
 from biomodals.execution import (
     DeploymentIdentity,
     NodeAggregationPolicy,
@@ -28,7 +30,7 @@ from biomodals.schema import (
 from biomodals.workflow.core import NodeRunContext, Workflow, WorkflowNativeNode
 from biomodals.workflow.core.runtime import WorkflowRuntime
 from biomodals.workflow.ppiflow import manifests
-from biomodals.workflow.ppiflow_workflow import ReFoldNode
+from biomodals.workflow.ppiflow_workflow import PPIFlowPartialNode, ReFoldNode
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "PPIFlowWorkflow", 7)
@@ -131,15 +133,32 @@ class FakeModalDriver:
         del provider_call_handle_id
 
 
-def test_refold_candidates_are_independent_kernel_tasks(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("node", "expected_function"),
+    [
+        (
+            ReFoldNode("ReFoldStep", {"run_name": "refold"}),
+            "run_ppiflow_refold_candidate",
+        ),
+        (
+            PPIFlowPartialNode("PartialStep", {"run_name": "partial"}),
+            "run_ppiflow_partial_candidate",
+        ),
+    ],
+)
+def test_ppiflow_candidates_are_independent_kernel_tasks(
+    tmp_path: Path,
+    node,
+    expected_function: str,
+) -> None:
     workflow = Workflow("ppiflow-fanout")
     source = workflow.add_node(
         CandidateSourceNode(("candidate-b", "candidate-a")),
         id="source",
     )
     workflow.add_node(
-        ReFoldNode("ReFoldStep", {"run_name": "refold"}),
-        id="refold",
+        node,
+        id="candidate-stage",
         inputs={
             "structures": source.outputs(kind=ArtifactKind.STRUCTURES),
             "candidate_manifest": source.outputs(
@@ -163,16 +182,16 @@ def test_refold_candidates_are_independent_kernel_tasks(tmp_path: Path) -> None:
         poll_interval_seconds=0,
     )
 
-    result = runtime.run(workload_run_key="refold")
+    result = runtime.run(workload_run_key="candidate-stage")
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert driver.events[:4] == [
-        "resolve:run_ppiflow_refold_candidate",
+        f"resolve:{expected_function}",
         "spawn:candidate-b",
-        "resolve:run_ppiflow_refold_candidate",
+        f"resolve:{expected_function}",
         "spawn:candidate-a",
     ]
-    tasks = runtime.store.execution.list_tasks(RUN_ID, "refold")
+    tasks = runtime.store.execution.list_tasks(RUN_ID, "candidate-stage")
     assert [task.task_key for task in tasks] == ["candidate-b", "candidate-a"]
     assert tasks[0].scientific_payload["files"][0]["content_sha256"] == (
         hashlib.sha256(b"MODEL candidate-b\n").hexdigest()
@@ -181,12 +200,14 @@ def test_refold_candidates_are_independent_kernel_tasks(tmp_path: Path) -> None:
         TaskStatus.SUCCEEDED,
         TaskStatus.SUCCEEDED,
     ]
-    assert runtime.store.execution.get_node(RUN_ID, "refold").status == (
+    assert runtime.store.execution.get_node(RUN_ID, "candidate-stage").status == (
         NodeStatus.SUCCEEDED
     )
     [manifest_artifact] = [
         artifact
-        for artifact in runtime.store.artifacts.load_node_output_artifacts("refold")
+        for artifact in runtime.store.artifacts.load_node_output_artifacts(
+            "candidate-stage"
+        )
         if any(file.role == manifests.MANIFEST_FILE_ROLE for file in artifact.files)
     ]
     frame = manifests.read_manifest(tmp_path / manifest_artifact.storage.path)

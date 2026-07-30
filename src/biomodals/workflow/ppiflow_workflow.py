@@ -108,6 +108,9 @@ runtime_image = (
     .env(CONF.default_env)
     .pipe(patch_image_for_helper, include_workflow_modules=True)
 )
+ppiflow_task_image = ppiflow_app.runtime_image.add_local_python_source(
+    "biomodals.workflow"
+)
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
@@ -142,6 +145,10 @@ PPI_FLOW_SOURCE_VOLUME_MOUNTS: dict[
     AF3SCORE_OUTPUT_MOUNTPOINT: AF3SCORE_OUTPUT_VOLUME,
     ROSETTA_OUTPUT_MOUNTPOINT: ROSETTA_OUTPUT_VOLUME,
     WORKFLOW_OUTPUT_MOUNTPOINT: WORKFLOW_OUTPUT_VOLUME,
+}
+PPI_FLOW_TASK_VOLUME_MOUNTS = {
+    **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    **ppiflow_app.CONF.mounts(output_volume=True, model_volume=True),
 }
 
 
@@ -631,6 +638,7 @@ def filter_ppiflow_artifacts(
 def derive_ppiflow_fixed_positions(
     *,
     artifacts: list[WorkflowArtifact],
+    candidate_manifests: list[WorkflowArtifact] | None = None,
     config: dict[str, object],
     run_id: str,
     node_id: str,
@@ -745,6 +753,13 @@ def derive_ppiflow_fixed_positions(
         (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
     positions_csv = output_dir / "fixed_positions.csv"
     pl.DataFrame(rows).write_csv(positions_csv)
+    manifest_frame = _candidate_manifest_frame_from_inputs(
+        candidate_manifests or [],
+        structures,
+        step_name=step_name,
+    )
+    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(manifest_frame.to_dicts(), manifest_path)
     WORKFLOW_OUTPUT_VOLUME.commit()
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
@@ -770,6 +785,13 @@ def derive_ppiflow_fixed_positions(
                 volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
                 media_type="text/csv",
                 metadata={"step_name": step_name, "rows": len(rows)},
+            ),
+            ppiflow_manifests.manifest_artifact_output(
+                manifest_path=manifest_path,
+                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
+                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+                stage_name=step_name,
+                row_count=manifest_frame.height,
             ),
         ],
     )
@@ -1297,24 +1319,23 @@ def run_ppiflow_ligandmpnn_stage(
 
 
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
+    image=ppiflow_task_image,
+    gpu=ppiflow_app.CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
     timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    volumes=PPI_FLOW_TASK_VOLUME_MOUNTS,
 )
-def run_ppiflow_partial_stage(
+def run_ppiflow_partial_candidate(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None,
+    candidate_id: str,
     config: dict[str, object],
     step_name: str,
     run_name: str,
-    run_id: str,
-    node_id: str,
 ) -> AppRunResult:
-    """Run PPIFlow partial design for every selected candidate."""
-    # TODO: tune CPU/memory/timeout once PPIFlow partial fan-out telemetry exists.
+    """Run one kernel-owned PPIFlow partial-design candidate."""
     _reload_ppiflow_source_volumes()
     selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts,
@@ -1330,100 +1351,55 @@ def run_ppiflow_partial_stage(
             step_name=step_name,
         ),
     )
-    selected_structures = [asdict(structure) for structure in candidate_structures]
+    matches = [
+        structure
+        for structure in candidate_structures
+        if structure.candidate_id == candidate_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"PPIFlow partial candidate {candidate_id!r} resolved to "
+            f"{len(matches)} structures"
+        )
+    structure = matches[0]
     fixed_positions_by_candidate = _fixed_positions_by_candidate(
         artifacts,
         candidate_structures,
     )
-    PPI_FLOW_OUTPUT_VOLUME.reload()
     raw_args_template = deepcopy(config.get("args", config))
     if not isinstance(raw_args_template, dict):
         raise ValueError(f"PPIFlow step {step_name!r} args must be a mapping")
-    staged_paths: dict[str, str] = {}
     field_name = "complex_pdb" if "complex_pdb" in raw_args_template else "input_pdb"
-    for structure in selected_structures:
-        candidate_id = str(structure["candidate_id"])
-        staged_path = (
-            Path(PPI_FLOW_OUTPUT_MOUNTPOINT)
-            / sanitize_filename(run_name)
-            / sanitize_filename(step_name)
-            / sanitize_filename(candidate_id)
-            / sanitize_filename(field_name)
-            / sanitize_filename(str(structure["file_name"]))
-        )
-        staged_path.parent.mkdir(parents=True, exist_ok=True)
-        staged_path.write_bytes(_bytes_payload(structure["data"], "structure data"))
-        staged_paths[candidate_id] = str(staged_path)
+    staged_path = (
+        Path(PPI_FLOW_OUTPUT_MOUNTPOINT)
+        / sanitize_filename(run_name)
+        / sanitize_filename(step_name)
+        / sanitize_filename(candidate_id)
+        / sanitize_filename(field_name)
+        / sanitize_filename(structure.file_name)
+    )
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path.write_bytes(structure.data)
     PPI_FLOW_OUTPUT_VOLUME.commit()
 
-    def submit(task: ppiflow_coordinators.CandidateTask):
-        try:
-            raw_args = deepcopy(raw_args_template)
-            raw_args[field_name] = staged_paths[task.candidate_id]
-            if "fixed_positions" not in raw_args and fixed_positions_by_candidate:
-                fixed_positions = fixed_positions_by_candidate.get(task.candidate_id)
-                if fixed_positions:
-                    raw_args["fixed_positions"] = fixed_positions
-            app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
-            call = ppiflow_app.ppiflow_run_workflow.spawn(
-                args=app_args,
-                run_name=sanitize_filename(f"{run_name}-{task.candidate_id}"),
-            )
-            result = AppRunResult.model_validate(call.get())
-            return ppiflow_coordinators.CandidateOutcome(
-                candidate_id=task.candidate_id,
-                status=result.status,
-                outputs={"app_outputs": result.outputs},
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ppiflow_coordinators.CandidateOutcome(
-                candidate_id=task.candidate_id,
-                status=AppRunStatus.FAILED,
-                error=str(exc),
-            )
-
-    tasks = [
-        ppiflow_coordinators.CandidateTask(
-            candidate_id=str(structure["candidate_id"]),
-            payload=structure,
+    raw_args = deepcopy(raw_args_template)
+    raw_args[field_name] = str(staged_path)
+    if "fixed_positions" not in raw_args:
+        fixed_positions = fixed_positions_by_candidate.get(candidate_id)
+        if fixed_positions:
+            raw_args["fixed_positions"] = fixed_positions
+    app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
+    result = AppRunResult.model_validate(
+        ppiflow_app.ppiflow_run_workflow.get_raw_f()(
+            args=app_args,
+            run_name=sanitize_filename(f"{run_name}-{candidate_id}"),
         )
-        for structure in selected_structures
-    ]
-    outcomes = ppiflow_coordinators.run_candidate_tasks(
-        tasks,
-        submit,
-        candidate_concurrency=int(
-            config.get(
-                "candidate_concurrency",
-                ppiflow_coordinators.DEFAULT_CANDIDATE_CONCURRENCY,
-            )
-        ),
     )
-    outputs = [
-        output
-        for outcome in outcomes
-        for output in outcome.outputs.get("app_outputs", [])
-        if isinstance(output, AppOutput)
-    ]
-    manifest_output = _write_candidate_manifest_output(
-        run_id=run_id,
-        node_id=node_id,
+    return _ppiflow_candidate_result(
+        result,
+        candidate_id=candidate_id,
         step_name=step_name,
-        rows=ppiflow_coordinators.outcome_manifest_rows(
-            stage_name=step_name,
-            stage_role="partial_design",
-            operation_mode="ppiflow_partial",
-            outcomes=outcomes,
-        ),
-    )
-    return AppRunResult(
-        status=ppiflow_coordinators.status_from_candidate_outcomes(outcomes),
-        outputs=[*outputs, manifest_output],
-        warnings=[
-            f"{outcome.candidate_id}: {outcome.error}"
-            for outcome in outcomes
-            if outcome.error
-        ],
+        source_structure=structure.file_name,
     )
 
 
@@ -1718,23 +1694,54 @@ class PPIFlowDesignNode(_PPIFlowRunNode):
 
 
 @dataclass
-class PPIFlowPartialNode(_PPIFlowRunNode):
-    """PPIFlow partial-design step for stage 2."""
+class PPIFlowPartialNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+    """PPIFlow partial design with one kernel Task per candidate."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare candidate-wide PPIFlow partial design."""
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Discover stable candidate Tasks from the upstream manifest."""
+        return _candidate_remote_tasks(
+            context,
+            max_candidates=_optional_config_int(self.config, "max_structures"),
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Prepare one partial-design candidate for kernel submission."""
+        candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
         return RemoteNodeCall(
-            function_name="run_ppiflow_partial_stage",
-            uses_gpu=False,
+            function_name="run_ppiflow_partial_candidate",
+            uses_gpu=True,
             kwargs={
                 "artifacts": self._structure_inputs(context),
                 "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
+                "candidate_id": candidate_id,
                 "config": self.config,
                 "step_name": self.step_name,
                 "run_name": self._run_name(context),
-                "run_id": context.workload_run_key,
-                "node_id": context.node_id,
             },
+            runtime_image_key="ppiflow",
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Publish deterministic partial-design candidate outcomes."""
+        return _finalize_candidate_tasks(
+            context,
+            step_name=self.step_name,
+            stage_role="partial_design",
+            operation_mode="ppiflow_partial",
+            results=results,
+            errors=errors,
         )
 
 
@@ -1882,17 +1889,9 @@ class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         context: NodeRunContext,
     ) -> tuple[RemoteWorkflowTask, ...]:
         """Discover stable candidate Tasks from the upstream manifest."""
-        rows = _candidate_rows_for_task_discovery(
+        return _candidate_remote_tasks(
             context,
             max_candidates=_optional_config_int(self.config, "max_structures"),
-        )
-        return tuple(
-            RemoteWorkflowTask(
-                task_key=str(row["candidate_id"]),
-                scientific_payload=row,
-                execution_payload={"candidate_id": str(row["candidate_id"])},
-            )
-            for row in rows
         )
 
     def prepare_remote_task(
@@ -1901,11 +1900,7 @@ class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         task: RemoteWorkflowTask,
     ) -> RemoteNodeCall:
         """Prepare one candidate wrapper for kernel submission."""
-        if not isinstance(task.execution_payload, Mapping):
-            raise TypeError("ReFold Task execution payload must be a mapping")
-        candidate_id = str(task.execution_payload["candidate_id"])
-        if candidate_id != task.task_key or context.task_key != task.task_key:
-            raise ValueError("ReFold Task identity does not match its payload")
+        candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
         return RemoteNodeCall(
             function_name="run_ppiflow_refold_candidate",
             uses_gpu=False,
@@ -1926,44 +1921,13 @@ class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         errors: Mapping[str, str],
     ) -> AppRunResult:
         """Publish deterministic candidate outcomes after all Tasks finish."""
-        candidate_ids = sorted((*results, *errors))
-        rows = [
-            ppiflow_manifests.candidate_manifest_row(
-                candidate_id=candidate_id,
-                stage_name=self.step_name,
-                stage_role="refold",
-                operation_mode="alphafold3",
-                candidate_status=(
-                    AppRunStatus.SUCCEEDED.value
-                    if candidate_id in results
-                    else AppRunStatus.FAILED.value
-                ),
-                error=errors.get(candidate_id),
-                files=(
-                    _task_result_structure_files(
-                        context,
-                        results[candidate_id],
-                    )
-                    if candidate_id in results
-                    else ()
-                ),
-            )
-            for candidate_id in candidate_ids
-        ]
-        status = (
-            AppRunStatus.PARTIAL
-            if results and errors
-            else AppRunStatus.SUCCEEDED
-            if not errors
-            else AppRunStatus.FAILED
-        )
-        return AppRunResult(
-            status=status,
-            outputs=[_task_manifest_output(context, self.step_name, rows)],
-            warnings=[
-                f"{candidate_id}: {errors[candidate_id]}"
-                for candidate_id in sorted(errors)
-            ],
+        return _finalize_candidate_tasks(
+            context,
+            step_name=self.step_name,
+            stage_role="refold",
+            operation_mode="alphafold3",
+            results=results,
+            errors=errors,
         )
 
 
@@ -2070,6 +2034,7 @@ class FixedPositionsNode(RemoteWorkflowNode):
             uses_gpu=False,
             kwargs={
                 "artifacts": artifacts,
+                "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
                 "config": self.config,
                 "run_id": context.workload_run_key,
                 "node_id": context.node_id,
@@ -2369,6 +2334,87 @@ def _candidate_rows_for_task_discovery(
     return rows
 
 
+def _candidate_remote_tasks(
+    context: NodeRunContext,
+    *,
+    max_candidates: int | None,
+) -> tuple[RemoteWorkflowTask, ...]:
+    """Discover one stable kernel Task per active candidate row."""
+    return tuple(
+        RemoteWorkflowTask(
+            task_key=str(row["candidate_id"]),
+            scientific_payload=row,
+            execution_payload={"candidate_id": str(row["candidate_id"])},
+        )
+        for row in _candidate_rows_for_task_discovery(
+            context,
+            max_candidates=max_candidates,
+        )
+    )
+
+
+def _candidate_task_id(
+    context: NodeRunContext,
+    task: RemoteWorkflowTask,
+    *,
+    step_name: str,
+) -> str:
+    """Validate and return one persisted candidate Task identity."""
+    if not isinstance(task.execution_payload, Mapping):
+        raise TypeError(f"{step_name} Task execution payload must be a mapping")
+    candidate_id = str(task.execution_payload["candidate_id"])
+    if candidate_id != task.task_key or context.task_key != task.task_key:
+        raise ValueError(f"{step_name} Task identity does not match its payload")
+    return candidate_id
+
+
+def _finalize_candidate_tasks(
+    context: NodeRunContext,
+    *,
+    step_name: str,
+    stage_role: str,
+    operation_mode: str,
+    results: Mapping[str, AppRunResult],
+    errors: Mapping[str, str],
+) -> AppRunResult:
+    """Publish one deterministic manifest for terminal candidate Tasks."""
+    candidate_ids = sorted((*results, *errors))
+    rows = [
+        ppiflow_manifests.candidate_manifest_row(
+            candidate_id=candidate_id,
+            stage_name=step_name,
+            stage_role=stage_role,
+            operation_mode=operation_mode,
+            candidate_status=(
+                AppRunStatus.SUCCEEDED.value
+                if candidate_id in results
+                else AppRunStatus.FAILED.value
+            ),
+            error=errors.get(candidate_id),
+            files=(
+                _task_result_structure_files(context, results[candidate_id])
+                if candidate_id in results
+                else ()
+            ),
+        )
+        for candidate_id in candidate_ids
+    ]
+    status = (
+        AppRunStatus.PARTIAL
+        if results and errors
+        else AppRunStatus.SUCCEEDED
+        if not errors
+        else AppRunStatus.FAILED
+    )
+    return AppRunResult(
+        status=status,
+        outputs=[_task_manifest_output(context, step_name, rows)],
+        warnings=[
+            f"{candidate_id}: {errors[candidate_id]}" for candidate_id in sorted(errors)
+        ],
+    )
+
+
 def _task_manifest_output(
     context: NodeRunContext,
     step_name: str,
@@ -2397,6 +2443,14 @@ def _task_result_structure_files(
         raise RuntimeError("Workflow Volume context is unavailable")
     records = []
     for output in result.outputs:
+        candidate_files = output.metadata.get("candidate_files")
+        if isinstance(candidate_files, Sequence):
+            records.extend(
+                dict(file_record)
+                for file_record in candidate_files
+                if isinstance(file_record, Mapping)
+            )
+            continue
         if (
             output.kind != ArtifactKind.STRUCTURES
             or not isinstance(output.storage, VolumePath)
@@ -2425,6 +2479,74 @@ def _task_result_structure_files(
                 )
             )
     return records
+
+
+def _ppiflow_candidate_result(
+    result: AppRunResult,
+    *,
+    candidate_id: str,
+    step_name: str,
+    source_structure: str,
+) -> AppRunResult:
+    """Annotate one PPIFlow app result with candidate-keyed structure files."""
+    outputs = []
+    structure_count = 0
+    for output in result.outputs:
+        if (
+            not isinstance(output.storage, VolumePath)
+            or output.storage.volume_name != PPI_FLOW_OUTPUT_VOLUME_NAME
+        ):
+            outputs.append(output)
+            continue
+        root = output.storage.at_mountpoint(PPI_FLOW_OUTPUT_MOUNTPOINT)
+        structure_paths = (
+            [root]
+            if root.is_file() and root.suffix.lower() in {".pdb", ".cif"}
+            else sorted(
+                path
+                for path in root.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".pdb", ".cif"}
+            )
+        )
+        candidate_files = [
+            ppiflow_manifests.candidate_file_record(
+                role="structure",
+                volume_name=PPI_FLOW_OUTPUT_VOLUME_NAME,
+                app_volume_path=path.relative_to(PPI_FLOW_OUTPUT_MOUNTPOINT).as_posix(),
+                path=(
+                    path.name if root.is_file() else path.relative_to(root).as_posix()
+                ),
+                media_type=(
+                    "chemical/x-pdb"
+                    if path.suffix.lower() == ".pdb"
+                    else "chemical/x-mmcif"
+                ),
+                size_bytes=path.stat().st_size,
+                content_sha256=_file_sha256(path),
+            )
+            for path in structure_paths
+        ]
+        structure_count += len(candidate_files)
+        outputs.append(
+            output.model_copy(
+                update={
+                    "kind": ArtifactKind.STRUCTURES,
+                    "metadata": dict(output.metadata)
+                    | {
+                        "candidate_id": candidate_id,
+                        "candidate_files": candidate_files,
+                        "source_structure": source_structure,
+                        "step_name": step_name,
+                        "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
+                    },
+                }
+            )
+        )
+    if structure_count == 0:
+        raise FileNotFoundError(
+            f"PPIFlow candidate {candidate_id!r} produced no structure files"
+        )
+    return result.model_copy(update={"outputs": outputs})
 
 
 def _file_sha256(path: Path) -> str:
@@ -2944,6 +3066,7 @@ def _add_stage2_nodes(
     candidate_concurrency: int,
 ) -> None:
     tail = upstream
+    partial_tail = None
     if _step_enabled(enabled, "RosettaFixStep"):
         tail = workflow.add_node(
             RosettaFixNode(
@@ -2982,7 +3105,9 @@ def _add_stage2_nodes(
             ),
             id="stage2-partial-ppiflow",
             inputs=_structure_inputs(tail),
+            aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
         )
+        partial_tail = tail
 
     mpnn_step = None
     if gentype == "binder" and _step_enabled(enabled, "MPNNStep_stage2"):
@@ -3004,7 +3129,9 @@ def _add_stage2_nodes(
             ),
             id=node_id,
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
         report_table_inputs["mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
 
     if _step_enabled(enabled, "FlowpackerStep_stage2"):
@@ -3019,7 +3146,9 @@ def _add_stage2_nodes(
             ),
             id="stage2-flowpacker",
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
 
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage2"):
@@ -3034,6 +3163,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-af3score",
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
 
     filtered = tail
@@ -3052,7 +3182,9 @@ def _add_stage2_nodes(
             ),
             id="stage2-filter",
             inputs=inputs,
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
         report_table_inputs["filter_tables"] = filtered.outputs(kind=ArtifactKind.TABLE)
 
     refold = None
@@ -3069,6 +3201,7 @@ def _add_stage2_nodes(
             id="stage2-alphafold3-refold",
             inputs=_structure_inputs(filtered),
             aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+            accept_partial_from=_partial_sources(partial_tail),
         )
         report_table_inputs["refold_metrics"] = refold.outputs(kind=ArtifactKind.TABLE)
 
@@ -3088,7 +3221,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-dockq",
             inputs=inputs,
-            accept_partial_from=[refold] if refold is not None else None,
+            accept_partial_from=_partial_sources(partial_tail, refold),
         )
 
     relaxed = None
@@ -3107,6 +3240,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-rosetta-relax",
             inputs=inputs,
+            accept_partial_from=_partial_sources(partial_tail),
         )
 
     rank = None
@@ -3126,7 +3260,10 @@ def _add_stage2_nodes(
             ),
             id="stage2-rank",
             inputs=inputs,
-            accept_partial_from=[refold] if refold is not None else None,
+            accept_partial_from=_partial_sources(
+                partial_tail if relaxed is None else None,
+                refold,
+            ),
         )
 
     if _step_enabled(enabled, "ReportStep"):
@@ -3140,7 +3277,10 @@ def _add_stage2_nodes(
             ReportNode("ReportStep", _step_cfg(steps, "ReportStep")),
             id="stage2-report",
             inputs=inputs,
-            accept_partial_from=[refold] if refold is not None else None,
+            accept_partial_from=_partial_sources(
+                partial_tail if rank is None else None,
+                refold,
+            ),
         )
 
 
@@ -3154,6 +3294,12 @@ def _structure_inputs(upstream) -> dict[str, Any]:
             role=ppiflow_manifests.MANIFEST_FILE_ROLE,
         ),
     }
+
+
+def _partial_sources(*sources: Any) -> list[Any] | None:
+    """Return the present partial-result dependencies for one Node."""
+    present = [source for source in sources if source is not None]
+    return present or None
 
 
 def _stage2_input_node(
@@ -3456,7 +3602,7 @@ def submit_ppiflow_workflow(
     if not use_deployed_coordinator:
         orchestrator_kwargs["development_function_handles"] = {
             "ppiflow_run": ppiflow_app.ppiflow_run_workflow,
-            "run_ppiflow_partial_stage": run_ppiflow_partial_stage,
+            "run_ppiflow_partial_candidate": run_ppiflow_partial_candidate,
             "run_ppiflow_ligandmpnn_stage": run_ppiflow_ligandmpnn_stage,
             "run_ppiflow_flowpacker_stage": run_ppiflow_flowpacker_stage,
             "run_ppiflow_af3score_stage": run_ppiflow_af3score_stage,

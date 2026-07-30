@@ -345,7 +345,7 @@ class ExecutionCoordinator:
                 predecessor_deployment,
             )
             if candidate is None:
-                candidate = replace(
+                successor_plan = replace(
                     predecessor_plan,
                     max_active_provider_calls=(
                         predecessor_plan.max_active_provider_calls
@@ -370,17 +370,7 @@ class ExecutionCoordinator:
                     raise ValueError(
                         "Launch inputs changed the Workload Plan Fingerprint"
                     )
-            successor_plan = replace(
-                predecessor_plan,
-                max_active_provider_calls=candidate.max_active_provider_calls,
-                max_active_gpu_provider_calls=(candidate.max_active_gpu_provider_calls),
-                strict_external_artifact_checks=(
-                    candidate.strict_external_artifact_checks
-                ),
-                external_artifact_checker_function_name=(
-                    candidate.external_artifact_checker_function_name
-                ),
-            )
+                successor_plan = candidate
             successor_execution_plan = execution_plan(
                 successor_plan.workflow.validate(),
                 workload_run_key=successor_plan.workload_run_key,

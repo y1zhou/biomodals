@@ -2145,12 +2145,26 @@ def finalize_ppiflow_rosetta_stage(
     )
 
 
+_OPERATIONAL_CONFIG_KEYS = (
+    "candidate_concurrency",
+    "max_child_calls",
+    "max_batches",
+    "max_num_pods",
+    "num_jobs",
+    "prepare_workers",
+)
+_INPUT_DIGESTS_KEY = "_biomodals_input_sha256"
+
+
 @dataclass
 class _ConfiguredAppStepNode(AppBackedNode):
     """Base class for configured PPIFlow app-backed workflow nodes."""
 
     step_name: str
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
+    )
 
     def _run_name(self, context: NodeRunContext) -> str:
         run_name = sanitize_filename(
@@ -2176,6 +2190,9 @@ class _ConfiguredAppStepNode(AppBackedNode):
 @dataclass
 class PPIFlowDesignNode(_ConfiguredAppStepNode):
     """Initial PPIFlow design step with candidate-manifest publication."""
+
+    config: dict[str, Any] = field(default_factory=dict, metadata={"dag_hash": False})
+    scientific_config: dict[str, Any] = field(default_factory=dict)
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
         """Prepare one direct PPIFlow design call for kernel submission."""
@@ -2788,7 +2805,10 @@ class ExistingStructuresNode(RemoteWorkflowNode):
 
     step_name: str
     storage: VolumePath
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
+    )
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
         """Prepare Stage2Input normalization for kernel submission."""
@@ -2810,7 +2830,10 @@ class FilterStructuresNode(RemoteWorkflowNode):
     """Filter structures using score artifacts."""
 
     step_name: str
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
+    )
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
         """Prepare score filtering for kernel submission."""
@@ -2840,7 +2863,10 @@ class FixedPositionsNode(RemoteWorkflowNode):
     """Convert Rosetta residue energies into fixed-position constraints."""
 
     step_name: str
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
+    )
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
         """Prepare fixed-position conversion for kernel submission."""
@@ -2866,7 +2892,10 @@ class RankNode(RemoteWorkflowNode):
     """Rank final designs."""
 
     step_name: str
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
+    )
 
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
         """Prepare score-aware ranking for kernel submission."""
@@ -2898,7 +2927,10 @@ class ReportNode(WorkflowNativeNode):
     """Write the final design report."""
 
     step_name: str
-    config: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
+    )
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Execute report generation logic."""
@@ -3878,14 +3910,17 @@ def _add_stage1_nodes(
     tail = None
     partial_tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
+        design_config = _step_cfg_with_candidate_concurrency(
+            steps,
+            "PPIFlowStep",
+            candidate_concurrency,
+        )
+        runtime_config, scientific_config = _ppiflow_design_configs(design_config)
         tail = workflow.add_node(
             PPIFlowDesignNode(
                 "PPIFlowStep",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "PPIFlowStep",
-                    candidate_concurrency,
-                ),
+                runtime_config,
+                scientific_config,
             ),
             id="stage1-ppiflow-design",
         )
@@ -4378,6 +4413,29 @@ def _step_cfg(steps: dict[str, Any], step_name: str) -> dict[str, Any]:
     return cfg
 
 
+def _ppiflow_design_configs(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separate runtime paths from content-based scientific input identity."""
+    runtime_config = deepcopy(config)
+    raw_digests = runtime_config.pop(_INPUT_DIGESTS_KEY, {})
+    if not isinstance(raw_digests, Mapping):
+        raise ValueError(f"{_INPUT_DIGESTS_KEY} must be a mapping")
+    input_digests = {str(key): str(value) for key, value in raw_digests.items()}
+
+    scientific_config = deepcopy(runtime_config)
+    for key in _OPERATIONAL_CONFIG_KEYS:
+        scientific_config.pop(key, None)
+    scientific_args = scientific_config.get("args", scientific_config)
+    if not isinstance(scientific_args, dict):
+        raise ValueError("PPIFlow step args must be a mapping")
+    for field_name in input_digests:
+        scientific_args.pop(field_name, None)
+    if input_digests:
+        scientific_config["input_sha256"] = dict(sorted(input_digests.items()))
+    return runtime_config, scientific_config
+
+
 def _step_cfg_with_candidate_concurrency(
     steps: dict[str, Any],
     step_name: str,
@@ -4451,10 +4509,22 @@ def _stage_ppiflow_app_inputs(
             continue
 
         app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
+        input_digests: dict[str, str] = {}
         for field_name in _ppiflow_input_fields(app_args.args):
             current_value = getattr(app_args.args, field_name)
             current_path = Path(current_value)
             if current_path.is_absolute() and current_path.is_relative_to(volume_root):
+                remote_storage = volume_path_from_mount_path(
+                    str(current_path),
+                    str(volume_root),
+                    ppiflow_app.CONF.output_volume_name,
+                )
+                digest = hashlib.sha256()
+                for chunk in ppiflow_app.CONF.output_volume.read_file(
+                    remote_storage.path
+                ):
+                    digest.update(chunk)
+                input_digests[field_name] = digest.hexdigest()
                 continue
 
             local_path = current_path.expanduser().resolve()
@@ -4464,14 +4534,20 @@ def _stage_ppiflow_app_inputs(
                     f"locally or in the mounted output volume: {current_value}"
                 )
 
+            with local_path.open("rb") as input_file:
+                content_sha256 = hashlib.file_digest(input_file, "sha256").hexdigest()
+            input_digests[field_name] = content_sha256
+            suffix = "".join(part.lower() for part in local_path.suffixes)
             remote_rel = (
                 Path(run_id)
                 / sanitize_filename(step_name)
                 / sanitize_filename(field_name)
-                / sanitize_filename(local_path.name)
+                / f"{content_sha256}{suffix}"
             )
             raw_args[field_name] = str(volume_root / remote_rel)
             uploads.append((local_path, remote_rel.as_posix()))
+        if input_digests:
+            cfg[_INPUT_DIGESTS_KEY] = input_digests
 
     if uploads:
         with ppiflow_app.CONF.output_volume.batch_upload(force=True) as batch:

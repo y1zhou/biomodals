@@ -2,7 +2,7 @@
 
 # ruff: noqa: D101,D102,D103
 
-from dataclasses import fields
+from dataclasses import dataclass, field, fields
 
 import pytest
 
@@ -19,6 +19,14 @@ from biomodals.workflow.core.nodes import WorkflowNativeNode
 
 
 class DummyNode(WorkflowNativeNode):
+    def run(self, context):  # pragma: no cover - builder tests do not execute nodes
+        raise NotImplementedError
+
+
+@dataclass
+class ConfiguredDummyNode(WorkflowNativeNode):
+    config: dict[str, object] = field(metadata={"dag_hash_exclude_keys": ("workers",)})
+
     def run(self, context):  # pragma: no cover - builder tests do not execute nodes
         raise NotImplementedError
 
@@ -109,6 +117,28 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
     assert plan.nodes[1].aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
     assert plan.nodes[1].allow_empty_result is True
     assert plan.scientific_payload["dag_hash"]
+
+
+def test_workflow_hash_can_exclude_declared_operational_config_keys() -> None:
+    def fingerprint(*, workers: int, threshold: float) -> str:
+        workflow = Workflow("demo")
+        workflow.add_node(
+            ConfiguredDummyNode({
+                "workers": workers,
+                "threshold": threshold,
+                "nested": {"workers": 99},
+            }),
+            id="configured",
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint(workers=1, threshold=0.5)
+
+    assert fingerprint(workers=8, threshold=0.5) == baseline
+    assert fingerprint(workers=1, threshold=0.8) != baseline
 
 
 def test_partial_acceptance_must_name_an_actual_dependency() -> None:

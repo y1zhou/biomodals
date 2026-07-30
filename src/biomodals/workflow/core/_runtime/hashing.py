@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import Field, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -61,7 +61,7 @@ def stable_json_value(value: object) -> object:
         return value.as_posix()
     if is_dataclass(value) and not isinstance(value, type):
         return {
-            field.name: stable_json_value(getattr(value, field.name))
+            field.name: _field_json_value(field, getattr(value, field.name))
             for field in fields(value)
             if field.metadata.get("dag_hash") is not False
         }
@@ -84,3 +84,21 @@ def stable_json_value(value: object) -> object:
         f"Unsupported DAG hash value type: {type(value).__module__}."
         f"{type(value).__qualname__}"
     )
+
+
+def _field_json_value(field: Field[object], value: object) -> object:
+    """Exclude declared top-level operational keys from one mapping field."""
+    excluded_keys = {
+        str(key) for key in field.metadata.get("dag_hash_exclude_keys", ())
+    }
+    if not excluded_keys:
+        return stable_json_value(value)
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"DAG hash exclusions require a mapping field, got {type(value).__name__}"
+        )
+    return {
+        str(key): stable_json_value(item)
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        if str(key) not in excluded_keys
+    }

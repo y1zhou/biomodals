@@ -3,7 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -69,6 +69,7 @@ class FakeHandle:
 @dataclass
 class TextNode(WorkflowNativeNode):
     text: str
+    workers: int = field(default=1, metadata={"dag_hash": False})
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         del context
@@ -487,7 +488,7 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
         volume,
     )
     workflow = Workflow("demo")
-    workflow.add_node(TextNode("complete"), id="write")
+    workflow.add_node(TextNode("complete", workers=8), id="write")
     raw_cls.run._get_raw_f()(
         predecessor_coordinator,
         workflow=workflow,
@@ -503,11 +504,13 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
         execution_run_id=str(SUCCESSOR_ID),
         deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
     )
+    candidate_workflow = Workflow("demo")
+    candidate_workflow.add_node(TextNode("complete", workers=2), id="write")
 
     result = raw_cls.restart_from._get_raw_f()(
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
-        workflow=workflow,
+        workflow=candidate_workflow,
         workload_run_key="demo",
         max_active_provider_calls=3,
         max_active_gpu_provider_calls=2,
@@ -520,6 +523,9 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
     assert successor.deployment == SUCCESSOR_DEPLOYMENT
     assert successor.max_active_provider_calls == 3
     assert successor.max_active_gpu_provider_calls == 2
+    successor_plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
+    successor_node = successor_plan.workflow.validate().nodes["write"].node
+    assert successor_node.workers == 2
     store.close()
 
 

@@ -14,6 +14,7 @@ from uuid import UUID
 
 import polars as pl
 import pytest
+import yaml
 import zstandard as zstd
 
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
@@ -2009,6 +2010,96 @@ PPIFlowStep:
     assert "Submitting PPIFlow workflow" not in stdout
 
 
+def test_ppiflow_stages_local_inputs_by_content_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uploads: list[tuple[Path, str]] = []
+    remote_payloads = {
+        "existing/first.pdb": b"ATOM remote\n",
+        "existing/renamed.pdb": b"ATOM remote\n",
+    }
+
+    class FakeBatchUpload:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def put_file(self, local_path: Path, remote_path: str) -> None:
+            uploads.append((local_path, remote_path))
+
+    class FakeVolume:
+        def batch_upload(self, *, force: bool):
+            assert force is True
+            return FakeBatchUpload()
+
+        def read_file(self, path: str):
+            yield remote_payloads[path]
+
+    volume_root = "/mnt/PPIFlow-outputs"
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint=volume_root,
+            output_volume_name="PPIFlow-outputs",
+        ),
+    )
+    first = tmp_path / "first.pdb"
+    same = tmp_path / "renamed.pdb"
+    changed = tmp_path / "changed.pdb"
+    first.write_bytes(b"ATOM same\n")
+    same.write_bytes(b"ATOM same\n")
+    changed.write_bytes(b"ATOM changed\n")
+
+    def stage(path: Path):
+        return ppiflow_workflow._stage_ppiflow_app_inputs(
+            steps_doc={
+                "PPIFlowStep": {
+                    "args": {
+                        "name": "demo",
+                        "specified_hotspots": "A1",
+                        "input_pdb": str(path),
+                        "binder_chain": "B",
+                    }
+                }
+            },
+            run_id="demo",
+            app_steps=("PPIFlowStep",),
+        )
+
+    first_steps = stage(first)
+    same_steps = stage(same)
+    changed_steps = stage(changed)
+    remote_first_steps = stage(Path(f"{volume_root}/existing/first.pdb"))
+    remote_same_steps = stage(Path(f"{volume_root}/existing/renamed.pdb"))
+    first_path = first_steps["PPIFlowStep"]["args"]["input_pdb"]
+    same_path = same_steps["PPIFlowStep"]["args"]["input_pdb"]
+    changed_path = changed_steps["PPIFlowStep"]["args"]["input_pdb"]
+
+    assert first_path == same_path
+    assert first_path != changed_path
+    assert hashlib.sha256(first.read_bytes()).hexdigest() in str(first_path)
+
+    task_yaml = _task_yaml(enabled_steps="  PPIFlowStep: true\n")
+
+    def workflow_hash(steps: object) -> str:
+        return hashing.dag_hash(
+            build_ppiflow_workflow(
+                task_yaml_bytes=task_yaml,
+                steps_yaml_bytes=yaml.safe_dump(steps).encode(),
+            ).validate()
+        )
+
+    assert workflow_hash(first_steps) == workflow_hash(same_steps)
+    assert workflow_hash(first_steps) != workflow_hash(changed_steps)
+    assert workflow_hash(remote_first_steps) == workflow_hash(remote_same_steps)
+    assert len(uploads) == 3
+
+
 def test_submit_ppiflow_workflow_creates_new_execution_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2475,6 +2566,41 @@ RosettaFixStep:
     assert definition.nodes["stage2-rosetta-fix"].node.config["max_num_pods"] == 2
 
 
+def test_ppiflow_operational_fanout_does_not_change_scientific_dag_hash() -> None:
+    task_yaml = b"""
+task:
+  gentype: binder
+  candidate_concurrency: 8
+steps:
+  MPNNStep_stage1: true
+  AF3scoreStep_stage1: true
+  RosettaFixStep: true
+"""
+
+    def workflow_hash(max_child_calls: int, *, max_structures: int = 5) -> str:
+        return hashing.dag_hash(
+            build_ppiflow_workflow(
+                task_yaml_bytes=task_yaml,
+                steps_yaml_bytes=f"""
+MPNNStep_stage1:
+  candidate_concurrency: 6
+  max_structures: {max_structures}
+AF3scoreStep_stage1:
+  num_jobs: 7
+  prepare_workers: 4
+RosettaFixStep:
+  max_num_pods: 5
+""".encode(),
+                max_child_calls=max_child_calls,
+            ).validate()
+        )
+
+    baseline = workflow_hash(2)
+
+    assert workflow_hash(4) == baseline
+    assert workflow_hash(2, max_structures=6) != baseline
+
+
 def test_ppiflow_stage2_only_requires_existing_input() -> None:
     try:
         build_ppiflow_workflow(
@@ -2837,6 +2963,11 @@ PPIFlowStep:
         ppiflow_workflow.orchestrator,
         "ExecutionCoordinator",
         FakeExecutionCoordinator,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_stage_ppiflow_app_inputs",
+        lambda **kwargs: kwargs["steps_doc"],
     )
 
     raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f

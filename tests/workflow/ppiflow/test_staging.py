@@ -328,10 +328,11 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         app_steps=("PPIFlowStep",),
     )
 
+    digest = hashlib.sha256(input_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["input_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/input_pdb/{digest}.pdb"
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
     assert upload_forces == [True]
 
     uploaded.clear()
@@ -341,7 +342,7 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         run_id="run-1",
         app_steps=("PPIFlowStep",),
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
     assert upload_forces == [True]
 
 
@@ -409,11 +410,12 @@ def test_ppiflow_staging_uses_active_stage_steps(
         app_steps=_active_ppiflow_app_steps(task_doc, stage=1),
     )
 
+    digest = hashlib.sha256(input_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["input_pdb"].endswith(
-        "/PPIFlowStep/input_pdb/input.pdb"
+        f"/PPIFlowStep/input_pdb/{digest}.pdb"
     )
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
 
     staged = _stage_ppiflow_app_inputs(
         steps_doc=steps_doc,
@@ -422,7 +424,7 @@ def test_ppiflow_staging_uses_active_stage_steps(
     )
 
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
 
 
 def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
@@ -480,15 +482,23 @@ def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
         app_steps=("PPIFlowStep",),
     )
 
+    antigen_digest = hashlib.sha256(antigen_pdb.read_bytes()).hexdigest()
+    framework_digest = hashlib.sha256(framework_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["antigen_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/{antigen_digest}.pdb"
     )
     assert staged["PPIFlowStep"]["args"]["framework_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/{framework_digest}.pdb"
     )
     assert uploaded == [
-        (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
-        (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
+        (
+            antigen_pdb,
+            f"/run-1/PPIFlowStep/antigen_pdb/{antigen_digest}.pdb",
+        ),
+        (
+            framework_pdb,
+            f"/run-1/PPIFlowStep/framework_pdb/{framework_digest}.pdb",
+        ),
     ]
 
 

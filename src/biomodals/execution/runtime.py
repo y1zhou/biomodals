@@ -13,6 +13,7 @@ from biomodals.execution.modal import (
     ModalSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.model import (
+    ExecutionRunRecord,
     ProviderBinding,
     ProviderCallRecord,
     ProviderCallStatus,
@@ -185,3 +186,36 @@ class ExecutionRuntime:
             )
         self._checkpoint()
         return updated
+
+    def cancel_run(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Durably request cancellation, then ask each attached provider owner."""
+        provider_call_ids = self.repository.request_run_cancellation(
+            execution_run_id,
+            now=now,
+        )
+        self._checkpoint()
+        for provider_call_id in provider_call_ids:
+            call = self.repository.get_provider_call(provider_call_id)
+            if call.provider_call_handle_id is None:
+                self.repository.mark_provider_cancellation_unknown(
+                    provider_call_id,
+                    message="Provider Call has no attached cancellation handle",
+                    now=now,
+                )
+                self._checkpoint()
+                continue
+            try:
+                self._modal.cancel(call.provider_call_handle_id)
+            except Exception as error:
+                self.repository.mark_provider_cancellation_unknown(
+                    provider_call_id,
+                    message=f"Modal cancellation was inconclusive: {error}",
+                    now=now,
+                )
+                self._checkpoint()
+        return self.repository.get_run(execution_run_id)

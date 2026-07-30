@@ -461,6 +461,54 @@ class SqliteExecutionRepository:
                 )
         return self.get_run(execution_run_id)
 
+    def create_successor_run(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        execution_run_id: UUID,
+        deployment: DeploymentIdentity,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+        now: int,
+        plan: ExecutionPlan | None = None,
+    ) -> ExecutionRunRecord:
+        """Create an explicit compatible retry boundary with no copied state."""
+        if execution_run_id == predecessor_execution_run_id:
+            raise ValueError("Successor Execution Run ID must be new")
+        predecessor = self.get_run(predecessor_execution_run_id)
+        if not predecessor.status.is_terminal:
+            raise ValueError("predecessor Run is not terminal")
+        if self.active_provider_call_counts(predecessor_execution_run_id).total:
+            raise ValueError("predecessor Run still has active Provider Calls")
+        nodes = self.list_nodes(predecessor_execution_run_id)
+        tasks = tuple(
+            task
+            for node in nodes
+            for task in self.list_tasks(
+                predecessor_execution_run_id,
+                node.node_key,
+            )
+        )
+        if not all(node.status.is_terminal for node in nodes) or not all(
+            task.status.is_terminal for task in tasks
+        ):
+            raise ValueError("predecessor execution state is not conclusive")
+        if (
+            plan is not None
+            and plan.workload_plan_fingerprint
+            != predecessor.plan.workload_plan_fingerprint
+        ):
+            raise ValueError("Workload Plan Fingerprint does not match predecessor")
+        return self.create_run(
+            execution_run_id=execution_run_id,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            plan=predecessor.plan,
+            deployment=deployment,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            now=now,
+        )
+
     def get_run(self, execution_run_id: UUID) -> ExecutionRunRecord:
         """Load one Execution Run by its opaque identity."""
         row = self._connection.execute(
@@ -1707,6 +1755,135 @@ class SqliteExecutionRepository:
             explicit_resume=False,
         )
 
+    def request_run_cancellation(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> tuple[UUID, ...]:
+        """Durably stop admission and identify remote owners to cancel."""
+        run = self.get_run(execution_run_id)
+        if run.status.is_terminal:
+            return ()
+        if run.status != RunStatus.CANCEL_REQUESTED:
+            self._transition_run(
+                execution_run_id,
+                RunStatus.CANCEL_REQUESTED,
+                reason=None,
+                message=None,
+                now=now,
+                explicit_resume=False,
+            )
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                status_reason = NULL,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ?
+                AND (
+                    (
+                        status = ?
+                        AND provider_call_id IS NULL
+                        AND worker_provider_call_id IS NULL
+                        AND local_owned = 0
+                    )
+                    OR (status = ? AND local_owned = 1)
+                )
+            """,
+            (
+                TaskStatus.CANCELLED.value,
+                now,
+                now,
+                str(execution_run_id),
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        )
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET status = ?,
+                status_reason = NULL,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND status = ?
+            """,
+            (
+                NodeStatus.CANCELLED.value,
+                now,
+                now,
+                str(execution_run_id),
+                NodeStatus.PENDING.value,
+            ),
+        )
+        for node in self.list_nodes(execution_run_id):
+            if node.status == NodeStatus.RUNNING:
+                self._complete_cancelled_node_if_conclusive(
+                    execution_run_id,
+                    node.node_key,
+                    now=now,
+                )
+        rows = self._connection.execute(
+            """
+            SELECT provider_call_id
+            FROM execution_provider_calls
+            WHERE execution_run_id = ?
+                AND status NOT IN (?, ?, ?)
+            ORDER BY created_at, rowid
+            """,
+            (
+                str(execution_run_id),
+                ProviderCallStatus.SUCCEEDED.value,
+                ProviderCallStatus.FAILED.value,
+                ProviderCallStatus.CANCELLED.value,
+            ),
+        ).fetchall()
+        return tuple(UUID(row["provider_call_id"]) for row in rows)
+
+    def mark_provider_cancellation_unknown(
+        self,
+        provider_call_id: UUID,
+        *,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Preserve ownership when a cancellation outcome is inconclusive."""
+        call = self.get_provider_call(provider_call_id)
+        if call.status in {
+            ProviderCallStatus.SUBMITTING,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+        }:
+            if call.status == ProviderCallStatus.SUBMITTING:
+                self._set_provider_call_status(
+                    provider_call_id,
+                    ProviderCallStatus.OUTCOME_UNKNOWN,
+                    message=message,
+                    now=now,
+                )
+        elif call.status in {
+            ProviderCallStatus.ATTACHED,
+            ProviderCallStatus.RUNNING,
+            ProviderCallStatus.STATE_UNKNOWN,
+        }:
+            if call.status != ProviderCallStatus.STATE_UNKNOWN:
+                self._set_provider_call_status(
+                    provider_call_id,
+                    ProviderCallStatus.STATE_UNKNOWN,
+                    message=message,
+                    now=now,
+                )
+        elif call.status.is_terminal:
+            return call
+        self._project_run_unknown(
+            call.execution_run_id,
+            reason=RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN,
+            message=message,
+            now=now,
+        )
+        return self.get_provider_call(provider_call_id)
+
     def active_provider_call_counts(
         self,
         execution_run_id: UUID,
@@ -2278,6 +2455,69 @@ class SqliteExecutionRepository:
             ),
         )
 
+    def _complete_cancelled_node_if_conclusive(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        now: int,
+    ) -> None:
+        active_call = self._connection.execute(
+            """
+            SELECT 1
+            FROM execution_provider_calls
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status NOT IN (?, ?, ?)
+            LIMIT 1
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                ProviderCallStatus.SUCCEEDED.value,
+                ProviderCallStatus.FAILED.value,
+                ProviderCallStatus.CANCELLED.value,
+            ),
+        ).fetchone()
+        unfinished_task = self._connection.execute(
+            """
+            SELECT 1
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        if active_call is not None or unfinished_task is not None:
+            return
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET status = ?,
+                status_reason = NULL,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status = ?
+            """,
+            (
+                NodeStatus.CANCELLED.value,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+                NodeStatus.RUNNING.value,
+            ),
+        )
+
     def _set_provider_call_status(
         self,
         provider_call_id: UUID,
@@ -2380,6 +2620,17 @@ class SqliteExecutionRepository:
     ) -> None:
         run = self.get_run(execution_run_id)
         if run.status == RunStatus.STATE_UNKNOWN:
+            if run.status_reason != reason or run.status_message != message:
+                self._connection.execute(
+                    """
+                    UPDATE execution_runs
+                    SET status_reason = ?,
+                        status_message = ?,
+                        updated_at = ?
+                    WHERE execution_run_id = ?
+                    """,
+                    (reason.value, message, now, str(execution_run_id)),
+                )
             return
         self._transition_run(
             execution_run_id,
@@ -2414,9 +2665,14 @@ class SqliteExecutionRepository:
             ),
         ).fetchone()
         if row is None:
+            target = (
+                RunStatus.CANCEL_REQUESTED
+                if run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+                else RunStatus.RUNNING
+            )
             self._transition_run(
                 execution_run_id,
-                RunStatus.RUNNING,
+                target,
                 reason=None,
                 message=None,
                 now=now,

@@ -403,6 +403,7 @@ def materialize_app_run_result(
     result_dir: Path,
     artifact_dir: Path,
     producing_node_id: str,
+    artifact_id_scope: str | None = None,
     volume_root: Path | None = None,
     volume_path_mode: Literal["reference", "copy"] = "reference",
     volume_roots: Mapping[str, Path] | None = None,
@@ -412,6 +413,11 @@ def materialize_app_run_result(
     persisted_outputs: list[AppOutput] = []
     persisted_logs: list[AppOutput] = []
 
+    def scoped_output_name(output_name: str) -> str:
+        if artifact_id_scope is None:
+            return output_name
+        return f"{artifact_id_scope}-{output_name}"
+
     def materialize_output(
         output,
         *,
@@ -419,9 +425,10 @@ def materialize_app_run_result(
         source_app_output_name: str | None = None,
         artifact_parent: Path | None = None,
     ) -> tuple[WorkflowArtifact, AppOutput]:
+        artifact_output_name = scoped_output_name(artifact_output_name or output.name)
         artifact_id = _artifact_id(
             producing_node_id,
-            artifact_output_name or output.name,
+            artifact_output_name,
         )
         if isinstance(output.storage, InlineBytes):
             artifact = _materialize_inline_bytes(

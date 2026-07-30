@@ -68,6 +68,45 @@ def test_materialize_inline_bytes_writes_one_result_artifact_copy(
     assert (tmp_path / "artifacts" / "summary-summary.json").exists()
 
 
+def test_task_scope_keeps_repeated_output_names_distinct(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="structure",
+                kind=ArtifactKind.STRUCTURES,
+                storage=InlineBytes(data=b"ATOM\n", filename="model.pdb"),
+            )
+        ],
+    )
+
+    first = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "candidate-a",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="design",
+        artifact_id_scope="candidate-a",
+        volume_root=tmp_path,
+    )
+    second = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "candidate-b",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="design",
+        artifact_id_scope="candidate-b",
+        volume_root=tmp_path,
+    )
+
+    assert first.artifacts[0].artifact_id == "design-candidate-a-structure"
+    assert second.artifacts[0].artifact_id == "design-candidate-b-structure"
+    assert first.artifacts[0].source_app_output_name == "structure"
+    assert second.artifacts[0].source_app_output_name == "structure"
+
+
 def test_workflow_artifact_availability_accepts_existing_workflow_file(
     tmp_path: Path,
 ) -> None:

@@ -27,6 +27,7 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
     WorkStatusReason,
 )
+from biomodals.execution.runtime import ExecutionRuntime
 from biomodals.execution.scheduler import (
     aggregate_task_outcome,
     propagated_skip_node_keys,
@@ -49,6 +50,7 @@ __all__ = [
     "ExecutionPlan",
     "ExecutionRunNotFoundError",
     "ExecutionRunRecord",
+    "ExecutionRuntime",
     "ExecutionSnapshot",
     "ExecutionTaskRecord",
     "NodeAggregationPolicy",

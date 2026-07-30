@@ -9,11 +9,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import orjson
 
-from biomodals.execution import SqliteExecutionRepository
+from biomodals.execution import (
+    DeploymentIdentity,
+    ExecutionPlan,
+    SqliteExecutionRepository,
+)
 from biomodals.service.runtime_config import (
     JobAdmissionConfiguration,
     ModalConfigurationSnapshot,
@@ -240,6 +245,7 @@ class JobRecord:
     result_previous_state: JobState | None
     result_cached: bool
     intermediates_cleaned_at: int | None
+    execution_run_id: UUID | None = None
 
     @property
     def warnings(self) -> list[str]:
@@ -1252,9 +1258,35 @@ class ServiceStore:
         now: int,
         new_job_id: UUID | None = None,
         initial_operation: InitialModalOperation | None = None,
+        execution_plan: ExecutionPlan | None = None,
+        execution_run_id: UUID | None = None,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
     ) -> JobAdmission:
         """Atomically apply idempotency and every active Job admission limit."""
         workload = configuration.workload
+        if initial_operation is not None and execution_plan is not None:
+            raise ValueError(
+                "Initial legacy operation and Execution Plan are mutually exclusive"
+            )
+        execution_parameters = (
+            execution_run_id,
+            max_active_provider_calls,
+            max_active_gpu_provider_calls,
+        )
+        if execution_plan is None:
+            if any(value is not None for value in execution_parameters):
+                raise ValueError("Execution Run parameters require an Execution Plan")
+        elif (
+            execution_run_id is None
+            or max_active_provider_calls is None
+            or max_active_gpu_provider_calls is None
+        ):
+            raise ValueError(
+                "Execution Plan admission requires complete Run parameters"
+            )
+        elif execution_plan.workload_name != workload:
+            raise ValueError("Execution Plan workload does not match Job workload")
         if artifact_request_sha256 is not None and (
             len(artifact_request_sha256) != 64
             or any(
@@ -1398,18 +1430,19 @@ class ServiceStore:
             conn.execute(
                 """
                 INSERT INTO jobs (
-                    job_id, owner_user_id, workload, display_name,
+                    job_id, owner_user_id, execution_run_id, workload, display_name,
                     idempotency_key, request_hash, parameters_json,
                     artifact_request_sha256, state,
                     modal_environment, modal_app_name, modal_app_version,
                     run_name, created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
                     str(job_id),
                     str(owner_user_id),
+                    (None if execution_run_id is None else str(execution_run_id)),
                     workload,
                     display_name,
                     idempotency_key,
@@ -1425,6 +1458,25 @@ class ServiceStore:
                     now,
                 ),
             )
+            if execution_plan is not None:
+                SqliteExecutionRepository(conn).create_run(
+                    execution_run_id=cast(UUID, execution_run_id),
+                    plan=execution_plan,
+                    deployment=DeploymentIdentity(
+                        modal_environment.strip(),
+                        modal_app_name.strip(),
+                        modal_app_version,
+                    ),
+                    max_active_provider_calls=cast(
+                        int,
+                        max_active_provider_calls,
+                    ),
+                    max_active_gpu_provider_calls=cast(
+                        int,
+                        max_active_gpu_provider_calls,
+                    ),
+                    now=now,
+                )
             if initial_operation is not None:
                 conn.execute(
                     """
@@ -2555,6 +2607,11 @@ def _job_from_row(
     return JobRecord(
         job_id=UUID(row["job_id"]),
         owner_user_id=UUID(row["owner_user_id"]),
+        execution_run_id=(
+            UUID(row["execution_run_id"])
+            if row["execution_run_id"] is not None
+            else None
+        ),
         workload=str(row["workload"]),
         display_name=str(row["display_name"]),
         idempotency_key=str(row["idempotency_key"]),

@@ -138,6 +138,32 @@ def test_service_execution_repository_uses_the_service_transaction(
         assert repository.get_run(execution_run_id).plan.workload_name == "test"
 
 
+def test_job_admission_atomically_links_a_new_execution_run(tmp_path: Path) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    execution_run_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    plan = ExecutionPlan(
+        workload_name="gromacs",
+        workload_run_key="simulation-1",
+        nodes=(NodePlan(node_key="prepare"),),
+    )
+
+    admission = admit(
+        store,
+        alice,
+        key="execution-job",
+        execution_plan=plan,
+        execution_run_id=execution_run_id,
+    )
+
+    assert admission.job.execution_run_id == execution_run_id
+    with store.execution_repository() as repository:
+        run = repository.get_run(execution_run_id)
+    assert run.plan == plan
+    assert run.deployment == DeploymentIdentity("production", "Gromacs", 1)
+    assert run.max_active_provider_calls == 3
+    assert run.max_active_gpu_provider_calls == 1
+
+
 def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
     locks = JobLifecycleLocks()
     job_id = UUID("11111111-1111-4111-8111-111111111111")
@@ -186,6 +212,8 @@ def admit(
     new_job_id: UUID | None = None,
     initial_operation: InitialModalOperation | None = None,
     artifact_request_sha256: str | None = None,
+    execution_plan: ExecutionPlan | None = None,
+    execution_run_id: UUID | None = None,
 ):
     store.update_user(
         owner_user_id,
@@ -214,6 +242,10 @@ def admit(
         now=1_800_000_000,
         new_job_id=new_job_id,
         initial_operation=initial_operation,
+        execution_plan=execution_plan,
+        execution_run_id=execution_run_id,
+        max_active_provider_calls=3 if execution_plan is not None else None,
+        max_active_gpu_provider_calls=1 if execution_plan is not None else None,
     )
 
 

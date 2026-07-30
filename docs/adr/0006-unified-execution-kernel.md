@@ -397,9 +397,27 @@ submission preclaim creates a call directly in `submitting`, so unsubmitted
 intent remains on the Task or Dispatch Batch rather than a `planned` call.
 `outcome_unknown` means spawn may have occurred without a durably attached
 provider ID, while `state_unknown` means the ID exists but observation or
-cancellation is inconclusive. An expired provider handle is an observation,
-not a status: conclusive failure becomes `failed`, while an unresolved outcome
-becomes `state_unknown`.
+terminal result recovery, or cancellation is inconclusive. An expired provider
+handle is an observation, not a status: conclusive failure becomes `failed`,
+while an unresolved outcome becomes `state_unknown`.
+
+The Provider Call and Task completion boundary was accepted on 2026-07-30. A
+successfully returned call becomes `succeeded` only after the coordinator
+stores a small JSON-compatible Result Envelope and crosses the host durability
+boundary. The envelope contains durable per-Task result references or
+conclusive diagnostics, never large scientific payloads. That terminal call
+releases its total and optional GPU slots immediately, while unfinished Tasks
+retain their owner and remain `running` through workload decoding,
+publication, and validation. Valid publication succeeds each Task; conclusive
+decode or publication failure fails only the affected Task; unknown validation
+suspends the Run without reopening the call. A returned but conclusively
+malformed payload may be stored as a diagnostic envelope, leaving the provider
+call `succeeded` while its affected Tasks fail. If no envelope can be recovered
+or made durable, the call cannot claim success and remains or becomes
+`state_unknown`. Recovery before envelope durability recollects the same
+attached call; recovery afterward resumes from the envelope without another
+provider invocation. There is no `finalizing` call status, Task Attempt, or
+slot-allocation row.
 
 The submission-preclaim boundary was accepted on 2026-07-29. The atomic
 repository preclaim creates the `submitting` Provider Call, assigns its Tasks,
@@ -428,7 +446,9 @@ allocation; the kernel persists that boolean on the Provider Call but does not
 inspect or reproduce Modal decorators. Every nonterminal call consumes one
 total slot, and a GPU call also consumes one GPU slot. The serialized preclaim
 checks both counts atomically before creating `submitting`; terminal status
-releases the slot by removing the call from the derived active count.
+releases the slot by removing the call from the derived active count. A
+successful return remains nonterminal until its Result Envelope is host
+durable; Task publication is not part of the slot lifetime.
 `outcome_unknown` and `state_unknown` retain their slots conservatively. A
 single call containing many Tasks and each pull-worker call consume one slot;
 local work consumes none. The kernel stores no variable permit cost, named
@@ -664,9 +684,11 @@ outputs without reopening or overwriting its predecessor ledger.
 
 An execution repository is authoritative for scheduling facts such as the
 immutable plan, readiness, single-submission claims, attached call IDs,
-observed provider state, and timestamps. It records that a workload publication
-was validated, but the publication's marker, manifest, or workload-specific
-validator remains authoritative for whether scientific output is reusable.
+observed provider state, Result Envelopes, and timestamps. It records that a
+workload publication was validated, but the publication's marker, manifest, or
+workload-specific validator remains authoritative for whether scientific
+output is reusable. Provider success and scientific Task success are separate
+recoverable transitions.
 
 Concurrent Task execution does not imply concurrent SQLite writers. One
 coordinator durably admits work and records returned events while direct

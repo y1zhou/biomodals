@@ -16,7 +16,7 @@ The target is one place to reason about:
 - single-submission Task state and its relationship to Provider Calls;
 - safe submission, attachment, polling, cancellation, and recovery;
 - cache observations and the decision to reuse or compute;
-- input preparation and output collection boundaries;
+- input preparation, Result Envelope, and publication boundaries;
 - batching and Run-level total/GPU Provider Call limits;
 - reusable direct-fan-out and SQLite-backed pull worker-pool dispatch.
 
@@ -40,8 +40,9 @@ In particular:
    replacement work.
 4. Every submitted call is either durably attached or leaves an explicit
    outcome-unknown record.
-5. A successful call is not terminally committed before its decoded result and
-   workload publication are durably recoverable.
+5. A successful call releases its slots only after a recoverable Result
+   Envelope is durable; unfinished Tasks remain active until their scientific
+   publications validate.
 6. Parallel tasks run when their dependencies and Provider Call slots allow
    it.
 7. One provider call may represent a batch of independently identified tasks.
@@ -258,6 +259,12 @@ this is not an exactly-once execution claim.
 durable provider call ID and observed lifecycle. It belongs to one Node and
 can cover zero or many Tasks from that Node. A Modal Function Call is its
 current provider implementation.
+
+**Result Envelope** is a small durable JSON-compatible operational record
+captured before a successfully returned Provider Call becomes `succeeded`. It
+maps that call to Task-specific durable result references or conclusive
+diagnostics needed to resume decoding and publication. It contains no large
+scientific payload and is not a Workload Publication.
 
 **Dispatch Batch** is a durable grouping of Tasks from one Node offered to one
 Provider Call or a shared worker pool. Fixed-batch dispatch binds every Task
@@ -558,10 +565,10 @@ fingerprinting Tasks.
 | Task planning | Immutable task records, encounter ordinals, canonical fingerprint calculation, dependency links | Ordered Task discovery, normalized scientific payload, and content digests |
 | Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
-| Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
+| Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine, and durable Result Envelope boundary | Function selection, provider adapter binding, and returned-value conversion |
 | Local execution | Durable ownership, publication-first recovery, and hook invocation order | Idempotent hook logic, Task-specific staging, atomic publication |
 | Dispatch | Durable fixed batches, direct fan-out, pull claims, worker-call tracking, stable image cohorts, and returned outcome routing | Provider binding, Runtime Image Key, Task payloads, compatibility keys, and per-Task decoding |
-| Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
+| Outputs | Resuming from Result Envelopes, calling decode/validate/publish hooks, and committing outcome ordering | Envelope decoding, schemas, scientific validation, paths, publication |
 | Batching | Stable grouping by compatibility and encounter order, immutable call mapping, and outcome distribution | Positive maximum Tasks per call and whether batching changes scientific identity |
 | Resources | Run-scoped total and GPU Provider Call admission counts | Service admission, Modal decorators, deployment limits, cross-coordinator policy |
 | Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
@@ -837,8 +844,9 @@ not elapsed time:
 - a normal result may carry independent per-Task outcomes for a batch;
 - a conclusive terminal call failure fails its unfinished Tasks and releases
   its total and optional GPU call slots;
-- a successful call with a missing or invalid expected publication fails the
-  affected Task;
+- a successful call releases its slots after its Result Envelope is durable;
+  unfinished Tasks remain `running` through decode and publication;
+- a missing or invalid expected publication then fails only the affected Task;
 - unknown call state preserves `state_unknown` and forbids replacement work.
 
 Direct one-Task-per-call execution needs no separate remote assignment store.
@@ -861,9 +869,12 @@ no different Provider Call may claim them in the same Execution Run.
 
 Workers publish their outputs before sending an idempotent completion report.
 The coordinator records individual Task outcomes in one serialized
-transaction. The worker call retains its single active slot until that call
-becomes terminal. A lost completion response is harmless, and publication
-validation reconciles output that became durable before its completion report.
+transaction. An early validated completion report may finish a Task while its
+worker call is still active. The call retains its single active slot until its
+terminal Result Envelope is durable, then releases that slot independently of
+any unfinished Task publication. A lost completion response is harmless, and
+publication validation reconciles output that became durable before its
+completion report.
 
 Provider redelivery is not a second kernel submission. A claim request may
 repeat automatically before or after a Worker Assignment is committed, and
@@ -1011,10 +1022,12 @@ preclaim then atomically:
 5. returns spawn authorization only after the host durability boundary.
 
 After preclaim, the Task-to-call mapping is immutable. Recovery observes or
-collects the same call and never repacks its Tasks. A successful call may
-still contain failed or invalid Task results, which per-Task decoding and
-publication validation record independently. A failed call preserves any
-already-validated Task successes and fails only its unfinished Tasks.
+collects the same call and never repacks its Tasks. Its Result Envelope
+preserves the returned per-Task references or diagnostics before the call
+becomes `succeeded`. A successful call may still contain failed or invalid
+Task results, which per-Task decoding and publication validation record
+independently. A failed call preserves any already-validated Task successes
+and fails only its unfinished Tasks.
 
 #### Pull-worker dispatch
 
@@ -1089,8 +1102,10 @@ and creates the `submitting` call only when both slots are available.
 Every nonterminal Provider Call consumes exactly one total slot. A GPU call
 also consumes exactly one GPU slot. `submitting`, `outcome_unknown`, and
 `state_unknown` retain those slots because a container may exist. A terminal
-call releases its slots automatically by leaving the derived active count;
-there is no allocation table or variable permit cost.
+call releases its slots automatically by leaving the derived active count. A
+successful return becomes terminal only after its Result Envelope crosses the
+host durability boundary; unfinished Task publication does not retain the
+call slot. There is no allocation table or variable permit cost.
 
 A call that owns a batch of Tasks still consumes one slot, and each pull
 worker call consumes one slot regardless of how many Tasks it claims. Local
@@ -1247,8 +1262,8 @@ The kernel uses exactly eight Provider Call statuses:
 | `attached` | No | The provider call ID is durable but the call has not yet been observed |
 | `running` | No | The provider reports that the call is active |
 | `outcome_unknown` | No | Spawn may have occurred, but no provider call ID was durably attached |
-| `state_unknown` | No | The call ID exists, but state or cancellation outcome is inconclusive |
-| `succeeded` | Yes | The provider call returned successfully |
+| `state_unknown` | No | The call ID exists, but state, terminal result recovery, or cancellation is inconclusive |
+| `succeeded` | Yes | The provider call returned and its Result Envelope is durably recoverable |
 | `failed` | Yes | The provider conclusively reported failure |
 | `cancelled` | Yes | The provider conclusively confirmed cancellation |
 
@@ -1274,9 +1289,9 @@ state_unknown
 
 `outcome_unknown` means a spawn may have started but no call ID was durably
 attached. `state_unknown` means an attached call exists but its current or
-terminal provider state cannot be established. Both preserve Task ownership
-and prohibit replacement work until explicit reconciliation establishes one
-of the listed transitions.
+terminal provider state, returned result recovery, or cancellation outcome
+cannot be established. Both preserve Task ownership and prohibit replacement
+work until explicit reconciliation establishes one of the listed transitions.
 
 There is no `planned` Provider Call: unsubmitted intent remains on the Task or
 Dispatch Batch, and the durable preclaim creates a call directly in
@@ -1312,6 +1327,51 @@ A provider adapter must expose only the operations the kernel needs: spawn,
 resolve by call ID, observe or collect, and cancel. Modal-specific objects
 must not leak into plans or persisted models.
 
+### Result Envelope and split completion
+
+Provider Call completion and scientific Task completion are deliberately
+separate durability boundaries. When a call returns successfully, its provider
+adapter converts the returned value into a small JSON-compatible Result
+Envelope. The envelope records call identity plus the durable per-Task result
+references or conclusive diagnostics needed by the workload decoder. Large
+trajectories, models, archives, and other scientific files remain in
+provider- or workload-owned durable storage; the envelope may refer to them
+but never embeds them and is excluded from scientific fingerprints.
+
+The repository stores the envelope and the call's transition to `succeeded`
+atomically, then the coordinator crosses the host durability boundary. Only
+then does the call leave the derived total and optional GPU active counts. No
+`finalizing` status or separate slot row is needed. Any owned Task not already
+finished by an idempotent worker completion report remains `running` while the
+coordinator loads the envelope and invokes workload decode, staging,
+publication, and validation hooks:
+
+- a valid decoded outcome whose publication validates as `available` succeeds
+  that Task;
+- a conclusive per-Task error, malformed outcome, invalid publication, or
+  authoritative post-publication `missing` fails only that Task;
+- `unknown` publication validation leaves the Task `running` and suspends the
+  Run with `result_validation_unknown`;
+- one call may therefore be `succeeded` while its Tasks independently become
+  succeeded, failed, or temporarily unresolved.
+
+A provider return that is conclusively malformed may be represented by a
+durable diagnostic envelope. The call still succeeded as a provider
+invocation, while decoding fails its affected Tasks. If the coordinator cannot
+obtain, reconstruct, or make any envelope durable, it must not invent call
+success: the call remains or becomes `state_unknown`, retains its slots, and
+requires explicit reconciliation.
+
+The recovery path follows the last durable boundary:
+
+1. before envelope durability, resolve and collect the same attached provider
+   call ID without spawning replacement work;
+2. after envelope durability but before Task publication, resume decode and
+   publication from the stored envelope without contacting Modal for another
+   execution;
+3. after publication but before Task commit, observe the publication and
+   commit the recovered Task outcome.
+
 ### Cache and publication lifecycle
 
 Node and Task reuse decisions return exactly one observation:
@@ -1332,10 +1392,9 @@ generic execution state. `unknown` leaves the observed Node or Task
 nonterminal and suspends the Run with `result_validation_unknown`; explicit
 resume repeats validation.
 
-After a call succeeds, the decoded result and workload publication are
-committed before the Task and call are made durably terminal. If a store
-cannot make those changes in one transaction, its adapter must use a
-recoverable prepare/publish/finalize protocol.
+Result Envelope durability does not make scientific output reusable. The
+workload publication and validator remain authoritative, and the Task becomes
+terminal only under the split-completion protocol above.
 
 ### Coordinator-local execution lifecycle
 
@@ -1450,9 +1509,10 @@ characterization tests:
    Exit must preserve call-bound ownership.
 
 Fault-injection tests must stop immediately after preclaim, spawn, attachment,
-collection, decode, publication, and final commit. Each restart assertion must
-prove whether the old call is recovered, the run blocks as unknown, or a
-Successor Execution Run may safely submit missing work.
+collection, Result Envelope durability, decode, publication, and Task commit.
+Each restart assertion must prove whether the old call is recovered, the
+stored envelope is replayed, the run blocks as unknown, or a Successor
+Execution Run may safely submit missing work.
 
 ## State-transition policy
 
@@ -1521,7 +1581,7 @@ Phase 0 test inventory:
 | `tests/service/test_submission.py` | Pre-preclaim failure leaves work unowned; one preclaim authorizes one spawn; definite post-preclaim rejection fails; unknown or abandoned submission blocks; an unattached returned call is cancelled and marked unknown |
 | `tests/workflow/test_runtime.py` | A crash after durable claim but before attachment does not submit replacement work |
 | `tests/workflow/test_runtime.py` | A recorded call ID is resolved and collected instead of resubmitted |
-| `tests/workflow/test_runtime.py` | A crash after collection, decode, publication, or final commit never starts another provider call |
+| `tests/workflow/test_runtime.py` | A crash after collection, Result Envelope durability, decode, publication, or Task commit never starts another provider call |
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover total and GPU active-call counts |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
@@ -1536,15 +1596,16 @@ Phase 0 test inventory:
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
 | `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; no owner is admitted before host durability; recovery reloads persisted fingerprints without polling-time recomputation |
-| `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; terminal calls release them |
+| `tests/execution/test_result_envelope.py` | A successful return becomes a terminal call only with a host-durable envelope; recovery before that boundary recollects the same call; recovery afterward resumes decode and publication without Modal; malformed envelopes fail affected Tasks; unknown envelope recovery retains call slots |
+| `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; a durable successful-call envelope releases slots while its Tasks may remain active |
 | `tests/execution/test_admission.py` | One cycle fills every feasible slot; depth and unfinished descendant span remain primary; equal graph ranks schedule GPU before CPU, stably cohort Runtime Image Keys, then use persisted encounter order; GPU saturation skips only GPU candidates; active-call timing does not change recovery order |
 | `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
-| `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, unknown-state ownership, and expiry projection are deterministic |
+| `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, success requires a durable Result Envelope, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
 | `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
 | `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; non-successful terminals define a backward repair closure; valid publications are reused; unknown or invalid predecessor state fails closed |
 | `tests/execution/test_restart_compatibility.py` | Result-affecting input, content, and declared version changes reject successor creation; operational policy and Deployment Identity changes remain compatible; generic and launch-time restart use the same fingerprint |
-| `tests/workflow/test_ledger.py` | Execution result, artifacts, Task, Node, and Provider Call finalize atomically without attempt rows or paths |
+| `tests/workflow/test_ledger.py` | Result Envelope persistence and Provider Call success commit atomically; publication/artifact and Task completion remain independently recoverable without attempt rows or paths |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves; Prepare result remains coordinator-local, consumes no call slot, and uses publication-gated interruption recovery |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
 | `tests/app/test_alphafold3_production_contracts.py` | Search, run, request, marker, and seed-batch identities remain unchanged |
@@ -1652,7 +1713,10 @@ Deliverables:
 - implement durable coordinator-local ownership without a Task Attempt or
   Provider Call record;
 - implement preclaim, spawn, attachment, observation, collection,
-  cancellation, and unknown-outcome recovery behind the provider port;
+  Result Envelope persistence, cancellation, and unknown-outcome recovery
+  behind the provider port;
+- release successful call slots at envelope durability while preserving
+  unfinished Task ownership through decode, publication, and validation;
 - reuse `ModalJobSubmitter`'s preclaim, attachment, and unknown-spawn
   classifications, but deliberately replace its retryable operation-release
   behavior with the one-spawn preclaim rule;
@@ -1971,7 +2035,8 @@ Rollback: revert the commit; it has no schema effect.
 | Layer | Required verification |
 | --- | --- |
 | Pure model | Graph cycles, readiness, terminal closure, stable fingerprints, task discovery determinism |
-| Call lifecycle | Fault injection around every transition, attach validation, recovery, expiry, cancellation, unknown outcomes |
+| Call lifecycle | Fault injection around every transition, attach validation, Result Envelope durability and replay, recovery, expiry, cancellation, unknown outcomes |
+| Result publication | Call success releases slots before unfinished Task decode/publish/validate; malformed per-Task outcomes fail independently; publication recovery never respawns |
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
 | Batching | Compatibility grouping, maximum-size chunking, immutable call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
 | Dispatch | Fixed preclaim assignment, direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
@@ -1997,6 +2062,7 @@ authorized smoke test after local and CI gates pass.
 | Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate host loops |
 | A batch obscures individual outcomes | Persist Task identities, per-Task outcomes, and explicit call links |
+| Call slots remain occupied by local result processing | Persist a small recoverable Result Envelope, terminally succeed the call, and publish each Task independently |
 | A claim response is lost after assignment | Commit and Volume-checkpoint the assignment before responding; replay by stable request ID |
 | An exit callback races a restarted worker | Treat exit events as advisory and retain call-bound Worker Assignments |
 | Recovery silently spends on a second call | Enforce one Task submission per Run in SQLite; require a Successor Execution Run for failed work |
@@ -2404,6 +2470,19 @@ after each decision:
     interruption may re-enter the hook without creating an attempt or second
     admission. Cancellation prevents replay. Uncontrolled non-idempotent
     external side effects require an idempotency key or tracked Provider Call.
+56. **Result Envelope and split completion — accepted 2026-07-30**: a
+    successfully returned Provider Call becomes `succeeded` only after a small
+    JSON-compatible Result Envelope crosses the host durability boundary. The
+    envelope contains durable per-Task references or conclusive diagnostics,
+    not large scientific payloads, and is excluded from fingerprints. Call
+    success releases its total and optional GPU slots while unfinished Tasks
+    remain `running` through workload decode, publication, and validation.
+    Conclusive per-Task errors fail only those Tasks; unknown publication
+    validation suspends the Run. Recovery before the envelope boundary
+    recollects the same call, while recovery afterward resumes from the stored
+    envelope without another provider invocation. An unrecoverable envelope
+    leaves the call `state_unknown`; there is no `finalizing` call status,
+    Task Attempt, or slot-allocation row.
 
 ## Definition of ready for implementation
 

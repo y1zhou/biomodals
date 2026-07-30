@@ -205,8 +205,20 @@ The kernel lifecycle value for a Provider Call: `submitting`, `attached`,
 `running`, `outcome_unknown`, `state_unknown`, `succeeded`, `failed`, or
 `cancelled`. The first five are nonterminal and preserve ownership; the final
 three are terminal. `outcome_unknown` has no durably attached provider call ID,
-whereas `state_unknown` does.
+whereas `state_unknown` does but cannot conclusively establish provider state,
+terminal result recovery, or cancellation.
 _Avoid_: planned, expired, retrying
+
+**Result Envelope** [planned]:
+A small, durable, JSON-compatible operational record captured from a
+successfully returned Provider Call before that call becomes `succeeded`. It
+maps the call to Task-specific durable result references or conclusive outcome
+diagnostics needed to resume decoding and publication. It may name scientific
+files but never contains large scientific payloads, and it is excluded from
+scientific fingerprints. A successful call releases its slots after this
+envelope crosses the host durability boundary; unfinished Tasks remain
+`running` until their Workload Publications validate.
+_Avoid_: Workload Publication, result archive, raw scientific output
 
 **Dispatch Batch** [planned]:
 A durable grouping of Tasks from one Node offered together to one Provider
@@ -726,8 +738,10 @@ _Avoid_: execution kernel, provider autoscaler
 The pair of coordinator-enforced `max_active_provider_calls` and
 `max_active_gpu_provider_calls` ceilings for one Execution Run. Every
 nonterminal Provider Call consumes one total slot; a call bound to a
-GPU-decorated function also consumes one GPU slot. CPU, RAM, accelerator type,
-GPU count, and actual Modal container packing remain provider-owned.
+GPU-decorated function also consumes one GPU slot. A successfully returned
+call remains nonterminal until its Result Envelope is durable, then releases
+its slots independently of unfinished Task publication. CPU, RAM, accelerator
+type, GPU count, and actual Modal container packing remain provider-owned.
 _Avoid_: Task limit, resource vector, Modal decorator, cross-run global cap
 
 **Runtime Image Key** [planned]:

@@ -91,6 +91,7 @@ class ExecutionRuntime:
         submission_token: str,
         args: tuple[Any, ...] = (),
         kwargs: Mapping[str, Any] | None = None,
+        provider_call_id_kwarg: str | None = None,
         now: int,
     ) -> ProviderCallRecord | None:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
@@ -108,6 +109,7 @@ class ExecutionRuntime:
             submission_token=submission_token,
             args=args,
             kwargs=kwargs,
+            provider_call_id_kwarg=provider_call_id_kwarg,
             now=now,
         )
 
@@ -130,6 +132,7 @@ class ExecutionRuntime:
         submission_token: str,
         args: tuple[Any, ...] = (),
         kwargs: Mapping[str, Any] | None = None,
+        provider_call_id_kwarg: str | None = None,
         now: int,
     ) -> ProviderCallRecord | None:
         """Preclaim and spawn once using an already hydrated exact binding."""
@@ -146,11 +149,22 @@ class ExecutionRuntime:
             return None
         if not preclaim.spawn_authorized:
             return preclaim.call
+        invocation_kwargs = {} if kwargs is None else dict(kwargs)
+        if provider_call_id_kwarg is not None:
+            if not provider_call_id_kwarg:
+                raise ValueError("provider_call_id_kwarg cannot be empty")
+            if provider_call_id_kwarg in invocation_kwargs:
+                raise ValueError(
+                    f"{provider_call_id_kwarg} is supplied by the execution runtime"
+                )
+            invocation_kwargs[provider_call_id_kwarg] = str(
+                preclaim.call.provider_call_id
+            )
         return self._spawn_preclaimed(
             preclaim,
             function=function,
             args=args,
-            kwargs={} if kwargs is None else kwargs,
+            kwargs=invocation_kwargs,
             now=now,
         )
 
@@ -467,6 +481,7 @@ class AsyncExecutionRuntime:
         submission_token: str,
         args: tuple[Any, ...] = (),
         kwargs: Mapping[str, Any] | None = None,
+        provider_call_id_kwarg: str | None = None,
         now: int,
     ) -> ProviderCallRecord | None:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
@@ -490,12 +505,23 @@ class AsyncExecutionRuntime:
             return None
         if not preclaim.spawn_authorized:
             return preclaim.call
+        invocation_kwargs = {} if kwargs is None else dict(kwargs)
+        if provider_call_id_kwarg is not None:
+            if not provider_call_id_kwarg:
+                raise ValueError("provider_call_id_kwarg cannot be empty")
+            if provider_call_id_kwarg in invocation_kwargs:
+                raise ValueError(
+                    f"{provider_call_id_kwarg} is supplied by the execution runtime"
+                )
+            invocation_kwargs[provider_call_id_kwarg] = str(
+                preclaim.call.provider_call_id
+            )
         self._checkpoint_state()
         try:
             handle_id = await self._modal.spawn(
                 function,
                 args=args,
-                kwargs={} if kwargs is None else kwargs,
+                kwargs=invocation_kwargs,
             )
         except ModalDefiniteSubmissionError as error:
             self.repository.fail_provider_call(

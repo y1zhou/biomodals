@@ -397,6 +397,33 @@ def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
     assert checkpoints == ["checkpoint", "checkpoint"]
 
 
+def test_fixed_submission_can_receive_its_durable_call_identity() -> None:
+    repository = create_repository(task_count=1)
+    driver = FakeModalDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+
+    call = runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(),
+        submission_token="batch-with-owner",
+        kwargs={"seed": 0},
+        provider_call_id_kwarg="claim_owner",
+        now=110,
+    )
+
+    assert call is not None
+    assert driver.spawn_kwargs == [
+        {
+            "seed": 0,
+            "claim_owner": str(call.provider_call_id),
+        }
+    ]
+
+
 def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
     repository = create_repository(task_count=1)
     driver = FakeModalDriver()

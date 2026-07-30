@@ -618,7 +618,7 @@ def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
     assert calls["restart"]["workflow"].name == "rfd_ligandmpnn"
 
 
-def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
+def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -652,7 +652,6 @@ def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
         num_rfdiffusion_trajectories=1,
         num_rfdiffusion_designs=1,
         wait=False,
-        strict_artifact_checks=True,
     )
 
     spawn_kwargs = calls["spawn"]

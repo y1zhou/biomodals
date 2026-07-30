@@ -204,6 +204,11 @@ function that mounts and inspects the required volumes. Keep checks run-level
 and derived from recorded `WorkflowArtifact` locations; do not add per-Node
 user settings or tool-specific logic to workflow core.
 
+ShortMD, RFdiffusion-to-LigandMPNN, and PPIFlow install their checker
+unconditionally because they publish app-owned Volume paths. New workflows
+with external outputs must do the same; do not expose a flag that makes normal
+publication validation inconclusive.
+
 The helpers in `workflow.core.artifact_availability` are pure Python so workflow
 modules can call them from a lightweight Modal function that mounts the
 app-owned volumes needed for the run. Use the typed availability contract to

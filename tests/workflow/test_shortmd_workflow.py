@@ -794,7 +794,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert "1 replicate(s)" in stdout
 
 
-def test_submit_shortmd_workflow_can_enable_strict_external_checks(
+def test_submit_shortmd_workflow_enables_external_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -829,7 +829,6 @@ def test_submit_shortmd_workflow_can_enable_strict_external_checks(
         run_id="shortmd-run",
         replicates=1,
         wait=True,
-        strict_artifact_checks=True,
     )
 
     assert calls["spawn"]["strict_external_artifact_checks"] is True

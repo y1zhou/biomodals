@@ -581,7 +581,6 @@ def submit_rfd_ligandmpnn_workflow(
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
-    strict_artifact_checks: bool = False,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "development",
     deployment_name: str | None = None,
@@ -609,8 +608,6 @@ def submit_rfd_ligandmpnn_workflow(
         wait: Wait locally for the remote workflow result.
         max_parallel: Maximum ready workflow Nodes and active Provider Calls.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
-        strict_artifact_checks: Validate referenced RFdiffusion volume artifacts
-            before reusing completed workflow nodes.
         use_deployed_coordinator: Submit through an exact named deployment.
         deployment_environment: Modal Environment containing the deployment.
         deployment_name: Modal app deployment name. Defaults to this workflow.
@@ -668,6 +665,10 @@ def submit_rfd_ligandmpnn_workflow(
         "max_parallel_nodes": max_parallel,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
+        "strict_external_artifact_checks": True,
+        "external_artifact_checker_function_name": (
+            "check_rfd_ligandmpnn_external_artifact"
+        ),
     }
     if not use_deployed_coordinator:
         orchestrator_kwargs["development_function_handles"] = {
@@ -678,11 +679,6 @@ def submit_rfd_ligandmpnn_workflow(
                 check_rfd_ligandmpnn_external_artifact
             ),
         }
-    if strict_artifact_checks:
-        orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker_function_name"] = (
-            "check_rfd_ligandmpnn_external_artifact"
-        )
     total_structures = num_rfdiffusion_trajectories * num_rfdiffusion_designs
     print(
         f"Submitting {CONF.name} '{resolved_run_id}' with "

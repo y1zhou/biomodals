@@ -2926,7 +2926,7 @@ def test_structure_consuming_steps_fail_clearly_without_inputs(
         raise AssertionError("missing PPIFlow inputs should fail clearly")
 
 
-def test_submit_ppiflow_workflow_can_enable_strict_external_checks(
+def test_submit_ppiflow_workflow_enables_external_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2978,7 +2978,6 @@ PPIFlowStep:
         steps_yaml=str(steps_yaml),
         run_id="demo",
         wait=True,
-        strict_artifact_checks=True,
     )
 
     assert calls["spawn"]["strict_external_artifact_checks"] is True

@@ -4582,7 +4582,6 @@ def submit_ppiflow_workflow(
     max_parallel: int = 16,
     max_child_calls: int | None = None,
     dry_run: bool = False,
-    strict_artifact_checks: bool = False,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "development",
     deployment_name: str | None = None,
@@ -4606,8 +4605,6 @@ def submit_ppiflow_workflow(
         max_child_calls: Compatibility cap applied to stage fan-out settings
             and the Run-level active Provider Call limit.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
-        strict_artifact_checks: Validate referenced app-owned volume artifacts
-            before reusing completed workflow nodes.
         use_deployed_coordinator: Submit through an exact named deployment.
         deployment_environment: Modal Environment containing the deployment.
         deployment_name: Modal app deployment name. Defaults to this workflow.
@@ -4678,6 +4675,8 @@ def submit_ppiflow_workflow(
         "max_parallel_nodes": max_parallel,
         "max_active_provider_calls": provider_call_limit,
         "max_active_gpu_provider_calls": provider_call_limit,
+        "strict_external_artifact_checks": True,
+        "external_artifact_checker_function_name": ("check_ppiflow_external_artifact"),
     }
     if not use_deployed_coordinator:
         orchestrator_kwargs["development_function_handles"] = {
@@ -4699,11 +4698,6 @@ def submit_ppiflow_workflow(
             "normalize_ppiflow_stage2_input": normalize_ppiflow_stage2_input,
             "check_ppiflow_external_artifact": check_ppiflow_external_artifact,
         }
-    if strict_artifact_checks:
-        orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker_function_name"] = (
-            "check_ppiflow_external_artifact"
-        )
     print(
         f"Submitting PPIFlow workflow '{resolved_run_id}' with "
         f"{len(workflow.validate().nodes)} node(s)",

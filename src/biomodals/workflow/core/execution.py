@@ -20,7 +20,12 @@ def execution_plan(
         NodePlan(
             node_key=node_id,
             dependencies=tuple(
-                NodeDependency(node_key=dependency)
+                NodeDependency(
+                    node_key=dependency,
+                    accept_partial=(
+                        dependency in definition.nodes[node_id].partial_dependencies
+                    ),
+                )
                 for dependency in encounter_order
                 if dependency in definition.dependencies[node_id]
             ),

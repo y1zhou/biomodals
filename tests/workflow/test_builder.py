@@ -91,6 +91,7 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
         DummyNode(),
         id="second",
         depends_on=[first],
+        accept_partial_from=[first],
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
         allow_empty_result=True,
     )
@@ -104,9 +105,23 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
     assert [dependency.node_key for dependency in plan.nodes[1].dependencies] == [
         "first"
     ]
+    assert plan.nodes[1].dependencies[0].accept_partial is True
     assert plan.nodes[1].aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
     assert plan.nodes[1].allow_empty_result is True
     assert plan.scientific_payload["dag_hash"]
+
+
+def test_partial_acceptance_must_name_an_actual_dependency() -> None:
+    workflow = Workflow("demo")
+    first = workflow.add_node(DummyNode(), id="first")
+    workflow.add_node(
+        DummyNode(),
+        id="second",
+        accept_partial_from=[first],
+    )
+
+    with pytest.raises(ValueError, match="must name a Node dependency"):
+        workflow.validate()
 
 
 def test_workflow_node_is_one_scientifically_identified_task() -> None:

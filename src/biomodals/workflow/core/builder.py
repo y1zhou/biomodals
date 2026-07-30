@@ -44,6 +44,7 @@ class WorkflowNodeSpec:
     allow_empty_result: bool = False
     inputs: dict[str, ArtifactSelector] = field(default_factory=dict)
     control_dependencies: set[str] = field(default_factory=set)
+    partial_dependencies: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class Workflow:
         id: str,
         inputs: dict[str, ArtifactSelector] | None = None,
         depends_on: list[NodeHandle | str] | None = None,
+        accept_partial_from: list[NodeHandle | str] | None = None,
         aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL,
         allow_empty_result: bool = False,
     ) -> NodeHandle:
@@ -82,6 +84,10 @@ class Workflow:
             dependency.node_id if isinstance(dependency, NodeHandle) else dependency
             for dependency in depends_on or []
         }
+        partial_dependencies = {
+            dependency.node_id if isinstance(dependency, NodeHandle) else dependency
+            for dependency in accept_partial_from or []
+        }
         self._nodes[node_id] = WorkflowNodeSpec(
             node_id=node_id,
             node=node,
@@ -89,6 +95,7 @@ class Workflow:
             allow_empty_result=allow_empty_result,
             inputs=inputs or {},
             control_dependencies=control_dependencies,
+            partial_dependencies=partial_dependencies,
         )
         return NodeHandle(node_id=node_id)
 
@@ -115,6 +122,16 @@ class Workflow:
         }
         if missing:
             raise ValueError(f"Unknown workflow node dependencies: {sorted(missing)}")
+        invalid_partial = {
+            node_id: sorted(spec.partial_dependencies - dependencies[node_id])
+            for node_id, spec in self._nodes.items()
+            if spec.partial_dependencies - dependencies[node_id]
+        }
+        if invalid_partial:
+            raise ValueError(
+                "Partial-result acceptance must name a Node dependency: "
+                f"{invalid_partial}"
+            )
         self._raise_for_cycles(dependencies)
         return WorkflowDefinition(
             name=self.name,

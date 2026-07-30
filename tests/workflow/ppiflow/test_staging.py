@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+import hashlib
 import tarfile
 from io import BytesIO
 from pathlib import Path
@@ -119,7 +120,8 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
         roots,
     )
     assert [record.artifact_file_path for record in records] == ["nested/design.pdb"]
-    assert records[0].size_bytes == archive_path.stat().st_size
+    assert records[0].size_bytes == len(b"ATOM\n")
+    assert records[0].content_sha256 == hashlib.sha256(b"ATOM\n").hexdigest()
 
 
 def test_stage2_input_manifest_rows_scan_structure_directory(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import shlex
 import shutil
@@ -22,7 +23,7 @@ from biomodals.app.bioinfo import rosetta_app
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
 from biomodals.app.score import af3score_app, dockq_app
-from biomodals.execution import DeploymentIdentity
+from biomodals.execution import DeploymentIdentity, NodeAggregationPolicy
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     AppRunLayout,
@@ -48,7 +49,9 @@ from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
     RemoteNodeCall,
+    RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
+    RemoteWorkflowTask,
     Workflow,
     WorkflowNativeNode,
     orchestrator,
@@ -1236,7 +1239,10 @@ def run_ppiflow_ligandmpnn_stage(
             return ppiflow_coordinators.CandidateOutcome(
                 candidate_id=task.candidate_id,
                 status=status,
-                outputs={"app_outputs": outputs},
+                outputs={
+                    "app_outputs": outputs,
+                    "files": _inline_output_file_records(outputs),
+                },
             )
         except Exception as exc:  # noqa: BLE001
             return ppiflow_coordinators.CandidateOutcome(
@@ -1428,17 +1434,16 @@ def run_ppiflow_partial_stage(
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
 )
-def run_ppiflow_refold_stage(
+def run_ppiflow_refold_candidate(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None,
+    candidate_id: str,
     config: dict[str, object],
     step_name: str,
     run_name: str,
-    run_id: str,
-    node_id: str,
 ) -> AppRunResult:
-    """Run AlphaFold3 refolding for every selected candidate."""
+    """Run AlphaFold3 refolding for one kernel-owned candidate Task."""
     # TODO: tune CPU/memory/timeout/GPU once ReFold candidate-stage telemetry exists.
     # TODO: sometimes PDB and score files mismatch in length; investigate
     _reload_ppiflow_source_volumes()
@@ -1448,65 +1453,34 @@ def run_ppiflow_refold_stage(
         patterns=_patterns_from_config(config, default=("*.pdb",)),
         max_files=_optional_config_int(config, "max_structures"),
     )
-    selected_structures = [
-        asdict(structure)
-        for structure in ppiflow_staging.candidate_structure_files_from_selected(
+    structures = ppiflow_staging.candidate_structure_files_from_selected(
+        selected,
+        manifest_frame=_candidate_manifest_frame_from_inputs(
+            candidate_manifests or [],
             selected,
-            manifest_frame=_candidate_manifest_frame_from_inputs(
-                candidate_manifests or [],
-                selected,
-                step_name=step_name,
-            ),
-        )
-    ]
-    outcomes = []
-    outputs = []
-    for structure in selected_structures:
-        candidate_id = str(structure["candidate_id"])
-        candidate_run_name = sanitize_filename(f"{run_name}-{candidate_id}")
-        try:
-            candidate_outputs = _run_one_refold_candidate(
-                structure_name=str(structure["file_name"]),
-                structure_bytes=_bytes_payload(structure["data"], "structure data"),
-                candidate_id=candidate_id,
-                run_name=candidate_run_name,
-                step_name=step_name,
-                config=config,
-            )
-            outputs.extend(candidate_outputs)
-            outcomes.append(
-                ppiflow_coordinators.CandidateOutcome(
-                    candidate_id,
-                    AppRunStatus.SUCCEEDED,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            outcomes.append(
-                ppiflow_coordinators.CandidateOutcome(
-                    candidate_id,
-                    AppRunStatus.FAILED,
-                    error=str(exc),
-                )
-            )
-    manifest_output = _write_candidate_manifest_output(
-        run_id=run_id,
-        node_id=node_id,
-        step_name=step_name,
-        rows=ppiflow_coordinators.outcome_manifest_rows(
-            stage_name=step_name,
-            stage_role="refold",
-            operation_mode="alphafold3",
-            outcomes=outcomes,
+            step_name=step_name,
         ),
     )
+    matches = [
+        structure for structure in structures if structure.candidate_id == candidate_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"ReFold candidate {candidate_id!r} resolved to {len(matches)} structures"
+        )
+    structure = matches[0]
+    candidate_run_name = sanitize_filename(f"{run_name}-{candidate_id}")
     return AppRunResult(
-        status=ppiflow_coordinators.status_from_candidate_outcomes(outcomes),
-        outputs=[*outputs, manifest_output],
-        warnings=[
-            f"{outcome.candidate_id}: {outcome.error}"
-            for outcome in outcomes
-            if outcome.error
-        ],
+        status=AppRunStatus.SUCCEEDED,
+        outputs=_run_one_refold_candidate(
+            structure_name=structure.file_name,
+            structure_bytes=structure.data,
+            candidate_id=candidate_id,
+            run_name=candidate_run_name,
+            step_name=step_name,
+            config=config,
+        ),
+        metrics={"candidate_id": candidate_id},
     )
 
 
@@ -1900,23 +1874,96 @@ class RosettaRelaxNode(_RosettaNode):
 
 
 @dataclass
-class ReFoldNode(_ConfiguredAppStepNode):
-    """AlphaFold3 refolding step."""
+class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+    """AlphaFold3 refolding with one kernel Task per candidate."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare AlphaFold3 refolding as one workflow stage call."""
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Discover stable candidate Tasks from the upstream manifest."""
+        rows = _candidate_rows_for_task_discovery(
+            context,
+            max_candidates=_optional_config_int(self.config, "max_structures"),
+        )
+        return tuple(
+            RemoteWorkflowTask(
+                task_key=str(row["candidate_id"]),
+                scientific_payload=row,
+                execution_payload={"candidate_id": str(row["candidate_id"])},
+            )
+            for row in rows
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Prepare one candidate wrapper for kernel submission."""
+        if not isinstance(task.execution_payload, Mapping):
+            raise TypeError("ReFold Task execution payload must be a mapping")
+        candidate_id = str(task.execution_payload["candidate_id"])
+        if candidate_id != task.task_key or context.task_key != task.task_key:
+            raise ValueError("ReFold Task identity does not match its payload")
         return RemoteNodeCall(
-            function_name="run_ppiflow_refold_stage",
+            function_name="run_ppiflow_refold_candidate",
             uses_gpu=False,
             kwargs={
                 "artifacts": self._structure_inputs(context),
                 "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
+                "candidate_id": candidate_id,
                 "config": self.config,
                 "step_name": self.step_name,
                 "run_name": self._run_name(context),
-                "run_id": context.workload_run_key,
-                "node_id": context.node_id,
             },
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Publish deterministic candidate outcomes after all Tasks finish."""
+        candidate_ids = sorted((*results, *errors))
+        rows = [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id=candidate_id,
+                stage_name=self.step_name,
+                stage_role="refold",
+                operation_mode="alphafold3",
+                candidate_status=(
+                    AppRunStatus.SUCCEEDED.value
+                    if candidate_id in results
+                    else AppRunStatus.FAILED.value
+                ),
+                error=errors.get(candidate_id),
+                files=(
+                    _task_result_structure_files(
+                        context,
+                        results[candidate_id],
+                    )
+                    if candidate_id in results
+                    else ()
+                ),
+            )
+            for candidate_id in candidate_ids
+        ]
+        status = (
+            AppRunStatus.PARTIAL
+            if results and errors
+            else AppRunStatus.SUCCEEDED
+            if not errors
+            else AppRunStatus.FAILED
+        )
+        return AppRunResult(
+            status=status,
+            outputs=[_task_manifest_output(context, self.step_name, rows)],
+            warnings=[
+                f"{candidate_id}: {errors[candidate_id]}"
+                for candidate_id in sorted(errors)
+            ],
         )
 
 
@@ -2214,6 +2261,27 @@ def _ligandmpnn_stage_outputs(
     return [*adapted.outputs, *([sequence_output] if sequence_output else [])]
 
 
+def _inline_output_file_records(
+    outputs: Sequence[AppOutput],
+) -> list[dict[str, object]]:
+    """Describe inline candidate outputs with one durable content digest."""
+    return [
+        ppiflow_manifests.candidate_file_record(
+            role=(
+                "structure"
+                if output.kind == ArtifactKind.STRUCTURES
+                else output.kind.value
+            ),
+            path=output.storage.filename,
+            media_type=output.storage.media_type,
+            size_bytes=len(output.storage.data),
+            content_sha256=hashlib.sha256(output.storage.data).hexdigest(),
+        )
+        for output in outputs
+        if isinstance(output.storage, InlineBytes)
+    ]
+
+
 def _inline_csv_table_output(
     *,
     name: str,
@@ -2262,6 +2330,109 @@ def _write_candidate_manifest_output(
         stage_name=step_name,
         row_count=len(rows),
     )
+
+
+def _candidate_rows_for_task_discovery(
+    context: NodeRunContext,
+    *,
+    max_candidates: int | None,
+) -> list[dict[str, object]]:
+    """Load active candidate rows from workflow-owned manifest artifacts."""
+    artifacts = context.inputs.get("candidate_manifest") or []
+    if not artifacts:
+        raise ValueError(
+            f"PPIFlow Node {context.node_id!r} requires a candidate manifest"
+        )
+    frames = [
+        ppiflow_manifests.read_manifest(context.resolve_workflow_artifact(artifact))
+        for artifact in artifacts
+    ]
+    frame = pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
+    ppiflow_manifests.validate_manifest_frame(frame)
+    active = frame.filter(pl.col("candidate_status") == AppRunStatus.SUCCEEDED.value)
+    if max_candidates is not None:
+        active = active.head(max_candidates)
+    rows = active.to_dicts()
+    for row in rows:
+        files = row.get("files")
+        has_structure_digest = isinstance(files, Sequence) and any(
+            isinstance(file_record, Mapping)
+            and file_record.get("role") in {"structure", "structures"}
+            and bool(file_record.get("content_sha256"))
+            for file_record in files
+        )
+        if not has_structure_digest:
+            raise ValueError(
+                "PPIFlow candidate manifest row "
+                f"{row['candidate_id']!r} has no structure content digest"
+            )
+    return rows
+
+
+def _task_manifest_output(
+    context: NodeRunContext,
+    step_name: str,
+    rows: Sequence[Mapping[str, object]],
+) -> AppOutput:
+    """Write one task-aggregated manifest inside the workflow run Volume."""
+    if context.volume_root is None or context.workflow_volume_name is None:
+        raise RuntimeError("Workflow Volume context is unavailable")
+    manifest_path = context.work_dir / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(rows, manifest_path)
+    return ppiflow_manifests.manifest_artifact_output(
+        manifest_path=manifest_path,
+        mount_root=str(context.volume_root),
+        volume_name=context.workflow_volume_name,
+        stage_name=step_name,
+        row_count=len(rows),
+    )
+
+
+def _task_result_structure_files(
+    context: NodeRunContext,
+    result: AppRunResult,
+) -> list[dict[str, object]]:
+    """Describe workflow-owned Task structures for downstream fingerprints."""
+    if context.volume_root is None or context.workflow_volume_name is None:
+        raise RuntimeError("Workflow Volume context is unavailable")
+    records = []
+    for output in result.outputs:
+        if (
+            output.kind != ArtifactKind.STRUCTURES
+            or not isinstance(output.storage, VolumePath)
+            or output.storage.volume_name != context.workflow_volume_name
+        ):
+            continue
+        root = output.storage.at_mountpoint(context.volume_root)
+        paths = (
+            [root]
+            if root.is_file()
+            else sorted(path for path in root.rglob("*") if path.is_file())
+        )
+        for path in paths:
+            relative = path.relative_to(context.volume_root).as_posix()
+            records.append(
+                ppiflow_manifests.candidate_file_record(
+                    role="structure",
+                    workflow_path=relative,
+                    volume_name=context.workflow_volume_name,
+                    path=path.name
+                    if root.is_file()
+                    else path.relative_to(root).as_posix(),
+                    media_type=output.storage.media_type,
+                    size_bytes=path.stat().st_size,
+                    content_sha256=_file_sha256(path),
+                )
+            )
+    return records
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _run_one_refold_candidate(
@@ -2367,6 +2538,7 @@ def _candidate_manifest_frame_from_inputs(
                     role="structure",
                     path=name,
                     size_bytes=len(data),
+                    content_sha256=hashlib.sha256(data).hexdigest(),
                 )
             ],
         )
@@ -2896,6 +3068,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-alphafold3-refold",
             inputs=_structure_inputs(filtered),
+            aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
         )
         report_table_inputs["refold_metrics"] = refold.outputs(kind=ArtifactKind.TABLE)
 
@@ -2915,6 +3088,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-dockq",
             inputs=inputs,
+            accept_partial_from=[refold] if refold is not None else None,
         )
 
     relaxed = None
@@ -2952,6 +3126,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-rank",
             inputs=inputs,
+            accept_partial_from=[refold] if refold is not None else None,
         )
 
     if _step_enabled(enabled, "ReportStep"):
@@ -2965,6 +3140,7 @@ def _add_stage2_nodes(
             ReportNode("ReportStep", _step_cfg(steps, "ReportStep")),
             id="stage2-report",
             inputs=inputs,
+            accept_partial_from=[refold] if refold is not None else None,
         )
 
 
@@ -3204,10 +3380,10 @@ def submit_ppiflow_workflow(
             only, or omit to build both stages.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
-        max_parallel: Maximum number of ready workflow nodes to execute
-            concurrently in one scheduler wave.
-        max_child_calls: Best-effort cap on child app calls submitted inside
-            one PPIFlow stage coordinator container.
+        max_parallel: Maximum number of active provider calls in the Execution
+            Run. The configured candidate concurrency may lower this value.
+        max_child_calls: Additional compatibility cap for PPIFlow stages that
+            have not yet moved their internal fan-out into kernel Tasks.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced app-owned volume artifacts
             before reusing completed workflow nodes.
@@ -3222,6 +3398,8 @@ def submit_ppiflow_workflow(
     task_yaml_bytes = task_yaml_path.read_bytes()
     steps_yaml_bytes = steps_yaml_path.read_bytes()
     task_doc = _load_yaml_bytes(task_yaml_bytes)
+    if max_parallel < 1:
+        raise ValueError("max_parallel must be at least 1")
     if dry_run:
         workflow = build_ppiflow_workflow(
             task_yaml_bytes=task_yaml_bytes,
@@ -3238,6 +3416,15 @@ def submit_ppiflow_workflow(
         app_steps=_active_ppiflow_app_steps(task_doc, stage),
     )
     steps_doc = _inline_rosetta_config_files(steps_doc)
+    provider_call_limit = min(
+        max_parallel,
+        ppiflow_coordinators.candidate_concurrency_from_config(
+            _task_section(task_doc),
+            steps_doc,
+        ),
+    )
+    if max_child_calls is not None:
+        provider_call_limit = min(provider_call_limit, max_child_calls)
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=task_yaml_bytes,
         steps_yaml_bytes=yaml.safe_dump(steps_doc).encode("utf-8"),
@@ -3263,8 +3450,8 @@ def submit_ppiflow_workflow(
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
-        "max_active_provider_calls": max_parallel,
-        "max_active_gpu_provider_calls": max_parallel,
+        "max_active_provider_calls": provider_call_limit,
+        "max_active_gpu_provider_calls": provider_call_limit,
     }
     if not use_deployed_coordinator:
         orchestrator_kwargs["development_function_handles"] = {
@@ -3274,7 +3461,7 @@ def submit_ppiflow_workflow(
             "run_ppiflow_flowpacker_stage": run_ppiflow_flowpacker_stage,
             "run_ppiflow_af3score_stage": run_ppiflow_af3score_stage,
             "run_ppiflow_rosetta_stage": run_ppiflow_rosetta_stage,
-            "run_ppiflow_refold_stage": run_ppiflow_refold_stage,
+            "run_ppiflow_refold_candidate": run_ppiflow_refold_candidate,
             "run_ppiflow_dockq_stage": run_ppiflow_dockq_stage,
             "filter_ppiflow_artifacts": filter_ppiflow_artifacts,
             "derive_ppiflow_fixed_positions": derive_ppiflow_fixed_positions,

@@ -4,6 +4,7 @@
 
 import pickle
 import tarfile
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +26,10 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow import ppiflow_workflow
-from biomodals.workflow.core import NodeRunContext, RemoteWorkflowNode
+from biomodals.workflow.core import (
+    NodeRunContext,
+    RemoteWorkflowNode,
+)
 from biomodals.workflow.core._runtime import hashing
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow_workflow import (
@@ -189,7 +193,7 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
 
     for function_name in (
         "run_ppiflow_ligandmpnn_stage",
-        "run_ppiflow_refold_stage",
+        "run_ppiflow_refold_candidate",
         "run_ppiflow_partial_stage",
         "run_ppiflow_flowpacker_stage",
         "run_ppiflow_dockq_stage",
@@ -706,48 +710,105 @@ def test_rosetta_stage_records_partial_candidate_manifest(
 
 
 def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> None:
-    pdb_bytes = (
-        b"ATOM      1  CA  ALA A   1      0.000   0.000   0.000  1.00  0.00           C\n"
-        b"ATOM      2  CA  CYS A   2      0.000   0.000   0.000  1.00  0.00           C\n"
+    manifest_path = tmp_path / "manifests" / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="candidate-a",
+                stage_name="FilterStep_stage2",
+                stage_role="filter",
+                operation_mode="retained",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        content_sha256="0" * 64,
+                    )
+                ],
+            )
+        ],
+        manifest_path,
     )
-    _ = pdb_bytes
+    manifest = WorkflowArtifact(
+        artifact_id="candidate-manifest",
+        producing_node_id="stage2-filter",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=manifest_path.relative_to(tmp_path).as_posix(),
+        ),
+    )
     node = ppiflow_workflow.ReFoldNode(
         "ReFoldStep",
         {"run_name": "refold-run", "model_seeds": [3], "recycle": 2, "sample": 1},
     )
-
-    submission = node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id="stage2-alphafold3-refold",
-            task_key="node",
-            work_dir=tmp_path / "result",
-            cache_dir=tmp_path / "cache",
-            inputs={"structures": [_upstream_structure_artifact()]},
-        )
+    context = NodeRunContext(
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
+        node_id="stage2-alphafold3-refold",
+        task_key="node",
+        work_dir=tmp_path / "result",
+        cache_dir=tmp_path / "cache",
+        inputs={
+            "structures": [_upstream_structure_artifact()],
+            "candidate_manifest": [manifest],
+        },
+        volume_root=tmp_path,
+        workflow_volume_name="workflow-volume",
+    )
+    [task] = node.discover_remote_tasks(context)
+    submission = node.prepare_remote_task(
+        replace(context, task_key=task.task_key),
+        task,
     )
 
-    assert submission.function_name == "run_ppiflow_refold_stage"
+    assert task.task_key == "candidate-a"
+    assert submission.function_name == "run_ppiflow_refold_candidate"
+    assert submission.kwargs["candidate_id"] == "candidate-a"
     assert submission.kwargs["config"]["recycle"] == 2
     assert submission.kwargs["config"]["sample"] == 1
     assert submission.kwargs["config"]["model_seeds"] == [3]
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
 
 
-def test_refold_defers_multi_structure_selection_to_tracked_stage(
+def test_refold_discovers_manifest_candidates_in_order(
     tmp_path: Path,
 ) -> None:
-    artifacts = [
-        _upstream_structure_artifact(),
-        _upstream_structure_artifact(metadata={"candidate_id": "second"}),
-    ]
+    manifest_path = tmp_path / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id=candidate_id,
+                stage_name="FilterStep_stage2",
+                stage_role="filter",
+                operation_mode="retained",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        content_sha256="0" * 64,
+                    )
+                ],
+            )
+            for candidate_id in ("candidate-b", "candidate-a")
+        ],
+        manifest_path,
+    )
+    manifest = WorkflowArtifact(
+        artifact_id="candidate-manifest",
+        producing_node_id="stage2-filter",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=manifest_path.name,
+        ),
+    )
     node = ppiflow_workflow.ReFoldNode(
         "ReFoldStep",
-        {"run_name": "refold-run"},
+        {"run_name": "refold-run", "max_structures": 1},
     )
 
-    submission = node.prepare_remote(
+    tasks = node.discover_remote_tasks(
         NodeRunContext(
             execution_run_id=RUN_ID,
             workload_run_key="run-1",
@@ -755,12 +816,16 @@ def test_refold_defers_multi_structure_selection_to_tracked_stage(
             task_key="node",
             work_dir=tmp_path / "result",
             cache_dir=tmp_path / "cache",
-            inputs={"structures": artifacts},
+            inputs={
+                "structures": [_upstream_structure_artifact()],
+                "candidate_manifest": [manifest],
+            },
+            volume_root=tmp_path,
+            workflow_volume_name="workflow-volume",
         )
     )
 
-    assert submission.function_name == "run_ppiflow_refold_stage"
-    assert submission.kwargs["artifacts"] == artifacts
+    assert [task.task_key for task in tasks] == ["candidate-b"]
 
 
 def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> None:
@@ -1283,6 +1348,8 @@ PPIFlowStep:
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == ppiflow_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
+    assert calls["spawn"]["max_active_provider_calls"] == 4
+    assert calls["spawn"]["max_active_gpu_provider_calls"] == 4
     assert "force" not in calls["spawn"]
 
 
@@ -1360,6 +1427,13 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-filter",
         "stage2-alphafold3-refold",
     }
+    assert (
+        definition.nodes["stage2-alphafold3-refold"].aggregation_policy
+        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
+    )
+    assert definition.nodes["stage2-dockq"].partial_dependencies == {
+        "stage2-alphafold3-refold"
+    }
     assert definition.dependencies["stage2-rosetta-relax"] == {
         "stage2-filter",
         "stage2-dockq",
@@ -1369,6 +1443,9 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-alphafold3-refold",
         "stage2-rosetta-relax",
         "stage2-dockq",
+    }
+    assert definition.nodes["stage2-rank"].partial_dependencies == {
+        "stage2-alphafold3-refold"
     }
     assert (
         definition.nodes["stage2-rank"].inputs["refold_metrics"].kind

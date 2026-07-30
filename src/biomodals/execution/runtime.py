@@ -76,6 +76,10 @@ class ExecutionRuntime:
         self._modal = modal_driver
         self._checkpoint = checkpoint
 
+    def checkpoint(self) -> None:
+        """Cross the host durability boundary for caller-owned transitions."""
+        self._checkpoint()
+
     def submit_fixed_batch(
         self,
         execution_run_id: UUID,
@@ -356,6 +360,10 @@ class AsyncExecutionRuntime:
         self.repository = repository
         self._modal = modal_driver
         self._checkpoint = checkpoint
+
+    def checkpoint(self) -> None:
+        """Cross the host durability boundary for caller-owned transitions."""
+        self._checkpoint()
 
     async def submit_fixed_batch(
         self,

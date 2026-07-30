@@ -129,7 +129,7 @@ TERMINAL_JOB_STATES = (
 )
 RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 4
+_SERVICE_SCHEMA_VERSION = 5
 _RESULT_PACKAGING_OPERATION = "result_packaging"
 _JOB_OPERATIONS_TABLE_SQL = """
 CREATE TABLE job_operations (
@@ -494,6 +494,12 @@ class ServiceStore:
                         ON jobs(owner_user_id, created_at DESC);
                     CREATE INDEX jobs_active
                         ON jobs(state, owner_user_id, workload);
+
+                    CREATE TABLE job_inputs (
+                        job_id TEXT PRIMARY KEY REFERENCES jobs(job_id)
+                            ON DELETE CASCADE,
+                        content BLOB NOT NULL
+                    );
 
                     {_JOB_OPERATIONS_TABLE_SQL};
                     {_JOB_OPERATIONS_ACTIVE_INDEX_SQL};
@@ -1263,6 +1269,7 @@ class ServiceStore:
         execution_run_id: UUID | None = None,
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
+        input_content: bytes | None = None,
     ) -> JobAdmission:
         """Atomically apply idempotency and every active Job admission limit."""
         workload = configuration.workload
@@ -1288,6 +1295,8 @@ class ServiceStore:
             )
         elif execution_plan.workload_name != workload:
             raise ValueError("Execution Plan workload does not match Job workload")
+        if input_content is not None and not input_content:
+            raise ValueError("Staged Job input cannot be empty")
         if artifact_request_sha256 is not None and (
             len(artifact_request_sha256) != 64
             or any(
@@ -1459,6 +1468,11 @@ class ServiceStore:
                     now,
                 ),
             )
+            if input_content is not None:
+                conn.execute(
+                    "INSERT INTO job_inputs (job_id, content) VALUES (?, ?)",
+                    (str(job_id), input_content),
+                )
             if execution_plan is not None:
                 SqliteExecutionRepository(conn).create_run(
                     execution_run_id=cast(UUID, execution_run_id),
@@ -1685,6 +1699,23 @@ class ServiceStore:
         """Open one atomic kernel-state transaction in the service database."""
         with self._transaction() as conn:
             yield SqliteExecutionRepository(conn)
+
+    def load_job_input(self, job_id: UUID) -> bytes | None:
+        """Load a temporary service-owned input needed before remote staging."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT content FROM job_inputs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return None if row is None else bytes(row["content"])
+
+    def clear_job_input(self, job_id: UUID) -> None:
+        """Delete input bytes after the workload has durably staged them."""
+        with self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM job_inputs WHERE job_id = ?",
+                (str(job_id),),
+            )
 
     @contextmanager
     def async_execution_runtime(

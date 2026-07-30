@@ -153,6 +153,7 @@ def test_job_admission_atomically_links_a_new_execution_run(tmp_path: Path) -> N
         key="execution-job",
         execution_plan=plan,
         execution_run_id=execution_run_id,
+        input_content=b"ATOM\n",
     )
 
     assert admission.job.execution_run_id == execution_run_id
@@ -162,6 +163,11 @@ def test_job_admission_atomically_links_a_new_execution_run(tmp_path: Path) -> N
     assert run.deployment == DeploymentIdentity("production", "Gromacs", 1)
     assert run.max_active_provider_calls == 3
     assert run.max_active_gpu_provider_calls == 1
+    assert store.load_job_input(admission.job.job_id) == b"ATOM\n"
+
+    store.clear_job_input(admission.job.job_id)
+
+    assert store.load_job_input(admission.job.job_id) is None
 
 
 def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:
@@ -214,6 +220,7 @@ def admit(
     artifact_request_sha256: str | None = None,
     execution_plan: ExecutionPlan | None = None,
     execution_run_id: UUID | None = None,
+    input_content: bytes | None = None,
 ):
     store.update_user(
         owner_user_id,
@@ -246,6 +253,7 @@ def admit(
         execution_run_id=execution_run_id,
         max_active_provider_calls=3 if execution_plan is not None else None,
         max_active_gpu_provider_calls=1 if execution_plan is not None else None,
+        input_content=input_content,
     )
 
 

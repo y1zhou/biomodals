@@ -9,6 +9,11 @@ from uuid import UUID
 
 import pytest
 
+from biomodals.execution import (
+    DeploymentIdentity,
+    ExecutionPlan,
+    NodePlan,
+)
 from biomodals.service.auth import AuthService
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.runtime_config import (
@@ -93,6 +98,44 @@ def test_job_operations_are_the_only_durable_stage_ledger(tmp_path: Path) -> Non
         "started_at",
         "completed_at",
     } == operation_columns
+
+
+def test_service_database_embeds_host_invariant_execution_tables(
+    tmp_path: Path,
+) -> None:
+    store, _alice, _bob = make_store(tmp_path)
+
+    with sqlite3.connect(store.path) as conn:
+        job_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)")}
+        execution_foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(execution_runs)"
+        ).fetchall()
+
+    assert "execution_run_id" in job_columns
+    assert {str(row[2]) for row in execution_foreign_keys} <= {"execution_runs"}
+
+
+def test_service_execution_repository_uses_the_service_transaction(
+    tmp_path: Path,
+) -> None:
+    store, _alice, _bob = make_store(tmp_path)
+    execution_run_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+    with store.execution_repository() as repository:
+        repository.create_run(
+            execution_run_id=execution_run_id,
+            plan=ExecutionPlan(
+                workload_name="test",
+                nodes=(NodePlan(node_key="work"),),
+            ),
+            deployment=DeploymentIdentity("production", "test-app", 1),
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=0,
+            now=10,
+        )
+
+    with store.execution_repository() as repository:
+        assert repository.get_run(execution_run_id).plan.workload_name == "test"
 
 
 def test_job_lifecycle_lock_registry_releases_unused_locks() -> None:

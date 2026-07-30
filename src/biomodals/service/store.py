@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import orjson
 
+from biomodals.execution import SqliteExecutionRepository
 from biomodals.service.runtime_config import (
     JobAdmissionConfiguration,
     ModalConfigurationSnapshot,
@@ -122,7 +123,7 @@ TERMINAL_JOB_STATES = (
 )
 RECONCILABLE_JOB_STATES = (*PROVIDER_TRACKED_JOB_STATES, JobState.BLOCKED)
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 3
+_SERVICE_SCHEMA_VERSION = 4
 _RESULT_PACKAGING_OPERATION = "result_packaging"
 _JOB_OPERATIONS_TABLE_SQL = """
 CREATE TABLE job_operations (
@@ -433,6 +434,7 @@ class ServiceStore:
                     CREATE TABLE jobs (
                         job_id TEXT PRIMARY KEY,
                         owner_user_id TEXT NOT NULL REFERENCES users(user_id),
+                        execution_run_id TEXT UNIQUE,
                         workload TEXT NOT NULL,
                         display_name TEXT NOT NULL,
                         idempotency_key TEXT NOT NULL,
@@ -511,10 +513,16 @@ class ServiceStore:
                             )
                     );
 
-                    PRAGMA user_version = {_SERVICE_SCHEMA_VERSION};
-                    COMMIT;
                     """
                 )
+                try:
+                    SqliteExecutionRepository(conn).initialize_schema()
+                    conn.execute(f"PRAGMA user_version = {_SERVICE_SCHEMA_VERSION}")
+                except BaseException:
+                    conn.rollback()
+                    raise
+                else:
+                    conn.commit()
             elif version != _SERVICE_SCHEMA_VERSION:
                 raise RuntimeError(
                     "Unsupported pre-release service database version "
@@ -546,6 +554,9 @@ class ServiceStore:
             ):
                 raise RuntimeError("SQLite schema is unavailable")
             conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+            conn.execute(
+                "SELECT version FROM execution_schema WHERE singleton = 1"
+            ).fetchone()
         except sqlite3.Error as exc:
             raise RuntimeError("SQLite readiness check failed") from exc
         finally:
@@ -1615,6 +1626,12 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             return _job_from_row_with_operations(conn, row)
+
+    @contextmanager
+    def execution_repository(self) -> Iterator[SqliteExecutionRepository]:
+        """Open one atomic kernel-state transaction in the service database."""
+        with self._transaction() as conn:
+            yield SqliteExecutionRepository(conn)
 
     def list_operations(self, job_id: UUID) -> list[JobOperationRecord]:
         """List every durable remote or local operation for one Job."""

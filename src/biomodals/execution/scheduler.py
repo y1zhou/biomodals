@@ -60,16 +60,24 @@ def required_node_ranks(
     unfinished_node_keys: set[str],
 ) -> dict[str, NodeAdmissionRank]:
     """Calculate depth and unfinished descendant span in one required closure."""
+    nodes = {node.node_key: node for node in plan.nodes}
     depths: dict[str, int] = {}
-    for node in plan.nodes:
-        if node.node_key not in required_node_keys:
-            continue
+
+    def depth(node_key: str) -> int:
+        if node_key in depths:
+            return depths[node_key]
+        node = nodes[node_key]
         dependency_depths = [
-            depths[dependency.node_key]
+            depth(dependency.node_key)
             for dependency in node.dependencies
             if dependency.node_key in required_node_keys
         ]
-        depths[node.node_key] = max(dependency_depths) + 1 if dependency_depths else 0
+        value = max(dependency_depths) + 1 if dependency_depths else 0
+        depths[node_key] = value
+        return value
+
+    for node_key in required_node_keys:
+        depth(node_key)
 
     dependents: dict[str, list[str]] = defaultdict(list)
     for node in plan.nodes:

@@ -77,6 +77,28 @@ def test_required_node_rank_uses_depth_and_unfinished_descendant_span() -> None:
     assert ranks["result"].unblocking_span == 0
 
 
+def test_required_node_rank_accepts_non_topological_encounter_order() -> None:
+    plan = ExecutionPlan(
+        workload_name="reverse-order",
+        nodes=(
+            NodePlan(
+                node_key="downstream",
+                dependencies=(NodeDependency(node_key="upstream"),),
+            ),
+            NodePlan(node_key="upstream"),
+        ),
+    )
+
+    ranks = required_node_ranks(
+        plan,
+        required_node_keys={"upstream", "downstream"},
+        unfinished_node_keys={"upstream", "downstream"},
+    )
+
+    assert ranks["upstream"].depth == 0
+    assert ranks["downstream"].depth == 1
+
+
 def test_admission_keeps_graph_rank_primary_then_gpu_and_image_cohorts() -> None:
     candidates = (
         _candidate("cpu-critical", 0, binding=CPU_X, depth=3),

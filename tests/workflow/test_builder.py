@@ -10,6 +10,10 @@ import biomodals.workflow as workflow_api
 from biomodals.schema import ArtifactKind
 from biomodals.workflow import Workflow
 from biomodals.workflow.core.builder import NodeHandle
+from biomodals.workflow.core.execution import (
+    execution_plan,
+    node_task_plan,
+)
 from biomodals.workflow.core.nodes import WorkflowNativeNode
 
 
@@ -77,3 +81,28 @@ def test_cycles_raise_value_error() -> None:
 
     with pytest.raises(ValueError, match="cycle"):
         workflow.validate()
+
+
+def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None:
+    workflow = Workflow("demo")
+    first = workflow.add_node(DummyNode(), id="first")
+    workflow.add_node(DummyNode(), id="second", depends_on=[first])
+    definition = workflow.validate()
+
+    plan = execution_plan(definition, workload_run_key="run-1")
+
+    assert plan.workload_name == "workflow:demo"
+    assert plan.workload_run_key == "run-1"
+    assert plan.node_keys == ("first", "second")
+    assert [dependency.node_key for dependency in plan.nodes[1].dependencies] == [
+        "first"
+    ]
+    assert plan.scientific_payload["dag_hash"]
+
+
+def test_workflow_node_is_one_scientifically_identified_task() -> None:
+    task = node_task_plan("score")
+
+    assert task.task_key == "node"
+    assert task.scientific_payload == {"workflow_node_id": "score"}
+    assert task.execution_payload is None

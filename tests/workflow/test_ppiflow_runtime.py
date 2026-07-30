@@ -3,11 +3,11 @@
 # ruff: noqa: D101, D102, D103, D107
 
 import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+import orjson
 import pytest
 
 from biomodals.execution import (
@@ -114,7 +114,7 @@ class RosettaPlanSourceNode(WorkflowNativeNode):
                     name="rosetta_task_plan",
                     kind=ArtifactKind.TABLE,
                     storage=InlineBytes(
-                        data=json.dumps({
+                        data=orjson.dumps({
                             "schema_version": 1,
                             "run_name": "rosetta-run",
                             "run_id": "rosetta-id",
@@ -125,7 +125,7 @@ class RosettaPlanSourceNode(WorkflowNativeNode):
                             "claim_capacity": len(self.tasks),
                             "max_parallel_per_worker": len(self.tasks),
                             "tasks": [task.to_dict() for task in self.tasks],
-                        }).encode(),
+                        }),
                         filename="rosetta_task_plan.json",
                         media_type="application/json",
                     ),

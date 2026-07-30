@@ -12,9 +12,11 @@ from biomodals.execution.model import (
     ActiveProviderCallCounts,
     AvailabilityStatus,
     DeploymentIdentity,
+    DispatchMode,
     ExecutionNodeRecord,
     ExecutionPlan,
     ExecutionRunRecord,
+    ExecutionSnapshot,
     ExecutionTaskRecord,
     NodeAggregationPolicy,
     NodeDependency,
@@ -24,11 +26,13 @@ from biomodals.execution.model import (
     ProviderCallPreclaim,
     ProviderCallRecord,
     ProviderCallStatus,
+    PullTaskClaim,
     ResultProvenance,
     RunStatus,
     RunStatusReason,
     TaskPlan,
     TaskStatus,
+    WorkerAssignmentRecord,
     WorkStatusReason,
 )
 from biomodals.execution.scheduler import aggregate_task_outcome, terminal_run_outcome
@@ -170,6 +174,8 @@ _SCHEMA_STATEMENTS = (
         node_key TEXT NOT NULL,
         mode TEXT NOT NULL,
         compatibility_key TEXT NOT NULL,
+        policy_json TEXT NOT NULL,
+        claim_capacity INTEGER CHECK (claim_capacity > 0),
         created_at INTEGER NOT NULL,
         FOREIGN KEY (execution_run_id, node_key)
             REFERENCES execution_nodes(execution_run_id, node_key)
@@ -186,6 +192,7 @@ _SCHEMA_STATEMENTS = (
             ON DELETE CASCADE,
         submission_token TEXT NOT NULL,
         preclaim_json TEXT NOT NULL,
+        dispatch_mode TEXT NOT NULL,
         provider_environment TEXT NOT NULL,
         provider_app_name TEXT NOT NULL,
         provider_app_version INTEGER NOT NULL
@@ -226,18 +233,68 @@ _SCHEMA_STATEMENTS = (
             REFERENCES execution_dispatch_batches(dispatch_batch_id),
         provider_call_id TEXT
             REFERENCES execution_provider_calls(provider_call_id),
+        worker_provider_call_id TEXT
+            REFERENCES execution_provider_calls(provider_call_id),
         local_owned INTEGER NOT NULL DEFAULT 0 CHECK (local_owned IN (0, 1)),
         error_message TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         started_at INTEGER,
         completed_at INTEGER,
-        CHECK (local_owned = 0 OR provider_call_id IS NULL),
+        CHECK (
+            (provider_call_id IS NULL OR worker_provider_call_id IS NULL)
+            AND (
+                local_owned = 0
+                OR (
+                    provider_call_id IS NULL
+                    AND worker_provider_call_id IS NULL
+                )
+            )
+        ),
         PRIMARY KEY (execution_run_id, node_key, task_key),
         UNIQUE (execution_run_id, node_key, ordinal),
         FOREIGN KEY (execution_run_id, node_key)
             REFERENCES execution_nodes(execution_run_id, node_key)
             ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE execution_task_claim_requests (
+        request_id TEXT PRIMARY KEY,
+        provider_call_id TEXT NOT NULL
+            REFERENCES execution_provider_calls(provider_call_id)
+            ON DELETE CASCADE,
+        capacity INTEGER NOT NULL CHECK (capacity > 0),
+        created_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE execution_worker_assignments (
+        execution_run_id TEXT NOT NULL,
+        node_key TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        provider_call_id TEXT NOT NULL
+            REFERENCES execution_provider_calls(provider_call_id),
+        request_id TEXT NOT NULL
+            REFERENCES execution_task_claim_requests(request_id),
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (execution_run_id, node_key, task_key),
+        UNIQUE (request_id, ordinal),
+        FOREIGN KEY (execution_run_id, node_key, task_key)
+            REFERENCES execution_tasks(execution_run_id, node_key, task_key)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE execution_task_completion_requests (
+        request_id TEXT PRIMARY KEY,
+        provider_call_id TEXT NOT NULL
+            REFERENCES execution_provider_calls(provider_call_id),
+        task_key TEXT NOT NULL,
+        observation TEXT NOT NULL,
+        message TEXT,
+        created_at INTEGER NOT NULL
     )
     """,
     """
@@ -417,6 +474,22 @@ class SqliteExecutionRepository:
         if row is None:
             raise ExecutionRunNotFoundError(str(execution_run_id))
         return _run_from_row(row)
+
+    def snapshot(self, execution_run_id: UUID) -> ExecutionSnapshot:
+        """Return a common read-only execution view for host projections."""
+        nodes = self.list_nodes(execution_run_id)
+        tasks = tuple(
+            task
+            for node in nodes
+            for task in self.list_tasks(execution_run_id, node.node_key)
+        )
+        return ExecutionSnapshot(
+            run=self.get_run(execution_run_id),
+            nodes=nodes,
+            tasks=tasks,
+            provider_calls=self.list_provider_calls(execution_run_id),
+            active_provider_calls=self.active_provider_call_counts(execution_run_id),
+        )
 
     def list_nodes(self, execution_run_id: UUID) -> tuple[ExecutionNodeRecord, ...]:
         """Load planned Nodes in their persisted encounter order."""
@@ -753,6 +826,7 @@ class SqliteExecutionRepository:
                 task.status != TaskStatus.PENDING
                 or task.result_observation != AvailabilityStatus.MISSING
                 or task.provider_call_id is not None
+                or task.worker_provider_call_id is not None
                 or task.local_owned
             ):
                 raise ValueError(
@@ -769,15 +843,18 @@ class SqliteExecutionRepository:
                 node_key,
                 mode,
                 compatibility_key,
+                policy_json,
                 created_at
             )
-            VALUES (?, ?, ?, 'fixed_batch', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(dispatch_batch_id),
                 str(execution_run_id),
                 node_key,
+                DispatchMode.FIXED_BATCH.value,
                 compatibility_key,
+                preclaim_json,
                 now,
             ),
         )
@@ -790,6 +867,7 @@ class SqliteExecutionRepository:
                 dispatch_batch_id,
                 submission_token,
                 preclaim_json,
+                dispatch_mode,
                 provider_environment,
                 provider_app_name,
                 provider_app_version,
@@ -800,7 +878,7 @@ class SqliteExecutionRepository:
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(provider_call_id),
@@ -809,6 +887,7 @@ class SqliteExecutionRepository:
                 str(dispatch_batch_id),
                 submission_token,
                 preclaim_json,
+                DispatchMode.FIXED_BATCH.value,
                 binding.environment,
                 binding.app_name,
                 binding.app_version,
@@ -849,6 +928,425 @@ class SqliteExecutionRepository:
             spawn_authorized=True,
         )
 
+    def preclaim_pull_worker(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        submission_token: str,
+        binding: ProviderBinding,
+        compatibility_key: str,
+        claim_capacity: int,
+        now: int,
+    ) -> ProviderCallPreclaim | None:
+        """Admit one derived pull-worker call without assigning Tasks yet."""
+        if not submission_token:
+            raise ValueError("submission token cannot be empty")
+        if claim_capacity <= 0:
+            raise ValueError("claim_capacity must be positive")
+        policy_json = _dump_json({
+            "binding": _binding_json_value(binding),
+            "claim_capacity": claim_capacity,
+            "compatibility_key": compatibility_key,
+            "node_key": node_key,
+        })
+        preclaim_json = _dump_json({
+            "mode": DispatchMode.PULL_WORKER.value,
+            "policy": json.loads(policy_json),
+            "submission_token": submission_token,
+        })
+        existing = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_provider_calls
+            WHERE execution_run_id = ? AND submission_token = ?
+            """,
+            (str(execution_run_id), submission_token),
+        ).fetchone()
+        if existing is not None:
+            if existing["preclaim_json"] != preclaim_json:
+                raise ValueError("submission token was reused for different work")
+            return ProviderCallPreclaim(
+                call=self._provider_call_from_row(existing),
+                spawn_authorized=False,
+            )
+
+        run = self.get_run(execution_run_id)
+        if run.status != RunStatus.RUNNING:
+            return None
+        node = self.get_node(execution_run_id, node_key)
+        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+            raise ValueError("Pull-worker Node is not ready for admission")
+        invalid_task = self._connection.execute(
+            """
+            SELECT task_key
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status = ?
+                AND result_observation != ?
+            LIMIT 1
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                TaskStatus.PENDING.value,
+                AvailabilityStatus.MISSING.value,
+            ),
+        ).fetchone()
+        if invalid_task is not None:
+            raise ValueError(
+                f"Task {invalid_task['task_key']!r} was not cache-validated"
+            )
+
+        batch = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_dispatch_batches
+            WHERE execution_run_id = ? AND node_key = ? AND mode = ?
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                DispatchMode.PULL_WORKER.value,
+            ),
+        ).fetchone()
+        if batch is not None and batch["policy_json"] != policy_json:
+            raise ValueError("pull-worker policy cannot change within a Run")
+
+        unfinished = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status IN (?, ?)
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        ).fetchone()["count"]
+        desired_workers = (unfinished + claim_capacity - 1) // claim_capacity
+        existing_workers = (
+            0
+            if batch is None
+            else self._connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM execution_provider_calls
+                WHERE dispatch_batch_id = ?
+                    AND status NOT IN (?, ?, ?)
+                """,
+                (
+                    batch["dispatch_batch_id"],
+                    ProviderCallStatus.SUCCEEDED.value,
+                    ProviderCallStatus.FAILED.value,
+                    ProviderCallStatus.CANCELLED.value,
+                ),
+            ).fetchone()["count"]
+        )
+        if existing_workers >= desired_workers:
+            return None
+        counts = self.active_provider_call_counts(execution_run_id)
+        if counts.total >= run.max_active_provider_calls:
+            return None
+        if binding.uses_gpu and counts.gpu >= run.max_active_gpu_provider_calls:
+            return None
+
+        if batch is None:
+            dispatch_batch_id = uuid4()
+            self._connection.execute(
+                """
+                INSERT INTO execution_dispatch_batches (
+                    dispatch_batch_id,
+                    execution_run_id,
+                    node_key,
+                    mode,
+                    compatibility_key,
+                    policy_json,
+                    claim_capacity,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(dispatch_batch_id),
+                    str(execution_run_id),
+                    node_key,
+                    DispatchMode.PULL_WORKER.value,
+                    compatibility_key,
+                    policy_json,
+                    claim_capacity,
+                    now,
+                ),
+            )
+        else:
+            dispatch_batch_id = UUID(batch["dispatch_batch_id"])
+
+        provider_call_id = uuid4()
+        self._connection.execute(
+            """
+            INSERT INTO execution_provider_calls (
+                provider_call_id,
+                execution_run_id,
+                node_key,
+                dispatch_batch_id,
+                submission_token,
+                preclaim_json,
+                dispatch_mode,
+                provider_environment,
+                provider_app_name,
+                provider_app_version,
+                provider_function_name,
+                uses_gpu,
+                runtime_image_key,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(provider_call_id),
+                str(execution_run_id),
+                node_key,
+                str(dispatch_batch_id),
+                submission_token,
+                preclaim_json,
+                DispatchMode.PULL_WORKER.value,
+                binding.environment,
+                binding.app_name,
+                binding.app_version,
+                binding.function_name,
+                int(binding.uses_gpu),
+                binding.runtime_image_key,
+                ProviderCallStatus.SUBMITTING.value,
+                now,
+                now,
+            ),
+        )
+        return ProviderCallPreclaim(
+            call=self.get_provider_call(provider_call_id),
+            spawn_authorized=True,
+        )
+
+    def claim_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        *,
+        request_id: str,
+        capacity: int,
+        now: int,
+    ) -> PullTaskClaim:
+        """Checkpoint an ordered Task microbatch before returning its payloads."""
+        if not request_id:
+            raise ValueError("claim request ID cannot be empty")
+        if capacity <= 0:
+            raise ValueError("claim capacity must be positive")
+        call = self.get_provider_call(provider_call_id)
+        existing = self._connection.execute(
+            """
+            SELECT provider_call_id, capacity
+            FROM execution_task_claim_requests
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["provider_call_id"] != str(provider_call_id)
+                or existing["capacity"] != capacity
+            ):
+                raise ValueError("claim request ID was reused for another claim")
+            return self._load_pull_task_claim(request_id)
+        if call.dispatch_mode != DispatchMode.PULL_WORKER:
+            raise ValueError("Provider Call is not a pull worker")
+        if call.status not in {
+            ProviderCallStatus.ATTACHED,
+            ProviderCallStatus.RUNNING,
+        }:
+            raise ValueError(f"cannot claim Tasks for {call.status.value} worker")
+        batch = self._connection.execute(
+            """
+            SELECT claim_capacity
+            FROM execution_dispatch_batches
+            WHERE dispatch_batch_id = ?
+            """,
+            (str(call.dispatch_batch_id),),
+        ).fetchone()
+        if capacity > batch["claim_capacity"]:
+            raise ValueError("claim capacity exceeds the pull-worker policy")
+
+        self._connection.execute(
+            """
+            INSERT INTO execution_task_claim_requests (
+                request_id,
+                provider_call_id,
+                capacity,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (request_id, str(provider_call_id), capacity, now),
+        )
+        rows = self._connection.execute(
+            """
+            SELECT task_key
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status = ?
+                AND result_observation = ?
+                AND provider_call_id IS NULL
+                AND worker_provider_call_id IS NULL
+                AND local_owned = 0
+            ORDER BY ordinal
+            LIMIT ?
+            """,
+            (
+                str(call.execution_run_id),
+                call.node_key,
+                TaskStatus.PENDING.value,
+                AvailabilityStatus.MISSING.value,
+                capacity,
+            ),
+        ).fetchall()
+        for ordinal, row in enumerate(rows):
+            self._connection.execute(
+                """
+                INSERT INTO execution_worker_assignments (
+                    execution_run_id,
+                    node_key,
+                    task_key,
+                    provider_call_id,
+                    request_id,
+                    ordinal,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(call.execution_run_id),
+                    call.node_key,
+                    row["task_key"],
+                    str(provider_call_id),
+                    request_id,
+                    ordinal,
+                    now,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    worker_provider_call_id = ?,
+                    started_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND task_key = ?
+                """,
+                (
+                    TaskStatus.RUNNING.value,
+                    str(provider_call_id),
+                    now,
+                    now,
+                    str(call.execution_run_id),
+                    call.node_key,
+                    row["task_key"],
+                ),
+            )
+        return self._load_pull_task_claim(request_id)
+
+    def record_pull_task_completion(
+        self,
+        provider_call_id: UUID,
+        task_key: str,
+        *,
+        request_id: str,
+        observation: AvailabilityStatus,
+        message: str | None = None,
+        now: int,
+    ) -> ExecutionTaskRecord:
+        """Apply one idempotent pull-worker completion after publication."""
+        if not request_id:
+            raise ValueError("completion request ID cannot be empty")
+        call = self.get_provider_call(provider_call_id)
+        existing = self._connection.execute(
+            """
+            SELECT provider_call_id, task_key, observation, message
+            FROM execution_task_completion_requests
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["provider_call_id"] != str(provider_call_id)
+                or existing["task_key"] != task_key
+                or existing["observation"] != observation.value
+                or existing["message"] != message
+            ):
+                raise ValueError("completion request ID was reused")
+            return self.get_task(call.execution_run_id, call.node_key, task_key)
+        assignment = self._connection.execute(
+            """
+            SELECT 1
+            FROM execution_worker_assignments
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND task_key = ?
+                AND provider_call_id = ?
+            """,
+            (
+                str(call.execution_run_id),
+                call.node_key,
+                task_key,
+                str(provider_call_id),
+            ),
+        ).fetchone()
+        if assignment is None:
+            raise ValueError("Task is not assigned to this Provider Call")
+        self._connection.execute(
+            """
+            INSERT INTO execution_task_completion_requests (
+                request_id,
+                provider_call_id,
+                task_key,
+                observation,
+                message,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                str(provider_call_id),
+                task_key,
+                observation.value,
+                message,
+                now,
+            ),
+        )
+        if observation == AvailabilityStatus.MISSING:
+            return self.fail_task(
+                call.execution_run_id,
+                call.node_key,
+                task_key,
+                message=message or "Worker publication was missing",
+                now=now,
+            )
+        return self.record_task_result_observation(
+            call.execution_run_id,
+            call.node_key,
+            task_key,
+            observation,
+            now=now,
+        )
+
     def acquire_local_task(
         self,
         execution_run_id: UUID,
@@ -867,8 +1365,16 @@ class SqliteExecutionRepository:
         if task.result_observation != AvailabilityStatus.MISSING:
             return False
         if task.status == TaskStatus.RUNNING:
-            return task.local_owned and task.provider_call_id is None
-        if task.status != TaskStatus.PENDING or task.provider_call_id is not None:
+            return (
+                task.local_owned
+                and task.provider_call_id is None
+                and task.worker_provider_call_id is None
+            )
+        if (
+            task.status != TaskStatus.PENDING
+            or task.provider_call_id is not None
+            or task.worker_provider_call_id is not None
+        ):
             return False
         self._connection.execute(
             """
@@ -1067,6 +1573,11 @@ class SqliteExecutionRepository:
                             FROM execution_provider_calls
                             WHERE status IN (?, ?, ?)
                         )
+                        OR worker_provider_call_id IN (
+                            SELECT provider_call_id
+                            FROM execution_provider_calls
+                            WHERE status IN (?, ?, ?)
+                        )
                     )
                 """,
                 (
@@ -1077,6 +1588,9 @@ class SqliteExecutionRepository:
                     str(execution_run_id),
                     node.node_key,
                     TaskStatus.RUNNING.value,
+                    ProviderCallStatus.SUCCEEDED.value,
+                    ProviderCallStatus.FAILED.value,
+                    ProviderCallStatus.CANCELLED.value,
                     ProviderCallStatus.SUCCEEDED.value,
                     ProviderCallStatus.FAILED.value,
                     ProviderCallStatus.CANCELLED.value,
@@ -1123,10 +1637,12 @@ class SqliteExecutionRepository:
             """
             UPDATE execution_tasks
             SET status_reason = ?
-            WHERE provider_call_id = ? AND status = ?
+            WHERE (provider_call_id = ? OR worker_provider_call_id = ?)
+                AND status = ?
             """,
             (
                 WorkStatusReason.RESULT_ALREADY_SATISFIED.value,
+                str(provider_call_id),
                 str(provider_call_id),
                 TaskStatus.CANCELLED.value,
             ),
@@ -1610,15 +2126,17 @@ class SqliteExecutionRepository:
             """
             SELECT task_key
             FROM execution_tasks
-            WHERE provider_call_id = ?
+            WHERE provider_call_id = ? OR worker_provider_call_id = ?
             ORDER BY ordinal
             """,
-            (row["provider_call_id"],),
+            (row["provider_call_id"], row["provider_call_id"]),
         ).fetchall()
         return ProviderCallRecord(
             provider_call_id=UUID(row["provider_call_id"]),
             execution_run_id=UUID(row["execution_run_id"]),
             node_key=row["node_key"],
+            dispatch_batch_id=UUID(row["dispatch_batch_id"]),
+            dispatch_mode=DispatchMode(row["dispatch_mode"]),
             submission_token=row["submission_token"],
             binding=ProviderBinding(
                 environment=row["provider_environment"],
@@ -1642,6 +2160,58 @@ class SqliteExecutionRepository:
             attached_at=row["attached_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
+        )
+
+    def _load_pull_task_claim(self, request_id: str) -> PullTaskClaim:
+        request = self._connection.execute(
+            """
+            SELECT provider_call_id
+            FROM execution_task_claim_requests
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if request is None:
+            raise LookupError(f"Task claim request not found: {request_id}")
+        rows = self._connection.execute(
+            """
+            SELECT
+                assignment.execution_run_id,
+                assignment.node_key,
+                assignment.task_key,
+                assignment.provider_call_id,
+                assignment.request_id,
+                assignment.ordinal,
+                assignment.created_at,
+                task.fingerprint,
+                task.execution_payload_json
+            FROM execution_worker_assignments AS assignment
+            JOIN execution_tasks AS task
+                ON task.execution_run_id = assignment.execution_run_id
+                AND task.node_key = assignment.node_key
+                AND task.task_key = assignment.task_key
+            WHERE assignment.request_id = ?
+            ORDER BY assignment.ordinal
+            """,
+            (request_id,),
+        ).fetchall()
+        return PullTaskClaim(
+            request_id=request_id,
+            provider_call_id=UUID(request["provider_call_id"]),
+            assignments=tuple(
+                WorkerAssignmentRecord(
+                    execution_run_id=UUID(row["execution_run_id"]),
+                    node_key=row["node_key"],
+                    task_key=row["task_key"],
+                    task_fingerprint=row["fingerprint"],
+                    execution_payload=json.loads(row["execution_payload_json"]),
+                    provider_call_id=UUID(row["provider_call_id"]),
+                    request_id=row["request_id"],
+                    ordinal=row["ordinal"],
+                    created_at=row["created_at"],
+                )
+                for row in rows
+            ),
         )
 
     def _complete_pruned_node_if_conclusive(
@@ -1765,6 +2335,26 @@ class SqliteExecutionRepository:
                 completed_at = ?,
                 updated_at = ?
             WHERE provider_call_id = ?
+                AND status IN (?, ?)
+            """,
+            (
+                task_status.value,
+                message,
+                now,
+                now,
+                str(provider_call_id),
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        )
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE worker_provider_call_id = ?
                 AND status IN (?, ?)
             """,
             (
@@ -2002,6 +2592,11 @@ def _task_from_row(row: sqlite3.Row) -> ExecutionTaskRecord:
         ),
         provider_call_id=(
             None if row["provider_call_id"] is None else UUID(row["provider_call_id"])
+        ),
+        worker_provider_call_id=(
+            None
+            if row["worker_provider_call_id"] is None
+            else UUID(row["worker_provider_call_id"])
         ),
         local_owned=bool(row["local_owned"]),
         error_message=row["error_message"],

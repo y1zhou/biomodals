@@ -111,6 +111,13 @@ class ProviderCallStatus(StrEnum):
         }
 
 
+class DispatchMode(StrEnum):
+    """Supported remote Task-to-call assignment modes."""
+
+    FIXED_BATCH = "fixed_batch"
+    PULL_WORKER = "pull_worker"
+
+
 @dataclass(frozen=True)
 class ProviderBinding:
     """Resolved Modal function identity and operational scheduling metadata."""
@@ -365,6 +372,7 @@ class ExecutionTaskRecord:
     result_observed_at: int | None
     result_provenance: ResultProvenance | None
     provider_call_id: UUID | None
+    worker_provider_call_id: UUID | None
     local_owned: bool
     error_message: str | None
     created_at: int
@@ -380,6 +388,8 @@ class ProviderCallRecord:
     provider_call_id: UUID
     execution_run_id: UUID
     node_key: str
+    dispatch_batch_id: UUID
+    dispatch_mode: DispatchMode
     submission_token: str
     binding: ProviderBinding
     status: ProviderCallStatus
@@ -408,6 +418,41 @@ class ActiveProviderCallCounts:
 
     total: int
     gpu: int
+
+
+@dataclass(frozen=True)
+class WorkerAssignmentRecord:
+    """One checkpointed pull-worker ownership decision."""
+
+    execution_run_id: UUID
+    node_key: str
+    task_key: str
+    task_fingerprint: str
+    execution_payload: Any
+    provider_call_id: UUID
+    request_id: str
+    ordinal: int
+    created_at: int
+
+
+@dataclass(frozen=True)
+class PullTaskClaim:
+    """Idempotent response to one bounded pull-worker claim request."""
+
+    request_id: str
+    provider_call_id: UUID
+    assignments: tuple[WorkerAssignmentRecord, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionSnapshot:
+    """One read-only execution view for adapters and diagnostics."""
+
+    run: ExecutionRunRecord
+    nodes: tuple[ExecutionNodeRecord, ...]
+    tasks: tuple[ExecutionTaskRecord, ...]
+    provider_calls: tuple[ProviderCallRecord, ...]
+    active_provider_calls: ActiveProviderCallCounts
 
 
 def _canonical_json_sha256(value: Any) -> str:

@@ -51,34 +51,6 @@ class _FakeFunctionCall:
         return self.result
 
 
-class _FakePPIFlowFunction:
-    def __init__(self) -> None:
-        self.kwargs = {}
-
-    def _result(self) -> AppRunResult:
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="ppiflow_outputs",
-                    kind=ArtifactKind.DIRECTORY,
-                    storage=VolumePath(
-                        volume_name=ppiflow_app.CONF.output_volume_name,
-                        path="demo-run",
-                    ),
-                )
-            ],
-        )
-
-    def remote(self, **kwargs):
-        self.kwargs = kwargs
-        return self._result()
-
-    def spawn(self, **kwargs):
-        self.kwargs = kwargs
-        return _FakeFunctionCall("fc-ppiflow", self._result())
-
-
 class _FakeModalFunction:
     def __init__(
         self,
@@ -206,6 +178,10 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
         source,
         "run_ppiflow_partial_candidate",
     )
+    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_design_stage",
+    )
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
         "run_ppiflow_af3score_stage",
@@ -213,54 +189,6 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
         "run_ppiflow_rosetta_stage",
-    )
-
-
-def test_ppiflow_app_step_prepares_kernel_call_and_normalizes_result(
-    tmp_path: Path,
-) -> None:
-    fake_function = _FakePPIFlowFunction()
-    workflow = build_ppiflow_workflow(
-        task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
-        steps_yaml_bytes=b"""
-PPIFlowStep:
-  run_name: demo-run
-  args:
-    name: demo
-    specified_hotspots: A1
-    input_pdb: /inputs/demo.pdb
-    binder_chain: B
-""",
-    )
-
-    definition = workflow.validate()
-    spec = definition.nodes["stage1-ppiflow-design"]
-    call = spec.node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id=spec.node_id,
-            task_key="node",
-            work_dir=tmp_path / "result",
-            cache_dir=tmp_path / "cache",
-            inputs={},
-        )
-    )
-    result = spec.node.process_remote_result(fake_function._result(), call.metadata)
-
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert call.function_name == "ppiflow_run"
-    assert call.kwargs["run_name"] == "demo-run"
-    assert isinstance(call.kwargs["args"], ppiflow_app.PPIFlowArgs)
-    assert result.outputs[0].storage == VolumePath(
-        volume_name=ppiflow_app.CONF.output_volume_name,
-        path="demo-run",
-    )
-    assert result.outputs[0].metadata["structure_patterns"] == (
-        "outputs/*.pdb",
-        "outputs/**/*.pdb",
-        "outputs/*.cif",
-        "outputs/**/*.cif",
     )
 
 
@@ -293,8 +221,10 @@ PPIFlowStep:
         )
     )
 
-    assert submission.function_name == "ppiflow_run"
+    assert submission.function_name == "run_ppiflow_design_stage"
     assert submission.kwargs["run_name"] == "demo-run"
+    assert submission.kwargs["run_id"] == "run-1"
+    assert submission.kwargs["node_id"] == "stage1-ppiflow-design"
     assert isinstance(submission.kwargs["args"], ppiflow_app.PPIFlowArgs)
     assert isinstance(submission.kwargs["args"].args.input_pdb, str)
     assert isinstance(submission.kwargs["args"].args.config, str)
@@ -478,6 +408,83 @@ def test_partial_step_prepares_one_kernel_candidate_task(
     assert submission.uses_gpu is True
     assert submission.kwargs["candidate_id"] == "candidate-1"
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
+
+
+def test_design_stage_publishes_digest_bearing_candidate_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    output_root = tmp_path / "ppiflow-output"
+    output_root.mkdir()
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_OUTPUT_MOUNTPOINT",
+        str(output_root),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUME_ROOTS",
+        {
+            **ppiflow_workflow.PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            ppiflow_app.CONF.output_volume_name: str(output_root),
+        },
+    )
+
+    def run_raw(*, args, run_name):
+        del args
+        outputs_dir = output_root / run_name / "outputs"
+        outputs_dir.mkdir(parents=True)
+        (outputs_dir / "design-b.pdb").write_bytes(b"MODEL B\n")
+        (outputs_dir / "design-a.cif").write_bytes(b"data_A\n")
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="ppiflow_outputs",
+                    kind=ArtifactKind.DIRECTORY,
+                    storage=VolumePath(
+                        volume_name=ppiflow_app.CONF.output_volume_name,
+                        path=run_name,
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        ppiflow_app,
+        "ppiflow_run_workflow",
+        SimpleNamespace(get_raw_f=lambda: run_raw),
+    )
+    result = ppiflow_workflow.run_ppiflow_design_stage.get_raw_f()(
+        args=ppiflow_app.PPIFlowArgs.model_validate({
+            "args": {
+                "name": "design",
+                "specified_hotspots": "A1",
+                "input_pdb": "/input.pdb",
+                "binder_chain": "B",
+            }
+        }),
+        run_name="design-run",
+        run_id="run-1",
+        node_id="design",
+        step_name="PPIFlowStep",
+    )
+
+    assert [output.kind for output in result.outputs] == [
+        ArtifactKind.STRUCTURES,
+        ArtifactKind.TABLE,
+    ]
+    manifest = ppiflow_manifests.read_manifest(
+        workflow_root / result.outputs[1].storage.path
+    )
+    assert manifest.height == 2
+    assert manifest.get_column("candidate_id").n_unique() == 2
+    assert all(
+        file_record["content_sha256"]
+        for row in manifest.iter_rows(named=True)
+        for file_record in row["files"]
+    )
 
 
 def test_partial_candidate_runs_science_in_kernel_owned_call(

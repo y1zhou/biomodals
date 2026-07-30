@@ -184,6 +184,54 @@ def select_ppiflow_structure_files(
 
 
 @app.function(
+    image=ppiflow_task_image,
+    gpu=ppiflow_app.CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
+    timeout=CONF.timeout,
+    volumes=PPI_FLOW_TASK_VOLUME_MOUNTS,
+)
+def run_ppiflow_design_stage(
+    *,
+    args: ppiflow_app.PPIFlowArgs,
+    run_name: str,
+    run_id: str,
+    node_id: str,
+    step_name: str,
+) -> AppRunResult:
+    """Run initial PPIFlow design and publish candidate identities."""
+    _reload_ppiflow_source_volumes()
+    result = AppRunResult.model_validate(
+        ppiflow_app.ppiflow_run_workflow.get_raw_f()(
+            args=args,
+            run_name=run_name,
+        )
+    )
+    adapted = _result_with_output_kind(
+        result,
+        ArtifactKind.STRUCTURES,
+        {
+            "step_name": step_name,
+            "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
+        },
+    )
+    rows = _initial_ppiflow_candidate_rows(adapted, step_name=step_name)
+    return adapted.model_copy(
+        update={
+            "outputs": [
+                *adapted.outputs,
+                _write_candidate_manifest_output(
+                    run_id=run_id,
+                    node_id=node_id,
+                    step_name=step_name,
+                    rows=rows,
+                ),
+            ]
+        }
+    )
+
+
+@app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 8192),
@@ -1653,44 +1701,26 @@ class _ConfiguredAppStepNode(AppBackedNode):
 
 
 @dataclass
-class _PPIFlowRunNode(_ConfiguredAppStepNode):
-    """App-backed node implemented by the PPIFlow workflow app function."""
+class PPIFlowDesignNode(_ConfiguredAppStepNode):
+    """Initial PPIFlow design step with candidate-manifest publication."""
 
-    def _app_kwargs(self, context: NodeRunContext) -> dict[str, object]:
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare one direct PPIFlow design call for kernel submission."""
         raw_args = self.config.get("args", self.config)
         if not isinstance(raw_args, dict):
             raise ValueError(f"PPIFlow step {self.step_name!r} args must be a mapping")
-
-        app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
-        return {"args": app_args, "run_name": self._run_name(context)}
-
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare the PPIFlow app call for kernel submission."""
         return RemoteNodeCall(
-            function_name="ppiflow_run",
+            function_name="run_ppiflow_design_stage",
             uses_gpu=True,
-            kwargs=self._app_kwargs(context),
-        )
-
-    def process_remote_result(
-        self, result: AppRunResult, metadata: Mapping[str, object]
-    ) -> AppRunResult:
-        """Expose PPIFlow app output directories as structure artifacts."""
-        result = AppRunResult.model_validate(result)
-        return _result_with_output_kind(
-            result,
-            ArtifactKind.STRUCTURES,
-            {
+            kwargs={
+                "args": ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args}),
+                "run_name": self._run_name(context),
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
                 "step_name": self.step_name,
-                "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
-            }
-            | dict(metadata),
+            },
+            runtime_image_key="ppiflow",
         )
-
-
-@dataclass
-class PPIFlowDesignNode(_PPIFlowRunNode):
-    """Initial PPIFlow design step."""
 
 
 @dataclass
@@ -2267,6 +2297,64 @@ def _inline_csv_table_output(
         ),
         metadata={"rows": len(rows)} | dict(metadata),
     )
+
+
+def _initial_ppiflow_candidate_rows(
+    result: AppRunResult,
+    *,
+    step_name: str,
+) -> list[dict[str, object]]:
+    """Describe initial PPIFlow structures with stable content identities."""
+    rows = []
+    for output in result.outputs:
+        if output.kind != ArtifactKind.STRUCTURES or not isinstance(
+            output.storage, VolumePath
+        ):
+            continue
+        artifact = WorkflowArtifact(
+            artifact_id=sanitize_filename(output.name),
+            producing_node_id=step_name,
+            kind=ArtifactKind.STRUCTURES,
+            storage=output.storage,
+            metadata=output.metadata,
+        )
+        for structure in ppiflow_staging.selected_structure_file_records_from_artifact(
+            artifact,
+            PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
+            PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        ):
+            candidate_id = ppiflow_manifests.initial_candidate_id(
+                stage_name=step_name,
+                source_artifact_id=structure.artifact_id,
+                source_path=structure.app_volume_path,
+                basename=structure.file_name,
+            )
+            rows.append(
+                ppiflow_manifests.candidate_manifest_row(
+                    candidate_id=candidate_id,
+                    stage_name=step_name,
+                    stage_role="initial_design",
+                    operation_mode="ppiflow",
+                    candidate_status=AppRunStatus.SUCCEEDED.value,
+                    source_artifact_id=structure.artifact_id,
+                    source_path=structure.app_volume_path,
+                    derived_path=structure.app_volume_path,
+                    files=[
+                        ppiflow_manifests.candidate_file_record(
+                            role="structure",
+                            volume_name=structure.volume_name,
+                            app_volume_path=structure.app_volume_path,
+                            path=structure.artifact_file_path,
+                            media_type=structure.media_type,
+                            size_bytes=structure.size_bytes,
+                            content_sha256=structure.content_sha256,
+                        )
+                    ],
+                )
+            )
+    if not rows:
+        raise FileNotFoundError("PPIFlow design produced no structure candidates")
+    return sorted(rows, key=lambda row: str(row["candidate_id"]))
 
 
 def _write_candidate_manifest_output(
@@ -3601,7 +3689,7 @@ def submit_ppiflow_workflow(
     }
     if not use_deployed_coordinator:
         orchestrator_kwargs["development_function_handles"] = {
-            "ppiflow_run": ppiflow_app.ppiflow_run_workflow,
+            "run_ppiflow_design_stage": run_ppiflow_design_stage,
             "run_ppiflow_partial_candidate": run_ppiflow_partial_candidate,
             "run_ppiflow_ligandmpnn_stage": run_ppiflow_ligandmpnn_stage,
             "run_ppiflow_flowpacker_stage": run_ppiflow_flowpacker_stage,

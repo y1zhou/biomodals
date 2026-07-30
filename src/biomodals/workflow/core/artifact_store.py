@@ -87,6 +87,7 @@ class WorkflowArtifactStore:
             CREATE TABLE IF NOT EXISTS workflow_task_results (
                 node_key TEXT NOT NULL,
                 task_key TEXT NOT NULL,
+                task_fingerprint TEXT NOT NULL,
                 result_json TEXT NOT NULL,
                 completed_at INTEGER NOT NULL,
                 PRIMARY KEY (node_key, task_key)
@@ -202,6 +203,7 @@ class WorkflowArtifactStore:
         node_key: str,
         task_key: str,
         *,
+        task_fingerprint: str,
         result: AppRunResult,
         artifacts: tuple[WorkflowArtifact, ...],
         now: int,
@@ -209,6 +211,8 @@ class WorkflowArtifactStore:
         """Atomically stage one immutable Task result and its artifacts."""
         if not task_key:
             raise ValueError("Workflow Task key cannot be empty")
+        if not task_fingerprint:
+            raise ValueError("Workflow Task fingerprint cannot be empty")
         _raise_for_inline_bytes_result(result)
         for artifact in artifacts:
             if artifact.producing_node_id != node_key:
@@ -217,7 +221,12 @@ class WorkflowArtifactStore:
         existing_result = self.load_task_result(node_key, task_key)
         if existing_result is not None:
             existing_artifacts = self.load_task_output_artifacts(node_key, task_key)
-            if existing_result == result and existing_artifacts == artifacts:
+            existing_fingerprint = self.load_task_fingerprint(node_key, task_key)
+            if (
+                existing_fingerprint == task_fingerprint
+                and existing_result == result
+                and existing_artifacts == artifacts
+            ):
                 return
             raise ValueError(
                 f"Workflow Task publication already exists: {node_key}/{task_key}"
@@ -245,12 +254,19 @@ class WorkflowArtifactStore:
             INSERT INTO workflow_task_results (
                 node_key,
                 task_key,
+                task_fingerprint,
                 result_json,
                 completed_at
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (node_key, task_key, result.model_dump_json(), now),
+            (
+                node_key,
+                task_key,
+                task_fingerprint,
+                result.model_dump_json(),
+                now,
+            ),
         )
 
     def load_task_result(
@@ -270,6 +286,20 @@ class WorkflowArtifactStore:
         if row is None:
             return None
         return AppRunResult.model_validate_json(row["result_json"])
+
+    def load_task_fingerprint(self, node_key: str, task_key: str) -> str | None:
+        """Load the scientific fingerprint bound to one Task publication."""
+        row = self._connection.execute(
+            """
+            SELECT task_fingerprint
+            FROM workflow_task_results
+            WHERE node_key = ? AND task_key = ?
+            """,
+            (node_key, task_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["task_fingerprint"])
 
     def load_task_output_artifacts(
         self,

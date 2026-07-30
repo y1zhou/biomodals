@@ -13,18 +13,28 @@ import pytest
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionRunNotFoundError,
+    NodeAggregationPolicy,
     NodeStatus,
     ProviderBinding,
     ResultProvenance,
     RunStatus,
     RunStatusReason,
 )
+from biomodals.execution.modal import (
+    ModalCallObservation,
+    ModalCallObservationKind,
+)
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
 from biomodals.schema.storage import InlineBytes
 from biomodals.workflow import Workflow, WorkflowNativeNode
 from biomodals.workflow.core import orchestrator
-from biomodals.workflow.core.nodes import NodeRunContext
+from biomodals.workflow.core.nodes import (
+    NodeRunContext,
+    RemoteNodeCall,
+    RemoteTaskWorkflowNode,
+    RemoteWorkflowTask,
+)
 from biomodals.workflow.core.run_store import WorkflowRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -76,6 +86,104 @@ class TextNode(WorkflowNativeNode):
                 )
             ],
         )
+
+
+@dataclass
+class FanoutNode(RemoteTaskWorkflowNode):
+    texts: tuple[str, ...]
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        del context
+        return tuple(
+            RemoteWorkflowTask(
+                task_key=f"candidate-{ordinal}",
+                scientific_payload={"text": text},
+                execution_payload={"text": text},
+            )
+            for ordinal, text in enumerate(self.texts)
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        del context
+        return RemoteNodeCall(
+            function_name="run_candidate",
+            uses_gpu=False,
+            kwargs={
+                "task_key": task.task_key,
+                "text": task.execution_payload["text"],
+            },
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results,
+        errors,
+    ) -> AppRunResult:
+        del context
+        status = (
+            AppRunStatus.PARTIAL
+            if results and errors
+            else AppRunStatus.SUCCEEDED
+            if not errors
+            else AppRunStatus.FAILED
+        )
+        return AppRunResult(
+            status=status,
+            outputs=[
+                AppOutput(
+                    name="summary",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=",".join(results).encode(),
+                        filename="summary.txt",
+                        media_type="text/plain",
+                    ),
+                )
+            ],
+        )
+
+
+class FanoutDriver:
+    def __init__(self, *, failing_tasks: set[str] | None = None) -> None:
+        self.failing_tasks = failing_tasks or set()
+        self.spawned: list[str] = []
+        self.results: dict[str, AppRunResult] = {}
+
+    def resolve(self, binding: ProviderBinding) -> str:
+        return binding.function_name
+
+    def spawn(self, function, *, args, kwargs) -> str:
+        del function, args
+        task_key = str(kwargs["task_key"])
+        self.spawned.append(task_key)
+        call_id = f"fc-{task_key}"
+        self.results[call_id] = TextNode(str(kwargs["text"])).run(
+            cast(NodeRunContext, None)
+        )
+        return call_id
+
+    def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
+        task_key = provider_call_handle_id.removeprefix("fc-")
+        if task_key in self.failing_tasks:
+            return ModalCallObservation(
+                ModalCallObservationKind.FAILED,
+                message=f"{task_key} failed",
+            )
+        return ModalCallObservation(
+            ModalCallObservationKind.SUCCEEDED,
+            result=self.results[provider_call_handle_id],
+        )
+
+    def cancel(self, provider_call_handle_id: str) -> None:
+        del provider_call_handle_id
 
 
 def _raw_coordinator(
@@ -364,6 +472,73 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
             "SELECT COUNT(*) FROM workflow_node_results"
         ).fetchone()[0]
         == 1
+    )
+    store.close()
+
+
+def test_restart_reuses_successful_task_publications_from_partial_node(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    predecessor_driver = FanoutDriver(failing_tasks={"candidate-1"})
+    monkeypatch.setattr(
+        orchestrator,
+        "ModalCallDriver",
+        lambda **_kwargs: predecessor_driver,
+    )
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("fanout")
+    workflow.add_node(
+        FanoutNode(("alpha", "beta")),
+        id="fanout",
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+
+    predecessor_result = raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="fanout",
+    )
+
+    assert predecessor_result.status == AppRunStatus.PARTIAL
+    assert predecessor_driver.spawned == ["candidate-0", "candidate-1"]
+
+    successor_driver = FanoutDriver()
+    monkeypatch.setattr(
+        orchestrator,
+        "ModalCallDriver",
+        lambda **_kwargs: successor_driver,
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    successor_result = raw_cls.restart._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert successor_result.status == AppRunStatus.SUCCEEDED
+    assert successor_driver.spawned == ["candidate-1"]
+    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    cached = store.execution.get_task(SUCCESSOR_ID, "fanout", "candidate-0")
+    repaired = store.execution.get_task(SUCCESSOR_ID, "fanout", "candidate-1")
+    assert cached.result_provenance == ResultProvenance.CACHE
+    assert repaired.result_provenance == ResultProvenance.CURRENT_RUN
+    assert store.execution.get_node(SUCCESSOR_ID, "fanout").status == (
+        NodeStatus.SUCCEEDED
     )
     store.close()
 

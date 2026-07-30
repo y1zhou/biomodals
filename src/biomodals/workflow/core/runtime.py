@@ -324,6 +324,7 @@ class WorkflowRuntime:
                             self._task_publication_observation(
                                 node.node_key,
                                 task.task_key,
+                                task.fingerprint,
                             ),
                         ))
                 else:
@@ -567,21 +568,32 @@ class WorkflowRuntime:
         try:
             if isinstance(node, RemoteTaskWorkflowNode):
                 discovered = node.discover_remote_tasks(context)
-                tasks = tuple(
-                    _PreparedTask(
-                        plan=TaskPlan(
-                            task_key=task.task_key,
-                            scientific_payload=_json_value(task.scientific_payload),
-                            execution_payload=_json_value(task.execution_payload),
-                        ),
-                        observation=self._task_publication_observation(
-                            node_id,
-                            task.task_key,
-                        ),
+                workload_plan_fingerprint = self.store.execution.get_run(
+                    self.execution_run_id
+                ).plan.workload_plan_fingerprint
+                tasks: list[_PreparedTask] = []
+                for task in discovered:
+                    plan = TaskPlan(
+                        task_key=task.task_key,
+                        scientific_payload=_json_value(task.scientific_payload),
+                        execution_payload=_json_value(task.execution_payload),
                     )
-                    for task in discovered
-                )
-                return _PreparedNode(node_id, context, tasks)
+                    tasks.append(
+                        _PreparedTask(
+                            plan=plan,
+                            observation=self._task_publication_observation(
+                                node_id,
+                                task.task_key,
+                                plan.fingerprint(
+                                    workload_plan_fingerprint=(
+                                        workload_plan_fingerprint
+                                    ),
+                                    node_key=node_id,
+                                ),
+                            ),
+                        )
+                    )
+                return _PreparedNode(node_id, context, tuple(tasks))
             invocation = (
                 node.prepare_remote(context)
                 if isinstance(node, RemoteWorkflowNode)
@@ -806,6 +818,11 @@ class WorkflowRuntime:
         task_key: str,
         result: AppRunResult,
     ) -> None:
+        task = self.store.execution.get_task(
+            self.execution_run_id,
+            node_id,
+            task_key,
+        )
         if result.status != AppRunStatus.SUCCEEDED:
             self._fail_discovered_task(
                 node_id,
@@ -832,6 +849,7 @@ class WorkflowRuntime:
             self.store.artifacts.record_task_publication(
                 node_id,
                 task_key,
+                task_fingerprint=task.fingerprint,
                 result=materialized.result,
                 artifacts=tuple(materialized.artifacts),
                 now=self._now(),
@@ -1142,9 +1160,15 @@ class WorkflowRuntime:
         self,
         node_id: str,
         task_key: str,
+        expected_fingerprint: str,
     ) -> AvailabilityStatus:
         result = self.store.artifacts.load_task_result(node_id, task_key)
-        if result is None or result.status != AppRunStatus.SUCCEEDED:
+        if (
+            result is None
+            or result.status != AppRunStatus.SUCCEEDED
+            or self.store.artifacts.load_task_fingerprint(node_id, task_key)
+            != expected_fingerprint
+        ):
             return AvailabilityStatus.MISSING
         artifacts = self.store.artifacts.load_task_output_artifacts(
             node_id,

@@ -250,6 +250,7 @@ def test_task_publications_are_durable_idempotent_and_node_reusable() -> None:
     artifacts.record_task_publication(
         "design",
         "candidate-1",
+        task_fingerprint="fingerprint-1",
         result=result,
         artifacts=(artifact,),
         now=100,
@@ -257,6 +258,7 @@ def test_task_publications_are_durable_idempotent_and_node_reusable() -> None:
     artifacts.record_task_publication(
         "design",
         "candidate-1",
+        task_fingerprint="fingerprint-1",
         result=result,
         artifacts=(artifact,),
         now=200,
@@ -270,6 +272,7 @@ def test_task_publications_are_durable_idempotent_and_node_reusable() -> None:
     connection.commit()
 
     assert artifacts.list_task_publication_keys("design") == ("candidate-1",)
+    assert artifacts.load_task_fingerprint("design", "candidate-1") == "fingerprint-1"
     assert artifacts.load_task_result("design", "candidate-1") == result
     assert artifacts.load_task_output_artifacts(
         "design",
@@ -285,6 +288,7 @@ def test_task_publications_are_durable_idempotent_and_node_reusable() -> None:
     artifacts.discard_task_publication("design", "candidate-1")
     connection.commit()
     assert artifacts.load_task_result("design", "candidate-1") is None
+    assert artifacts.load_task_fingerprint("design", "candidate-1") is None
     with pytest.raises(FileNotFoundError):
         artifacts.load_artifact(artifact.artifact_id)
 
@@ -295,6 +299,7 @@ def test_task_publication_rejects_divergent_replay() -> None:
     artifacts.record_task_publication(
         "design",
         "candidate-1",
+        task_fingerprint="fingerprint-1",
         result=result,
         artifacts=(artifact,),
         now=100,
@@ -304,7 +309,17 @@ def test_task_publication_rejects_divergent_replay() -> None:
         artifacts.record_task_publication(
             "design",
             "candidate-1",
+            task_fingerprint="fingerprint-1",
             result=result.model_copy(update={"warnings": ["changed"]}),
+            artifacts=(artifact,),
+            now=200,
+        )
+    with pytest.raises(ValueError, match="Task publication already exists"):
+        artifacts.record_task_publication(
+            "design",
+            "candidate-1",
+            task_fingerprint="fingerprint-2",
+            result=result,
             artifacts=(artifact,),
             now=200,
         )

@@ -20,6 +20,7 @@ from biomodals.execution import (
     ExecutionSnapshot,
     NodeStatus,
     ProviderBinding,
+    TaskStatus,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -112,6 +113,22 @@ class WorkflowCoordinatorPlan:
             self.strict_external_artifact_checks,
             self.external_artifact_checker_function_name,
         )
+
+
+@dataclass(frozen=True)
+class _NodePublication:
+    node_key: str
+    result: AppRunResult
+    artifacts: tuple[WorkflowArtifact, ...]
+
+
+@dataclass(frozen=True)
+class _TaskPublication:
+    node_key: str
+    task_key: str
+    task_fingerprint: str
+    result: AppRunResult
+    artifacts: tuple[WorkflowArtifact, ...]
 
 
 @app.cls(
@@ -231,7 +248,12 @@ class ExecutionCoordinator:
         )
         with self._lock():
             OUT_VOLUME.reload()
-            predecessor, predecessor_plan, publications = self._load_successor_source(
+            (
+                predecessor,
+                predecessor_plan,
+                node_publications,
+                task_publications,
+            ) = self._load_successor_source(
                 predecessor_id,
                 predecessor_deployment,
             )
@@ -271,7 +293,8 @@ class ExecutionCoordinator:
                 predecessor=predecessor,
                 plan=plan,
                 deployment=deployment,
-                publications=publications,
+                node_publications=node_publications,
+                task_publications=task_publications,
             )
             runtime = self._open_runtime(plan, resolve_external_checker=True)
         try:
@@ -386,7 +409,8 @@ class ExecutionCoordinator:
     ) -> tuple[
         ExecutionRunRecord,
         WorkflowCoordinatorPlan,
-        tuple[tuple[str, AppRunResult, tuple[WorkflowArtifact, ...]], ...],
+        tuple[_NodePublication, ...],
+        tuple[_TaskPublication, ...],
     ]:
         store = WorkflowRunStore(
             Path(CONF.output_volume_mountpoint),
@@ -411,19 +435,62 @@ class ExecutionCoordinator:
                 raise ValueError(
                     "Predecessor workflow plan does not match its Execution Run"
                 )
-            publications = []
+            node_publications = []
+            task_publications = []
             for node in store.execution.list_nodes(predecessor_execution_run_id):
-                if node.status != NodeStatus.SUCCEEDED:
-                    continue
-                result = store.artifacts.load_node_result(node.node_key)
-                if result is None:
-                    continue
-                publications.append((
+                if node.status == NodeStatus.SUCCEEDED:
+                    result = store.artifacts.load_node_result(node.node_key)
+                    if result is not None:
+                        node_publications.append(
+                            _NodePublication(
+                                node_key=node.node_key,
+                                result=result,
+                                artifacts=(
+                                    store.artifacts.load_node_output_artifacts(
+                                        node.node_key
+                                    )
+                                ),
+                            )
+                        )
+                for task in store.execution.list_tasks(
+                    predecessor_execution_run_id,
                     node.node_key,
-                    result,
-                    store.artifacts.load_node_output_artifacts(node.node_key),
-                ))
-            return predecessor, plan, tuple(publications)
+                ):
+                    if task.status != TaskStatus.SUCCEEDED:
+                        continue
+                    result = store.artifacts.load_task_result(
+                        node.node_key,
+                        task.task_key,
+                    )
+                    if (
+                        result is None
+                        or store.artifacts.load_task_fingerprint(
+                            node.node_key,
+                            task.task_key,
+                        )
+                        != task.fingerprint
+                    ):
+                        continue
+                    task_publications.append(
+                        _TaskPublication(
+                            node_key=node.node_key,
+                            task_key=task.task_key,
+                            task_fingerprint=task.fingerprint,
+                            result=result,
+                            artifacts=(
+                                store.artifacts.load_task_output_artifacts(
+                                    node.node_key,
+                                    task.task_key,
+                                )
+                            ),
+                        )
+                    )
+            return (
+                predecessor,
+                plan,
+                tuple(node_publications),
+                tuple(task_publications),
+            )
         finally:
             store.close()
 
@@ -433,9 +500,8 @@ class ExecutionCoordinator:
         predecessor: ExecutionRunRecord,
         plan: WorkflowCoordinatorPlan,
         deployment: DeploymentIdentity,
-        publications: tuple[
-            tuple[str, AppRunResult, tuple[WorkflowArtifact, ...]], ...
-        ],
+        node_publications: tuple[_NodePublication, ...],
+        task_publications: tuple[_TaskPublication, ...],
     ) -> None:
         execution_run_id, _ = self._identity()
         store = self._run_store()
@@ -453,11 +519,20 @@ class ExecutionCoordinator:
                         max_active_gpu_provider_calls=plan.effective_gpu_limit,
                         now=int(time.time()),
                     )
-                    for node_key, result, artifacts in publications:
+                    for publication in task_publications:
+                        store.artifacts.record_task_publication(
+                            publication.node_key,
+                            publication.task_key,
+                            task_fingerprint=publication.task_fingerprint,
+                            result=publication.result,
+                            artifacts=publication.artifacts,
+                            now=int(time.time()),
+                        )
+                    for publication in node_publications:
                         store.artifacts.record_node_publication(
-                            node_key,
-                            result=result,
-                            artifacts=artifacts,
+                            publication.node_key,
+                            result=publication.result,
+                            artifacts=publication.artifacts,
                             now=int(time.time()),
                         )
                 if (

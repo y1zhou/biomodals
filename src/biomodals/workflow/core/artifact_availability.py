@@ -76,9 +76,9 @@ def check_artifact_availability(
     except Exception as exc:  # noqa: BLE001
         return ArtifactAvailability(
             artifact_id=artifact.artifact_id,
-            status=ArtifactAvailabilityStatus.MISSING,
-            errors=(
-                f"{artifact.artifact_id}: external artifact checker failed: {exc}",
+            status=ArtifactAvailabilityStatus.UNKNOWN,
+            unknown_reason=(
+                f"{artifact.artifact_id}: external artifact checker failed: {exc}"
             ),
         )
 

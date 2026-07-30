@@ -207,6 +207,36 @@ def test_typed_artifact_availability_reports_unknown_external_without_checker(
     )
 
 
+def test_typed_artifact_availability_reports_unknown_when_checker_fails(
+    tmp_path: Path,
+) -> None:
+    artifact = WorkflowArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    def broken_checker(_artifact: WorkflowArtifact) -> list[str]:
+        raise RuntimeError("volume unavailable")
+
+    availability = check_artifact_availability(
+        artifact,
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+        external_artifact_checker=broken_checker,
+    )
+
+    assert availability.status == ArtifactAvailabilityStatus.UNKNOWN
+    assert availability.errors == ()
+    assert availability.unknown_reason == (
+        "rfd-output: external artifact checker failed: volume unavailable"
+    )
+
+
 def test_external_mounted_volume_checker_validates_app_volume_artifacts(
     tmp_path: Path,
 ) -> None:

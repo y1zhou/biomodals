@@ -1,0 +1,125 @@
+"""AlphaFold3 Task identities for the shared execution kernel."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+
+from biomodals.app.fold.alphafold3.inference_inputs import PreparedInferenceRun
+from biomodals.app.fold.alphafold3.msa_search import (
+    MsaAssemblyTask,
+    RawSearchTask,
+    sequence_hash,
+)
+from biomodals.app.fold.alphafold3.template_search import TemplateTask
+from biomodals.execution import TaskPlan
+
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def _digest(value: str, *, field_name: str) -> str:
+    if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def raw_search_task_plan(
+    task: RawSearchTask,
+    *,
+    search_identity: str,
+) -> TaskPlan:
+    """Describe one canonical sequence-by-database search."""
+    identity = _digest(search_identity, field_name="search_identity")
+    query_identity = sequence_hash(task.sequence)
+    return TaskPlan(
+        task_key=f"{task.database_id}:{query_identity}:{identity}",
+        scientific_payload={
+            "database_id": task.database_id,
+            "polymer": task.polymer,
+            "search_identity": identity,
+            "sequence_sha256": query_identity,
+        },
+        execution_payload={
+            "database_id": task.database_id,
+            "sequence_sha256": query_identity,
+        },
+    )
+
+
+def combined_msa_task_plan(
+    task: MsaAssemblyTask,
+    *,
+    raw_publication_digests: Mapping[str, str],
+) -> TaskPlan:
+    """Describe one combined-MSA publication over validated raw inputs."""
+    query_identity = sequence_hash(task.sequence)
+    dependencies = {
+        database_id: _digest(
+            digest,
+            field_name=f"raw_publication_digests[{database_id!r}]",
+        )
+        for database_id, digest in sorted(raw_publication_digests.items())
+    }
+    return TaskPlan(
+        task_key=(
+            f"{task.polymer}:{query_identity}:"
+            f"u{int(task.include_unpaired)}:p{int(task.include_paired)}"
+        ),
+        scientific_payload={
+            "include_paired": task.include_paired,
+            "include_unpaired": task.include_unpaired,
+            "polymer": task.polymer,
+            "raw_publication_digests": dependencies,
+            "sequence_sha256": query_identity,
+        },
+        execution_payload={
+            "include_paired": task.include_paired,
+            "include_unpaired": task.include_unpaired,
+            "polymer": task.polymer,
+            "sequence_sha256": query_identity,
+        },
+    )
+
+
+def template_search_task_plan(task: TemplateTask) -> TaskPlan:
+    """Describe one canonical or request-local protein template search."""
+    query_identity = sequence_hash(task.sequence)
+    publication_kind = "canonical" if task.publish_canonical else "request-local"
+    return TaskPlan(
+        task_key=f"{query_identity}:{task.template_identity}:{publication_kind}",
+        scientific_payload={
+            "max_template_date": task.max_template_date,
+            "publish_canonical": task.publish_canonical,
+            "sequence_sha256": query_identity,
+            "template_identity": task.template_identity,
+            "unpaired_msa_sha256": task.unpaired_msa_sha256,
+        },
+        execution_payload={
+            "publish_canonical": task.publish_canonical,
+            "sequence_sha256": query_identity,
+            "template_identity": task.template_identity,
+        },
+    )
+
+
+def seed_prediction_task_plan(
+    prepared: PreparedInferenceRun,
+    seed: int,
+) -> TaskPlan:
+    """Describe one independently publishable AlphaFold3 seed prediction."""
+    if seed not in prepared.normalized_seeds:
+        raise ValueError(f"Seed {seed} is not part of the prepared request")
+    return TaskPlan(
+        task_key=f"seed:{seed}",
+        scientific_payload={
+            "request_id": prepared.request_id,
+            "run_id": prepared.run_id,
+            "sample_count": prepared.sample_count,
+            "seed": seed,
+        },
+        execution_payload={
+            "request_id": prepared.request_id,
+            "run_id": prepared.run_id,
+            "seed": seed,
+        },
+    )

@@ -45,6 +45,9 @@ import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.execution_publications import (
+    publish_execution_result,
+)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     LoadedInferenceInput,
@@ -275,6 +278,23 @@ _INFERENCE_RUNTIME = InferenceRuntime(
 )
 
 
+def _coordinator_result(
+    result: dict[str, object],
+    execution_result_path: str | None,
+) -> dict[str, object]:
+    """Return direct output or publish a small coordinator result reference."""
+    if execution_result_path is None:
+        return result
+    return {
+        "execution_result": publish_execution_result(
+            Path(CONF.output_volume_mountpoint),
+            CONF.output_volume,
+            execution_result_path,
+            result,
+        )
+    }
+
+
 @app.function(
     image=sharding_image,
     cpu=PROFILE_BUILD_CPU,
@@ -423,15 +443,17 @@ def _msa_search_runtime(
             read_only=False,
             sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
 def search_database_msa(
     database_id: str,
     sequence: str,
     generation_id: str | None = None,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search one fixed sharded database with database-level resume."""
-    return run_database_search(
+    result = run_database_search(
         _msa_search_runtime(
             maximum_age_seconds=CONF.timeout + 900,
             wait_timeout_seconds=max(60, CONF.timeout - 60),
@@ -440,6 +462,7 @@ def search_database_msa(
         sequence,
         generation_id=generation_id,
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -457,6 +480,7 @@ def search_database_msa(
             read_only=False,
             sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
 def assemble_sequence_msas(
@@ -465,11 +489,12 @@ def assemble_sequence_msas(
     include_unpaired: bool,
     include_paired: bool,
     generation_id: str | None = None,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Assemble requested fields with pinned upstream deduplication."""
     if polymer not in {"protein", "rna"}:
         raise ValueError(f"Unsupported polymer: {polymer!r}")
-    return assemble_and_publish_msas(
+    result = assemble_and_publish_msas(
         _msa_search_runtime(
             maximum_age_seconds=2700,
             wait_timeout_seconds=1740,
@@ -482,6 +507,7 @@ def assemble_sequence_msas(
         ),
         generation_id=generation_id,
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -523,6 +549,7 @@ def inspect_protein_template_cache(
             read_only=False,
             sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
         ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
 def search_protein_templates(
@@ -532,9 +559,10 @@ def search_protein_templates(
     publish_canonical: bool,
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
     generation_id: str | None = None,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
-    return run_template_search(
+    result = run_template_search(
         TemplateRuntime(
             source_volume=AF3_MSA_DB_VOLUME,
             cache_volume=MSA_CACHE_VOLUME,
@@ -561,6 +589,7 @@ def search_protein_templates(
         ),
         generation_id=generation_id,
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 def _search_msa_and_templates(
@@ -679,6 +708,7 @@ def run_inference_pipeline(
     request_id: str,
     staged_input_record: dict[str, object],
     claimed_seed_records: list[dict[str, object]],
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
     with guard_seed_prediction_claims(
@@ -687,7 +717,7 @@ def run_inference_pipeline(
         claimed_seed_records,
     ) as claimed_seeds:
         staged = _load_staged_request(run_id, request_id, staged_input_record)
-        return run_upstream_seed_worker(
+        result = run_upstream_seed_worker(
             UpstreamInferenceRuntime(
                 predictions=_INFERENCE_RUNTIME,
                 source_root=CONF.git_clone_dir,
@@ -700,6 +730,7 @@ def run_inference_pipeline(
             staged.sample_count,
             claimed_seeds,
         )
+        return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -712,15 +743,17 @@ def finalize_inference_summary(
     run_id: str,
     request_id: str,
     staged_input_record: dict[str, object],
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
     staged = _load_staged_request(run_id, request_id, staged_input_record)
-    return finalize_upstream_run_summary(
+    result = finalize_upstream_run_summary(
         _INFERENCE_RUNTIME,
         staged.config,
         run_id,
         staged.sample_count,
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -736,9 +769,10 @@ def finalize_inference_request(
     normalized_seeds: list[int],
     sample_count: int,
     display_name: str,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Publish one manifest-last view over the request's completed seeds."""
-    return publish_request_results(
+    result = publish_request_results(
         _INFERENCE_RUNTIME,
         RequestPublication(
             run_id=run_id,
@@ -749,6 +783,7 @@ def finalize_inference_request(
             display_name=display_name,
         ),
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 def _predict_structures(

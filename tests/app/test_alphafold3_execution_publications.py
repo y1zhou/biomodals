@@ -5,6 +5,9 @@
 from pathlib import Path
 from uuid import UUID
 
+import pytest
+
+from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3.execution_publications import (
     execution_result_path,
     load_execution_result,
@@ -69,4 +72,32 @@ def test_execution_result_rejects_a_changed_publication(tmp_path: Path) -> None:
             expected_path=path,
         )
         is None
+    )
+
+
+def test_worker_adapter_returns_a_reference_for_coordinated_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct calls stay unchanged while coordinator calls return references."""
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        alphafold3_app.CONF,
+        "output_volume_mountpoint",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(alphafold3_app.CONF, "output_volume", volume)
+    result: dict[str, object] = {"status": "complete"}
+    path = execution_result_path(RUN_ID, "seed-predictions", "c" * 64)
+
+    assert alphafold3_app._coordinator_result(result, None) is result
+    envelope = alphafold3_app._coordinator_result(result, path.as_posix())
+
+    assert (
+        load_execution_result(
+            tmp_path,
+            envelope["execution_result"],
+            expected_path=path,
+        )
+        == result
     )

@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 
 from biomodals.app.fold.alphafold3.inference_inputs import PreparedInferenceRun
+from biomodals.app.fold.alphafold3.invocation_cache import PreparedInvocation
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
     RawSearchTask,
@@ -43,6 +44,15 @@ def raw_search_task_plan(
             "database_id": task.database_id,
             "sequence_sha256": query_identity,
         },
+    )
+
+
+def stage_request_task_plan(invocation: PreparedInvocation) -> TaskPlan:
+    """Describe validation of the immutable staged request input."""
+    return TaskPlan(
+        task_key="request",
+        scientific_payload={"invocation_id": invocation.invocation_id},
+        execution_payload={"mode": "local"},
     )
 
 
@@ -121,5 +131,43 @@ def seed_prediction_task_plan(
             "request_id": prepared.request_id,
             "run_id": prepared.run_id,
             "seed": seed,
+        },
+    )
+
+
+def staged_inference_task_plan(prepared: PreparedInferenceRun) -> TaskPlan:
+    """Describe publication of one marker-complete staged inference input."""
+    return TaskPlan(
+        task_key="staged-input",
+        scientific_payload={
+            "request_id": prepared.request_id,
+            "run_id": prepared.run_id,
+        },
+        execution_payload={"mode": "local"},
+    )
+
+
+def inference_summary_task_plan(prepared: PreparedInferenceRun) -> TaskPlan:
+    """Describe the accumulated summary required by this seed request."""
+    return TaskPlan(
+        task_key="summary",
+        scientific_payload={
+            "normalized_seeds": list(prepared.normalized_seeds),
+            "run_id": prepared.run_id,
+            "sample_count": prepared.sample_count,
+        },
+    )
+
+
+def request_publication_task_plan(prepared: PreparedInferenceRun) -> TaskPlan:
+    """Describe the immutable request view and exact invocation receipt."""
+    return TaskPlan(
+        task_key="request-view",
+        scientific_payload={
+            "display_name": prepared.display_name,
+            "normalized_seeds": list(prepared.normalized_seeds),
+            "request_id": prepared.request_id,
+            "run_id": prepared.run_id,
+            "submitted_seeds": list(prepared.submitted_seeds),
         },
     )

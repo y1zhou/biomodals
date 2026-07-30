@@ -10,8 +10,12 @@ from biomodals.app.fold.alphafold3.execution_plan import (
 )
 from biomodals.app.fold.alphafold3.execution_tasks import (
     combined_msa_task_plan,
+    inference_summary_task_plan,
     raw_search_task_plan,
+    request_publication_task_plan,
     seed_prediction_task_plan,
+    stage_request_task_plan,
+    staged_inference_task_plan,
     template_search_task_plan,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import prepare_inference_run
@@ -162,3 +166,36 @@ def test_alphafold3_seed_tasks_are_independent_of_gpu_partitioning() -> None:
     assert tuple(plan.task_key for plan in plans) == ("seed:1", "seed:3")
     assert {plan.scientific_payload["run_id"] for plan in plans} == {prepared.run_id}
     assert all("max_num_gpus" not in repr(plan.scientific_payload) for plan in plans)
+
+
+def test_alphafold3_singleton_tasks_bind_publication_identities() -> None:
+    """Coordinator-local and finalizer Tasks retain the existing run identities."""
+    invocation = _invocation()
+    config = AF3Config(
+        name="example",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa="",
+                    pairedMsa="",
+                    templates=[],
+                )
+            )
+        ],
+    )
+    prepared = prepare_inference_run(config, recycle=10, sample=5)
+
+    assert stage_request_task_plan(invocation).scientific_payload == {
+        "invocation_id": invocation.invocation_id
+    }
+    assert staged_inference_task_plan(prepared).task_key == "staged-input"
+    assert inference_summary_task_plan(prepared).scientific_payload[
+        "normalized_seeds"
+    ] == [1]
+    assert (
+        request_publication_task_plan(prepared).scientific_payload["request_id"]
+        == prepared.request_id
+    )

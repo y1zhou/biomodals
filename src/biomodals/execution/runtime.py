@@ -13,10 +13,14 @@ from biomodals.execution.modal import (
     ModalSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.model import (
+    AvailabilityStatus,
     ExecutionRunRecord,
+    ExecutionTaskRecord,
     ProviderBinding,
+    ProviderCallPreclaim,
     ProviderCallRecord,
     ProviderCallStatus,
+    PullTaskClaim,
 )
 from biomodals.execution.scheduler import ProviderCallCandidate
 from biomodals.execution.sqlite import SqliteExecutionRepository
@@ -78,12 +82,110 @@ class ExecutionRuntime:
             return None
         if not preclaim.spawn_authorized:
             return preclaim.call
+        return self._spawn_preclaimed(
+            preclaim,
+            function=function,
+            args=args,
+            kwargs={} if kwargs is None else kwargs,
+            now=now,
+        )
+
+    def submit_pull_worker(
+        self,
+        execution_run_id: UUID,
+        *,
+        node_key: str,
+        submission_token: str,
+        binding: ProviderBinding,
+        compatibility_key: str,
+        claim_capacity: int,
+        args: tuple[Any, ...] = (),
+        kwargs: Mapping[str, Any] | None = None,
+        now: int,
+    ) -> ProviderCallRecord | None:
+        """Submit one pull worker with its durable owner identity."""
+        function = self._modal.resolve(binding)
+        preclaim = self.repository.preclaim_pull_worker(
+            execution_run_id,
+            node_key,
+            submission_token=submission_token,
+            binding=binding,
+            compatibility_key=compatibility_key,
+            claim_capacity=claim_capacity,
+            now=now,
+        )
+        if preclaim is None:
+            return None
+        if not preclaim.spawn_authorized:
+            return preclaim.call
+        invocation_kwargs = {} if kwargs is None else dict(kwargs)
+        if "provider_call_id" in invocation_kwargs:
+            raise ValueError("provider_call_id is supplied by the execution runtime")
+        invocation_kwargs["provider_call_id"] = str(preclaim.call.provider_call_id)
+        return self._spawn_preclaimed(
+            preclaim,
+            function=function,
+            args=args,
+            kwargs=invocation_kwargs,
+            now=now,
+        )
+
+    def claim_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        *,
+        request_id: str,
+        capacity: int,
+        now: int,
+    ) -> PullTaskClaim:
+        """Checkpoint pull assignments before exposing their payloads."""
+        claim = self.repository.claim_pull_tasks(
+            provider_call_id,
+            request_id=request_id,
+            capacity=capacity,
+            now=now,
+        )
+        self._checkpoint()
+        return claim
+
+    def record_pull_task_completion(
+        self,
+        provider_call_id: UUID,
+        task_key: str,
+        *,
+        request_id: str,
+        observation: AvailabilityStatus,
+        message: str | None = None,
+        now: int,
+    ) -> ExecutionTaskRecord:
+        """Checkpoint one idempotent worker publication report."""
+        task = self.repository.record_pull_task_completion(
+            provider_call_id,
+            task_key,
+            request_id=request_id,
+            observation=observation,
+            message=message,
+            now=now,
+        )
+        self._checkpoint()
+        return task
+
+    def _spawn_preclaimed(
+        self,
+        preclaim: ProviderCallPreclaim,
+        *,
+        function: Any,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        now: int,
+    ) -> ProviderCallRecord:
+        """Cross the durable preclaim/spawn/attachment fault boundary."""
         self._checkpoint()
         try:
             handle_id = self._modal.spawn(
                 function,
                 args=args,
-                kwargs={} if kwargs is None else kwargs,
+                kwargs=kwargs,
             )
         except ModalDefiniteSubmissionError as error:
             self.repository.fail_provider_call(

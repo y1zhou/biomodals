@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from biomodals.execution import ProviderCallStatus
+from biomodals.execution import AvailabilityStatus, ProviderCallStatus
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -30,6 +30,7 @@ class FakeModalDriver:
         self.spawn_count = 0
         self.observe_count = 0
         self.cancelled: list[str] = []
+        self.spawn_kwargs: list[dict[str, object]] = []
         self.spawn_error: Exception | None = None
         self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
 
@@ -39,6 +40,7 @@ class FakeModalDriver:
 
     def spawn(self, function, *, args, kwargs):
         self.spawn_count += 1
+        self.spawn_kwargs.append(dict(kwargs))
         if self.spawn_error is not None:
             raise self.spawn_error
         return f"fc-{function.name}"
@@ -241,3 +243,74 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
     assert completed.status == ProviderCallStatus.SUCCEEDED
     assert replay == completed
     assert driver.observe_count == 1
+
+
+def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
+    repository = create_repository(task_count=2)
+    driver = FakeModalDriver()
+    checkpoints: list[str] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: checkpoints.append("checkpoint"),
+    )
+
+    call = runtime.submit_pull_worker(
+        RUN_ID,
+        node_key="inference",
+        submission_token="worker-0",
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=2,
+        kwargs={"coordinator": "run-pool"},
+        now=110,
+    )
+
+    assert call is not None
+    assert call.status == ProviderCallStatus.ATTACHED
+    assert driver.spawn_kwargs == [
+        {
+            "coordinator": "run-pool",
+            "provider_call_id": str(call.provider_call_id),
+        }
+    ]
+    assert checkpoints == ["checkpoint", "checkpoint"]
+
+
+def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
+    repository = create_repository(task_count=1)
+    driver = FakeModalDriver()
+    checkpoints: list[str] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: checkpoints.append("checkpoint"),
+    )
+    call = runtime.submit_pull_worker(
+        RUN_ID,
+        node_key="inference",
+        submission_token="worker-0",
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=1,
+        now=110,
+    )
+    assert call is not None
+
+    claim = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim-0",
+        capacity=1,
+        now=111,
+    )
+    completed = runtime.record_pull_task_completion(
+        call.provider_call_id,
+        "seed-0",
+        request_id="complete-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=112,
+    )
+
+    assert [assignment.task_key for assignment in claim.assignments] == ["seed-0"]
+    assert completed.status.value == "succeeded"
+    assert checkpoints == ["checkpoint"] * 4

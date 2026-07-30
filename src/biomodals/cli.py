@@ -5,7 +5,7 @@ import shlex
 import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import typer
 from rich.console import Console
@@ -553,6 +553,26 @@ def _print_execution_snapshot(snapshot: ExecutionSnapshot) -> None:
     )
 
 
+def _print_spawned_execution_run(
+    *,
+    execution_run_id: UUID,
+    environment: str,
+    deployment_name: str,
+    deployment_version: int,
+    call: object,
+) -> None:
+    """Print the explicit location of one detached coordinator call."""
+    console.print(f"Execution Run ID: [green]{execution_run_id}[/green]")
+    console.print(
+        "Deployment Identity: "
+        f"[green]{environment}/{deployment_name}/v{deployment_version}[/green]"
+    )
+    console.print(
+        "Coordinator FunctionCall ID: "
+        f"[green]{getattr(call, 'object_id', call)}[/green]"
+    )
+
+
 @run_commands.command(name="status")
 def status_execution_run(
     environment: Annotated[
@@ -661,14 +681,110 @@ def resume_execution_run_command(
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Error[/bold red] Could not resume run: {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(f"Execution Run ID: [green]{execution_run_id}[/green]")
-    console.print(
-        "Deployment Identity: "
-        f"[green]{environment}/{deployment_name}/v{deployment_version}[/green]"
+    _print_spawned_execution_run(
+        execution_run_id=execution_run_id,
+        environment=environment,
+        deployment_name=deployment_name,
+        deployment_version=deployment_version,
+        call=call,
     )
-    console.print(
-        "Coordinator FunctionCall ID: "
-        f"[green]{getattr(call, 'object_id', call)}[/green]"
+
+
+@run_commands.command(name="restart")
+def restart_execution_run(
+    environment: Annotated[
+        str,
+        typer.Option(
+            "--environment",
+            help="Modal Environment containing the predecessor Run.",
+        ),
+    ],
+    deployment_name: Annotated[
+        str,
+        typer.Option(
+            "--deployment-name",
+            help="Predecessor Modal app deployment name.",
+        ),
+    ],
+    deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--deployment-version",
+            min=1,
+            help="Exact predecessor Modal deployment version.",
+        ),
+    ],
+    execution_run_id: Annotated[
+        UUID,
+        typer.Option(
+            "--execution-run-id",
+            help="Opaque predecessor Execution Run UUID.",
+        ),
+    ],
+    target_environment: Annotated[
+        str,
+        typer.Option(
+            "--target-environment",
+            help="Modal Environment for the Successor Run.",
+        ),
+    ],
+    target_deployment_name: Annotated[
+        str,
+        typer.Option(
+            "--target-deployment-name",
+            help="Modal app deployment name for the Successor Run.",
+        ),
+    ],
+    target_deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--target-deployment-version",
+            min=1,
+            help="Exact Modal deployment version for the Successor Run.",
+        ),
+    ],
+    max_active_provider_calls: Annotated[
+        int | None,
+        typer.Option(
+            "--max-active-provider-calls",
+            min=1,
+            help="Override the predecessor's total active-call limit.",
+        ),
+    ] = None,
+    max_active_gpu_provider_calls: Annotated[
+        int | None,
+        typer.Option(
+            "--max-active-gpu-provider-calls",
+            min=0,
+            help="Override the predecessor's active GPU-call limit.",
+        ),
+    ] = None,
+) -> None:
+    """Create a new Successor Run without mutating the predecessor."""
+    successor_execution_run_id = uuid4()
+    try:
+        call = _run_coordinator(
+            environment=target_environment,
+            deployment_name=target_deployment_name,
+            deployment_version=target_deployment_version,
+            execution_run_id=successor_execution_run_id,
+        ).restart.spawn(
+            predecessor_execution_run_id=str(execution_run_id),
+            predecessor_deployment_environment=environment,
+            predecessor_deployment_name=deployment_name,
+            predecessor_deployment_version=deployment_version,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Error[/bold red] Could not restart run: {exc}")
+        raise typer.Exit(code=1) from exc
+    _print_spawned_execution_run(
+        execution_run_id=successor_execution_run_id,
+        environment=target_environment,
+        deployment_name=target_deployment_name,
+        deployment_version=target_deployment_version,
+        call=call,
     )
 
 

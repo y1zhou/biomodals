@@ -9,8 +9,10 @@ import pytest
 from typer.testing import CliRunner
 
 from biomodals.cli import app
+from biomodals.execution import DeploymentIdentity
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 LOCATION_FLAGS = [
     "--environment",
     "production",
@@ -21,6 +23,14 @@ LOCATION_FLAGS = [
     "--execution-run-id",
     str(RUN_ID),
 ]
+TARGET_FLAGS = [
+    "--target-environment",
+    "production",
+    "--target-deployment-name",
+    "ShortMDWorkflow",
+    "--target-deployment-version",
+    "8",
+]
 runner = CliRunner()
 
 
@@ -29,13 +39,16 @@ class FakeRemoteMethod:
         self.result = result
         self.remote_calls = 0
         self.spawn_calls = 0
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    def remote(self) -> object:
+    def remote(self, *args: object, **kwargs: object) -> object:
         self.remote_calls += 1
+        self.calls.append((args, kwargs))
         return self.result
 
-    def spawn(self) -> object:
+    def spawn(self, *args: object, **kwargs: object) -> object:
         self.spawn_calls += 1
+        self.calls.append((args, kwargs))
         return self.result
 
 
@@ -45,6 +58,7 @@ class FakeCoordinator:
         self.status = FakeRemoteMethod(self.snapshot)
         self.cancel = FakeRemoteMethod(self.snapshot)
         self.resume = FakeRemoteMethod(SimpleNamespace(object_id="fc-resume"))
+        self.restart = FakeRemoteMethod(SimpleNamespace(object_id="fc-restart"))
 
 
 def _patch_coordinator(
@@ -78,6 +92,7 @@ def test_run_status_uses_explicit_location_and_prints_snapshot(
     assert printed == [coordinator.snapshot]
     assert calls["execution_run_id"] == RUN_ID
     deployment = calls["deployment"]
+    assert isinstance(deployment, DeploymentIdentity)
     assert deployment.environment == "production"
     assert deployment.deployment_name == "ShortMDWorkflow"
     assert deployment.deployment_version == 7
@@ -112,6 +127,52 @@ def test_run_resume_spawns_a_detached_coordinator_loop(
     assert "fc-resume" in result.output
 
 
+def test_run_restart_creates_a_new_explicit_successor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, calls = _patch_coordinator(monkeypatch)
+    monkeypatch.setattr("biomodals.cli.uuid4", lambda: SUCCESSOR_ID)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "restart",
+            *LOCATION_FLAGS,
+            *TARGET_FLAGS,
+            "--max-active-provider-calls",
+            "12",
+            "--max-active-gpu-provider-calls",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert coordinator.restart.spawn_calls == 1
+    assert calls["execution_run_id"] == SUCCESSOR_ID
+    deployment = calls["deployment"]
+    assert isinstance(deployment, DeploymentIdentity)
+    assert deployment.environment == "production"
+    assert deployment.deployment_name == "ShortMDWorkflow"
+    assert deployment.deployment_version == 8
+    assert coordinator.restart.calls == [
+        (
+            (),
+            {
+                "predecessor_execution_run_id": str(RUN_ID),
+                "predecessor_deployment_environment": "production",
+                "predecessor_deployment_name": "ShortMDWorkflow",
+                "predecessor_deployment_version": 7,
+                "max_active_provider_calls": 12,
+                "max_active_gpu_provider_calls": 3,
+            },
+        )
+    ]
+    assert str(SUCCESSOR_ID) in result.output
+    assert "production/ShortMDWorkflow/v8" in result.output
+    assert "fc-restart" in result.output
+
+
 def test_top_level_run_is_reserved_for_execution_lifecycle() -> None:
     result = runner.invoke(app, ["run", "--help"])
 
@@ -119,3 +180,4 @@ def test_top_level_run_is_reserved_for_execution_lifecycle() -> None:
     assert "status" in result.output
     assert "cancel" in result.output
     assert "resume" in result.output
+    assert "restart" in result.output

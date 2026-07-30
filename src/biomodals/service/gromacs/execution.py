@@ -15,6 +15,7 @@ from biomodals.execution import (
     NodeStatus,
     ProviderCallStatus,
     RunStatus,
+    RunStatusReason,
     TaskStatus,
 )
 from biomodals.execution.modal import (
@@ -36,7 +37,12 @@ from biomodals.service.gromacs.plan import (
     operation_provider_binding,
     operation_task_plan,
 )
-from biomodals.service.gromacs.results import FinalArchive
+from biomodals.service.gromacs.results import (
+    ArchiveNotReadyError,
+    FinalArchive,
+    GromacsResultInvalidError,
+    ResultIdentityMismatchError,
+)
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.store import JobRecord, ServiceStore
 
@@ -343,6 +349,42 @@ class GromacsExecutionCoordinator:
         )
         if task.status == TaskStatus.SUCCEEDED:
             return None
+        if (
+            task.status == TaskStatus.RUNNING
+            and task.local_owned
+            and task.provider_call_id is None
+            and task.worker_provider_call_id is None
+        ):
+            try:
+                archive = await self.adapter.recover_archive(job)
+            except ArchiveNotReadyError:
+                runtime.repository.record_task_result_observation(
+                    execution_run_id,
+                    PREPARE_RESULT,
+                    "operation",
+                    AvailabilityStatus.MISSING,
+                    now=self._now(),
+                )
+            except (
+                GromacsResultInvalidError,
+                ResultIdentityMismatchError,
+                ValueError,
+            ) as exc:
+                self._fail_result_task(runtime, execution_run_id, str(exc))
+                return None
+            except Exception:
+                runtime.repository.record_task_result_observation(
+                    execution_run_id,
+                    PREPARE_RESULT,
+                    "operation",
+                    AvailabilityStatus.UNKNOWN,
+                    now=self._now(),
+                )
+                runtime.checkpoint()
+                raise
+            else:
+                self._complete_result_task(runtime, execution_run_id)
+                return archive
         if not runtime.repository.acquire_local_task(
             execution_run_id,
             PREPARE_RESULT,
@@ -351,10 +393,37 @@ class GromacsExecutionCoordinator:
         ):
             return None
         runtime.checkpoint()
-        archive = await self.adapter.publish_archive(
-            job,
-            completed_at=self._now(),
-        )
+        try:
+            archive = await self.adapter.publish_archive(
+                job,
+                completed_at=self._now(),
+            )
+        except (
+            GromacsResultInvalidError,
+            ResultIdentityMismatchError,
+            ValueError,
+        ) as exc:
+            self._fail_result_task(runtime, execution_run_id, str(exc))
+            return None
+        except Exception as exc:
+            runtime.repository.transition_run(
+                execution_run_id,
+                RunStatus.SUSPENDED,
+                reason=RunStatusReason.COORDINATOR_ERROR,
+                message=str(exc),
+                now=self._now(),
+            )
+            runtime.checkpoint()
+            raise
+        self._complete_result_task(runtime, execution_run_id)
+        return archive
+
+    def _complete_result_task(
+        self,
+        runtime: AsyncExecutionRuntime,
+        execution_run_id: UUID,
+    ) -> None:
+        """Record one successfully validated result publication."""
         runtime.repository.record_task_result_observation(
             execution_run_id,
             PREPARE_RESULT,
@@ -368,7 +437,27 @@ class GromacsExecutionCoordinator:
             now=self._now(),
         )
         runtime.checkpoint()
-        return archive
+
+    def _fail_result_task(
+        self,
+        runtime: AsyncExecutionRuntime,
+        execution_run_id: UUID,
+        message: str,
+    ) -> None:
+        """Record one conclusive result-publication failure."""
+        runtime.repository.fail_task(
+            execution_run_id,
+            PREPARE_RESULT,
+            "operation",
+            message=message,
+            now=self._now(),
+        )
+        runtime.repository.reconcile_node_tasks(
+            execution_run_id,
+            PREPARE_RESULT,
+            now=self._now(),
+        )
+        runtime.checkpoint()
 
     async def _submit_ready_remote_tasks(
         self,

@@ -10,6 +10,7 @@ from biomodals.execution import (
     DeploymentIdentity,
     ProviderCallStatus,
     RunStatus,
+    RunStatusReason,
 )
 from biomodals.execution.modal import (
     ModalCallObservation,
@@ -20,7 +21,11 @@ from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
 from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.execution import GromacsExecutionCoordinator
 from biomodals.service.gromacs.plan import execution_plan
-from biomodals.service.gromacs.results import FinalArchive
+from biomodals.service.gromacs.results import (
+    ArchiveNotReadyError,
+    FinalArchive,
+    GromacsResultInvalidError,
+)
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
     JobAdmissionConfiguration,
@@ -37,6 +42,7 @@ class FakeGromacsExecutionAdapter:
         self._current_wave: list[str] = []
         self._calls: dict[str, str] = {}
         self.publish_count = 0
+        self.recover_count = 0
 
     def begin_wave(self) -> None:
         self._current_wave = []
@@ -63,6 +69,9 @@ class FakeGromacsExecutionAdapter:
 
     async def publish_archive(self, job, *, completed_at):
         self.publish_count += 1
+        return self._archive(job)
+
+    def _archive(self, job):
         return FinalArchive(
             state=JobState.SUCCEEDED,
             volume_name="Gromacs-outputs",
@@ -74,10 +83,58 @@ class FakeGromacsExecutionAdapter:
         )
 
     async def recover_archive(self, job):
-        return await self.publish_archive(job, completed_at=0)
+        self.recover_count += 1
+        return self._archive(job)
 
     async def cleanup_intermediates(self, job):
         return None
+
+
+class CoordinatorInterrupted(BaseException):
+    """Simulate process loss without application-level exception handling."""
+
+
+class PublishedBeforeInterruptionAdapter(FakeGromacsExecutionAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self._interrupt_publication = True
+
+    async def publish_archive(self, job, *, completed_at):
+        self.publish_count += 1
+        if self._interrupt_publication:
+            self._interrupt_publication = False
+            raise CoordinatorInterrupted
+        return self._archive(job)
+
+
+class InvalidPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
+    async def recover_archive(self, job):
+        self.recover_count += 1
+        raise GromacsResultInvalidError("published archive is corrupt")
+
+
+class MissingPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
+    async def recover_archive(self, job):
+        self.recover_count += 1
+        raise ArchiveNotReadyError("published archive is missing")
+
+
+class UnknownPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
+    async def recover_archive(self, job):
+        self.recover_count += 1
+        raise RuntimeError("Modal Volume could not be inspected")
+
+
+class InvalidInitialPublicationAdapter(FakeGromacsExecutionAdapter):
+    async def publish_archive(self, job, *, completed_at):
+        self.publish_count += 1
+        raise GromacsResultInvalidError("required output is malformed")
+
+
+class UnknownInitialPublicationAdapter(FakeGromacsExecutionAdapter):
+    async def publish_archive(self, job, *, completed_at):
+        self.publish_count += 1
+        raise RuntimeError("Modal Volume upload failed")
 
 
 def _store(tmp_path: Path) -> tuple[ServiceStore, UUID]:
@@ -188,5 +245,230 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
             "prepare_result",
         ]
         assert job.result_archive_schema_version == GROMACS_ARCHIVE_SCHEMA_VERSION
+
+    asyncio.run(scenario())
+
+
+def test_replacement_coordinator_recovers_published_local_result(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = PublishedBeforeInterruptionAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 220)).__next__,
+        )
+
+        for _ in range(3):
+            adapter.begin_wave()
+            await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except CoordinatorInterrupted:
+            pass
+        else:
+            raise AssertionError("publication should simulate coordinator loss")
+
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+
+        assert adapter.publish_count == 1
+        assert adapter.recover_count == 1
+        with store.execution_repository() as repository:
+            assert repository.snapshot(RUN_ID).run.status == RunStatus.SUCCEEDED
+        job = store.get_job_by_id(JOB_ID)
+        assert job is not None
+        assert job.state == JobState.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+def test_conclusive_local_result_recovery_failure_terminates_run(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = InvalidPublicationOnRecoveryAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 240)).__next__,
+        )
+
+        for _ in range(3):
+            adapter.begin_wave()
+            await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except CoordinatorInterrupted:
+            pass
+        else:
+            raise AssertionError("publication should simulate coordinator loss")
+
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+
+        assert adapter.publish_count == 1
+        assert adapter.recover_count == 1
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+        assert snapshot.run.status == RunStatus.FAILED
+        job = store.get_job_by_id(JOB_ID)
+        assert job is not None
+        assert job.state == JobState.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_missing_local_result_is_republished_after_interruption(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = MissingPublicationOnRecoveryAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 240)).__next__,
+        )
+
+        for _ in range(3):
+            adapter.begin_wave()
+            await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except CoordinatorInterrupted:
+            pass
+        else:
+            raise AssertionError("publication should simulate coordinator loss")
+
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+
+        assert adapter.publish_count == 2
+        assert adapter.recover_count == 1
+        with store.execution_repository() as repository:
+            assert repository.snapshot(RUN_ID).run.status == RunStatus.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+def test_inconclusive_local_result_recovery_suspends_run(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = UnknownPublicationOnRecoveryAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 240)).__next__,
+        )
+
+        for _ in range(3):
+            adapter.begin_wave()
+            await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except CoordinatorInterrupted:
+            pass
+        else:
+            raise AssertionError("publication should simulate coordinator loss")
+
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except RuntimeError as exc:
+            assert str(exc) == "Modal Volume could not be inspected"
+        else:
+            raise AssertionError("inconclusive recovery should remain visible")
+
+        assert adapter.publish_count == 1
+        assert adapter.recover_count == 1
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+        assert snapshot.run.status == RunStatus.SUSPENDED
+        assert snapshot.run.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
+        job = store.get_job_by_id(JOB_ID)
+        assert job is not None
+        assert job.state == JobState.BLOCKED
+
+    asyncio.run(scenario())
+
+
+def test_conclusive_initial_publication_failure_terminates_run(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = InvalidInitialPublicationAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 240)).__next__,
+        )
+
+        for _ in range(4):
+            adapter.begin_wave()
+            await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+
+        assert adapter.publish_count == 1
+        assert adapter.recover_count == 0
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+        assert snapshot.run.status == RunStatus.FAILED
+        job = store.get_job_by_id(JOB_ID)
+        assert job is not None
+        assert job.state == JobState.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_infrastructure_publication_failure_suspends_run(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = UnknownInitialPublicationAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 240)).__next__,
+        )
+
+        for _ in range(3):
+            adapter.begin_wave()
+            await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except RuntimeError as exc:
+            assert str(exc) == "Modal Volume upload failed"
+        else:
+            raise AssertionError("infrastructure failure should remain visible")
+
+        assert adapter.publish_count == 1
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+        assert snapshot.run.status == RunStatus.SUSPENDED
+        assert snapshot.run.status_reason == RunStatusReason.COORDINATOR_ERROR
 
     asyncio.run(scenario())

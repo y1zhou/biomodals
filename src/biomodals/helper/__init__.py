@@ -24,8 +24,8 @@ def patch_image_for_helper(
             This can slow down iteration since it requires a rebuild of the Image
             and any subsequent build steps whenever the included files change,
             but it is required if you want to run additional build steps after this one.
-        include_workflow_modules: Whether to include workflow modules in the patch.
-            By default, only helper dependencies are included.
+        include_workflow_modules: Whether to include workflow modules in addition
+            to the shared helper and execution modules.
         skip_deps: A list of package names to skip when installing
             `biomodals` dependencies. By default, all dependencies are included.
             This is to help with older project apps on Python <3.12.
@@ -43,7 +43,12 @@ def patch_image_for_helper(
     except metadata.PackageNotFoundError:
         helper_deps = []
 
-    mods = ["biomodals.helper", "biomodals.app.config", "biomodals.schema"]
+    mods = [
+        "biomodals.helper",
+        "biomodals.app.config",
+        "biomodals.schema",
+        "biomodals.execution",
+    ]
     if include_workflow_modules:
         mods.append("biomodals.workflow")
 

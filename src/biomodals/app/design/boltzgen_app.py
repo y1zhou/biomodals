@@ -72,6 +72,7 @@ runtime_image = (
     .uv_pip_install(f"git+{CONF.repo_url}@{CONF.repo_commit_hash}")
     .workdir(str(CONF.git_clone_dir))
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.design.boltzgen")
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

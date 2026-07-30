@@ -70,6 +70,7 @@ runtime_image = (
     .from_registry("rosettacommons/rosetta:serial-420", add_python=CONF.python_version)
     .env(CONF.default_env)
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.bioinfo.rosetta")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_rosetta_task"})

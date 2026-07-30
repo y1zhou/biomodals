@@ -219,11 +219,7 @@ ALPHAFOLD3_TASK_VOLUME_MOUNTS = {
         model_volume=True,
         model_ro=True,
     ),
-    alphafold3_app._JAX_CACHE_MOUNTPOINT: modal.Volume.from_name(  # noqa: SLF001
-        alphafold3_app._JAX_CACHE_MOUNTPOINT.name,  # noqa: SLF001
-        create_if_missing=True,
-        version=2,
-    ),
+    alphafold3_app.JAX_CACHE_MOUNTPOINT: alphafold3_app.JAX_CACHE_VOLUME,
 }
 ROSETTA_TASK_VOLUME_MOUNTS = rosetta_app.CONF.mounts(output_volume=True)
 

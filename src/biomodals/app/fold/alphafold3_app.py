@@ -171,7 +171,12 @@ SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     create_if_missing=True,
     version=2,
 )
-_JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
+JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
+JAX_CACHE_VOLUME = modal.Volume.from_name(
+    JAX_CACHE_MOUNTPOINT.name,
+    create_if_missing=True,
+    version=2,
+)
 _SUMMARY_TIMEOUT_SECONDS = 3600
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_alphafold3_task"})
@@ -670,11 +675,7 @@ def claim_seed_prediction_work(
         model_ro=True,
     )
     | {
-        _JAX_CACHE_MOUNTPOINT: modal.Volume.from_name(
-            _JAX_CACHE_MOUNTPOINT.name,
-            create_if_missing=True,
-            version=2,
-        )
+        JAX_CACHE_MOUNTPOINT: JAX_CACHE_VOLUME,
     },
 )
 def run_inference_pipeline(
@@ -696,7 +697,7 @@ def run_inference_pipeline(
                 predictions=_INFERENCE_RUNTIME,
                 source_root=CONF.git_clone_dir,
                 model_root=Path(CONF.model_volume_mountpoint),
-                jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
+                jax_cache_dir=Path(JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
             ),
             staged.config,
             run_id,

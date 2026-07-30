@@ -28,7 +28,7 @@ def drive_execution_run(
     execution_run_id: UUID,
     *,
     advance_once: Callable[[], None],
-    checkpoint: Callable[[], None],
+    checkpoint: Callable[[], SqliteExecutionRepository | None],
     now: Callable[[], int] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     poll_interval_seconds: float = 1.0,
@@ -41,7 +41,9 @@ def drive_execution_run(
     while repository.get_run(execution_run_id).status in _DRIVABLE_STATUSES:
         try:
             advance_once()
-            checkpoint()
+            replacement = checkpoint()
+            if replacement is not None:
+                repository = replacement
         except Exception as exc:
             _suspend_after_application_error(
                 repository,
@@ -61,12 +63,14 @@ def resume_execution_run(
     repository: SqliteExecutionRepository,
     execution_run_id: UUID,
     *,
-    checkpoint: Callable[[], None],
+    checkpoint: Callable[[], SqliteExecutionRepository | None],
     now: int,
 ) -> ExecutionRunRecord:
     """Explicitly resume one suspended Run and cross its durability boundary."""
     run = repository.resume_run(execution_run_id, now=now)
-    checkpoint()
+    replacement = checkpoint()
+    if replacement is not None:
+        run = replacement.get_run(execution_run_id)
     return run
 
 
@@ -75,7 +79,7 @@ def _suspend_after_application_error(
     execution_run_id: UUID,
     *,
     message: str,
-    checkpoint: Callable[[], None],
+    checkpoint: Callable[[], SqliteExecutionRepository | None],
     now: int,
 ) -> None:
     """Best-effort persistence for an uncaught coordinator application error."""

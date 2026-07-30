@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103, S106
 
+import sqlite3
+
 import pytest
 
 from biomodals.execution import (
@@ -66,6 +68,46 @@ def test_detached_coordinator_loop_reaches_terminal_without_client_polling() -> 
     )
     assert reopened.run.status == RunStatus.SUCCEEDED
     assert advance_count == 1
+
+
+def test_coordinator_accepts_a_reopened_volume_repository(tmp_path) -> None:
+    ledger_path = tmp_path / "ledger.sqlite3"
+    connection = sqlite3.connect(ledger_path)
+    repository = create_repository(connection=connection, task_count=1)
+    connection.commit()
+    active_repository = repository
+    active_connection = connection
+
+    def advance_once() -> None:
+        active_repository.record_task_result_observation(
+            RUN_ID,
+            "inference",
+            "seed-0",
+            AvailabilityStatus.AVAILABLE,
+            now=110,
+        )
+        active_repository.reconcile_node_tasks(RUN_ID, "inference", now=111)
+        active_repository.finalize_run_from_results(RUN_ID, now=112)
+
+    def checkpoint():
+        nonlocal active_connection, active_repository
+        active_connection.commit()
+        active_connection.close()
+        active_connection = sqlite3.connect(ledger_path)
+        active_repository = type(repository)(active_connection)
+        return active_repository
+
+    snapshot = drive_execution_run(
+        repository,
+        RUN_ID,
+        advance_once=advance_once,
+        checkpoint=checkpoint,
+        sleep=lambda _: None,
+        poll_interval_seconds=0,
+    )
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert active_repository is not repository
 
 
 def test_application_error_suspends_without_replacing_attached_work() -> None:

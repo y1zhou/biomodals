@@ -114,6 +114,10 @@ ppiflow_task_image = ppiflow_app.runtime_image.add_local_python_source(
 ligandmpnn_task_image = ligandmpnn_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
+flowpacker_task_image = flowpacker_app.runtime_image.add_local_python_source(
+    "biomodals.workflow"
+)
+dockq_task_image = dockq_app.runtime_image.add_local_python_source("biomodals.workflow")
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
@@ -156,6 +160,14 @@ PPI_FLOW_TASK_VOLUME_MOUNTS = {
 LIGANDMPNN_TASK_VOLUME_MOUNTS = {
     **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
     **ligandmpnn_app.CONF.mounts(model_volume=True),
+}
+FLOWPACKER_TASK_VOLUME_MOUNTS = {
+    **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    **flowpacker_app.CONF.mounts(
+        output_volume=True,
+        model_volume=True,
+        model_ro=False,
+    ),
 }
 
 
@@ -239,11 +251,12 @@ def run_ppiflow_design_stage(
 
 
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
+    image=flowpacker_task_image,
+    gpu=flowpacker_app.CONF.gpu,
+    cpu=(0.125, 16.125),
+    memory=(1024, 65536),
     timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    volumes=FLOWPACKER_TASK_VOLUME_MOUNTS,
 )
 def run_ppiflow_flowpacker_stage(
     *,
@@ -275,7 +288,7 @@ def run_ppiflow_flowpacker_stage(
         if key in config
     }
     return AppRunResult.model_validate(
-        flowpacker_app.run_flowpacker_workflow.remote(
+        flowpacker_app.run_flowpacker_workflow.get_raw_f()(
             input_files=selected,
             run_name=run_name,
             **kwargs,
@@ -284,9 +297,9 @@ def run_ppiflow_flowpacker_stage(
 
 
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
+    image=dockq_task_image,
+    cpu=(0.125, 16.125),
+    memory=(512, 16384),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
 )
@@ -335,7 +348,7 @@ def run_ppiflow_dockq_stage(
     if isinstance(dockq_args, str):
         dockq_args = shlex.split(dockq_args)
     return AppRunResult.model_validate(
-        dockq_app.run_dockq_workflow.remote(
+        dockq_app.run_dockq_workflow.get_raw_f()(
             pairs=pairs,
             run_name=run_name,
             dockq_args=dockq_args,

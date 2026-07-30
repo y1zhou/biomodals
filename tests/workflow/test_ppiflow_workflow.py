@@ -72,6 +72,9 @@ class _FakeModalFunction:
         self.kwargs = kwargs
         return _FakeFunctionCall(self.object_id, self.result)
 
+    def get_raw_f(self):
+        return self.remote
+
 
 def _task_yaml(*, enabled_steps: str) -> bytes:
     return f"""
@@ -166,7 +169,6 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
 
     for function_name in (
         "run_ppiflow_refold_candidate",
-        "run_ppiflow_flowpacker_stage",
         "run_ppiflow_dockq_stage",
     ):
         assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
@@ -184,6 +186,10 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     assert "LIGANDMPNN_TASK_VOLUME_MOUNTS" in _decorator_block(
         source,
         "run_ppiflow_ligandmpnn_candidate",
+    )
+    assert "FLOWPACKER_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_flowpacker_stage",
     )
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
@@ -351,6 +357,40 @@ def test_flowpacker_step_prepares_selected_structures_for_kernel(
     assert submission.kwargs["config"]["n_samples"] == 2
     assert submission.kwargs["config"]["seed"] == 7
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
+
+
+def test_flowpacker_stage_executes_batch_in_tracked_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flowpacker = _FakeModalFunction(
+        "unused",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_reload_ppiflow_source_volumes",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.ppiflow_staging,
+        "select_structure_files_from_artifacts",
+        lambda *args, **kwargs: [("candidate.pdb", b"ATOM\n")],
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.flowpacker_app,
+        "run_flowpacker_workflow",
+        flowpacker,
+    )
+
+    ppiflow_workflow.run_ppiflow_flowpacker_stage.get_raw_f()(
+        artifacts=[_upstream_structure_artifact()],
+        config={"seed": 7},
+        run_name="flowpacker-run",
+    )
+
+    assert flowpacker.kwargs["input_files"] == [("candidate.pdb", b"ATOM\n")]
+    assert flowpacker.kwargs["run_name"] == "flowpacker-run"
+    assert flowpacker.kwargs["seed"] == 7
 
 
 def test_partial_step_prepares_one_kernel_candidate_task(
@@ -1104,6 +1144,46 @@ def test_dockq_stage_rejects_unpaired_structure_counts(
             config={},
             run_name="dockq-run",
         )
+
+
+def test_dockq_stage_executes_batch_in_tracked_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = iter([
+        [("candidate.pdb", b"ATOM REF\n")],
+        [("candidate.pdb", b"ATOM MODEL\n")],
+    ])
+    dockq = _FakeModalFunction(
+        "unused",
+        AppRunResult(status=AppRunStatus.SUCCEEDED),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_reload_ppiflow_source_volumes",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.ppiflow_staging,
+        "select_structure_files_from_artifacts",
+        lambda *args, **kwargs: next(selected),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.dockq_app,
+        "run_dockq_workflow",
+        dockq,
+    )
+
+    ppiflow_workflow.run_ppiflow_dockq_stage.get_raw_f()(
+        reference_artifacts=[_upstream_structure_artifact()],
+        model_artifacts=[_upstream_structure_artifact()],
+        candidate_manifests=None,
+        config={},
+        run_name="dockq-run",
+    )
+
+    assert dockq.kwargs["run_name"] == "dockq-run"
+    assert len(dockq.kwargs["pairs"]) == 1
+    assert dockq.kwargs["pairs"][0]["candidate_id"] == "candidate"
 
 
 def test_filter_step_delegates_score_filtering(

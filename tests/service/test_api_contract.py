@@ -32,6 +32,7 @@ from biomodals.execution.modal import (
     ModalDefiniteSubmissionError,
     ModalSubmissionOutcomeUnknownError,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease
 from biomodals.service.auth import AuthService, IssuedPasswordLink
@@ -1610,18 +1611,36 @@ def test_registered_workload_drives_runtime_admin_and_job_views(
             AvailabilityStatus.MISSING,
             now=1_800_000_001,
         )
+        binding = ProviderBinding(
+            environment="production",
+            app_name="ConfiguredStructureApp",
+            app_version=9,
+            function_name="predict_structure",
+            uses_gpu=False,
+        )
+        repository.persist_fixed_dispatch_policy(
+            execution_run_id,
+            (
+                TaskDispatchDescriptor(
+                    node_key="predict_structure",
+                    node_ordinal=0,
+                    task_key="prediction",
+                    task_ordinal=0,
+                    binding=binding,
+                    compatibility_key="predict_structure",
+                    max_tasks_per_call=1,
+                    depth=0,
+                    unblocking_span=0,
+                ),
+            ),
+            now=1_800_000_001,
+        )
         preclaim = repository.preclaim_fixed_batch(
             execution_run_id,
             "predict_structure",
             ("prediction",),
             submission_token=submission_key,
-            binding=ProviderBinding(
-                environment="production",
-                app_name="ConfiguredStructureApp",
-                app_version=9,
-                function_name="predict_structure",
-                uses_gpu=False,
-            ),
+            binding=binding,
             compatibility_key="predict_structure",
             now=1_800_000_001,
         )

@@ -6,11 +6,22 @@ import pytest
 
 from biomodals.execution import AvailabilityStatus, ProviderCallStatus, TaskStatus
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
 
 
 def test_call_success_and_task_scientific_completion_are_separate() -> None:
     repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -46,6 +57,12 @@ def test_call_success_and_task_scientific_completion_are_separate() -> None:
 
 def test_non_json_result_does_not_change_call_or_release_slot() -> None:
     repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -77,6 +94,13 @@ def test_non_json_result_does_not_change_call_or_release_slot() -> None:
 
 def test_conclusive_call_failure_fails_only_unfinished_owned_tasks() -> None:
     repository = create_repository(task_count=2)
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        max_tasks_per_call=2,
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",

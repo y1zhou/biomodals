@@ -6,11 +6,23 @@ import pytest
 
 from biomodals.execution import ProviderCallStatus, TaskStatus
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
 
 
 def test_only_new_durable_preclaim_authorizes_spawn() -> None:
     repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="model-weights-v3",
+        max_tasks_per_call=2,
+    )
 
     first = repository.preclaim_fixed_batch(
         RUN_ID,
@@ -48,6 +60,12 @@ def test_only_new_durable_preclaim_authorizes_spawn() -> None:
 
 def test_task_cannot_acquire_a_second_remote_owner() -> None:
     repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="model-weights-v3",
+    )
     repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -74,6 +92,12 @@ def test_task_cannot_acquire_a_second_remote_owner() -> None:
 
 def test_reusing_submission_token_for_other_work_is_a_conflict() -> None:
     repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="model-weights-v3",
+    )
     repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -98,6 +122,12 @@ def test_reusing_submission_token_for_other_work_is_a_conflict() -> None:
 
 def test_abandoned_submitting_call_becomes_unknown_and_never_reauthorizes() -> None:
     repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="model-weights-v3",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",

@@ -18,7 +18,12 @@ from biomodals.execution.coordinator import (
     resume_execution_run,
 )
 
-from .provider_call_helpers import CPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    CPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
 
 
 class CoordinatorInterrupted(BaseException):
@@ -165,6 +170,12 @@ def test_coordinator_accepts_a_reopened_volume_repository(tmp_path) -> None:
 
 def test_application_error_suspends_without_replacing_attached_work() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=CPU_BINDING,
+        compatibility_key="search",
+    )
     preclaim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",

@@ -3,6 +3,7 @@
 # ruff: noqa: D103, S106
 
 import sqlite3
+from dataclasses import replace
 
 import orjson
 import pytest
@@ -108,21 +109,18 @@ def test_fixed_batch_size_must_be_positive() -> None:
 def test_fixed_batch_policy_is_durable_and_immutable_within_a_run() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(connection=connection, task_count=3)
+    descriptors = tuple(
+        replace(_task(f"seed-{index}", index), node_ordinal=0) for index in range(3)
+    )
 
-    with pytest.raises(
-        ValueError,
-        match="fixed Provider Call batch exceeds max_tasks_per_call",
-    ):
-        repository.preclaim_fixed_batch(
-            RUN_ID,
-            "inference",
-            ("seed-0", "seed-1"),
-            submission_token="oversized",
-            binding=GPU,
-            compatibility_key="same-model",
-            max_tasks_per_call=1,
-            now=110,
-        )
+    persisted, changed = repository.persist_fixed_dispatch_policy(
+        RUN_ID,
+        descriptors,
+        now=110,
+    )
+
+    assert persisted == descriptors
+    assert changed is True
 
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
@@ -132,30 +130,84 @@ def test_fixed_batch_policy_is_durable_and_immutable_within_a_run() -> None:
         binding=GPU,
         compatibility_key="same-model",
         max_tasks_per_call=2,
-        now=111,
+        now=112,
     )
 
     assert claim is not None
-    policy_json = connection.execute(
+    task_policies = connection.execute(
         """
-        SELECT policy_json
-        FROM execution_dispatch_batches
-        WHERE dispatch_batch_id = ?
+        SELECT dispatch_policy_json
+        FROM execution_tasks
+        WHERE execution_run_id = ? AND node_key = ?
+        ORDER BY ordinal
         """,
-        (str(claim.call.dispatch_batch_id),),
-    ).fetchone()[0]
-    assert orjson.loads(policy_json)["max_tasks_per_call"] == 2
+        (str(RUN_ID), "inference"),
+    ).fetchall()
+    assert [orjson.loads(row[0])["max_tasks_per_call"] for row in task_policies] == [
+        2,
+        2,
+        2,
+    ]
 
-    with pytest.raises(ValueError, match="different work"):
-        repository.preclaim_fixed_batch(
+    with pytest.raises(
+        ValueError,
+        match="fixed-batch dispatch policy cannot change within a Run",
+    ):
+        repository.persist_fixed_dispatch_policy(
             RUN_ID,
-            "inference",
-            ("seed-0", "seed-1"),
-            submission_token="batch",
-            binding=GPU,
-            compatibility_key="same-model",
-            max_tasks_per_call=3,
-            now=112,
+            (
+                replace(
+                    _task("seed-2", 2, max_tasks_per_call=1),
+                    node_ordinal=0,
+                ),
+            ),
+            now=113,
+        )
+
+
+def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=3)
+    descriptor = PullWorkerDispatchDescriptor(
+        node_key="inference",
+        node_ordinal=0,
+        binding=GPU,
+        compatibility_key="af3-seeds",
+        claim_capacity=2,
+        unfinished_task_count=3,
+        nonterminal_worker_count=0,
+        next_worker_ordinal=0,
+        depth=0,
+        unblocking_span=0,
+    )
+
+    persisted, changed = repository.persist_pull_worker_dispatch_policy(
+        RUN_ID,
+        descriptor,
+        now=110,
+    )
+
+    assert persisted == descriptor
+    assert changed is True
+    mode, policy_json = connection.execute(
+        """
+        SELECT dispatch_mode, dispatch_policy_json
+        FROM execution_nodes
+        WHERE execution_run_id = ? AND node_key = ?
+        """,
+        (str(RUN_ID), "inference"),
+    ).fetchone()
+    assert mode == "pull_worker"
+    assert orjson.loads(policy_json)["claim_capacity"] == 2
+
+    with pytest.raises(
+        ValueError,
+        match="pull-worker dispatch policy cannot change within a Run",
+    ):
+        repository.persist_pull_worker_dispatch_policy(
+            RUN_ID,
+            replace(descriptor, claim_capacity=1),
+            now=111,
         )
 
 

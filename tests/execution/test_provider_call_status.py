@@ -6,13 +6,29 @@ import pytest
 
 from biomodals.execution import ProviderCallStatus, RunStatus, RunStatusReason
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
+
+
+def _repository_with_policy():
+    repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    return repository
 
 
 def test_call_attachment_running_and_success_require_durable_identity_and_result() -> (
     None
 ):
-    repository = create_repository()
+    repository = _repository_with_policy()
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -50,7 +66,7 @@ def test_call_attachment_running_and_success_require_durable_identity_and_result
 
 
 def test_attached_unknown_state_projects_to_run_and_can_be_reconciled() -> None:
-    repository = create_repository()
+    repository = _repository_with_policy()
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -89,7 +105,7 @@ def test_attached_unknown_state_projects_to_run_and_can_be_reconciled() -> None:
 def test_call_lifecycle_rejects_missing_attachment_identity_and_illegal_rewrites() -> (
     None
 ):
-    repository = create_repository()
+    repository = _repository_with_policy()
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",

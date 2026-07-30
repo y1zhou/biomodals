@@ -474,6 +474,13 @@ class RosettaExecutionRuntime:
             depth=rank.depth,
             unblocking_span=rank.unblocking_span,
         )
+        self._provider.repository = repository
+        descriptor = self._provider.persist_pull_worker_dispatch_policy(
+            self.execution_run_id,
+            descriptor,
+            now=self._now(),
+        )
+        repository = self.store.execution
         counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = select_admissible_candidates(
             form_pull_worker_candidates((descriptor,)),

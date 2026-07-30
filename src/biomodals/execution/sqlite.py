@@ -38,12 +38,14 @@ from biomodals.execution.model import (
     canonical_json_bytes,
 )
 from biomodals.execution.scheduler import (
+    PullWorkerDispatchDescriptor,
+    TaskDispatchDescriptor,
     aggregate_task_outcome,
     propagated_skip_node_keys,
     terminal_run_outcome,
 )
 
-EXECUTION_SCHEMA_VERSION = 1
+EXECUTION_SCHEMA_VERSION = 2
 
 
 class UnsupportedExecutionSchemaVersionError(RuntimeError):
@@ -163,6 +165,8 @@ _SCHEMA_STATEMENTS = (
         result_observation TEXT,
         result_observed_at INTEGER,
         result_provenance TEXT,
+        dispatch_mode TEXT,
+        dispatch_policy_json TEXT,
         error_message TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -229,6 +233,7 @@ _SCHEMA_STATEMENTS = (
         fingerprint TEXT NOT NULL,
         scientific_payload_json TEXT NOT NULL,
         execution_payload_json TEXT NOT NULL,
+        dispatch_policy_json TEXT,
         status TEXT NOT NULL,
         status_reason TEXT,
         result_observation TEXT,
@@ -873,6 +878,221 @@ class SqliteExecutionRepository:
             self._suspend_for_unknown_result(execution_run_id, now=now)
         return self.get_task(execution_run_id, node_key, task_key)
 
+    def persist_fixed_dispatch_policy(
+        self,
+        execution_run_id: UUID,
+        descriptors: tuple[TaskDispatchDescriptor, ...],
+        *,
+        now: int,
+    ) -> tuple[tuple[TaskDispatchDescriptor, ...], bool]:
+        """Persist every ready fixed Task's immutable operational policy."""
+        if not descriptors:
+            return (), False
+        run = self.get_run(execution_run_id)
+
+        prepared: list[
+            tuple[TaskDispatchDescriptor, str, sqlite3.Row, sqlite3.Row]
+        ] = []
+        seen: set[tuple[str, str]] = set()
+        node_keys: set[str] = set()
+        fixed_node_policy_json = _dump_json({"mode": DispatchMode.FIXED_BATCH.value})
+        for descriptor in descriptors:
+            identity = (descriptor.node_key, descriptor.task_key)
+            if identity in seen:
+                raise ValueError(
+                    "fixed-batch dispatch policy contains a duplicate Task"
+                )
+            seen.add(identity)
+            if descriptor.max_tasks_per_call <= 0:
+                raise ValueError("max_tasks_per_call must be positive")
+
+            node = self._connection.execute(
+                """
+                SELECT ordinal, status, discovery_complete,
+                       dispatch_mode, dispatch_policy_json
+                FROM execution_nodes
+                WHERE execution_run_id = ? AND node_key = ?
+                """,
+                (str(execution_run_id), descriptor.node_key),
+            ).fetchone()
+            if node is None:
+                raise LookupError(f"Execution Node not found: {descriptor.node_key}")
+            if node["ordinal"] != descriptor.node_ordinal:
+                raise ValueError("fixed-batch Node ordinal does not match the plan")
+            if node["dispatch_mode"] not in {
+                None,
+                DispatchMode.FIXED_BATCH.value,
+            }:
+                raise ValueError("dispatch mode cannot change within a Run")
+            if (
+                node["dispatch_mode"] == DispatchMode.FIXED_BATCH.value
+                and node["dispatch_policy_json"] != fixed_node_policy_json
+            ):
+                raise RuntimeError("stored fixed-batch dispatch policy is invalid")
+
+            task = self._connection.execute(
+                """
+                SELECT ordinal, status, result_observation, dispatch_policy_json
+                FROM execution_tasks
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND task_key = ?
+                """,
+                (
+                    str(execution_run_id),
+                    descriptor.node_key,
+                    descriptor.task_key,
+                ),
+            ).fetchone()
+            if task is None:
+                raise LookupError(
+                    "Execution Task not found: "
+                    f"{descriptor.node_key}/{descriptor.task_key}"
+                )
+            if task["ordinal"] != descriptor.task_ordinal:
+                raise ValueError("fixed-batch Task ordinal does not match discovery")
+
+            policy_json = _fixed_dispatch_policy_json(descriptor)
+            existing_policy = task["dispatch_policy_json"]
+            if existing_policy is not None and existing_policy != policy_json:
+                raise ValueError(
+                    "fixed-batch dispatch policy cannot change within a Run"
+                )
+            if existing_policy is None:
+                if run.status != RunStatus.RUNNING:
+                    raise ValueError(
+                        "cannot persist a new dispatch policy while Run is "
+                        f"{run.status.value}"
+                    )
+                if node["status"] != NodeStatus.RUNNING.value or not bool(
+                    node["discovery_complete"]
+                ):
+                    raise ValueError("fixed-batch Node is not ready for dispatch")
+                if (
+                    task["status"] != TaskStatus.PENDING.value
+                    or task["result_observation"] != AvailabilityStatus.MISSING.value
+                ):
+                    raise ValueError(
+                        f"Task {descriptor.task_key!r} is not ready for dispatch"
+                    )
+            node_keys.add(descriptor.node_key)
+            prepared.append((descriptor, policy_json, node, task))
+
+        changed = False
+        for node_key in node_keys:
+            cursor = self._connection.execute(
+                """
+                UPDATE execution_nodes
+                SET dispatch_mode = ?,
+                    dispatch_policy_json = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND dispatch_mode IS NULL
+                """,
+                (
+                    DispatchMode.FIXED_BATCH.value,
+                    fixed_node_policy_json,
+                    now,
+                    str(execution_run_id),
+                    node_key,
+                ),
+            )
+            changed = changed or cursor.rowcount > 0
+        for descriptor, policy_json, _, task in prepared:
+            if task["dispatch_policy_json"] is not None:
+                continue
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET dispatch_policy_json = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND task_key = ?
+                """,
+                (
+                    policy_json,
+                    now,
+                    str(execution_run_id),
+                    descriptor.node_key,
+                    descriptor.task_key,
+                ),
+            )
+            changed = True
+
+        persisted = tuple(
+            _task_dispatch_descriptor_from_policy(descriptor, policy_json)
+            for descriptor, policy_json, _, _ in prepared
+        )
+        return persisted, changed
+
+    def persist_pull_worker_dispatch_policy(
+        self,
+        execution_run_id: UUID,
+        descriptor: PullWorkerDispatchDescriptor,
+        *,
+        now: int,
+    ) -> tuple[PullWorkerDispatchDescriptor, bool]:
+        """Persist one pull Node's immutable operational worker policy."""
+        if descriptor.claim_capacity <= 0:
+            raise ValueError("claim_capacity must be positive")
+        run = self.get_run(execution_run_id)
+        node = self._connection.execute(
+            """
+            SELECT ordinal, status, discovery_complete,
+                   dispatch_mode, dispatch_policy_json
+            FROM execution_nodes
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (str(execution_run_id), descriptor.node_key),
+        ).fetchone()
+        if node is None:
+            raise LookupError(f"Execution Node not found: {descriptor.node_key}")
+        if node["ordinal"] != descriptor.node_ordinal:
+            raise ValueError("pull-worker Node ordinal does not match the plan")
+        if node["dispatch_mode"] not in {
+            None,
+            DispatchMode.PULL_WORKER.value,
+        }:
+            raise ValueError("dispatch mode cannot change within a Run")
+
+        policy_json = _pull_worker_dispatch_policy_json(descriptor)
+        existing_policy = node["dispatch_policy_json"]
+        if existing_policy is not None and existing_policy != policy_json:
+            raise ValueError("pull-worker dispatch policy cannot change within a Run")
+        changed = existing_policy is None
+        if changed:
+            if run.status != RunStatus.RUNNING:
+                raise ValueError(
+                    "cannot persist a new dispatch policy while Run is "
+                    f"{run.status.value}"
+                )
+            if node["status"] != NodeStatus.RUNNING.value or not bool(
+                node["discovery_complete"]
+            ):
+                raise ValueError("pull-worker Node is not ready for dispatch")
+            self._connection.execute(
+                """
+                UPDATE execution_nodes
+                SET dispatch_mode = ?,
+                    dispatch_policy_json = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ? AND node_key = ?
+                """,
+                (
+                    DispatchMode.PULL_WORKER.value,
+                    policy_json,
+                    now,
+                    str(execution_run_id),
+                    descriptor.node_key,
+                ),
+            )
+        return (
+            _pull_worker_descriptor_from_policy(descriptor, policy_json),
+            changed,
+        )
+
     def preclaim_fixed_batch(
         self,
         execution_run_id: UUID,
@@ -925,12 +1145,30 @@ class SqliteExecutionRepository:
         node = self.get_node(execution_run_id, node_key)
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             raise ValueError("Provider Call Node is not ready for admission")
+        node_policy = self._connection.execute(
+            """
+            SELECT dispatch_mode
+            FROM execution_nodes
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchone()
+        if (
+            node_policy is None
+            or node_policy["dispatch_mode"] != DispatchMode.FIXED_BATCH.value
+        ):
+            raise ValueError("fixed-batch dispatch policy is not persisted")
         counts = self.active_provider_call_counts(execution_run_id)
         if counts.total >= run.max_active_provider_calls:
             return None
         if binding.uses_gpu and counts.gpu >= run.max_active_gpu_provider_calls:
             return None
 
+        expected_policy_json = _fixed_dispatch_policy_json_from_parts(
+            binding=binding,
+            compatibility_key=compatibility_key,
+            max_tasks_per_call=max_tasks_per_call,
+        )
         tasks = [
             self.get_task(execution_run_id, node_key, task_key)
             for task_key in task_keys
@@ -945,6 +1183,23 @@ class SqliteExecutionRepository:
             ):
                 raise ValueError(
                     f"Task {task.task_key!r} is not ready for Provider Call ownership"
+                )
+            policy_row = self._connection.execute(
+                """
+                SELECT dispatch_policy_json
+                FROM execution_tasks
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND task_key = ?
+                """,
+                (str(execution_run_id), node_key, task.task_key),
+            ).fetchone()
+            if (
+                policy_row is None
+                or policy_row["dispatch_policy_json"] != expected_policy_json
+            ):
+                raise ValueError(
+                    "fixed-batch dispatch policy cannot change within a Run"
                 )
 
         dispatch_batch_id = uuid4()
@@ -1091,6 +1346,25 @@ class SqliteExecutionRepository:
         node = self.get_node(execution_run_id, node_key)
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             raise ValueError("Pull-worker Node is not ready for admission")
+        node_policy = self._connection.execute(
+            """
+            SELECT dispatch_mode, dispatch_policy_json
+            FROM execution_nodes
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchone()
+        expected_node_policy_json = _pull_worker_dispatch_policy_json_from_parts(
+            binding=binding,
+            compatibility_key=compatibility_key,
+            claim_capacity=claim_capacity,
+        )
+        if (
+            node_policy is None
+            or node_policy["dispatch_mode"] != DispatchMode.PULL_WORKER.value
+            or node_policy["dispatch_policy_json"] != expected_node_policy_json
+        ):
+            raise ValueError("pull-worker dispatch policy cannot change within a Run")
         invalid_task = self._connection.execute(
             """
             SELECT task_key
@@ -3056,3 +3330,103 @@ def _binding_json_value(binding: ProviderBinding) -> dict[str, Any]:
         "runtime_image_key": binding.runtime_image_key,
         "uses_gpu": binding.uses_gpu,
     }
+
+
+def _binding_from_json_value(value: Mapping[str, Any]) -> ProviderBinding:
+    return ProviderBinding(
+        environment=value["environment"],
+        app_name=value["app_name"],
+        app_version=value["app_version"],
+        function_name=value["function_name"],
+        uses_gpu=value["uses_gpu"],
+        runtime_image_key=value["runtime_image_key"],
+    )
+
+
+def _fixed_dispatch_policy_json(
+    descriptor: TaskDispatchDescriptor,
+) -> str:
+    return _fixed_dispatch_policy_json_from_parts(
+        binding=descriptor.binding,
+        compatibility_key=descriptor.compatibility_key,
+        max_tasks_per_call=descriptor.max_tasks_per_call,
+    )
+
+
+def _fixed_dispatch_policy_json_from_parts(
+    *,
+    binding: ProviderBinding,
+    compatibility_key: str,
+    max_tasks_per_call: int,
+) -> str:
+    return _dump_json({
+        "binding": _binding_json_value(binding),
+        "compatibility_key": compatibility_key,
+        "max_tasks_per_call": max_tasks_per_call,
+        "mode": DispatchMode.FIXED_BATCH.value,
+    })
+
+
+def _task_dispatch_descriptor_from_policy(
+    descriptor: TaskDispatchDescriptor,
+    policy_json: str,
+) -> TaskDispatchDescriptor:
+    value = orjson.loads(policy_json)
+    if value.get("mode") != DispatchMode.FIXED_BATCH.value:
+        raise RuntimeError("stored fixed-batch dispatch policy is invalid")
+    return TaskDispatchDescriptor(
+        node_key=descriptor.node_key,
+        node_ordinal=descriptor.node_ordinal,
+        task_key=descriptor.task_key,
+        task_ordinal=descriptor.task_ordinal,
+        binding=_binding_from_json_value(value["binding"]),
+        compatibility_key=value["compatibility_key"],
+        max_tasks_per_call=value["max_tasks_per_call"],
+        depth=descriptor.depth,
+        unblocking_span=descriptor.unblocking_span,
+    )
+
+
+def _pull_worker_dispatch_policy_json(
+    descriptor: PullWorkerDispatchDescriptor,
+) -> str:
+    return _pull_worker_dispatch_policy_json_from_parts(
+        binding=descriptor.binding,
+        compatibility_key=descriptor.compatibility_key,
+        claim_capacity=descriptor.claim_capacity,
+    )
+
+
+def _pull_worker_dispatch_policy_json_from_parts(
+    *,
+    binding: ProviderBinding,
+    compatibility_key: str,
+    claim_capacity: int,
+) -> str:
+    return _dump_json({
+        "binding": _binding_json_value(binding),
+        "claim_capacity": claim_capacity,
+        "compatibility_key": compatibility_key,
+        "mode": DispatchMode.PULL_WORKER.value,
+    })
+
+
+def _pull_worker_descriptor_from_policy(
+    descriptor: PullWorkerDispatchDescriptor,
+    policy_json: str,
+) -> PullWorkerDispatchDescriptor:
+    value = orjson.loads(policy_json)
+    if value.get("mode") != DispatchMode.PULL_WORKER.value:
+        raise RuntimeError("stored pull-worker dispatch policy is invalid")
+    return PullWorkerDispatchDescriptor(
+        node_key=descriptor.node_key,
+        node_ordinal=descriptor.node_ordinal,
+        binding=_binding_from_json_value(value["binding"]),
+        compatibility_key=value["compatibility_key"],
+        claim_capacity=value["claim_capacity"],
+        unfinished_task_count=descriptor.unfinished_task_count,
+        nonterminal_worker_count=descriptor.nonterminal_worker_count,
+        next_worker_ordinal=descriptor.next_worker_ordinal,
+        depth=descriptor.depth,
+        unblocking_span=descriptor.unblocking_span,
+    )

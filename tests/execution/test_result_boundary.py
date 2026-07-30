@@ -21,6 +21,7 @@ from biomodals.execution import (
     required_node_keys,
     result_probe_frontier,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 
 RUN_ID = UUID("d4e4744e-aacf-4478-92d6-a58681805162")
 CPU_BINDING = ProviderBinding("prod", "demo", 2, "compute", False)
@@ -161,6 +162,23 @@ def test_running_pruned_ancestor_waits_for_conclusive_call_cancellation() -> Non
             AvailabilityStatus.MISSING,
             now=103,
         )
+    repository.persist_fixed_dispatch_policy(
+        RUN_ID,
+        (
+            TaskDispatchDescriptor(
+                node_key="input",
+                node_ordinal=0,
+                task_key="download",
+                task_ordinal=0,
+                binding=CPU_BINDING,
+                compatibility_key="pdb",
+                max_tasks_per_call=1,
+                depth=0,
+                unblocking_span=2,
+            ),
+        ),
+        now=103,
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "input",

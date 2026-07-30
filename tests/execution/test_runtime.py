@@ -18,7 +18,13 @@ from biomodals.execution.modal import (
 from biomodals.execution.runtime import ExecutionRuntime
 from biomodals.execution.scheduler import ProviderCallCandidate
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+    persist_pull_policy,
+)
 
 
 @dataclass
@@ -75,6 +81,12 @@ def _candidate(task_index: int = 0) -> ProviderCallCandidate:
 
 def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     driver = FakeModalDriver()
     checkpoints: list[int] = []
     runtime = ExecutionRuntime(
@@ -109,6 +121,12 @@ def test_checkpoint_may_replace_a_volume_backed_repository(tmp_path) -> None:
     ledger_path = tmp_path / "ledger.sqlite3"
     connection = sqlite3.connect(ledger_path)
     repository = create_repository(connection=connection, task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     connection.commit()
     driver = FakeModalDriver()
     active_connection = connection
@@ -142,6 +160,12 @@ def test_checkpoint_may_replace_a_volume_backed_repository(tmp_path) -> None:
 
 def test_resolution_failure_happens_before_durable_preclaim() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
 
     class BrokenResolver(FakeModalDriver):
         def resolve(self, binding):
@@ -168,6 +192,12 @@ def test_resolution_failure_happens_before_durable_preclaim() -> None:
 def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
     """Conclusive version loss becomes the accepted terminal Run reason."""
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
 
     class UnavailableResolver(FakeModalDriver):
         def resolve(self, binding):
@@ -199,6 +229,12 @@ def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
 def test_unavailable_deployment_first_drains_attached_calls() -> None:
     """Known child ownership remains observable before the Run fails closed."""
     repository = create_repository(task_count=2)
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
@@ -247,6 +283,12 @@ def test_unavailable_deployment_first_drains_attached_calls() -> None:
 
 def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     driver = FakeModalDriver()
 
     def fail_checkpoint():
@@ -299,6 +341,12 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
     expected_status: ProviderCallStatus,
 ) -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     driver = FakeModalDriver()
     driver.spawn_error = error
     runtime = ExecutionRuntime(
@@ -331,6 +379,12 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
 
 def test_recovery_collects_attached_call_once_then_replays_durable_envelope() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
@@ -368,6 +422,12 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
 
 def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
     repository = create_repository(task_count=2)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=2,
+    )
     driver = FakeModalDriver()
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(
@@ -400,6 +460,12 @@ def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
 
 def test_fixed_submission_can_receive_its_durable_call_identity() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
@@ -427,6 +493,12 @@ def test_fixed_submission_can_receive_its_durable_call_identity() -> None:
 
 def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
     repository = create_repository(task_count=1)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=1,
+    )
     driver = FakeModalDriver()
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(

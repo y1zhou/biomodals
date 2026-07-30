@@ -25,7 +25,11 @@ from biomodals.execution.model import (
     RunStatus,
     RunStatusReason,
 )
-from biomodals.execution.scheduler import ProviderCallCandidate
+from biomodals.execution.scheduler import (
+    ProviderCallCandidate,
+    PullWorkerDispatchDescriptor,
+    TaskDispatchDescriptor,
+)
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
 
@@ -82,6 +86,40 @@ class ExecutionRuntime:
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
         self._checkpoint_state()
+
+    def persist_fixed_dispatch_policy(
+        self,
+        execution_run_id: UUID,
+        descriptors: tuple[TaskDispatchDescriptor, ...],
+        *,
+        now: int,
+    ) -> tuple[TaskDispatchDescriptor, ...]:
+        """Bind ready fixed Tasks to the Run's durable dispatch policy."""
+        persisted, changed = self.repository.persist_fixed_dispatch_policy(
+            execution_run_id,
+            descriptors,
+            now=now,
+        )
+        if changed:
+            self._checkpoint_state()
+        return persisted
+
+    def persist_pull_worker_dispatch_policy(
+        self,
+        execution_run_id: UUID,
+        descriptor: PullWorkerDispatchDescriptor,
+        *,
+        now: int,
+    ) -> PullWorkerDispatchDescriptor:
+        """Bind one pull Node to the Run's durable worker policy."""
+        persisted, changed = self.repository.persist_pull_worker_dispatch_policy(
+            execution_run_id,
+            descriptor,
+            now=now,
+        )
+        if changed:
+            self._checkpoint_state()
+        return persisted
 
     def submit_fixed_batch(
         self,
@@ -140,6 +178,15 @@ class ExecutionRuntime:
         """Preclaim and spawn once using an already hydrated exact binding."""
         if candidate.max_tasks_per_call is None:
             raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
+        self.persist_fixed_dispatch_policy(
+            execution_run_id,
+            _fixed_descriptors_for_candidate(
+                self.repository,
+                execution_run_id,
+                candidate,
+            ),
+            now=now,
+        )
         preclaim = self.repository.preclaim_fixed_batch(
             execution_run_id,
             candidate.node_key,
@@ -187,6 +234,33 @@ class ExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord | None:
         """Submit one pull worker with its durable owner identity."""
+        node = self.repository.get_node(execution_run_id, node_key)
+        tasks = self.repository.list_tasks(execution_run_id, node_key)
+        calls = tuple(
+            call
+            for call in self.repository.list_provider_calls(execution_run_id)
+            if call.node_key == node_key and call.dispatch_mode.value == "pull_worker"
+        )
+        self.persist_pull_worker_dispatch_policy(
+            execution_run_id,
+            PullWorkerDispatchDescriptor(
+                node_key=node_key,
+                node_ordinal=node.ordinal,
+                binding=binding,
+                compatibility_key=compatibility_key,
+                claim_capacity=claim_capacity,
+                unfinished_task_count=sum(
+                    not task.status.is_terminal for task in tasks
+                ),
+                nonterminal_worker_count=sum(
+                    not call.status.is_terminal for call in calls
+                ),
+                next_worker_ordinal=len(calls),
+                depth=0,
+                unblocking_span=0,
+            ),
+            now=now,
+        )
         function = self._resolve_provider(
             execution_run_id,
             binding,
@@ -478,6 +552,23 @@ class AsyncExecutionRuntime:
         """Cross the host durability boundary for caller-owned transitions."""
         self._checkpoint_state()
 
+    def persist_fixed_dispatch_policy(
+        self,
+        execution_run_id: UUID,
+        descriptors: tuple[TaskDispatchDescriptor, ...],
+        *,
+        now: int,
+    ) -> tuple[TaskDispatchDescriptor, ...]:
+        """Bind ready fixed Tasks to the Run's durable dispatch policy."""
+        persisted, changed = self.repository.persist_fixed_dispatch_policy(
+            execution_run_id,
+            descriptors,
+            now=now,
+        )
+        if changed:
+            self._checkpoint_state()
+        return persisted
+
     async def submit_fixed_batch(
         self,
         execution_run_id: UUID,
@@ -492,6 +583,15 @@ class AsyncExecutionRuntime:
         """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
         if candidate.max_tasks_per_call is None:
             raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
+        self.persist_fixed_dispatch_policy(
+            execution_run_id,
+            _fixed_descriptors_for_candidate(
+                self.repository,
+                execution_run_id,
+                candidate,
+            ),
+            now=now,
+        )
         function = await self._resolve_provider(
             execution_run_id,
             candidate.binding,
@@ -712,3 +812,35 @@ class AsyncExecutionRuntime:
         replacement = self._checkpoint()
         if replacement is not None:
             self.repository = replacement
+
+
+def _fixed_descriptors_for_candidate(
+    repository: SqliteExecutionRepository,
+    execution_run_id: UUID,
+    candidate: ProviderCallCandidate,
+) -> tuple[TaskDispatchDescriptor, ...]:
+    """Reconstruct the persisted per-Task policy represented by one batch."""
+    if candidate.max_tasks_per_call is None:
+        raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
+    node = repository.get_node(execution_run_id, candidate.node_key)
+    return tuple(
+        TaskDispatchDescriptor(
+            node_key=candidate.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=candidate.binding,
+            compatibility_key=candidate.compatibility_key,
+            max_tasks_per_call=candidate.max_tasks_per_call,
+            depth=candidate.depth,
+            unblocking_span=candidate.unblocking_span,
+        )
+        for task_key in candidate.task_keys
+        for task in (
+            repository.get_task(
+                execution_run_id,
+                candidate.node_key,
+                task_key,
+            ),
+        )
+    )

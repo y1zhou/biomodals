@@ -24,6 +24,7 @@ from biomodals.execution import (
     ProviderBinding,
     TaskPlan,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_execution import AppExecutionRunStore
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -172,18 +173,36 @@ def _terminal_predecessor(
             AvailabilityStatus.MISSING,
             now=4,
         )
+        binding = ProviderBinding(
+            environment="main",
+            app_name="BoltzGen",
+            app_version=7,
+            function_name="run_boltzgen_task",
+            uses_gpu=True,
+        )
+        store.execution.persist_fixed_dispatch_policy(
+            PREDECESSOR_ID,
+            (
+                TaskDispatchDescriptor(
+                    node_key="design-runs",
+                    node_ordinal=0,
+                    task_key="run-a",
+                    task_ordinal=0,
+                    binding=binding,
+                    compatibility_key="run_boltzgen_task",
+                    max_tasks_per_call=1,
+                    depth=0,
+                    unblocking_span=1,
+                ),
+            ),
+            now=4,
+        )
         preclaim = store.execution.preclaim_fixed_batch(
             PREDECESSOR_ID,
             "design-runs",
             ("run-a",),
             submission_token="run-a",
-            binding=ProviderBinding(
-                environment="main",
-                app_name="BoltzGen",
-                app_version=7,
-                function_name="run_boltzgen_task",
-                uses_gpu=True,
-            ),
+            binding=binding,
             compatibility_key="run_boltzgen_task",
             now=5,
         )

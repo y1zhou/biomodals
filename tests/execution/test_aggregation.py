@@ -10,7 +10,12 @@ from biomodals.execution import (
     aggregate_task_outcome,
 )
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
 
 
 def test_task_aggregation_policies_are_strict_and_non_vacuous() -> None:
@@ -56,6 +61,12 @@ def test_fail_fast_skips_only_unowned_siblings_and_drains_owned_work() -> None:
     repository = create_repository(
         task_count=3,
         aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-1",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
     )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,

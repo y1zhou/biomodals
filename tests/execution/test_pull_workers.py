@@ -11,10 +11,21 @@ from biomodals.execution import (
     TaskStatus,
 )
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_pull_policy,
+)
 
 
 def _admit_workers(repository, count: int):
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=2,
+    )
     claims = []
     for index in range(count):
         claim = repository.preclaim_pull_worker(
@@ -124,6 +135,12 @@ def test_claim_response_is_checkpointed_idempotent_and_ordered() -> None:
 
 def test_worker_can_claim_after_spawn_before_call_attachment() -> None:
     repository = create_repository(task_count=1)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=1,
+    )
     worker = repository.preclaim_pull_worker(
         RUN_ID,
         "inference",

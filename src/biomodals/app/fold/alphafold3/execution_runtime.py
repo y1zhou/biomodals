@@ -685,6 +685,15 @@ class AlphaFold3ExecutionRuntime:
                         unblocking_span=rank.unblocking_span,
                     )
                 )
+        self._provider.repository = repository
+        descriptors = list(
+            self._provider.persist_fixed_dispatch_policy(
+                self.execution_run_id,
+                tuple(descriptors),
+                now=self._now(),
+            )
+        )
+        repository = self.store.execution
         counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = select_admissible_candidates(
             form_fixed_batches(tuple(descriptors)),

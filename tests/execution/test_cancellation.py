@@ -16,7 +16,12 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.runtime import ExecutionRuntime
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
 
 
 class CancelDriver:
@@ -54,6 +59,12 @@ def test_pending_run_cancels_without_provider_work() -> None:
 
 def test_cancel_request_waits_for_attached_call_confirmation() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -101,6 +112,12 @@ def test_cancel_request_waits_for_attached_call_confirmation() -> None:
 
 def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -137,6 +154,12 @@ def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
 
 def test_result_pruning_waits_for_conclusive_provider_cancellation() -> None:
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",
@@ -187,6 +210,12 @@ def test_result_pruning_without_an_attached_handle_preserves_unknown_ownership()
     None
 ):
     repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,
         "inference",

@@ -984,6 +984,23 @@ class WorkflowRuntime:
                     )
                 )
 
+        self._provider.repository = repository
+        descriptors = list(
+            self._provider.persist_fixed_dispatch_policy(
+                self.execution_run_id,
+                tuple(descriptors),
+                now=self._now(),
+            )
+        )
+        pull_descriptors = [
+            self._provider.persist_pull_worker_dispatch_policy(
+                self.execution_run_id,
+                descriptor,
+                now=self._now(),
+            )
+            for descriptor in pull_descriptors
+        ]
+        repository = self.store.execution
         counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = select_admissible_candidates(
             (

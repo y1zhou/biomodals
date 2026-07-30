@@ -15,6 +15,10 @@ from biomodals.execution import (
     SqliteExecutionRepository,
     TaskPlan,
 )
+from biomodals.execution.scheduler import (
+    PullWorkerDispatchDescriptor,
+    TaskDispatchDescriptor,
+)
 
 RUN_ID = UUID("d4e4744e-aacf-4478-92d6-a58681805162")
 GPU_BINDING = ProviderBinding(
@@ -90,3 +94,64 @@ def create_repository(
             now=103,
         )
     return repository
+
+
+def persist_fixed_policy(
+    repository: SqliteExecutionRepository,
+    task_keys: tuple[str, ...],
+    *,
+    binding: ProviderBinding,
+    compatibility_key: str,
+    max_tasks_per_call: int = 1,
+    now: int = 109,
+) -> None:
+    """Bind selected fixture Tasks to one fixed-batch dispatch policy."""
+    node = repository.get_node(RUN_ID, "inference")
+    tasks = {task.task_key: task for task in repository.list_tasks(RUN_ID, "inference")}
+    repository.persist_fixed_dispatch_policy(
+        RUN_ID,
+        tuple(
+            TaskDispatchDescriptor(
+                node_key="inference",
+                node_ordinal=node.ordinal,
+                task_key=task_key,
+                task_ordinal=tasks[task_key].ordinal,
+                binding=binding,
+                compatibility_key=compatibility_key,
+                max_tasks_per_call=max_tasks_per_call,
+                depth=0,
+                unblocking_span=0,
+            )
+            for task_key in task_keys
+        ),
+        now=now,
+    )
+
+
+def persist_pull_policy(
+    repository: SqliteExecutionRepository,
+    *,
+    binding: ProviderBinding,
+    compatibility_key: str,
+    claim_capacity: int,
+    now: int = 109,
+) -> None:
+    """Bind the fixture Node to one pull-worker dispatch policy."""
+    node = repository.get_node(RUN_ID, "inference")
+    tasks = repository.list_tasks(RUN_ID, "inference")
+    repository.persist_pull_worker_dispatch_policy(
+        RUN_ID,
+        PullWorkerDispatchDescriptor(
+            node_key="inference",
+            node_ordinal=node.ordinal,
+            binding=binding,
+            compatibility_key=compatibility_key,
+            claim_capacity=claim_capacity,
+            unfinished_task_count=sum(not task.status.is_terminal for task in tasks),
+            nonterminal_worker_count=0,
+            next_worker_ordinal=0,
+            depth=0,
+            unblocking_span=0,
+        ),
+        now=now,
+    )

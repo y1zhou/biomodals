@@ -14,7 +14,12 @@ from biomodals.execution.modal import (
 from biomodals.execution.runtime import AsyncExecutionRuntime
 from biomodals.execution.scheduler import ProviderCallCandidate
 
-from .provider_call_helpers import GPU_BINDING, RUN_ID, create_repository
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
 
 
 @dataclass
@@ -60,6 +65,12 @@ def _candidate() -> ProviderCallCandidate:
 def test_async_runtime_preserves_preclaim_and_result_envelope_boundaries() -> None:
     async def scenario() -> None:
         repository = create_repository(task_count=1)
+        persist_fixed_policy(
+            repository,
+            ("seed-0",),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
         driver = AsyncFakeModalDriver()
         checkpoints: list[int] = []
         runtime = AsyncExecutionRuntime(
@@ -109,6 +120,12 @@ def test_async_runtime_preserves_preclaim_and_result_envelope_boundaries() -> No
 def test_async_runtime_requests_cancellation_without_inventing_completion() -> None:
     async def scenario() -> None:
         repository = create_repository(task_count=1)
+        persist_fixed_policy(
+            repository,
+            ("seed-0",),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
         driver = AsyncFakeModalDriver()
         runtime = AsyncExecutionRuntime(
             repository,
@@ -139,6 +156,12 @@ def test_async_runtime_fails_a_missing_exact_deployment_before_preclaim() -> Non
 
     async def scenario() -> None:
         repository = create_repository(task_count=1)
+        persist_fixed_policy(
+            repository,
+            ("seed-0",),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
 
         class UnavailableDriver(AsyncFakeModalDriver):
             async def resolve(self, binding):

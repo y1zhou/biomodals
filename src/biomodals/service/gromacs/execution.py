@@ -507,6 +507,13 @@ class GromacsExecutionCoordinator:
                             unblocking_span=rank.unblocking_span,
                         )
                     )
+        descriptors = list(
+            runtime.persist_fixed_dispatch_policy(
+                execution_run_id,
+                tuple(descriptors),
+                now=self._now(),
+            )
+        )
         counts = runtime.repository.active_provider_call_counts(execution_run_id)
         selected = select_admissible_candidates(
             form_fixed_batches(tuple(descriptors)),

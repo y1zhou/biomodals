@@ -9,6 +9,7 @@ from .provider_call_helpers import (
     GPU_BINDING,
     RUN_ID,
     create_repository,
+    persist_fixed_policy,
 )
 
 
@@ -17,6 +18,18 @@ def test_preclaim_atomically_enforces_total_and_gpu_subset_limits() -> None:
         task_count=4,
         max_active_provider_calls=2,
         max_active_gpu_provider_calls=1,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-2", "seed-3"),
+        binding=CPU_BINDING,
+        compatibility_key="cpu",
     )
 
     gpu = repository.preclaim_fixed_batch(
@@ -70,6 +83,12 @@ def test_unknown_calls_retain_slots_and_durable_success_releases_them() -> None:
         task_count=3,
         max_active_provider_calls=1,
         max_active_gpu_provider_calls=1,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
     )
     claim = repository.preclaim_fixed_batch(
         RUN_ID,

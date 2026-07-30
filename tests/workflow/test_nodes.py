@@ -8,7 +8,13 @@ from uuid import UUID
 import pytest
 
 from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
-from biomodals.workflow.core.nodes import AppBackedNode, NodeRunContext
+from biomodals.workflow.core.nodes import (
+    AppBackedNode,
+    NodeRunContext,
+    RemoteNodeCall,
+    RemoteTaskWorkflowNode,
+    RemoteWorkflowTask,
+)
 
 
 def test_app_backed_node_requires_caller_owned_remote_preparation(
@@ -35,6 +41,28 @@ def test_app_backed_node_owns_no_modal_lookup_or_submission_api() -> None:
     assert not hasattr(AppBackedNode, "load_app_function")
     assert not hasattr(AppBackedNode, "invoke_app_function")
     assert not hasattr(AppBackedNode, "submit_remote")
+
+
+def test_remote_task_node_declares_data_without_modal_submission() -> None:
+    task = RemoteWorkflowTask(
+        task_key="candidate-a",
+        scientific_payload={"candidate_id": "candidate-a"},
+        call=RemoteNodeCall(
+            function_name="score_candidate",
+            uses_gpu=True,
+            kwargs={"candidate_id": "candidate-a"},
+        ),
+    )
+
+    assert task.task_key == "candidate-a"
+    assert task.call.function_name == "score_candidate"
+    assert not hasattr(RemoteTaskWorkflowNode, "submit_remote")
+    with pytest.raises(ValueError, match="cannot be empty"):
+        RemoteWorkflowTask(
+            task_key="",
+            scientific_payload={},
+            call=task.call,
+        )
 
 
 def test_node_context_resolves_workflow_artifact(tmp_path: Path) -> None:

@@ -97,5 +97,52 @@ class RemoteWorkflowNode:
         raise RuntimeError("Remote workflow Nodes must be submitted by the kernel")
 
 
+@dataclass(frozen=True)
+class RemoteWorkflowTask:
+    """One independently scheduled remote Task discovered by a workflow Node."""
+
+    task_key: str
+    scientific_payload: Any
+    call: RemoteNodeCall
+
+    def __post_init__(self) -> None:
+        """Reject missing Task identity before the discovery transaction."""
+        if not self.task_key:
+            raise ValueError("Remote workflow Task key cannot be empty")
+
+
+class RemoteTaskWorkflowNode:
+    """Base class for workflow Nodes that discover finite remote Tasks."""
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Return the complete deterministic Task collection for this Node."""
+        raise NotImplementedError
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        """Normalize one durable provider result for Task publication."""
+        return AppRunResult.model_validate(result)
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Build the Node publication after every discovered Task is terminal."""
+        raise NotImplementedError
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Prevent bypassing the kernel's Task discovery and call ownership."""
+        raise RuntimeError("Remote Task workflow Nodes must use the kernel")
+
+
 class AppBackedNode(RemoteWorkflowNode):
     """Semantic name for a remote Node implemented by a Biomodals app."""

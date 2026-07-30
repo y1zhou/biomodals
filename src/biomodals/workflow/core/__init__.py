@@ -20,7 +20,9 @@ from biomodals.workflow.core.nodes import (
     AppBackedNode,
     NodeRunContext,
     RemoteNodeCall,
+    RemoteTaskWorkflowNode,
     RemoteWorkflowNode,
+    RemoteWorkflowTask,
     WorkflowNativeNode,
     WorkflowNode,
 )
@@ -33,6 +35,8 @@ __all__ = [
     "NodeHandle",
     "NodeRunContext",
     "RemoteNodeCall",
+    "RemoteTaskWorkflowNode",
+    "RemoteWorkflowTask",
     "RemoteWorkflowNode",
     "Workflow",
     "WorkflowDefinition",

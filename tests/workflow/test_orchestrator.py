@@ -1,16 +1,20 @@
-"""Tests for the mocked workflow orchestrator boundary."""
+"""Tests for the workflow coordinator's Modal boundary."""
 
 # ruff: noqa: D101,D102,D103,D107
 
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID
 
 import pytest
 
+from biomodals.execution import DeploymentIdentity, ProviderBinding
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import AppRunResult, AppRunStatus
 from biomodals.workflow import Workflow
 from biomodals.workflow.core import orchestrator
+
+RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
 
 class FakeVolume:
@@ -30,160 +34,136 @@ def _raw_orchestrator() -> tuple[Any, Any]:
     return raw_cls, raw_cls()
 
 
-def test_orchestrator_run_constructs_runtime(monkeypatch) -> None:
+def test_orchestrator_binds_exact_execution_identity_and_call_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: dict[str, object] = {}
     volume = FakeVolume()
     monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
 
     class FakeRuntime:
-        def __init__(
-            self,
-            *,
-            workflow: Workflow,
-            volume_root: Path,
-            workflow_volume_name: str | None = None,
-            workflow_volume=None,
-            function_call_resolver=None,
-            max_ready_workers: int = 32,
-            strict_external_artifact_checks: bool = False,
-            external_artifact_checker=None,
-        ):
-            calls["workflow"] = workflow
-            calls["volume_root"] = volume_root
-            calls["workflow_volume_name"] = workflow_volume_name
-            calls["workflow_volume"] = workflow_volume
-            calls["function_call_resolver"] = function_call_resolver
-            calls["max_ready_workers"] = max_ready_workers
-            calls["strict_external_artifact_checks"] = strict_external_artifact_checks
-            calls["external_artifact_checker"] = external_artifact_checker
+        def __init__(self, **kwargs: object) -> None:
+            calls["init"] = kwargs
 
-        def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
-            calls["run_id"] = run_id
-            calls["force"] = force
+        def run(self, *, workload_run_key: str) -> AppRunResult:
+            calls["workload_run_key"] = workload_run_key
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
         def close(self) -> None:
             calls["closed"] = True
 
     monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
-
     raw_cls, instance = _raw_orchestrator()
     workflow = Workflow("demo")
+
     result = raw_cls.run._get_raw_f()(
         instance,
         workflow=workflow,
-        run_id="run-1",
-        force=True,
-        max_ready_workers=7,
+        execution_run_id=str(RUN_ID),
+        workload_run_key="friendly-name",
+        deployment_environment="main",
+        deployment_name="DemoWorkflow",
+        deployment_version=7,
+        max_active_provider_calls=9,
+        max_active_gpu_provider_calls=3,
     )
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert calls == {
+    assert calls["init"] == {
         "workflow": workflow,
+        "execution_run_id": RUN_ID,
+        "deployment": DeploymentIdentity("main", "DemoWorkflow", 7),
         "volume_root": Path(orchestrator.CONF.output_volume_mountpoint),
         "workflow_volume_name": WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
         "workflow_volume": volume,
-        "function_call_resolver": calls["function_call_resolver"],
-        "max_ready_workers": 7,
+        "modal_driver": None,
+        "max_active_provider_calls": 9,
+        "max_active_gpu_provider_calls": 3,
         "strict_external_artifact_checks": False,
         "external_artifact_checker": None,
-        "run_id": "run-1",
-        "force": True,
-        "closed": True,
     }
-    assert callable(calls["function_call_resolver"])
-    assert volume.reload_count == 1
-    assert volume.commit_count == 1
-
-
-def test_orchestrator_run_passes_function_call_resolver(monkeypatch) -> None:
-    calls: dict[str, object] = {}
-    volume = FakeVolume()
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
-
-    class FakeRuntime:
-        def __init__(
-            self,
-            *,
-            workflow: Workflow,
-            volume_root: Path,
-            workflow_volume_name: str | None = None,
-            workflow_volume=None,
-            function_call_resolver=None,
-            max_ready_workers: int = 32,
-            strict_external_artifact_checks: bool = False,
-            external_artifact_checker=None,
-        ) -> None:
-            calls["function_call_resolver"] = function_call_resolver
-            calls["max_ready_workers"] = max_ready_workers
-            calls["strict_external_artifact_checks"] = strict_external_artifact_checks
-            calls["external_artifact_checker"] = external_artifact_checker
-
-        def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
-            calls["run_id"] = run_id
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
-
-        def close(self) -> None:
-            calls["closed"] = True
-
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
-
-    raw_cls, instance = _raw_orchestrator()
-    result = raw_cls.run._get_raw_f()(
-        instance,
-        workflow=Workflow("demo"),
-        run_id="run-1",
-        max_ready_workers=9,
-    )
-
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert callable(calls["function_call_resolver"])
-    assert calls["max_ready_workers"] == 9
-    assert calls["strict_external_artifact_checks"] is False
-    assert calls["external_artifact_checker"] is None
-    assert calls["run_id"] == "run-1"
+    assert calls["workload_run_key"] == "friendly-name"
     assert calls["closed"] is True
     assert volume.reload_count == 1
     assert volume.commit_count == 1
 
 
-def test_orchestrator_run_passes_external_artifact_checker(monkeypatch) -> None:
+def test_orchestrator_uses_explicit_handles_only_for_development_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    volume = FakeVolume()
+    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
+
+    class FakeHandle:
+        def __init__(self) -> None:
+            self.hydrated = False
+
+        def hydrate(self) -> None:
+            self.hydrated = True
+
+    class FakeRuntime:
+        def __init__(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+
+        def run(self, *, workload_run_key: str) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            pass
+
+    handle = FakeHandle()
+    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+    raw_cls, instance = _raw_orchestrator()
+    raw_cls.run._get_raw_f()(
+        instance,
+        workflow=Workflow("demo"),
+        execution_run_id=str(RUN_ID),
+        workload_run_key="demo",
+        deployment_environment="development",
+        deployment_name="DemoWorkflow",
+        deployment_version=1,
+        development_function_handles={"compute": handle},
+    )
+
+    driver = calls["modal_driver"]
+    resolved = driver.resolve(
+        ProviderBinding("development", "DemoWorkflow", 1, "compute", False)
+    )
+    assert resolved is handle
+    assert handle.hydrated is True
+
+
+def test_orchestrator_passes_external_artifact_checker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: dict[str, object] = {}
     volume = FakeVolume()
     monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
 
     class FakeRuntime:
-        def __init__(
-            self,
-            *,
-            workflow: Workflow,
-            volume_root: Path,
-            workflow_volume_name: str | None = None,
-            workflow_volume=None,
-            function_call_resolver=None,
-            max_ready_workers: int = 32,
-            strict_external_artifact_checks: bool = False,
-            external_artifact_checker=None,
-        ) -> None:
-            calls["strict_external_artifact_checks"] = strict_external_artifact_checks
-            calls["external_artifact_checker"] = external_artifact_checker
+        def __init__(self, **kwargs: object) -> None:
+            calls.update(kwargs)
 
-        def run(self, *, run_id: str, force: bool = False) -> AppRunResult:
+        def run(self, *, workload_run_key: str) -> AppRunResult:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
         def close(self) -> None:
-            calls["closed"] = True
+            pass
 
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
-
-    def external_checker(_artifact) -> list[str]:
+    def external_checker(_artifact: object) -> list[str]:
         return []
 
+    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
     raw_cls, instance = _raw_orchestrator()
     result = raw_cls.run._get_raw_f()(
         instance,
         workflow=Workflow("demo"),
-        run_id="run-1",
+        execution_run_id=str(RUN_ID),
+        workload_run_key="demo",
+        deployment_environment="main",
+        deployment_name="DemoWorkflow",
+        deployment_version=7,
         strict_external_artifact_checks=True,
         external_artifact_checker=external_checker,
     )
@@ -191,12 +171,11 @@ def test_orchestrator_run_passes_external_artifact_checker(monkeypatch) -> None:
     assert result.status == AppRunStatus.SUCCEEDED
     assert calls["strict_external_artifact_checks"] is True
     assert calls["external_artifact_checker"] is external_checker
-    assert calls["closed"] is True
-    assert volume.reload_count == 1
-    assert volume.commit_count == 1
 
 
-def test_orchestrator_enter_closes_stale_runtime_before_reload(monkeypatch) -> None:
+def test_orchestrator_enter_and_exit_close_without_cancelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     volume = FakeVolume()
     monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
 
@@ -208,66 +187,58 @@ def test_orchestrator_enter_closes_stale_runtime_before_reload(monkeypatch) -> N
             self.close_count += 1
 
     raw_cls, instance = _raw_orchestrator()
-    runtime = FakeRuntime()
-    instance._runtime = runtime
+    stale_runtime = FakeRuntime()
+    instance._runtime = stale_runtime
 
     raw_cls.enter._get_raw_f()(instance)
 
-    assert runtime.close_count == 1
+    assert stale_runtime.close_count == 1
     assert instance._runtime is None
     assert volume.reload_count == 1
 
-
-def test_orchestrator_exit_preserves_active_remote_calls(monkeypatch) -> None:
-    volume = FakeVolume()
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
-
-    class FakeRuntime:
-        def __init__(self) -> None:
-            self.cancel_count = 0
-            self.close_count = 0
-
-        def cancel_active_remote_calls(self, *, terminate_containers: bool) -> None:
-            assert terminate_containers is True
-            self.cancel_count += 1
-
-        def close(self) -> None:
-            self.close_count += 1
-
-    raw_cls, instance = _raw_orchestrator()
-    runtime = FakeRuntime()
-    instance._runtime = runtime
-
+    active_runtime = FakeRuntime()
+    instance._runtime = active_runtime
     raw_cls.exit._get_raw_f()(instance)
     raw_cls.exit._get_raw_f()(instance)
 
-    assert runtime.cancel_count == 0
-    assert runtime.close_count == 1
+    assert active_runtime.close_count == 1
     assert instance._runtime is None
     assert volume.commit_count == 2
 
 
-def test_orchestrator_rejects_serialized_workflow_dict() -> None:
+@pytest.mark.parametrize(
+    ("workflow", "execution_run_id", "deployment_version", "message"),
+    [
+        ({"nodes": []}, str(RUN_ID), 7, "Workflow object"),
+        (Workflow("demo"), "not-a-uuid", 7, "badly formed"),
+        (Workflow("demo"), str(RUN_ID), 0, "positive"),
+    ],
+)
+def test_orchestrator_rejects_invalid_identity(
+    workflow: object,
+    execution_run_id: str,
+    deployment_version: int,
+    message: str,
+) -> None:
     raw_cls, instance = _raw_orchestrator()
 
-    with pytest.raises(TypeError, match="Workflow object"):
+    with pytest.raises((TypeError, ValueError), match=message):
         raw_cls.run._get_raw_f()(
             instance,
-            workflow={"nodes": []},
-            run_id="run-1",
+            workflow=workflow,
+            execution_run_id=execution_run_id,
+            workload_run_key="demo",
+            deployment_environment="main",
+            deployment_name="DemoWorkflow",
+            deployment_version=deployment_version,
         )
 
 
-def test_orchestrator_modal_app_uses_python_313_runtime() -> None:
-    assert orchestrator.CONF.python_version == "3.13"
-    assert orchestrator.WorkflowOrchestrator is not None
-    assert orchestrator.OUT_VOLUME_NAME == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
-
-
-def test_orchestrator_app_exposes_only_class_remote_surface() -> None:
+def test_orchestrator_modal_app_exposes_only_class_remote_surface() -> None:
     functions = orchestrator.app._local_state.functions
 
+    assert orchestrator.CONF.python_version == "3.13"
+    assert orchestrator.OUT_VOLUME_NAME == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
     assert "WorkflowOrchestrator.*" in functions
     assert "run_workflow_orchestrator" not in functions
     assert "run_remote_workflow_node" not in functions
-    assert "submit_workflow_orchestrator_task" not in functions

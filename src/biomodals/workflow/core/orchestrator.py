@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.execution import DeploymentIdentity
+from biomodals.execution.modal import ModalCallDriver
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
@@ -58,29 +63,62 @@ class WorkflowOrchestrator:
     def run(
         self,
         workflow: Workflow,
-        run_id: str,
-        force: bool = False,
-        max_ready_workers: int = 32,
+        execution_run_id: str,
+        workload_run_key: str,
+        deployment_environment: str,
+        deployment_name: str,
+        deployment_version: int,
+        max_active_provider_calls: int = 32,
+        max_active_gpu_provider_calls: int | None = None,
         strict_external_artifact_checks: bool = False,
         external_artifact_checker: ExternalArtifactChecker | None = None,
+        development_function_handles: Mapping[str, Any] | None = None,
     ) -> AppRunResult:
         """Run one workflow definition through the workflow runtime."""
         if not isinstance(workflow, Workflow):
             raise TypeError("workflow must be a Workflow object")
+        parsed_run_id = UUID(execution_run_id)
+        deployment = DeploymentIdentity(
+            environment=deployment_environment,
+            deployment_name=deployment_name,
+            deployment_version=deployment_version,
+        )
+        modal_driver = None
+        if development_function_handles is not None:
+            handles = dict(development_function_handles)
+
+            def resolve_development_function(
+                _app_name: str,
+                function_name: str,
+                **_kwargs: object,
+            ) -> Any:
+                try:
+                    return handles[function_name]
+                except KeyError as error:
+                    raise ValueError(
+                        f"No development function handle for {function_name!r}"
+                    ) from error
+
+            modal_driver = ModalCallDriver(
+                function_resolver=resolve_development_function
+            )
 
         OUT_VOLUME.reload()
         self._runtime = WorkflowRuntime(
             workflow=workflow,
+            execution_run_id=parsed_run_id,
+            deployment=deployment,
             volume_root=Path(CONF.output_volume_mountpoint),
             workflow_volume_name=OUT_VOLUME_NAME,
             workflow_volume=OUT_VOLUME,
-            function_call_resolver=modal.FunctionCall.from_id,
-            max_ready_workers=max_ready_workers,
+            modal_driver=modal_driver,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
             strict_external_artifact_checks=strict_external_artifact_checks,
             external_artifact_checker=external_artifact_checker,
         )
         try:
-            return self._runtime.run(run_id=run_id, force=force)
+            return self._runtime.run(workload_run_key=workload_run_key)
         finally:
             self._close_runtime()
             OUT_VOLUME.commit()

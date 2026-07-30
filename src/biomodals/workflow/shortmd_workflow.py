@@ -16,6 +16,7 @@ import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 import modal
 
@@ -32,15 +33,14 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
-    NodeExecutionPolicy,
-    NodePlacement,
     VolumePath,
     WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
-    RemoteNodeSubmission,
+    RemoteNodeCall,
+    RemoteWorkflowNode,
     Workflow,
     WorkflowNativeNode,
     orchestrator,
@@ -227,15 +227,6 @@ class ShortMDPrepNode(AppBackedNode):
     )
     overwrite_existing: bool = False
     gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
-
-    def _app_function(self) -> modal.Function:
-        return (
-            self.modal_namespace.prepare_cpu
-            if self.gromacs.cpu_only
-            else self.modal_namespace.prepare_gpu
-        )
 
     def _app_kwargs(self) -> dict[str, object]:
         safe_run_name = sanitize_filename(self.run_name)
@@ -254,17 +245,18 @@ class ShortMDPrepNode(AppBackedNode):
     def _metadata(self) -> dict[str, str]:
         return {"stage": "prep", "run_name": sanitize_filename(self.run_name)}
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit GROMACS preparation directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare GROMACS preparation for kernel submission."""
         safe_run_name = sanitize_filename(self.run_name)
         if self.overwrite_existing:
             self.modal_namespace.clear.remote(run_name=safe_run_name)
         function_name = (
             "prepare_tpr_cpu" if self.gromacs.cpu_only else "prepare_tpr_gpu"
         )
-        return RemoteNodeSubmission(
-            function_call=self._app_function().spawn(**self._app_kwargs()),
+        return RemoteNodeCall(
             function_name=function_name,
+            uses_gpu=not self.gromacs.cpu_only,
+            kwargs=self._app_kwargs(),
             metadata=self._metadata(),
         )
 
@@ -295,7 +287,7 @@ class ShortMDPrepNode(AppBackedNode):
 
 
 @dataclass
-class ShortMDCloneNode(WorkflowNativeNode):
+class ShortMDCloneNode(RemoteWorkflowNode):
     """Workflow-native adapter that clones prepared inputs for one replicate."""
 
     source_run_name: str
@@ -306,8 +298,6 @@ class ShortMDCloneNode(WorkflowNativeNode):
         metadata={"dag_hash": False},
     )
     overwrite_clone: bool = False
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
 
     def _app_kwargs_and_metadata(
         self,
@@ -342,12 +332,13 @@ class ShortMDCloneNode(WorkflowNativeNode):
             },
         )
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit clone file-management work directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare clone file-management work for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.clone.spawn(**kwargs),
+        return RemoteNodeCall(
             function_name="clone_prepared_shortmd_run",
+            uses_gpu=False,
+            kwargs=kwargs,
             metadata=metadata,
         )
 
@@ -394,15 +385,6 @@ class ShortMDReplicateNode(AppBackedNode):
         metadata={"dag_hash": False},
     )
     gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
-
-    def _app_function(self) -> modal.Function:
-        return (
-            self.modal_namespace.production_cpu
-            if self.gromacs.cpu_only
-            else self.modal_namespace.production_gpu
-        )
 
     def _app_kwargs_and_metadata(
         self,
@@ -439,15 +421,16 @@ class ShortMDReplicateNode(AppBackedNode):
             },
         )
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit GROMACS production directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare GROMACS production for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
         function_name = (
             "production_run_cpu" if self.gromacs.cpu_only else "production_run_gpu"
         )
-        return RemoteNodeSubmission(
-            function_call=self._app_function().spawn(**kwargs),
+        return RemoteNodeCall(
             function_name=function_name,
+            uses_gpu=not self.gromacs.cpu_only,
+            kwargs=kwargs,
             metadata=metadata,
         )
 
@@ -692,7 +675,7 @@ def submit_shortmd_workflow(
         ld_seed: Random seed for Langevin dynamics during preparation.
         gen_seed: Random seed for initial velocity generation during preparation.
         genion_seed: Random seed for ion placement during preparation.
-        force: Replace an existing workflow run ledger before running.
+        force: Replace existing ShortMD-managed app outputs before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
         max_parallel: Maximum number of ready workflow nodes to execute
@@ -723,12 +706,24 @@ def submit_shortmd_workflow(
         print_workflow_dag(workflow.validate())
         return
 
+    execution_run_id = uuid4()
     orchestrator_handle = orchestrator.WorkflowOrchestrator()
     orchestrator_kwargs = {
         "workflow": workflow,
-        "run_id": resolved_run_id,
-        "force": force,
-        "max_ready_workers": max_parallel,
+        "execution_run_id": str(execution_run_id),
+        "workload_run_key": resolved_run_id,
+        "deployment_environment": "development",
+        "deployment_name": CONF.name,
+        "deployment_version": 1,
+        "max_active_provider_calls": max_parallel,
+        "max_active_gpu_provider_calls": max_parallel,
+        "development_function_handles": {
+            "prepare_tpr_cpu": gromacs_app.prepare_tpr_cpu,
+            "prepare_tpr_gpu": gromacs_app.prepare_tpr_gpu,
+            "clone_prepared_shortmd_run": clone_prepared_shortmd_run,
+            "production_run_cpu": gromacs_app.production_run_cpu,
+            "production_run_gpu": gromacs_app.production_run_gpu,
+        },
     }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
@@ -740,12 +735,16 @@ def submit_shortmd_workflow(
         f"{len(input_pdbs)} input PDB(s), {replicates} replicate(s) each",
         flush=True,
     )
+    function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    print(f"Execution Run ID: {execution_run_id}", flush=True)
+    print(
+        "Coordinator FunctionCall ID: "
+        f"{getattr(function_call, 'object_id', function_call)}",
+        flush=True,
+    )
     if wait:
-        result: AppRunResult | str = AppRunResult.model_validate(
-            orchestrator_handle.run.remote(**orchestrator_kwargs)
-        )
+        result: AppRunResult | str = AppRunResult.model_validate(function_call.get())
     else:
-        function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
         result = str(getattr(function_call, "object_id", function_call))
     if isinstance(result, AppRunResult):
         print(f"ShortMD workflow run finished with status: {result.status}", flush=True)

@@ -6,6 +6,7 @@ import tarfile
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import polars as pl
 import pytest
@@ -528,9 +529,11 @@ def test_report_node_reads_rank_artifact_from_configured_volume_root(
 
     result = ppiflow_workflow.ReportNode("ReportStep").run(
         ppiflow_workflow.NodeRunContext(
-            run_id="run-1",
+            execution_run_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            workload_run_key="run-1",
             node_id="report",
-            attempt_id="attempt-1",
+            task_key="node",
+            work_dir=tmp_path / "result",
             cache_dir=tmp_path,
             inputs={"rank": [artifact]},
         )

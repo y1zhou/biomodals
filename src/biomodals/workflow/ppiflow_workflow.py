@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 import modal
 import polars as pl
@@ -38,8 +39,6 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
-    NodeExecutionPolicy,
-    NodePlacement,
     VolumePath,
     WorkflowArtifact,
 )
@@ -47,7 +46,8 @@ from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
-    RemoteNodeSubmission,
+    RemoteNodeCall,
+    RemoteWorkflowNode,
     Workflow,
     WorkflowNativeNode,
     orchestrator,
@@ -207,7 +207,6 @@ def copy_ppiflow_structure_artifacts(
     artifacts: list[WorkflowArtifact],
     run_id: str,
     node_id: str,
-    attempt_id: str,
     output_name: str,
     metadata: dict[str, object] | None = None,
     patterns: Sequence[str] | None = None,
@@ -226,7 +225,6 @@ def copy_ppiflow_structure_artifacts(
         / "ppiflow"
         / sanitize_filename(run_id)
         / sanitize_filename(node_id)
-        / sanitize_filename(attempt_id)
         / sanitize_filename(output_name)
     )
     if output_dir.exists():
@@ -267,7 +265,6 @@ def normalize_ppiflow_stage2_input(
     config: dict[str, object],
     run_id: str,
     node_id: str,
-    attempt_id: str,
     step_name: str,
 ) -> AppRunResult:
     """Normalize Stage2Input structures into a workflow-owned manifest."""
@@ -287,7 +284,6 @@ def normalize_ppiflow_stage2_input(
         / "ppiflow"
         / sanitize_filename(run_id)
         / sanitize_filename(node_id)
-        / sanitize_filename(attempt_id)
         / "stage2_input"
     )
     if output_dir.exists():
@@ -374,7 +370,6 @@ def filter_ppiflow_artifacts(
     config: dict[str, object],
     run_id: str,
     node_id: str,
-    attempt_id: str,
     step_name: str,
 ) -> AppRunResult:
     """Filter structure artifacts using an AF3Score-compatible CSV."""
@@ -458,7 +453,6 @@ def filter_ppiflow_artifacts(
         / "ppiflow"
         / sanitize_filename(run_id)
         / sanitize_filename(node_id)
-        / sanitize_filename(attempt_id)
         / "filtered"
     )
     if output_dir.exists():
@@ -535,7 +529,6 @@ def derive_ppiflow_fixed_positions(
     config: dict[str, object],
     run_id: str,
     node_id: str,
-    attempt_id: str,
     step_name: str,
 ) -> AppRunResult:
     """Derive per-structure fixed positions from Rosetta residue energies."""
@@ -637,7 +630,6 @@ def derive_ppiflow_fixed_positions(
         / "ppiflow"
         / sanitize_filename(run_id)
         / sanitize_filename(node_id)
-        / sanitize_filename(attempt_id)
         / "fixed_positions"
     )
     if output_dir.exists():
@@ -692,7 +684,6 @@ def rank_ppiflow_artifacts(
     config: dict[str, object],
     run_id: str,
     node_id: str,
-    attempt_id: str,
     step_name: str,
 ) -> AppRunResult:
     """Merge available score tables and rank final PPIFlow structures."""
@@ -733,7 +724,6 @@ def rank_ppiflow_artifacts(
         / "ppiflow"
         / sanitize_filename(run_id)
         / sanitize_filename(node_id)
-        / sanitize_filename(attempt_id)
         / "ranked"
     )
     if output_dir.exists():
@@ -943,7 +933,6 @@ def run_ppiflow_af3score_stage(
     run_name: str,
     run_id: str,
     node_id: str,
-    attempt_id: str,
 ) -> AppRunResult:
     """Run AF3Score prepare/GPU/postprocess as one workflow stage call."""
     # TODO: tune CPU/memory/timeout once AF3Score candidate-stage telemetry exists.
@@ -1032,7 +1021,6 @@ def run_ppiflow_af3score_stage(
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
-        attempt_id=attempt_id,
         step_name=step_name,
         rows=[
             ppiflow_manifests.candidate_manifest_row(
@@ -1096,7 +1084,6 @@ def run_ppiflow_ligandmpnn_stage(
     run_name: str,
     run_id: str,
     node_id: str,
-    attempt_id: str,
     script_mode: str,
     model_type: str,
     cli_args: dict[str, str | int | float | bool],
@@ -1163,7 +1150,6 @@ def run_ppiflow_ligandmpnn_stage(
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
-        attempt_id=attempt_id,
         step_name=step_name,
         rows=ppiflow_coordinators.outcome_manifest_rows(
             stage_name=step_name,
@@ -1201,7 +1187,6 @@ def run_ppiflow_partial_stage(
     run_name: str,
     run_id: str,
     node_id: str,
-    attempt_id: str,
     fixed_positions_by_candidate: dict[str, str] | None = None,
 ) -> AppRunResult:
     """Run PPIFlow partial design for every selected candidate."""
@@ -1279,7 +1264,6 @@ def run_ppiflow_partial_stage(
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
-        attempt_id=attempt_id,
         step_name=step_name,
         rows=ppiflow_coordinators.outcome_manifest_rows(
             stage_name=step_name,
@@ -1314,7 +1298,6 @@ def run_ppiflow_refold_stage(
     run_name: str,
     run_id: str,
     node_id: str,
-    attempt_id: str,
 ) -> AppRunResult:
     """Run AlphaFold3 refolding for every selected candidate."""
     # TODO: tune CPU/memory/timeout/GPU once ReFold candidate-stage telemetry exists.
@@ -1351,7 +1334,6 @@ def run_ppiflow_refold_stage(
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
-        attempt_id=attempt_id,
         step_name=step_name,
         rows=ppiflow_coordinators.outcome_manifest_rows(
             stage_name=step_name,
@@ -1387,7 +1369,6 @@ def run_ppiflow_rosetta_stage(
     run_name: str,
     run_id: str,
     node_id: str,
-    attempt_id: str,
 ) -> AppRunResult:
     """Stage Rosetta candidates, run worker pods, and classify outputs."""
     # TODO: tune CPU/memory/timeout and pod sizing once Rosetta stage telemetry exists.
@@ -1395,7 +1376,7 @@ def run_ppiflow_rosetta_stage(
         artifacts=artifacts,
         candidate_manifests=candidate_manifests,
         run_name=run_name,
-        run_id=sanitize_filename(f"{run_id}-{node_id}-{attempt_id}"),
+        run_id=sanitize_filename(f"{run_id}-{node_id}"),
         rosetta_binary=str(config.get("rosetta_binary", "relax")),
         rosetta_script=config.get("rosetta_script"),
         flags_file=config.get("flags_file"),
@@ -1494,7 +1475,6 @@ def run_ppiflow_rosetta_stage(
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
-        attempt_id=attempt_id,
         step_name=step_name,
         rows=rows,
     )
@@ -1568,12 +1548,13 @@ class _ConfiguredAppStepNode(AppBackedNode):
         metadata={"dag_hash": False},
     )
     config: dict[str, Any] = field(default_factory=dict)
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RERUN
-    placement: NodePlacement = NodePlacement.REMOTE
 
     def _run_name(self, context: NodeRunContext) -> str:
         run_name = sanitize_filename(
-            str(self.config.get("run_name") or f"{context.run_id}-{self.step_name}")
+            str(
+                self.config.get("run_name")
+                or f"{context.workload_run_key}-{self.step_name}"
+            )
         )
         return run_name
 
@@ -1638,13 +1619,12 @@ class _PPIFlowRunNode(_ConfiguredAppStepNode):
         app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
         return {"args": app_args, "run_name": self._run_name(context)}
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the PPIFlow app function directly from the orchestrator."""
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.ppiflow_run.spawn(
-                **self._app_kwargs(context)
-            ),
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the PPIFlow app call for kernel submission."""
+        return RemoteNodeCall(
             function_name="ppiflow_run",
+            uses_gpu=True,
+            kwargs=self._app_kwargs(context),
         )
 
     def process_remote_result(
@@ -1672,8 +1652,8 @@ class PPIFlowDesignNode(_PPIFlowRunNode):
 class PPIFlowPartialNode(_PPIFlowRunNode):
     """PPIFlow partial-design step for stage 2."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit candidate-wide PPIFlow partial design."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare candidate-wide PPIFlow partial design."""
         selected_structures = ppiflow_staging.candidate_structure_files_from_selected(
             self._select_structures(
                 context,
@@ -1681,23 +1661,23 @@ class PPIFlowPartialNode(_PPIFlowRunNode):
             ),
             manifest_frame=_candidate_manifest_frame_from_context(context),
         )
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.ppiflow_partial_stage.spawn(
-                selected_structures=[
+        return RemoteNodeCall(
+            function_name="run_ppiflow_partial_stage",
+            uses_gpu=False,
+            kwargs={
+                "selected_structures": [
                     asdict(structure) for structure in selected_structures
                 ],
-                config=self.config,
-                step_name=self.step_name,
-                run_name=self._run_name(context),
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-                fixed_positions_by_candidate=_fixed_positions_by_candidate(
+                "config": self.config,
+                "step_name": self.step_name,
+                "run_name": self._run_name(context),
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+                "fixed_positions_by_candidate": _fixed_positions_by_candidate(
                     context.inputs.get("structures") or [],
                     selected_structures,
                 ),
-            ),
-            function_name="run_ppiflow_partial_stage",
+            },
             metadata={"structure_count": len(selected_structures)},
         )
 
@@ -1706,8 +1686,8 @@ class PPIFlowPartialNode(_PPIFlowRunNode):
 class LigandMPNNNode(_ConfiguredAppStepNode):
     """LigandMPNN or AbMPNN design step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the LigandMPNN app function."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the LigandMPNN app call."""
         selected_structures = ppiflow_staging.candidate_structure_files_from_selected(
             self._select_structures(
                 context,
@@ -1727,22 +1707,22 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
             script_mode=script_mode,
             model_type=model_type,
         )
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.ligandmpnn_stage.spawn(
-                selected_structures=[
+        return RemoteNodeCall(
+            function_name="run_ppiflow_ligandmpnn_stage",
+            uses_gpu=False,
+            kwargs={
+                "selected_structures": [
                     asdict(structure) for structure in selected_structures
                 ],
-                config=self.config,
-                run_name=self._run_name(context),
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-                script_mode=script_mode,
-                model_type=model_type,
-                cli_args=ligandmpnn_app.build_ligandmpnn_cli_args(**cli_kwargs),
-                step_name=self.step_name,
-            ),
-            function_name="run_ppiflow_ligandmpnn_stage",
+                "config": self.config,
+                "run_name": self._run_name(context),
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+                "script_mode": script_mode,
+                "model_type": model_type,
+                "cli_args": ligandmpnn_app.build_ligandmpnn_cli_args(**cli_kwargs),
+                "step_name": self.step_name,
+            },
             metadata={"structure_count": len(selected_structures)},
         )
 
@@ -1764,8 +1744,8 @@ class LigandMPNNNode(_ConfiguredAppStepNode):
 class FlowPackerNode(_ConfiguredAppStepNode):
     """FlowPacker side-chain packing step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the FlowPacker app function."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the FlowPacker app call."""
         selected_structures = self._select_structures(
             context,
             max_files=self.config.get("max_structures"),
@@ -1785,13 +1765,14 @@ class FlowPackerNode(_ConfiguredAppStepNode):
             )
             if key in self.config
         }
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.flowpacker_run.spawn(
-                input_files=selected_structures,
-                run_name=self._run_name(context),
-                **kwargs,
-            ),
+        return RemoteNodeCall(
             function_name="run_flowpacker_workflow",
+            uses_gpu=True,
+            kwargs={
+                "input_files": selected_structures,
+                "run_name": self._run_name(context),
+                **kwargs,
+            },
             metadata={"structure_count": len(selected_structures)},
         )
 
@@ -1811,23 +1792,23 @@ class FlowPackerNode(_ConfiguredAppStepNode):
 class AF3ScoreNode(_ConfiguredAppStepNode):
     """AF3Score structure scoring step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit AF3Score as one recoverable workflow stage call."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare AF3Score as one recoverable workflow stage call."""
         structures = context.inputs.get("structures") or []
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.af3score_stage.spawn(
-                artifacts=structures,
-                candidate_manifests=context.inputs.get("candidate_manifest") or [],
-                config=self.config,
-                step_name=self.step_name,
-                run_name=self._run_name(context),
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-            ),
+        return RemoteNodeCall(
             function_name="run_ppiflow_af3score_stage",
+            uses_gpu=False,
+            kwargs={
+                "artifacts": structures,
+                "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
+                "config": self.config,
+                "step_name": self.step_name,
+                "run_name": self._run_name(context),
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+            },
         )
 
 
@@ -1835,23 +1816,23 @@ class AF3ScoreNode(_ConfiguredAppStepNode):
 class _RosettaNode(_ConfiguredAppStepNode):
     """Base class for PPIFlow Rosetta steps."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit Rosetta staging and workers as one workflow stage call."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare Rosetta staging and workers as one workflow stage call."""
         structures = context.inputs.get("structures") or []
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.rosetta_stage.spawn(
-                artifacts=structures,
-                candidate_manifests=context.inputs.get("candidate_manifest") or [],
-                config=self.config,
-                step_name=self.step_name,
-                run_name=self._run_name(context),
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-            ),
+        return RemoteNodeCall(
             function_name="run_ppiflow_rosetta_stage",
+            uses_gpu=False,
+            kwargs={
+                "artifacts": structures,
+                "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
+                "config": self.config,
+                "step_name": self.step_name,
+                "run_name": self._run_name(context),
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+            },
         )
 
 
@@ -1869,8 +1850,8 @@ class RosettaRelaxNode(_RosettaNode):
 class ReFoldNode(_ConfiguredAppStepNode):
     """AlphaFold3 refolding step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit AlphaFold3 refolding as one workflow stage call."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare AlphaFold3 refolding as one workflow stage call."""
         selected_structures = ppiflow_staging.candidate_structure_files_from_selected(
             self._select_structures(
                 context,
@@ -1879,19 +1860,19 @@ class ReFoldNode(_ConfiguredAppStepNode):
             ),
             manifest_frame=_candidate_manifest_frame_from_context(context),
         )
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.refold_stage.spawn(
-                selected_structures=[
+        return RemoteNodeCall(
+            function_name="run_ppiflow_refold_stage",
+            uses_gpu=False,
+            kwargs={
+                "selected_structures": [
                     asdict(structure) for structure in selected_structures
                 ],
-                config=self.config,
-                step_name=self.step_name,
-                run_name=self._run_name(context),
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-            ),
-            function_name="run_ppiflow_refold_stage",
+                "config": self.config,
+                "step_name": self.step_name,
+                "run_name": self._run_name(context),
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+            },
             metadata={"structure_count": len(selected_structures)},
         )
 
@@ -1900,8 +1881,8 @@ class ReFoldNode(_ConfiguredAppStepNode):
 class DockQNode(_ConfiguredAppStepNode):
     """DockQ model/reference scoring step."""
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the DockQ app function."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the DockQ app call."""
         references = ppiflow_staging.candidate_structure_files_from_selected(
             self._select_structures(context),
             manifest_frame=_candidate_manifest_frame_from_context(context),
@@ -1927,13 +1908,14 @@ class DockQNode(_ConfiguredAppStepNode):
         dockq_args = self.config.get("dockq_args", "--short")
         if isinstance(dockq_args, str):
             dockq_args = shlex.split(dockq_args)
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.dockq_run.spawn(
-                pairs=pairs,
-                run_name=self._run_name(context),
-                dockq_args=dockq_args,
-            ),
+        return RemoteNodeCall(
             function_name="run_dockq_workflow",
+            uses_gpu=False,
+            kwargs={
+                "pairs": pairs,
+                "run_name": self._run_name(context),
+                "dockq_args": dockq_args,
+            },
             metadata={"pair_count": len(pairs)},
         )
 
@@ -1950,7 +1932,7 @@ class DockQNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class ExistingStructuresNode(WorkflowNativeNode):
+class ExistingStructuresNode(RemoteWorkflowNode):
     """Reference existing structures for stage-2-only PPIFlow runs."""
 
     step_name: str
@@ -1961,20 +1943,19 @@ class ExistingStructuresNode(WorkflowNativeNode):
     )
     storage: VolumePath
     config: dict[str, Any] = field(default_factory=dict)
-    placement: NodePlacement = NodePlacement.REMOTE
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit Stage2Input normalization as a remote workflow adapter."""
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.stage2_input_manifest.spawn(
-                storage=self.storage,
-                config=self.config,
-                run_id=context.run_id,
-                node_id=context.node_id,
-                attempt_id=context.attempt_id,
-                step_name=self.step_name,
-            ),
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare Stage2Input normalization for kernel submission."""
+        return RemoteNodeCall(
             function_name="normalize_ppiflow_stage2_input",
+            uses_gpu=False,
+            kwargs={
+                "storage": self.storage,
+                "config": self.config,
+                "run_id": context.workload_run_key,
+                "node_id": context.node_id,
+                "step_name": self.step_name,
+            },
         )
 
 
@@ -2003,9 +1984,8 @@ class FilterStructuresNode(WorkflowNativeNode):
             scores=scores,
             candidate_manifests=context.inputs.get("candidate_manifest") or [],
             config=self.config,
-            run_id=context.run_id,
+            run_id=context.workload_run_key,
             node_id=context.node_id,
-            attempt_id=context.attempt_id,
             step_name=self.step_name,
         )
         _reload_workflow_output_volume()
@@ -2033,9 +2013,8 @@ class FixedPositionsNode(WorkflowNativeNode):
             self.modal_namespace.derive_fixed_positions.remote(
                 artifacts=artifacts,
                 config=self.config,
-                run_id=context.run_id,
+                run_id=context.workload_run_key,
                 node_id=context.node_id,
-                attempt_id=context.attempt_id,
                 step_name=self.step_name,
             )
         )
@@ -2069,9 +2048,8 @@ class RankNode(WorkflowNativeNode):
                 structures=structures,
                 score_artifacts=score_artifacts,
                 config=self.config,
-                run_id=context.run_id,
+                run_id=context.workload_run_key,
                 node_id=context.node_id,
-                attempt_id=context.attempt_id,
                 step_name=self.step_name,
             )
         )
@@ -2254,7 +2232,6 @@ def _write_candidate_manifest_output(
     *,
     run_id: str,
     node_id: str,
-    attempt_id: str,
     step_name: str,
     rows: Sequence[Mapping[str, object]],
 ) -> AppOutput:
@@ -2263,7 +2240,6 @@ def _write_candidate_manifest_output(
         / "ppiflow"
         / sanitize_filename(run_id)
         / sanitize_filename(node_id)
-        / sanitize_filename(attempt_id)
         / ppiflow_manifests.MANIFEST_OUTPUT_NAME
     )
     if output_dir.exists():
@@ -3241,7 +3217,6 @@ def submit_ppiflow_workflow(
     steps_yaml: str,
     run_id: str | None = None,
     stage: int | None = None,
-    force: bool = False,
     wait: bool = True,
     max_parallel: int = 16,
     max_child_calls: int | None = None,
@@ -3258,7 +3233,6 @@ def submit_ppiflow_workflow(
             the task YAML filename stem.
         stage: Optional stage selector. Use 1 for stage 1 only, 2 for stage 2
             only, or omit to build both stages.
-        force: Replace an existing workflow run ledger before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
         max_parallel: Maximum number of ready workflow nodes to execute
@@ -3298,12 +3272,28 @@ def submit_ppiflow_workflow(
         max_child_calls=max_child_calls,
     )
 
+    execution_run_id = uuid4()
     orchestrator_handle = orchestrator.WorkflowOrchestrator()
     orchestrator_kwargs = {
         "workflow": workflow,
-        "run_id": resolved_run_id,
-        "force": force,
-        "max_ready_workers": max_parallel,
+        "execution_run_id": str(execution_run_id),
+        "workload_run_key": resolved_run_id,
+        "deployment_environment": "development",
+        "deployment_name": CONF.name,
+        "deployment_version": 1,
+        "max_active_provider_calls": max_parallel,
+        "max_active_gpu_provider_calls": max_parallel,
+        "development_function_handles": {
+            "ppiflow_run": ppiflow_app.ppiflow_run_workflow,
+            "run_ppiflow_partial_stage": run_ppiflow_partial_stage,
+            "run_ppiflow_ligandmpnn_stage": run_ppiflow_ligandmpnn_stage,
+            "run_flowpacker_workflow": flowpacker_app.run_flowpacker_workflow,
+            "run_ppiflow_af3score_stage": run_ppiflow_af3score_stage,
+            "run_ppiflow_rosetta_stage": run_ppiflow_rosetta_stage,
+            "run_ppiflow_refold_stage": run_ppiflow_refold_stage,
+            "run_dockq_workflow": dockq_app.run_dockq_workflow,
+            "normalize_ppiflow_stage2_input": normalize_ppiflow_stage2_input,
+        },
     }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
@@ -3315,12 +3305,16 @@ def submit_ppiflow_workflow(
         f"{len(workflow.validate().nodes)} node(s)",
         flush=True,
     )
+    function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    print(f"Execution Run ID: {execution_run_id}", flush=True)
+    print(
+        "Coordinator FunctionCall ID: "
+        f"{getattr(function_call, 'object_id', function_call)}",
+        flush=True,
+    )
     if wait:
-        result: AppRunResult | str = AppRunResult.model_validate(
-            orchestrator_handle.run.remote(**orchestrator_kwargs)
-        )
+        result: AppRunResult | str = AppRunResult.model_validate(function_call.get())
     else:
-        function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
         result = str(getattr(function_call, "object_id", function_call))
     if isinstance(result, AppRunResult):
         print(f"PPIFlow workflow run finished with status: {result.status}", flush=True)

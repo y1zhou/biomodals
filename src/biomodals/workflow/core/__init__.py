@@ -19,8 +19,8 @@ from biomodals.workflow.core.display import print_workflow_dag
 from biomodals.workflow.core.nodes import (
     AppBackedNode,
     NodeRunContext,
-    RemoteFunctionCall,
-    RemoteNodeSubmission,
+    RemoteNodeCall,
+    RemoteWorkflowNode,
     WorkflowNativeNode,
     WorkflowNode,
 )
@@ -32,8 +32,8 @@ __all__ = [
     "ExternalArtifactChecker",
     "NodeHandle",
     "NodeRunContext",
-    "RemoteFunctionCall",
-    "RemoteNodeSubmission",
+    "RemoteNodeCall",
+    "RemoteWorkflowNode",
     "Workflow",
     "WorkflowDefinition",
     "WorkflowNativeNode",

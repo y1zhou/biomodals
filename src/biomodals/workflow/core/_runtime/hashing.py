@@ -40,7 +40,6 @@ def node_hash_payload(node: WorkflowNode) -> dict[str, object]:
     """Return the semantic hash payload for one workflow node."""
     payload: dict[str, object] = {
         "class": f"{node.__class__.__module__}.{node.__class__.__qualname__}",
-        "execution_policy": node.execution_policy.value,
     }
     if is_dataclass(node):
         payload["dataclass"] = stable_json_value(node)

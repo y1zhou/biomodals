@@ -14,6 +14,7 @@ import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 import modal
 
@@ -29,15 +30,13 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
-    NodeExecutionPolicy,
-    NodePlacement,
     VolumePath,
     WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
-    RemoteNodeSubmission,
+    RemoteNodeCall,
     Workflow,
     WorkflowNativeNode,
     orchestrator,
@@ -242,27 +241,28 @@ class RFdiffusionTrajectoryNode(AppBackedNode):
     noise_scale_ca: float = 1.0
     noise_scale_frame: float = 1.0
     rfd_args: str = ""
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the RFdiffusion app function directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the RFdiffusion call for kernel submission."""
         safe_run_name = sanitize_filename(self.run_name)
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.rfdiffusion_infer.spawn(
-                input_pdb_bytes=self.pdb_content,
-                input_pdb_name=self.input_pdb_name,
-                run_name=safe_run_name,
-                hydra_overrides=rfdiffusion_app.build_rfdiffusion_hydra_overrides(
-                    contigs=self.contigs,
-                    num_designs=self.num_designs,
-                    hotspot_res=self.hotspot_res,
-                    noise_scale_ca=self.noise_scale_ca,
-                    noise_scale_frame=self.noise_scale_frame,
-                    rfd_args=self.rfd_args,
-                ),
-            ),
+        return RemoteNodeCall(
             function_name="rfdiffusion_infer",
+            uses_gpu=True,
+            kwargs={
+                "input_pdb_bytes": self.pdb_content,
+                "input_pdb_name": self.input_pdb_name,
+                "run_name": safe_run_name,
+                "hydra_overrides": (
+                    rfdiffusion_app.build_rfdiffusion_hydra_overrides(
+                        contigs=self.contigs,
+                        num_designs=self.num_designs,
+                        hotspot_res=self.hotspot_res,
+                        noise_scale_ca=self.noise_scale_ca,
+                        noise_scale_frame=self.noise_scale_frame,
+                        rfd_args=self.rfd_args,
+                    )
+                ),
+            },
         )
 
 
@@ -277,8 +277,6 @@ class LigandMPNNDesignNode(AppBackedNode):
         repr=False, compare=False, metadata={"dag_hash": False}
     )
     settings: LigandMPNNDesignSettings
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RERUN
-    placement: NodePlacement = NodePlacement.REMOTE
 
     def _select_ligandmpnn_inputs(
         self, context: NodeRunContext
@@ -316,8 +314,8 @@ class LigandMPNNDesignNode(AppBackedNode):
             },
         )
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the LigandMPNN app function directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the LigandMPNN call for kernel submission."""
         pdb_bytes, redesigned_residues, metadata = self._select_ligandmpnn_inputs(
             context
         )
@@ -333,15 +331,16 @@ class LigandMPNNDesignNode(AppBackedNode):
             repack_everything=True,
             redesigned_residues=redesigned_residues,
         )
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.ligandmpnn_run.spawn(
-                run_name=sanitize_filename(self.run_name),
-                script_mode="run",
-                struct_bytes=pdb_bytes,
-                seeds=list(self.settings.seeds),
-                cli_args=cli_args,
-            ),
+        return RemoteNodeCall(
             function_name="ligandmpnn_run",
+            uses_gpu=True,
+            kwargs={
+                "run_name": sanitize_filename(self.run_name),
+                "script_mode": "run",
+                "struct_bytes": pdb_bytes,
+                "seeds": list(self.settings.seeds),
+                "cli_args": cli_args,
+            },
             metadata=metadata,
         )
 
@@ -552,7 +551,6 @@ def submit_rfd_ligandmpnn_workflow(
     noise_scale_ca: float = 1.0,
     noise_scale_frame: float = 1.0,
     rfd_args: str = "",
-    force: bool = False,
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
@@ -576,7 +574,6 @@ def submit_rfd_ligandmpnn_workflow(
         noise_scale_ca: RFdiffusion denoiser CA noise scale.
         noise_scale_frame: RFdiffusion denoiser frame noise scale.
         rfd_args: Extra RFdiffusion Hydra overrides.
-        force: Replace an existing workflow run ledger before running.
         wait: Wait locally for the remote workflow result.
         max_parallel: Maximum ready workflow nodes per scheduler wave.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
@@ -608,11 +605,20 @@ def submit_rfd_ligandmpnn_workflow(
     if dry_run:
         print_workflow_dag(workflow.validate())
         return
+    execution_run_id = uuid4()
     orchestrator_kwargs = {
         "workflow": workflow,
-        "run_id": resolved_run_id,
-        "force": force,
-        "max_ready_workers": max_parallel,
+        "execution_run_id": str(execution_run_id),
+        "workload_run_key": resolved_run_id,
+        "deployment_environment": "development",
+        "deployment_name": CONF.name,
+        "deployment_version": 1,
+        "max_active_provider_calls": max_parallel,
+        "max_active_gpu_provider_calls": max_parallel,
+        "development_function_handles": {
+            "rfdiffusion_infer": rfdiffusion_app.rfdiffusion_infer,
+            "ligandmpnn_run": ligandmpnn_app.ligandmpnn_run,
+        },
     }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
@@ -630,6 +636,11 @@ def submit_rfd_ligandmpnn_workflow(
     )
     orchestrator_handle = orchestrator.WorkflowOrchestrator()
     fc = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    print(f"Execution Run ID: {execution_run_id}", flush=True)
+    print(
+        f"Coordinator FunctionCall ID: {getattr(fc, 'object_id', fc)}",
+        flush=True,
+    )
     if wait:
         result: AppRunResult | str = AppRunResult.model_validate(fc.get())
         print(f"{CONF.name} run finished with status: {result.status}", flush=True)

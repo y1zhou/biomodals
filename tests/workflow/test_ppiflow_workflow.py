@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from uuid import UUID
 
 import modal
 import polars as pl
@@ -25,7 +26,7 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow import ppiflow_workflow
-from biomodals.workflow.core import NodeRunContext
+from biomodals.workflow.core import NodeRunContext, RemoteWorkflowNode
 from biomodals.workflow.core._runtime import hashing
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow_workflow import (
@@ -33,6 +34,8 @@ from biomodals.workflow.ppiflow_workflow import (
     PPIFlowModalNamespace,
     build_ppiflow_workflow,
 )
+
+RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
 
 class _FakeFunctionCall:
@@ -298,7 +301,9 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     )
 
 
-def test_ppiflow_app_step_uses_included_modal_namespace(tmp_path: Path) -> None:
+def test_ppiflow_app_step_prepares_kernel_call_and_normalizes_result(
+    tmp_path: Path,
+) -> None:
     fake_function = _FakePPIFlowFunction()
     namespace = _fake_namespace(fake_function)
     workflow = build_ppiflow_workflow(
@@ -317,19 +322,24 @@ PPIFlowStep:
 
     definition = workflow.validate()
     spec = definition.nodes["stage1-ppiflow-design"]
-    result = spec.node.run(
+    call = spec.node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id=spec.node_id,
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={},
         )
     )
+    result = spec.node.process_remote_result(fake_function._result(), call.metadata)
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert fake_function.kwargs["run_name"] == "demo-run"
-    assert isinstance(fake_function.kwargs["args"], ppiflow_app.PPIFlowArgs)
+    assert call.function_name == "ppiflow_run"
+    assert call.kwargs["run_name"] == "demo-run"
+    assert isinstance(call.kwargs["args"], ppiflow_app.PPIFlowArgs)
+    assert fake_function.kwargs == {}
     assert result.outputs[0].storage == VolumePath(
         volume_name=ppiflow_app.CONF.output_volume_name,
         path="demo-run",
@@ -342,7 +352,9 @@ PPIFlowStep:
     )
 
 
-def test_ppiflow_app_step_submits_app_function_directly(tmp_path: Path) -> None:
+def test_ppiflow_app_step_preparation_does_not_submit_provider_call(
+    tmp_path: Path,
+) -> None:
     fake_function = _FakePPIFlowFunction()
     namespace = _fake_namespace(fake_function)
     workflow = build_ppiflow_workflow(
@@ -360,25 +372,27 @@ PPIFlowStep:
     )
 
     spec = workflow.validate().nodes["stage1-ppiflow-design"]
-    submission = spec.node.submit_remote(
+    submission = spec.node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id=spec.node_id,
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={},
         )
     )
 
     assert submission.function_name == "ppiflow_run"
-    assert submission.function_call.object_id == "fc-ppiflow"
-    assert fake_function.kwargs["run_name"] == "demo-run"
-    assert isinstance(fake_function.kwargs["args"], ppiflow_app.PPIFlowArgs)
-    assert isinstance(fake_function.kwargs["args"].args.input_pdb, str)
-    assert isinstance(fake_function.kwargs["args"].args.config, str)
+    assert submission.kwargs["run_name"] == "demo-run"
+    assert isinstance(submission.kwargs["args"], ppiflow_app.PPIFlowArgs)
+    assert isinstance(submission.kwargs["args"].args.input_pdb, str)
+    assert isinstance(submission.kwargs["args"].args.config, str)
+    assert fake_function.kwargs == {}
 
 
-def test_ligandmpnn_step_selects_structure_and_submits_app_function(
+def test_ligandmpnn_step_prepares_selected_structures_for_kernel(
     tmp_path: Path,
 ) -> None:
     selector = _FakeModalFunction("fc-select", [("selected.pdb", b"ATOM selected\n")])
@@ -426,23 +440,23 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
         },
     )
     context = NodeRunContext(
-        run_id="run-1",
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
         node_id="stage1-ligandmpnn",
-        attempt_id="attempt-1",
-        cache_dir=tmp_path,
+        task_key="node",
+        work_dir=tmp_path / "result",
+        cache_dir=tmp_path / "cache",
         inputs={"structures": [_upstream_structure_artifact()]},
     )
 
-    submission = node.submit_remote(context)
-    result = node.process_remote_result(
-        submission.function_call.get(), submission.metadata
-    )
+    submission = node.prepare_remote(context)
+    result = node.process_remote_result(ligandmpnn_stage.result, submission.metadata)
 
     assert submission.function_name == "run_ppiflow_ligandmpnn_stage"
     assert selector.kwargs["artifacts"] == [_upstream_structure_artifact()]
-    assert ligandmpnn_stage.kwargs["run_name"] == "mpnn-run"
-    assert ligandmpnn_stage.kwargs["script_mode"] == "run"
-    assert ligandmpnn_stage.kwargs["selected_structures"] == [
+    assert submission.kwargs["run_name"] == "mpnn-run"
+    assert submission.kwargs["script_mode"] == "run"
+    assert submission.kwargs["selected_structures"] == [
         {
             "candidate_id": "selected",
             "file_name": "selected.pdb",
@@ -450,9 +464,10 @@ def test_ligandmpnn_step_selects_structure_and_submits_app_function(
             "source_path": "selected.pdb",
         }
     ]
-    assert ligandmpnn_stage.kwargs["cli_args"]["--model_type"] == "protein_mpnn"
-    assert ligandmpnn_stage.kwargs["cli_args"]["--batch_size"] == "2"
-    assert ligandmpnn_stage.kwargs["cli_args"]["--number_of_batches"] == "3"
+    assert submission.kwargs["cli_args"]["--model_type"] == "protein_mpnn"
+    assert submission.kwargs["cli_args"]["--batch_size"] == "2"
+    assert submission.kwargs["cli_args"]["--number_of_batches"] == "3"
+    assert ligandmpnn_stage.kwargs == {}
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert result.outputs[1].kind == ArtifactKind.TABLE
     assert result.outputs[1].name == "mpnn_seqs"
@@ -482,23 +497,26 @@ def test_ligandmpnn_processes_multi_structure_selection(
         {"run_name": "mpnn-run"},
     )
 
-    node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage1-ligandmpnn",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
 
     assert [
         structure["candidate_id"]
-        for structure in ligandmpnn_stage.kwargs["selected_structures"]
+        for structure in submission.kwargs["selected_structures"]
     ] == ["design-a", "design-b"]
+    assert ligandmpnn_stage.kwargs == {}
 
 
-def test_flowpacker_step_selects_structures_and_submits_app_function(
+def test_flowpacker_step_prepares_selected_structures_for_kernel(
     tmp_path: Path,
 ) -> None:
     selected_structures = [
@@ -533,24 +551,25 @@ def test_flowpacker_step_selects_structures_and_submits_app_function(
         {"run_name": "fp-run", "n_samples": 2, "seed": 7},
     )
     context = NodeRunContext(
-        run_id="run-1",
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
         node_id="stage1-flowpacker",
-        attempt_id="attempt-1",
-        cache_dir=tmp_path,
+        task_key="node",
+        work_dir=tmp_path / "result",
+        cache_dir=tmp_path / "cache",
         inputs={"structures": [_upstream_structure_artifact()]},
     )
 
-    submission = node.submit_remote(context)
-    result = node.process_remote_result(
-        submission.function_call.get(), submission.metadata
-    )
+    submission = node.prepare_remote(context)
+    result = node.process_remote_result(flowpacker.result, submission.metadata)
 
     assert submission.function_name == "run_flowpacker_workflow"
     assert selector.kwargs["artifacts"] == [_upstream_structure_artifact()]
-    assert flowpacker.kwargs["input_files"] == selected_structures
-    assert flowpacker.kwargs["run_name"] == "fp-run"
-    assert flowpacker.kwargs["n_samples"] == 2
-    assert flowpacker.kwargs["seed"] == 7
+    assert submission.kwargs["input_files"] == selected_structures
+    assert submission.kwargs["run_name"] == "fp-run"
+    assert submission.kwargs["n_samples"] == 2
+    assert submission.kwargs["seed"] == 7
+    assert flowpacker.kwargs == {}
     assert result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert result.outputs[0].metadata["structure_count"] == 2
 
@@ -585,12 +604,14 @@ def test_partial_step_processes_multi_structure_selection(tmp_path: Path) -> Non
         },
     )
 
-    submission = node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-partial-ppiflow",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
@@ -598,8 +619,9 @@ def test_partial_step_processes_multi_structure_selection(tmp_path: Path) -> Non
     assert submission.function_name == "run_ppiflow_partial_stage"
     assert [
         structure["candidate_id"]
-        for structure in partial_stage.kwargs["selected_structures"]
+        for structure in submission.kwargs["selected_structures"]
     ] == ["design-a", "design-b"]
+    assert partial_stage.kwargs == {}
 
 
 def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
@@ -615,12 +637,14 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
         {"run_name": "af3-run", "num_jobs": 4, "prepare_workers": 2},
     )
 
-    submission = node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage1-af3score",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={
                 "structures": [_upstream_structure_artifact()],
                 "candidate_manifest": [
@@ -631,13 +655,14 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     )
 
     assert submission.function_name == "run_ppiflow_af3score_stage"
-    assert af3score_stage.kwargs["artifacts"] == [_upstream_structure_artifact()]
-    assert af3score_stage.kwargs["candidate_manifests"] == [
+    assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
+    assert submission.kwargs["candidate_manifests"] == [
         _upstream_structure_artifact(kind=ArtifactKind.TABLE)
     ]
-    assert af3score_stage.kwargs["run_name"] == "af3-run"
-    assert af3score_stage.kwargs["config"]["num_jobs"] == 4
-    assert af3score_stage.kwargs["config"]["prepare_workers"] == 2
+    assert submission.kwargs["run_name"] == "af3-run"
+    assert submission.kwargs["config"]["num_jobs"] == 4
+    assert submission.kwargs["config"]["prepare_workers"] == 2
+    assert af3score_stage.kwargs == {}
 
 
 def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
@@ -705,15 +730,18 @@ def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
         {"run_name": "af3-run"},
     )
 
-    result = node.run(
+    call = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage1-af3score",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
+    result = node.process_remote_result(af3score_stage.result, call.metadata)
 
     assert result.status == AppRunStatus.PARTIAL
 
@@ -731,12 +759,14 @@ def test_rosetta_step_submits_stage_wrapper(
         {"run_name": "rosetta-run", "rosetta_binary": "relax", "max_num_pods": 1},
     )
 
-    submission = node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-rosetta-relax",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={
                 "structures": [_upstream_structure_artifact()],
                 "candidate_manifest": [
@@ -747,11 +777,12 @@ def test_rosetta_step_submits_stage_wrapper(
     )
 
     assert submission.function_name == "run_ppiflow_rosetta_stage"
-    assert rosetta_stage.kwargs["run_name"] == "rosetta-run"
-    assert rosetta_stage.kwargs["config"]["rosetta_binary"] == "relax"
-    assert rosetta_stage.kwargs["candidate_manifests"] == [
+    assert submission.kwargs["run_name"] == "rosetta-run"
+    assert submission.kwargs["config"]["rosetta_binary"] == "relax"
+    assert submission.kwargs["candidate_manifests"] == [
         _upstream_structure_artifact(kind=ArtifactKind.TABLE)
     ]
+    assert rosetta_stage.kwargs == {}
 
 
 def test_rosetta_stage_records_partial_candidate_manifest(
@@ -829,7 +860,6 @@ def test_rosetta_stage_records_partial_candidate_manifest(
         run_name="rosetta-run",
         run_id="run-1",
         node_id="stage2-rosetta-relax",
-        attempt_id="attempt-1",
     )
 
     assert result.status == AppRunStatus.PARTIAL
@@ -867,21 +897,24 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
         {"run_name": "refold-run", "model_seeds": [3], "recycle": 2, "sample": 1},
     )
 
-    submission = node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-alphafold3-refold",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
 
     assert submission.function_name == "run_ppiflow_refold_stage"
-    assert refold_stage.kwargs["config"]["recycle"] == 2
-    assert refold_stage.kwargs["config"]["sample"] == 1
-    assert refold_stage.kwargs["config"]["model_seeds"] == [3]
-    assert refold_stage.kwargs["selected_structures"][0]["candidate_id"] == "model"
+    assert submission.kwargs["config"]["recycle"] == 2
+    assert submission.kwargs["config"]["sample"] == 1
+    assert submission.kwargs["config"]["model_seeds"] == [3]
+    assert submission.kwargs["selected_structures"][0]["candidate_id"] == "model"
+    assert refold_stage.kwargs == {}
 
 
 def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
@@ -911,12 +944,14 @@ def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
         {"run_name": "refold-run"},
     )
 
-    submission = node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-alphafold3-refold",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
@@ -924,8 +959,9 @@ def test_refold_processes_multi_structure_selection(tmp_path: Path) -> None:
     assert submission.function_name == "run_ppiflow_refold_stage"
     assert [
         structure["candidate_id"]
-        for structure in refold_stage.kwargs["selected_structures"]
+        for structure in submission.kwargs["selected_structures"]
     ] == ["design-a", "design-b"]
+    assert refold_stage.kwargs == {}
 
 
 def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> None:
@@ -953,27 +989,28 @@ def test_dockq_step_pairs_filtered_and_refolded_structures(tmp_path: Path) -> No
         namespace,
         {"run_name": "dockq-run", "dockq_args": "--short"},
     )
-    submission = node.submit_remote(
+    submission = node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-dockq",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={
                 "structures": [_upstream_structure_artifact()],
                 "models": [_upstream_structure_artifact()],
             },
         )
     )
-    result = node.process_remote_result(
-        submission.function_call.get(), submission.metadata
-    )
+    result = node.process_remote_result(dockq.result, submission.metadata)
 
     assert submission.function_name == "run_dockq_workflow"
-    assert dockq.kwargs["run_name"] == "dockq-run"
-    assert dockq.kwargs["dockq_args"] == ["--short"]
-    assert dockq.kwargs["pairs"][0]["model_bytes"] == b"ATOM\n"
-    assert dockq.kwargs["pairs"][0]["reference_bytes"] == b"ATOM\n"
+    assert submission.kwargs["run_name"] == "dockq-run"
+    assert submission.kwargs["dockq_args"] == ["--short"]
+    assert submission.kwargs["pairs"][0]["model_bytes"] == b"ATOM\n"
+    assert submission.kwargs["pairs"][0]["reference_bytes"] == b"ATOM\n"
+    assert dockq.kwargs == {}
     assert result.outputs[0].kind == ArtifactKind.SCORES
     assert result.outputs[0].metadata["pair_count"] == 1
 
@@ -1001,12 +1038,14 @@ def test_dockq_rejects_unpaired_structure_counts(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="pairing mismatch"):
-        node.submit_remote(
+        node.prepare_remote(
             NodeRunContext(
-                run_id="run-1",
+                execution_run_id=RUN_ID,
+                workload_run_key="run-1",
                 node_id="stage2-dockq",
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
+                task_key="node",
+                work_dir=tmp_path / "result",
+                cache_dir=tmp_path / "cache",
                 inputs={
                     "structures": [_upstream_structure_artifact()],
                     "models": [_upstream_structure_artifact()],
@@ -1036,10 +1075,12 @@ def test_filter_step_delegates_score_filtering(
 
     result = node.run(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage1-filter",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={
                 "structures": [_upstream_structure_artifact()],
                 "scores": [_upstream_structure_artifact(kind=ArtifactKind.SCORES)],
@@ -1065,10 +1106,12 @@ def test_fixed_positions_delegates_residue_energy_parsing(tmp_path: Path) -> Non
 
     result = node.run(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-fixed-positions",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
@@ -1092,10 +1135,12 @@ def test_rank_step_delegates_score_aware_ranking(tmp_path: Path) -> None:
 
     result = node.run(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-rank",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         )
     )
@@ -1132,7 +1177,6 @@ def test_filter_transform_selects_only_passing_structures(
         config={"filters": {"iptm": "> 0.7"}},
         run_id="run-1",
         node_id="filter",
-        attempt_id="attempt-1",
         step_name="FilterStep_stage1",
     )
 
@@ -1182,7 +1226,6 @@ def test_fixed_position_transform_parses_rosetta_residue_energies(
         config={"gentype": "binder", "energy_threshold": -5},
         run_id="run-1",
         node_id="fixed",
-        attempt_id="attempt-1",
         step_name="FixedPositions",
     )
 
@@ -1217,7 +1260,6 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
         config={"gentype": "binder", "dockq_threshold": 0.49},
         run_id="run-1",
         node_id="rank",
-        attempt_id="attempt-1",
         step_name="RankStep",
     )
 
@@ -1254,7 +1296,6 @@ def test_rank_transform_allows_empty_ranked_outputs(
         config={"gentype": "binder", "dockq_threshold": 0.49},
         run_id="run-1",
         node_id="rank",
-        attempt_id="attempt-1",
         step_name="RankStep",
     )
 
@@ -1310,10 +1351,12 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
 
     result = node.run(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id="stage2-report",
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={
                 "rank": [
                     WorkflowArtifact(
@@ -1402,15 +1445,16 @@ PPIFlowStep:
     )
 
     stdout = strip_ansi(capsys.readouterr().out)
-    assert "[workflow] DAG graph: node_id [placement; class] <- dependency" in stdout
+    assert "[workflow] DAG graph: node_id [execution; class] <- dependency" in stdout
     assert (
-        "[workflow]   stage1-ppiflow-design [remote; PPIFlowDesignNode] <- -" in stdout
+        "[workflow]   stage1-ppiflow-design [provider; PPIFlowDesignNode] <- -"
+        in stdout
     )
     assert "ppiflow_workflow.PPIFlowDesignNode" not in stdout
     assert "Submitting PPIFlow workflow" not in stdout
 
 
-def test_submit_ppiflow_workflow_force_resets_workflow_only(
+def test_submit_ppiflow_workflow_creates_new_execution_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1436,9 +1480,12 @@ PPIFlowStep:
         return kwargs["steps_doc"]
 
     class FakeOrchestratorMethod:
-        def remote(self, **kwargs):
-            calls["remote"] = kwargs
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+        def spawn(self, **kwargs):
+            calls["spawn"] = kwargs
+            return _FakeFunctionCall(
+                "call-1",
+                AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
 
     class FakeWorkflowOrchestrator:
         def __init__(self) -> None:
@@ -1462,11 +1509,15 @@ PPIFlowStep:
         steps_yaml=str(steps_yaml),
         run_id="demo",
         wait=True,
-        force=True,
     )
 
     assert "force" not in calls["staging"]
-    assert calls["remote"]["force"] is True
+    UUID(str(calls["spawn"]["execution_run_id"]))
+    assert calls["spawn"]["workload_run_key"] == "demo"
+    assert calls["spawn"]["deployment_environment"] == "development"
+    assert calls["spawn"]["deployment_name"] == ppiflow_workflow.CONF.name
+    assert calls["spawn"]["deployment_version"] == 1
+    assert "force" not in calls["spawn"]
 
 
 def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
@@ -1771,9 +1822,9 @@ RosettaFixStep: {}
         definition.nodes["stage2-rosetta-fix"].inputs["candidate_manifest"].role
         == ppiflow_manifests.MANIFEST_FILE_ROLE
     )
-    assert (
-        definition.nodes["stage2-existing-input"].node.placement
-        == ppiflow_workflow.NodePlacement.REMOTE
+    assert isinstance(
+        definition.nodes["stage2-existing-input"].node,
+        RemoteWorkflowNode,
     )
 
 
@@ -1848,7 +1899,7 @@ def test_stage2_input_node_returns_structures_and_manifest(tmp_path: Path) -> No
                 kind=ArtifactKind.TABLE,
                 storage=VolumePath(
                     volume_name="workflow-volume",
-                    path="ppiflow/run/node/attempt/stage2_input/candidate_manifest.parquet",
+                    path="ppiflow/run/node/result/stage2_input/candidate_manifest.parquet",
                     media_type=ppiflow_manifests.MANIFEST_MEDIA_TYPE,
                 ),
             ),
@@ -1868,23 +1919,27 @@ RosettaFixStep: {}
     )
     spec = workflow.validate().nodes["stage2-existing-input"]
 
-    node_result = spec.node.run(
+    call = spec.node.prepare_remote(
         NodeRunContext(
-            run_id="run-1",
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
             node_id=spec.node_id,
-            attempt_id="attempt-1",
-            cache_dir=tmp_path,
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
             inputs={},
         )
     )
+    node_result = spec.node.process_remote_result(result, call.metadata)
 
     assert node_result.outputs[0].kind == ArtifactKind.STRUCTURES
     assert node_result.outputs[1].kind == ArtifactKind.TABLE
-    assert stage2_input.kwargs["storage"] == VolumePath(
+    assert call.kwargs["storage"] == VolumePath(
         volume_name="source-volume",
         path="existing",
     )
-    assert stage2_input.kwargs["step_name"] == "Stage2Input"
+    assert call.kwargs["step_name"] == "Stage2Input"
+    assert stage2_input.kwargs == {}
 
 
 def test_stage2_input_generated_manifest_does_not_affect_dag_hash() -> None:
@@ -1957,7 +2012,6 @@ def test_stage2_input_normalization_scans_path_and_writes_manifest(
         config={"run_name": "stage2-run", "structure_patterns": "*.pdb"},
         run_id="run-1",
         node_id="stage2-existing-input",
-        attempt_id="attempt-1",
         step_name="Stage2Input",
     )
 
@@ -2017,7 +2071,6 @@ def test_stage2_input_normalization_accepts_explicit_manifest(
         },
         run_id="run-1",
         node_id="stage2-existing-input",
-        attempt_id="attempt-1",
         step_name="Stage2Input",
     )
 
@@ -2040,12 +2093,14 @@ def test_structure_consuming_steps_fail_clearly_without_inputs(
 
     spec = workflow.validate().nodes["stage1-flowpacker"]
     try:
-        spec.node.run(
+        spec.node.prepare_remote(
             NodeRunContext(
-                run_id="run-1",
+                execution_run_id=RUN_ID,
+                workload_run_key="run-1",
                 node_id=spec.node_id,
-                attempt_id="attempt-1",
-                cache_dir=tmp_path,
+                task_key="node",
+                work_dir=tmp_path / "result",
+                cache_dir=tmp_path / "cache",
                 inputs={},
             )
         )
@@ -2077,9 +2132,12 @@ PPIFlowStep:
     calls = {}
 
     class FakeOrchestratorMethod:
-        def remote(self, **kwargs):
-            calls["remote"] = kwargs
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+        def spawn(self, **kwargs):
+            calls["spawn"] = kwargs
+            return _FakeFunctionCall(
+                "call-1",
+                AppRunResult(status=AppRunStatus.SUCCEEDED),
+            )
 
     class FakeWorkflowOrchestrator:
         def __init__(self) -> None:
@@ -2101,7 +2159,7 @@ PPIFlowStep:
         strict_artifact_checks=True,
     )
 
-    assert calls["remote"]["strict_external_artifact_checks"] is True
-    checker = calls["remote"]["external_artifact_checker"]
+    assert calls["spawn"]["strict_external_artifact_checks"] is True
+    checker = calls["spawn"]["external_artifact_checker"]
     assert callable(checker)
     assert "check_ppiflow_external_artifact" in repr(checker)

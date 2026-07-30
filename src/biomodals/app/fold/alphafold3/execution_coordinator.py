@@ -100,7 +100,9 @@ class AlphaFold3ExecutionCoordinator:
             runtime = self._open_runtime(request)
             snapshot = runtime.cancel()
             self._verify_snapshot(snapshot)
+        if snapshot.run.status.is_terminal:
             return snapshot
+        return self._drive(runtime, resume=False)
 
     def resume(self) -> ExecutionSnapshot:
         """Resume this same Run without retrying conclusive Task failures."""

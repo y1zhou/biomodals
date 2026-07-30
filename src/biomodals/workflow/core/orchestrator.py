@@ -207,7 +207,20 @@ class ExecutionCoordinator:
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
             runtime.cancel()
-            return self._verified_snapshot()
+            snapshot = self._verified_snapshot()
+        if snapshot.run.status.is_terminal:
+            return snapshot
+        try:
+            runtime.run(
+                workload_run_key=plan.workload_run_key,
+                synchronize=self._lock,
+            )
+            with self._lock():
+                return self._verified_snapshot()
+        finally:
+            with self._lock():
+                self._close_runtime()
+                OUT_VOLUME.commit()
 
     @modal.method()
     def resume(self) -> AppRunResult:

@@ -87,12 +87,15 @@ class RosettaExecutionCoordinator:
                 self.volume_root,
                 self.execution_run_id,
             )
-            snapshot = self._open_runtime(
+            runtime = self._open_runtime(
                 request,
                 predecessor_execution_run_id=self._existing_predecessor(),
-            ).cancel()
+            )
+            snapshot = runtime.cancel()
             self._verify_snapshot(snapshot)
+        if snapshot.run.status.is_terminal:
             return snapshot
+        return self._drive(runtime, resume=False)
 
     def resume(self) -> ExecutionSnapshot:
         """Resume this same Run without retrying failed Tasks."""

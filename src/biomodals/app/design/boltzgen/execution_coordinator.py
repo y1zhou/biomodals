@@ -90,9 +90,12 @@ class BoltzGenExecutionCoordinator:
                 self.volume_root,
                 self.execution_run_id,
             )
-            snapshot = self._open_runtime(request).cancel()
+            runtime = self._open_runtime(request)
+            snapshot = runtime.cancel()
             self._verify_snapshot(snapshot)
+        if snapshot.run.status.is_terminal:
             return snapshot
+        return self._drive(runtime, resume=False)
 
     def resume(self) -> ExecutionSnapshot:
         """Resume this Run without retrying conclusive Task failures."""

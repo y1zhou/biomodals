@@ -14,7 +14,7 @@ import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import modal
 
@@ -586,6 +586,7 @@ def submit_rfd_ligandmpnn_workflow(
     deployment_environment: str = "development",
     deployment_name: str | None = None,
     deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run RFdiffusion trajectories followed by LigandMPNN sequence design.
 
@@ -614,7 +615,11 @@ def submit_rfd_ligandmpnn_workflow(
         deployment_environment: Modal Environment containing the deployment.
         deployment_name: Modal app deployment name. Defaults to this workflow.
         deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    if predecessor_execution_run_id is not None and not use_deployed_coordinator:
+        raise ValueError("restart_from requires an exact deployed workflow coordinator")
     input_path = Path(input_pdb).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
@@ -684,7 +689,13 @@ def submit_rfd_ligandmpnn_workflow(
         f"{total_structures} LigandMPNN node(s)",
         flush=True,
     )
-    fc = coordinator.run.spawn(**orchestrator_kwargs)
+    if predecessor_execution_run_id is None:
+        fc = coordinator.run.spawn(**orchestrator_kwargs)
+    else:
+        fc = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            **orchestrator_kwargs,
+        )
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"

@@ -4,7 +4,7 @@ import os
 import pickle
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -277,15 +277,62 @@ class ExecutionCoordinator:
         max_active_gpu_provider_calls: int | None = None,
     ) -> AppRunResult:
         """Create and drive a successor from one conclusive terminal Run."""
-        predecessor_id = UUID(predecessor_execution_run_id)
-        successor_id, deployment = self._identity()
-        if successor_id == predecessor_id:
-            raise ValueError("Successor Execution Run ID must be new")
         predecessor_deployment = DeploymentIdentity(
             environment=predecessor_deployment_environment,
             deployment_name=predecessor_deployment_name,
             deployment_version=predecessor_deployment_version,
         )
+        return self._restart_successor(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=predecessor_deployment,
+            candidate=None,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workflow: Workflow,
+        workload_run_key: str,
+        max_active_provider_calls: int = 32,
+        max_active_gpu_provider_calls: int | None = None,
+        strict_external_artifact_checks: bool = False,
+        external_artifact_checker_function_name: str | None = None,
+    ) -> AppRunResult:
+        """Match launch inputs and drive a linked Successor Execution Run."""
+        candidate = WorkflowCoordinatorPlan(
+            workflow=workflow,
+            workload_run_key=workload_run_key,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            strict_external_artifact_checks=strict_external_artifact_checks,
+            external_artifact_checker_function_name=(
+                external_artifact_checker_function_name
+            ),
+        )
+        return self._restart_successor(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            candidate=candidate,
+            max_active_provider_calls=None,
+            max_active_gpu_provider_calls=None,
+        )
+
+    def _restart_successor(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity | None,
+        candidate: WorkflowCoordinatorPlan | None,
+        max_active_provider_calls: int | None,
+        max_active_gpu_provider_calls: int | None,
+    ) -> AppRunResult:
+        """Apply the one successor operation used by both restart surfaces."""
+        successor_id, deployment = self._identity()
+        if successor_id == predecessor_execution_run_id:
+            raise ValueError("Successor Execution Run ID must be new")
         with self._lock():
             OUT_VOLUME.reload()
             (
@@ -294,32 +341,49 @@ class ExecutionCoordinator:
                 node_publications,
                 task_publications,
             ) = self._load_successor_source(
-                predecessor_id,
+                predecessor_execution_run_id,
                 predecessor_deployment,
             )
-            candidate = WorkflowCoordinatorPlan(
-                workflow=predecessor_plan.workflow,
-                workload_run_key=predecessor_plan.workload_run_key,
-                max_active_provider_calls=(
-                    predecessor_plan.max_active_provider_calls
-                    if max_active_provider_calls is None
-                    else max_active_provider_calls
-                ),
-                max_active_gpu_provider_calls=(
-                    predecessor_plan.max_active_gpu_provider_calls
-                    if max_active_gpu_provider_calls is None
-                    else max_active_gpu_provider_calls
-                ),
+            if candidate is None:
+                candidate = replace(
+                    predecessor_plan,
+                    max_active_provider_calls=(
+                        predecessor_plan.max_active_provider_calls
+                        if max_active_provider_calls is None
+                        else max_active_provider_calls
+                    ),
+                    max_active_gpu_provider_calls=(
+                        predecessor_plan.max_active_gpu_provider_calls
+                        if max_active_gpu_provider_calls is None
+                        else max_active_gpu_provider_calls
+                    ),
+                )
+            else:
+                candidate_execution_plan = execution_plan(
+                    candidate.workflow.validate(),
+                    workload_run_key=candidate.workload_run_key,
+                )
+                if (
+                    candidate_execution_plan.workload_plan_fingerprint
+                    != predecessor.plan.workload_plan_fingerprint
+                ):
+                    raise ValueError(
+                        "Launch inputs changed the Workload Plan Fingerprint"
+                    )
+            successor_plan = replace(
+                predecessor_plan,
+                max_active_provider_calls=candidate.max_active_provider_calls,
+                max_active_gpu_provider_calls=(candidate.max_active_gpu_provider_calls),
                 strict_external_artifact_checks=(
-                    predecessor_plan.strict_external_artifact_checks
+                    candidate.strict_external_artifact_checks
                 ),
                 external_artifact_checker_function_name=(
-                    predecessor_plan.external_artifact_checker_function_name
+                    candidate.external_artifact_checker_function_name
                 ),
             )
             successor_execution_plan = execution_plan(
-                candidate.workflow.validate(),
-                workload_run_key=candidate.workload_run_key,
+                successor_plan.workflow.validate(),
+                workload_run_key=successor_plan.workload_run_key,
             )
             if (
                 successor_execution_plan.workload_plan_fingerprint
@@ -328,7 +392,7 @@ class ExecutionCoordinator:
                 raise ValueError(
                     "Target deployment changed the Workload Plan Fingerprint"
                 )
-            plan = self._persist_or_verify_plan(candidate)
+            plan = self._persist_or_verify_plan(successor_plan)
             self._persist_or_verify_successor(
                 predecessor=predecessor,
                 plan=plan,
@@ -446,7 +510,7 @@ class ExecutionCoordinator:
     def _load_successor_source(
         self,
         predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity,
+        predecessor_deployment: DeploymentIdentity | None,
     ) -> tuple[
         ExecutionRunRecord,
         WorkflowCoordinatorPlan,
@@ -463,7 +527,10 @@ class ExecutionCoordinator:
             predecessor = store.execution.validate_successor_source(
                 predecessor_execution_run_id
             )
-            if predecessor.deployment != predecessor_deployment:
+            if (
+                predecessor_deployment is not None
+                and predecessor.deployment != predecessor_deployment
+            ):
                 raise ValueError(
                     "Predecessor Deployment Identity does not match Execution Run"
                 )

@@ -476,6 +476,92 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     store.close()
 
 
+def test_launch_restart_matches_candidate_science_and_changes_operational_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("demo")
+    workflow.add_node(TextNode("complete"), id="write")
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="demo",
+        max_active_provider_calls=8,
+        max_active_gpu_provider_calls=4,
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    result = raw_cls.restart_from._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        workflow=workflow,
+        workload_run_key="demo",
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=2,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    successor = store.execution.get_run(SUCCESSOR_ID)
+    assert successor.predecessor_execution_run_id == RUN_ID
+    assert successor.deployment == SUCCESSOR_DEPLOYMENT
+    assert successor.max_active_provider_calls == 3
+    assert successor.max_active_gpu_provider_calls == 2
+    store.close()
+
+
+def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    predecessor_workflow = Workflow("demo")
+    predecessor_workflow.add_node(TextNode("original"), id="write")
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=predecessor_workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    candidate_workflow = Workflow("demo")
+    candidate_workflow.add_node(TextNode("changed"), id="write")
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    with pytest.raises(ValueError, match="Workload Plan Fingerprint"):
+        raw_cls.restart_from._get_raw_f()(
+            successor_coordinator,
+            predecessor_execution_run_id=str(RUN_ID),
+            workflow=candidate_workflow,
+            workload_run_key="demo",
+        )
+
+    assert not WorkflowRunStore(tmp_path, SUCCESSOR_ID).ledger_path.exists()
+
+
 def test_restart_reuses_successful_task_publications_from_partial_node(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -16,7 +16,7 @@ import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import modal
 
@@ -748,6 +748,7 @@ def submit_shortmd_workflow(
     deployment_environment: str = "development",
     deployment_name: str | None = None,
     deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run ShortMD production replicate workflow for a directory of PDB files.
 
@@ -778,7 +779,11 @@ def submit_shortmd_workflow(
         deployment_environment: Modal Environment containing the deployment.
         deployment_name: Modal app deployment name. Defaults to this workflow.
         deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    if predecessor_execution_run_id is not None and not use_deployed_coordinator:
+        raise ValueError("restart_from requires an exact deployed workflow coordinator")
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
     resolved_run_id = sanitize_filename(run_id or input_path.name)
@@ -843,7 +848,13 @@ def submit_shortmd_workflow(
         f"{len(input_pdbs)} input PDB(s), {replicates} replicate(s) each",
         flush=True,
     )
-    function_call = coordinator.run.spawn(**orchestrator_kwargs)
+    if predecessor_execution_run_id is None:
+        function_call = coordinator.run.spawn(**orchestrator_kwargs)
+    else:
+        function_call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            **orchestrator_kwargs,
+        )
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"

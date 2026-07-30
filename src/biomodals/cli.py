@@ -1032,6 +1032,13 @@ def run_workflow(
             help="Exact Modal deployment version. Defaults to the latest deployment.",
         ),
     ] = None,
+    restart_from: Annotated[
+        UUID | None,
+        typer.Option(
+            "--restart-from",
+            help="Create a Successor Run from this Execution Run UUID.",
+        ),
+    ] = None,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the workflow entrypoint."),
@@ -1046,6 +1053,18 @@ def run_workflow(
 
     workflow = _load_entry("workflow", workflow_name_or_path)
     entrypoint = _resolve_workflow_entrypoint(workflow)
+    if restart_from is not None:
+        if development:
+            message = "--restart-from is unavailable in source-backed development mode"
+        elif dry_run:
+            message = "--restart-from is unavailable for a local dry run"
+        elif modal_mode == "shell":
+            message = "--restart-from is unavailable for an interactive shell"
+        else:
+            message = None
+        if message is not None:
+            console.print(f"[bold red]Error[/bold red] {message}")
+            raise typer.Exit(code=1)
     coordinator_flags: list[str] = []
     if modal_mode != "shell" and not dry_run and not development:
         try:
@@ -1072,6 +1091,8 @@ def run_workflow(
             "--deployment-version",
             str(resolved_version),
         ]
+        if restart_from is not None:
+            coordinator_flags.extend(["--restart-from", str(restart_from)])
     cmd = build_workflow_run_command(
         workflow_module=workflow.module,
         entrypoint=entrypoint,

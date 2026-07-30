@@ -4504,6 +4504,7 @@ def submit_ppiflow_workflow(
     deployment_environment: str = "development",
     deployment_name: str | None = None,
     deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Build and submit a PPIFlow workflow from task and step YAML files.
 
@@ -4528,7 +4529,11 @@ def submit_ppiflow_workflow(
         deployment_environment: Modal Environment containing the deployment.
         deployment_name: Modal app deployment name. Defaults to this workflow.
         deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    if predecessor_execution_run_id is not None and not use_deployed_coordinator:
+        raise ValueError("restart_from requires an exact deployed workflow coordinator")
     task_yaml_path = Path(task_yaml).expanduser().resolve()
     steps_yaml_path = Path(steps_yaml).expanduser().resolve()
     resolved_run_id = sanitize_filename(run_id or task_yaml_path.stem)
@@ -4620,7 +4625,13 @@ def submit_ppiflow_workflow(
         f"{len(workflow.validate().nodes)} node(s)",
         flush=True,
     )
-    function_call = coordinator.run.spawn(**orchestrator_kwargs)
+    if predecessor_execution_run_id is None:
+        function_call = coordinator.run.spawn(**orchestrator_kwargs)
+    else:
+        function_call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            **orchestrator_kwargs,
+        )
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"

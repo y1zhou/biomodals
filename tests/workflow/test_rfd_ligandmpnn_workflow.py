@@ -565,6 +565,58 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert "1 RFdiffusion trajector" in stdout
 
 
+def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    calls: dict[str, Any] = {}
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    class UnexpectedRunMethod:
+        def spawn(self, **_kwargs: object) -> FakeFunctionCall:
+            raise AssertionError("restart must not create a root run")
+
+    class FakeRestartMethod:
+        def spawn(self, **kwargs: object) -> FakeFunctionCall:
+            calls["restart"] = kwargs
+            return FakeFunctionCall("call-1")
+
+    class FakeCoordinator:
+        run = UnexpectedRunMethod()
+        restart_from = FakeRestartMethod()
+
+    def fake_coordinator_handle(**kwargs: object) -> FakeCoordinator:
+        calls["coordinator"] = kwargs
+        return FakeCoordinator()
+
+    monkeypatch.setattr(
+        rfd_ligandmpnn_workflow.orchestrator,
+        "execution_coordinator_handle",
+        fake_coordinator_handle,
+    )
+
+    raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdb=str(input_pdb),
+        contigs="100-150/0 E333-526",
+        hotspot_res="E405,E408",
+        run_id="demo",
+        wait=False,
+        use_deployed_coordinator=True,
+        deployment_environment="production",
+        deployment_name="rfd-mpnn-prod",
+        deployment_version=7,
+        restart_from=predecessor,
+    )
+
+    assert calls["restart"]["predecessor_execution_run_id"] == predecessor
+    assert calls["restart"]["workload_run_key"] == "demo"
+    assert calls["restart"]["workflow"].name == "rfd_ligandmpnn"
+
+
 def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

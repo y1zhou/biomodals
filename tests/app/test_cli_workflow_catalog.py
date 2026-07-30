@@ -252,6 +252,88 @@ def test_workflow_run_resolves_and_forwards_an_exact_deployment(
     assert run_kwargs["output_mode"] == "inherit"
 
 
+def test_workflow_restart_forwards_only_the_explicit_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch-time workflow restart remains an explicit successor operation."""
+    commands: list[list[str]] = []
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    def fake_run_command(command, **_kwargs):
+        commands.append(command)
+        if "history" in command:
+            return ['[{"version":"v7"}]']
+        return []
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli._workflow_deployment_name",
+        lambda _workflow: "ShortMDWorkflow",
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "run",
+            "shortmd",
+            "--restart-from",
+            predecessor,
+            "--",
+            "/inputs",
+        ],
+    )
+
+    assert result.exit_code == 0
+    restart_index = commands[1].index("--restart-from")
+    assert commands[1][restart_index + 1] == predecessor
+
+
+@pytest.mark.parametrize(
+    "mode_flags",
+    [
+        ("--development",),
+        ("--dry-run",),
+        ("--mode", "shell"),
+    ],
+)
+def test_workflow_restart_rejects_launches_without_durable_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    mode_flags: tuple[str, ...],
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "run",
+            "shortmd",
+            *mode_flags,
+            "--restart-from",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "--",
+            "/inputs",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--restart-from" in strip_ansi(result.output)
+    assert commands == []
+
+
 def test_workflow_run_validates_an_explicit_version_and_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

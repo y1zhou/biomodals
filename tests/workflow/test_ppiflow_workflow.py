@@ -2078,6 +2078,75 @@ PPIFlowStep:
     assert "force" not in calls["spawn"]
 
 
+def test_submit_ppiflow_workflow_uses_successor_operation_for_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_yaml = tmp_path / "task.yaml"
+    steps_yaml = tmp_path / "steps.yaml"
+    task_yaml.write_bytes(_task_yaml(enabled_steps="  PPIFlowStep: true\n"))
+    steps_yaml.write_text(
+        f"""
+PPIFlowStep:
+  run_name: demo-run
+  args:
+    name: demo
+    specified_hotspots: A1
+    input_pdb: {ppiflow_app.CONF.output_volume_mountpoint}/inputs/demo.pdb
+    binder_chain: B
+""",
+        encoding="utf-8",
+    )
+    calls = {}
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    class UnexpectedRunMethod:
+        def spawn(self, **_kwargs):
+            raise AssertionError("restart must not create a root run")
+
+    class FakeRestartMethod:
+        def spawn(self, **kwargs):
+            calls["restart"] = kwargs
+            return _FakeFunctionCall("call-1")
+
+    class FakeCoordinator:
+        run = UnexpectedRunMethod()
+        restart_from = FakeRestartMethod()
+
+    def fake_coordinator_handle(**kwargs):
+        calls["coordinator"] = kwargs
+        return FakeCoordinator()
+
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_stage_ppiflow_app_inputs",
+        lambda **kwargs: kwargs["steps_doc"],
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.orchestrator,
+        "execution_coordinator_handle",
+        fake_coordinator_handle,
+    )
+
+    raw_f = ppiflow_workflow.submit_ppiflow_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        task_yaml=str(task_yaml),
+        steps_yaml=str(steps_yaml),
+        run_id="demo",
+        wait=False,
+        use_deployed_coordinator=True,
+        deployment_environment="production",
+        deployment_name="ppiflow-prod",
+        deployment_version=7,
+        restart_from=predecessor,
+    )
+
+    assert calls["restart"]["predecessor_execution_run_id"] == predecessor
+    assert calls["restart"]["workload_run_key"] == "demo"
+    assert calls["restart"]["workflow"].name == "ppiflow-v2"
+
+
 def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=_task_yaml(

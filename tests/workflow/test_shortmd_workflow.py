@@ -870,6 +870,54 @@ def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles
     assert "development_function_handles" not in calls["spawn"]
 
 
+def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "pdbs"
+    input_dir.mkdir()
+    input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
+    calls = {}
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    class UnexpectedRunMethod:
+        def spawn(self, **_kwargs):
+            raise AssertionError("restart must not create a root run")
+
+    class FakeRestartMethod:
+        def spawn(self, **kwargs):
+            calls["restart"] = kwargs
+            return FakeFunctionCall("call-1")
+
+    class FakeCoordinator:
+        run = UnexpectedRunMethod()
+        restart_from = FakeRestartMethod()
+
+    monkeypatch.setattr(
+        shortmd_workflow.orchestrator,
+        "execution_coordinator_handle",
+        lambda **kwargs: calls.setdefault("coordinator", kwargs) and FakeCoordinator(),
+    )
+    raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
+    assert raw_f is not None
+
+    raw_f(
+        input_dir=str(input_dir),
+        run_id="shortmd-run",
+        replicates=1,
+        wait=False,
+        use_deployed_coordinator=True,
+        deployment_environment="production",
+        deployment_name="shortmd-prod",
+        deployment_version=7,
+        restart_from=predecessor,
+    )
+
+    assert calls["restart"]["predecessor_execution_run_id"] == predecessor
+    assert calls["restart"]["workload_run_key"] == "shortmd-run"
+    assert calls["restart"]["workflow"].name == "shortmd"
+
+
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

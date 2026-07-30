@@ -131,6 +131,14 @@ class _NoEntrypointApp:
     _entrypoint: str | None = None
 
 
+@dataclass
+class _CoordinatedApp:
+    name: str = "alphafold3"
+    module: str = "biomodals.app.fold.alphafold3_app"
+    path: Path = Path("src/biomodals/app/fold/alphafold3_app.py")
+    _entrypoint: str | None = "submit_alphafold3_task"
+
+
 def test_workflow_run_requires_entrypoint_for_multiple_local_entrypoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -357,6 +365,143 @@ def test_app_run_uses_inherited_output_streams(
     assert result.exit_code == 0
     assert calls["command"][-1] == "--example"
     assert calls["kwargs"]["output_mode"] == "inherit"
+
+
+def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coordinator-aware app entrypoints use the same pinned lookup as workflows."""
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run_command(command, **kwargs):
+        calls.append((command, kwargs))
+        if "history" in command:
+            return ['[{"version":"v9"},{"version":"v7"}]']
+        return []
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _CoordinatedApp(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli._app_deployment_name",
+        lambda _app: "AlphaFold3",
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(
+        app,
+        [
+            "app",
+            "run",
+            "alphafold3::submit_alphafold3_task",
+            "--environment",
+            "production",
+            "--version",
+            "7",
+            "--",
+            "--input-json",
+            "input.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0][0][-4:] == [
+        "AlphaFold3",
+        "--env",
+        "production",
+        "--json",
+    ]
+    target = calls[1][0].index(
+        "src/biomodals/app/fold/alphafold3_app.py::submit_alphafold3_task"
+    )
+    assert calls[1][0][target + 1 :] == [
+        "--use-deployed-coordinator",
+        "--deployment-environment",
+        "production",
+        "--deployment-name",
+        "AlphaFold3",
+        "--deployment-version",
+        "7",
+        "--input-json",
+        "input.json",
+    ]
+
+
+def test_coordinated_app_restart_forwards_only_the_explicit_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch-time restart remains a thin convenience over Successor Run creation."""
+    commands: list[list[str]] = []
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    def fake_run_command(command, **_kwargs):
+        commands.append(command)
+        if "history" in command:
+            return ['[{"version":"v9"}]']
+        return []
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _CoordinatedApp(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli._app_deployment_name",
+        lambda _app: "AlphaFold3",
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(
+        app,
+        [
+            "app",
+            "run",
+            "alphafold3::submit_alphafold3_task",
+            "--restart-from",
+            predecessor,
+            "--",
+            "--input-json",
+            "input.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "--restart-from" in commands[1]
+    restart_index = commands[1].index("--restart-from")
+    assert commands[1][restart_index + 1] == predecessor
+
+
+def test_coordinated_app_development_mode_skips_deployment_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Development mode keeps the source-backed no-resume behavior explicit."""
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _CoordinatedApp(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "app",
+            "run",
+            "alphafold3::submit_alphafold3_task",
+            "--development",
+            "--",
+            "--input-json",
+            "input.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(commands) == 1
+    assert "history" not in commands[0]
+    assert "--use-deployed-coordinator" not in commands[0]
 
 
 def test_app_run_without_entrypoint_renders_help_without_subprocess(

@@ -468,6 +468,46 @@ def run_modal_app(
             help="Timeout in seconds for the modal run. If not specified, use the app default.",
         ),
     ] = None,
+    development: Annotated[
+        bool,
+        typer.Option(
+            "--development",
+            help=(
+                "Run coordinator-aware apps from current source without "
+                "cross-command recovery."
+            ),
+        ),
+    ] = False,
+    environment: Annotated[
+        str,
+        typer.Option(
+            "--environment",
+            "-e",
+            help="Modal Environment containing a deployed app coordinator.",
+        ),
+    ] = "main",
+    deployment_name: Annotated[
+        str | None,
+        typer.Option(
+            "--deployment-name",
+            help="Modal app name. Defaults to the app's declared name.",
+        ),
+    ] = None,
+    version: Annotated[
+        int | None,
+        typer.Option(
+            "--version",
+            min=1,
+            help="Exact Modal deployment version. Defaults to the latest deployment.",
+        ),
+    ] = None,
+    restart_from: Annotated[
+        UUID | None,
+        typer.Option(
+            "--restart-from",
+            help="Create a Successor Run from this Execution Run UUID.",
+        ),
+    ] = None,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the modal run command."),
@@ -482,12 +522,55 @@ def run_modal_app(
     import os
 
     app = _load_entry("app", app_name_or_path)
+    coordinator_flags: list[str] = []
+    coordinated_entrypoint = _coordinated_app_entrypoint(app)
+    if modal_mode != "shell" and coordinated_entrypoint is not None and not development:
+        try:
+            resolved_deployment_name = deployment_name or _app_deployment_name(app)
+            resolved_version = _resolve_deployment_version(
+                deployment_name=resolved_deployment_name,
+                environment=environment,
+                requested_version=version,
+            )
+        except (ImportError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+            console.print(
+                "[bold red]Error[/bold red] Could not resolve exact app "
+                f"deployment: {exc}"
+            )
+            raise typer.Exit(code=1) from exc
+        coordinator_flags = [
+            "--use-deployed-coordinator",
+            "--deployment-environment",
+            environment,
+            "--deployment-name",
+            resolved_deployment_name,
+            "--deployment-version",
+            str(resolved_version),
+        ]
+        if restart_from is not None:
+            coordinator_flags.extend(["--restart-from", str(restart_from)])
+    elif restart_from is not None:
+        if development:
+            message = "--restart-from is unavailable in source-backed development mode"
+        else:
+            message = "--restart-from requires a coordinator-aware app entrypoint"
+        console.print(f"[bold red]Error[/bold red] {message}")
+        raise typer.Exit(code=1)
+    elif coordinated_entrypoint is None and (
+        development or version is not None or deployment_name is not None
+    ):
+        console.print(
+            "[bold red]Error[/bold red] Deployment coordinator options require "
+            "a coordinator-aware app entrypoint"
+        )
+        raise typer.Exit(code=1)
+
     cmd = build_app_run_command(
         app_path=app.path,
         entrypoint=app._entrypoint,
         modal_mode=modal_mode,
         detach=detach,
-        flags=flags,
+        flags=[*coordinator_flags, *(flags or ())],
     )
 
     if modal_mode == "shell":
@@ -510,6 +593,33 @@ def run_modal_app(
         run_command(list(cmd), env=env, output_mode="inherit")
     else:
         _show_entry_help("app", str(app.path), verbose=False)
+
+
+def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
+    """Return the selected entrypoint only when its module opts into the kernel."""
+    entrypoint = app._entrypoint
+    module_name = getattr(app, "module", None)
+    if entrypoint is None or not isinstance(module_name, str):
+        return None
+    module = importlib.import_module(module_name)
+    declared = getattr(module, "EXECUTION_COORDINATOR_ENTRYPOINTS", ())
+    if not isinstance(declared, frozenset | set | tuple | list) or not all(
+        isinstance(value, str) and value for value in declared
+    ):
+        raise ValueError(
+            f"App '{app.name}' has an invalid coordinator entrypoint declaration"
+        )
+    return entrypoint if entrypoint in declared else None
+
+
+def _app_deployment_name(app: BiomodalsApp) -> str:
+    """Return a coordinator-aware app module's Modal deployment name."""
+    module = importlib.import_module(app.module)
+    config = getattr(module, "CONF", None)
+    deployment_name = getattr(config, "name", None)
+    if not isinstance(deployment_name, str) or not deployment_name:
+        raise ValueError(f"App '{app.name}' does not declare a deployment name")
+    return deployment_name
 
 
 def _run_coordinator(
@@ -817,13 +927,13 @@ def _workflow_deployment_name(workflow: BiomodalsApp) -> str:
     return deployment_name
 
 
-def _resolve_workflow_deployment_version(
+def _resolve_deployment_version(
     *,
     deployment_name: str,
     environment: str,
     requested_version: int | None,
 ) -> int:
-    """Preflight one exact workflow deployment through Modal history."""
+    """Preflight one exact deployment through Modal history."""
     command = build_modal_app_history_command(
         deployment_name=deployment_name,
         environment=environment,
@@ -835,6 +945,20 @@ def _resolve_workflow_deployment_version(
     )
     return select_modal_deployment_version(
         "\n".join(lines),
+        requested_version=requested_version,
+    )
+
+
+def _resolve_workflow_deployment_version(
+    *,
+    deployment_name: str,
+    environment: str,
+    requested_version: int | None,
+) -> int:
+    """Retain the workflow-specific composition seam used by CLI tests."""
+    return _resolve_deployment_version(
+        deployment_name=deployment_name,
+        environment=environment,
         requested_version=requested_version,
     )
 

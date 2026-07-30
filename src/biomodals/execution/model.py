@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any
+from uuid import UUID
 
 
 class RunStatus(StrEnum):
@@ -30,6 +31,18 @@ class RunStatus(StrEnum):
             RunStatus.FAILED,
             RunStatus.CANCELLED,
         }
+
+
+class RunStatusReason(StrEnum):
+    """Closed machine-readable reasons for selected Run statuses."""
+
+    COORDINATOR_ERROR = "coordinator_error"
+    RESULT_VALIDATION_UNKNOWN = "result_validation_unknown"
+    SUBMISSION_OUTCOME_UNKNOWN = "submission_outcome_unknown"
+    PROVIDER_OUTCOME_UNKNOWN = "provider_outcome_unknown"
+    CANCELLATION_OUTCOME_UNKNOWN = "cancellation_outcome_unknown"
+    REQUIRED_WORK_FAILED = "required_work_failed"
+    DEPLOYMENT_UNAVAILABLE = "deployment_unavailable"
 
 
 class NodeStatus(StrEnum):
@@ -104,6 +117,31 @@ class AvailabilityStatus(StrEnum):
     AVAILABLE = "available"
     MISSING = "missing"
     UNKNOWN = "unknown"
+
+
+class ResultProvenance(StrEnum):
+    """How one validated scientific result satisfied execution work."""
+
+    CACHE = "cache"
+    CURRENT_RUN = "current_run"
+
+
+@dataclass(frozen=True)
+class DeploymentIdentity:
+    """Exact deployed coordinator location fixed for one Execution Run."""
+
+    environment: str
+    deployment_name: str
+    deployment_version: int
+
+    def __post_init__(self) -> None:
+        """Reject incomplete or non-versioned deployment locations."""
+        if not self.environment:
+            raise ValueError("deployment environment cannot be empty")
+        if not self.deployment_name:
+            raise ValueError("deployment name cannot be empty")
+        if self.deployment_version < 1:
+            raise ValueError("deployment version must be positive")
 
 
 @dataclass(frozen=True)
@@ -237,6 +275,68 @@ class ExecutionPlan:
             "workload_name": self.workload_name,
         }
         return _canonical_json_sha256(value)
+
+
+@dataclass(frozen=True)
+class ExecutionRunRecord:
+    """Durable state and immutable identity for one Execution Run."""
+
+    execution_run_id: UUID
+    predecessor_execution_run_id: UUID | None
+    plan: ExecutionPlan
+    deployment: DeploymentIdentity
+    status: RunStatus
+    status_reason: RunStatusReason | None
+    status_message: str | None
+    max_active_provider_calls: int
+    max_active_gpu_provider_calls: int
+    created_at: int
+    updated_at: int
+    started_at: int | None
+    completed_at: int | None
+
+
+@dataclass(frozen=True)
+class ExecutionNodeRecord:
+    """Durable state for one fixed Node in an Execution Run."""
+
+    execution_run_id: UUID
+    node_key: str
+    ordinal: int
+    dependencies: tuple[NodeDependency, ...]
+    aggregation_policy: NodeAggregationPolicy
+    allow_empty_result: bool
+    status: NodeStatus
+    discovery_complete: bool
+    result_observation: AvailabilityStatus | None
+    result_observed_at: int | None
+    result_provenance: ResultProvenance | None
+    error_message: str | None
+    created_at: int
+    updated_at: int
+    started_at: int | None
+    completed_at: int | None
+
+
+@dataclass(frozen=True)
+class ExecutionTaskRecord:
+    """Durable identity, payload, and lifecycle for one discovered Task."""
+
+    execution_run_id: UUID
+    node_key: str
+    task_key: str
+    ordinal: int
+    fingerprint: str
+    scientific_payload: Any
+    execution_payload: Any
+    status: TaskStatus
+    result_observation: AvailabilityStatus | None
+    result_observed_at: int | None
+    result_provenance: ResultProvenance | None
+    created_at: int
+    updated_at: int
+    started_at: int | None
+    completed_at: int | None
 
 
 def _canonical_json_sha256(value: Any) -> str:

@@ -1,0 +1,975 @@
+"""Coordinator-owned SQLite state for execution Runs."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Mapping
+from typing import Any
+from uuid import UUID
+
+from biomodals.execution.model import (
+    AvailabilityStatus,
+    DeploymentIdentity,
+    ExecutionNodeRecord,
+    ExecutionPlan,
+    ExecutionRunRecord,
+    ExecutionTaskRecord,
+    NodeAggregationPolicy,
+    NodeDependency,
+    NodePlan,
+    NodeStatus,
+    ResultProvenance,
+    RunStatus,
+    RunStatusReason,
+    TaskPlan,
+    TaskStatus,
+)
+
+EXECUTION_SCHEMA_VERSION = 1
+
+
+class UnsupportedExecutionSchemaVersionError(RuntimeError):
+    """Raised when a repository uses another execution schema version."""
+
+
+class ExecutionRunNotFoundError(LookupError):
+    """Raised when an Execution Run ID is absent from this repository."""
+
+
+_RUN_TRANSITIONS: Mapping[RunStatus, frozenset[RunStatus]] = {
+    RunStatus.PENDING: frozenset({
+        RunStatus.RUNNING,
+        RunStatus.CANCEL_REQUESTED,
+        RunStatus.SUSPENDED,
+        RunStatus.STATE_UNKNOWN,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }),
+    RunStatus.RUNNING: frozenset({
+        RunStatus.CANCEL_REQUESTED,
+        RunStatus.SUSPENDED,
+        RunStatus.STATE_UNKNOWN,
+        RunStatus.SUCCEEDED,
+        RunStatus.PARTIAL,
+        RunStatus.FAILED,
+    }),
+    RunStatus.CANCEL_REQUESTED: frozenset({
+        RunStatus.CANCELLED,
+        RunStatus.STATE_UNKNOWN,
+        RunStatus.SUCCEEDED,
+        RunStatus.PARTIAL,
+        RunStatus.FAILED,
+    }),
+    RunStatus.SUSPENDED: frozenset({
+        RunStatus.RUNNING,
+        RunStatus.CANCEL_REQUESTED,
+        RunStatus.STATE_UNKNOWN,
+        RunStatus.FAILED,
+    }),
+    RunStatus.STATE_UNKNOWN: frozenset({
+        RunStatus.RUNNING,
+        RunStatus.CANCEL_REQUESTED,
+        RunStatus.SUCCEEDED,
+        RunStatus.PARTIAL,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }),
+    RunStatus.SUCCEEDED: frozenset(),
+    RunStatus.PARTIAL: frozenset(),
+    RunStatus.FAILED: frozenset(),
+    RunStatus.CANCELLED: frozenset(),
+}
+
+_RUN_REASONS: Mapping[RunStatus, frozenset[RunStatusReason]] = {
+    RunStatus.SUSPENDED: frozenset({
+        RunStatusReason.COORDINATOR_ERROR,
+        RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+    }),
+    RunStatus.STATE_UNKNOWN: frozenset({
+        RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN,
+        RunStatusReason.PROVIDER_OUTCOME_UNKNOWN,
+        RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN,
+    }),
+    RunStatus.FAILED: frozenset({
+        RunStatusReason.REQUIRED_WORK_FAILED,
+        RunStatusReason.DEPLOYMENT_UNAVAILABLE,
+    }),
+}
+
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE execution_schema (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        version INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE execution_runs (
+        execution_run_id TEXT PRIMARY KEY,
+        predecessor_execution_run_id TEXT
+            REFERENCES execution_runs(execution_run_id),
+        workload_name TEXT NOT NULL,
+        workload_run_key TEXT,
+        workload_plan_fingerprint TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        deployment_environment TEXT NOT NULL,
+        deployment_name TEXT NOT NULL,
+        deployment_version INTEGER NOT NULL CHECK (deployment_version > 0),
+        status TEXT NOT NULL,
+        status_reason TEXT,
+        status_message TEXT,
+        max_active_provider_calls INTEGER NOT NULL
+            CHECK (max_active_provider_calls > 0),
+        max_active_gpu_provider_calls INTEGER NOT NULL
+            CHECK (
+                max_active_gpu_provider_calls >= 0
+                AND max_active_gpu_provider_calls <= max_active_provider_calls
+            ),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER
+    )
+    """,
+    """
+    CREATE TABLE execution_nodes (
+        execution_run_id TEXT NOT NULL
+            REFERENCES execution_runs(execution_run_id) ON DELETE CASCADE,
+        node_key TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        aggregation_policy TEXT NOT NULL,
+        allow_empty_result INTEGER NOT NULL CHECK (allow_empty_result IN (0, 1)),
+        status TEXT NOT NULL,
+        discovery_complete INTEGER NOT NULL DEFAULT 0
+            CHECK (discovery_complete IN (0, 1)),
+        result_observation TEXT,
+        result_observed_at INTEGER,
+        result_provenance TEXT,
+        error_message TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        PRIMARY KEY (execution_run_id, node_key),
+        UNIQUE (execution_run_id, ordinal)
+    )
+    """,
+    """
+    CREATE TABLE execution_tasks (
+        execution_run_id TEXT NOT NULL,
+        node_key TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        fingerprint TEXT NOT NULL,
+        scientific_payload_json TEXT NOT NULL,
+        execution_payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_observation TEXT,
+        result_observed_at INTEGER,
+        result_provenance TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        PRIMARY KEY (execution_run_id, node_key, task_key),
+        UNIQUE (execution_run_id, node_key, ordinal),
+        FOREIGN KEY (execution_run_id, node_key)
+            REFERENCES execution_nodes(execution_run_id, node_key)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE execution_node_dependencies (
+        execution_run_id TEXT NOT NULL,
+        node_key TEXT NOT NULL,
+        dependency_node_key TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        accept_partial INTEGER NOT NULL CHECK (accept_partial IN (0, 1)),
+        PRIMARY KEY (execution_run_id, node_key, dependency_node_key),
+        UNIQUE (execution_run_id, node_key, ordinal),
+        FOREIGN KEY (execution_run_id, node_key)
+            REFERENCES execution_nodes(execution_run_id, node_key)
+            ON DELETE CASCADE,
+        FOREIGN KEY (execution_run_id, dependency_node_key)
+            REFERENCES execution_nodes(execution_run_id, node_key)
+            ON DELETE CASCADE
+    )
+    """,
+)
+
+
+class SqliteExecutionRepository:
+    """Persist execution state on a host-owned SQLite connection."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        """Bind a connection without committing, closing, or selecting its path."""
+        self._connection = connection
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys = ON")
+
+    def initialize_schema(self) -> None:
+        """Create the current schema or reject another recorded version."""
+        schema_exists = self._connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'execution_schema'
+            """
+        ).fetchone()
+        if schema_exists is not None:
+            row = self._connection.execute(
+                "SELECT version FROM execution_schema WHERE singleton = 1"
+            ).fetchone()
+            version = None if row is None else int(row["version"])
+            if version != EXECUTION_SCHEMA_VERSION:
+                raise UnsupportedExecutionSchemaVersionError(
+                    f"Unsupported execution schema version {version}"
+                )
+            return
+
+        for statement in _SCHEMA_STATEMENTS:
+            self._connection.execute(statement)
+        self._connection.execute(
+            "INSERT INTO execution_schema (singleton, version) VALUES (1, ?)",
+            (EXECUTION_SCHEMA_VERSION,),
+        )
+
+    def create_run(
+        self,
+        *,
+        execution_run_id: UUID,
+        plan: ExecutionPlan,
+        deployment: DeploymentIdentity,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+        predecessor_execution_run_id: UUID | None = None,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Persist one immutable plan and its initial pending Nodes."""
+        _validate_call_limits(
+            max_active_provider_calls,
+            max_active_gpu_provider_calls,
+        )
+        plan_json = _dump_plan(plan)
+        values = (
+            str(execution_run_id),
+            (
+                None
+                if predecessor_execution_run_id is None
+                else str(predecessor_execution_run_id)
+            ),
+            plan.workload_name,
+            plan.workload_run_key,
+            plan.workload_plan_fingerprint,
+            plan_json,
+            deployment.environment,
+            deployment.deployment_name,
+            deployment.deployment_version,
+            RunStatus.PENDING.value,
+            max_active_provider_calls,
+            max_active_gpu_provider_calls,
+            now,
+            now,
+        )
+        self._connection.execute(
+            """
+            INSERT INTO execution_runs (
+                execution_run_id,
+                predecessor_execution_run_id,
+                workload_name,
+                workload_run_key,
+                workload_plan_fingerprint,
+                plan_json,
+                deployment_environment,
+                deployment_name,
+                deployment_version,
+                status,
+                max_active_provider_calls,
+                max_active_gpu_provider_calls,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        for ordinal, node in enumerate(plan.nodes):
+            self._connection.execute(
+                """
+                INSERT INTO execution_nodes (
+                    execution_run_id,
+                    node_key,
+                    ordinal,
+                    aggregation_policy,
+                    allow_empty_result,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(execution_run_id),
+                    node.node_key,
+                    ordinal,
+                    node.aggregation_policy.value,
+                    int(node.allow_empty_result),
+                    NodeStatus.PENDING.value,
+                    now,
+                    now,
+                ),
+            )
+        for node in plan.nodes:
+            for ordinal, dependency in enumerate(node.dependencies):
+                self._connection.execute(
+                    """
+                    INSERT INTO execution_node_dependencies (
+                        execution_run_id,
+                        node_key,
+                        dependency_node_key,
+                        ordinal,
+                        accept_partial
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(execution_run_id),
+                        node.node_key,
+                        dependency.node_key,
+                        ordinal,
+                        int(dependency.accept_partial),
+                    ),
+                )
+        return self.get_run(execution_run_id)
+
+    def get_run(self, execution_run_id: UUID) -> ExecutionRunRecord:
+        """Load one Execution Run by its opaque identity."""
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_runs
+            WHERE execution_run_id = ?
+            """,
+            (str(execution_run_id),),
+        ).fetchone()
+        if row is None:
+            raise ExecutionRunNotFoundError(str(execution_run_id))
+        return _run_from_row(row)
+
+    def list_nodes(self, execution_run_id: UUID) -> tuple[ExecutionNodeRecord, ...]:
+        """Load planned Nodes in their persisted encounter order."""
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_nodes
+            WHERE execution_run_id = ?
+            ORDER BY ordinal
+            """,
+            (str(execution_run_id),),
+        ).fetchall()
+        return tuple(self._node_from_row(row) for row in rows)
+
+    def get_node(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+    ) -> ExecutionNodeRecord:
+        """Load one planned Node."""
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_nodes
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Execution Node not found: {node_key}")
+        return self._node_from_row(row)
+
+    def start_node(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        now: int,
+    ) -> ExecutionNodeRecord:
+        """Move one pending Node into execution."""
+        run = self.get_run(execution_run_id)
+        if run.status == RunStatus.PENDING:
+            self._transition_run(
+                execution_run_id,
+                RunStatus.RUNNING,
+                reason=None,
+                message=None,
+                now=now,
+                explicit_resume=False,
+            )
+        elif run.status != RunStatus.RUNNING:
+            raise ValueError(f"cannot start a Node while Run is {run.status.value}")
+        node = self.get_node(execution_run_id, node_key)
+        if node.status != NodeStatus.PENDING:
+            raise ValueError(f"cannot start Node from {node.status.value}")
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET status = ?,
+                started_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (
+                NodeStatus.RUNNING.value,
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+            ),
+        )
+        return self.get_node(execution_run_id, node_key)
+
+    def discover_tasks(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        task_plans: tuple[TaskPlan, ...],
+        *,
+        now: int,
+    ) -> tuple[ExecutionTaskRecord, ...]:
+        """Persist one Node's complete finite Task set exactly once."""
+        node = self.get_node(execution_run_id, node_key)
+        if node.status != NodeStatus.RUNNING:
+            raise ValueError(f"cannot discover Tasks for {node.status.value} Node")
+        if node.discovery_complete:
+            raise ValueError("Task discovery is already complete")
+
+        seen: set[str] = set()
+        prepared: list[tuple[TaskPlan, str, str, str]] = []
+        plan_fingerprint = self.get_run(execution_run_id).plan.workload_plan_fingerprint
+        for task_plan in task_plans:
+            if not task_plan.task_key:
+                raise ValueError("Task key cannot be empty")
+            if task_plan.task_key in seen:
+                raise ValueError(f"duplicate Task key {task_plan.task_key!r}")
+            seen.add(task_plan.task_key)
+            prepared.append((
+                task_plan,
+                task_plan.fingerprint(
+                    workload_plan_fingerprint=plan_fingerprint,
+                    node_key=node_key,
+                ),
+                _dump_json(task_plan.scientific_payload),
+                _dump_json(task_plan.execution_payload),
+            ))
+
+        for ordinal, (
+            task_plan,
+            fingerprint,
+            scientific_payload_json,
+            execution_payload_json,
+        ) in enumerate(prepared):
+            self._connection.execute(
+                """
+                INSERT INTO execution_tasks (
+                    execution_run_id,
+                    node_key,
+                    task_key,
+                    ordinal,
+                    fingerprint,
+                    scientific_payload_json,
+                    execution_payload_json,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(execution_run_id),
+                    node_key,
+                    task_plan.task_key,
+                    ordinal,
+                    fingerprint,
+                    scientific_payload_json,
+                    execution_payload_json,
+                    TaskStatus.PENDING.value,
+                    now,
+                    now,
+                ),
+            )
+        if prepared or node.allow_empty_result:
+            status = NodeStatus.RUNNING
+            error_message = None
+            completed_at = None
+        else:
+            status = NodeStatus.FAILED
+            error_message = "Node discovered no Tasks"
+            completed_at = now
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET discovery_complete = 1,
+                status = ?,
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (
+                status.value,
+                error_message,
+                completed_at,
+                now,
+                str(execution_run_id),
+                node_key,
+            ),
+        )
+        return self.list_tasks(execution_run_id, node_key)
+
+    def record_node_result_observation(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        observation: AvailabilityStatus,
+        *,
+        now: int,
+    ) -> ExecutionNodeRecord:
+        """Record caller-owned Node validation without storing its evidence."""
+        node = self.get_node(execution_run_id, node_key)
+        if node.status.is_terminal:
+            raise ValueError(
+                f"cannot record a result for terminal Node {node.status.value}"
+            )
+        status = node.status
+        provenance: ResultProvenance | None = None
+        completed_at = node.completed_at
+        if observation == AvailabilityStatus.AVAILABLE:
+            status = NodeStatus.SUCCEEDED
+            provenance = (
+                ResultProvenance.CACHE
+                if node.status == NodeStatus.PENDING
+                else ResultProvenance.CURRENT_RUN
+            )
+            completed_at = now
+        self._connection.execute(
+            """
+            UPDATE execution_nodes
+            SET status = ?,
+                result_observation = ?,
+                result_observed_at = ?,
+                result_provenance = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (
+                status.value,
+                observation.value,
+                now,
+                None if provenance is None else provenance.value,
+                completed_at,
+                now,
+                str(execution_run_id),
+                node_key,
+            ),
+        )
+        if observation == AvailabilityStatus.UNKNOWN:
+            self._suspend_for_unknown_result(execution_run_id, now=now)
+        return self.get_node(execution_run_id, node_key)
+
+    def record_task_result_observation(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        task_key: str,
+        observation: AvailabilityStatus,
+        *,
+        now: int,
+    ) -> ExecutionTaskRecord:
+        """Record caller-owned Task validation and any conclusive cache hit."""
+        task = self.get_task(execution_run_id, node_key, task_key)
+        if task.status.is_terminal:
+            raise ValueError(
+                f"cannot record a result for terminal Task {task.status.value}"
+            )
+        status = task.status
+        provenance: ResultProvenance | None = None
+        completed_at = task.completed_at
+        if observation == AvailabilityStatus.AVAILABLE:
+            status = TaskStatus.SUCCEEDED
+            provenance = (
+                ResultProvenance.CACHE
+                if task.status == TaskStatus.PENDING
+                else ResultProvenance.CURRENT_RUN
+            )
+            completed_at = now
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                result_observation = ?,
+                result_observed_at = ?,
+                result_provenance = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+            """,
+            (
+                status.value,
+                observation.value,
+                now,
+                None if provenance is None else provenance.value,
+                completed_at,
+                now,
+                str(execution_run_id),
+                node_key,
+                task_key,
+            ),
+        )
+        if observation == AvailabilityStatus.UNKNOWN:
+            self._suspend_for_unknown_result(execution_run_id, now=now)
+        return self.get_task(execution_run_id, node_key, task_key)
+
+    def list_tasks(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+    ) -> tuple[ExecutionTaskRecord, ...]:
+        """Load one Node's Tasks in persisted encounter order."""
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_tasks
+            WHERE execution_run_id = ? AND node_key = ?
+            ORDER BY ordinal
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchall()
+        return tuple(_task_from_row(row) for row in rows)
+
+    def get_task(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        task_key: str,
+    ) -> ExecutionTaskRecord:
+        """Load one discovered Task."""
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_tasks
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+            """,
+            (str(execution_run_id), node_key, task_key),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Execution Task not found: {node_key}/{task_key}")
+        return _task_from_row(row)
+
+    def transition_run(
+        self,
+        execution_run_id: UUID,
+        status: RunStatus,
+        *,
+        reason: RunStatusReason | None = None,
+        message: str | None = None,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Apply one legal Run transition and atomically replace diagnostics."""
+        return self._transition_run(
+            execution_run_id,
+            status,
+            reason=reason,
+            message=message,
+            now=now,
+            explicit_resume=False,
+        )
+
+    def resume_run(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Explicitly resume one suspended coordinator Run."""
+        current = self.get_run(execution_run_id)
+        if current.status != RunStatus.SUSPENDED:
+            raise ValueError("only a suspended Run can be explicitly resumed")
+        return self._transition_run(
+            execution_run_id,
+            RunStatus.RUNNING,
+            reason=None,
+            message=None,
+            now=now,
+            explicit_resume=True,
+        )
+
+    def _transition_run(
+        self,
+        execution_run_id: UUID,
+        status: RunStatus,
+        *,
+        reason: RunStatusReason | None,
+        message: str | None,
+        now: int,
+        explicit_resume: bool,
+    ) -> ExecutionRunRecord:
+        _validate_run_reason(status, reason)
+        current = self.get_run(execution_run_id)
+        if current.status.is_terminal:
+            raise ValueError(f"cannot transition terminal Run {current.status.value}")
+        if (
+            current.status == RunStatus.SUSPENDED
+            and status == RunStatus.RUNNING
+            and not explicit_resume
+        ):
+            raise ValueError("suspended Run requires explicit resume")
+        if status not in _RUN_TRANSITIONS[current.status]:
+            raise ValueError(
+                f"cannot transition Run from {current.status.value} to {status.value}"
+            )
+        started_at = (
+            now
+            if status == RunStatus.RUNNING and current.started_at is None
+            else current.started_at
+        )
+        completed_at = now if status.is_terminal else None
+        self._connection.execute(
+            """
+            UPDATE execution_runs
+            SET status = ?,
+                status_reason = ?,
+                status_message = ?,
+                updated_at = ?,
+                started_at = ?,
+                completed_at = ?
+            WHERE execution_run_id = ?
+            """,
+            (
+                status.value,
+                None if reason is None else reason.value,
+                message,
+                now,
+                started_at,
+                completed_at,
+                str(execution_run_id),
+            ),
+        )
+        return self.get_run(execution_run_id)
+
+    def _suspend_for_unknown_result(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> None:
+        run = self.get_run(execution_run_id)
+        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+            raise ValueError(
+                f"cannot suspend result validation while Run is {run.status.value}"
+            )
+        self._transition_run(
+            execution_run_id,
+            RunStatus.SUSPENDED,
+            reason=RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+            message="Workload result validation was inconclusive",
+            now=now,
+            explicit_resume=False,
+        )
+
+    def _node_from_row(self, row: sqlite3.Row) -> ExecutionNodeRecord:
+        dependencies = self._connection.execute(
+            """
+            SELECT dependency_node_key, accept_partial
+            FROM execution_node_dependencies
+            WHERE execution_run_id = ? AND node_key = ?
+            ORDER BY ordinal
+            """,
+            (row["execution_run_id"], row["node_key"]),
+        ).fetchall()
+        return ExecutionNodeRecord(
+            execution_run_id=UUID(row["execution_run_id"]),
+            node_key=row["node_key"],
+            ordinal=row["ordinal"],
+            dependencies=tuple(
+                NodeDependency(
+                    node_key=dependency["dependency_node_key"],
+                    accept_partial=bool(dependency["accept_partial"]),
+                )
+                for dependency in dependencies
+            ),
+            aggregation_policy=NodeAggregationPolicy(row["aggregation_policy"]),
+            allow_empty_result=bool(row["allow_empty_result"]),
+            status=NodeStatus(row["status"]),
+            discovery_complete=bool(row["discovery_complete"]),
+            result_observation=(
+                None
+                if row["result_observation"] is None
+                else AvailabilityStatus(row["result_observation"])
+            ),
+            result_observed_at=row["result_observed_at"],
+            result_provenance=(
+                None
+                if row["result_provenance"] is None
+                else ResultProvenance(row["result_provenance"])
+            ),
+            error_message=row["error_message"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
+
+
+def _validate_call_limits(total: int, gpu: int) -> None:
+    if total <= 0:
+        raise ValueError("max_active_provider_calls must be positive")
+    if gpu < 0:
+        raise ValueError("max_active_gpu_provider_calls cannot be negative")
+    if gpu > total:
+        raise ValueError(
+            "max_active_gpu_provider_calls cannot exceed max_active_provider_calls"
+        )
+
+
+def _validate_run_reason(
+    status: RunStatus,
+    reason: RunStatusReason | None,
+) -> None:
+    allowed = _RUN_REASONS.get(status)
+    if allowed is None:
+        if reason is not None:
+            raise ValueError(f"{status.value} does not accept a status reason")
+        return
+    if reason is None:
+        raise ValueError(f"{status.value} requires a status reason")
+    if reason not in allowed:
+        raise ValueError(f"{reason.value} is not valid for {status.value}")
+
+
+def _dump_plan(plan: ExecutionPlan) -> str:
+    value = {
+        "nodes": [
+            {
+                "aggregation_policy": node.aggregation_policy.value,
+                "allow_empty_result": node.allow_empty_result,
+                "dependencies": [
+                    {
+                        "accept_partial": dependency.accept_partial,
+                        "node_key": dependency.node_key,
+                    }
+                    for dependency in node.dependencies
+                ],
+                "node_key": node.node_key,
+            }
+            for node in plan.nodes
+        ],
+        "scientific_payload": plan.scientific_payload,
+        "scientific_versions": plan.scientific_versions,
+        "workload_name": plan.workload_name,
+        "workload_run_key": plan.workload_run_key,
+    }
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _dump_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _load_plan(value: str) -> ExecutionPlan:
+    decoded: dict[str, Any] = json.loads(value)
+    return ExecutionPlan(
+        workload_name=decoded["workload_name"],
+        workload_run_key=decoded["workload_run_key"],
+        scientific_payload=decoded["scientific_payload"],
+        scientific_versions=decoded["scientific_versions"],
+        nodes=tuple(
+            NodePlan(
+                node_key=node["node_key"],
+                dependencies=tuple(
+                    NodeDependency(
+                        node_key=dependency["node_key"],
+                        accept_partial=dependency["accept_partial"],
+                    )
+                    for dependency in node["dependencies"]
+                ),
+                aggregation_policy=NodeAggregationPolicy(node["aggregation_policy"]),
+                allow_empty_result=node["allow_empty_result"],
+            )
+            for node in decoded["nodes"]
+        ),
+    )
+
+
+def _task_from_row(row: sqlite3.Row) -> ExecutionTaskRecord:
+    return ExecutionTaskRecord(
+        execution_run_id=UUID(row["execution_run_id"]),
+        node_key=row["node_key"],
+        task_key=row["task_key"],
+        ordinal=row["ordinal"],
+        fingerprint=row["fingerprint"],
+        scientific_payload=json.loads(row["scientific_payload_json"]),
+        execution_payload=json.loads(row["execution_payload_json"]),
+        status=TaskStatus(row["status"]),
+        result_observation=(
+            None
+            if row["result_observation"] is None
+            else AvailabilityStatus(row["result_observation"])
+        ),
+        result_observed_at=row["result_observed_at"],
+        result_provenance=(
+            None
+            if row["result_provenance"] is None
+            else ResultProvenance(row["result_provenance"])
+        ),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _run_from_row(row: sqlite3.Row) -> ExecutionRunRecord:
+    plan = _load_plan(row["plan_json"])
+    if plan.workload_plan_fingerprint != row["workload_plan_fingerprint"]:
+        raise RuntimeError("stored Execution Plan fingerprint does not match its data")
+    return ExecutionRunRecord(
+        execution_run_id=UUID(row["execution_run_id"]),
+        predecessor_execution_run_id=(
+            None
+            if row["predecessor_execution_run_id"] is None
+            else UUID(row["predecessor_execution_run_id"])
+        ),
+        plan=plan,
+        deployment=DeploymentIdentity(
+            environment=row["deployment_environment"],
+            deployment_name=row["deployment_name"],
+            deployment_version=row["deployment_version"],
+        ),
+        status=RunStatus(row["status"]),
+        status_reason=(
+            None
+            if row["status_reason"] is None
+            else RunStatusReason(row["status_reason"])
+        ),
+        status_message=row["status_message"],
+        max_active_provider_calls=row["max_active_provider_calls"],
+        max_active_gpu_provider_calls=row["max_active_gpu_provider_calls"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )

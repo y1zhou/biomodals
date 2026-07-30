@@ -24,6 +24,7 @@ class FakeResolvedFunction:
 class AsyncFakeModalDriver:
     def __init__(self) -> None:
         self.spawn_count = 0
+        self.cancelled: list[str] = []
         self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     async def resolve(self, binding):
@@ -37,7 +38,7 @@ class AsyncFakeModalDriver:
         return self.observation
 
     async def cancel(self, provider_call_handle_id):
-        return None
+        self.cancelled.append(provider_call_handle_id)
 
 
 def _candidate() -> ProviderCallCandidate:
@@ -99,5 +100,33 @@ def test_async_runtime_preserves_preclaim_and_result_envelope_boundaries() -> No
         assert completed.result_envelope == {
             "tasks": {"seed-0": {"path": "/outputs/seed-0"}}
         }
+
+    asyncio.run(scenario())
+
+
+def test_async_runtime_requests_cancellation_without_inventing_completion() -> None:
+    async def scenario() -> None:
+        repository = create_repository(task_count=1)
+        driver = AsyncFakeModalDriver()
+        runtime = AsyncExecutionRuntime(
+            repository,
+            modal_driver=driver,
+            checkpoint=lambda: None,
+        )
+        call = await runtime.submit_fixed_batch(
+            RUN_ID,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+        assert call is not None
+
+        requested = await runtime.request_provider_call_cancellation(
+            call.provider_call_id,
+            now=120,
+        )
+
+        assert requested.status == ProviderCallStatus.ATTACHED
+        assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}"]
 
     asyncio.run(scenario())

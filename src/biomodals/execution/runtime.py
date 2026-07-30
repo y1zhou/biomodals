@@ -252,6 +252,7 @@ class ExecutionRuntime:
         provider_call_id: UUID,
         *,
         encode_result: Callable[[Any], Any],
+        result_already_satisfied: bool = False,
         now: int,
     ) -> ProviderCallRecord:
         """Observe or collect the existing call without ever resubmitting it."""
@@ -298,11 +299,17 @@ class ExecutionRuntime:
                 now=now,
             )
         elif observation.kind == ModalCallObservationKind.CANCELLED:
-            updated = self.repository.cancel_provider_call(
-                provider_call_id,
-                message=observation.message or "Modal function was cancelled",
-                now=now,
-            )
+            if result_already_satisfied:
+                updated = self.repository.cancel_pruned_provider_call(
+                    provider_call_id,
+                    now=now,
+                )
+            else:
+                updated = self.repository.cancel_provider_call(
+                    provider_call_id,
+                    message=observation.message or "Modal function was cancelled",
+                    now=now,
+                )
         else:
             updated = self.repository.mark_provider_call_state_unknown(
                 provider_call_id,
@@ -311,6 +318,36 @@ class ExecutionRuntime:
             )
         self._checkpoint_state()
         return updated
+
+    def request_provider_call_cancellation(
+        self,
+        provider_call_id: UUID,
+        *,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Request cancellation without inventing a conclusive provider outcome."""
+        call = self.repository.get_provider_call(provider_call_id)
+        if call.status.is_terminal:
+            return call
+        if call.provider_call_handle_id is None:
+            updated = self.repository.mark_provider_cancellation_unknown(
+                provider_call_id,
+                message="Provider Call has no attached cancellation handle",
+                now=now,
+            )
+            self._checkpoint_state()
+            return updated
+        try:
+            self._modal.cancel(call.provider_call_handle_id)
+        except Exception as error:
+            updated = self.repository.mark_provider_cancellation_unknown(
+                provider_call_id,
+                message=f"Modal cancellation was inconclusive: {error}",
+                now=now,
+            )
+            self._checkpoint_state()
+            return updated
+        return self.repository.get_provider_call(provider_call_id)
 
     def cancel_run(
         self,
@@ -325,24 +362,7 @@ class ExecutionRuntime:
         )
         self._checkpoint_state()
         for provider_call_id in provider_call_ids:
-            call = self.repository.get_provider_call(provider_call_id)
-            if call.provider_call_handle_id is None:
-                self.repository.mark_provider_cancellation_unknown(
-                    provider_call_id,
-                    message="Provider Call has no attached cancellation handle",
-                    now=now,
-                )
-                self._checkpoint_state()
-                continue
-            try:
-                self._modal.cancel(call.provider_call_handle_id)
-            except Exception as error:
-                self.repository.mark_provider_cancellation_unknown(
-                    provider_call_id,
-                    message=f"Modal cancellation was inconclusive: {error}",
-                    now=now,
-                )
-                self._checkpoint_state()
+            self.request_provider_call_cancellation(provider_call_id, now=now)
         return self.repository.get_run(execution_run_id)
 
     def _checkpoint_state(self) -> None:
@@ -444,6 +464,7 @@ class AsyncExecutionRuntime:
         provider_call_id: UUID,
         *,
         encode_result: Callable[[Any], Any],
+        result_already_satisfied: bool = False,
         now: int,
     ) -> ProviderCallRecord:
         """Observe or collect an existing async call without resubmission."""
@@ -490,11 +511,17 @@ class AsyncExecutionRuntime:
                 now=now,
             )
         elif observation.kind == ModalCallObservationKind.CANCELLED:
-            updated = self.repository.cancel_provider_call(
-                provider_call_id,
-                message=observation.message or "Modal function was cancelled",
-                now=now,
-            )
+            if result_already_satisfied:
+                updated = self.repository.cancel_pruned_provider_call(
+                    provider_call_id,
+                    now=now,
+                )
+            else:
+                updated = self.repository.cancel_provider_call(
+                    provider_call_id,
+                    message=observation.message or "Modal function was cancelled",
+                    now=now,
+                )
         else:
             updated = self.repository.mark_provider_call_state_unknown(
                 provider_call_id,
@@ -503,6 +530,36 @@ class AsyncExecutionRuntime:
             )
         self._checkpoint_state()
         return updated
+
+    async def request_provider_call_cancellation(
+        self,
+        provider_call_id: UUID,
+        *,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Request cancellation without inventing a conclusive provider outcome."""
+        call = self.repository.get_provider_call(provider_call_id)
+        if call.status.is_terminal:
+            return call
+        if call.provider_call_handle_id is None:
+            updated = self.repository.mark_provider_cancellation_unknown(
+                provider_call_id,
+                message="Provider Call has no attached cancellation handle",
+                now=now,
+            )
+            self._checkpoint_state()
+            return updated
+        try:
+            await self._modal.cancel(call.provider_call_handle_id)
+        except Exception as error:
+            updated = self.repository.mark_provider_cancellation_unknown(
+                provider_call_id,
+                message=f"Modal cancellation was inconclusive: {error}",
+                now=now,
+            )
+            self._checkpoint_state()
+            return updated
+        return self.repository.get_provider_call(provider_call_id)
 
     async def cancel_run(
         self,
@@ -517,24 +574,7 @@ class AsyncExecutionRuntime:
         )
         self._checkpoint_state()
         for provider_call_id in provider_call_ids:
-            call = self.repository.get_provider_call(provider_call_id)
-            if call.provider_call_handle_id is None:
-                self.repository.mark_provider_cancellation_unknown(
-                    provider_call_id,
-                    message="Provider Call has no attached cancellation handle",
-                    now=now,
-                )
-                self._checkpoint_state()
-                continue
-            try:
-                await self._modal.cancel(call.provider_call_handle_id)
-            except Exception as error:
-                self.repository.mark_provider_cancellation_unknown(
-                    provider_call_id,
-                    message=f"Modal cancellation was inconclusive: {error}",
-                    now=now,
-                )
-                self._checkpoint_state()
+            await self.request_provider_call_cancellation(provider_call_id, now=now)
         return self.repository.get_run(execution_run_id)
 
     def _checkpoint_state(self) -> None:

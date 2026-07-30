@@ -8,6 +8,7 @@ from biomodals.execution import (
     RunStatus,
     RunStatusReason,
     TaskStatus,
+    WorkStatusReason,
 )
 from biomodals.execution.modal import (
     ModalCallObservation,
@@ -132,3 +133,85 @@ def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
     assert call.status == ProviderCallStatus.STATE_UNKNOWN
     assert task.status == TaskStatus.RUNNING
     assert repository.active_provider_call_counts(RUN_ID).total == 1
+
+
+def test_result_pruning_waits_for_conclusive_provider_cancellation() -> None:
+    repository = create_repository(task_count=1)
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+    driver = CancelDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+
+    requested = runtime.request_provider_call_cancellation(
+        claim.call.provider_call_id,
+        now=120,
+    )
+
+    assert requested.status == ProviderCallStatus.ATTACHED
+    assert driver.cancelled == ["fc-123"]
+    assert (
+        repository.get_task(RUN_ID, "inference", "seed-0").status == TaskStatus.RUNNING
+    )
+
+    cancelled = runtime.reconcile_provider_call(
+        claim.call.provider_call_id,
+        encode_result=lambda value: value,
+        result_already_satisfied=True,
+        now=121,
+    )
+    task = repository.get_task(RUN_ID, "inference", "seed-0")
+
+    assert cancelled.status == ProviderCallStatus.CANCELLED
+    assert task.status == TaskStatus.CANCELLED
+    assert task.status_reason == WorkStatusReason.RESULT_ALREADY_SATISFIED
+
+
+def test_result_pruning_without_an_attached_handle_preserves_unknown_ownership() -> (
+    None
+):
+    repository = create_repository(task_count=1)
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=CancelDriver(),
+        checkpoint=lambda: None,
+    )
+
+    call = runtime.request_provider_call_cancellation(
+        claim.call.provider_call_id,
+        now=120,
+    )
+    run = repository.get_run(RUN_ID)
+
+    assert call.status == ProviderCallStatus.OUTCOME_UNKNOWN
+    assert run.status == RunStatus.STATE_UNKNOWN
+    assert run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+    assert (
+        repository.get_task(RUN_ID, "inference", "seed-0").status == TaskStatus.RUNNING
+    )

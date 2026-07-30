@@ -359,6 +359,10 @@ class ExecutionCoordinator:
                     ),
                 )
             else:
+                if candidate.workload_run_key != predecessor_plan.workload_run_key:
+                    raise ValueError(
+                        "Launch Workload Run Key does not match predecessor"
+                    )
                 candidate_execution_plan = execution_plan(
                     candidate.workflow.validate(),
                     workload_run_key=candidate.workload_run_key,

@@ -568,6 +568,45 @@ def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
     assert not WorkflowRunStore(tmp_path, SUCCESSOR_ID).ledger_path.exists()
 
 
+def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("demo")
+    workflow.add_node(TextNode("unchanged"), id="write")
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="original",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    with pytest.raises(ValueError, match="Workload Run Key"):
+        raw_cls.restart_from._get_raw_f()(
+            successor_coordinator,
+            predecessor_execution_run_id=str(RUN_ID),
+            workflow=workflow,
+            workload_run_key="changed",
+        )
+
+    successor_store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    assert not successor_store.ledger_path.exists()
+    assert not successor_store.workflow_plan_path.exists()
+
+
 def test_restart_reuses_successful_task_publications_from_partial_node(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

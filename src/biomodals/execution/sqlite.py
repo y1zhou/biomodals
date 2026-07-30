@@ -6,9 +6,10 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from biomodals.execution.model import (
+    ActiveProviderCallCounts,
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionNodeRecord,
@@ -19,6 +20,10 @@ from biomodals.execution.model import (
     NodeDependency,
     NodePlan,
     NodeStatus,
+    ProviderBinding,
+    ProviderCallPreclaim,
+    ProviderCallRecord,
+    ProviderCallStatus,
     ResultProvenance,
     RunStatus,
     RunStatusReason,
@@ -156,6 +161,51 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE execution_dispatch_batches (
+        dispatch_batch_id TEXT PRIMARY KEY,
+        execution_run_id TEXT NOT NULL,
+        node_key TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        compatibility_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (execution_run_id, node_key)
+            REFERENCES execution_nodes(execution_run_id, node_key)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE execution_provider_calls (
+        provider_call_id TEXT PRIMARY KEY,
+        execution_run_id TEXT NOT NULL,
+        node_key TEXT NOT NULL,
+        dispatch_batch_id TEXT NOT NULL
+            REFERENCES execution_dispatch_batches(dispatch_batch_id)
+            ON DELETE CASCADE,
+        submission_token TEXT NOT NULL,
+        preclaim_json TEXT NOT NULL,
+        provider_environment TEXT NOT NULL,
+        provider_app_name TEXT NOT NULL,
+        provider_app_version INTEGER NOT NULL
+            CHECK (provider_app_version > 0),
+        provider_function_name TEXT NOT NULL,
+        uses_gpu INTEGER NOT NULL CHECK (uses_gpu IN (0, 1)),
+        runtime_image_key TEXT,
+        status TEXT NOT NULL,
+        provider_call_handle_id TEXT UNIQUE,
+        result_envelope_json TEXT,
+        error_message TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        attached_at INTEGER,
+        started_at INTEGER,
+        completed_at INTEGER,
+        UNIQUE (execution_run_id, submission_token),
+        FOREIGN KEY (execution_run_id, node_key)
+            REFERENCES execution_nodes(execution_run_id, node_key)
+            ON DELETE CASCADE
+    )
+    """,
+    """
     CREATE TABLE execution_tasks (
         execution_run_id TEXT NOT NULL,
         node_key TEXT NOT NULL,
@@ -168,10 +218,17 @@ _SCHEMA_STATEMENTS = (
         result_observation TEXT,
         result_observed_at INTEGER,
         result_provenance TEXT,
+        dispatch_batch_id TEXT
+            REFERENCES execution_dispatch_batches(dispatch_batch_id),
+        provider_call_id TEXT
+            REFERENCES execution_provider_calls(provider_call_id),
+        local_owned INTEGER NOT NULL DEFAULT 0 CHECK (local_owned IN (0, 1)),
+        error_message TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         started_at INTEGER,
         completed_at INTEGER,
+        CHECK (local_owned = 0 OR provider_call_id IS NULL),
         PRIMARY KEY (execution_run_id, node_key, task_key),
         UNIQUE (execution_run_id, node_key, ordinal),
         FOREIGN KEY (execution_run_id, node_key)
@@ -631,6 +688,429 @@ class SqliteExecutionRepository:
             self._suspend_for_unknown_result(execution_run_id, now=now)
         return self.get_task(execution_run_id, node_key, task_key)
 
+    def preclaim_fixed_batch(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        task_keys: tuple[str, ...],
+        *,
+        submission_token: str,
+        binding: ProviderBinding,
+        compatibility_key: str,
+        now: int,
+    ) -> ProviderCallPreclaim | None:
+        """Atomically own one fixed Task batch and reserve one call slot."""
+        if not submission_token:
+            raise ValueError("submission token cannot be empty")
+        if not task_keys:
+            raise ValueError("fixed Provider Call batch cannot be empty")
+        if len(task_keys) != len(set(task_keys)):
+            raise ValueError("fixed Provider Call batch contains duplicate Tasks")
+        preclaim_json = _dump_json({
+            "binding": _binding_json_value(binding),
+            "compatibility_key": compatibility_key,
+            "node_key": node_key,
+            "task_keys": task_keys,
+        })
+        existing = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_provider_calls
+            WHERE execution_run_id = ? AND submission_token = ?
+            """,
+            (str(execution_run_id), submission_token),
+        ).fetchone()
+        if existing is not None:
+            if existing["preclaim_json"] != preclaim_json:
+                raise ValueError("submission token was reused for different work")
+            return ProviderCallPreclaim(
+                call=self._provider_call_from_row(existing),
+                spawn_authorized=False,
+            )
+
+        run = self.get_run(execution_run_id)
+        if run.status != RunStatus.RUNNING:
+            return None
+        node = self.get_node(execution_run_id, node_key)
+        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+            raise ValueError("Provider Call Node is not ready for admission")
+        counts = self.active_provider_call_counts(execution_run_id)
+        if counts.total >= run.max_active_provider_calls:
+            return None
+        if binding.uses_gpu and counts.gpu >= run.max_active_gpu_provider_calls:
+            return None
+
+        tasks = [
+            self.get_task(execution_run_id, node_key, task_key)
+            for task_key in task_keys
+        ]
+        for task in tasks:
+            if (
+                task.status != TaskStatus.PENDING
+                or task.result_observation != AvailabilityStatus.MISSING
+                or task.provider_call_id is not None
+            ):
+                raise ValueError(
+                    f"Task {task.task_key!r} is not ready for Provider Call ownership"
+                )
+
+        dispatch_batch_id = uuid4()
+        provider_call_id = uuid4()
+        self._connection.execute(
+            """
+            INSERT INTO execution_dispatch_batches (
+                dispatch_batch_id,
+                execution_run_id,
+                node_key,
+                mode,
+                compatibility_key,
+                created_at
+            )
+            VALUES (?, ?, ?, 'fixed_batch', ?, ?)
+            """,
+            (
+                str(dispatch_batch_id),
+                str(execution_run_id),
+                node_key,
+                compatibility_key,
+                now,
+            ),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO execution_provider_calls (
+                provider_call_id,
+                execution_run_id,
+                node_key,
+                dispatch_batch_id,
+                submission_token,
+                preclaim_json,
+                provider_environment,
+                provider_app_name,
+                provider_app_version,
+                provider_function_name,
+                uses_gpu,
+                runtime_image_key,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(provider_call_id),
+                str(execution_run_id),
+                node_key,
+                str(dispatch_batch_id),
+                submission_token,
+                preclaim_json,
+                binding.environment,
+                binding.app_name,
+                binding.app_version,
+                binding.function_name,
+                int(binding.uses_gpu),
+                binding.runtime_image_key,
+                ProviderCallStatus.SUBMITTING.value,
+                now,
+                now,
+            ),
+        )
+        for task_key in task_keys:
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    dispatch_batch_id = ?,
+                    provider_call_id = ?,
+                    started_at = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND task_key = ?
+                """,
+                (
+                    TaskStatus.RUNNING.value,
+                    str(dispatch_batch_id),
+                    str(provider_call_id),
+                    now,
+                    now,
+                    str(execution_run_id),
+                    node_key,
+                    task_key,
+                ),
+            )
+        return ProviderCallPreclaim(
+            call=self.get_provider_call(provider_call_id),
+            spawn_authorized=True,
+        )
+
+    def active_provider_call_counts(
+        self,
+        execution_run_id: UUID,
+    ) -> ActiveProviderCallCounts:
+        """Derive occupied total and GPU slots from nonterminal calls."""
+        terminal = tuple(
+            status.value for status in ProviderCallStatus if status.is_terminal
+        )
+        row = self._connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(uses_gpu), 0) AS gpu
+            FROM execution_provider_calls
+            WHERE execution_run_id = ?
+                AND status NOT IN (?, ?, ?)
+            """,
+            (str(execution_run_id), *terminal),
+        ).fetchone()
+        return ActiveProviderCallCounts(total=row["total"], gpu=row["gpu"])
+
+    def list_provider_calls(
+        self,
+        execution_run_id: UUID,
+    ) -> tuple[ProviderCallRecord, ...]:
+        """Load Provider Calls in durable preclaim order."""
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_provider_calls
+            WHERE execution_run_id = ?
+            ORDER BY created_at, rowid
+            """,
+            (str(execution_run_id),),
+        ).fetchall()
+        return tuple(self._provider_call_from_row(row) for row in rows)
+
+    def get_provider_call(self, provider_call_id: UUID) -> ProviderCallRecord:
+        """Load one durable Provider Call."""
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_provider_calls
+            WHERE provider_call_id = ?
+            """,
+            (str(provider_call_id),),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Provider Call not found: {provider_call_id}")
+        return self._provider_call_from_row(row)
+
+    def attach_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        provider_call_handle_id: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Durably attach the provider's concrete call identity."""
+        if not provider_call_handle_id:
+            raise ValueError("provider call handle ID cannot be empty")
+        call = self.get_provider_call(provider_call_id)
+        if (
+            call.status == ProviderCallStatus.ATTACHED
+            and call.provider_call_handle_id == provider_call_handle_id
+        ):
+            return call
+        if call.status not in {
+            ProviderCallStatus.SUBMITTING,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+        }:
+            raise ValueError(f"cannot attach {call.status.value} Provider Call")
+        self._connection.execute(
+            """
+            UPDATE execution_provider_calls
+            SET status = ?,
+                provider_call_handle_id = ?,
+                attached_at = ?,
+                updated_at = ?
+            WHERE provider_call_id = ?
+            """,
+            (
+                ProviderCallStatus.ATTACHED.value,
+                provider_call_handle_id,
+                now,
+                now,
+                str(provider_call_id),
+            ),
+        )
+        self._reconcile_run_unknown(call.execution_run_id, now=now)
+        return self.get_provider_call(provider_call_id)
+
+    def mark_provider_call_running(
+        self,
+        provider_call_id: UUID,
+        *,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Record a conclusive active provider observation."""
+        call = self.get_provider_call(provider_call_id)
+        if call.status == ProviderCallStatus.RUNNING:
+            return call
+        if call.status not in {
+            ProviderCallStatus.ATTACHED,
+            ProviderCallStatus.STATE_UNKNOWN,
+        }:
+            raise ValueError(f"cannot mark {call.status.value} Provider Call running")
+        self._connection.execute(
+            """
+            UPDATE execution_provider_calls
+            SET status = ?,
+                started_at = COALESCE(started_at, ?),
+                updated_at = ?
+            WHERE provider_call_id = ?
+            """,
+            (
+                ProviderCallStatus.RUNNING.value,
+                now,
+                now,
+                str(provider_call_id),
+            ),
+        )
+        self._reconcile_run_unknown(call.execution_run_id, now=now)
+        return self.get_provider_call(provider_call_id)
+
+    def mark_submission_outcome_unknown(
+        self,
+        provider_call_id: UUID,
+        *,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Preserve ownership when spawn may have occurred without attachment."""
+        call = self.get_provider_call(provider_call_id)
+        if call.status == ProviderCallStatus.OUTCOME_UNKNOWN:
+            return call
+        if call.status != ProviderCallStatus.SUBMITTING:
+            raise ValueError(
+                f"cannot mark {call.status.value} submission outcome unknown"
+            )
+        self._set_provider_call_status(
+            provider_call_id,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+            message=message,
+            now=now,
+        )
+        self._project_run_unknown(
+            call.execution_run_id,
+            reason=RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN,
+            message=message,
+            now=now,
+        )
+        return self.get_provider_call(provider_call_id)
+
+    def mark_provider_call_state_unknown(
+        self,
+        provider_call_id: UUID,
+        *,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Preserve attached ownership after an inconclusive provider lookup."""
+        call = self.get_provider_call(provider_call_id)
+        if call.status == ProviderCallStatus.STATE_UNKNOWN:
+            return call
+        if call.status not in {
+            ProviderCallStatus.ATTACHED,
+            ProviderCallStatus.RUNNING,
+        }:
+            raise ValueError(
+                f"cannot mark {call.status.value} Provider Call state unknown"
+            )
+        self._set_provider_call_status(
+            provider_call_id,
+            ProviderCallStatus.STATE_UNKNOWN,
+            message=message,
+            now=now,
+        )
+        self._project_run_unknown(
+            call.execution_run_id,
+            reason=RunStatusReason.PROVIDER_OUTCOME_UNKNOWN,
+            message=message,
+            now=now,
+        )
+        return self.get_provider_call(provider_call_id)
+
+    def record_provider_call_result(
+        self,
+        provider_call_id: UUID,
+        *,
+        result_envelope: Any,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Persist a Result Envelope before releasing the call's slots."""
+        if result_envelope is None:
+            raise ValueError("Provider Call success requires a Result Envelope")
+        envelope_json = _dump_json(result_envelope)
+        call = self.get_provider_call(provider_call_id)
+        if call.status == ProviderCallStatus.SUCCEEDED:
+            if call.result_envelope != result_envelope:
+                raise ValueError("Provider Call Result Envelope cannot be replaced")
+            return call
+        if call.status not in {
+            ProviderCallStatus.ATTACHED,
+            ProviderCallStatus.RUNNING,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+            ProviderCallStatus.STATE_UNKNOWN,
+        }:
+            raise ValueError(
+                f"cannot complete {call.status.value} Provider Call successfully"
+            )
+        self._connection.execute(
+            """
+            UPDATE execution_provider_calls
+            SET status = ?,
+                result_envelope_json = ?,
+                error_message = NULL,
+                completed_at = ?,
+                updated_at = ?
+            WHERE provider_call_id = ?
+            """,
+            (
+                ProviderCallStatus.SUCCEEDED.value,
+                envelope_json,
+                now,
+                now,
+                str(provider_call_id),
+            ),
+        )
+        self._reconcile_run_unknown(call.execution_run_id, now=now)
+        return self.get_provider_call(provider_call_id)
+
+    def fail_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Record conclusive call failure and fail unfinished owned Tasks."""
+        return self._finish_provider_call(
+            provider_call_id,
+            call_status=ProviderCallStatus.FAILED,
+            task_status=TaskStatus.FAILED,
+            message=message,
+            now=now,
+        )
+
+    def cancel_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Record conclusive cancellation and cancel unfinished owned Tasks."""
+        call = self.get_provider_call(provider_call_id)
+        if call.status == ProviderCallStatus.SUBMITTING:
+            raise ValueError("cannot cancel submitting Provider Call")
+        return self._finish_provider_call(
+            provider_call_id,
+            call_status=ProviderCallStatus.CANCELLED,
+            task_status=TaskStatus.CANCELLED,
+            message=message,
+            now=now,
+        )
+
     def list_tasks(
         self,
         execution_run_id: UUID,
@@ -777,6 +1257,170 @@ class SqliteExecutionRepository:
             now=now,
             explicit_resume=False,
         )
+
+    def _provider_call_from_row(self, row: sqlite3.Row) -> ProviderCallRecord:
+        task_rows = self._connection.execute(
+            """
+            SELECT task_key
+            FROM execution_tasks
+            WHERE provider_call_id = ?
+            ORDER BY ordinal
+            """,
+            (row["provider_call_id"],),
+        ).fetchall()
+        return ProviderCallRecord(
+            provider_call_id=UUID(row["provider_call_id"]),
+            execution_run_id=UUID(row["execution_run_id"]),
+            node_key=row["node_key"],
+            submission_token=row["submission_token"],
+            binding=ProviderBinding(
+                environment=row["provider_environment"],
+                app_name=row["provider_app_name"],
+                app_version=row["provider_app_version"],
+                function_name=row["provider_function_name"],
+                uses_gpu=bool(row["uses_gpu"]),
+                runtime_image_key=row["runtime_image_key"],
+            ),
+            status=ProviderCallStatus(row["status"]),
+            provider_call_handle_id=row["provider_call_handle_id"],
+            result_envelope=(
+                None
+                if row["result_envelope_json"] is None
+                else json.loads(row["result_envelope_json"])
+            ),
+            error_message=row["error_message"],
+            task_keys=tuple(task["task_key"] for task in task_rows),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            attached_at=row["attached_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def _set_provider_call_status(
+        self,
+        provider_call_id: UUID,
+        status: ProviderCallStatus,
+        *,
+        message: str | None,
+        now: int,
+    ) -> None:
+        self._connection.execute(
+            """
+            UPDATE execution_provider_calls
+            SET status = ?,
+                error_message = ?,
+                completed_at = CASE WHEN ? THEN ? ELSE NULL END,
+                updated_at = ?
+            WHERE provider_call_id = ?
+            """,
+            (
+                status.value,
+                message,
+                int(status.is_terminal),
+                now,
+                now,
+                str(provider_call_id),
+            ),
+        )
+
+    def _finish_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        call_status: ProviderCallStatus,
+        task_status: TaskStatus,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        call = self.get_provider_call(provider_call_id)
+        if call.status.is_terminal:
+            if call.status != call_status:
+                raise ValueError(
+                    f"cannot rewrite terminal Provider Call {call.status.value}"
+                )
+            return call
+        self._set_provider_call_status(
+            provider_call_id,
+            call_status,
+            message=message,
+            now=now,
+        )
+        self._connection.execute(
+            """
+            UPDATE execution_tasks
+            SET status = ?,
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE provider_call_id = ?
+                AND status IN (?, ?)
+            """,
+            (
+                task_status.value,
+                message,
+                now,
+                now,
+                str(provider_call_id),
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        )
+        self._reconcile_run_unknown(call.execution_run_id, now=now)
+        return self.get_provider_call(provider_call_id)
+
+    def _project_run_unknown(
+        self,
+        execution_run_id: UUID,
+        *,
+        reason: RunStatusReason,
+        message: str,
+        now: int,
+    ) -> None:
+        run = self.get_run(execution_run_id)
+        if run.status == RunStatus.STATE_UNKNOWN:
+            return
+        self._transition_run(
+            execution_run_id,
+            RunStatus.STATE_UNKNOWN,
+            reason=reason,
+            message=message,
+            now=now,
+            explicit_resume=False,
+        )
+
+    def _reconcile_run_unknown(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> None:
+        run = self.get_run(execution_run_id)
+        if run.status != RunStatus.STATE_UNKNOWN:
+            return
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM execution_provider_calls
+            WHERE execution_run_id = ?
+                AND status IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                str(execution_run_id),
+                ProviderCallStatus.OUTCOME_UNKNOWN.value,
+                ProviderCallStatus.STATE_UNKNOWN.value,
+            ),
+        ).fetchone()
+        if row is None:
+            self._transition_run(
+                execution_run_id,
+                RunStatus.RUNNING,
+                reason=None,
+                message=None,
+                now=now,
+                explicit_resume=False,
+            )
 
     def _node_from_row(self, row: sqlite3.Row) -> ExecutionNodeRecord:
         dependencies = self._connection.execute(
@@ -935,6 +1579,10 @@ def _task_from_row(row: sqlite3.Row) -> ExecutionTaskRecord:
             if row["result_provenance"] is None
             else ResultProvenance(row["result_provenance"])
         ),
+        provider_call_id=(
+            None if row["provider_call_id"] is None else UUID(row["provider_call_id"])
+        ),
+        error_message=row["error_message"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
@@ -973,3 +1621,14 @@ def _run_from_row(row: sqlite3.Row) -> ExecutionRunRecord:
         started_at=row["started_at"],
         completed_at=row["completed_at"],
     )
+
+
+def _binding_json_value(binding: ProviderBinding) -> dict[str, Any]:
+    return {
+        "app_name": binding.app_name,
+        "app_version": binding.app_version,
+        "environment": binding.environment,
+        "function_name": binding.function_name,
+        "runtime_image_key": binding.runtime_image_key,
+        "uses_gpu": binding.uses_gpu,
+    }

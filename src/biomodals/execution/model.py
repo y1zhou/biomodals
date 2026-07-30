@@ -111,6 +111,29 @@ class ProviderCallStatus(StrEnum):
         }
 
 
+@dataclass(frozen=True)
+class ProviderBinding:
+    """Resolved Modal function identity and operational scheduling metadata."""
+
+    environment: str
+    app_name: str
+    app_version: int
+    function_name: str
+    uses_gpu: bool
+    runtime_image_key: str | None = None
+
+    def __post_init__(self) -> None:
+        """Require an exact deployed function identity."""
+        if not self.environment:
+            raise ValueError("provider environment cannot be empty")
+        if not self.app_name:
+            raise ValueError("provider app name cannot be empty")
+        if self.app_version < 1:
+            raise ValueError("provider app version must be positive")
+        if not self.function_name:
+            raise ValueError("provider function name cannot be empty")
+
+
 class AvailabilityStatus(StrEnum):
     """Authoritative observation of one workload publication."""
 
@@ -333,10 +356,49 @@ class ExecutionTaskRecord:
     result_observation: AvailabilityStatus | None
     result_observed_at: int | None
     result_provenance: ResultProvenance | None
+    provider_call_id: UUID | None
+    error_message: str | None
     created_at: int
     updated_at: int
     started_at: int | None
     completed_at: int | None
+
+
+@dataclass(frozen=True)
+class ProviderCallRecord:
+    """One durable concrete Modal function invocation."""
+
+    provider_call_id: UUID
+    execution_run_id: UUID
+    node_key: str
+    submission_token: str
+    binding: ProviderBinding
+    status: ProviderCallStatus
+    provider_call_handle_id: str | None
+    result_envelope: Any
+    error_message: str | None
+    task_keys: tuple[str, ...]
+    created_at: int
+    updated_at: int
+    attached_at: int | None
+    started_at: int | None
+    completed_at: int | None
+
+
+@dataclass(frozen=True)
+class ProviderCallPreclaim:
+    """A durable call plus one-time in-process permission to spawn it."""
+
+    call: ProviderCallRecord
+    spawn_authorized: bool
+
+
+@dataclass(frozen=True)
+class ActiveProviderCallCounts:
+    """Derived total and GPU-subset nonterminal Provider Call counts."""
+
+    total: int
+    gpu: int
 
 
 def _canonical_json_sha256(value: Any) -> str:

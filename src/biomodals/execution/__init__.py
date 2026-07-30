@@ -1,6 +1,7 @@
 """Durable task scheduling for Biomodals workloads."""
 
 from biomodals.execution.model import (
+    ActiveProviderCallCounts,
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionNodeRecord,
@@ -11,6 +12,9 @@ from biomodals.execution.model import (
     NodeDependency,
     NodePlan,
     NodeStatus,
+    ProviderBinding,
+    ProviderCallPreclaim,
+    ProviderCallRecord,
     ProviderCallStatus,
     ResultProvenance,
     RunStatus,
@@ -32,6 +36,7 @@ from biomodals.execution.sqlite import (
 )
 
 __all__ = [
+    "ActiveProviderCallCounts",
     "AvailabilityStatus",
     "DeploymentIdentity",
     "ExecutionNodeRecord",
@@ -44,6 +49,9 @@ __all__ = [
     "NodePlan",
     "NodeStatus",
     "ProviderCallStatus",
+    "ProviderBinding",
+    "ProviderCallPreclaim",
+    "ProviderCallRecord",
     "ResultProvenance",
     "RunStatus",
     "RunStatusReason",

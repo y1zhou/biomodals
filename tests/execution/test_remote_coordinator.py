@@ -205,6 +205,50 @@ def test_application_error_suspends_without_replacing_attached_work() -> None:
     assert checkpoints == [RunStatus.SUSPENDED]
 
 
+def test_application_error_uses_repository_reopened_by_checkpoint(tmp_path) -> None:
+    ledger_path = tmp_path / "ledger.sqlite3"
+    connection = sqlite3.connect(ledger_path)
+    repository = create_repository(connection=connection, task_count=1)
+    connection.commit()
+    active_repository = repository
+    active_connection = connection
+
+    def advance_once() -> None:
+        nonlocal active_connection, active_repository
+        active_connection.commit()
+        active_connection.close()
+        active_connection = sqlite3.connect(ledger_path)
+        active_repository = type(repository)(active_connection)
+        raise RuntimeError("workflow adapter crashed after checkpoint")
+
+    def checkpoint():
+        nonlocal active_connection, active_repository
+        active_connection.commit()
+        active_connection.close()
+        active_connection = sqlite3.connect(ledger_path)
+        active_repository = type(repository)(active_connection)
+        return active_repository
+
+    with pytest.raises(
+        RuntimeError,
+        match="workflow adapter crashed after checkpoint",
+    ):
+        drive_execution_run(
+            repository,
+            RUN_ID,
+            advance_once=advance_once,
+            checkpoint=checkpoint,
+            now=lambda: 120,
+            sleep=lambda _: None,
+            poll_interval_seconds=0,
+        )
+
+    run = active_repository.get_run(RUN_ID)
+    assert run.status == RunStatus.SUSPENDED
+    assert run.status_reason == RunStatusReason.COORDINATOR_ERROR
+    assert run.status_message == "workflow adapter crashed after checkpoint"
+
+
 def test_explicit_resume_drives_the_same_run_without_retrying_implicitly() -> None:
     repository = create_repository(task_count=1)
     checkpoints: list[RunStatus] = []

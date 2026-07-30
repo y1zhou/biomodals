@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -89,10 +90,17 @@ def _suspend_after_application_error(
     now: int,
 ) -> None:
     """Best-effort persistence for an uncaught coordinator application error."""
-    run = repository.get_run(execution_run_id)
-    if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-        return
     try:
+        try:
+            run = repository.get_run(execution_run_id)
+        except sqlite3.ProgrammingError:
+            replacement = checkpoint()
+            if replacement is None:
+                raise
+            repository = replacement
+            run = repository.get_run(execution_run_id)
+        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+            return
         repository.transition_run(
             execution_run_id,
             RunStatus.SUSPENDED,

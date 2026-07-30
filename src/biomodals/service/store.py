@@ -344,7 +344,6 @@ class JobOperationRecord:
     modal_call_id: str | None
     state: JobOperationState
     submission_token: str | None
-    submission_lease_until: int | None
     started_at: int | None
     completed_at: int | None
 
@@ -2249,7 +2248,6 @@ def _operations_from_execution_snapshot(
                 ),
                 state=state,
                 submission_token=(call.submission_token if call is not None else None),
-                submission_lease_until=None,
                 started_at=node.started_at,
                 completed_at=node.completed_at,
             )

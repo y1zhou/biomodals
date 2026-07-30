@@ -2334,7 +2334,6 @@ def test_unknown_spawn_outcome_is_not_retried(
     job = store.get_job(owner_id, UUID(replayed.json()["job_id"]))
     assert job is not None
     assert job.state == JobState.STATE_UNKNOWN
-    assert job.operations[0].submission_lease_until is None
 
 
 def test_admin_can_resolve_state_unknown_after_manual_provider_review(

@@ -111,6 +111,9 @@ runtime_image = (
 ppiflow_task_image = ppiflow_app.runtime_image.add_local_python_source(
     "biomodals.workflow"
 )
+ligandmpnn_task_image = ligandmpnn_app.runtime_image.add_local_python_source(
+    "biomodals.workflow"
+)
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
@@ -149,6 +152,10 @@ PPI_FLOW_SOURCE_VOLUME_MOUNTS: dict[
 PPI_FLOW_TASK_VOLUME_MOUNTS = {
     **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
     **ppiflow_app.CONF.mounts(output_volume=True, model_volume=True),
+}
+LIGANDMPNN_TASK_VOLUME_MOUNTS = {
+    **PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    **ligandmpnn_app.CONF.mounts(model_volume=True),
 }
 
 
@@ -1245,27 +1252,24 @@ def run_ppiflow_af3score_stage(
 
 
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
+    image=ligandmpnn_task_image,
+    gpu=ligandmpnn_app.CONF.gpu,
+    memory=(1024, 65536),
     timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
+    volumes=LIGANDMPNN_TASK_VOLUME_MOUNTS,
 )
-def run_ppiflow_ligandmpnn_stage(
+def run_ppiflow_ligandmpnn_candidate(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None,
+    candidate_id: str,
     config: dict[str, object],
     step_name: str,
     run_name: str,
-    run_id: str,
-    node_id: str,
     script_mode: str,
-    model_type: str,
     cli_args: dict[str, str | int | float | bool],
 ) -> AppRunResult:
-    """Run LigandMPNN for every selected PPIFlow candidate."""
-    # TODO: tune CPU/memory/timeout once real candidate fan-out telemetry exists.
+    """Run LigandMPNN for one kernel-owned PPIFlow candidate."""
     _reload_ppiflow_source_volumes()
     selected = ppiflow_staging.select_structure_files_from_artifacts(
         artifacts,
@@ -1284,85 +1288,51 @@ def run_ppiflow_ligandmpnn_stage(
             ),
         )
     ]
-
-    def submit(task: ppiflow_coordinators.CandidateTask):
-        structure = task.payload
-        candidate_run_name = sanitize_filename(f"{run_name}-{task.candidate_id}")
-        try:
-            call = ligandmpnn_app.ligandmpnn_run.spawn(
-                run_name=candidate_run_name,
-                script_mode=script_mode,
-                struct_bytes=structure["data"],
-                seeds=_parse_seed_values(config.get("seeds", [0])),
-                cli_args=cli_args,
-                bias_aa_per_residue_bytes=config.get("bias_aa_per_residue_bytes"),
-                omit_aa_per_residue_bytes=config.get("omit_aa_per_residue_bytes"),
-            )
-            result = AppRunResult.model_validate(call.get())
-            status = result.status
-            outputs = _ligandmpnn_stage_outputs(
-                result,
-                candidate_id=task.candidate_id,
-                step_name=step_name,
-                selected_structure=str(structure["file_name"]),
-            )
-            return ppiflow_coordinators.CandidateOutcome(
-                candidate_id=task.candidate_id,
-                status=status,
-                outputs={
-                    "app_outputs": outputs,
-                    "files": _inline_output_file_records(outputs),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ppiflow_coordinators.CandidateOutcome(
-                candidate_id=task.candidate_id,
-                status=AppRunStatus.FAILED,
-                error=str(exc),
-            )
-
-    tasks = [
-        ppiflow_coordinators.CandidateTask(
-            candidate_id=str(structure["candidate_id"]),
-            payload=structure,
-        )
+    matches = [
+        structure
         for structure in selected_structures
+        if structure["candidate_id"] == candidate_id
     ]
-    outcomes = ppiflow_coordinators.run_candidate_tasks(
-        tasks,
-        submit,
-        candidate_concurrency=int(
-            config.get(
-                "candidate_concurrency",
-                ppiflow_coordinators.DEFAULT_CANDIDATE_CONCURRENCY,
-            )
-        ),
+    if len(matches) != 1:
+        raise ValueError(
+            f"LigandMPNN candidate {candidate_id!r} resolved to "
+            f"{len(matches)} structures"
+        )
+    structure = matches[0]
+    result = AppRunResult.model_validate(
+        ligandmpnn_app.ligandmpnn_run.get_raw_f()(
+            run_name=sanitize_filename(f"{run_name}-{candidate_id}"),
+            script_mode=script_mode,
+            struct_bytes=_bytes_payload(structure["data"], "structure data"),
+            seeds=_parse_seed_values(config.get("seeds", [0])),
+            cli_args=cli_args,
+            bias_aa_per_residue_bytes=config.get("bias_aa_per_residue_bytes"),
+            omit_aa_per_residue_bytes=config.get("omit_aa_per_residue_bytes"),
+        )
     )
-    outputs = [
-        output
-        for outcome in outcomes
-        for output in outcome.outputs.get("app_outputs", [])
-        if isinstance(output, AppOutput)
-    ]
-    manifest_output = _write_candidate_manifest_output(
-        run_id=run_id,
-        node_id=node_id,
+    outputs = _ligandmpnn_stage_outputs(
+        result,
+        candidate_id=candidate_id,
         step_name=step_name,
-        rows=ppiflow_coordinators.outcome_manifest_rows(
-            stage_name=step_name,
-            stage_role="sequence_design",
-            operation_mode=model_type,
-            outcomes=outcomes,
-        ),
+        selected_structure=str(structure["file_name"]),
     )
-    return AppRunResult(
-        status=ppiflow_coordinators.status_from_candidate_outcomes(outcomes),
-        outputs=[*outputs, manifest_output],
-        warnings=[
-            f"{outcome.candidate_id}: {outcome.error}"
-            for outcome in outcomes
-            if outcome.error
-        ],
+    candidate_files = _inline_output_file_records([
+        output for output in outputs if output.kind == ArtifactKind.STRUCTURES
+    ])
+    return result.model_copy(
+        update={
+            "outputs": [
+                output.model_copy(
+                    update={
+                        "metadata": dict(output.metadata)
+                        | {"candidate_files": candidate_files}
+                    }
+                )
+                if output.kind == ArtifactKind.STRUCTURES
+                else output
+                for output in outputs
+            ]
+        }
     )
 
 
@@ -1776,51 +1746,72 @@ class PPIFlowPartialNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 
 
 @dataclass
-class LigandMPNNNode(_ConfiguredAppStepNode):
-    """LigandMPNN or AbMPNN design step."""
+class LigandMPNNNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+    """LigandMPNN design with one kernel Task per input candidate."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare the LigandMPNN app call."""
-        script_mode = str(self.config.get("script_mode", "run"))
-        model_type = str(
+    def _model_type(self) -> str:
+        """Return the configured sequence-design model."""
+        return str(
             self.config.get(
                 "model_type",
                 "abmpnn" if self.step_name.startswith("AbMPNN") else "protein_mpnn",
             )
         )
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Discover stable candidate Tasks from the upstream manifest."""
+        return _candidate_remote_tasks(
+            context,
+            max_candidates=_optional_config_int(self.config, "max_structures"),
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Prepare one LigandMPNN candidate for kernel submission."""
+        candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
+        script_mode = str(self.config.get("script_mode", "run"))
+        model_type = self._model_type()
         cli_kwargs = _ligandmpnn_cli_kwargs(
             self.config,
             script_mode=script_mode,
             model_type=model_type,
         )
         return RemoteNodeCall(
-            function_name="run_ppiflow_ligandmpnn_stage",
-            uses_gpu=False,
+            function_name="run_ppiflow_ligandmpnn_candidate",
+            uses_gpu=True,
             kwargs={
                 "artifacts": self._structure_inputs(context),
                 "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
+                "candidate_id": candidate_id,
                 "config": self.config,
                 "run_name": self._run_name(context),
-                "run_id": context.workload_run_key,
-                "node_id": context.node_id,
                 "script_mode": script_mode,
-                "model_type": model_type,
                 "cli_args": ligandmpnn_app.build_ligandmpnn_cli_args(**cli_kwargs),
                 "step_name": self.step_name,
             },
+            runtime_image_key="ligandmpnn",
         )
 
-    def process_remote_result(
-        self, result: AppRunResult, metadata: Mapping[str, object]
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
     ) -> AppRunResult:
-        """Expose LigandMPNN archives as structure artifacts."""
-        result = AppRunResult.model_validate(result)
-        if any(output.kind == ArtifactKind.TABLE for output in result.outputs):
-            return result
-        return _result_with_output_kind(
-            result,
-            ArtifactKind.STRUCTURES,
-            {"step_name": self.step_name} | dict(metadata),
+        """Publish deterministic sequence-design candidate outcomes."""
+        return _finalize_candidate_tasks(
+            context,
+            step_name=self.step_name,
+            stage_role="sequence_design",
+            operation_mode=self._model_type(),
+            results=results,
+            errors=errors,
         )
 
 
@@ -3016,8 +3007,9 @@ def build_ppiflow_workflow(
     report_table_inputs: dict[str, Any] = {}
 
     stage1_tail = None
+    stage1_allows_partial = False
     if stage in {None, 1}:
-        stage1_tail = _add_stage1_nodes(
+        stage1_tail, stage1_allows_partial = _add_stage1_nodes(
             workflow=workflow,
             enabled=enabled,
             steps=steps_doc,
@@ -3039,6 +3031,7 @@ def build_ppiflow_workflow(
             steps=steps_doc,
             gentype=gentype,
             upstream=stage2_upstream,
+            upstream_allows_partial=stage1_allows_partial,
             report_table_inputs=report_table_inputs,
             candidate_concurrency=candidate_concurrency,
         )
@@ -3056,6 +3049,7 @@ def _add_stage1_nodes(
     candidate_concurrency: int,
 ):
     tail = None
+    partial_tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
         tail = workflow.add_node(
             PPIFlowDesignNode(
@@ -3089,7 +3083,9 @@ def _add_stage1_nodes(
             ),
             id=node_id,
             inputs=_structure_inputs(tail),
+            aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
         )
+        partial_tail = tail
         report_table_inputs["stage1_mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
 
     if _step_enabled(enabled, "FlowpackerStep_stage1"):
@@ -3104,7 +3100,9 @@ def _add_stage1_nodes(
             ),
             id="stage1-flowpacker",
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
 
     score = None
     if _step_enabled(enabled, "AF3scoreStep_stage1"):
@@ -3119,6 +3117,7 @@ def _add_stage1_nodes(
             ),
             id="stage1-af3score",
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
 
     if _step_enabled(enabled, "FilterStep_stage1"):
@@ -3136,11 +3135,13 @@ def _add_stage1_nodes(
             ),
             id="stage1-filter",
             inputs=inputs,
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
         report_table_inputs["stage1_filter_tables"] = tail.outputs(
             kind=ArtifactKind.TABLE
         )
-    return tail
+    return tail, partial_tail is not None
 
 
 def _add_stage2_nodes(
@@ -3150,11 +3151,12 @@ def _add_stage2_nodes(
     steps: dict[str, Any],
     gentype: str,
     upstream,
+    upstream_allows_partial: bool,
     report_table_inputs: dict[str, Any],
     candidate_concurrency: int,
 ) -> None:
     tail = upstream
-    partial_tail = None
+    partial_tail = upstream if upstream_allows_partial else None
     if _step_enabled(enabled, "RosettaFixStep"):
         tail = workflow.add_node(
             RosettaFixNode(
@@ -3167,7 +3169,9 @@ def _add_stage2_nodes(
             ),
             id="stage2-rosetta-fix",
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
 
     if _step_enabled(enabled, "RosettaFixStep") and _step_enabled(
         enabled, "PartialStep"
@@ -3179,7 +3183,9 @@ def _add_stage2_nodes(
             ),
             id="stage2-fixed-positions",
             inputs=_structure_inputs(tail),
+            accept_partial_from=_partial_sources(partial_tail),
         )
+        partial_tail = None
 
     if _step_enabled(enabled, "PartialStep"):
         tail = workflow.add_node(
@@ -3194,6 +3200,7 @@ def _add_stage2_nodes(
             id="stage2-partial-ppiflow",
             inputs=_structure_inputs(tail),
             aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+            accept_partial_from=_partial_sources(partial_tail),
         )
         partial_tail = tail
 
@@ -3217,9 +3224,10 @@ def _add_stage2_nodes(
             ),
             id=node_id,
             inputs=_structure_inputs(tail),
+            aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
             accept_partial_from=_partial_sources(partial_tail),
         )
-        partial_tail = None
+        partial_tail = tail
         report_table_inputs["mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
 
     if _step_enabled(enabled, "FlowpackerStep_stage2"):
@@ -3691,7 +3699,7 @@ def submit_ppiflow_workflow(
         orchestrator_kwargs["development_function_handles"] = {
             "run_ppiflow_design_stage": run_ppiflow_design_stage,
             "run_ppiflow_partial_candidate": run_ppiflow_partial_candidate,
-            "run_ppiflow_ligandmpnn_stage": run_ppiflow_ligandmpnn_stage,
+            "run_ppiflow_ligandmpnn_candidate": run_ppiflow_ligandmpnn_candidate,
             "run_ppiflow_flowpacker_stage": run_ppiflow_flowpacker_stage,
             "run_ppiflow_af3score_stage": run_ppiflow_af3score_stage,
             "run_ppiflow_rosetta_stage": run_ppiflow_rosetta_stage,

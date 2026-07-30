@@ -15,7 +15,7 @@ import polars as pl
 import pytest
 import zstandard as zstd
 
-from biomodals.app.design import ppiflow_app
+from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
@@ -165,7 +165,6 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
 
     for function_name in (
-        "run_ppiflow_ligandmpnn_stage",
         "run_ppiflow_refold_candidate",
         "run_ppiflow_flowpacker_stage",
         "run_ppiflow_dockq_stage",
@@ -181,6 +180,10 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _decorator_block(
         source,
         "run_ppiflow_design_stage",
+    )
+    assert "LIGANDMPNN_TASK_VOLUME_MOUNTS" in _decorator_block(
+        source,
+        "run_ppiflow_ligandmpnn_candidate",
     )
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
         source,
@@ -233,34 +236,6 @@ PPIFlowStep:
 def test_ligandmpnn_step_prepares_selected_structures_for_kernel(
     tmp_path: Path,
 ) -> None:
-    ligandmpnn_stage = _FakeModalFunction(
-        "fc-ligandmpnn-stage",
-        AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="LigandMPNN_outputs",
-                    kind=ArtifactKind.STRUCTURES,
-                    storage=InlineBytes(
-                        data=_tar_zst_bytes({
-                            "outputs/seqs/selected.fa": b">selected_design\nACD\n"
-                        }),
-                        filename="ligandmpnn.tar.zst",
-                        media_type="application/zstd",
-                    ),
-                ),
-                AppOutput(
-                    name="mpnn_seqs",
-                    kind=ArtifactKind.TABLE,
-                    storage=InlineBytes(
-                        data=b"candidate_id,sequence\nselected,ACD\n",
-                        filename="mpnn_seqs.csv",
-                        media_type="text/csv",
-                    ),
-                ),
-            ],
-        ),
-    )
     node = ppiflow_workflow.LigandMPNNNode(
         "MPNNStep_stage1",
         {
@@ -275,27 +250,30 @@ def test_ligandmpnn_step_prepares_selected_structures_for_kernel(
         execution_run_id=RUN_ID,
         workload_run_key="run-1",
         node_id="stage1-ligandmpnn",
-        task_key="node",
+        task_key="candidate-1",
         work_dir=tmp_path / "result",
         cache_dir=tmp_path / "cache",
         inputs={"structures": [_upstream_structure_artifact()]},
     )
 
-    submission = node.prepare_remote(context)
-    result = node.process_remote_result(ligandmpnn_stage.result, submission.metadata)
+    submission = node.prepare_remote_task(
+        context,
+        ppiflow_workflow.RemoteWorkflowTask(
+            task_key="candidate-1",
+            scientific_payload={"candidate_id": "candidate-1"},
+            execution_payload={"candidate_id": "candidate-1"},
+        ),
+    )
 
-    assert submission.function_name == "run_ppiflow_ligandmpnn_stage"
+    assert submission.function_name == "run_ppiflow_ligandmpnn_candidate"
+    assert submission.uses_gpu is True
+    assert submission.kwargs["candidate_id"] == "candidate-1"
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
     assert submission.kwargs["run_name"] == "mpnn-run"
     assert submission.kwargs["script_mode"] == "run"
     assert submission.kwargs["cli_args"]["--model_type"] == "protein_mpnn"
     assert submission.kwargs["cli_args"]["--batch_size"] == "2"
     assert submission.kwargs["cli_args"]["--number_of_batches"] == "3"
-    assert ligandmpnn_stage.kwargs == {}
-    assert result.outputs[0].kind == ArtifactKind.STRUCTURES
-    assert result.outputs[1].kind == ArtifactKind.TABLE
-    assert result.outputs[1].name == "mpnn_seqs"
-    assert b"selected,ACD" in result.outputs[1].storage.data
 
 
 def test_ligandmpnn_defers_multi_structure_selection_to_tracked_stage(
@@ -310,16 +288,21 @@ def test_ligandmpnn_defers_multi_structure_selection_to_tracked_stage(
         {"run_name": "mpnn-run"},
     )
 
-    submission = node.prepare_remote(
+    submission = node.prepare_remote_task(
         NodeRunContext(
             execution_run_id=RUN_ID,
             workload_run_key="run-1",
             node_id="stage1-ligandmpnn",
-            task_key="node",
+            task_key="candidate-1",
             work_dir=tmp_path / "result",
             cache_dir=tmp_path / "cache",
             inputs={"structures": artifacts},
-        )
+        ),
+        ppiflow_workflow.RemoteWorkflowTask(
+            task_key="candidate-1",
+            scientific_payload={"candidate_id": "candidate-1"},
+            execution_payload={"candidate_id": "candidate-1"},
+        ),
     )
 
     assert submission.kwargs["artifacts"] == artifacts
@@ -485,6 +468,99 @@ def test_design_stage_publishes_digest_bearing_candidate_manifest(
         for row in manifest.iter_rows(named=True)
         for file_record in row["files"]
     )
+
+
+def test_ligandmpnn_candidate_runs_science_in_kernel_owned_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    structure_dir = source_root / "upstream" / "results"
+    structure_dir.mkdir(parents=True)
+    structure_bytes = b"ATOM\n"
+    (structure_dir / "candidate.pdb").write_bytes(structure_bytes)
+    manifest_path = workflow_root / "candidate_manifest.parquet"
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="candidate-1",
+                stage_name="source",
+                stage_role="source",
+                operation_mode="source",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        volume_name="source-volume",
+                        app_volume_path="upstream/results/candidate.pdb",
+                        path="candidate.pdb",
+                        content_sha256=hashlib.sha256(structure_bytes).hexdigest(),
+                    )
+                ],
+            )
+        ],
+        manifest_path,
+    )
+    calls = []
+    archive = _tar_zst_bytes({
+        "outputs/backbones/designed.pdb": b"MODEL\n",
+        "outputs/seqs/designed.fa": b">designed\nACD\n",
+    })
+
+    def run_raw(**kwargs):
+        calls.append(kwargs)
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="LigandMPNN_outputs",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=InlineBytes(
+                        data=archive,
+                        filename="ligandmpnn.tar.zst",
+                        media_type="application/zstd",
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        ligandmpnn_app,
+        "ligandmpnn_run",
+        SimpleNamespace(get_raw_f=lambda: run_raw),
+    )
+    result = ppiflow_workflow.run_ppiflow_ligandmpnn_candidate.get_raw_f()(
+        artifacts=[_upstream_structure_artifact()],
+        candidate_manifests=[
+            WorkflowArtifact(
+                artifact_id="candidate-manifest",
+                producing_node_id="source",
+                kind=ArtifactKind.TABLE,
+                storage=VolumePath(
+                    volume_name="workflow-volume",
+                    path=manifest_path.relative_to(workflow_root).as_posix(),
+                ),
+            )
+        ],
+        candidate_id="candidate-1",
+        config={"seeds": [1]},
+        step_name="MPNNStep_stage1",
+        run_name="mpnn-run",
+        script_mode="run",
+        cli_args={"--model_type": "protein_mpnn"},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["run_name"] == "mpnn-run-candidate-1"
+    assert calls[0]["struct_bytes"] == structure_bytes
+    assert [output.kind for output in result.outputs] == [
+        ArtifactKind.STRUCTURES,
+        ArtifactKind.TABLE,
+    ]
+    assert result.outputs[1].name == "mpnn_seqs"
+    assert b"ACD" in result.outputs[1].storage.data
+    [file_record] = result.outputs[0].metadata["candidate_files"]
+    assert file_record["content_sha256"] == hashlib.sha256(archive).hexdigest()
 
 
 def test_partial_candidate_runs_science_in_kernel_owned_call(
@@ -1551,6 +1627,13 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     assert definition.dependencies["stage2-partial-ppiflow"] == {
         "stage2-fixed-positions"
     }
+    assert (
+        definition.nodes["stage1-ligandmpnn"].aggregation_policy
+        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
+    )
+    assert definition.nodes["stage1-flowpacker"].partial_dependencies == {
+        "stage1-ligandmpnn"
+    }
     assert definition.dependencies["stage2-dockq"] == {
         "stage2-filter",
         "stage2-alphafold3-refold",
@@ -1559,6 +1642,13 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         definition.nodes["stage2-partial-ppiflow"].aggregation_policy
         == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
     )
+    assert (
+        definition.nodes["stage2-ligandmpnn"].aggregation_policy
+        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
+    )
+    assert definition.nodes["stage2-ligandmpnn"].partial_dependencies == {
+        "stage2-partial-ppiflow"
+    }
     assert (
         definition.nodes["stage2-alphafold3-refold"].aggregation_policy
         == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL

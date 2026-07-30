@@ -30,7 +30,11 @@ from biomodals.schema import (
 from biomodals.workflow.core import NodeRunContext, Workflow, WorkflowNativeNode
 from biomodals.workflow.core.runtime import WorkflowRuntime
 from biomodals.workflow.ppiflow import manifests
-from biomodals.workflow.ppiflow_workflow import PPIFlowPartialNode, ReFoldNode
+from biomodals.workflow.ppiflow_workflow import (
+    LigandMPNNNode,
+    PPIFlowPartialNode,
+    ReFoldNode,
+)
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "PPIFlowWorkflow", 7)
@@ -143,6 +147,10 @@ class FakeModalDriver:
         (
             PPIFlowPartialNode("PartialStep", {"run_name": "partial"}),
             "run_ppiflow_partial_candidate",
+        ),
+        (
+            LigandMPNNNode("MPNNStep_stage1", {"run_name": "mpnn"}),
+            "run_ppiflow_ligandmpnn_candidate",
         ),
     ],
 )

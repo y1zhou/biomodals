@@ -191,6 +191,153 @@ def test_workflow_run_dry_run_forwards_entrypoint_flag(
     assert calls["kwargs"]["output_mode"] == "inherit"
 
 
+def test_workflow_run_resolves_and_forwards_an_exact_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run_command(command, **kwargs):
+        calls.append((command, kwargs))
+        if "history" in command:
+            return ['[{"version":"v7"},{"version":"v4"}]']
+        return []
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli._workflow_deployment_name",
+        lambda _workflow: "ShortMDWorkflow",
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(
+        app,
+        ["workflow", "run", "shortmd", "--", "/inputs"],
+    )
+
+    assert result.exit_code == 0
+    history_command, history_kwargs = calls[0]
+    assert history_command[-5:] == [
+        "history",
+        "ShortMDWorkflow",
+        "--env",
+        "main",
+        "--json",
+    ]
+    assert history_kwargs["output_mode"] == "capture"
+    run_command, run_kwargs = calls[1]
+    target_index = run_command.index(
+        "biomodals.workflow.shortmd_workflow::submit_shortmd_workflow"
+    )
+    assert run_command[target_index + 1 :] == [
+        "--use-deployed-coordinator",
+        "--deployment-environment",
+        "main",
+        "--deployment-name",
+        "ShortMDWorkflow",
+        "--deployment-version",
+        "7",
+        "/inputs",
+    ]
+    assert run_kwargs["output_mode"] == "inherit"
+
+
+def test_workflow_run_validates_an_explicit_version_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run_command(command, **_kwargs):
+        commands.append(command)
+        if "history" in command:
+            return ['[{"version":"v7"},{"version":"v4"}]']
+        return []
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "run",
+            "shortmd",
+            "--environment",
+            "production",
+            "--deployment-name",
+            "shortmd-prod",
+            "--version",
+            "4",
+            "--",
+            "/inputs",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert commands[0][-4:] == [
+        "shortmd-prod",
+        "--env",
+        "production",
+        "--json",
+    ]
+    assert "--deployment-version" in commands[1]
+    assert commands[1][commands[1].index("--deployment-version") + 1] == "4"
+
+
+def test_workflow_run_development_mode_skips_deployment_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run_command(command, **_kwargs):
+        commands.append(command)
+        return []
+
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+
+    result = runner.invoke(
+        app,
+        ["workflow", "run", "shortmd", "--development", "--", "/inputs"],
+    )
+
+    assert result.exit_code == 0
+    assert len(commands) == 1
+    assert "history" not in commands[0]
+    assert "--use-deployed-coordinator" not in commands[0]
+
+
+def test_workflow_run_fails_closed_for_an_unavailable_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda *_args, **_kwargs: ['[{"version":"v7"}]'],
+    )
+
+    result = runner.invoke(
+        app,
+        ["workflow", "run", "shortmd", "--version", "4", "--", "/inputs"],
+    )
+
+    assert result.exit_code == 1
+    output = strip_ansi(result.output)
+    assert "version 4 is" in output
+    assert "not available" in output
+
+
 def test_app_run_uses_inherited_output_streams(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

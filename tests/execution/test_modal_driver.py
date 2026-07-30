@@ -3,14 +3,17 @@
 # ruff: noqa: D101, D102, D103, D107
 
 import asyncio
+from uuid import UUID
 
 import pytest
 
+from biomodals.execution import DeploymentIdentity
 from biomodals.execution.modal import (
     AsyncModalCallDriver,
     ModalCallDriver,
     ModalCallObservationKind,
     ModalSubmissionOutcomeUnknownError,
+    deployed_execution_coordinator,
 )
 
 from .provider_call_helpers import GPU_BINDING
@@ -28,6 +31,39 @@ class FakeFunction:
         assert args == ("input",)
         assert kwargs == {"seed": 1}
         return type("Call", (), {"object_id": "fc-123"})()
+
+
+def test_deployed_coordinator_uses_exact_class_version_and_run_parameters() -> None:
+    resolved: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    parameters: dict[str, object] = {}
+
+    class Coordinator:
+        def __init__(self, **kwargs: object) -> None:
+            parameters.update(kwargs)
+
+    def resolve(*args: object, **kwargs: object) -> type[Coordinator]:
+        resolved.append((args, kwargs))
+        return Coordinator
+
+    handle = deployed_execution_coordinator(
+        execution_run_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        deployment=DeploymentIdentity("production", "ShortMDWorkflow", 7),
+        class_resolver=resolve,
+    )
+
+    assert isinstance(handle, Coordinator)
+    assert resolved == [
+        (
+            ("ShortMDWorkflow", "ExecutionCoordinator"),
+            {"environment_name": "production", "version": 7},
+        )
+    ]
+    assert parameters == {
+        "execution_run_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "deployment_environment": "production",
+        "deployment_name": "ShortMDWorkflow",
+        "deployment_version": 7,
+    }
 
 
 def test_driver_resolves_exact_version_and_spawns_detached_call() -> None:

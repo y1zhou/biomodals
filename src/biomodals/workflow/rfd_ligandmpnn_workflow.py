@@ -19,6 +19,7 @@ from uuid import uuid4
 import modal
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
+from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
@@ -581,6 +582,10 @@ def submit_rfd_ligandmpnn_workflow(
     max_parallel: int = 16,
     dry_run: bool = False,
     strict_artifact_checks: bool = False,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "development",
+    deployment_name: str | None = None,
+    deployment_version: int = 1,
 ) -> None:
     """Run RFdiffusion trajectories followed by LigandMPNN sequence design.
 
@@ -605,6 +610,10 @@ def submit_rfd_ligandmpnn_workflow(
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced RFdiffusion volume artifacts
             before reusing completed workflow nodes.
+        use_deployed_coordinator: Submit through an exact named deployment.
+        deployment_environment: Modal Environment containing the deployment.
+        deployment_name: Modal app deployment name. Defaults to this workflow.
+        deployment_version: Exact numeric Modal deployment version.
     """
     input_path = Path(input_pdb).expanduser().resolve()
     if not input_path.exists():
@@ -632,26 +641,35 @@ def submit_rfd_ligandmpnn_workflow(
         print_workflow_dag(workflow.validate())
         return
     execution_run_id = uuid4()
-    coordinator = orchestrator.ExecutionCoordinator(
-        execution_run_id=str(execution_run_id),
-        deployment_environment="development",
-        deployment_name=CONF.name,
-        deployment_version=1,
+    deployment = DeploymentIdentity(
+        environment=(
+            deployment_environment if use_deployed_coordinator else "development"
+        ),
+        deployment_name=(
+            (deployment_name or CONF.name) if use_deployed_coordinator else CONF.name
+        ),
+        deployment_version=deployment_version if use_deployed_coordinator else 1,
+    )
+    coordinator = orchestrator.execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
     )
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
-        "development_function_handles": {
+    }
+    if not use_deployed_coordinator:
+        orchestrator_kwargs["development_function_handles"] = {
             "rfdiffusion_infer": rfdiffusion_app.rfdiffusion_infer,
             "select_rfdiffusion_design": select_rfdiffusion_design,
             "ligandmpnn_run": ligandmpnn_app.ligandmpnn_run,
             "check_rfd_ligandmpnn_external_artifact": (
                 check_rfd_ligandmpnn_external_artifact
             ),
-        },
-    }
+        }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
         orchestrator_kwargs["external_artifact_checker_function_name"] = (
@@ -667,6 +685,12 @@ def submit_rfd_ligandmpnn_workflow(
         flush=True,
     )
     fc = coordinator.run.spawn(**orchestrator_kwargs)
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}",
+        flush=True,
+    )
     print(f"Execution Run ID: {execution_run_id}", flush=True)
     print(
         f"Coordinator FunctionCall ID: {getattr(fc, 'object_id', fc)}",

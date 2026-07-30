@@ -822,6 +822,54 @@ def test_submit_shortmd_workflow_can_enable_strict_external_checks(
     )
 
 
+def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "pdbs"
+    input_dir.mkdir()
+    input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
+    calls = {}
+
+    class FakeOrchestratorMethod:
+        def spawn(self, **kwargs):
+            calls["spawn"] = kwargs
+            return FakeFunctionCall("call-1")
+
+    class FakeCoordinator:
+        run = FakeOrchestratorMethod()
+
+    def fake_coordinator_handle(**kwargs):
+        calls["coordinator"] = kwargs
+        return FakeCoordinator()
+
+    monkeypatch.setattr(
+        shortmd_workflow.orchestrator,
+        "execution_coordinator_handle",
+        fake_coordinator_handle,
+    )
+    raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
+    assert raw_f is not None
+
+    raw_f(
+        input_dir=str(input_dir),
+        run_id="shortmd-run",
+        replicates=1,
+        wait=False,
+        use_deployed_coordinator=True,
+        deployment_environment="production",
+        deployment_name="shortmd-prod",
+        deployment_version=7,
+    )
+
+    deployment = calls["coordinator"]["deployment"]
+    assert deployment.environment == "production"
+    assert deployment.deployment_name == "shortmd-prod"
+    assert deployment.deployment_version == 7
+    assert calls["coordinator"]["use_deployed_coordinator"] is True
+    assert "development_function_handles" not in calls["spawn"]
+
+
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

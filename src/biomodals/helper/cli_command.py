@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -47,11 +48,12 @@ def build_workflow_run_command(
     modal_mode: str,
     detach: bool,
     dry_run: bool,
+    coordinator_flags: list[str] | tuple[str, ...] | None = None,
     flags: list[str] | tuple[str, ...] | None = None,
     python_executable: str | None = None,
 ) -> tuple[str, ...]:
     """Build the command for `biomodals workflow run` without side effects."""
-    entrypoint_flags = list(flags or ())
+    entrypoint_flags = [*(coordinator_flags or ()), *(flags or ())]
     if dry_run and "--dry-run" not in entrypoint_flags:
         entrypoint_flags.insert(0, "--dry-run")
     return tuple([
@@ -64,6 +66,65 @@ def build_workflow_run_command(
         f"{workflow_module}::{entrypoint}",
         *entrypoint_flags,
     ])
+
+
+def build_modal_app_history_command(
+    *,
+    deployment_name: str,
+    environment: str,
+    python_executable: str | None = None,
+) -> tuple[str, ...]:
+    """Build the exact deployment-history lookup used before submission."""
+    return (
+        python_executable or sys.executable,
+        "-m",
+        "modal",
+        "app",
+        "history",
+        deployment_name,
+        "--env",
+        environment,
+        "--json",
+    )
+
+
+def select_modal_deployment_version(
+    history_json: str,
+    *,
+    requested_version: int | None = None,
+) -> int:
+    """Select or validate one numeric version from Modal history JSON."""
+    try:
+        history = json.loads(history_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("Modal app history did not return valid JSON") from error
+    if not isinstance(history, list) or not history:
+        raise ValueError("Modal app history contains no deployed versions")
+
+    versions: list[int] = []
+    for item in history:
+        if not isinstance(item, dict):
+            raise ValueError("Modal app history contains an invalid entry")
+        raw_version = item.get("version")
+        if isinstance(raw_version, str):
+            raw_version = raw_version.removeprefix("v")
+        if isinstance(raw_version, bool):
+            raise ValueError("Modal app history contains an invalid version")
+        try:
+            version = int(raw_version)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Modal app history contains an invalid version") from error
+        if version < 1:
+            raise ValueError("Modal app history contains an invalid version")
+        versions.append(version)
+
+    if requested_version is None:
+        return max(versions)
+    if requested_version not in versions:
+        raise ValueError(
+            f"Modal deployment version {requested_version} is not available"
+        )
+    return requested_version
 
 
 def resolve_workflow_entrypoint(

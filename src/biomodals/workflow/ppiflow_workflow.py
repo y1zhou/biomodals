@@ -22,6 +22,7 @@ from biomodals.app.bioinfo import rosetta_app
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
 from biomodals.app.score import af3score_app, dockq_app
+from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     AppRunLayout,
@@ -3186,6 +3187,10 @@ def submit_ppiflow_workflow(
     max_child_calls: int | None = None,
     dry_run: bool = False,
     strict_artifact_checks: bool = False,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "development",
+    deployment_name: str | None = None,
+    deployment_version: int = 1,
 ) -> None:
     """Build and submit a PPIFlow workflow from task and step YAML files.
 
@@ -3206,6 +3211,10 @@ def submit_ppiflow_workflow(
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced app-owned volume artifacts
             before reusing completed workflow nodes.
+        use_deployed_coordinator: Submit through an exact named deployment.
+        deployment_environment: Modal Environment containing the deployment.
+        deployment_name: Modal app deployment name. Defaults to this workflow.
+        deployment_version: Exact numeric Modal deployment version.
     """
     task_yaml_path = Path(task_yaml).expanduser().resolve()
     steps_yaml_path = Path(steps_yaml).expanduser().resolve()
@@ -3237,18 +3246,28 @@ def submit_ppiflow_workflow(
     )
 
     execution_run_id = uuid4()
-    coordinator = orchestrator.ExecutionCoordinator(
-        execution_run_id=str(execution_run_id),
-        deployment_environment="development",
-        deployment_name=CONF.name,
-        deployment_version=1,
+    deployment = DeploymentIdentity(
+        environment=(
+            deployment_environment if use_deployed_coordinator else "development"
+        ),
+        deployment_name=(
+            (deployment_name or CONF.name) if use_deployed_coordinator else CONF.name
+        ),
+        deployment_version=deployment_version if use_deployed_coordinator else 1,
+    )
+    coordinator = orchestrator.execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
     )
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
-        "development_function_handles": {
+    }
+    if not use_deployed_coordinator:
+        orchestrator_kwargs["development_function_handles"] = {
             "ppiflow_run": ppiflow_app.ppiflow_run_workflow,
             "run_ppiflow_partial_stage": run_ppiflow_partial_stage,
             "run_ppiflow_ligandmpnn_stage": run_ppiflow_ligandmpnn_stage,
@@ -3262,8 +3281,7 @@ def submit_ppiflow_workflow(
             "rank_ppiflow_artifacts": rank_ppiflow_artifacts,
             "normalize_ppiflow_stage2_input": normalize_ppiflow_stage2_input,
             "check_ppiflow_external_artifact": check_ppiflow_external_artifact,
-        },
-    }
+        }
     if strict_artifact_checks:
         orchestrator_kwargs["strict_external_artifact_checks"] = True
         orchestrator_kwargs["external_artifact_checker_function_name"] = (
@@ -3275,6 +3293,12 @@ def submit_ppiflow_workflow(
         flush=True,
     )
     function_call = coordinator.run.spawn(**orchestrator_kwargs)
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}",
+        flush=True,
+    )
     print(f"Execution Run ID: {execution_run_id}", flush=True)
     print(
         "Coordinator FunctionCall ID: "

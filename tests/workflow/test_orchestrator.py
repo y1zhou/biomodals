@@ -442,6 +442,39 @@ def test_coordinator_plan_rejects_invalid_workflow_or_limits() -> None:
         )
 
 
+def test_coordinator_handle_resolves_the_exact_deployed_class_version() -> None:
+    calls: dict[str, object] = {}
+
+    class FakeCoordinator:
+        def __init__(self, **kwargs: object) -> None:
+            calls["parameters"] = kwargs
+
+    def resolve(*args: object, **kwargs: object) -> type[FakeCoordinator]:
+        calls["lookup_args"] = args
+        calls["lookup_kwargs"] = kwargs
+        return FakeCoordinator
+
+    handle = orchestrator.execution_coordinator_handle(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        use_deployed_coordinator=True,
+        class_resolver=resolve,
+    )
+
+    assert isinstance(handle, FakeCoordinator)
+    assert calls["lookup_args"] == ("DemoWorkflow", "ExecutionCoordinator")
+    assert calls["lookup_kwargs"] == {
+        "environment_name": "main",
+        "version": 7,
+    }
+    assert calls["parameters"] == {
+        "execution_run_id": str(RUN_ID),
+        "deployment_environment": "main",
+        "deployment_name": "DemoWorkflow",
+        "deployment_version": 7,
+    }
+
+
 def test_orchestrator_modal_app_exposes_standard_coordinator_surface() -> None:
     functions = orchestrator.app._local_state.functions
 

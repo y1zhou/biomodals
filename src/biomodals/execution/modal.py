@@ -6,10 +6,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
+from uuid import UUID
 
 import modal
 
-from biomodals.execution.model import ProviderBinding
+from biomodals.execution.model import DeploymentIdentity, ProviderBinding
 
 
 class ModalDefiniteSubmissionError(RuntimeError):
@@ -66,6 +67,27 @@ _CONCLUSIVE_EXECUTION_ERRORS = (
     modal.exception.RemoteError,
     modal.exception.UserCodeException,
 )
+
+
+def deployed_execution_coordinator(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    class_resolver: Callable[..., Any] = modal.Cls.from_name,
+) -> Any:
+    """Resolve and parameterize the standard exact-version coordinator class."""
+    coordinator_class = class_resolver(
+        deployment.deployment_name,
+        "ExecutionCoordinator",
+        environment_name=deployment.environment,
+        version=deployment.deployment_version,
+    )
+    return coordinator_class(
+        execution_run_id=str(execution_run_id),
+        deployment_environment=deployment.environment,
+        deployment_name=deployment.deployment_name,
+        deployment_version=deployment.deployment_version,
+    )
 
 
 class ModalCallDriver:

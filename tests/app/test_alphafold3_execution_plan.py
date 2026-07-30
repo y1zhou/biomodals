@@ -105,7 +105,7 @@ def test_alphafold3_search_tasks_bind_existing_scientific_identities() -> None:
     )
     assembly_plan = combined_msa_task_plan(
         assembly,
-        raw_publication_digests={
+        raw_search_identities={
             "uniref90": "b" * 64,
             "uniprot": "c" * 64,
         },
@@ -124,7 +124,7 @@ def test_alphafold3_search_tasks_bind_existing_scientific_identities() -> None:
 
     assert raw_plan.task_key == f"uniref90:{sequence_hash('ACDE')}:{'a' * 64}"
     assert raw_plan.scientific_payload["search_identity"] == "a" * 64
-    assert assembly_plan.scientific_payload["raw_publication_digests"] == {
+    assert assembly_plan.scientific_payload["raw_search_identities"] == {
         "uniprot": "c" * 64,
         "uniref90": "b" * 64,
     }

@@ -49,16 +49,16 @@ def raw_search_task_plan(
 def combined_msa_task_plan(
     task: MsaAssemblyTask,
     *,
-    raw_publication_digests: Mapping[str, str],
+    raw_search_identities: Mapping[str, str],
 ) -> TaskPlan:
-    """Describe one combined-MSA publication over validated raw inputs."""
+    """Describe one combined-MSA publication over fixed raw-search identities."""
     query_identity = sequence_hash(task.sequence)
     dependencies = {
         database_id: _digest(
-            digest,
-            field_name=f"raw_publication_digests[{database_id!r}]",
+            identity,
+            field_name=f"raw_search_identities[{database_id!r}]",
         )
-        for database_id, digest in sorted(raw_publication_digests.items())
+        for database_id, identity in sorted(raw_search_identities.items())
     }
     return TaskPlan(
         task_key=(
@@ -69,7 +69,7 @@ def combined_msa_task_plan(
             "include_paired": task.include_paired,
             "include_unpaired": task.include_unpaired,
             "polymer": task.polymer,
-            "raw_publication_digests": dependencies,
+            "raw_search_identities": dependencies,
             "sequence_sha256": query_identity,
         },
         execution_payload={

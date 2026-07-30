@@ -13,6 +13,7 @@ BIOMODALS_HOME = Path(__file__).parent.parent.resolve()
 APP_HOME = BIOMODALS_HOME / "app"
 WORKFLOW_HOME = BIOMODALS_HOME / "workflow"
 CatalogType = Literal["app", "workflow"]
+_EXECUTION_COORDINATOR_TAG = "ExecutionCoordinator"
 
 
 class AppNotFoundError(ValueError):
@@ -72,7 +73,7 @@ def get_catalog(
 
 
 def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> modal.App:
-    """Include catalog app definitions into an existing Modal app."""
+    """Include child-call functions without importing a nested coordinator."""
     all_apps = get_catalog("app", use_absolute_paths=True)
     for dependency in dependencies:
         dependency_metadata = BiomodalsApp(dependency, all_apps=all_apps)
@@ -83,12 +84,20 @@ def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> moda
                 f"Dependency app '{dependency}' does not expose a modal.App named app"
             )
 
+        dependency_functions = {
+            tag: function
+            for tag, function in dependency_app._local_state.functions.items()
+            if not _is_execution_coordinator_tag(tag)
+        }
+        dependency_classes = {
+            tag: cls
+            for tag, cls in dependency_app._local_state.classes.items()
+            if not _is_execution_coordinator_tag(tag)
+        }
         function_collisions = set(app._local_state.functions) & set(
-            dependency_app._local_state.functions
+            dependency_functions
         )
-        class_collisions = set(app._local_state.classes) & set(
-            dependency_app._local_state.classes
-        )
+        class_collisions = set(app._local_state.classes) & set(dependency_classes)
         duplicate_tags = sorted(function_collisions | class_collisions)
         if duplicate_tags:
             duplicate_list = ", ".join(duplicate_tags)
@@ -96,8 +105,18 @@ def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> moda
                 f"Dependency app '{dependency}' has Modal tag collisions: "
                 f"{duplicate_list}"
             )
-        app.include(dependency_app, inherit_tags=False)
+        for function in dependency_functions.values():
+            app._add_function(function, False)
+        for tag, cls in dependency_classes.items():
+            app._add_class(tag, cls)
     return app
+
+
+def _is_execution_coordinator_tag(tag: str) -> bool:
+    """Return whether one Modal tag belongs to the child app's coordinator."""
+    return tag == _EXECUTION_COORDINATOR_TAG or tag.startswith(
+        f"{_EXECUTION_COORDINATOR_TAG}."
+    )
 
 
 @dataclass(frozen=True)

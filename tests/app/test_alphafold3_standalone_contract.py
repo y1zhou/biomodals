@@ -21,7 +21,6 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     LoadedInferenceInput,
-    PreparedInferenceRun,
     VolumeUpload,
     prepare_inference_run,
 )
@@ -40,7 +39,6 @@ from biomodals.app.fold.alphafold3.msa_search import (
     sequence_cache_relpath,
 )
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
-from biomodals.app.fold.alphafold3.request_results import RequestPublication
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -657,8 +655,9 @@ def test_inference_staging_is_marker_last_and_reusable() -> None:
 
 def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The thin client stages a normalized request for the remote coordinator."""
     input_json = tmp_path / "input.json"
     conf = AF3Config(
         name="original",
@@ -668,45 +667,50 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
         ],
     )
     input_json.write_text(conf.model_dump_json(), encoding="utf-8")
-    captured = {}
+    captured: dict[str, object] = {}
 
-    def fake_predict_structures(
-        prepared: PreparedInferenceRun,
-        num_containers: int,
-    ) -> dict[str, object]:
-        captured["prepared"] = prepared
-        captured["num_containers"] = num_containers
-        return {"request": {"status": "complete"}}
+    class CoordinatorMethod:
+        def spawn(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-coordinator",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=alphafold3_app.RunStatus.SUCCEEDED,
+                        status_reason=None,
+                        status_message=None,
+                    )
+                ),
+            )
 
+    class Coordinator:
+        run = CoordinatorMethod()
+
+    def stage(output_volume, execution_run_id, request):
+        del output_volume
+        captured["execution_run_id"] = execution_run_id
+        captured["request"] = request
+
+    def coordinator_handle(**kwargs):
+        captured["coordinator"] = kwargs
+        return Coordinator()
+
+    manifest: dict[str, object] = {"status": "complete"}
+    monkeypatch.setattr(alphafold3_app, "stage_execution_request", stage)
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_execution_coordinator_handle",
+        coordinator_handle,
+    )
     monkeypatch.setattr(
         alphafold3_app,
         "load_invocation_manifest",
-        lambda output_volume, invocation: None,
+        lambda output_volume, invocation: manifest,
     )
     monkeypatch.setattr(
         alphafold3_app,
-        "load_request_manifest",
-        lambda output_volume, publication: None,
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "publish_invocation_receipt",
-        lambda output_volume, receipt: None,
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "build_invocation_receipt",
-        lambda invocation, prepared, manifest: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "stage_inference_run",
-        lambda output_volume, prepared: None,
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "_predict_structures",
-        fake_predict_structures,
+        "request_publication_from_manifest",
+        lambda selected: SimpleNamespace(run_id="a" * 64),
     )
     monkeypatch.setattr(
         alphafold3_app,
@@ -728,29 +732,30 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
         max_num_gpus=4,
         recycle=3,
         sample=2,
+        use_deployed_coordinator=True,
+        deployment_environment="production",
+        deployment_name="AlphaFold3Prod",
+        deployment_version=7,
     )
 
-    prepared = captured.pop("prepared")
-    assert isinstance(prepared, PreparedInferenceRun)
-    assert prepared.display_name == "renamed"
-    assert prepared.submitted_seeds == (11, 12)
-    assert prepared.normalized_seeds == (11, 12)
-    assert prepared.recycle == 3
-    assert prepared.sample_count == 2
-    input_upload = next(
-        upload
-        for upload in prepared.payload_uploads
-        if upload.relative_path.name == "input.json"
-    )
-    assert AF3Config.model_validate_json(input_upload.content).modelSeeds == [11, 12]
-    assert captured == {"num_containers": 2}
+    request = captured["request"]
+    assert request.config.name == "renamed"
+    assert request.config.modelSeeds == [11, 12]
+    assert request.max_num_gpus == 4
+    assert request.recycle == 3
+    assert request.sample == 2
+    assert captured["run_kwargs"] == {"development": False}
+    deployment = captured["coordinator"]["deployment"]
+    assert deployment.environment == "production"
+    assert deployment.deployment_name == "AlphaFold3Prod"
+    assert deployment.deployment_version == 7
 
 
-def test_submit_alphafold3_task_reuses_a_completed_request_view(
+def test_submit_alphafold3_task_routes_a_cache_hit_through_a_new_root_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A completed view should skip staging and all inference remote calls."""
+    """A repeated launch still records a root Run before reusing publications."""
     input_json = tmp_path / "input.json"
     input_json.write_text(
         AF3Config(
@@ -773,10 +778,19 @@ def test_submit_alphafold3_task_reuses_a_completed_request_view(
     cached_manifest: dict[str, object] = {"status": "complete"}
     captured: dict[str, object] = {}
 
-    def load_manifest(output_volume, publication):
-        del output_volume
-        captured["publication"] = publication
-        return cached_manifest
+    class CoordinatorMethod:
+        def spawn(self, **kwargs):
+            captured["spawned"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-cached",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=alphafold3_app.RunStatus.SUCCEEDED,
+                        status_reason=None,
+                        status_message=None,
+                    )
+                ),
+            )
 
     def create_archive(reader, manifest, *, output_dir, display_name):
         del reader, output_dir
@@ -784,31 +798,28 @@ def test_submit_alphafold3_task_reuses_a_completed_request_view(
         captured["display_name"] = display_name
         return tmp_path / "cached.tar.zst"
 
-    monkeypatch.setattr(alphafold3_app, "load_request_manifest", load_manifest)
+    monkeypatch.setattr(
+        alphafold3_app,
+        "stage_execution_request",
+        lambda output, run_id, request: captured.update({
+            "run_id": run_id,
+            "request": request,
+        }),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_execution_coordinator_handle",
+        lambda **kwargs: SimpleNamespace(run=CoordinatorMethod()),
+    )
     monkeypatch.setattr(
         alphafold3_app,
         "load_invocation_manifest",
-        lambda output_volume, invocation: None,
+        lambda output_volume, invocation: cached_manifest,
     )
     monkeypatch.setattr(
         alphafold3_app,
-        "publish_invocation_receipt",
-        lambda output_volume, receipt: None,
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "build_invocation_receipt",
-        lambda invocation, prepared, manifest: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "stage_inference_run",
-        lambda *args: pytest.fail("completed request was restaged"),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "_predict_structures",
-        lambda *args: pytest.fail("completed request launched inference"),
+        "request_publication_from_manifest",
+        lambda selected: SimpleNamespace(run_id="a" * 64),
     )
     monkeypatch.setattr(alphafold3_app, "create_request_archive", create_archive)
 
@@ -822,19 +833,17 @@ def test_submit_alphafold3_task_reuses_a_completed_request_view(
         sample=1,
     )
 
-    publication = captured["publication"]
-    assert isinstance(publication, RequestPublication)
-    assert publication.display_name == "cached"
-    assert publication.submitted_seeds == (11,)
+    assert captured["request"].config.name == "cached"
+    assert captured["spawned"] == {"development": True}
     assert captured["manifest"] is cached_manifest
     assert captured["display_name"] == "cached"
 
 
-def test_submit_alphafold3_task_reuses_an_exact_invocation_before_search(
+def test_submit_alphafold3_task_restart_creates_a_successor_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An invocation receipt should bypass every remote-search and inference seam."""
+    """Launch-time restart delegates to the coordinator's successor operation."""
     input_json = tmp_path / "input.json"
     input_json.write_text(
         AF3Config(
@@ -846,54 +855,54 @@ def test_submit_alphafold3_task_reuses_an_exact_invocation_before_search(
     )
     manifest: dict[str, object] = {"status": "complete"}
     captured: dict[str, object] = {}
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
-    def load_invocation(output_volume, invocation):
-        del output_volume
-        captured["invocation"] = invocation
-        return manifest
+    class ForbiddenRun:
+        def spawn(self, **kwargs):
+            pytest.fail(f"restart submitted a root Run: {kwargs}")
 
-    def create_archive(reader, selected_manifest, *, output_dir, display_name):
-        del reader, output_dir
-        captured["manifest"] = selected_manifest
-        captured["display_name"] = display_name
-        return tmp_path / "exact.tar.zst"
+    class Restart:
+        def spawn(self, **kwargs):
+            captured["restart"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-successor",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=alphafold3_app.RunStatus.SUCCEEDED,
+                        status_reason=None,
+                        status_message=None,
+                    )
+                ),
+            )
 
     monkeypatch.setattr(
         alphafold3_app,
+        "stage_execution_request",
+        lambda output, run_id, request: None,
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "_execution_coordinator_handle",
+        lambda **kwargs: SimpleNamespace(
+            run=ForbiddenRun(),
+            restart_from=Restart(),
+        ),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
         "load_invocation_manifest",
-        load_invocation,
+        lambda output, invocation: manifest,
     )
     monkeypatch.setattr(
         alphafold3_app,
         "request_publication_from_manifest",
-        lambda selected: SimpleNamespace(run_id="a" * 64, request_id="b" * 64),
+        lambda selected: SimpleNamespace(run_id="a" * 64),
     )
     monkeypatch.setattr(
         alphafold3_app,
-        "_search_msa_and_templates",
-        lambda *args, **kwargs: pytest.fail("exact invocation launched search"),
+        "create_request_archive",
+        lambda *args, **kwargs: tmp_path / "exact.tar.zst",
     )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "load_request_manifest",
-        lambda *args: pytest.fail("exact invocation needed the secondary lookup"),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "stage_inference_run",
-        lambda *args: pytest.fail("exact invocation was restaged"),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "_predict_structures",
-        lambda *args: pytest.fail("exact invocation launched inference"),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "publish_invocation_receipt",
-        lambda *args: pytest.fail("existing invocation receipt was republished"),
-    )
-    monkeypatch.setattr(alphafold3_app, "create_request_archive", create_archive)
 
     entrypoint = alphafold3_app.submit_alphafold3_task.info
     assert entrypoint is not None and entrypoint.raw_f is not None
@@ -902,15 +911,12 @@ def test_submit_alphafold3_task_reuses_an_exact_invocation_before_search(
         out_dir=str(tmp_path),
         recycle=1,
         sample=1,
+        restart_from=predecessor,
     )
 
-    invocation = captured["invocation"]
-    assert invocation.identity["presentation"] == {
-        "display_name": "exact",
-        "submitted_seeds": [11],
+    assert captured["restart"] == {
+        "predecessor_execution_run_id": predecessor,
     }
-    assert captured["manifest"] is manifest
-    assert captured["display_name"] == "exact"
 
 
 def test_submit_alphafold3_task_rejects_input_json_symlink(tmp_path: Path) -> None:

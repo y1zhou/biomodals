@@ -115,3 +115,48 @@ def test_include_dependency_apps_rejects_duplicate_modal_tags(monkeypatch) -> No
 
     with pytest.raises(ValueError, match="duplicate_function"):
         include_dependency_apps(workflow_app, ("dependency",))
+
+
+def test_include_dependency_apps_excludes_the_child_coordinator(
+    monkeypatch,
+) -> None:
+    """A workflow includes child functions but owns the only execution ledger."""
+    workflow_app = modal.App("workflow")
+    dependency_app = modal.App("dependency")
+
+    @dependency_app.function(name="worker", serialized=True)
+    def worker() -> None:
+        return None
+
+    @dependency_app.cls(serialized=True)
+    class ExecutionCoordinator:
+        @modal.method()
+        def run(self) -> None:
+            return None
+
+    class FakeBiomodalsApp:
+        def __init__(self, app_name_or_path: str, all_apps: dict[str, Path]) -> None:
+            self.module = "fake.dependency_app"
+
+    monkeypatch.setattr(
+        catalog,
+        "get_catalog",
+        lambda *args, **kwargs: {"dependency": Path("/apps/dependency_app.py")},
+    )
+    monkeypatch.setattr(catalog, "BiomodalsApp", FakeBiomodalsApp)
+    monkeypatch.setattr(
+        catalog.importlib,
+        "import_module",
+        lambda module_name: SimpleNamespace(app=dependency_app),
+    )
+
+    include_dependency_apps(workflow_app, ("dependency",))
+
+    assert "worker" in workflow_app._local_state.functions
+    assert not any(
+        tag == "ExecutionCoordinator" or tag.startswith("ExecutionCoordinator.")
+        for tag in (
+            *workflow_app._local_state.functions,
+            *workflow_app._local_state.classes,
+        )
+    )

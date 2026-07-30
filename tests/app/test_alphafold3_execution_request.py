@@ -14,6 +14,7 @@ from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
     execution_request_path,
     load_execution_request,
+    persist_execution_request,
     stage_execution_request,
 )
 
@@ -120,3 +121,16 @@ def test_execution_request_staging_is_immutable_and_remotely_revalidated(
     path.write_bytes(_request(search_workers=1).to_bytes())
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_execution_request(volume, RUN_ID, request)
+
+
+def test_coordinator_request_persistence_is_idempotent(tmp_path: Path) -> None:
+    """Mounted coordinators can stage a successor request before its ledger."""
+    request = _request()
+
+    assert persist_execution_request(tmp_path, RUN_ID, request) == (
+        execution_request_path(RUN_ID)
+    )
+    assert persist_execution_request(tmp_path, RUN_ID, request) == (
+        execution_request_path(RUN_ID)
+    )
+    assert load_execution_request(tmp_path, RUN_ID) == request

@@ -165,6 +165,7 @@ class AlphaFold3ExecutionRuntime:
         search_runtime: SearchRuntime,
         template_runtime: TemplateRuntime,
         inference_runtime: InferenceRuntime,
+        predecessor_execution_run_id: UUID | None = None,
         poll_interval_seconds: float = 1.0,
         now: Callable[[], int] | None = None,
     ) -> None:
@@ -177,6 +178,7 @@ class AlphaFold3ExecutionRuntime:
         self.search_runtime = search_runtime
         self.template_runtime = template_runtime
         self.inference_runtime = inference_runtime
+        self.predecessor_execution_run_id = predecessor_execution_run_id
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
         self._provider = ExecutionRuntime(
@@ -282,6 +284,7 @@ class AlphaFold3ExecutionRuntime:
             with self.store.transaction():
                 repository.create_run(
                     execution_run_id=self.execution_run_id,
+                    predecessor_execution_run_id=(self.predecessor_execution_run_id),
                     plan=plan,
                     deployment=self.deployment,
                     max_active_provider_calls=(self.request.max_active_provider_calls),
@@ -291,6 +294,8 @@ class AlphaFold3ExecutionRuntime:
             return self._checkpoint()
         if existing.plan != plan:
             raise ValueError("AlphaFold3 plan does not match Execution Run")
+        if existing.predecessor_execution_run_id != self.predecessor_execution_run_id:
+            raise ValueError("AlphaFold3 predecessor does not match Execution Run")
         if existing.deployment != self.deployment:
             raise ValueError("Deployment Identity does not match Execution Run")
         if (

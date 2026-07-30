@@ -14,6 +14,7 @@ from uniaf3.schema.alphafold3 import AF3Config
 from biomodals.app.fold.alphafold3.artifacts import (
     read_bounded_file_bytes,
     read_volume_bytes,
+    write_bytes_atomic,
 )
 from biomodals.app.fold.alphafold3.execution_plan import (
     build_alphafold3_execution_plan,
@@ -216,6 +217,30 @@ def load_execution_request(
         max_bytes=MAX_EXECUTION_REQUEST_BYTES,
     )
     return AlphaFold3ExecutionRequest.from_bytes(content)
+
+
+def persist_execution_request(
+    volume_root: str | Path,
+    execution_run_id: UUID,
+    request: AlphaFold3ExecutionRequest,
+) -> PurePosixPath:
+    """Idempotently persist a request from inside a mounted coordinator."""
+    relative = execution_request_path(execution_run_id)
+    path = Path(volume_root).joinpath(*relative.parts)
+    content = request.to_bytes()
+    if path.exists():
+        existing = read_bounded_file_bytes(
+            path,
+            field_name="AlphaFold3 execution request",
+            max_bytes=MAX_EXECUTION_REQUEST_BYTES,
+        )
+        if existing != content:
+            raise RuntimeError(
+                "Existing AlphaFold3 execution request conflicts with this run"
+            )
+        return relative
+    write_bytes_atomic(path, content)
+    return relative
 
 
 def _required_bool(value: dict[object, object], key: str) -> bool:

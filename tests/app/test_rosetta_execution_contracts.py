@@ -79,7 +79,7 @@ def test_execute_preserves_command_and_reuses_valid_publication(
     )
 
     assert first == second
-    assert calls == [(expected_command, "capture", tmp_path / "logs" / "1.log")]
+    assert calls == [(expected_command, "log", tmp_path / "logs" / "1.log")]
     assert checkpoints == ["outputs"]
     assert validate_task_publication(tmp_path, task, "fingerprint")
     assert not validate_task_publication(tmp_path, task, "other-fingerprint")

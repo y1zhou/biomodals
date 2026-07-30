@@ -459,7 +459,7 @@ def run_boltzgen_task(
     )
     print(f"💊 Running BoltzGen, saving logs to {log_vol_path}")
     try:
-        run_command(cmd, output_mode="capture", log_file=log_path, cwd=out_path)
+        run_command(cmd, output_mode="log", log_file=log_path, cwd=out_path)
         if not is_boltzgen_run_complete(out_path):
             raise RuntimeError("BoltzGen returned without its final publication")
         CONF.output_volume.commit()

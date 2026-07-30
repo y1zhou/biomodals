@@ -132,7 +132,7 @@ def execute_rosetta_task(
     ])
     run_command(
         command,
-        output_mode="capture",
+        output_mode="log",
         log_file=worker_log,
     )
     missing = [

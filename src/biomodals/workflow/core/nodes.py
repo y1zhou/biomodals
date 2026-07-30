@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 from uuid import UUID
 
+from biomodals.execution import AvailabilityStatus
 from biomodals.schema import AppRunResult, WorkflowArtifact
 
 
@@ -182,6 +183,18 @@ class RemoteTaskWorkflowNode:
             raise ValueError("This workflow Node does not support Task batching")
         task_key = task_keys[0]
         return {task_key: self.process_remote_task_result(task_key, result, metadata)}
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[WorkflowArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        """Optionally validate a workload-owned publication beyond its artifacts."""
+        del context, task, expected_fingerprint, result, artifacts
+        return None
 
     def finalize_remote_tasks(
         self,

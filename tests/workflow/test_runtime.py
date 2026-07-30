@@ -9,6 +9,7 @@ from typing import cast
 from uuid import UUID
 
 from biomodals.execution import (
+    AvailabilityStatus,
     DeploymentIdentity,
     NodeAggregationPolicy,
     NodeStatus,
@@ -201,6 +202,16 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
 @dataclass
 class PullFanoutNode(RemotePullTaskWorkflowNode):
     texts: tuple[str, ...]
+    publication_observation: AvailabilityStatus | None = field(
+        default=None,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+    publication_probes: list[str] = field(
+        default_factory=list,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
     finalized_results: list[tuple[tuple[str, ...], tuple[str, ...]]] = field(
         default_factory=list,
         repr=False,
@@ -231,6 +242,18 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
             kwargs={"node_id": context.node_id},
             runtime_image_key="pull-cpu",
         )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[WorkflowArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, expected_fingerprint, result, artifacts
+        self.publication_probes.append(task.task_key)
+        return self.publication_observation
 
     def finalize_remote_tasks(
         self,
@@ -627,6 +650,45 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
     assert node.finalized_results == [
         (("candidate-0", "candidate-1", "candidate-2"), ()),
     ]
+
+
+def test_pull_task_node_uses_workload_publication_probe(tmp_path: Path) -> None:
+    workflow = Workflow("pull-publication-probe")
+    node = PullFanoutNode(
+        ("alpha",),
+        publication_observation=AvailabilityStatus.MISSING,
+    )
+    workflow.add_node(node, id="fanout")
+    driver = PullModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "pull-publication-probe"
+    runtime._ensure_run(definition, "pull-publication-probe")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+
+    task = runtime.complete_pull_task(
+        call.provider_call_id,
+        assignment.task_key,
+        request_id="complete",
+        result=_text_result("alpha"),
+    )
+
+    assert task.status == TaskStatus.FAILED
+    assert node.publication_probes == ["candidate-0"]
 
 
 def test_remote_task_node_can_publish_partial_outcomes(tmp_path: Path) -> None:

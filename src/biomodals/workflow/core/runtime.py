@@ -331,14 +331,26 @@ class WorkflowRuntime:
             artifact_id_scope=task_key,
             volume_root=self.volume_root,
         )
-        observation = self._artifact_observation(tuple(materialized.artifacts))
+        artifacts = tuple(materialized.artifacts)
+        observation = self._observe_remote_task_publication(
+            node,
+            context,
+            RemoteWorkflowTask(
+                task_key=task.task_key,
+                scientific_payload=task.scientific_payload,
+                execution_payload=task.execution_payload,
+            ),
+            task.fingerprint,
+            materialized.result,
+            artifacts,
+        )
         with self.store.transaction():
             self.store.artifacts.record_task_publication(
                 call.node_key,
                 task_key,
                 task_fingerprint=task.fingerprint,
                 result=materialized.result,
-                artifacts=tuple(materialized.artifacts),
+                artifacts=artifacts,
                 now=self._now(),
             )
             completed = self.store.execution.record_pull_task_completion(
@@ -418,12 +430,24 @@ class WorkflowRuntime:
                     ):
                         if task.status.is_terminal:
                             continue
+                        context = self._node_context(
+                            definition,
+                            node.node_key,
+                            task_key=task.task_key,
+                        )
+                        task_definition = RemoteWorkflowTask(
+                            task_key=task.task_key,
+                            scientific_payload=task.scientific_payload,
+                            execution_payload=task.execution_payload,
+                        )
                         task_observations.append((
                             node.node_key,
                             task.task_key,
-                            self._task_publication_observation(
+                            self._remote_task_publication_observation(
                                 node.node_key,
-                                task.task_key,
+                                implementation,
+                                context,
+                                task_definition,
                                 task.fingerprint,
                             ),
                         ))
@@ -687,9 +711,11 @@ class WorkflowRuntime:
                     tasks.append(
                         _PreparedTask(
                             plan=plan,
-                            observation=self._task_publication_observation(
+                            observation=self._remote_task_publication_observation(
                                 node_id,
-                                task.task_key,
+                                node,
+                                context,
+                                task,
                                 plan.fingerprint(
                                     workload_plan_fingerprint=(
                                         workload_plan_fingerprint
@@ -1419,6 +1445,61 @@ class WorkflowRuntime:
             task_key,
         )
         return self._artifact_observation(artifacts)
+
+    def _remote_task_publication_observation(
+        self,
+        node_id: str,
+        implementation: RemoteTaskWorkflowNode,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+    ) -> AvailabilityStatus:
+        """Validate a stored Task result and its workload-owned publication."""
+        result = self.store.artifacts.load_task_result(node_id, task.task_key)
+        if (
+            result is None
+            or result.status != AppRunStatus.SUCCEEDED
+            or self.store.artifacts.load_task_fingerprint(
+                node_id,
+                task.task_key,
+            )
+            != expected_fingerprint
+        ):
+            return AvailabilityStatus.MISSING
+        artifacts = self.store.artifacts.load_task_output_artifacts(
+            node_id,
+            task.task_key,
+        )
+        return self._observe_remote_task_publication(
+            implementation,
+            context,
+            task,
+            expected_fingerprint,
+            result,
+            artifacts,
+        )
+
+    def _observe_remote_task_publication(
+        self,
+        implementation: RemoteTaskWorkflowNode,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[WorkflowArtifact, ...],
+    ) -> AvailabilityStatus:
+        """Combine durable workflow artifacts with a workload-specific probe."""
+        artifact_observation = self._artifact_observation(artifacts)
+        if artifact_observation != AvailabilityStatus.AVAILABLE:
+            return artifact_observation
+        workload_observation = implementation.observe_remote_task_publication(
+            context,
+            task,
+            expected_fingerprint,
+            result,
+            artifacts,
+        )
+        return workload_observation or AvailabilityStatus.AVAILABLE
 
     def _artifact_observation(
         self,

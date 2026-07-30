@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from threading import RLock
 from typing import Protocol
-
-from biomodals.workflow.core.ledger import WorkflowLedger
 
 
 class WorkflowVolume(Protocol):
@@ -18,6 +17,13 @@ class WorkflowVolume(Protocol):
         """Refresh local view of writes made by other containers."""
 
 
+class WorkflowStore(Protocol):
+    """Store boundary needed while synchronizing its backing Volume."""
+
+    def closed_for_volume_sync(self) -> AbstractContextManager[None]:
+        """Close SQLite while the host crosses its durability boundary."""
+
+
 class WorkflowVolumeSync:
     """Coordinate Modal volume synchronization with ledger file access."""
 
@@ -25,7 +31,7 @@ class WorkflowVolumeSync:
         self,
         *,
         workflow_volume: WorkflowVolume | None,
-        ledger: WorkflowLedger,
+        ledger: WorkflowStore,
     ) -> None:
         self.workflow_volume = workflow_volume
         self.ledger = ledger
@@ -33,11 +39,10 @@ class WorkflowVolumeSync:
 
     def commit(self) -> None:
         """Persist pending workflow volume writes, if a Modal volume is attached."""
-        if self.workflow_volume is None:
-            return
         with self.lock:
             with self.ledger.closed_for_volume_sync():
-                self.workflow_volume.commit()
+                if self.workflow_volume is not None:
+                    self.workflow_volume.commit()
 
     def reload(self) -> None:
         """Refresh the local workflow volume view, if a Modal volume is attached."""

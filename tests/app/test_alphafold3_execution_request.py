@@ -1,12 +1,47 @@
 """Tests for AlphaFold3's remote App Run request boundary."""
 
+# ruff: noqa: D101,D102,D107
+
+from contextlib import contextmanager
+from pathlib import Path
+from uuid import UUID
+
 import orjson
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
+    execution_request_path,
+    load_execution_request,
+    stage_execution_request,
 )
+
+RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+
+class FakeVolume:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def read_file(self, path: str):
+        selected = self.root / path.lstrip("/")
+        if not selected.is_file():
+            raise FileNotFoundError(path)
+        yield selected.read_bytes()
+
+    @contextmanager
+    def batch_upload(self, *, force: bool):
+        assert force
+        root = self.root
+
+        class Batch:
+            def put_file(self, source, destination: str) -> None:
+                path = root / destination.lstrip("/")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(source.read())
+
+        yield Batch()
 
 
 def _request(*, search_workers: int = 4, gpu_workers: int = 2):
@@ -64,3 +99,24 @@ def test_execution_request_rejects_a_forged_invocation() -> None:
 
     with pytest.raises(ValueError, match="does not match"):
         AlphaFold3ExecutionRequest.from_bytes(orjson.dumps(record))
+
+
+def test_execution_request_staging_is_immutable_and_remotely_revalidated(
+    tmp_path: Path,
+) -> None:
+    """The client stages bytes once and the coordinator revalidates them."""
+    request = _request()
+    volume = FakeVolume(tmp_path)
+
+    assert stage_execution_request(volume, RUN_ID, request) == (
+        execution_request_path(RUN_ID)
+    )
+    assert stage_execution_request(volume, RUN_ID, request) == (
+        execution_request_path(RUN_ID)
+    )
+    assert load_execution_request(tmp_path, RUN_ID) == request
+
+    path = tmp_path.joinpath(*execution_request_path(RUN_ID).parts)
+    path.write_bytes(_request(search_workers=1).to_bytes())
+    with pytest.raises(RuntimeError, match="conflicts"):
+        stage_execution_request(volume, RUN_ID, request)

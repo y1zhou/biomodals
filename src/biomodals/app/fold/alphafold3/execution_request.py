@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
-from typing import cast
+from io import BytesIO
+from pathlib import Path, PurePosixPath
+from typing import Any, cast
 from uuid import UUID
 
 import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
+from biomodals.app.fold.alphafold3.artifacts import (
+    read_bounded_file_bytes,
+    read_volume_bytes,
+)
 from biomodals.app.fold.alphafold3.execution_plan import (
     build_alphafold3_execution_plan,
 )
@@ -173,6 +178,44 @@ def execution_request_path(execution_run_id: UUID) -> PurePosixPath:
         / str(execution_run_id)
         / EXECUTION_REQUEST_FILENAME
     )
+
+
+def stage_execution_request(
+    output_volume: Any,
+    execution_run_id: UUID,
+    request: AlphaFold3ExecutionRequest,
+) -> PurePosixPath:
+    """Idempotently stage one immutable request from the thin local client."""
+    path = execution_request_path(execution_run_id)
+    content = request.to_bytes()
+    existing = read_volume_bytes(
+        output_volume,
+        path.as_posix(),
+        max_bytes=MAX_EXECUTION_REQUEST_BYTES,
+    )
+    if existing is not None:
+        if existing != content:
+            raise RuntimeError(
+                "Existing AlphaFold3 execution request conflicts with this run"
+            )
+        return path
+    with output_volume.batch_upload(force=True) as batch:
+        batch.put_file(BytesIO(content), f"/{path.as_posix()}")
+    return path
+
+
+def load_execution_request(
+    volume_root: str | Path,
+    execution_run_id: UUID,
+) -> AlphaFold3ExecutionRequest:
+    """Load and revalidate one request from a coordinator's mounted Volume."""
+    relative = execution_request_path(execution_run_id)
+    content = read_bounded_file_bytes(
+        Path(volume_root).joinpath(*relative.parts),
+        field_name="AlphaFold3 execution request",
+        max_bytes=MAX_EXECUTION_REQUEST_BYTES,
+    )
+    return AlphaFold3ExecutionRequest.from_bytes(content)
 
 
 def _required_bool(value: dict[object, object], key: str) -> bool:

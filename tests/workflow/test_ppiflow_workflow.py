@@ -2164,6 +2164,7 @@ PPIFlowStep:
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == ppiflow_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
+    assert calls["spawn"]["max_parallel_nodes"] == 16
     assert calls["spawn"]["max_active_provider_calls"] == 4
     assert calls["spawn"]["max_active_gpu_provider_calls"] == 4
     assert "force" not in calls["spawn"]

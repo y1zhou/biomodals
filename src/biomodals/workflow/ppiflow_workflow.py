@@ -4601,8 +4601,8 @@ def submit_ppiflow_workflow(
             only, or omit to build both stages.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
-        max_parallel: Maximum number of active provider calls in the Execution
-            Run. The configured candidate concurrency may lower this value.
+        max_parallel: Maximum ready workflow Nodes and active Provider Calls.
+            Configured candidate concurrency may lower only the call limit.
         max_child_calls: Compatibility cap applied to stage fan-out settings
             and the Run-level active Provider Call limit.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
@@ -4675,6 +4675,7 @@ def submit_ppiflow_workflow(
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
+        "max_parallel_nodes": max_parallel,
         "max_active_provider_calls": provider_call_limit,
         "max_active_gpu_provider_calls": provider_call_limit,
     }

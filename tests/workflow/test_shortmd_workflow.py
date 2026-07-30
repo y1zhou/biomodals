@@ -19,6 +19,7 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow import shortmd_workflow
+from biomodals.workflow.core.execution import execution_plan
 from biomodals.workflow.core.nodes import NodeRunContext
 from biomodals.workflow.shortmd_workflow import (
     ShortMDAnalysisNode,
@@ -193,6 +194,21 @@ def test_build_shortmd_force_adds_tracked_cleanup_dependencies() -> None:
 
     assert isinstance(definition.nodes["clear-alpha"].node, ShortMDClearNode)
     assert definition.dependencies["prep-alpha"] == {"clear-alpha"}
+
+
+def test_shortmd_node_parallelism_is_not_scientific_identity() -> None:
+    def fingerprint(max_parallel: int) -> str:
+        workflow = build_shortmd_workflow(
+            input_pdbs=[("alpha.pdb", b"ATOM\n")],
+            replicates=1,
+            max_parallel=max_parallel,
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    assert fingerprint(1) == fingerprint(8)
 
 
 def test_build_shortmd_workflow_rejects_duplicate_sanitized_stems() -> None:
@@ -759,6 +775,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == shortmd_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
+    assert calls["spawn"]["max_parallel_nodes"] == 3
     assert calls["spawn"]["max_active_provider_calls"] == 3
     assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
     assert set(calls["spawn"]["development_function_handles"]) == {

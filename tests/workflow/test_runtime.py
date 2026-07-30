@@ -431,6 +431,7 @@ def _runtime(
     *,
     driver: FakeModalDriver | None = None,
     volume: FakeVolume | None = None,
+    max_parallel_nodes: int = 32,
     max_calls: int = 8,
     max_gpu_calls: int = 4,
     pull_worker_coordinator: object | None = None,
@@ -443,6 +444,7 @@ def _runtime(
         workflow_volume_name="Workflow-outputs",
         workflow_volume=volume,
         modal_driver=driver,
+        max_parallel_nodes=max_parallel_nodes,
         max_active_provider_calls=max_calls,
         max_active_gpu_provider_calls=max_gpu_calls,
         pull_worker_coordinator=pull_worker_coordinator,
@@ -535,6 +537,33 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
     assert volume.reloads > 0
 
 
+def test_node_parallelism_is_independent_from_provider_call_limits(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("node-limit")
+    workflow.add_node(RemoteTextNode("first", "run_first"), id="first")
+    workflow.add_node(RemoteTextNode("second", "run_second"), id="second")
+    driver = CancellingModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_parallel_nodes=1,
+        max_calls=2,
+        max_gpu_calls=0,
+    )
+    runtime._initialize("node-limit")
+
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert [node.status for node in snapshot.nodes] == [
+        NodeStatus.RUNNING,
+        NodeStatus.PENDING,
+    ]
+    assert len(snapshot.provider_calls) == 1
+
+
 def test_cancel_requested_workflow_reconciles_provider_cancellation(
     tmp_path: Path,
 ) -> None:
@@ -572,7 +601,14 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
         inputs={"candidates": fanout.outputs(kind=ArtifactKind.REPORT)},
     )
     driver = FanoutModalDriver()
-    runtime = _runtime(tmp_path, workflow, driver=driver)
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_parallel_nodes=1,
+        max_calls=2,
+        max_gpu_calls=0,
+    )
 
     result = runtime.run(workload_run_key="fanout")
 
@@ -589,6 +625,7 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
         TaskStatus.SUCCEEDED,
         TaskStatus.SUCCEEDED,
     ]
+    assert len(runtime.store.execution.list_provider_calls(RUN_ID)) == 2
     assert node.finalized_results == [
         (("candidate-0", "candidate-1"), ()),
     ]

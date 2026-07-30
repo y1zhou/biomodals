@@ -559,7 +559,7 @@ class ShortMDSummaryNode(WorkflowNativeNode):
     """Workflow-native node that emits a manifest of production replicates."""
 
     replicates: int
-    max_parallel: int
+    max_parallel: int = field(metadata={"dag_hash": False})
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Write a Markdown summary of all replicate output artifacts."""
@@ -574,7 +574,7 @@ class ShortMDSummaryNode(WorkflowNativeNode):
             "# ShortMD Workflow Summary",
             "",
             f"- Replicates per input: {self.replicates}",
-            f"- Max parallel workflow nodes: {self.max_parallel}",
+            f"- Max parallel workflow Nodes: {self.max_parallel}",
             "",
             "| Source run | Replicate run | Volume | Path |",
             "| --- | --- | --- | --- |",
@@ -770,8 +770,7 @@ def submit_shortmd_workflow(
         force: Replace existing ShortMD-managed app outputs before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
-        max_parallel: Maximum number of ready workflow nodes to execute
-            concurrently in one scheduler wave.
+        max_parallel: Maximum ready workflow Nodes and active Provider Calls.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced GROMACS volume artifacts
             before reusing completed workflow nodes.
@@ -784,6 +783,8 @@ def submit_shortmd_workflow(
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     if predecessor_execution_run_id is not None and not use_deployed_coordinator:
         raise ValueError("restart_from requires an exact deployed workflow coordinator")
+    if max_parallel < 1:
+        raise ValueError("max_parallel must be at least 1")
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
     resolved_run_id = sanitize_filename(run_id or input_path.name)
@@ -824,6 +825,7 @@ def submit_shortmd_workflow(
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
+        "max_parallel_nodes": max_parallel,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
     }

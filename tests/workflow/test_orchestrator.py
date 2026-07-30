@@ -241,6 +241,7 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
         instance,
         workflow=workflow,
         workload_run_key="friendly-name",
+        max_parallel_nodes=4,
         max_active_provider_calls=9,
         max_active_gpu_provider_calls=3,
     )
@@ -253,6 +254,7 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert init["volume_root"] == tmp_path
     assert init["workflow_volume_name"] == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
     assert init["workflow_volume"] is volume
+    assert init["max_parallel_nodes"] == 4
     assert init["max_active_provider_calls"] == 9
     assert init["max_active_gpu_provider_calls"] == 3
     assert calls["workload_run_key"] == "friendly-name"
@@ -267,10 +269,11 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert (
         plan.identity
         == orchestrator.WorkflowCoordinatorPlan(
-            workflow,
-            "friendly-name",
-            9,
-            3,
+            workflow=workflow,
+            workload_run_key="friendly-name",
+            max_parallel_nodes=4,
+            max_active_provider_calls=9,
+            max_active_gpu_provider_calls=3,
         ).identity
     )
 
@@ -493,6 +496,7 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="demo",
+        max_parallel_nodes=7,
         max_active_provider_calls=8,
         max_active_gpu_provider_calls=4,
         development_function_handles={},
@@ -512,6 +516,7 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
         predecessor_execution_run_id=str(RUN_ID),
         workflow=candidate_workflow,
         workload_run_key="demo",
+        max_parallel_nodes=1,
         max_active_provider_calls=3,
         max_active_gpu_provider_calls=2,
     )
@@ -524,6 +529,7 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
     assert successor.max_active_provider_calls == 3
     assert successor.max_active_gpu_provider_calls == 2
     successor_plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
+    assert successor_plan.max_parallel_nodes == 1
     successor_node = successor_plan.workflow.validate().nodes["write"].node
     assert successor_node.workers == 2
     store.close()
@@ -888,6 +894,12 @@ def test_coordinator_plan_rejects_invalid_workflow_or_limits() -> None:
         )
     with pytest.raises(ValueError, match="positive"):
         orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo", 0)
+    with pytest.raises(ValueError, match="max_parallel_nodes"):
+        orchestrator.WorkflowCoordinatorPlan(
+            Workflow("demo"),
+            "demo",
+            max_parallel_nodes=0,
+        )
     with pytest.raises(ValueError, match="between zero"):
         orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo", 2, 3)
     with pytest.raises(ValueError, match="checker function"):

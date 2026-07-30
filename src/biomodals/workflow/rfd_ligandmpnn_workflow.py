@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import pickle
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -389,7 +389,7 @@ class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
 
     num_rfdiffusion_trajectories: int
     num_rfdiffusion_designs: int
-    max_parallel: int
+    max_parallel: int = field(metadata={"dag_hash": False})
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Write a Markdown summary of LigandMPNN output artifacts."""
@@ -411,7 +411,7 @@ class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
             "",
             f"- RFdiffusion trajectories: {self.num_rfdiffusion_trajectories}",
             f"- RFdiffusion designs per trajectory: {self.num_rfdiffusion_designs}",
-            f"- Max parallel workflow nodes: {self.max_parallel}",
+            f"- Max parallel workflow Nodes: {self.max_parallel}",
             "",
             "| RFdiffusion run | Design index | LigandMPNN run | Volume | Path |",
             "| --- | --- | --- | --- | --- |",
@@ -607,7 +607,7 @@ def submit_rfd_ligandmpnn_workflow(
         noise_scale_frame: RFdiffusion denoiser frame noise scale.
         rfd_args: Extra RFdiffusion Hydra overrides.
         wait: Wait locally for the remote workflow result.
-        max_parallel: Maximum ready workflow nodes per scheduler wave.
+        max_parallel: Maximum ready workflow Nodes and active Provider Calls.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         strict_artifact_checks: Validate referenced RFdiffusion volume artifacts
             before reusing completed workflow nodes.
@@ -620,6 +620,8 @@ def submit_rfd_ligandmpnn_workflow(
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     if predecessor_execution_run_id is not None and not use_deployed_coordinator:
         raise ValueError("restart_from requires an exact deployed workflow coordinator")
+    if max_parallel < 1:
+        raise ValueError("max_parallel must be at least 1")
     input_path = Path(input_pdb).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
@@ -663,6 +665,7 @@ def submit_rfd_ligandmpnn_workflow(
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
+        "max_parallel_nodes": max_parallel,
         "max_active_provider_calls": max_parallel,
         "max_active_gpu_provider_calls": max_parallel,
     }

@@ -127,6 +127,7 @@ class WorkflowRuntime:
         workflow_volume_name: str,
         workflow_volume: WorkflowVolume | None = None,
         modal_driver: WorkflowModalDriver | None = None,
+        max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
         strict_external_artifact_checks: bool = False,
@@ -137,6 +138,8 @@ class WorkflowRuntime:
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Bind workflow code to one opaque Execution Run identity."""
+        if max_parallel_nodes < 1:
+            raise ValueError("max_parallel_nodes must be positive")
         if strict_external_artifact_checks:
             if external_artifact_checker is None and external_volume_roots is None:
                 raise ValueError(
@@ -153,6 +156,7 @@ class WorkflowRuntime:
         self.deployment = deployment
         self.volume_root = Path(volume_root)
         self.workflow_volume_name = workflow_volume_name
+        self.max_parallel_nodes = max_parallel_nodes
         self.max_active_provider_calls = max_active_provider_calls
         self.max_active_gpu_provider_calls = (
             max_active_provider_calls
@@ -641,18 +645,22 @@ class WorkflowRuntime:
 
     def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
         repository = self.store.execution
-        statuses = {
-            node.node_key: node.status
-            for node in repository.list_nodes(self.execution_run_id)
-        }
+        node_records = repository.list_nodes(self.execution_run_id)
+        statuses = {node.node_key: node.status for node in node_records}
         ready = ready_node_keys(
             repository.get_run(self.execution_run_id).plan,
             statuses,
         )
-        if not ready:
+        available_slots = self.max_parallel_nodes - sum(
+            node.status == NodeStatus.RUNNING for node in node_records
+        )
+        if not ready or available_slots <= 0:
             return
 
-        prepared = [self._prepare_node(definition, node_id) for node_id in ready]
+        prepared = [
+            self._prepare_node(definition, node_id)
+            for node_id in ready[:available_slots]
+        ]
         with self.store.transaction():
             for item in prepared:
                 self.store.execution.start_node(

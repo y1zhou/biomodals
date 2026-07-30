@@ -552,6 +552,7 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == rfd_ligandmpnn_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
+    assert calls["spawn"]["max_parallel_nodes"] == 3
     assert calls["spawn"]["max_active_provider_calls"] == 3
     assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
     assert set(calls["spawn"]["development_function_handles"]) == {

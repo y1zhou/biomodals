@@ -134,13 +134,15 @@ PPIFlow report generation stays a workflow-native transform that renders Markdow
 
 ## Enforce Run-level Provider Call limits in SQLite
 
-Workflow `max_parallel` remains workflow-node parallelism, not a Modal
-container limit. The execution repository atomically enforces
-`max_active_provider_calls` and its GPU subset by counting nonterminal Provider
-Calls in one Execution Run. Candidate concurrency, AF3Score job count, Rosetta
-worker count, and BoltzGen parallel runs are caller-side inputs to kernel
-dispatch; they do not form separate durable schedulers, shared leases, or
-cross-run resource managers.
+Workflow `max_parallel` sets the workflow adapter's
+`max_parallel_nodes` limit, not a Modal container limit. A workflow caller may
+also use that public value as the initial Provider Call ceiling, but Node
+parallelism and call admission remain independent runtime controls. The
+execution repository atomically enforces `max_active_provider_calls` and its
+GPU subset by counting nonterminal Provider Calls in one Execution Run.
+Candidate concurrency, AF3Score job count, Rosetta worker count, and BoltzGen
+parallel runs are caller-side inputs to kernel dispatch; they do not form
+separate durable schedulers, shared leases, or cross-run resource managers.
 
 ## Split PPIFlow workflow helpers into a submodule
 
@@ -160,7 +162,11 @@ PPIFlow helpers live under `biomodals.workflow.ppiflow` rather than `_ppiflow`. 
 
 ## No migration for old PPIFlow workflow runs
 
-The PPIFlow workflow refactor does not migrate old in-progress workflow ledgers or artifact manifests. The refactor changes candidate identity and artifact contracts; old in-progress runs should be restarted with `force`, while useful completed app-owned outputs can be reintroduced through explicit `Stage2Input`.
+The PPIFlow workflow refactor does not migrate old in-progress workflow ledgers
+or artifact manifests. Old ledgers are rejected and a new launch receives a
+fresh Execution Run ID. Useful completed app-owned outputs can be reintroduced
+through explicit `Stage2Input`; `force` is a workload-output option, not an
+execution-state migration.
 
 ## Keep PPIFlow Modal bindings in the workflow module
 
@@ -190,9 +196,10 @@ The PPIFlow refactor should be committed in phase-sized changes rather than one 
 
 The workflow runtime will decide run completion and resume scope from terminal workflow nodes. If every terminal node has durable completion and non-missing recorded outputs, the run succeeds without scheduling intermediate nodes, even when stale failed, running, or incomplete intermediate state remains. If some terminal nodes are incomplete, the scheduler only considers those terminals and their ancestor closure.
 
-This keeps resume output-driven and avoids recomputing expensive intermediate
-work when the externally relevant workflow outputs already exist. Missing
-terminal artifacts invalidate completion; unknown external artifact
-availability suspends the Run and admits no new work. `force=True` still
-discards the workflow run root before scheduling, so terminal pruning only
-affects non-forced resumes.
+This keeps execution result-driven and avoids recomputing expensive
+intermediate work when the externally relevant workflow outputs already exist.
+Missing terminal artifacts invalidate completion; unknown external artifact
+availability suspends the Run and admits no new work. `resume` continues a
+suspended Run without retrying failed Tasks. An explicit Successor Execution
+Run revalidates terminal publications and repairs only the missing backward
+closure.

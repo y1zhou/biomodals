@@ -217,6 +217,11 @@ filtering, ranking, reporting, and small manifest transforms. Its `run()`
 method executes through the kernel's Coordinator-Local Task boundary and
 consumes no Provider Call slot.
 
+`max_parallel_nodes` limits how many workflow Nodes may be `running` at once.
+It is independent from the Run's total and GPU Provider Call limits: one
+running Node may fan out to several calls, while a local Node consumes no call
+slot.
+
 Use `RemoteWorkflowNode` or its semantic alias `AppBackedNode` for one tracked
 remote call. Implement `prepare_remote(context)` to return a `RemoteNodeCall`;
 this prepares arguments and an exact function name but never submits work.
@@ -373,6 +378,11 @@ All remote orchestration functions should live as methods on
 perform floating deployed-app lookups, or own workflow-specific input staging.
 Domain-specific staging, DAG construction, and development function handles
 belong in top-level workflow scripts.
+
+Pass workflow Node parallelism as `max_parallel_nodes` and remote fan-out
+ceilings as `max_active_provider_calls` and
+`max_active_gpu_provider_calls`. Do not collapse these into one runtime field;
+a user-facing workflow flag may deliberately set both to the same value.
 
 ## Runtime Diagnostics
 

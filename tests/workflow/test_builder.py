@@ -11,11 +11,15 @@ from biomodals.execution import NodeAggregationPolicy
 from biomodals.schema import ArtifactKind
 from biomodals.workflow import Workflow
 from biomodals.workflow.core.builder import NodeHandle
+from biomodals.workflow.core.display import print_workflow_dag
 from biomodals.workflow.core.execution import (
     execution_plan,
     node_task_plan,
 )
-from biomodals.workflow.core.nodes import WorkflowNativeNode
+from biomodals.workflow.core.nodes import (
+    RemoteTaskWorkflowNode,
+    WorkflowNativeNode,
+)
 
 
 class DummyNode(WorkflowNativeNode):
@@ -160,3 +164,12 @@ def test_workflow_node_is_one_scientifically_identified_task() -> None:
     assert task.task_key == "node"
     assert task.scientific_payload == {"workflow_node_id": "score"}
     assert task.execution_payload is None
+
+
+def test_dag_display_marks_runtime_task_nodes_as_provider_work(capsys) -> None:
+    workflow = Workflow("display")
+    workflow.add_node(RemoteTaskWorkflowNode(), id="fanout")
+
+    print_workflow_dag(workflow.validate())
+
+    assert "[provider; RemoteTaskWorkflowNode]" in capsys.readouterr().out

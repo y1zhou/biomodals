@@ -735,7 +735,9 @@ A bounded process or thread pool from `concurrent.futures` that limits concurren
 _Avoid_: server pool, runner server
 
 **Workflow Node Parallelism**:
-The number of ready workflow nodes the workflow runtime may start concurrently in one scheduler wave.
+The `max_parallel_nodes` ceiling on workflow Nodes that may be `running`
+concurrently. It is an operational workflow-adapter setting independent from
+Run-Level Provider Call Limits.
 _Avoid_: global Modal container limit, child app concurrency
 
 **App-Local Scheduler**:

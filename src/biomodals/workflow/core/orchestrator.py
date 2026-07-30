@@ -67,6 +67,7 @@ class WorkflowCoordinatorPlan:
     workload_run_key: str
     max_active_provider_calls: int = 32
     max_active_gpu_provider_calls: int | None = None
+    max_parallel_nodes: int = 32
     strict_external_artifact_checks: bool = False
     external_artifact_checker_function_name: str | None = None
 
@@ -78,6 +79,8 @@ class WorkflowCoordinatorPlan:
             raise ValueError("workload_run_key cannot be empty")
         if self.max_active_provider_calls < 1:
             raise ValueError("max_active_provider_calls must be positive")
+        if self.max_parallel_nodes < 1:
+            raise ValueError("max_parallel_nodes must be positive")
         if not 0 <= self.effective_gpu_limit <= self.max_active_provider_calls:
             raise ValueError(
                 "max_active_gpu_provider_calls must be between zero and "
@@ -110,6 +113,7 @@ class WorkflowCoordinatorPlan:
             self.workload_run_key,
             self.max_active_provider_calls,
             self.effective_gpu_limit,
+            self.max_parallel_nodes,
             self.strict_external_artifact_checks,
             self.external_artifact_checker_function_name,
         )
@@ -163,6 +167,7 @@ class ExecutionCoordinator:
         workload_run_key: str,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
+        max_parallel_nodes: int = 32,
         strict_external_artifact_checks: bool = False,
         external_artifact_checker_function_name: str | None = None,
         development_function_handles: Mapping[str, Any] | None = None,
@@ -173,6 +178,7 @@ class ExecutionCoordinator:
             workload_run_key=workload_run_key,
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            max_parallel_nodes=max_parallel_nodes,
             strict_external_artifact_checks=strict_external_artifact_checks,
             external_artifact_checker_function_name=(
                 external_artifact_checker_function_name
@@ -311,6 +317,7 @@ class ExecutionCoordinator:
         workload_run_key: str,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
+        max_parallel_nodes: int = 32,
         strict_external_artifact_checks: bool = False,
         external_artifact_checker_function_name: str | None = None,
     ) -> AppRunResult:
@@ -320,6 +327,7 @@ class ExecutionCoordinator:
             workload_run_key=workload_run_key,
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            max_parallel_nodes=max_parallel_nodes,
             strict_external_artifact_checks=strict_external_artifact_checks,
             external_artifact_checker_function_name=(
                 external_artifact_checker_function_name
@@ -501,6 +509,7 @@ class ExecutionCoordinator:
             workflow_volume_name=OUT_VOLUME_NAME,
             workflow_volume=OUT_VOLUME,
             modal_driver=driver,
+            max_parallel_nodes=plan.max_parallel_nodes,
             max_active_provider_calls=plan.max_active_provider_calls,
             max_active_gpu_provider_calls=plan.effective_gpu_limit,
             strict_external_artifact_checks=(

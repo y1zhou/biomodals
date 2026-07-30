@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 from biomodals.workflow.core.builder import WorkflowDefinition
-from biomodals.workflow.core.nodes import RemoteWorkflowNode
+from biomodals.workflow.core.nodes import RemoteTaskWorkflowNode, RemoteWorkflowNode
 
 __all__ = ["print_workflow_dag", "print_workflow_message"]
 
@@ -29,7 +29,7 @@ def print_workflow_dag(definition: WorkflowDefinition) -> None:
         node_class = spec.node.__class__.__qualname__
         execution = (
             "provider"
-            if isinstance(spec.node, RemoteWorkflowNode)
+            if isinstance(spec.node, RemoteWorkflowNode | RemoteTaskWorkflowNode)
             else "coordinator-local"
         )
         print_workflow_message(

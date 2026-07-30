@@ -3,6 +3,7 @@
 # ruff: noqa: D103, S106
 
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
@@ -68,6 +69,58 @@ def test_detached_coordinator_loop_reaches_terminal_without_client_polling() -> 
     )
     assert reopened.run.status == RunStatus.SUCCEEDED
     assert advance_count == 1
+
+
+def test_coordinator_releases_host_lock_between_scheduling_cycles() -> None:
+    repository = create_repository(task_count=1)
+    lock_active = False
+    cycles = 0
+    events: list[str] = []
+
+    @contextmanager
+    def synchronize():
+        nonlocal lock_active
+        assert lock_active is False
+        lock_active = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            lock_active = False
+            events.append("exit")
+
+    def advance_once() -> None:
+        nonlocal cycles
+        assert lock_active is True
+        cycles += 1
+        if cycles == 2:
+            repository.record_task_result_observation(
+                RUN_ID,
+                "inference",
+                "seed-0",
+                AvailabilityStatus.AVAILABLE,
+                now=110,
+            )
+            repository.reconcile_node_tasks(RUN_ID, "inference", now=111)
+            repository.finalize_run_from_results(RUN_ID, now=112)
+
+    def sleep(_seconds: float) -> None:
+        assert lock_active is False
+        events.append("sleep")
+
+    snapshot = drive_execution_run(
+        repository,
+        RUN_ID,
+        advance_once=advance_once,
+        checkpoint=lambda: None,
+        sleep=sleep,
+        poll_interval_seconds=0,
+        synchronize=synchronize,
+    )
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert cycles == 2
+    assert events == ["enter", "exit", "sleep", "enter", "exit", "enter", "exit"]
 
 
 def test_coordinator_accepts_a_reopened_volume_repository(tmp_path) -> None:

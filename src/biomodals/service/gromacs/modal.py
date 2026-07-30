@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 
 import modal
 
+from biomodals.execution import ProviderBinding
+from biomodals.execution.modal import AsyncModalCallDriver, ModalCallObservation
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.coordinator import GromacsReconciler
@@ -41,16 +43,39 @@ class ModalGromacsAdapter:
         log_source: ModalCLILogSource | None = None,
     ) -> None:
         """Compose focused Modal compute and Result boundaries."""
+        resolved_function_resolver = function_resolver or modal.Function.from_name
         self.provider = ModalGromacsProvider(
             output_volume_name=output_volume_name,
             call_resolver=call_resolver,
-            function_resolver=function_resolver,
+            function_resolver=resolved_function_resolver,
+        )
+        self.execution = AsyncModalCallDriver(
+            call_resolver=call_resolver,
+            function_resolver=resolved_function_resolver,
         )
         self.results = ModalGromacsResults(
             output_volume_name=output_volume_name,
             artifact_cache=artifact_cache,
         )
         self.logs = log_source or ModalCLILogSource()
+
+    async def resolve(self, binding: ProviderBinding) -> modal.Function:
+        """Resolve one exact deployed function for kernel dispatch."""
+        return await self.execution.resolve(binding)
+
+    async def spawn(
+        self,
+        function: modal.Function,
+        *,
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+    ) -> str:
+        """Spawn one kernel-preclaimed deployed function."""
+        return await self.execution.spawn(function, args=args, kwargs=kwargs)
+
+    async def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
+        """Observe one kernel-attached deployed function call."""
+        return await self.execution.observe(provider_call_handle_id)
 
     async def preflight(
         self,

@@ -25,10 +25,12 @@ from biomodals.execution import (
     DeploymentIdentity,
     NodeStatus,
     ProviderCallStatus,
+    RunStatus,
 )
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
+    ModalDeploymentUnavailableError,
 )
 from biomodals.helper.app_execution import AppExecutionRunStore
 
@@ -110,6 +112,11 @@ class RecordingCallDriver:
 
     def cancel(self, provider_call_handle_id: str) -> None:
         raise AssertionError(provider_call_handle_id)
+
+
+class UnavailableCallDriver(NoCallDriver):
+    def resolve(self, binding):
+        raise ModalDeploymentUnavailableError(f"{binding} is unavailable")
 
 
 def _request(
@@ -265,4 +272,31 @@ def test_seed_tasks_use_fixed_batches_without_duplicate_submission(
         call.status == ProviderCallStatus.RUNNING
         for call in runtime.store.execution.list_provider_calls(RUN_ID)
     )
+    runtime.close()
+
+
+def test_seed_claim_is_not_acquired_before_deployment_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired exact version cannot strand a scientific generation claim."""
+    runtime = _runtime(
+        tmp_path,
+        request=_request(seeds=[1, 2], max_num_gpus=2),
+        driver=UnavailableCallDriver(),
+    )
+    monkeypatch.setattr(
+        execution_runtime,
+        "load_staged_inference_input",
+        lambda *args, **kwargs: SimpleNamespace(recycle=10),
+    )
+    runtime._initialize()
+
+    for _ in range(6):
+        runtime.advance_once()
+
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED
+    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
+    claims = cast(FakeClaims, runtime.inference_runtime.claims)
+    assert claims.values == {}
     runtime.close()

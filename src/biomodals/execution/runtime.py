@@ -101,6 +101,38 @@ class ExecutionRuntime:
         )
         if function is None:
             return None
+        return self.submit_resolved_fixed_batch(
+            execution_run_id,
+            candidate,
+            function=function,
+            submission_token=submission_token,
+            args=args,
+            kwargs=kwargs,
+            now=now,
+        )
+
+    def resolve_provider_binding(
+        self,
+        execution_run_id: UUID,
+        binding: ProviderBinding,
+        *,
+        now: int,
+    ) -> Any | None:
+        """Preflight one exact binding before workload writer coordination."""
+        return self._resolve_provider(execution_run_id, binding, now=now)
+
+    def submit_resolved_fixed_batch(
+        self,
+        execution_run_id: UUID,
+        candidate: ProviderCallCandidate,
+        *,
+        function: Any,
+        submission_token: str,
+        args: tuple[Any, ...] = (),
+        kwargs: Mapping[str, Any] | None = None,
+        now: int,
+    ) -> ProviderCallRecord | None:
+        """Preclaim and spawn once using an already hydrated exact binding."""
         preclaim = self.repository.preclaim_fixed_batch(
             execution_run_id,
             candidate.node_key,

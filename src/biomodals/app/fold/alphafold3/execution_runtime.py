@@ -699,6 +699,14 @@ class AlphaFold3ExecutionRuntime:
         )
         for candidate in selected:
             planned = planned_by_node[candidate.node_key]
+            self._provider.repository = self.store.execution
+            binding_function = self._provider.resolve_provider_binding(
+                self.execution_run_id,
+                candidate.binding,
+                now=self._now(),
+            )
+            if binding_function is None:
+                return
             selected_candidate, claimed = self._claim_seed_candidate(
                 candidate,
                 planned,
@@ -712,9 +720,10 @@ class AlphaFold3ExecutionRuntime:
             )
             self._provider.repository = self.store.execution
             try:
-                submitted = self._provider.submit_fixed_batch(
+                submitted = self._provider.submit_resolved_fixed_batch(
                     self.execution_run_id,
                     selected_candidate,
+                    function=binding_function,
                     submission_token=selected_candidate.candidate_key,
                     args=args,
                     kwargs=kwargs,

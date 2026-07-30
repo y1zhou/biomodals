@@ -53,6 +53,55 @@ uv run biomodals workflow run ppiflow --dry-run -- \
   --steps-yaml examples/data/ppiflow_workflow_steps.yaml
 ```
 
+### Durable app and workflow runs
+
+Coordinator-aware apps and workflows target an exact deployed Modal version by
+default. A launch prints three values needed to address the durable Run from
+another process:
+
+```text
+Deployment Identity: <environment>/<deployment-name>/v<version>
+Execution Run ID: <uuid>
+Coordinator FunctionCall ID: <provider-call-id>
+```
+
+Use the deployment fields and Execution Run ID with the shared lifecycle
+commands:
+
+```bash
+biomodals run status \
+  --environment <environment> \
+  --deployment-name <deployment-name> \
+  --deployment-version <version> \
+  --execution-run-id <uuid>
+
+biomodals run cancel  <the same four locator options>
+biomodals run resume  <the same four locator options>
+```
+
+`resume` continues the same suspended Run and never retries a conclusively
+failed Task. To retry missing work, create a linked Successor Run:
+
+```bash
+biomodals run restart \
+  --environment <predecessor-environment> \
+  --deployment-name <predecessor-deployment-name> \
+  --deployment-version <predecessor-version> \
+  --execution-run-id <predecessor-uuid> \
+  --target-environment <target-environment> \
+  --target-deployment-name <target-deployment-name> \
+  --target-deployment-version <target-version>
+```
+
+Restart first verifies that the result-affecting workload plan is unchanged,
+then reuses valid publications and schedules only conclusively missing work.
+Repeating a launch without `--restart-from` creates a new root Run.
+
+Pass `--development` to `biomodals app run` for explicit source-backed
+development. That mode has no cross-process recovery. Workflow `--dry-run`
+validates and prints the DAG without resolving a deployment or starting Modal
+work.
+
 ## API server
 
 The API is one local FastAPI control plane for GROMACS and future workloads.

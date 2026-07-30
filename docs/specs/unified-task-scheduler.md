@@ -2,9 +2,9 @@
 
 # Unified task scheduler refactor plan
 
-Status: accepted; implementation in progress.
+Status: accepted and implemented; manual Modal smoke validation pending.
 
-Implemented so far:
+Implemented:
 
 - the shared model, SQLite repository, deterministic admission, fixed-batch
   and pull-worker dispatch, Modal call boundary, cancellation, restart, and
@@ -14,15 +14,17 @@ Implemented so far:
 - the workflow ledger decomposition, remote workflow coordinator, deployed
   workflow CLI lifecycle, and successor recovery;
 - PPIFlow runtime Task discovery for ReFold, Partial, and LigandMPNN, plus
-  directly tracked initial-design, FlowPacker, and DockQ calls.
-
-Still pending:
-
+  directly tracked initial-design, FlowPacker, and DockQ calls;
 - AlphaFold3 search and inference adoption;
 - BoltzGen direct Task fan-out;
 - Rosetta pull-worker adoption and removal of its Modal Queue;
-- remote per-run coordination for direct `biomodals app run`;
-- manual Modal smoke tests after the remaining caller adapters are complete.
+- remote per-run coordination and generic lifecycle commands for direct
+  `biomodals app run` and `biomodals workflow run`.
+
+Still pending:
+
+- explicitly authorized manual Modal smoke tests. CI and local verification do
+  not make paid provider calls.
 
 This plan consolidates the execution and recovery findings from the API
 service, reusable workflow runtime, PPIFlow fan-out, and AlphaFold3 search and
@@ -76,9 +78,14 @@ In particular:
 11. Service, workflow, and app CLI entrypoints remain functionally testable;
    internal imports and unfinished schemas carry no compatibility promise.
 
-## Current execution authorities
+## Pre-refactor execution authorities
 
-| Area | Current authority | Reusable strength | Boundary to preserve |
+This historical inventory records the duplicated authorities that motivated the
+refactor. It is not a description of the current implementation; the shared
+execution mechanics now live in `biomodals.execution`, while each row's
+scientific and publication boundary remains workload-owned.
+
+| Area | Pre-refactor authority | Reusable strength | Boundary preserved |
 | --- | --- | --- | --- |
 | API service | `ServiceStore`, `ModalJobSubmitter`, GROMACS coordinator and plan | API admission, per-Job locking, preclaim-before-spawn, call attachment, cancellation, user-visible operations | User/auth/config state and global service transactions stay service-owned |
 | Workflow runtime | `Workflow`, `WorkflowRuntime`, `WorkflowLedger`, `RemoteCallManager` | Static DAG validation, node state, artifacts, per-run recovery, terminal pruning | Per-run ledger and workflow artifact contracts stay workflow-owned |
@@ -1604,7 +1611,7 @@ Phase 0 test inventory:
 | Test location | Required case |
 | --- | --- |
 | `tests/workflow/test_artifacts.py` | An external checker exception returns `unknown`, never `missing` |
-| `tests/service/test_submission.py` | Pre-preclaim failure leaves work unowned; one preclaim authorizes one spawn; definite post-preclaim rejection fails; unknown or abandoned submission blocks; an unattached returned call is cancelled and marked unknown |
+| `tests/execution/test_runtime.py` | Pre-preclaim failure leaves work unowned; one preclaim authorizes one spawn; definite post-preclaim rejection fails; unknown or abandoned submission blocks; an unattached returned call is cancelled and marked unknown |
 | `tests/workflow/test_runtime.py` | A crash after durable claim but before attachment does not submit replacement work |
 | `tests/workflow/test_runtime.py` | A recorded call ID is resolved and collected instead of resubmitted |
 | `tests/workflow/test_runtime.py` | A crash after collection, Result Envelope durability, decode, publication, or Task commit never starts another provider call |
@@ -1614,7 +1621,7 @@ Phase 0 test inventory:
 | `tests/execution/test_dispatch.py` | Fixed batches preserve compatibility and encounter order, bind Tasks atomically, and never repack; pull-worker counts derive from unfinished Tasks and claim capacity, existing and unknown calls suppress excess admission, lost claims replay, assignments survive preemption, terminal owners fail unfinished work, and zero-Task claim races exit cleanly |
 | `tests/execution/test_single_submission.py` | Each Task gets one admission and at most one remote owner per Run; provider redelivery and interrupted local-operation re-entry retain Task identity; resume never retries conclusive failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_local_task.py` | Cache success skips local execution; repeated interruption before and after publication re-enters only authoritatively missing work; available recovery commits success; unknown validation suspends; conclusive failure and cancellation never replay; local work consumes no call slot |
-| `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
+| `tests/execution/test_modal_driver.py`, `tests/execution/test_restart_compatibility.py`, and caller coordinator tests | Explicit versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and seven reason codes exist; legal transitions, terminality, status-reason constraints, coordinator and result-validation suspension, unknown-state blocking, deployment failure reason, and service projections are deterministic |
 | `tests/execution/test_node_status.py` | Exactly seven Node statuses exist; terminality, derived readiness, cache-success provenance, and non-duplication of Run control states are deterministic |
 | `tests/execution/test_plan.py` | Dependency readiness is strict by default; partial acceptance is edge-local; unacceptable terminal outcomes propagate skips; terminal publications prune ancestor work; explicit cancellation takes precedence |
@@ -1625,13 +1632,13 @@ Phase 0 test inventory:
 | `tests/execution/test_result_envelope.py` | A successful return becomes a terminal call only with a host-durable envelope; recovery before that boundary recollects the same call; recovery afterward resumes decode and publication without Modal; malformed envelopes fail affected Tasks; unknown envelope recovery retains call slots |
 | `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; a durable successful-call envelope releases slots while its Tasks may remain active |
 | `tests/execution/test_admission.py` | One cycle fills every feasible slot; depth and unfinished descendant span remain primary; equal graph ranks schedule GPU before CPU, stably cohort Runtime Image Keys, then use persisted encounter order; GPU saturation skips only GPU candidates; active-call timing does not change recovery order |
-| `tests/execution/test_relationships.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
+| `tests/execution/test_single_submission.py` and `tests/execution/test_dispatch.py` | Every Task, Dispatch Batch, and Provider Call belongs to one Node; a call cannot own another Node's Task; a Task cannot acquire a second remote owner; zero-call cache and local completion remain valid |
 | `tests/execution/test_provider_call_status.py` | Exactly eight Provider Call statuses exist; legal transitions, terminality, attachment identity, success requires a durable Result Envelope, unknown-state ownership, and expiry projection are deterministic |
 | `tests/execution/test_identity.py` | Execution UUIDs are opaque and unique; workload keys never select paths; successor lineage uses a new UUID |
-| `tests/execution/test_cli_location.py` | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; optional call IDs remain non-authoritative |
-| `tests/execution/test_cli_recovery.py` | A repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors; non-successful terminals define a backward repair closure; valid publications are reused; unknown or invalid predecessor state fails closed |
+| `tests/execution/test_cli.py` and caller coordinator tests | Explicit deployment and run flags reach the correct coordinator; mismatched ledger fields fail; repeated launch creates a root Run; resume never retries failures; generic restart and `--restart-from` create equivalent successors |
+| `tests/execution/test_restart_compatibility.py` and caller runtime tests | Non-successful terminals define a backward repair closure; valid publications are reused; unknown or invalid predecessor state fails closed |
 | `tests/execution/test_restart_compatibility.py` | Result-affecting input, content, and declared version changes reject successor creation; operational policy and Deployment Identity changes remain compatible; generic and launch-time restart use the same fingerprint |
-| `tests/workflow/test_ledger.py` | Result Envelope persistence and Provider Call success commit atomically; publication/artifact and Task completion remain independently recoverable without attempt rows or paths |
+| `tests/workflow/test_artifact_store.py`, `tests/workflow/test_run_store.py`, and `tests/workflow/test_runtime.py` | Execution state and workflow publication state share one transaction boundary; publication/artifact and Task completion remain independently recoverable without attempt rows or paths |
 | `tests/service/test_gromacs_plan.py` | The fixed GROMACS graph preserves its parallel readiness waves; Prepare result remains coordinator-local, consumes no call slot, and uses publication-gated interruption recovery |
 | `tests/workflow/ppiflow/test_coordinators.py` | Candidate outcomes preserve identity, order, partial failures, and configured concurrency |
 | `tests/app/test_alphafold3_production_contracts.py` | Search, run, request, marker, and seed-batch identities remain unchanged |

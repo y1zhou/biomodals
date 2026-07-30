@@ -452,6 +452,23 @@ remaining GPU slots, selection continues to feasible CPU candidates rather
 than leaving total slots idle. The kernel adds no fairness cursor, priority
 weights, preemption, or scheduler plugin surface.
 
+The dispatch-batching policy was accepted on 2026-07-30. The kernel implements
+exactly two remote dispatch mechanics. In fixed-batch dispatch, the workload
+declares each Task's provider binding, GPU use, compatibility key, positive
+maximum Tasks per call, argument construction, and per-Task result decoding.
+The kernel removes cache-satisfied Tasks, groups compatible ready Tasks in
+encounter order up to that maximum, and ranks each resulting call candidate by
+its first Task ordinal. The serialized preclaim atomically creates the
+Dispatch Batch and Provider Call and assigns every constituent Task before
+spawn authorization. That mapping never changes afterward. In pull-worker
+dispatch, the kernel admits Node-ranked worker Provider Calls without
+preassigning Tasks; each worker later obtains bounded microbatches through
+idempotent, checkpointed Worker Assignments. The Run persists its operational
+dispatch policy, so resume reproduces it while a Successor Run may choose
+different batching. Dispatch metadata stays outside scientific fingerprints
+unless it changes scientific meaning. There is no dynamic batching optimizer,
+cross-Node batch, or workload-owned durable scheduling state.
+
 The state-transition policy was accepted on 2026-07-29. The service preserves
 users, authentication data, and administrator configuration while recreating
 the Job and execution schema without old Job history. Existing workflow

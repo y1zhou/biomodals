@@ -250,8 +250,17 @@ can cover zero or many Tasks from that Node. A Modal Function Call is its
 current provider implementation.
 
 **Dispatch Batch** is a durable grouping of Tasks from one Node offered to one
-Provider Call or a shared worker pool. Exact Task-to-call attribution is
-recorded only when it is observed.
+Provider Call or a shared worker pool. Fixed-batch dispatch binds every Task
+to its call at preclaim; pull-worker dispatch records Task-to-call ownership
+only through Worker Assignments.
+
+**Fixed-Batch Dispatch** groups compatible ready Tasks from one Node into one
+Provider Call and persists the complete mapping at preclaim. The mapping is
+immutable after spawn authorization.
+
+**Pull-Worker Dispatch** admits worker Provider Calls before Task ownership is
+known. Workers later claim bounded Task microbatches through the coordinator,
+which checkpoints Worker Assignments before returning payloads.
 
 **Worker Assignment** is a durable, call-bound SQLite record electing the
 worker allowed to execute one Task from a shared pull work pool. It is
@@ -534,9 +543,9 @@ fingerprinting Tasks.
 | Cache | Node- and Task-level `available` / `missing` / `unknown` vocabulary, observation provenance, and scheduling policy | Validation logic, markers, manifests, content checks |
 | Inputs | Calling preparation hooks and recording normalized fingerprints | Parsing, validation, staging, provider kwargs |
 | Calls | Claim, submit, attach, resolve, poll, cancel, recover state machine | Function selection and provider adapter binding |
-| Dispatch | Durable batches, direct fan-out, pull claims, worker-call tracking, returned outcome routing | Task payloads and batch compatibility |
+| Dispatch | Durable fixed batches, direct fan-out, pull claims, worker-call tracking, and returned outcome routing | Provider binding, Task payloads, compatibility keys, and per-Task decoding |
 | Outputs | Calling decode/validate/publish hooks and committing outcome ordering | Schemas, scientific validation, paths, publication |
-| Batching | Mapping Tasks to call batches and distributing outcomes | Batch compatibility and workload-specific limits |
+| Batching | Stable grouping by compatibility and encounter order, immutable call mapping, and outcome distribution | Positive maximum Tasks per call and whether batching changes scientific identity |
 | Resources | Run-scoped total and GPU Provider Call admission counts | Service admission, Modal decorators, deployment limits, cross-coordinator policy |
 | Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
 | Presentation | Stable snapshots/events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
@@ -951,6 +960,71 @@ Do not add a trigger or materialized state column until query evidence shows
 that the indexed join is insufficient. If a read projection is cached later,
 it is disposable and never becomes a second authority.
 
+### Dispatch modes and deterministic batching
+
+The first kernel supports exactly two remote dispatch modes. Both keep Tasks
+as the independently cacheable, validated, and reported unit while Provider
+Calls remain the unit counted by remote-call limits.
+
+#### Fixed-batch dispatch
+
+The workload supplies operational dispatch descriptors for ready Tasks:
+
+- the resolved provider binding and whether it uses a GPU;
+- a stable compatibility key;
+- a positive `max_tasks_per_call`;
+- provider argument construction for an ordered Task collection;
+- result decoding into independent per-Task outcomes.
+
+The kernel first removes Tasks whose publications validate as `available`.
+Within one Node and provider binding, it groups the remaining ready Tasks by
+compatibility key, preserves `task_ordinal` within each group, and chunks each
+group up to `max_tasks_per_call`. A batch containing fewer Tasks is valid only
+as the remaining tail. The batch candidate's admission tie-break is the first
+constituent Task ordinal. Batches never span Nodes or provider bindings.
+
+Batch formation is a pure, side-effect-free operation. The serialized
+preclaim then atomically:
+
+1. rechecks Task readiness and ownership;
+2. checks the total and optional GPU call ceilings;
+3. creates the Dispatch Batch and `submitting` Provider Call;
+4. assigns every constituent Task directly to that call; and
+5. returns spawn authorization only after the host durability boundary.
+
+After preclaim, the Task-to-call mapping is immutable. Recovery observes or
+collects the same call and never repacks its Tasks. A successful call may
+still contain failed or invalid Task results, which per-Task decoding and
+publication validation record independently. A failed call preserves any
+already-validated Task successes and fails only its unfinished Tasks.
+
+#### Pull-worker dispatch
+
+For work-stealing Nodes, the Dispatch Batch represents the Node's durable
+ready Task pool. DAG-priority admission creates worker Provider Calls without
+preassigning Tasks. Each call consumes one total and optional GPU slot.
+
+A running worker sends an idempotent claim request with its bounded capacity.
+The coordinator selects ready Tasks in `task_ordinal` order, writes
+call-bound Worker Assignments, commits and checkpoints them, and only then
+returns payloads. The worker may repeat the same request after a lost response
+and may claim another microbatch after reporting completion. No Task moves to
+a different call after assignment in the same Execution Run.
+
+#### Policy persistence and scientific identity
+
+One Run persists its dispatch mode, compatibility descriptors, provider
+bindings, GPU declarations, and maximum batch or claim sizes as operational
+policy. Resume reloads that policy. A Successor Execution Run may choose
+different operational batching or worker counts while reusing validated
+scientific publications.
+
+These values are excluded from Workload Plan and Task Fingerprints unless they
+change scientific meaning. Any result-affecting ordering or batching parameter
+must instead appear in the normalized scientific payload. The kernel adds no
+dynamic bin-packing, duration estimation, byte-size optimization, cross-Node
+batching, or workload-owned durable queue.
+
 ### Resource ownership
 
 The first kernel has exactly two remote-admission limits inside one Execution
@@ -1325,7 +1399,7 @@ Phase 0 test inventory:
 | `tests/workflow/test_runtime.py` | Graceful and hard coordinator interruption preserve attached calls and recover total and GPU active-call counts |
 | `tests/workflow/test_orchestrator.py` | Container exit drains and checkpoints without cancelling children; explicit cancellation still cancels |
 | `tests/execution/test_remote_coordinator.py` | A detached loop reaches terminal without client polling; duplicate loop, claim, and completion inputs are idempotent; infrastructure replacement reloads checkpoints; uncaught coordinator errors stop without automatic retry or child cancellation; explicit resume reconciles; terminal status can reopen the ledger; different Execution Run IDs remain isolated |
-| `tests/execution/test_dispatch.py` | Lost claim responses, claim replay, preemption with an active assignment, terminal-owner failure without same-run reassignment, and unknown-owner blocking |
+| `tests/execution/test_dispatch.py` | Fixed batches preserve compatibility and encounter order, bind Tasks atomically, and never repack; pull workers replay lost claims, preserve active assignments across preemption, fail unfinished work with a terminal owner, and block unknown ownership |
 | `tests/execution/test_single_submission.py` | Each Task gets at most one submission per Run; redelivery retains call identity; resume never retries failure; restart reuses valid publications and submits only conclusively unowned missing work |
 | `tests/execution/test_deployment.py` | Explicit and history-resolved versions are pinned; an unavailable version fails with reason `deployment_unavailable`; restart creates a linked run and reuses publications |
 | `tests/execution/test_run_status.py` | Exactly nine statuses and seven reason codes exist; legal transitions, terminality, status-reason constraints, coordinator and result-validation suspension, unknown-state blocking, deployment failure reason, and service projections are deterministic |
@@ -1397,6 +1471,8 @@ Deliverables:
   fingerprints, without streaming or provider dependencies;
 - preserve ordered Node-plan and Task-discovery encounter ordinals as
   operational metadata, outside scientific fingerprints;
+- define pure fixed-batch grouping by Node, provider binding, compatibility
+  key, encounter order, and positive maximum batch size;
 - compute Task fingerprints once from fixed canonical JSON and keep
   operational execution payloads outside scientific identity;
 - add deterministic Workload Plan Fingerprints that separate result-affecting
@@ -1467,6 +1543,8 @@ Deliverables:
 
 - add Dispatch Batches, Worker Assignments, idempotent claim requests, and
   explicit Task-to-call or Task-to-assignment links;
+- implement fixed-batch preclaim with an immutable complete Task-to-call
+  mapping and pull-worker admission with assignment deferred to claims;
 - enforce total and GPU Provider Call ceilings atomically at submission
   preclaim;
 - derive active call-slot counts from nonterminal Provider Calls without an
@@ -1602,8 +1680,8 @@ Deliverables:
 - translate pure search and inference plans into Nodes and Tasks;
 - wrap existing marker validators as availability adapters;
 - wrap generation claims as writer-coordination adapters;
-- claim each missing seed Task independently before batching compatible seeds
-  into one GPU call;
+- retain one workload-owned generation claim per missing seed while the kernel
+  batches compatible seed Tasks into one GPU call;
 - persist the one-call-to-many-seed mapping and per-seed outcomes;
 - make a Successor Execution Run the only retry path while retaining current
   scientific request and workload run identities;
@@ -1757,8 +1835,8 @@ Rollback: revert the commit; it has no schema effect.
 | Pure model | Graph cycles, readiness, terminal closure, stable fingerprints, task discovery determinism |
 | Call lifecycle | Fault injection around every transition, attach validation, recovery, expiry, cancellation, unknown outcomes |
 | Cache | Available/missing/unknown, checker exceptions, marker validation, cache hit starts no call |
-| Batching | Call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
-| Dispatch | Direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
+| Batching | Compatibility grouping, maximum-size chunking, immutable call-to-many mapping, per-Task result decode, partial and failed batches, deterministic ordering |
+| Dispatch | Fixed preclaim assignment, direct fan-out, many-call pull pools, idempotent claim replay, call-bound Worker Assignments, partial outcomes |
 | Interruption | Graceful drain, hard kill, child-call preservation, replacement recovery, explicit cancellation |
 | Resources | Node parallelism independent from total/GPU call slots, one slot per active call, conservative unknown-state retention |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
@@ -2142,6 +2220,17 @@ after each decision:
     Encounter order is operational and excluded from scientific fingerprints;
     there is no one-call-per-Node pass, fairness cursor, aging, priority
     weights, preemption, or scheduler plugin.
+52. **Two dispatch modes — accepted 2026-07-30**: workloads declare provider
+    bindings, GPU use, compatibility keys, positive maximum batch or claim
+    sizes, argument construction, and per-Task decoding. For fixed batches,
+    the kernel groups ready Tasks deterministically and atomically binds the
+    complete batch to one call at preclaim; it never repacks that call. For
+    pull workers, the kernel admits empty worker calls and assigns ordered
+    microbatches through idempotent checkpointed claims. One Run persists its
+    operational dispatch policy, while a Successor Run may change it.
+    Operational batching is excluded from scientific fingerprints unless it
+    changes scientific meaning. There is no dynamic batch optimizer,
+    cross-Node batch, Modal Queue, or workload-owned durable scheduler.
 
 ## Definition of ready for implementation
 

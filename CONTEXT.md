@@ -202,10 +202,24 @@ _Avoid_: planned, expired, retrying
 
 **Dispatch Batch** [planned]:
 A durable grouping of Tasks from one Node offered together to one Provider
-Call or to a shared pull worker pool. It records intended dispatch without
-claiming that a particular worker performed a Task before a Worker Assignment
-is committed.
+Call or to a shared pull worker pool. Fixed dispatch binds every constituent
+Task to one call during preclaim; pull-worker dispatch records actual
+Task-to-call ownership only through a committed Worker Assignment.
 _Avoid_: workflow node, provider call, scientific batch
+
+**Fixed-Batch Dispatch** [planned]:
+A dispatch mode in which the kernel groups ready Tasks from one Node by a
+workload-declared provider binding, compatibility key, and positive maximum
+batch size. It preserves Task encounter order, persists the complete
+Task-to-call mapping during preclaim, and never repacks that call afterward.
+_Avoid_: pull claim, scientific batch identity, scheduler optimizer
+
+**Pull-Worker Dispatch** [planned]:
+A dispatch mode in which the kernel admits empty worker Provider Calls for one
+Node and those workers later claim bounded Task microbatches through the
+coordinator. Ready Task rows are the queue, and durable Worker Assignments
+record ownership before payload delivery.
+_Avoid_: fixed batch, Modal Queue, timeout lease
 
 **Worker Assignment** [planned]:
 A durable SQLite record linking one Task to the Provider Call and worker claim

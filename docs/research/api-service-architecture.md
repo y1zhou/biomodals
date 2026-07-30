@@ -7,6 +7,13 @@ Decision date: 2026-07-16
 Scope: HTTP ingress and job orchestration for GROMACS, AlphaFold3, and future
 Biomodals apps and workflows
 
+The execution details in
+[ADR 0006](../adr/0006-unified-execution-kernel.md) and the
+[unified scheduler specification](../specs/unified-task-scheduler.md) supersede
+the earlier service-only operation implementation. The HTTP, identity,
+artifact, configuration, and deployment decisions in this document remain
+service-owned.
+
 ## Decision
 
 Run one unified FastAPI control plane on the department's internal Linux host.
@@ -17,20 +24,22 @@ reverse proxy serves the frontend at `https://biomodals.example.com/` and proxie
 pattern.
 
 Scientific compute remains in separately deployed Modal Apps. Each workload
-module contributes an `APIRouter` and a narrow Modal adapter to the control
-plane. The adapter resolves each deployed stage by its Function name with
-`modal.Function.from_name()`, submits it with `.spawn()`, and reconciles the
-detached `FunctionCall`. GROMACS has no API-only coordinator or packaging
-Function. The control plane calls the existing preparation,
-trajectory-analysis, and production Functions through a fixed durable
-dependency graph. After preparation, NVT analysis, NPT analysis, and production
-run concurrently; production analysis starts when production finishes; Result
-preparation waits for all three analyses. The control plane then packages the
-established Volume outputs itself. The service preserves the deployed Function
-and Local Entrypoint interfaces; the separate restart-safe analysis-output
-correction does not add an API-only App path. This keeps the HTTP contract and
-account data local while preserving independent compute images, scaling, and
-deployment lifecycles.
+module contributes an `APIRouter` and caller-owned scientific planning,
+cache-validation, argument-construction, Result decoding, and publication
+logic. It uses the shared `biomodals.execution` kernel for durable Runs, Nodes,
+Tasks, Dispatch Batches, Provider Calls, scheduling, and recovery. The kernel
+resolves exact deployed stages by Function name and version, submits them with
+`.spawn()`, and reconciles detached `FunctionCall` objects without knowing
+about users, HTTP Jobs, or workload artifact schemas.
+
+GROMACS has no API-only Modal coordinator or packaging Function. Its
+service-side caller describes the established preparation, trajectory-analysis,
+and production Functions as a fixed durable DAG. After preparation, NVT
+analysis, NPT analysis, and production run concurrently; production analysis
+starts when production finishes; Result preparation waits for all three
+analyses. The service then packages the established Volume outputs itself as a
+Coordinator-Local Node. This preserves deployed Function and Local Entrypoint
+interfaces while centralizing cost-sensitive execution mechanics.
 [Modal: invoking deployed Functions](https://modal.com/docs/guide/trigger-deployed-functions)
 
 No Modal Web Function, webhook, `@modal.asgi_app`, or
@@ -47,15 +56,16 @@ frontend + /api reverse proxy (one internal origin)
         |
         v
 one FastAPI process
-  |-- shared auth, jobs, downloads, SQLite, reconciler
-  |-- /api/v1/gromacs/*   -> GROMACS adapter
-  |                            |-> prepare_tpr_{cpu,gpu}
-  |                            |     |-> collect_traj_stats(nvt_)
-  |                            |     |-> collect_traj_stats(npt_)
-  |                            |     `-> production_run_{cpu,gpu}
-  |                            |             `-> collect_traj_stats(production_)
-  |                            `-> service-built result.zip
-  `-- /api/v1/alphafold3/* -> future AF3 adapter -> deployed AF3 Modal App
+  |-- shared auth, Service Jobs, downloads, configuration
+  |-- one-way Service Job -> Execution Run
+  |       `-> Nodes -> Tasks -> Dispatch Batches -> Provider Calls
+  |              |-> prepare_tpr_{cpu,gpu}
+  |              |     |-> collect_traj_stats(nvt_)
+  |              |     |-> collect_traj_stats(npt_)
+  |              |     `-> production_run_{cpu,gpu}
+  |              |             `-> collect_traj_stats(production_)
+  |              `-> Coordinator-Local result.zip publication
+  `-- workload callers use the same kernel for future Apps and workflows
                                       |
                                       `-> Modal Volumes (authoritative data)
 ```
@@ -101,6 +111,15 @@ Workload-specific validation stays in explicit submodules. FastAPI's
 The current layout is:
 
 ```text
+src/biomodals/execution/
+  model.py           service-invariant execution records and state
+  sqlite.py          atomic Run, Node, Task, batch and call repository
+  scheduler.py       pure DAG readiness, priority and admission decisions
+  runtime.py         preclaim, spawn, observation and cancellation boundary
+  modal.py           exact deployed-Function and FunctionCall operations
+  coordinator.py     reusable run-scoped coordinator loop
+  pull_worker.py     deterministic pull-worker claim/complete mechanics
+
 src/biomodals/service/
   api.py             app assembly, lifecycle and production wiring
   http_contract.py   shared errors, auth dependencies and middleware
@@ -112,20 +131,19 @@ src/biomodals/service/
   config.py          host configuration
   runtime_config.py  effective process and Administrator settings
   auth.py            manual accounts and opaque browser sessions
-  store.py           SQLite users, sessions and jobs
+  store.py           service data and host-owned execution transactions
   jobs.py            common job view and workload registration
   workloads.py       fixed executable-workload descriptors
-  submission.py      shared operation lease, spawn and attachment boundary
   artifacts.py       verified final-ZIP staging and cache
   modal_logs.py      call-filtered Modal CLI log access
   gromacs/
+    archive.py       deterministic ZIP layout and validation
     contracts.py     GROMACS request schema and stable request identity
     router.py        GROMACS submission route
-    plan.py          pure operation graph and deployed-function arguments
-    provider.py      Modal lookup, submission, polling and cancellation
+    plan.py          immutable execution DAG and deployed-function arguments
+    execution.py     caller-owned coordination and service projection
     results.py       Result publication, recovery and cache access
-    coordinator.py   durable operation reconciliation and finalization
-    modal.py         stable facade that composes the focused boundaries
+    modal.py         Modal calls plus Volume-backed result operations
 ```
 
 New workloads export a router plus lifecycle hooks through an explicit
@@ -139,18 +157,20 @@ strings. Each registered workload owns their allowed values in its static
 definition; the shared OpenAPI schema does not need a new release whenever a
 workflow adds a stage or calls a different deployed function.
 
-`ServiceStore` deliberately remains the sole SQLite transaction owner for the
-MVP. Admission, User limits, operation attachment, cancellation, and Result
-publication cross several tables and must commit atomically. Splitting them
-into nominal repositories would either hide that boundary or add a forwarding
-facade; revisit the module boundary when a second persistence implementation or
-an explicit transaction coordinator exists.
+`ServiceStore` owns service users, sessions, Jobs, configuration, and the
+outermost transaction. Within that same connection,
+`SqliteExecutionRepository` owns only execution tables. Admission and final
+publication can therefore commit service and execution facts atomically
+without making execution records depend on service metadata. The Service Job
+contains a one-way `execution_run_id`; execution tables contain no Job, user,
+HTTP, administrator, or download-policy fields.
 
-`ModalGromacsAdapter` is the narrow composition facade over the focused compute
-provider and Result publisher. Routes and reconciliation depend on that one
-testable workload seam, while Modal lookup and archive behavior remain in their
-own modules. It is not a shared workflow base class, and future workloads need
-not reproduce its shape.
+`GromacsExecutionCoordinator` is caller-owned composition over the shared
+kernel and GROMACS Result publisher. It translates the workload's scientific
+plan and small Result Envelopes into kernel operations, then projects the
+execution snapshot into existing HTTP stages. It is not a shared workflow base
+class: future workloads reuse `biomodals.execution`, not GROMACS orchestration
+or a generic scientific I/O abstraction.
 
 The common routes are:
 
@@ -179,15 +199,17 @@ reasons: compute Functions already have independent containers.
 The browser supplies a UUID `Idempotency-Key` when submitting a job. The key is
 scoped to `(owner_user_id, workload)`. Repeating the same key and payload
 returns the existing job; reusing it with different inputs returns `409`.
-Admission, active-job limits, the Job's expected artifact-request digest, and
-the initial Modal-operation lease are recorded in one SQLite write transaction.
-That transaction also rechecks that the User is enabled before returning an
-existing same-payload admission, so a request racing with Disable cannot claim
-an unsubmitted Job's provider lease or leave a newly admitted Job without one.
-Limits are non-negative integers and zero intentionally blocks new Submissions
-within that scope. Lowering a User, Tool, or Global limit below its current
-count never cancels admitted work; new Submissions are rejected until the
-applicable count falls below the configured limit.
+Admission, active-job limits, the Job's expected artifact-request digest, the
+immutable Execution Plan, and the Service Job's one-way `execution_run_id` are
+recorded in one host-owned SQLite transaction. No provider side effect occurs
+inside that transaction. Once it commits, the caller advances the Execution
+Run through the shared kernel. The transaction also rechecks that the User is
+enabled before returning an existing same-payload admission, so a request
+racing with Disable cannot admit work for a newly disabled account. Limits are
+non-negative integers and zero intentionally blocks new Submissions within
+that scope. Lowering a User, Tool, or Global limit below its current count never
+cancels admitted work; new Submissions are rejected until the applicable count
+falls below the configured limit.
 
 Counts are scoped to this service's SQLite database. Global therefore means all
 Users and Tools admitted by one BioModals deployment, not a combined beta,
@@ -195,6 +217,14 @@ production, or Modal-account total. Separate deployments that target the same
 Modal App do not coordinate admission. Pre-release examples set User, Tool,
 and Global defaults to one; provider-level limits or shared coordination remain
 outside this architecture.
+
+Each Execution Run captures an exact Deployment Identity and its operational
+dispatch policy: total and GPU Provider Call ceilings, fixed-batch or
+pull-worker mode, provider bindings, compatibility and image keys, and
+batch/claim sizes. Resume reuses that policy; only an explicit Successor Run
+may choose different operational settings. These fields do not affect the
+Workload Plan Fingerprint, which covers normalized result-affecting inputs and
+declared scientific, model, tool, and schema versions.
 
 Every owner-facing list, inspect, cancel, and download lookup is constrained by
 both `owner_user_id` and `job_id`. Looking up another user's job returns the
@@ -204,23 +234,32 @@ Stage selectors and access their live or historical provider logs for any Job,
 but it cannot inspect Input, download Result, cancel work, or retrieve a
 provider call identifier.
 
-The submit route atomically persists the Job and leases preparation, spawns it,
-attaches its Modal call identifier to the leased operation, and returns `202`.
-SQLite keeps one ordered `job_operations` row per remote or local operation.
-Modal rows own their call identifier and submission lease; local Result
-packaging uses the same lifecycle without pretending to be a provider call.
-When calls complete, the reconciler evaluates the fixed GROMACS dependencies
-and attaches every newly ready call. Several direct stages may therefore be
-active at once.
+The submit route atomically persists the Job and Execution Run, commits that
+durable state, advances one scheduling wave, and returns `202`. Execution
+SQLite keeps immutable Nodes and Tasks plus Dispatch Batches and Provider Calls
+for actual work. Before any `.spawn()`, one atomic preclaim creates a
+`submitting` Provider Call, assigns its Tasks, and crosses the service
+transaction boundary. Only the caller that created that row receives an
+in-process one-time authorization to spawn. A successful spawn durably attaches
+its Modal call identifier; a definite rejection records failure; an ambiguous
+outcome records `outcome_unknown`. The authorization is not a persisted lease,
+does not expire, and is never recovered to spawn again.
+
+When calls complete, the reconciler evaluates the fixed GROMACS DAG and admits
+ready Tasks subject to the Run's persisted call limits and fixed dispatch
+policy. Several direct stages may therefore be active at once. Coordinator-
+Local Result preparation is a kernel Node and Task but never pretends to be a
+Provider Call.
 
 `JobView.active_stages` exposes every active sanitized stage code and deployed
 Function name. The singular `stage` remains as a compatibility summary of the
 most recently started active stage, or the relevant terminal stage. The API
-projects ordered `stage_history` entries from the operation ledger: a stage
-starts when its direct call is durably attached and ends when the reconciler
-records its observed terminal outcome. Parallel entries may have overlapping
-timestamps and may finish in a different order from their table rows. Each
-entry has `started_at`,
+projects ordered `stage_history` entries from the Execution Run snapshot: a
+remote stage starts when its Provider Call is durably attached and ends when
+the kernel records the terminal outcome. Local Result preparation derives its
+timestamps from its Node and has `N/A` as its Running Function. Parallel
+entries may have overlapping timestamps and may finish in a different order
+from their table rows. Each entry has `started_at`,
 nullable `ended_at`, and a nullable outcome of `completed`, `failed`, or
 `cancelled`; active, state-unknown, and blocked work has no end or outcome.
 Result packaging spans `finalizing` through archive publication. Modal call IDs,
@@ -271,12 +310,13 @@ join barrier. `collect_traj_stats` remains free to use its established
 implementation details, including its internal call to `postprocess_traj`; the
 API does not duplicate or alter those details.
 
-A definite branch failure prevents further dependent submissions and requests
-cancellation of every still-running sibling. The Job remains active until those
-calls are confirmed inactive, then becomes `failed`; this avoids hiding paid
-remote work behind an early terminal state. If a sibling's status expires while
-the service is trying to stop it, the Job becomes `state_unknown` and continues
-to consume admission capacity until an Administrator resolves it.
+A definite branch failure prevents dependent submissions. Independent required
+branches already in flight retain their owners and are reconciled
+conclusively; no failure path blindly resubmits or hides paid work behind an
+early terminal state. The Run outcome is result-driven: validated terminal
+Nodes determine success even if an upstream Node was skipped or cancelled.
+When a required terminal publication cannot be produced, the Run fails only
+after relevant provider ownership is conclusive.
 
 There is deliberately no deployed `run_gromacs_job` Function wrapping these
 calls. Such a wrapper adds a second Modal call layer, obscures which resource
@@ -285,27 +325,32 @@ orchestration authority. Likewise, archive construction is control-plane work,
 not a new Function added to the scientific App.
 
 One in-process reconciler polls active Modal calls approximately every ten
-seconds. Public states are intentionally coarse:
+seconds. Public Job states remain intentionally coarse projections:
 
 ```text
 queued -> running -> finalizing -> succeeded
                             |---> partial (downloadable, with warnings)
                             `---> failed
 queued/running -> cancel_requested -> cancelled
-queued/running/cancel_requested -> state_unknown -> failed (Admin resolution)
+queued/running -> blocked -> running | failed
+queued/running/cancel_requested -> state_unknown
+state_unknown -> running | succeeded | partial | failed | cancelled
 ```
 
-Cancellation is idempotent while it is pending. The adapter asks Modal to
-cancel every recorded active direct call and any visible active descendants
-with `terminate_containers=False`; the Job becomes `cancelled` only after all
-call graphs are inactive. This cancels inputs without forcibly terminating
-workers that may contain unrelated inputs. `cancel_requested_at` is persisted
-before the provider request, transient failures are retried, and restart
-resumes reconciliation. No successor stage may be spawned after the durable
-request. Calls that complete first are recorded as complete while their active
-siblings are cancelled; if a verified Result archive was already published,
-the completed Result wins. Terminal jobs are preserved and there is no
-job-delete endpoint in v1. [Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
+Cancellation is idempotent while it is pending. The execution runtime asks
+Modal to cancel every recorded active direct call and any visible active
+descendants with `terminate_containers=False`; the Job becomes `cancelled` only
+after all call graphs are inactive. This cancels inputs without forcibly
+terminating workers that may contain unrelated inputs. `cancel_requested_at`
+is persisted on the Execution Run before the provider request, and restart
+resumes reconciliation of the same attached calls. No successor Node may be
+admitted after the durable request. Calls that complete first are recorded as
+complete while their active siblings are cancelled; if a verified terminal
+publication was already available, the completed Result wins. An inconclusive
+cancellation moves the Run to `state_unknown`; it is not treated as success
+and is not retried blindly. Terminal Jobs are preserved and there is no
+job-delete endpoint in v1.
+[Modal: `FunctionCall`](https://modal.com/docs/sdk/py/latest/modal.FunctionCall)
 
 The service does not infer successful Cancellation from a timeout. A pending
 Cancellation continues consuming Active Job Limits while Modal still exposes a
@@ -315,13 +360,14 @@ reconciliation continues. If any call status expires before cancellation can
 be confirmed and no verified final Result can be recovered, the Job moves to
 `state_unknown`, not falsely to `cancelled`.
 
-`state_unknown` is the durable safety state for remote execution that may still
-exist but can no longer be tracked automatically. It also applies when a
-`.spawn()` request may have reached Modal but no call ID was durably recorded.
-An explicit ambiguous SDK outcome enters it immediately; a process interruption
-enters it after the short submission lease expires. It consumes User, Tool, and
-Global Active Job Limits, is excluded from reconciliation, and is returned by
-idempotent replay without submitting again.
+`state_unknown` is the durable Run safety state for provider ownership that
+cannot yet be established conclusively. A Provider Call uses
+`outcome_unknown` when `.spawn()` may have reached Modal but no call ID was
+durably attached, and `state_unknown` when an attached call's state, terminal
+result, or cancellation outcome is inconclusive. Either projects to Run-level
+`state_unknown`, retains User, Tool, Global, total-call, and GPU-call capacity,
+and forbids replacement work. Reconciliation may resolve an existing call; it
+may not submit a replacement.
 
 The owner sees “Status unknown,” a generic explanation, and
 `state_unknown_at`, but no provider detail. The Admin Modal page lists the safe
@@ -329,60 +375,51 @@ Job ID, workload, display name, run name, fixed reason, and timestamp needed for
 manual Modal review. After checking Modal and stopping remote work there when
 necessary, an Administrator may use the destructive `Mark failed` action. That
 action records a safe `compute_failed` terminal failure and releases admission
-capacity; it does not itself contact or cancel Modal. No automatic or owner
-transition leaves `state_unknown`.
+capacity; it does not itself contact or cancel Modal. Reconciliation may leave
+`state_unknown` only after it conclusively recovers the original provider
+owner or outcome. Owners cannot force a transition or request replacement
+work.
 
-Initial admission creates an operation-scoped SQLite lease in the same
-transaction as the Job and uses a stable run name made from a sanitized
-display-name slug plus the full Job UUID, for example
+Initial admission creates the Execution Run and Job in one transaction and
+uses a stable run name made from a sanitized display-name slug plus the full
+Job UUID, for example
 `kinase-trial-<job UUID without hyphens>`. The deployed GROMACS App uses that
 single value for both its Volume directory and scientific filenames, so the
 UUID suffix prevents repeated display names from silently reusing another
 Job's checkpoints. The API does not change the established App interface.
 
-An idempotent replay cannot create a second call while the lease is active. If
-the process dies after claiming the Job but before storing a Modal call ID,
-reconciliation leaves the Job queued until the lease expires and then moves it
-to `state_unknown`. It does not automatically resubmit an operation whose
-provider outcome cannot be proven, because doing so could duplicate paid
-compute. An Administrator must review the remote state before marking it failed.
+An idempotent replay observes the same Service Job and Execution Run. Every
+remote submission uses a stable request identity and the kernel's atomic
+preclaim. If the process dies after the `submitting` row crosses the durability
+boundary but before a Modal call ID is stored, recovery marks that Provider
+Call `outcome_unknown` immediately; there is no timeout-based lease stealing.
+It does not automatically resubmit work whose provider outcome cannot be
+proven, because doing so could duplicate paid compute. Each established stage
+writes resume-aware output under the stable run name, but cache behavior is not
+treated as a provider idempotency guarantee.
 
-Every later stage submission takes the same kind of operation-scoped durable
-lease before calling `.spawn()`. A returned call ID atomically attaches to that
-operation and clears its lease without replacing sibling calls. If the process
-dies or Modal's response is ambiguous before that attachment, the Job enters
-`state_unknown` immediately for an
-explicit ambiguous response or at lease expiry after a process interruption;
-it does not spawn the stage again. Each established stage writes resume-aware
-output under the stable run name, but resume behavior is not treated as a
-provider idempotency guarantee. The required single API worker means routine
-reconciliation passes cannot race. Eliminating this untracked-call limitation
-requires provider-side idempotent submission or an external durable worker
-before enabling multiple API processes.
-
-Initial workload routes use the shared `ModalJobSubmitter` state machine for
-the claim, detached spawn, call attachment, definite-rejection release,
-unattached-call cancellation, and `state_unknown` transitions. A new workload
-supplies its validated request, initial operation name, spawn callback, and
-cancel callback; it must not reproduce these cost-sensitive transitions in its
-route handler.
+New workload routes supply a validated immutable plan and caller-owned
+scientific operations to the shared execution runtime. They must use the
+kernel's exact preclaim, detached spawn, call attachment, result-envelope,
+cancellation, and unknown-state transitions rather than reproducing a second
+cost-sensitive state machine.
 
 Modal's supported CLI can filter App logs by one Function Call ID. Each workload
-may therefore register an optional operation-log opener and an
+may therefore register an optional Provider-Call log opener and an
 Administrator-overridable default for Job-owner visibility. GROMACS opts owners
 in by default; future workloads remain Administrator-only until reviewed. The
 shared Job log routes enforce ownership and the live Tool policy before mapping
-a selected Stage back to its durable operation. Running and `state_unknown`
-operations use
+a selected Stage back to its durable Provider Call. Running and
+`state_unknown` calls use
 `modal app logs --follow --function-call --timestamps`; completed, failed, and
-cancelled operations omit follow mode and use the operation's recorded time
+cancelled calls omit follow mode and use the Provider Call's recorded time
 range with `--since` and `--until`. Both forms use the Job's captured App and
 Environment.
 
 The same endpoint accepts paired, timezone-aware `since` and `until` query
 parameters for lazy history. The service rejects windows longer than 15
-minutes, clamps valid windows to the operation's recorded lifetime, and opens
-them in historical mode even while the operation is active. This keeps the
+minutes, clamps valid windows to the Provider Call's recorded lifetime, and
+opens them in historical mode even while the call is active. This keeps the
 provider-independent workload hook reusable: it receives an explicit live or
 historical selection rather than HTTP query details. Omitting both parameters
 preserves complete terminal fetches and active follow streams.
@@ -404,7 +441,7 @@ subprocess.
 The target list assigns live mode to running and `state_unknown` calls whose IDs
 are known. It assigns historical mode to completed, failed, and cancelled calls
 that also have recorded completion times. It excludes local Result preparation
-and unsubmitted operations. Logs are diagnostic provider output, not Job state,
+and unsubmitted Tasks. Logs are diagnostic provider output, not Job state,
 Progress, Stage History, or an audit record; their presence, absence, or final
 line never advances the durable Job lifecycle.
 
@@ -675,10 +712,12 @@ active development an Administrator may explicitly migrate selected records or
 remove the unsupported database while the service is stopped, then restart to
 initialize a fresh schema. This reset policy ends at the first release.
 
-The durable GROMACS operation plan is likewise a pre-release contract. Before
-changing operation names or dependencies, drain active Jobs or add an explicit
-plan-version compatibility path; a restarted service must not reinterpret an
-in-flight Job under a different graph.
+The durable GROMACS Execution Plan and Node/Task keys are likewise a pre-release
+contract. Before changing them, drain active Jobs or perform an explicit
+offline service-state transition that preserves users and configuration while
+recreating Job and execution state. The service does not carry a compatibility
+facade, dual-write old execution state, or reinterpret an in-flight Run under a
+different graph.
 
 Pre-release and production service definitions select distinct
 `BIOMODALS_STATE_DIR` and `BIOMODALS_CACHE_DIR` values. Pre-release sets

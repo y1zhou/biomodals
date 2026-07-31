@@ -103,6 +103,7 @@ from biomodals.execution import (
     drive_execution_run,
     ready_node_keys,
     required_node_keys,
+    result_probe_frontier,
     resume_execution_run,
 )
 from biomodals.execution.modal import (
@@ -142,6 +143,10 @@ _EMPTY_PUBLICATION_SCHEMA = 1
 
 class _ConclusivePublicationError(RuntimeError):
     """A completed call did not leave its required scientific publication."""
+
+
+class _IncompletePrerequisiteError(RuntimeError):
+    """A downstream publication cannot exist before its prerequisite."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +250,7 @@ class AlphaFold3ExecutionRuntime:
         repository = self.store.execution
         self._provider.repository = repository
 
-        self._observe_terminal_publication()
+        self._recover_publications()
         required = self._required_nodes()
         if required is None:
             return
@@ -305,22 +310,67 @@ class AlphaFold3ExecutionRuntime:
             raise ValueError("AlphaFold3 operational limits do not match Execution Run")
         return repository
 
-    def _observe_terminal_publication(self) -> None:
-        node = self.store.execution.get_node(
-            self.execution_run_id,
-            _REQUEST_PUBLICATION,
-        )
-        if node.status.is_terminal:
-            return
-        observation = self._invocation_observation()
-        with self.store.transaction():
-            self.store.execution.record_node_result_observation(
-                self.execution_run_id,
-                _REQUEST_PUBLICATION,
-                observation,
-                now=self._now(),
-            )
-        self._checkpoint()
+    def _recover_publications(self) -> None:
+        """Probe result Nodes backward until reusable work closes each branch."""
+        repository = self.store.execution
+        run = repository.get_run(self.execution_run_id)
+        observations: dict[str, AvailabilityStatus | None] = {}
+        for node in repository.list_nodes(self.execution_run_id):
+            if node.status == NodeStatus.SUCCEEDED:
+                observations[node.node_key] = AvailabilityStatus.AVAILABLE
+            elif node.status.is_terminal:
+                observations[node.node_key] = AvailabilityStatus.MISSING
+            else:
+                observations[node.node_key] = None
+
+        while frontier := result_probe_frontier(run.plan, observations):
+            observed = [
+                (node_key, self._node_observation(node_key)) for node_key in frontier
+            ]
+            with self.store.transaction():
+                for node_key, observation in observed:
+                    repository.record_node_result_observation(
+                        self.execution_run_id,
+                        node_key,
+                        observation,
+                        now=self._now(),
+                    )
+                    observations[node_key] = observation
+            repository = self._checkpoint()
+            if any(
+                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
+            ):
+                return
+
+    def _node_observation(self, node_key: str) -> AvailabilityStatus:
+        """Validate one complete Node result without admitting its Tasks."""
+        try:
+            planned = self._planned_tasks(node_key)
+        except _IncompletePrerequisiteError:
+            return AvailabilityStatus.MISSING
+        except Exception:
+            return AvailabilityStatus.UNKNOWN
+        if not planned:
+            return self._empty_node_observation(node_key)
+
+        observations: list[AvailabilityStatus] = []
+        for item in planned:
+            try:
+                observations.append(self._task_observation(node_key, item))
+            except (
+                _ConclusivePublicationError,
+                _IncompletePrerequisiteError,
+            ):
+                return AvailabilityStatus.MISSING
+            except Exception:
+                return AvailabilityStatus.UNKNOWN
+        if AvailabilityStatus.UNKNOWN in observations:
+            return AvailabilityStatus.UNKNOWN
+        if all(
+            observation == AvailabilityStatus.AVAILABLE for observation in observations
+        ):
+            return AvailabilityStatus.AVAILABLE
+        return AvailabilityStatus.MISSING
 
     def _invocation_observation(self) -> AvailabilityStatus:
         try:
@@ -1011,6 +1061,7 @@ class AlphaFold3ExecutionRuntime:
             result = self._task_result_if_returned(
                 node_key,
                 item.plan.task_key,
+                task_plan=item.plan,
             )
             if result is None:
                 return self._remote_publication_observation(
@@ -1043,6 +1094,7 @@ class AlphaFold3ExecutionRuntime:
             result = self._task_result_if_returned(
                 node_key,
                 item.plan.task_key,
+                task_plan=item.plan,
             )
             if result is None:
                 return self._remote_publication_observation(
@@ -1062,14 +1114,19 @@ class AlphaFold3ExecutionRuntime:
             return AvailabilityStatus.AVAILABLE
         if node_key == _STAGE_INFERENCE:
             prepared = cast(PreparedInferenceRun, item.value)
+            output_root = self.inference_runtime.output_root
+            if not output_root.is_absolute() or not output_root.is_dir():
+                return AvailabilityStatus.UNKNOWN
             try:
                 load_staged_inference_input(
-                    self.inference_runtime.output_root,
+                    output_root,
                     run_id=prepared.run_id,
                     request_id=prepared.request_id,
                     staged_input_record=prepared.staged_input.to_record(),
                 )
-            except FileNotFoundError:
+            except OSError:
+                return AvailabilityStatus.UNKNOWN
+            except (RuntimeError, ValueError):
                 return AvailabilityStatus.MISSING
             return AvailabilityStatus.AVAILABLE
         if node_key == _SEED_PREDICTIONS:
@@ -1134,13 +1191,19 @@ class AlphaFold3ExecutionRuntime:
         self,
         node_key: str,
         task_key: str,
+        *,
+        task_plan: TaskPlan | None = None,
     ) -> dict[str, object] | None:
         call = self._task_call(node_key, task_key)
         if call is not None and call.status == ProviderCallStatus.SUCCEEDED:
             return self._load_call_result(call)
         return load_execution_result_path(
             self.inference_runtime.output_root,
-            self._task_result_path(node_key, task_key),
+            self._task_result_path(
+                node_key,
+                task_key,
+                task_plan=task_plan,
+            ),
         )
 
     def _task_call(
@@ -1248,17 +1311,23 @@ class AlphaFold3ExecutionRuntime:
         for task in plan.assemblies:
             outcome = cached.get((task.polymer, task.sequence))
             if outcome is None:
-                key = combined_msa_task_plan(
+                task_plan = combined_msa_task_plan(
                     task,
                     raw_search_identities={
                         database_id: identity
                         for (database_id, sequence), identity in identities.items()
                         if sequence == task.sequence
                     },
-                ).task_key
-                outcome = self._task_result_if_returned(_MSA_ASSEMBLIES, key)
+                )
+                outcome = self._task_result_if_returned(
+                    _MSA_ASSEMBLIES,
+                    task_plan.task_key,
+                    task_plan=task_plan,
+                )
             if outcome is None:
-                raise RuntimeError("Successful MSA Task has no reusable result")
+                raise _IncompletePrerequisiteError(
+                    "MSA assembly publication is unavailable"
+                )
             outcomes.append(outcome)
         resolution = reduce_msa_assembly_results(plan.assemblies, outcomes)
         apply_msa_resolution(
@@ -1301,22 +1370,19 @@ class AlphaFold3ExecutionRuntime:
         )
         cached = reduce_template_cache_results(canonical, statuses)
         templates = dict(cached.templates_by_identity)
-        task_keys = {
-            cast(str, record.scientific_payload["template_identity"]): record.task_key
-            for record in self.store.execution.list_tasks(
-                self.execution_run_id,
-                _TEMPLATE_SEARCHES,
-            )
-        }
         for task in plan.tasks:
             if task.template_identity in templates:
                 continue
+            task_plan = template_search_task_plan(task)
             result = self._task_result_if_returned(
                 _TEMPLATE_SEARCHES,
-                task_keys[task.template_identity],
+                task_plan.task_key,
+                task_plan=task_plan,
             )
             if result is None:
-                raise RuntimeError("Successful template Task has no reusable result")
+                raise _IncompletePrerequisiteError(
+                    "Template publication is unavailable"
+                )
             templates[task.template_identity] = validate_template_result(
                 task,
                 result,
@@ -1433,7 +1499,26 @@ class AlphaFold3ExecutionRuntime:
         self,
         node_key: str,
         task_key: str,
+        *,
+        task_plan: TaskPlan | None = None,
     ) -> PurePosixPath:
+        if task_plan is not None:
+            if task_plan.task_key != task_key:
+                raise ValueError("AlphaFold3 Task Plan key does not match result key")
+            fingerprint = task_plan.fingerprint(
+                workload_plan_fingerprint=(
+                    self.request.execution_plan.workload_plan_fingerprint
+                ),
+                node_key=node_key,
+            )
+            digest = sha256(
+                orjson.dumps([fingerprint], option=orjson.OPT_SORT_KEYS)
+            ).hexdigest()
+            return execution_result_path(
+                self.request.execution_plan.workload_plan_fingerprint,
+                node_key,
+                digest,
+            )
         return self._result_path(node_key, (task_key,))
 
     def _call_result_path(self, call: ProviderCallRecord) -> PurePosixPath:

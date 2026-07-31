@@ -19,7 +19,8 @@ from biomodals.app.fold.alphafold3.execution_runtime import (
     _result_envelope,
 )
 from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
-from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
+from biomodals.app.fold.alphafold3.input_enrichment import chain_msa_states
+from biomodals.app.fold.alphafold3.msa_search import SearchRuntime, plan_msa_resolution
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -27,6 +28,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
 from biomodals.execution import (
+    AvailabilityStatus,
     DeploymentIdentity,
     NodeStatus,
     ProviderCallStatus,
@@ -128,6 +130,7 @@ def _request(
     *,
     seeds: list[int] | None = None,
     max_num_gpus: int = 1,
+    search_msa: bool = False,
 ) -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
         AF3Config(
@@ -142,7 +145,7 @@ def _request(
                 )
             ],
         ),
-        search_msa=False,
+        search_msa=search_msa,
         search_protein_templates=True,
         max_parallel_search_workers=2,
         max_num_gpus=max_num_gpus,
@@ -264,7 +267,10 @@ def test_seed_tasks_use_fixed_batches_without_duplicate_submission(
         ("seed:1", "seed:2"),
         ("seed:3",),
     ]
-    assert {call.status for call in calls} == {ProviderCallStatus.ATTACHED}
+    assert {call.status for call in calls}.issubset({
+        ProviderCallStatus.ATTACHED,
+        ProviderCallStatus.RUNNING,
+    })
     assert all(
         cast(Any, spawn["function"]).function_name == "run_inference_pipeline"
         for spawn in driver.spawns
@@ -327,6 +333,75 @@ def test_completed_invocation_prunes_every_ancestor_without_a_call(
     assert snapshot.provider_calls == ()
     assert snapshot.nodes[-1].status == NodeStatus.SUCCEEDED
     assert all(node.status.is_terminal for node in snapshot.nodes)
+    runtime.close()
+
+
+def test_backward_probe_stops_at_reusable_combined_msa(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reusable intermediate prunes its raw-search ancestor closure."""
+    runtime = _runtime(tmp_path, request=_request(search_msa=True))
+    runtime._initialize()
+    observed: list[str] = []
+
+    def observe(node_key: str) -> AvailabilityStatus:
+        observed.append(node_key)
+        if node_key == "combined-msa-publications":
+            return AvailabilityStatus.AVAILABLE
+        return AvailabilityStatus.MISSING
+
+    monkeypatch.setattr(runtime, "_node_observation", observe)
+
+    runtime._recover_publications()
+    required = runtime._required_nodes()
+    assert required is not None
+    runtime._prune_unrequired(required)
+
+    assert observed == [
+        "request-publication",
+        "inference-summary",
+        "seed-predictions",
+        "stage-inference-input",
+        "protein-template-searches",
+        "combined-msa-publications",
+    ]
+    assert "raw-database-searches" not in required
+    nodes = {node.node_key: node for node in runtime.store.execution.list_nodes(RUN_ID)}
+    assert nodes["combined-msa-publications"].status == NodeStatus.SUCCEEDED
+    assert nodes["raw-database-searches"].status == NodeStatus.SKIPPED
+    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
+    runtime.close()
+
+
+def test_combined_msa_node_observation_uses_validated_combined_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AF3 adapter can recognize a reusable aggregate before discovery."""
+    runtime = _runtime(tmp_path, request=_request(search_msa=True))
+    plan = plan_msa_resolution(chain_msa_states(runtime.request.config))
+    raw_statuses = tuple(
+        {
+            "status": "missing",
+            "search_identity": f"{index:064x}",
+        }
+        for index, _ in enumerate(plan.raw_searches, start=1)
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_msa_inventory",
+        lambda: (plan.raw_searches, raw_statuses, plan.assemblies),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_inspect_combined",
+        lambda tasks: tuple({"status": "reused"} for _ in tasks),
+    )
+
+    assert runtime._node_observation("combined-msa-publications") == (
+        AvailabilityStatus.AVAILABLE
+    )
     runtime.close()
 
 

@@ -2013,6 +2013,10 @@ Rollback:
 Migrate only apps that already own multi-call scheduling or duplicate a proven
 execution graph. Keep single-call apps on their existing direct path.
 
+Status: implemented for all six apps below. Each app has a deployment-local
+remote coordinator for direct CLI Runs and retains its workload-owned scientific
+publications and validators.
+
 Adoption order:
 
 1. GROMACS reuses its established service operation graph for direct CLI Runs
@@ -2028,6 +2032,9 @@ Adoption order:
 6. OligoFormer replaces Modal Queue work stealing, nested branch scheduling,
    and same-Run provider resubmission with kernel dispatch. Its efficacy,
    reference, shard, evidence, and final-table publications remain authoritative.
+   Kernel Tasks stop at the RNAplfold reference-shard, PITA candidate, and
+   TargetScan candidate/reference-tile boundaries. Bounded row-level work stays
+   inside each provider container as a local pool.
 
 Shared constraints:
 

@@ -27,25 +27,36 @@ Results are saved locally as `<run-name>.xlsx`, containing the upstream
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 
-from __future__ import annotations
-
 import os
 import re
 import shlex
 import shutil
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.score.ensirna_execution import (
+    EnsirnaExecutionCoordinator,
+    EnsirnaExecutionRequest,
+    EnsirnaPdbChunkSpec,
+    EnsirnaPreparationPlan,
+    load_execution_request_from_volume,
+    stage_execution_request,
+)
+from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    deployed_execution_coordinator,
+    development_modal_call_driver,
+)
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout
-from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import build_local_output_path, resolve_local_output_dir
 from biomodals.helper.shell import run_command, sanitize_filename
-from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -85,9 +96,6 @@ class AppInfo:
     result_marker_name: str = "inference.json"
     pdb_prep_dir_name: str = "pdb_chunks"
     inference_prep_dir_name: str = "inference"
-    cache_lock_dict_name: str = f"{CONF.package_name}-cache-locks"
-    cache_lock_poll_seconds: float = 5.0
-    cache_lock_stale_seconds: float = MAX_TIMEOUT + 600
     max_prepare_jobs: int = 64
     max_pdb_cores: int = 32
     max_total_pdb_cores: int = 64
@@ -422,30 +430,6 @@ path.write_text(text, encoding="utf-8")
     def dataset_runtime_patch_runner(self) -> str:
         """Return a Python one-liner that applies the dataset patch."""
         return f"exec({self.dataset_runtime_patch!r})"
-
-
-@dataclass(frozen=True, slots=True)
-class EnsirnaPdbChunkSpec:
-    """One CPU Rosetta PDB preparation chunk."""
-
-    chunk_name: str
-    csv_path: str
-    json_path: str
-    pdb_dir: str
-
-
-@dataclass(frozen=True, slots=True)
-class EnsirnaPreparationPlan:
-    """Volume-backed prepared-input contract for ENsiRNA inference."""
-
-    cache_key: str
-    prepared_dir: str
-    json_path: str
-    processed_dir: str
-    candidate_count: int
-    chunk_count: int
-    chunks: list[EnsirnaPdbChunkSpec]
-    cached: bool
 
 
 def _sanitize_fasta_for_upstream(mrna_fasta_bytes: bytes) -> bytes:
@@ -984,78 +968,6 @@ def _is_prepared(layout: AppRunLayout) -> bool:
     return _prepared_metadata(layout) is not None
 
 
-@contextmanager
-def _cache_build_lock(stage: str, identity: str, *, rebuild: bool = False):
-    """Elect one cache builder using append-only Modal Dict generations."""
-    from time import sleep, time
-    from uuid import uuid4
-
-    locks = modal.Dict.from_name(APP_INFO.cache_lock_dict_name, create_if_missing=True)
-    lock_key = hash_string(f"{stage}\n{identity}")
-    head_key = f"{lock_key}:head"
-    owner = {"id": uuid4().hex, "acquired_at": time()}
-    stored_head = locks.get(head_key, 0)
-    generation = stored_head if isinstance(stored_head, int) else 0
-    owns_generation = False
-    rebuild_pending = rebuild
-    while True:
-        owner_key = f"{lock_key}:owner:{generation}"
-        status_key = f"{lock_key}:status:{generation}"
-        if locks.put(owner_key, owner, skip_if_exists=True):
-            owns_generation = True
-            locks.put(head_key, generation)
-            break
-        status = locks.get(status_key)
-        if isinstance(status, dict) and status.get("state") == "complete":
-            if locks.get(f"{lock_key}:owner:{generation + 1}") is not None:
-                rebuild_pending = False
-                generation += 1
-                continue
-            if rebuild_pending:
-                rebuild_pending = False
-                generation += 1
-                continue
-            break
-        if isinstance(status, dict) and status.get("state") in {"abandoned", "failed"}:
-            rebuild_pending = False
-            generation += 1
-            continue
-        current = locks.get(owner_key)
-        if (
-            isinstance(current, dict)
-            and isinstance(current.get("acquired_at"), (int, float))
-            and time() - current["acquired_at"] > APP_INFO.cache_lock_stale_seconds
-        ):
-            locks.put(
-                status_key,
-                {"state": "abandoned", "recorded_at": time()},
-                skip_if_exists=True,
-            )
-            continue
-        # A live owner is already satisfying this cache request. Following it
-        # must consume a pending repair request so waiters do not each create a
-        # fresh generation after the shared repair completes.
-        rebuild_pending = False
-        sleep(APP_INFO.cache_lock_poll_seconds)
-    try:
-        yield owns_generation
-    except BaseException:
-        if owns_generation:
-            locks.put(
-                status_key,
-                {"state": "failed", "recorded_at": time()},
-                skip_if_exists=True,
-            )
-        raise
-    else:
-        if owns_generation:
-            locks.put(
-                status_key,
-                {"state": "complete", "recorded_at": time()},
-                skip_if_exists=True,
-            )
-
-
 def _plan_from_layout(
     *, cache_key: str, layout: AppRunLayout, candidate_count: int, chunk_count: int
 ) -> EnsirnaPreparationPlan:
@@ -1114,19 +1026,6 @@ def _write_prepared_marker(
             "processed_parts": processed_parts,
         }),
     )
-
-
-def _invalidate_published_preparation(layout: AppRunLayout) -> None:
-    """Remove derived evidence from a published cache that failed validation."""
-    for path in (
-        layout.outputs_dir / f"{APP_INFO.input_stem}.json",
-        layout.outputs_dir / f"{APP_INFO.input_stem}_processed",
-        _prepared_marker_path(layout),
-    ):
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink(missing_ok=True)
 
 
 def _load_prepared_json_records(layout: AppRunLayout) -> dict[str, dict]:
@@ -1284,6 +1183,12 @@ runtime_image = (
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+ENSIRNA_OUTPUT_CLAIMS = modal.Dict.from_name(
+    f"{CONF.name}-output-claims",
+    create_if_missing=True,
+)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_ensirna_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 
 ##########################################
@@ -1788,80 +1693,6 @@ def ensirna_preprocess_dataset(
 
 
 @app.function(
-    cpu=(0.125, 1.0),
-    memory=(512, 2048),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def build_ensirna_prepared_inputs(
-    mrna_fasta_bytes: bytes,
-    prepare_workers: int = 4,
-    pdb_cores: int = 1,
-    preprocess_shard_size: int = APP_INFO.preprocess_shard_size,
-    force_generation: str | None = None,
-) -> EnsirnaPreparationPlan:
-    """Own and orchestrate one complete content-addressed preparation build."""
-    if not 1 <= prepare_workers <= APP_INFO.max_prepare_jobs:
-        raise ValueError(
-            f"prepare_workers must be between 1 and {APP_INFO.max_prepare_jobs}"
-        )
-    if not 1 <= pdb_cores <= APP_INFO.max_pdb_cores:
-        raise ValueError(f"pdb_cores must be between 1 and {APP_INFO.max_pdb_cores}")
-    if prepare_workers * pdb_cores > APP_INFO.max_total_pdb_cores:
-        raise ValueError(
-            "prepare_workers * pdb_cores must not exceed "
-            f"{APP_INFO.max_total_pdb_cores}"
-        )
-    if preprocess_shard_size < 1:
-        raise ValueError("preprocess_shard_size must be at least 1")
-
-    cache_key = _cache_key_for_fasta(
-        mrna_fasta_bytes, force_generation=force_generation
-    )
-    layout = _layout_for_cache_key(cache_key)
-    CONF.output_volume.reload()
-    prepared_ready = (
-        _cached_preparation_plan(cache_key=cache_key, layout=layout) is not None
-    )
-    with _cache_build_lock(
-        "prepared", cache_key, rebuild=not prepared_ready
-    ) as owns_build:
-        CONF.output_volume.reload()
-        if cached := _cached_preparation_plan(cache_key=cache_key, layout=layout):
-            return cached
-        if not owns_build:
-            raise RuntimeError(
-                "ENsiRNA cache builder completed without publishing a valid cache"
-            )
-        if _prepared_marker_path(layout).exists():
-            _invalidate_published_preparation(layout)
-            CONF.output_volume.commit()
-
-        plan = ensirna_prepare_inputs.remote(
-            mrna_fasta_bytes=mrna_fasta_bytes,
-            max_prepare_jobs=prepare_workers,
-            force_generation=force_generation,
-        )
-        print(
-            f"💊 Preparing {plan.candidate_count} siRNAs across "
-            f"{plan.chunk_count} CPU chunks (up to "
-            f"{min(prepare_workers, plan.chunk_count)} containers, "
-            f"{pdb_cores} local processes each, "
-            f"{min(prepare_workers, plan.chunk_count) * pdb_cores} process slots)"
-        )
-
-        def run_chunk(chunk: EnsirnaPdbChunkSpec) -> dict[str, int | str]:
-            return ensirna_prepare_pdb_chunk.remote(chunk=chunk, pdb_cores=pdb_cores)
-
-        bounded_map(plan.chunks, run_chunk, max_parallel=prepare_workers)
-        finalized = ensirna_finalize_prepared_inputs.remote(plan)
-        return ensirna_preprocess_dataset.remote(
-            finalized,
-            preprocess_shard_size=preprocess_shard_size,
-        )
-
-
-@app.function(
     gpu=CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
@@ -1885,67 +1716,56 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
     cache_key = str(prepared_metadata["cache_key"])
 
     result_xlsx = layout.outputs_dir / "mrna_result.xlsx"
-    result_ready = _result_ready(layout, cache_key)
-    with _cache_build_lock(
-        "inference", cache_key, rebuild=force or not result_ready
-    ) as owns_build:
-        CONF.output_volume.reload()
-        if not force and _result_ready(layout, cache_key):
-            return result_xlsx.read_bytes()
-        if not owns_build:
-            if _result_ready(layout, cache_key):
-                return result_xlsx.read_bytes()
-            raise RuntimeError("ENsiRNA inference completed without a valid result")
+    if not force and _result_ready(layout, cache_key):
+        return result_xlsx.read_bytes()
 
-        _link_checkpoints()
-        checkpoint_args = [
-            str(APP_INFO.ensirna_dir / "pkl" / filename)
-            for filename in APP_INFO.checkpoint_filenames
-        ]
-        staging_dir = _inference_prep_dir(layout) / uuid4().hex
-        staging_dir.mkdir(parents=True)
-        staging_result = staging_dir / result_xlsx.name
-        try:
-            run_command(
-                [
-                    "micromamba",
-                    "run",
-                    "-n",
-                    APP_INFO.conda_env_name,
-                    "python",
-                    "run.py",
-                    "--ckpt",
-                    *checkpoint_args,
-                    "--test_set",
-                    str(layout.outputs_dir / f"{APP_INFO.input_stem}.json"),
-                    "--save_dir",
-                    str(staging_dir),
-                    "--gpu",
-                    "0",
-                    "--id",
-                    APP_INFO.input_stem,
-                ],
-                cwd=APP_INFO.ensirna_dir,
-                output_mode="inherit",
-            )
-            if not staging_result.is_file() or staging_result.stat().st_size == 0:
-                raise FileNotFoundError(
-                    f"ENsiRNA result XLSX not found: {staging_result}"
-                )
-            staging_result.replace(result_xlsx)
-            _atomic_write(
-                _result_marker_path(layout),
-                orjson.dumps({
-                    "schema_version": APP_INFO.cache_schema_version,
-                    "cache_key": cache_key,
-                    "size": result_xlsx.stat().st_size,
-                    "sha256": _file_sha256(result_xlsx),
-                }),
-            )
-            CONF.output_volume.commit()
-        finally:
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir)
+    _link_checkpoints()
+    checkpoint_args = [
+        str(APP_INFO.ensirna_dir / "pkl" / filename)
+        for filename in APP_INFO.checkpoint_filenames
+    ]
+    staging_dir = _inference_prep_dir(layout) / uuid4().hex
+    staging_dir.mkdir(parents=True)
+    staging_result = staging_dir / result_xlsx.name
+    try:
+        run_command(
+            [
+                "micromamba",
+                "run",
+                "-n",
+                APP_INFO.conda_env_name,
+                "python",
+                "run.py",
+                "--ckpt",
+                *checkpoint_args,
+                "--test_set",
+                str(layout.outputs_dir / f"{APP_INFO.input_stem}.json"),
+                "--save_dir",
+                str(staging_dir),
+                "--gpu",
+                "0",
+                "--id",
+                APP_INFO.input_stem,
+            ],
+            cwd=APP_INFO.ensirna_dir,
+            output_mode="inherit",
+        )
+        if not staging_result.is_file() or staging_result.stat().st_size == 0:
+            raise FileNotFoundError(f"ENsiRNA result XLSX not found: {staging_result}")
+        staging_result.replace(result_xlsx)
+        _atomic_write(
+            _result_marker_path(layout),
+            orjson.dumps({
+                "schema_version": APP_INFO.cache_schema_version,
+                "cache_key": cache_key,
+                "size": result_xlsx.stat().st_size,
+                "sha256": _file_sha256(result_xlsx),
+            }),
+        )
+        CONF.output_volume.commit()
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
     if not _result_ready(layout, cache_key):
         raise FileNotFoundError(f"ENsiRNA result XLSX not found: {result_xlsx}")
@@ -1953,7 +1773,171 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
 
 
 ##########################################
-# Entrypoint for ephemeral usage
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=CONF.timeout,
+    max_containers=1,
+    volumes=CONF.mounts(output_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with ENsiRNA functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh output state before accepting lifecycle methods."""
+        self._coordinator_adapter = None
+        self._development = None
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionSnapshot:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionSnapshot:
+        """Read this Run's durable kernel snapshot."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionSnapshot:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionSnapshot:
+        """Resume this Run without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> ExecutionSnapshot:
+        """Create and drive one compatible Successor Run."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        prepare_workers: int,
+    ) -> ExecutionSnapshot:
+        """Create a compatible Successor while inferring predecessor identity."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=prepare_workers,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return (
+            UUID(self.execution_run_id),
+            DeploymentIdentity(
+                self.deployment_environment,
+                self.deployment_name,
+                self.deployment_version,
+            ),
+        )
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> EnsirnaExecutionCoordinator:
+        adapter = getattr(self, "_coordinator_adapter", None)
+        selected_mode = getattr(self, "_development", None)
+        if adapter is not None:
+            if development is not None and selected_mode != development:
+                raise ValueError("Coordinator execution mode cannot change in place")
+            return adapter
+        execution_run_id, deployment = self._identity()
+        selected_mode = False if development is None else development
+        adapter = EnsirnaExecutionCoordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=Path(CONF.output_volume_mountpoint),
+            output_volume=CONF.output_volume,
+            output_claims=ENSIRNA_OUTPUT_CLAIMS,
+            modal_driver=_coordinator_modal_driver(development=selected_mode),
+        )
+        self._coordinator_adapter = adapter
+        self._development = selected_mode
+        return adapter
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "download_ensirna_models": download_ensirna_models,
+            "ensirna_prepare_inputs": ensirna_prepare_inputs,
+            "ensirna_prepare_pdb_chunk": ensirna_prepare_pdb_chunk,
+            "ensirna_finalize_prepared_inputs": ensirna_finalize_prepared_inputs,
+            "ensirna_preprocess_dataset": ensirna_preprocess_dataset,
+            "run_ensirna_inference": run_ensirna_inference,
+        },
+        workload_name="ENsiRNA",
+    )
+
+
+def _execution_coordinator_handle(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    use_deployed_coordinator: bool,
+):
+    """Resolve this run's exact deployed or current-source coordinator."""
+    if use_deployed_coordinator:
+        return deployed_execution_coordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+        )
+    return ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment=deployment.environment,
+        deployment_name=deployment.deployment_name,
+        deployment_version=deployment.deployment_version,
+    )
+
+
+##########################################
+# Local entrypoint client
 ##########################################
 @app.local_entrypoint()
 def submit_ensirna_task(
@@ -1964,6 +1948,11 @@ def submit_ensirna_task(
     pdb_cores: int = 1,
     preprocess_shard_size: int = APP_INFO.preprocess_shard_size,
     force: bool = False,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run ENsiRNA siRNA candidate design.
 
@@ -1981,9 +1970,13 @@ def submit_ensirna_task(
             completed preparation caches remain reusable across values.
         force: Rebuild prepared artifacts and rerun inference instead of using
             matching cached Modal volume outputs.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            Biomodals CLI supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
-    from uuid import uuid4
-
     input_path = Path(mrna_fasta).expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f"mRNA FASTA not found: {input_path}")
@@ -1996,22 +1989,95 @@ def submit_ensirna_task(
         overwrite=force,
     )
 
-    print(f"🧬 Submitting ENsiRNA run '{run_name}'")
-    download_ensirna_models.remote(force=False)
-    prepared_plan = build_ensirna_prepared_inputs.remote(
-        mrna_fasta_bytes=input_path.read_bytes(),
+    if not 1 <= prepare_workers <= APP_INFO.max_prepare_jobs:
+        raise ValueError(
+            f"prepare_workers must be between 1 and {APP_INFO.max_prepare_jobs}"
+        )
+    if not 1 <= pdb_cores <= APP_INFO.max_pdb_cores:
+        raise ValueError(f"pdb_cores must be between 1 and {APP_INFO.max_pdb_cores}")
+    if prepare_workers * pdb_cores > APP_INFO.max_total_pdb_cores:
+        raise ValueError(
+            "prepare_workers * pdb_cores must not exceed "
+            f"{APP_INFO.max_total_pdb_cores}"
+        )
+    if preprocess_shard_size < 1:
+        raise ValueError("preprocess_shard_size must be at least 1")
+
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    predecessor_request = (
+        None
+        if predecessor_execution_run_id is None
+        else load_execution_request_from_volume(
+            CONF.output_volume,
+            predecessor_execution_run_id,
+        )
+    )
+    if predecessor_request is None:
+        fasta_content = _sanitize_fasta_for_upstream(input_path.read_bytes())
+        force_generation = uuid4().hex if force else None
+        app_version = CONF.repo_commit_hash or CONF.version or "unknown"
+    else:
+        fasta_content = predecessor_request.fasta_content
+        force_generation = predecessor_request.force_generation
+        app_version = predecessor_request.app_version
+    request = EnsirnaExecutionRequest(
+        run_name=run_name,
+        fasta_content=fasta_content,
         prepare_workers=prepare_workers,
         pdb_cores=pdb_cores,
         preprocess_shard_size=preprocess_shard_size,
-        force_generation=uuid4().hex if force else None,
+        force_generation=force_generation,
+        app_version=app_version,
     )
-    if prepared_plan.cached:
-        print(f"🧬 Reusing prepared ENsiRNA inputs: {prepared_plan.prepared_dir}")
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
+    )
+    if predecessor_execution_run_id is None:
+        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(development=not use_deployed_coordinator)
+    else:
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            workload_plan_fingerprint=(
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            prepare_workers=request.prepare_workers,
+        )
+    print(f"Execution Run ID: {execution_run_id}")
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
+    )
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    snapshot = call.get()
+    if snapshot.run.status != RunStatus.SUCCEEDED:
+        diagnostic = snapshot.run.status_message or (
+            snapshot.run.status_reason.value
+            if snapshot.run.status_reason is not None
+            else snapshot.run.status.value
+        )
+        raise RuntimeError(
+            f"{CONF.name} Execution Run ended as "
+            f"{snapshot.run.status.value}: {diagnostic}"
+        )
 
-    xlsx_bytes = run_ensirna_inference.remote(
-        prepared_dir=prepared_plan.prepared_dir,
-        force=force,
+    cache_key = _cache_key_for_fasta(
+        request.fasta_content,
+        force_generation=request.force_generation,
     )
+    result_path = _layout_for_cache_key(cache_key).outputs_dir / "mrna_result.xlsx"
+    relative_result = result_path.relative_to(CONF.output_volume_mountpoint)
+    xlsx_bytes = b"".join(CONF.output_volume.read_file(relative_result.as_posix()))
     out_file.parent.mkdir(parents=True, exist_ok=True)
     temporary = out_file.with_name(f".{out_file.name}.{uuid4().hex}.tmp")
     try:

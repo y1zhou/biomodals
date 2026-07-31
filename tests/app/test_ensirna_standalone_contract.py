@@ -6,7 +6,6 @@ import ast
 import base64
 import gzip
 import re
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,32 +46,6 @@ def make_test_layout(
         ),
     )
     return ensirna_app._layout_for_cache_key(TEST_CACHE_KEY)
-
-
-def install_completed_cache_generation(monkeypatch, stage: str, identity: str):
-    lock_key = ensirna_app.hash_string(f"{stage}\n{identity}")
-    values = {
-        f"{lock_key}:head": 0,
-        f"{lock_key}:owner:0": {"id": "original", "acquired_at": 0.0},
-        f"{lock_key}:status:0": {"state": "complete", "recorded_at": 1.0},
-    }
-
-    class FakeDict:
-        def get(self, key, default=None):
-            return values.get(key, default)
-
-        def put(self, key, value, *, skip_if_exists=False):
-            if skip_if_exists and key in values:
-                return False
-            values[key] = value
-            return True
-
-    monkeypatch.setattr(
-        ensirna_app.modal.Dict,
-        "from_name",
-        lambda *_args, **_kwargs: FakeDict(),
-    )
-    return lock_key, values
 
 
 def write_prepared_marker(
@@ -446,333 +419,6 @@ def test_pdb_manifest_requires_candidate_specific_path(tmp_path: Path) -> None:
             [{"siRNA": "target_0", "pdb_data_path": str(wrong_pdb)}],
             pdb_dir,
         )
-
-
-def test_cache_builder_elects_one_writer_and_isolates_rebuilds(monkeypatch) -> None:
-    values = {}
-
-    class FakeDict:
-        def get(self, key, default=None):
-            return values.get(key, default)
-
-        def put(self, key, value, *, skip_if_exists=False):
-            if skip_if_exists and key in values:
-                return False
-            values[key] = value
-            return True
-
-    monkeypatch.setattr(
-        ensirna_app.modal.Dict,
-        "from_name",
-        lambda *_args, **_kwargs: FakeDict(),
-    )
-
-    with ensirna_app._cache_build_lock("prepared", "identity") as owns_first:
-        assert owns_first is True
-    with ensirna_app._cache_build_lock("prepared", "identity") as owns_cached:
-        assert owns_cached is False
-    with ensirna_app._cache_build_lock(
-        "prepared", "identity", rebuild=True
-    ) as owns_rebuild:
-        assert owns_rebuild is True
-
-
-def test_cache_builder_waiters_share_one_repair_generation(monkeypatch) -> None:
-    from threading import Event, Lock, Thread
-
-    values = {}
-    values_lock = Lock()
-    waiter_observed_owner = Event()
-
-    class FakeDict:
-        def get(self, key, default=None):
-            with values_lock:
-                return values.get(key, default)
-
-        def put(self, key, value, *, skip_if_exists=False):
-            with values_lock:
-                if skip_if_exists and key in values:
-                    if key.endswith(":owner:1"):
-                        waiter_observed_owner.set()
-                    return False
-                values[key] = value
-                return True
-
-    monkeypatch.setattr(
-        ensirna_app.modal.Dict,
-        "from_name",
-        lambda *_args, **_kwargs: FakeDict(),
-    )
-    monkeypatch.setattr(
-        ensirna_app,
-        "APP_INFO",
-        replace(ensirna_app.APP_INFO, cache_lock_poll_seconds=0.001),
-    )
-    first_entered = Event()
-    release_first = Event()
-    ownership = []
-
-    with ensirna_app._cache_build_lock("prepared", "shared") as owns_initial:
-        assert owns_initial is True
-
-    def first_builder():
-        with ensirna_app._cache_build_lock("prepared", "shared", rebuild=True) as owns:
-            ownership.append(owns)
-            first_entered.set()
-            release_first.wait(timeout=2)
-
-    def waiting_builder():
-        with ensirna_app._cache_build_lock("prepared", "shared", rebuild=True) as owns:
-            ownership.append(owns)
-
-    first = Thread(target=first_builder)
-    waiter = Thread(target=waiting_builder)
-    first.start()
-    assert first_entered.wait(timeout=2)
-    waiter.start()
-    assert waiter_observed_owner.wait(timeout=2)
-    release_first.set()
-    first.join(timeout=2)
-    waiter.join(timeout=2)
-
-    assert ownership == [True, False]
-    assert any(key.endswith(":owner:1") for key in values)
-    assert not any(key.endswith(":owner:2") for key in values)
-
-
-def test_preparation_repairs_wholly_missing_completed_publication(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    output_volume = FakeVolume()
-    monkeypatch.setattr(
-        ensirna_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=output_volume, output_volume_mountpoint=str(tmp_path)
-        ),
-    )
-    fasta = b">m\nAUGCUAGCUAGCUAGCUAGC\n"
-    cache_key = ensirna_app._cache_key_for_fasta(fasta)
-    layout = ensirna_app._layout_for_cache_key(cache_key)
-    lock_key, lock_values = install_completed_cache_generation(
-        monkeypatch, "prepared", cache_key
-    )
-    plan = ensirna_app.EnsirnaPreparationPlan(
-        cache_key=cache_key,
-        prepared_dir=str(layout.run_root),
-        json_path=str(layout.outputs_dir / "mrna.json"),
-        processed_dir=str(layout.outputs_dir / "mrna_processed"),
-        candidate_count=1,
-        chunk_count=0,
-        chunks=[],
-        cached=False,
-    )
-
-    class FakePrepare:
-        def remote(self, **_kwargs):
-            return plan
-
-    class FakeFinalize:
-        def remote(self, stage_plan):
-            return stage_plan
-
-    class FakePreprocess:
-        def remote(self, stage_plan, *, preprocess_shard_size):
-            assert preprocess_shard_size == ensirna_app.APP_INFO.preprocess_shard_size
-            layout.outputs_dir.mkdir(parents=True)
-            Path(stage_plan.json_path).write_text('{"siRNA":"m_0"}\n', encoding="utf-8")
-            processed_dir = Path(stage_plan.processed_dir)
-            processed_dir.mkdir()
-            part = processed_dir / "part_0.pkl"
-            part.write_bytes(b"processed")
-            processed_dir.joinpath("_metainfo").write_text(
-                '{"num_entry":1,"file_names":["'
-                + str(part)
-                + '"],"file_num_entries":[1]}',
-                encoding="utf-8",
-            )
-            ensirna_app._write_prepared_marker(
-                layout=layout, plan=stage_plan, json_records=1
-            )
-            return stage_plan
-
-    monkeypatch.setattr(ensirna_app, "ensirna_prepare_inputs", FakePrepare())
-    monkeypatch.setattr(ensirna_app, "ensirna_finalize_prepared_inputs", FakeFinalize())
-    monkeypatch.setattr(ensirna_app, "ensirna_preprocess_dataset", FakePreprocess())
-
-    result = ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(fasta)
-
-    assert result.cache_key == cache_key
-    assert lock_values[f"{lock_key}:status:1"]["state"] == "complete"
-    assert not any(key.endswith(":owner:2") for key in lock_values)
-
-
-def test_preparation_coordinator_preserves_partial_generation_on_retry(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    output_volume = FakeVolume()
-    monkeypatch.setattr(
-        ensirna_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=output_volume, output_volume_mountpoint=str(tmp_path)
-        ),
-    )
-    captured = {}
-    plan = ensirna_app.EnsirnaPreparationPlan(
-        cache_key=ensirna_app._cache_key_for_fasta(b">m\nAUGCUAGCUAGCUAGCUAGC\n"),
-        prepared_dir="/unused",
-        json_path="/unused/mrna.json",
-        processed_dir="/unused/mrna_processed",
-        candidate_count=1,
-        chunk_count=0,
-        chunks=[],
-        cached=False,
-    )
-
-    class FakeRemote:
-        def __init__(self, result):
-            self.result = result
-
-        def remote(self, **kwargs):
-            captured["prepare"] = kwargs
-            return self.result
-
-    class FakeStage:
-        def remote(self, *_args, **kwargs):
-            if "preprocess_shard_size" in kwargs:
-                captured["preprocess_shard_size"] = kwargs["preprocess_shard_size"]
-            return plan
-
-    @contextmanager
-    def owned_lock(*_args, **_kwargs):
-        yield True
-
-    monkeypatch.setattr(ensirna_app, "_cache_build_lock", owned_lock)
-    monkeypatch.setattr(ensirna_app, "ensirna_prepare_inputs", FakeRemote(plan))
-    monkeypatch.setattr(ensirna_app, "ensirna_finalize_prepared_inputs", FakeStage())
-    monkeypatch.setattr(ensirna_app, "ensirna_preprocess_dataset", FakeStage())
-
-    ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(
-        b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-        preprocess_shard_size=17,
-    )
-
-    assert captured["prepare"] == {
-        "mrna_fasta_bytes": b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-        "max_prepare_jobs": 4,
-        "force_generation": None,
-    }
-    assert captured["preprocess_shard_size"] == 17
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    (
-        ({"prepare_workers": 0}, "prepare_workers must be between"),
-        ({"pdb_cores": 0}, "pdb_cores must be between"),
-        (
-            {"prepare_workers": 3, "pdb_cores": 32},
-            "prepare_workers * pdb_cores must not exceed",
-        ),
-        ({"preprocess_shard_size": 0}, "preprocess_shard_size must be at least 1"),
-    ),
-)
-def test_preparation_coordinator_rejects_invalid_runtime_budget(
-    kwargs: dict[str, int], message: str
-) -> None:
-    with pytest.raises(ValueError, match=re.escape(message)):
-        ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(
-            b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-            **kwargs,
-        )
-
-
-def test_corrupt_published_part_is_invalidated_and_recomputed(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    output_volume = FakeVolume()
-    monkeypatch.setattr(
-        ensirna_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=output_volume, output_volume_mountpoint=str(tmp_path)
-        ),
-    )
-    fasta = b">m\nAUGCUAGCUAGCUAGCUAGC\n"
-    cache_key = ensirna_app._cache_key_for_fasta(fasta)
-    layout = ensirna_app._layout_for_cache_key(cache_key)
-    processed_dir = layout.outputs_dir / "mrna_processed"
-    processed_dir.mkdir(parents=True)
-    json_path = layout.outputs_dir / "mrna.json"
-    json_path.write_text('{"siRNA":"m_0"}\n', encoding="utf-8")
-    part = processed_dir / "part_0.pkl"
-    part.write_bytes(b"original")
-    processed_dir.joinpath("_metainfo").write_text(
-        '{"num_entry":1,"file_names":["' + str(part) + '"],"file_num_entries":[1]}',
-        encoding="utf-8",
-    )
-    plan = ensirna_app.EnsirnaPreparationPlan(
-        cache_key=cache_key,
-        prepared_dir=str(layout.run_root),
-        json_path=str(json_path),
-        processed_dir=str(processed_dir),
-        candidate_count=1,
-        chunk_count=0,
-        chunks=[],
-        cached=False,
-    )
-    ensirna_app._write_prepared_marker(layout=layout, plan=plan, json_records=1)
-    part.write_bytes(b"corrupt!")
-    captured = {}
-
-    @contextmanager
-    def owned_lock(*_args, **kwargs):
-        captured["rebuild"] = kwargs["rebuild"]
-        yield True
-
-    class FakePrepare:
-        def remote(self, **_kwargs):
-            assert not processed_dir.exists()
-            assert not ensirna_app._prepared_marker_path(layout).exists()
-            json_path.parent.mkdir(parents=True, exist_ok=True)
-            json_path.write_text('{"siRNA":"m_0"}\n', encoding="utf-8")
-            return plan
-
-    class FakeFinalize:
-        def remote(self, _plan):
-            return _plan
-
-    class FakePreprocess:
-        def remote(self, _plan, *, preprocess_shard_size):
-            assert preprocess_shard_size == ensirna_app.APP_INFO.preprocess_shard_size
-            processed_dir.mkdir(parents=True)
-            part.write_bytes(b"recomputed")
-            processed_dir.joinpath("_metainfo").write_text(
-                '{"num_entry":1,"file_names":["'
-                + str(part)
-                + '"],"file_num_entries":[1]}',
-                encoding="utf-8",
-            )
-            ensirna_app._write_prepared_marker(layout=layout, plan=plan, json_records=1)
-            return plan
-
-    monkeypatch.setattr(ensirna_app, "_cache_build_lock", owned_lock)
-    monkeypatch.setattr(ensirna_app, "ensirna_prepare_inputs", FakePrepare())
-    monkeypatch.setattr(ensirna_app, "ensirna_finalize_prepared_inputs", FakeFinalize())
-    monkeypatch.setattr(ensirna_app, "ensirna_preprocess_dataset", FakePreprocess())
-
-    ensirna_app.build_ensirna_prepared_inputs.get_raw_f()(fasta)
-
-    assert captured["rebuild"] is True
-    assert part.read_bytes() == b"recomputed"
-    assert (
-        ensirna_app._cached_preparation_plan(cache_key=cache_key, layout=layout)
-        is not None
-    )
 
 
 def test_prepare_inputs_creates_cpu_chunk_plan(
@@ -1638,7 +1284,6 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
         candidate_count=1,
         chunk_count=1,
     )
-    lock_rebuilds = []
     run_count = 0
 
     def fake_run_command(cmd, **kwargs):
@@ -1648,13 +1293,7 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
         captured["cwd"] = kwargs["cwd"]
         Path(cmd[cmd.index("--save_dir") + 1], "mrna_result.xlsx").write_bytes(b"xlsx")
 
-    @contextmanager
-    def owned_lock(*_args, **kwargs):
-        lock_rebuilds.append(kwargs["rebuild"])
-        yield True
-
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    monkeypatch.setattr(ensirna_app, "_cache_build_lock", owned_lock)
     result = ensirna_app.run_ensirna_inference.get_raw_f()(
         prepared_dir=str(layout.run_root)
     )
@@ -1679,7 +1318,7 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
     assert captured["cwd"] == ensirna_dir
     for filename in ensirna_app.APP_INFO.checkpoint_filenames:
         assert (ensirna_dir / "pkl" / filename).resolve() == checkpoint_dir / filename
-    assert output_volume.reload_count == 2
+    assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
 
     (layout.outputs_dir / "mrna_result.xlsx").write_bytes(b"oops")
@@ -1688,7 +1327,6 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
     )
 
     assert repaired == b"xlsx"
-    assert lock_rebuilds == [True, True]
     assert run_count == 2
 
 
@@ -1725,9 +1363,6 @@ def test_inference_repairs_wholly_missing_completed_publication(
         encoding="utf-8",
     )
     write_prepared_marker(layout, candidate_count=1, chunk_count=1)
-    lock_key, lock_values = install_completed_cache_generation(
-        monkeypatch, "inference", TEST_CACHE_KEY
-    )
 
     def fake_run_command(cmd, **_kwargs):
         Path(cmd[cmd.index("--save_dir") + 1], "mrna_result.xlsx").write_bytes(b"xlsx")
@@ -1739,43 +1374,59 @@ def test_inference_repairs_wholly_missing_completed_publication(
     )
 
     assert result == b"xlsx"
-    assert lock_values[f"{lock_key}:status:1"]["state"] == "complete"
-    assert not any(key.endswith(":owner:2") for key in lock_values)
 
 
 def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     input_fasta = tmp_path / "target.fa"
     input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
     captured = {}
+    execution_run_id = ensirna_app.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
-    class FakeDownload:
-        def remote(self, *, force: bool):
-            captured["download_force"] = force
+    class FakeVolume:
+        def read_file(self, path):
+            captured["download"] = path
+            yield b"xlsx"
 
-    class FakeRun:
-        def remote(self, **kwargs):
-            captured["run"] = kwargs
-            return b"xlsx"
+    class FakeMethod:
+        def spawn(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=ensirna_app.RunStatus.SUCCEEDED,
+                        status_message=None,
+                        status_reason=None,
+                    )
+                ),
+            )
 
-    monkeypatch.setattr(ensirna_app, "download_ensirna_models", FakeDownload())
-    preprocessed_plan = ensirna_app.EnsirnaPreparationPlan(
-        cache_key="abc123",
-        prepared_dir="/remote/prepared",
-        json_path="/remote/outputs/mrna.json",
-        processed_dir="/remote/outputs/mrna_processed",
-        candidate_count=1,
-        chunk_count=1,
-        chunks=[],
-        cached=False,
+    def stage(volume, run_id, request):
+        captured.update(volume=volume, run_id=run_id, request=request)
+
+    def coordinator_handle(**kwargs):
+        captured["handle_kwargs"] = kwargs
+        return SimpleNamespace(run=FakeMethod())
+
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(
+            name="ENsiRNA",
+            version=None,
+            repo_commit_hash="0288243",
+            output_volume=volume,
+            output_volume_mountpoint="/ensirna-output",
+        ),
     )
-
-    class FakeBuild:
-        def remote(self, **kwargs):
-            captured["build"] = kwargs
-            return preprocessed_plan
-
-    monkeypatch.setattr(ensirna_app, "build_ensirna_prepared_inputs", FakeBuild())
-    monkeypatch.setattr(ensirna_app, "run_ensirna_inference", FakeRun())
+    monkeypatch.setattr(ensirna_app, "uuid4", lambda: execution_run_id)
+    monkeypatch.setattr(ensirna_app, "stage_execution_request", stage)
+    monkeypatch.setattr(
+        ensirna_app,
+        "_execution_coordinator_handle",
+        coordinator_handle,
+    )
     raw_f = ensirna_app.submit_ensirna_task.info.raw_f
     assert raw_f is not None
 
@@ -1788,13 +1439,11 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
         preprocess_shard_size=17,
     )
 
-    assert captured["download_force"] is False
-    assert captured["build"] == {
-        "mrna_fasta_bytes": b">m\nAUGCUAGCUAGCUAGCUAGC\n",
-        "prepare_workers": 2,
-        "pdb_cores": 3,
-        "preprocess_shard_size": 17,
-        "force_generation": None,
-    }
-    assert captured["run"] == {"prepared_dir": "/remote/prepared", "force": False}
+    request = captured["request"]
+    assert captured["run_id"] == execution_run_id
+    assert request.fasta_content == b">m\nAUGCUAGCUAGCUAGCUAGC\n"
+    assert request.prepare_workers == 2
+    assert request.pdb_cores == 3
+    assert request.preprocess_shard_size == 17
+    assert captured["run_kwargs"] == {"development": True}
     assert (tmp_path / "demo.xlsx").read_bytes() == b"xlsx"

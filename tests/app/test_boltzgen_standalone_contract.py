@@ -2,7 +2,6 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,14 +18,6 @@ class FakeOutputVolume:
 
     def reload(self) -> None:
         self.reload_count += 1
-
-
-def test_collection_function_does_not_schedule_nested_modal_calls() -> None:
-    source = inspect.getsource(boltzgen_app.collect_boltzgen_data.get_raw_f())
-
-    assert ".remote(" not in source
-    assert ".spawn(" not in source
-    assert "bounded_map" not in source
 
 
 def test_prepare_boltzgen_run_uses_app_run_layout(

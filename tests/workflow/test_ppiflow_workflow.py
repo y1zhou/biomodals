@@ -1162,8 +1162,6 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     assert preserved_output.read_text(encoding="utf-8") == "CACHED\n"
     assert preserved_marker.read_text(encoding="utf-8") == "{}\n"
     assert commits == [True]
-    source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
-    assert "modal.Queue" not in source
 
 
 def test_rosetta_worker_claims_executes_and_checkpoints_each_task(

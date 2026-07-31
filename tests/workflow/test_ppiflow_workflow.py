@@ -16,8 +16,14 @@ import polars as pl
 import pytest
 import yaml
 import zstandard as zstd
+from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
+from biomodals.app.fold.alphafold3 import (
+    inference_inputs,
+    modal_adapters,
+    request_results,
+)
 from biomodals.execution import PullTaskClaim, WorkerAssignmentRecord
 from biomodals.helper import shell as shell_helper
 from biomodals.helper.styling import strip_ansi
@@ -1252,7 +1258,7 @@ def test_rosetta_worker_claims_executes_and_checkpoints_microbatch(
         f"{provider_call_id}:complete:task-fingerprint",
     )
     assert completions[0][3].status == AppRunStatus.SUCCEEDED
-    assert commits == [True, True]
+    assert commits == [True]
 
 
 def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
@@ -1446,11 +1452,49 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
 
     assert task.task_key == "candidate-a"
     assert submission.function_name == "run_ppiflow_refold_candidate"
+    assert submission.uses_gpu is True
     assert submission.kwargs["candidate_id"] == "candidate-a"
     assert submission.kwargs["config"]["recycle"] == 2
     assert submission.kwargs["config"]["sample"] == 1
     assert submission.kwargs["config"]["model_seeds"] == [3]
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
+
+
+def test_refold_uses_alphafold3_helpers_from_their_owning_modules() -> None:
+    assert ppiflow_workflow.AF3Config is AF3Config
+    assert (
+        ppiflow_workflow.prepare_inference_run is inference_inputs.prepare_inference_run
+    )
+    assert ppiflow_workflow.stage_inference_run is modal_adapters.stage_inference_run
+    assert ppiflow_workflow.RequestPublication is request_results.RequestPublication
+    assert (
+        ppiflow_workflow.load_request_manifest is request_results.load_request_manifest
+    )
+    assert (
+        ppiflow_workflow.request_manifest_from_result
+        is request_results.request_manifest_from_result
+    )
+    assert (
+        ppiflow_workflow.create_request_archive
+        is request_results.create_request_archive
+    )
+
+
+def test_refold_builds_af3_config_without_app_reexports() -> None:
+    config = ppiflow_workflow._af3_config_for_refold(
+        structure_name="candidate.pdb",
+        structure_bytes=(
+            b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000"
+            b"  1.00  0.00           C\n"
+        ),
+        run_name="refold-run",
+        config={"model_seeds": [3]},
+    )
+
+    assert config.name == "refold-run"
+    assert config.modelSeeds == [3]
+    assert config.sequences[0].protein.id == "A"
+    assert config.sequences[0].protein.sequence == "A"
 
 
 def test_refold_discovers_manifest_candidates_in_order(

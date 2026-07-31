@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from threading import Lock
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -21,7 +20,7 @@ import modal
 import orjson
 import polars as pl
 import yaml
-from uniaf3.schema.alphafold3 import AF3Protein, AF3SequenceEntry
+from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.bioinfo import rosetta_app
 from biomodals.app.bioinfo.rosetta.execution_contracts import (
@@ -31,11 +30,19 @@ from biomodals.app.bioinfo.rosetta.execution_contracts import (
 )
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
+from biomodals.app.fold.alphafold3.inference_inputs import prepare_inference_run
 from biomodals.app.fold.alphafold3.inference_pipeline import (
     coordinate_seed_predictions,
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
     InProcessInferenceExecutor,
+    stage_inference_run,
+)
+from biomodals.app.fold.alphafold3.request_results import (
+    RequestPublication,
+    create_request_archive,
+    load_request_manifest,
+    request_manifest_from_result,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
     resolve_msa_and_templates,
@@ -1907,11 +1914,6 @@ def run_ppiflow_rosetta_worker(
     layout = AppRunLayout.from_run_root(
         Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{run_name}-{run_id}"
     )
-    publication_lock = Lock()
-
-    def checkpoint_outputs() -> None:
-        with publication_lock:
-            ROSETTA_OUTPUT_VOLUME.commit()
 
     def claim(request_id: str, capacity: int):
         return coordinator.claim_tasks.remote(
@@ -1931,7 +1933,6 @@ def run_ppiflow_rosetta_worker(
                 task=task,
                 task_fingerprint=assignment.task_fingerprint,
                 run_command=run_command,
-                checkpoint_outputs=checkpoint_outputs,
             )
         except Exception as error:  # noqa: BLE001
             return AppRunResult(
@@ -2751,7 +2752,7 @@ class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
         return RemoteNodeCall(
             function_name="run_ppiflow_refold_candidate",
-            uses_gpu=False,
+            uses_gpu=True,
             kwargs={
                 "artifacts": self._structure_inputs(context),
                 "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
@@ -3505,18 +3506,18 @@ def _run_one_refold_candidate(
         search_msa=False,
         search_protein_templates=False,
     )
-    prepared = alphafold3_app.prepare_inference_run(
+    prepared = prepare_inference_run(
         enriched,
         recycle=_config_int(config, "recycle", 10),
         sample=_config_int(config, "sample", 5),
     )
-    publication = alphafold3_app.RequestPublication.from_prepared(prepared)
-    manifest = alphafold3_app.load_request_manifest(
+    publication = RequestPublication.from_prepared(prepared)
+    manifest = load_request_manifest(
         alphafold3_app.CONF.output_volume,
         publication,
     )
     if manifest is None:
-        alphafold3_app.stage_inference_run(
+        stage_inference_run(
             alphafold3_app.CONF.output_volume,
             prepared,
         )
@@ -3533,9 +3534,9 @@ def _run_one_refold_candidate(
             num_containers=1,
             active_wait_timeout_seconds=MAX_TIMEOUT + 900,
         )
-        manifest = alphafold3_app.request_manifest_from_result(result)
+        manifest = request_manifest_from_result(result)
     with TemporaryDirectory(prefix="biomodals-ppiflow-refold-") as temp_dir:
-        archive_path = alphafold3_app.create_request_archive(
+        archive_path = create_request_archive(
             alphafold3_app.CONF.output_volume,
             manifest,
             output_dir=temp_dir,
@@ -3784,11 +3785,9 @@ def _af3_config_for_refold(
     structure_bytes: bytes,
     run_name: str,
     config: Mapping[str, object],
-):
+) -> AF3Config:
     if config.get("af3_config_json") is not None:
-        conf = alphafold3_app.AF3Config.model_validate_json(
-            str(config["af3_config_json"])
-        )
+        conf = AF3Config.model_validate_json(str(config["af3_config_json"]))
         conf.name = run_name
         return conf
 
@@ -3830,7 +3829,7 @@ def _af3_config_for_refold(
     if not chains:
         raise ValueError(f"Could not derive AlphaFold3 sequence from {structure_name}")
 
-    return alphafold3_app.AF3Config(
+    return AF3Config(
         name=run_name,
         modelSeeds=[
             int(seed) for seed in _parse_seed_values(config.get("model_seeds", [1]))

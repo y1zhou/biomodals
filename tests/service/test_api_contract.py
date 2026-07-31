@@ -39,7 +39,7 @@ from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
 from biomodals.service.gromacs.execution import GromacsExecutionCoordinator
-from biomodals.service.gromacs.results import FinalArchive
+from biomodals.service.gromacs.results import ArchiveNotReadyError, FinalArchive
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     OperationLogRequest,
@@ -75,6 +75,7 @@ class FakeGromacsAdapter:
         self.submission_configurations: list[tuple[str, str, int]] = []
         self.cancellations: list[str] = []
         self.recovery_attempts: list[UUID] = []
+        self.published_archives: set[UUID] = set()
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
         self.failures_remaining = 0
@@ -170,14 +171,20 @@ class FakeGromacsAdapter:
                 message="test provider cancellation",
             )
 
-    async def cancel(self, modal_call_id: str) -> None:
-        self.cancellations.append(modal_call_id)
+    async def cancel(self, provider_call_handle_id: str) -> None:
+        self.cancellations.append(provider_call_handle_id)
 
     async def recover_archive(self, job) -> FinalArchive:
         self.recovery_attempts.append(job.job_id)
-        return await self.publish_archive(job, completed_at=0)
+        if job.job_id not in self.published_archives:
+            raise ArchiveNotReadyError("published archive is missing")
+        return self._archive(job)
 
     async def publish_archive(self, job, *, completed_at):
+        self.published_archives.add(job.job_id)
+        return self._archive(job)
+
+    def _archive(self, job) -> FinalArchive:
         return FinalArchive(
             state=JobState.SUCCEEDED,
             volume_name="Gromacs-outputs",

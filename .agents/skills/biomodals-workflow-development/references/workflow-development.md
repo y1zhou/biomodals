@@ -14,6 +14,11 @@ use it as the reference for candidate-manifest joins, retained-candidate
 filtering, candidate-wide remote stage coordinators, and PPIFlow-specific stage
 wiring.
 
+Treat [ADR 0006](../../../../docs/adr/0006-unified-execution-kernel.md) and the
+[scheduler specification](../../../../docs/specs/unified-task-scheduler.md) as
+authoritative when changing execution statuses, ownership, restart, durability,
+or coordinator behavior. Keep this guide focused on workflow composition.
+
 ## Contents
 
 - [Vocabulary](#vocabulary)
@@ -250,6 +255,10 @@ The runtime preclaims every Provider Call before invoking Modal, attaches the
 returned call ID durably, and recovers that exact call. Node implementations
 must not call `.spawn()`, `.remote()`, or `.get()` themselves.
 
+An app function invoked by a workflow is a Provider Call in the workflow's
+Execution Run. It must not launch the app's top-level coordinator or create a
+nested app-run ledger.
+
 Do not add a generic remote-node wrapper that accepts arbitrary workflow nodes.
 Workflow-native file-management adapters and app-backed nodes that combine
 multiple non-`AppRunResult` app calls should expose their own workflow-local
@@ -315,10 +324,11 @@ workflow_task_results
 ```
 
 Keep large payloads in files and only durable `VolumePath` references in
-SQLite. `InlineBytes` are materialized before the result is recorded. Before
-reading another container's files, reload the Volume. After durable state or
-workflow-owned files change, close SQLite around Volume synchronization and
-commit the Volume checkpoint.
+SQLite. `InlineBytes` are materialized before the result is recorded. Commit
+coordinator-local SQLite changes locally. Close SQLite and synchronize its
+Volume only at a cross-container visibility or ownership boundary; reload
+before reading another container's committed files. Do not commit the Volume
+after every same-container state or file mutation.
 
 The persisted `workflow-plan.pkl` is trusted internal state tied to the exact
 deployment. A reopened Run must match its Workload Plan Fingerprint, Workload
@@ -540,14 +550,15 @@ that path to workflow storage with
 `str` inputs and returns a single validated `VolumePath`; do not construct a
 `VolumePath` only to extract `.path` and wrap it again.
 
-Workflow-native remote functions that mutate mounted volumes must call
-`reload()` before reading data written by other containers and `commit()` after
-writing, copying, or deleting files. Validate artifact storage paths with
-`VolumePath` before joining them to mounted paths.
+Workflow-native remote functions must `reload()` before reading data committed
+by another container. Explicitly `commit()` writes, copies, or deletions before
+another container consumes or acts on them; code in the same container sees its
+own writes without a commit. Validate artifact storage paths with `VolumePath`
+before joining them to mounted paths.
 
-When a caller waits for a remote function that created, copied, or deleted files
-in a mounted volume, reload that same volume before reading, selecting,
-materializing, or validating those paths in the caller.
+When a caller waits for a remote function that committed created, copied, or
+deleted files in a mounted Volume, reload that same Volume before reading,
+selecting, materializing, or validating those paths in the caller.
 
 ## DAG Construction
 

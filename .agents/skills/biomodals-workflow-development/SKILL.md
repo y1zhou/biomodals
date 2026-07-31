@@ -1,6 +1,6 @@
 ---
 name: biomodals-workflow-development
-description: Use when creating, editing, or reviewing Biomodals workflow code under src/biomodals/workflow/, shared workflow schemas under src/biomodals/schema/, workflow-compatible app functions, or workflow CLI/tests, including ShortMD-style DAG construction, orchestrator composition, app dependency inclusion, workflow artifacts, and Modal volume handling.
+description: Use when creating, editing, or reviewing Biomodals workflow code under src/biomodals/workflow/, shared workflow schemas under src/biomodals/schema/, workflow-compatible app functions, or workflow CLI/tests, including execution-kernel Task scheduling, ShortMD-style DAG construction, orchestrator composition, app dependency inclusion, workflow artifacts, and Modal volume handling.
 ---
 
 # Biomodals Workflow Development
@@ -37,9 +37,12 @@ stage coordinators, and PPIFlow-specific stage wiring.
   `process_remote_result(...)` only when needed. They never submit directly.
 - Keep hydrated Modal objects out of workflow Nodes. Explicit development runs
   may supply a function-name-to-handle map at the coordinator boundary.
+- Keep generic execution state in `biomodals.execution` and scientific
+  publications in workflow artifacts. Do not add workflow attempt tables,
+  replacement-call loops, or a second task queue.
 - Import app-owned volume handles, volume names, and mountpoints from source app
-  modules, and reload relevant volumes after remote file mutations before
-  reading those paths.
+  modules, and reload relevant volumes before reading mutations committed by
+  another container.
 - When staging workflow-derived files for downstream apps, do not use full
   artifact/provenance strings as local filenames. Derive short deterministic
   names from candidate ids or content hashes because pipeline-derived names can

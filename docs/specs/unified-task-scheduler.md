@@ -2008,6 +2008,58 @@ Rollback:
 - revert each workload-adoption commit independently; validated publications
   remain reusable and require no reverse migration.
 
+### Phase 9 — adopt the remaining multi-call apps
+
+Migrate only apps that already own multi-call scheduling or duplicate a proven
+execution graph. Keep single-call apps on their existing direct path.
+
+Adoption order:
+
+1. GROMACS reuses its established service operation graph for direct CLI Runs
+   without changing the deployed scientific functions.
+2. AF3Score replaces client-owned GPU-batch fan-out and its Volume-directory
+   run lock with a remote coordinator and workload-owned publication claim.
+3. ENsiRNA models candidate preparation, Rosetta chunks, dataset preprocessing,
+   and inference as durable Nodes and Tasks while retaining its cache markers.
+4. ABCFold2 models Boltz and Chai as parallel Nodes with one Task per seed and
+   separate result publications.
+5. Protenix models per-input MSA searches as Tasks after its reusable MSA cache
+   has an authoritative publication validator.
+6. OligoFormer replaces Modal Queue work stealing, nested branch scheduling,
+   and same-Run provider resubmission with kernel dispatch. Its efficacy,
+   reference, shard, evidence, and final-table publications remain authoritative.
+
+Shared constraints:
+
+- each direct CLI invocation uses the deployment-local remote coordinator and
+  App Run Ledger already defined by this specification;
+- service or workflow Child App Calls continue to use their parent Execution
+  Run and never create a nested ledger;
+- in-container thread or process pools remain workload implementation details;
+- cross-Run scientific publication claims remain workload-owned and are not
+  execution state;
+- only conclusive `missing` publication observations authorize work, and
+  `resume` never retries a conclusively failed Task;
+- no new workload-handler framework, provider abstraction, compatibility
+  facade, or generic cache layer is introduced.
+
+Exit gate:
+
+- the six standalone CLIs preserve their accepted inputs, scientific outputs,
+  cache identities, and operational concurrency controls;
+- every remote Provider Call is preclaimed and recoverable by Function Call ID;
+- AF3Score has no Volume-directory scheduler lock;
+- ENsiRNA and OligoFormer have no app-local durable Task queue;
+- ABCFold2 and Protenix no longer spawn untracked child calls from coordinator
+  functions;
+- GROMACS has one operation graph shared by service and direct CLI execution;
+- OligoFormer has no Modal Queue or same-Run outer call retry loop.
+
+Rollback:
+
+- revert one app-adoption commit at a time; workload publications and caches
+  remain reusable because their formats do not move into the kernel.
+
 ## Suggested incremental commits
 
 Use small commits in dependency order:

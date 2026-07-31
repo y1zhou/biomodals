@@ -215,7 +215,7 @@ class AlphaFold3ExecutionRuntime:
         *,
         synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> ExecutionSnapshot:
-        """Explicitly resume a suspended Run without retrying failed Tasks."""
+        """Resume suspension or explicitly reconcile unknown provider state."""
         with synchronize():
             repository = self._initialize()
             resume_execution_run(

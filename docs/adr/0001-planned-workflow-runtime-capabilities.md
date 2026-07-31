@@ -15,7 +15,8 @@ The retained decisions now have these forms:
   `biomodals.execution`; uncertain ownership never authorizes replacement work;
 - Tasks have no attempt identity and receive one scheduler submission per
   Execution Run;
-- `resume` only continues a suspended Run and never retries conclusive failure;
+- `resume` continues a suspended Run or explicitly reconciles
+  `state_unknown`, and never retries conclusive failure;
 - retrying missing work requires an explicit compatible Successor Execution Run;
 - workflow-owned caches and scientific publications remain outside the kernel
   and are validated with `available`, `missing`, or `unknown` observations;

@@ -778,7 +778,7 @@ def resume_execution_run_command(
         typer.Option("--execution-run-id", help="Opaque Execution Run UUID."),
     ],
 ) -> None:
-    """Resume one suspended Run without retrying failed Tasks."""
+    """Resume a suspended or state-unknown Run without retrying failed Tasks."""
     try:
         call = _run_coordinator(
             environment=environment,

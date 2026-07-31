@@ -230,7 +230,7 @@ class ExecutionCoordinator:
 
     @modal.method()
     def resume(self) -> AppRunResult:
-        """Explicitly resume and drive a suspended Execution Run."""
+        """Resume suspension or explicitly reconcile unknown provider state."""
         with self._lock():
             self._require_ledger()
             plan = self._load_plan()

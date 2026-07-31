@@ -136,6 +136,12 @@ class UnknownPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
         raise RuntimeError("Modal Volume could not be inspected")
 
 
+class UnknownInitialProbeAdapter(FakeGromacsExecutionAdapter):
+    async def recover_archive(self, job):
+        self.recover_count += 1
+        raise RuntimeError("Modal Volume could not be inspected")
+
+
 class InvalidInitialPublicationAdapter(FakeGromacsExecutionAdapter):
     async def publish_archive(self, job, *, completed_at):
         self.publish_count += 1
@@ -299,6 +305,42 @@ def test_existing_archive_prunes_every_stage_before_task_discovery(
         job = store.get_job_by_id(JOB_ID)
         assert job is not None
         assert job.state == JobState.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+def test_unknown_initial_archive_probe_suspends_without_discovering_tasks(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = UnknownInitialProbeAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 180)).__next__,
+        )
+
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+            assert all(
+                repository.list_tasks(RUN_ID, node.node_key) == ()
+                for node in snapshot.nodes
+            )
+        assert snapshot.run.status == RunStatus.SUSPENDED
+        assert snapshot.run.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
+        assert snapshot.provider_calls == ()
+        assert adapter.spawn_waves == [[], []]
+        assert adapter.recover_count == 1
+        job = store.get_job_by_id(JOB_ID)
+        assert job is not None
+        assert job.state == JobState.BLOCKED
 
     asyncio.run(scenario())
 

@@ -221,6 +221,7 @@ class AlphaFold3ExecutionRuntime:
             resume_execution_run(
                 repository,
                 self.execution_run_id,
+                reconcile_once=self.advance_once,
                 checkpoint=self._checkpoint,
                 now=self._now(),
             )

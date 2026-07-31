@@ -113,6 +113,7 @@ class RosettaExecutionRuntime:
             resume_execution_run(
                 repository,
                 self.execution_run_id,
+                reconcile_once=self.advance_once,
                 checkpoint=self._checkpoint,
                 now=self._now(),
             )
@@ -216,7 +217,7 @@ class RosettaExecutionRuntime:
         self._recover_publications()
         self._reconcile_nodes_and_run()
         run = self.store.execution.get_run(self.execution_run_id)
-        if run.status == RunStatus.CANCEL_REQUESTED:
+        if run.status in {RunStatus.CANCEL_REQUESTED, RunStatus.STATE_UNKNOWN}:
             self._reconcile_provider_calls(set(run.plan.node_keys))
             self._recover_publications()
             self._reconcile_nodes_and_run()

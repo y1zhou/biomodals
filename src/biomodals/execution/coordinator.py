@@ -70,15 +70,24 @@ def resume_execution_run(
     repository: SqliteExecutionRepository,
     execution_run_id: UUID,
     *,
+    reconcile_once: Callable[[], None],
     checkpoint: Callable[[], SqliteExecutionRepository | None],
     now: int,
 ) -> ExecutionRunRecord:
-    """Explicitly resume one suspended Run and cross its durability boundary."""
-    run = repository.resume_run(execution_run_id, now=now)
+    """Resume suspension or explicitly reconcile uncertain provider ownership."""
+    run = repository.get_run(execution_run_id)
+    if run.status == RunStatus.SUSPENDED:
+        repository.resume_run(execution_run_id, now=now)
+    elif run.status == RunStatus.STATE_UNKNOWN:
+        reconcile_once()
+    else:
+        raise ValueError(
+            "only a suspended or state_unknown Run can be explicitly resumed"
+        )
     replacement = checkpoint()
     if replacement is not None:
-        run = replacement.get_run(execution_run_id)
-    return run
+        repository = replacement
+    return repository.get_run(execution_run_id)
 
 
 def _suspend_after_application_error(

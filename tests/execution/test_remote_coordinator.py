@@ -279,6 +279,7 @@ def test_explicit_resume_drives_the_same_run_without_retrying_implicitly() -> No
     resumed = resume_execution_run(
         repository,
         RUN_ID,
+        reconcile_once=lambda: None,
         checkpoint=lambda: checkpoints.append(repository.get_run(RUN_ID).status),
         now=130,
     )
@@ -311,6 +312,93 @@ def test_explicit_resume_drives_the_same_run_without_retrying_implicitly() -> No
         RunStatus.RUNNING,
         RunStatus.SUCCEEDED,
     ]
+
+
+def test_explicit_resume_reconciles_unknown_provider_ownership_in_place() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=CPU_BINDING,
+        compatibility_key="search",
+    )
+    preclaim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="call-once",
+        binding=CPU_BINDING,
+        compatibility_key="search",
+        now=110,
+    )
+    assert preclaim is not None
+    repository.attach_provider_call(
+        preclaim.call.provider_call_id,
+        provider_call_handle_id="fc-live",
+        now=111,
+    )
+    repository.mark_provider_call_state_unknown(
+        preclaim.call.provider_call_id,
+        message="Modal state lookup was inconclusive",
+        now=112,
+    )
+    checkpoints: list[RunStatus] = []
+
+    def reconcile_once() -> None:
+        repository.mark_provider_call_running(
+            preclaim.call.provider_call_id,
+            now=120,
+        )
+
+    resumed = resume_execution_run(
+        repository,
+        RUN_ID,
+        reconcile_once=reconcile_once,
+        checkpoint=lambda: checkpoints.append(repository.get_run(RUN_ID).status),
+        now=120,
+    )
+
+    assert resumed.status == RunStatus.RUNNING
+    assert resumed.status_reason is None
+    assert len(repository.list_provider_calls(RUN_ID)) == 1
+    assert checkpoints == [RunStatus.RUNNING]
+
+
+def test_explicit_resume_preserves_unresolved_provider_ownership() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=CPU_BINDING,
+        compatibility_key="search",
+    )
+    preclaim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="call-once",
+        binding=CPU_BINDING,
+        compatibility_key="search",
+        now=110,
+    )
+    assert preclaim is not None
+    repository.mark_submission_outcome_unknown(
+        preclaim.call.provider_call_id,
+        message="Modal submission response was lost",
+        now=111,
+    )
+
+    resumed = resume_execution_run(
+        repository,
+        RUN_ID,
+        reconcile_once=lambda: None,
+        checkpoint=lambda: None,
+        now=120,
+    )
+
+    assert resumed.status == RunStatus.STATE_UNKNOWN
+    assert resumed.status_reason == RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN
+    assert len(repository.list_provider_calls(RUN_ID)) == 1
 
 
 def test_hard_coordinator_interruption_preserves_running_state() -> None:

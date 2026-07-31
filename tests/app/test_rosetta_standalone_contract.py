@@ -222,7 +222,7 @@ def test_rosetta_worker_uses_app_run_layout(
         "-out:path:all",
         str(run_root / "outputs" / "1"),
     ]
-    assert captured["output_mode"] == "capture"
+    assert captured["output_mode"] == "log"
     assert captured["log_file"] == run_root / "logs" / "1.log"
     assert completions[0][0:3] == (
         str(PROVIDER_CALL_ID),

@@ -1228,7 +1228,7 @@ def test_rosetta_worker_claims_executes_and_checkpoints_each_task(
     )
 
     def run_command(command, *, output_mode, log_file):
-        assert output_mode == "capture"
+        assert output_mode == "log"
         Path(command[-1], "score.sc").write_text("SCORE\n", encoding="utf-8")
         Path(log_file).write_text("worker log\n", encoding="utf-8")
 

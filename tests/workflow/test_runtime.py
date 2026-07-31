@@ -317,6 +317,14 @@ class CancellingModalDriver(FakeModalDriver):
         return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
 
+class StateUnknownUntilCancelledModalDriver(CancellingModalDriver):
+    def observe(self, provider_call_handle_id):
+        self.events.append(f"observe:{provider_call_handle_id}")
+        if provider_call_handle_id in self.cancelled:
+            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+        return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
+
+
 class FanoutModalDriver(FakeModalDriver):
     def __init__(self, *, failing_tasks: set[str] | None = None) -> None:
         super().__init__()
@@ -586,6 +594,64 @@ def test_cancel_requested_workflow_reconciles_provider_cancellation(
     assert {call.status for call in snapshot.provider_calls} == {
         ProviderCallStatus.CANCELLED
     }
+
+
+def test_unknown_workflow_prunes_call_after_terminal_publication_appears(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("unknown-pruning")
+    workflow.add_node(RemoteTextNode("remote", "run_remote"), id="remote")
+    driver = StateUnknownUntilCancelledModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+    runtime._initialize("unknown-pruning")
+    runtime.advance_once()
+    call = runtime.store.execution.list_provider_calls(RUN_ID)[0]
+    with runtime.store.transaction():
+        runtime.store.execution.mark_provider_call_state_unknown(
+            call.provider_call_id,
+            message="Modal state lookup was inconclusive",
+            now=11,
+        )
+    cached_path = runtime.store.output_root / "cached" / "result.txt"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_text("cached")
+    storage = VolumePath(
+        volume_name="Workflow-outputs",
+        path=cached_path.relative_to(tmp_path).as_posix(),
+        media_type="text/plain",
+    )
+    with runtime.store.transaction():
+        runtime.store.artifacts.record_node_publication(
+            "remote",
+            result=AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="text",
+                        kind=ArtifactKind.REPORT,
+                        storage=storage,
+                    )
+                ],
+            ),
+            artifacts=(
+                WorkflowArtifact(
+                    artifact_id="remote-text",
+                    producing_node_id="remote",
+                    kind=ArtifactKind.REPORT,
+                    storage=storage,
+                    files=[ArtifactFile(path="result.txt", size_bytes=6)],
+                ),
+            ),
+            now=12,
+        )
+    runtime._checkpoint()
+
+    result = runtime.resume(workload_run_key="unknown-pruning")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert driver.cancelled == ["fc-run_remote"]
+    call = runtime.store.execution.list_provider_calls(RUN_ID)[0]
+    assert call.status == ProviderCallStatus.CANCELLED
 
 
 def test_remote_task_node_discovers_and_publishes_independent_tasks(

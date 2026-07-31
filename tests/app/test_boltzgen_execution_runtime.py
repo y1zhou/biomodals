@@ -51,6 +51,7 @@ class RecordingCallDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
         self.cancelled: set[str] = set()
+        self.state_unknown = False
 
     def resolve(self, binding):
         return binding
@@ -68,6 +69,8 @@ class RecordingCallDriver:
     def observe(self, provider_call_handle_id: str):
         if provider_call_handle_id in self.cancelled:
             return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+        if self.state_unknown:
+            return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
         return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     def cancel(self, provider_call_handle_id: str) -> None:
@@ -256,6 +259,43 @@ def test_terminal_collection_publication_prunes_all_calls(
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert snapshot.provider_calls == ()
     assert driver.spawns == []
+    runtime.close()
+
+
+def test_unknown_run_prunes_calls_after_terminal_publication_appears(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    driver = RecordingCallDriver()
+    runtime = _runtime(tmp_path, request=request, driver=driver)
+    runtime._initialize()
+    runtime.advance_once()
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    for call in calls:
+        runtime.store.execution.mark_provider_call_state_unknown(
+            call.provider_call_id,
+            message="Modal state lookup was inconclusive",
+            now=11,
+        )
+    driver.state_unknown = True
+    write_collection_publication(
+        tmp_path,
+        request.collection_publication_path,
+        {
+            "run_name": request.run_name,
+            "run_ids": list(request.run_ids),
+            "filtered": False,
+        },
+    )
+
+    snapshot = runtime.resume()
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert driver.cancelled == {str(spawn["handle"]) for spawn in driver.spawns}
+    assert len(driver.spawns) == len(calls)
+    assert {call.status for call in snapshot.provider_calls} == {
+        ProviderCallStatus.CANCELLED
+    }
     runtime.close()
 
 

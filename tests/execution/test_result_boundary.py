@@ -229,3 +229,85 @@ def test_running_pruned_ancestor_waits_for_conclusive_call_cancellation() -> Non
     assert node.status == NodeStatus.CANCELLED
     assert node.status_reason == WorkStatusReason.RESULT_ALREADY_SATISFIED
     assert run.status == RunStatus.SUCCEEDED
+
+
+def test_pruning_cancels_active_call_after_node_publication_wins() -> None:
+    repository = _repository()
+    repository.start_node(RUN_ID, "input", now=101)
+    repository.discover_tasks(
+        RUN_ID,
+        "input",
+        (TaskPlan(task_key="download", scientific_payload={"source": "pdb"}),),
+        now=102,
+    )
+    repository.record_task_result_observation(
+        RUN_ID,
+        "input",
+        "download",
+        AvailabilityStatus.MISSING,
+        now=103,
+    )
+    repository.persist_fixed_dispatch_policy(
+        RUN_ID,
+        (
+            TaskDispatchDescriptor(
+                node_key="input",
+                node_ordinal=0,
+                task_key="download",
+                task_ordinal=0,
+                binding=CPU_BINDING,
+                compatibility_key="pdb",
+                max_tasks_per_call=1,
+                depth=0,
+                unblocking_span=2,
+            ),
+        ),
+        now=103,
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "input",
+        ("download",),
+        submission_token="download",
+        binding=CPU_BINDING,
+        compatibility_key="pdb",
+        now=104,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-download",
+        now=105,
+    )
+    repository.record_node_result_observation(
+        RUN_ID,
+        "input",
+        AvailabilityStatus.AVAILABLE,
+        now=109,
+    )
+    repository.record_node_result_observation(
+        RUN_ID,
+        "summary",
+        AvailabilityStatus.AVAILABLE,
+        now=110,
+    )
+
+    active_calls = repository.prune_unrequired_nodes(
+        RUN_ID,
+        required_node_keys=set(),
+        now=111,
+    )
+
+    assert active_calls == (claim.call.provider_call_id,)
+    assert repository.get_node(RUN_ID, "input").status == NodeStatus.SUCCEEDED
+    repository.cancel_pruned_provider_call(
+        claim.call.provider_call_id,
+        now=120,
+    )
+    run = repository.finalize_run_from_results(RUN_ID, now=121)
+
+    task = repository.get_task(RUN_ID, "input", "download")
+    assert task.status == TaskStatus.CANCELLED
+    assert task.status_reason == WorkStatusReason.RESULT_ALREADY_SATISFIED
+    assert repository.get_node(RUN_ID, "input").status == NodeStatus.SUCCEEDED
+    assert run.status == RunStatus.SUCCEEDED

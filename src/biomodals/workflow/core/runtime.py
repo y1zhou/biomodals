@@ -237,8 +237,24 @@ class WorkflowRuntime:
         self._reconcile_nodes_and_run()
 
         run = self.store.execution.get_run(self.execution_run_id)
-        if run.status in {RunStatus.CANCEL_REQUESTED, RunStatus.STATE_UNKNOWN}:
+        if run.status == RunStatus.CANCEL_REQUESTED:
             self._reconcile_provider_calls(set(run.plan.node_keys))
+            self._recover_publications()
+            self._reconcile_nodes_and_run()
+            return
+        if run.status == RunStatus.STATE_UNKNOWN:
+            required = self._required_nodes()
+            if required is None:
+                required_nodes = set(run.plan.node_keys)
+            else:
+                required_nodes = required
+                for provider_call_id in self._prune_unrequired(required):
+                    self._provider.repository = self.store.execution
+                    self._provider.request_provider_call_cancellation(
+                        provider_call_id,
+                        now=self._now(),
+                    )
+            self._reconcile_provider_calls(required_nodes)
             self._recover_publications()
             self._reconcile_nodes_and_run()
             return

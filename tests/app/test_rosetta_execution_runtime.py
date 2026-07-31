@@ -45,6 +45,7 @@ class RecordingDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
         self.succeeded = False
+        self.state_unknown = False
         self.cancelled: set[str] = set()
 
     def resolve(self, binding):
@@ -63,6 +64,8 @@ class RecordingDriver:
     def observe(self, provider_call_handle_id: str):
         if provider_call_handle_id in self.cancelled:
             return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+        if self.state_unknown:
+            return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
         if self.succeeded:
             return ModalCallObservation(
                 ModalCallObservationKind.SUCCEEDED,
@@ -242,4 +245,38 @@ def test_cancel_requested_run_reconciles_worker_cancellation(
     assert {call.status for call in snapshot.provider_calls} == {
         ProviderCallStatus.CANCELLED
     }
+    runtime.close()
+
+
+def test_unknown_run_prunes_workers_after_task_publications_appear(
+    tmp_path: Path,
+) -> None:
+    driver = RecordingDriver()
+    runtime = _runtime(tmp_path, driver)
+    runtime._initialize()
+    runtime.advance_once()
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    for ordinal, call in enumerate(calls):
+        claim = runtime.claim_pull_tasks(
+            call.provider_call_id,
+            request_id=f"claim-{ordinal}",
+            capacity=2,
+        )
+        for assignment in claim.assignments:
+            _publish_assignment(runtime, assignment)
+        runtime.store.execution.mark_provider_call_state_unknown(
+            call.provider_call_id,
+            message="Modal state lookup was inconclusive",
+            now=11,
+        )
+    driver.state_unknown = True
+
+    snapshot = runtime.resume()
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert driver.cancelled == {str(spawn["handle"]) for spawn in driver.spawns}
+    assert {call.status for call in snapshot.provider_calls} == {
+        ProviderCallStatus.CANCELLED
+    }
+    assert {task.status for task in snapshot.tasks} == {TaskStatus.SUCCEEDED}
     runtime.close()

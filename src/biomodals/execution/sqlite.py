@@ -1970,7 +1970,7 @@ class SqliteExecutionRepository:
         """Prune unnecessary work and return calls needing cancellation."""
         active_calls: list[UUID] = []
         for node in self.list_nodes(execution_run_id):
-            if node.node_key in required_node_keys or node.status.is_terminal:
+            if node.node_key in required_node_keys:
                 continue
             if node.status == NodeStatus.PENDING:
                 self._connection.execute(
@@ -1993,6 +1993,10 @@ class SqliteExecutionRepository:
                 )
                 continue
 
+            # A validated publication may make the Node terminal before an
+            # attached owner finishes. Preserve that historical Node outcome,
+            # but still close every Task and Provider Call owned by work that
+            # the result boundary no longer requires.
             self._connection.execute(
                 """
                 UPDATE execution_tasks

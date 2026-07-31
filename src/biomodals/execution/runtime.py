@@ -302,34 +302,7 @@ class ExecutionRuntime:
         kwargs: Mapping[str, Any] | None = None,
         now: int,
     ) -> ProviderCallRecord | None:
-        """Submit one pull worker with its durable owner identity."""
-        node = self.repository.get_node(execution_run_id, node_key)
-        tasks = self.repository.list_tasks(execution_run_id, node_key)
-        calls = tuple(
-            call
-            for call in self.repository.list_provider_calls(execution_run_id)
-            if call.node_key == node_key and call.dispatch_mode.value == "pull_worker"
-        )
-        self.persist_pull_worker_dispatch_policy(
-            execution_run_id,
-            PullWorkerDispatchDescriptor(
-                node_key=node_key,
-                node_ordinal=node.ordinal,
-                binding=binding,
-                compatibility_key=compatibility_key,
-                claim_capacity=claim_capacity,
-                unfinished_task_count=sum(
-                    not task.status.is_terminal for task in tasks
-                ),
-                nonterminal_worker_count=sum(
-                    not call.status.is_terminal for call in calls
-                ),
-                next_worker_ordinal=len(calls),
-                depth=0,
-                unblocking_span=0,
-            ),
-            now=now,
-        )
+        """Submit one pull worker after its dispatch policy is durable."""
         function = self._resolve_provider(
             execution_run_id,
             binding,

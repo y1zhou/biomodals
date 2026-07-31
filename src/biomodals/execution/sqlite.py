@@ -471,37 +471,6 @@ class SqliteExecutionRepository:
                 )
         return self.get_run(execution_run_id)
 
-    def create_successor_run(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        max_active_provider_calls: int,
-        max_active_gpu_provider_calls: int,
-        now: int,
-        plan: ExecutionPlan | None = None,
-    ) -> ExecutionRunRecord:
-        """Create an explicit compatible retry boundary with no copied state."""
-        if execution_run_id == predecessor_execution_run_id:
-            raise ValueError("Successor Execution Run ID must be new")
-        predecessor = self.validate_successor_source(predecessor_execution_run_id)
-        if (
-            plan is not None
-            and plan.workload_plan_fingerprint
-            != predecessor.plan.workload_plan_fingerprint
-        ):
-            raise ValueError("Workload Plan Fingerprint does not match predecessor")
-        return self.create_run(
-            execution_run_id=execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            plan=predecessor.plan,
-            deployment=deployment,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-            now=now,
-        )
-
     def validate_successor_source(
         self,
         predecessor_execution_run_id: UUID,

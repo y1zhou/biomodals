@@ -318,19 +318,6 @@ class WorkflowArtifactStore:
         ).fetchall()
         return tuple(self.load_artifact(str(row["artifact_id"])) for row in rows)
 
-    def list_task_publication_keys(self, node_key: str) -> tuple[str, ...]:
-        """Return Task keys with durable results in stable lexical order."""
-        rows = self._connection.execute(
-            """
-            SELECT task_key
-            FROM workflow_task_results
-            WHERE node_key = ?
-            ORDER BY task_key
-            """,
-            (node_key,),
-        ).fetchall()
-        return tuple(str(row["task_key"]) for row in rows)
-
     def discard_task_publication(self, node_key: str, task_key: str) -> None:
         """Remove one invalid Task publication without deleting shared artifacts."""
         artifact_rows = self._connection.execute(

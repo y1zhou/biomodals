@@ -981,26 +981,6 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
         resolve_msa_and_templates(config, cast(Any, NeverCalledExecutor()))
 
 
-def test_remote_cache_inspectors_repeat_task_bounds() -> None:
-    with pytest.raises(ValueError, match="512 remote search tasks"):
-        alphafold3_app.inspect_msa_search_cache.get_raw_f()(
-            [("small_bfd", "ACDE")] * 513,
-            [],
-        )
-    with pytest.raises(ValueError, match="512 remote search tasks"):
-        alphafold3_app.inspect_protein_template_cache.get_raw_f()(
-            [("ACDE", "a" * 64, "2021-09-30")] * 513,
-        )
-
-
-def test_remote_msa_inspector_validates_assembly_shape_before_volume_access() -> None:
-    inspect = alphafold3_app.inspect_msa_search_cache.get_raw_f()
-    with pytest.raises(TypeError, match="include_unpaired must be a boolean"):
-        inspect([], [("protein", "ACDE", 1, True)])  # type: ignore[list-item]
-    with pytest.raises(ValueError, match="complete canonical MSAs"):
-        inspect([], [("protein", "ACDE", True, False)])
-
-
 def test_remote_search_repeats_query_length_bound() -> None:
     with pytest.raises(ValueError, match="between 1 and 5,120"):
         alphafold3_app.search_database_msa.get_raw_f()(

@@ -2046,7 +2046,7 @@ Files:
 
 Change:
 
-- map external checker exceptions to `ArtifactAvailabilityStatus.UNKNOWN`;
+- map external checker exceptions to `AvailabilityStatus.UNKNOWN`;
 - put the exception diagnostic in `unknown_reason`;
 - leave `errors` empty because absence was not established;
 - add the focused regression test and change no scheduling code.

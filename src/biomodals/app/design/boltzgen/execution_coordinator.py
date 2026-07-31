@@ -50,11 +50,6 @@ class BoltzGenExecutionCoordinator:
         self._drive_lock = Lock()
         self._runtime: BoltzGenExecutionRuntime | None = None
 
-    def initialize_container(self) -> None:
-        """Reload durable state before serving lifecycle calls."""
-        with self._writer_lock:
-            self.output_volume.reload()
-
     def run(self) -> ExecutionSnapshot:
         """Load the staged request and drive one root Run."""
         with self._drive_lock:

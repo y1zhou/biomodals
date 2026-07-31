@@ -53,7 +53,6 @@ from biomodals.workflow.core._runtime.volume_sync import (
     WorkflowVolumeSync,
 )
 from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailabilityStatus,
     ExternalArtifactChecker,
     check_artifact_availability,
     mounted_volume_checker,
@@ -1524,26 +1523,6 @@ class WorkflowRuntime:
         artifacts = self.store.artifacts.load_node_output_artifacts(node_id)
         return self._artifact_observation(artifacts)
 
-    def _task_publication_observation(
-        self,
-        node_id: str,
-        task_key: str,
-        expected_fingerprint: str,
-    ) -> AvailabilityStatus:
-        result = self.store.artifacts.load_task_result(node_id, task_key)
-        if (
-            result is None
-            or result.status != AppRunStatus.SUCCEEDED
-            or self.store.artifacts.load_task_fingerprint(node_id, task_key)
-            != expected_fingerprint
-        ):
-            return AvailabilityStatus.MISSING
-        artifacts = self.store.artifacts.load_task_output_artifacts(
-            node_id,
-            task_key,
-        )
-        return self._artifact_observation(artifacts)
-
     def _remote_task_publication_observation(
         self,
         node_id: str,
@@ -1612,9 +1591,9 @@ class WorkflowRuntime:
             ).status
             for artifact in artifacts
         ]
-        if ArtifactAvailabilityStatus.UNKNOWN in statuses:
+        if AvailabilityStatus.UNKNOWN in statuses:
             return AvailabilityStatus.UNKNOWN
-        if ArtifactAvailabilityStatus.MISSING in statuses:
+        if AvailabilityStatus.MISSING in statuses:
             return AvailabilityStatus.MISSING
         return AvailabilityStatus.AVAILABLE
 

@@ -271,7 +271,6 @@ def test_task_publications_are_durable_idempotent_and_node_reusable() -> None:
     )
     connection.commit()
 
-    assert artifacts.list_task_publication_keys("design") == ("candidate-1",)
     assert artifacts.load_task_fingerprint("design", "candidate-1") == "fingerprint-1"
     assert artifacts.load_task_result("design", "candidate-1") == result
     assert artifacts.load_task_output_artifacts(

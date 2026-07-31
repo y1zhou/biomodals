@@ -2,7 +2,6 @@
 
 from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
-    ArtifactAvailabilityStatus,
     ExternalArtifactChecker,
     check_artifact_availability,
     check_external_artifact_availability,
@@ -32,7 +31,6 @@ from biomodals.workflow.core.nodes import (
 __all__ = [
     "AppBackedNode",
     "ArtifactAvailability",
-    "ArtifactAvailabilityStatus",
     "ExternalArtifactChecker",
     "NodeHandle",
     "NodeRunContext",

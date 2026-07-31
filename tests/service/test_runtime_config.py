@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 
+from biomodals.app.bioinfo.gromacs_execution import execution_plan
 from biomodals.service.config import ServiceSettings
-from biomodals.service.gromacs.plan import execution_plan
 from biomodals.service.runtime_config import RuntimeConfiguration, SettingOverrideError
 from biomodals.service.store import ServiceStore
 from biomodals.service.workloads import GROMACS_WORKLOAD

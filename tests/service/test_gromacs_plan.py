@@ -4,8 +4,7 @@
 
 import pytest
 
-from biomodals.execution import ProviderBinding
-from biomodals.service.gromacs.plan import (
+from biomodals.app.bioinfo.gromacs_execution import (
     PREPARE_RESULT,
     REQUIRED_FUNCTIONS,
     execution_plan,
@@ -13,6 +12,7 @@ from biomodals.service.gromacs.plan import (
     operation_provider_binding,
     operation_task_plan,
 )
+from biomodals.execution import ProviderBinding
 from biomodals.service.workloads import GROMACS_WORKLOAD
 
 

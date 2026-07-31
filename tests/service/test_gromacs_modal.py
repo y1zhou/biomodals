@@ -21,6 +21,7 @@ import modal
 import orjson
 import pytest
 
+from biomodals.app.bioinfo.gromacs_execution import REQUIRED_FUNCTIONS, execution_plan
 from biomodals.execution import ProviderBinding
 from biomodals.execution.modal import ModalCallObservationKind
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
@@ -31,7 +32,6 @@ from biomodals.service.gromacs.modal import (
     GromacsResultInvalidError,
     ModalGromacsAdapter,
 )
-from biomodals.service.gromacs.plan import REQUIRED_FUNCTIONS, execution_plan
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
     JobAdmissionConfiguration,

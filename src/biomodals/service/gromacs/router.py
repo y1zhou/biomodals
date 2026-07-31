@@ -22,6 +22,7 @@ from fastapi import (
     UploadFile,
 )
 
+from biomodals.app.bioinfo.gromacs_execution import execution_plan
 from biomodals.execution.modal import ModalSubmissionOutcomeUnknownError
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.auth import AuthenticatedSession
@@ -35,7 +36,6 @@ from biomodals.service.gromacs.execution import (
     GromacsExecutionAdapter,
     GromacsExecutionCoordinator,
 )
-from biomodals.service.gromacs.plan import execution_plan
 from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,

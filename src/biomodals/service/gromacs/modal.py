@@ -7,10 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 import modal
 
+from biomodals.app.bioinfo.gromacs_execution import REQUIRED_FUNCTIONS
 from biomodals.execution import ProviderBinding
 from biomodals.execution.modal import AsyncModalCallDriver, ModalCallObservation
 from biomodals.service.artifacts import ArtifactCache
-from biomodals.service.gromacs.plan import REQUIRED_FUNCTIONS
 from biomodals.service.gromacs.results import (
     ArchiveNotReadyError,
     FinalArchive,

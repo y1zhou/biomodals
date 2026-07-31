@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from uuid import UUID
 
+from biomodals.app.bioinfo.gromacs_execution import execution_plan
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -22,7 +23,6 @@ from biomodals.service.auth import AuthService
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
 from biomodals.service.gromacs.contracts import GromacsJobOptions
 from biomodals.service.gromacs.execution import GromacsExecutionCoordinator
-from biomodals.service.gromacs.plan import execution_plan
 from biomodals.service.gromacs.results import (
     ArchiveNotReadyError,
     FinalArchive,

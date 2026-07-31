@@ -9,6 +9,12 @@ from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 from uuid import UUID
 
+from biomodals.app.bioinfo.gromacs_execution import (
+    PREPARE_RESULT,
+    modal_invocation,
+    operation_provider_binding,
+    operation_task_plan,
+)
 from biomodals.execution import (
     AsyncExecutionRuntime,
     AvailabilityStatus,
@@ -32,12 +38,6 @@ from biomodals.execution.scheduler import (
 )
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
 from biomodals.service.gromacs.contracts import GromacsJobOptions
-from biomodals.service.gromacs.plan import (
-    PREPARE_RESULT,
-    modal_invocation,
-    operation_provider_binding,
-    operation_task_plan,
-)
 from biomodals.service.gromacs.results import (
     ArchiveNotReadyError,
     FinalArchive,

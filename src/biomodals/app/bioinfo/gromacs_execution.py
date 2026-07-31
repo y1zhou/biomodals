@@ -120,7 +120,7 @@ def execution_plan(
 
 
 def operation_task_plan(operation: str) -> TaskPlan:
-    """Represent one GROMACS service stage as one scientific Task."""
+    """Represent one GROMACS operation as one scientific Task."""
     return TaskPlan(
         task_key="operation",
         scientific_payload={"operation": operation},

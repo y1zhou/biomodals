@@ -375,10 +375,10 @@ Job ID, workload, display name, run name, fixed reason, and timestamp needed for
 manual Modal review. After checking Modal and stopping remote work there when
 necessary, an Administrator may use the destructive `Mark failed` action. That
 action records a safe `compute_failed` terminal failure and releases admission
-capacity; it does not itself contact or cancel Modal. Reconciliation may leave
-`state_unknown` only after it conclusively recovers the original provider
-owner or outcome. Owners cannot force a transition or request replacement
-work.
+capacity; it does not itself contact or cancel Modal. Although the kernel can
+retain and reconcile an original owner, the MVP service deliberately excludes
+`state_unknown` Jobs from automatic reconciliation and exposes no owner
+recovery action. Owners cannot force a transition or request replacement work.
 
 Initial admission creates the Execution Run and Job in one transaction and
 uses a stable run name made from a sanitized display-name slug plus the full

@@ -518,7 +518,7 @@ class GromacsExecutionRuntime:
                     )
                     if task.status != TaskStatus.RUNNING:
                         continue
-                    if not valid or observation == AvailabilityStatus.MISSING:
+                    if observation is None or observation == AvailabilityStatus.MISSING:
                         repository.fail_task(
                             self.execution_run_id,
                             call.node_key,

@@ -17,7 +17,6 @@ from biomodals.execution import (
     RunStatus,
     RunStatusReason,
     TaskStatus,
-    required_node_keys,
     result_probe_frontier,
 )
 from biomodals.execution.modal import (
@@ -197,18 +196,12 @@ class GromacsExecutionCoordinator:
                         now=self._now(),
                     )
 
-                calls_to_observe = tuple(
-                    (call.provider_call_id, call.node_key not in required)
-                    for call in runtime.repository.list_provider_calls(execution_run_id)
-                    if not call.status.is_terminal
+                await runtime.reconcile_provider_calls(
+                    execution_run_id,
+                    required_node_keys=required,
+                    encode_result=_result_envelope,
+                    now=self._now(),
                 )
-                for provider_call_id, result_already_satisfied in calls_to_observe:
-                    await runtime.reconcile_provider_call(
-                        provider_call_id,
-                        encode_result=_result_envelope,
-                        result_already_satisfied=result_already_satisfied,
-                        now=self._now(),
-                    )
 
                 self._decode_completed_calls(
                     runtime,
@@ -436,18 +429,7 @@ class GromacsExecutionCoordinator:
         execution_run_id: UUID,
     ) -> set[str] | None:
         """Return the result-driven GROMACS repair closure."""
-        observations: dict[str, AvailabilityStatus] = {}
-        for node in runtime.repository.list_nodes(execution_run_id):
-            if node.status == NodeStatus.SUCCEEDED:
-                observations[node.node_key] = AvailabilityStatus.AVAILABLE
-            elif node.result_observation is not None:
-                observations[node.node_key] = node.result_observation
-            else:
-                observations[node.node_key] = AvailabilityStatus.MISSING
-        required = required_node_keys(
-            runtime.repository.get_run(execution_run_id).plan,
-            observations,
-        )
+        required = runtime.required_node_keys(execution_run_id)
         return None if required is None else set(required)
 
     def _decode_completed_calls(

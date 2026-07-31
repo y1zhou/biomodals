@@ -3,6 +3,7 @@
 # ruff: noqa: D103, S106
 
 import sqlite3
+from typing import Any, cast
 from uuid import UUID
 
 from biomodals.execution import (
@@ -21,6 +22,7 @@ from biomodals.execution import (
     required_node_keys,
     result_probe_frontier,
 )
+from biomodals.execution.runtime import ExecutionRuntime
 from biomodals.execution.scheduler import TaskDispatchDescriptor
 
 RUN_ID = UUID("d4e4744e-aacf-4478-92d6-a58681805162")
@@ -97,6 +99,29 @@ def test_result_probe_frontier_stops_at_available_ancestor() -> None:
     observations["compute"] = AvailabilityStatus.AVAILABLE
     assert result_probe_frontier(plan, observations) == ()
     assert observations["input"] is None
+
+
+def test_required_closure_uses_recorded_node_observations() -> None:
+    repository = _repository()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=cast(Any, object()),
+        checkpoint=lambda: None,
+    )
+
+    assert runtime.required_node_keys(RUN_ID) == (
+        "input",
+        "compute",
+        "summary",
+    )
+    repository.record_node_result_observation(
+        RUN_ID,
+        "summary",
+        AvailabilityStatus.AVAILABLE,
+        now=110,
+    )
+
+    assert runtime.required_node_keys(RUN_ID) == ()
 
 
 def _repository() -> SqliteExecutionRepository:

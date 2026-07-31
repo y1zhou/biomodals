@@ -46,12 +46,9 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
+from biomodals.helper.app_execution import ExecutionVolume, ExecutionVolumeSync
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import AppRunResult, AppRunStatus, WorkflowArtifact
-from biomodals.workflow.core._runtime.volume_sync import (
-    WorkflowVolume,
-    WorkflowVolumeSync,
-)
 from biomodals.workflow.core.artifact_availability import (
     ExternalArtifactChecker,
     check_artifact_availability,
@@ -125,7 +122,7 @@ class WorkflowRuntime:
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         workflow_volume_name: str,
-        workflow_volume: WorkflowVolume | None = None,
+        workflow_volume: ExecutionVolume | None = None,
         modal_driver: WorkflowModalDriver | None = None,
         max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,
@@ -168,9 +165,9 @@ class WorkflowRuntime:
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
         self.store = WorkflowRunStore(self.volume_root, execution_run_id)
-        self._volume_sync = WorkflowVolumeSync(
-            workflow_volume=workflow_volume,
-            ledger=self.store,
+        self._volume_sync = ExecutionVolumeSync(
+            volume=workflow_volume,
+            store=self.store,
         )
         self._provider = ExecutionRuntime(
             self.store.execution,
@@ -568,17 +565,8 @@ class WorkflowRuntime:
                 )
 
     def _required_nodes(self) -> set[str] | None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        observations: dict[str, AvailabilityStatus] = {}
-        for node in repository.list_nodes(self.execution_run_id):
-            if node.status == NodeStatus.SUCCEEDED:
-                observations[node.node_key] = AvailabilityStatus.AVAILABLE
-            elif node.result_observation is not None:
-                observations[node.node_key] = node.result_observation
-            else:
-                observations[node.node_key] = AvailabilityStatus.MISSING
-        required = required_node_keys(run.plan, observations)
+        self._provider.repository = self.store.execution
+        required = self._provider.required_node_keys(self.execution_run_id)
         return None if required is None else set(required)
 
     def _prune_unrequired(self, required: set[str]) -> tuple[UUID, ...]:
@@ -593,29 +581,25 @@ class WorkflowRuntime:
         return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        publications = []
-        publication_may_have_changed = False
-        for original in calls:
-            call = original
-            if not call.status.is_terminal:
-                self._provider.repository = self.store.execution
-                call = self._provider.reconcile_provider_call(
-                    call.provider_call_id,
-                    encode_result=_result_envelope,
-                    result_already_satisfied=call.node_key not in required,
-                    now=self._now(),
-                )
-                publication_may_have_changed |= call.status.is_terminal
-            if (
-                call.status == ProviderCallStatus.SUCCEEDED
-                and call.node_key in required
-            ):
-                publications.append(call)
-        if publication_may_have_changed:
+        self._provider.repository = self.store.execution
+        reconciled = self._provider.reconcile_provider_calls(
+            self.execution_run_id,
+            required_node_keys=required,
+            encode_result=_result_envelope,
+            now=self._now(),
+        )
+        if any(
+            not original.status.is_terminal and updated.status.is_terminal
+            for original, updated in reconciled
+        ):
             self._volume_sync.reload()
             self._provider.repository = self.store.execution
-        for call in publications:
+        for _, call in reconciled:
+            if (
+                call.status != ProviderCallStatus.SUCCEEDED
+                or call.node_key not in required
+            ):
+                continue
             self._publish_provider_result(call)
 
     def _publish_provider_result(

@@ -45,7 +45,7 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import ExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore, ExecutionVolumeSync
 
 
 @dataclass(frozen=True)
@@ -77,6 +77,7 @@ class BoltzGenExecutionRuntime:
         self.deployment = deployment
         self.store = store
         self.output_volume = output_volume
+        self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
         self.output_root = Path(output_root)
         self.predecessor_execution_run_id = predecessor_execution_run_id
         self.poll_interval_seconds = poll_interval_seconds
@@ -371,18 +372,8 @@ class BoltzGenExecutionRuntime:
         return self._node_observation(node_key)
 
     def _required_nodes(self) -> tuple[str, ...] | None:
-        repository = self.store.execution
-        observations = {}
-        for node in repository.list_nodes(self.execution_run_id):
-            observations[node.node_key] = (
-                AvailabilityStatus.AVAILABLE
-                if node.status == NodeStatus.SUCCEEDED
-                else node.result_observation or AvailabilityStatus.MISSING
-            )
-        return required_node_keys(
-            repository.get_run(self.execution_run_id).plan,
-            observations,
-        )
+        self._provider.repository = self.store.execution
+        return self._provider.required_node_keys(self.execution_run_id)
 
     def _prune_unrequired(self, required: tuple[str, ...]) -> tuple[UUID, ...]:
         with self.store.transaction():
@@ -396,19 +387,17 @@ class BoltzGenExecutionRuntime:
         return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        publication_may_have_changed = False
-        for call in self.store.execution.list_provider_calls(self.execution_run_id):
-            if call.status.is_terminal:
-                continue
-            self._provider.repository = self.store.execution
-            updated = self._provider.reconcile_provider_call(
-                call.provider_call_id,
-                encode_result=_result_envelope,
-                result_already_satisfied=call.node_key not in required,
-                now=self._now(),
-            )
-            publication_may_have_changed |= updated.status.is_terminal
-        if publication_may_have_changed:
+        self._provider.repository = self.store.execution
+        reconciled = self._provider.reconcile_provider_calls(
+            self.execution_run_id,
+            required_node_keys=required,
+            encode_result=_result_envelope,
+            now=self._now(),
+        )
+        if any(
+            not original.status.is_terminal and updated.status.is_terminal
+            for original, updated in reconciled
+        ):
             self._reload_output()
 
     def _start_ready_nodes(self) -> None:
@@ -672,15 +661,13 @@ class BoltzGenExecutionRuntime:
         return self.store.execution.get_provider_call(task.provider_call_id)
 
     def _checkpoint(self):
-        with self.store.closed_for_volume_sync():
-            self.output_volume.commit()
+        self._volume_sync.commit()
         repository = self.store.execution
         self._provider.repository = repository
         return repository
 
     def _reload_output(self) -> None:
-        with self.store.closed_for_volume_sync():
-            self.output_volume.reload()
+        self._volume_sync.reload()
         self._provider.repository = self.store.execution
 
 

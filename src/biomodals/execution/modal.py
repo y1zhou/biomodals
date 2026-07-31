@@ -77,6 +77,24 @@ _DEPLOYMENT_UNAVAILABLE_ERRORS = (
 )
 
 
+def _observation_from_error(error: Exception) -> ModalCallObservation:
+    """Classify one sync or async retained-call error."""
+    if isinstance(error, (TimeoutError, modal.exception.TimeoutError)):
+        kind = ModalCallObservationKind.RUNNING
+    elif isinstance(error, modal.exception.InputCancellation):
+        kind = ModalCallObservationKind.CANCELLED
+    elif isinstance(
+        error,
+        (modal.exception.OutputExpiredError, *_INCONCLUSIVE_SERVICE_ERRORS),
+    ):
+        kind = ModalCallObservationKind.STATE_UNKNOWN
+    elif isinstance(error, _CONCLUSIVE_EXECUTION_ERRORS):
+        kind = ModalCallObservationKind.FAILED
+    else:
+        kind = ModalCallObservationKind.STATE_UNKNOWN
+    return ModalCallObservation(kind, message=str(error))
+
+
 def deployed_execution_coordinator(
     *,
     execution_run_id: UUID,
@@ -152,31 +170,8 @@ class ModalCallDriver:
         call = self._call_resolver(provider_call_handle_id)
         try:
             result = call.get(timeout=0)
-        except (TimeoutError, modal.exception.TimeoutError):
-            return ModalCallObservation(ModalCallObservationKind.RUNNING)
-        except modal.exception.InputCancellation as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.CANCELLED,
-                message=str(error),
-            )
-        except (
-            modal.exception.OutputExpiredError,
-            *_INCONCLUSIVE_SERVICE_ERRORS,
-        ) as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.STATE_UNKNOWN,
-                message=str(error),
-            )
-        except _CONCLUSIVE_EXECUTION_ERRORS as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.FAILED,
-                message=str(error),
-            )
         except Exception as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.STATE_UNKNOWN,
-                message=str(error),
-            )
+            return _observation_from_error(error)
         return ModalCallObservation(
             ModalCallObservationKind.SUCCEEDED,
             result=result,
@@ -185,6 +180,29 @@ class ModalCallDriver:
     def cancel(self, provider_call_handle_id: str) -> None:
         """Request cancellation of one attached Function Call."""
         self._call_resolver(provider_call_handle_id).cancel()
+
+
+def development_modal_call_driver(
+    function_handles: Mapping[str, Any],
+    *,
+    workload_name: str,
+) -> ModalCallDriver:
+    """Build a driver that resolves only current-source development handles."""
+    handles = dict(function_handles)
+
+    def resolve(
+        _app_name: str,
+        function_name: str,
+        **_kwargs: object,
+    ) -> Any:
+        try:
+            return handles[function_name]
+        except KeyError as error:
+            raise ValueError(
+                f"No {workload_name} development function {function_name!r}"
+            ) from error
+
+    return ModalCallDriver(function_resolver=resolve)
 
 
 class AsyncModalCallDriver:
@@ -244,31 +262,8 @@ class AsyncModalCallDriver:
         call = self._call_resolver(provider_call_handle_id)
         try:
             result = await call.get.aio(timeout=0)
-        except (TimeoutError, modal.exception.TimeoutError):
-            return ModalCallObservation(ModalCallObservationKind.RUNNING)
-        except modal.exception.InputCancellation as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.CANCELLED,
-                message=str(error),
-            )
-        except (
-            modal.exception.OutputExpiredError,
-            *_INCONCLUSIVE_SERVICE_ERRORS,
-        ) as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.STATE_UNKNOWN,
-                message=str(error),
-            )
-        except _CONCLUSIVE_EXECUTION_ERRORS as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.FAILED,
-                message=str(error),
-            )
         except Exception as error:
-            return ModalCallObservation(
-                ModalCallObservationKind.STATE_UNKNOWN,
-                message=str(error),
-            )
+            return _observation_from_error(error)
         return ModalCallObservation(
             ModalCallObservationKind.SUCCEEDED,
             result=result,

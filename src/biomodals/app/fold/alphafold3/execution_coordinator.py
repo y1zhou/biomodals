@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 from pathlib import Path
-from threading import Lock, RLock
 from typing import Any
 from uuid import UUID
 
@@ -24,10 +22,13 @@ from biomodals.execution import (
     ExecutionRunNotFoundError,
     ExecutionSnapshot,
 )
-from biomodals.helper.app_execution import ExecutionRunStore
+from biomodals.helper.app_execution import (
+    ExecutionCoordinatorLifecycle,
+    ExecutionRunStore,
+)
 
 
-class AlphaFold3ExecutionCoordinator:
+class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one run-scoped writer to AlphaFold3-owned state and publications."""
 
     def __init__(
@@ -44,18 +45,17 @@ class AlphaFold3ExecutionCoordinator:
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only the host resources needed by this deployment adapter."""
-        self.execution_run_id = execution_run_id
-        self.deployment = deployment
-        self.volume_root = Path(volume_root)
+        super().__init__(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=volume_root,
+        )
         self.output_volume = output_volume
         self.modal_driver = modal_driver
         self.search_runtime = search_runtime
         self.template_runtime = template_runtime
         self.inference_runtime = inference_runtime
         self.poll_interval_seconds = poll_interval_seconds
-        self._writer_lock = RLock()
-        self._drive_lock = Lock()
-        self._runtime: AlphaFold3ExecutionRuntime | None = None
 
     def run(self) -> ExecutionSnapshot:
         """Load the staged immutable request and drive a root Run."""
@@ -67,23 +67,6 @@ class AlphaFold3ExecutionCoordinator:
                 )
                 runtime = self._open_runtime(request)
             return self._drive(runtime, resume=False)
-
-    def status(self) -> ExecutionSnapshot:
-        """Read one verified snapshot without advancing or retrying work."""
-        with self._writer_lock:
-            runtime = self._runtime
-            if runtime is not None:
-                snapshot = runtime.store.execution.snapshot(self.execution_run_id)
-            else:
-                store = self._run_store()
-                if not store.ledger_path.is_file():
-                    raise ExecutionRunNotFoundError(str(self.execution_run_id))
-                try:
-                    snapshot = store.execution.snapshot(self.execution_run_id)
-                finally:
-                    store.close()
-            self._verify_snapshot(snapshot)
-            return snapshot
 
     def cancel(self) -> ExecutionSnapshot:
         """Idempotently request cancellation without replacing unknown work."""
@@ -195,10 +178,6 @@ class AlphaFold3ExecutionCoordinator:
             self._close_runtime()
             self.output_volume.commit()
 
-    def synchronize(self) -> AbstractContextManager[object]:
-        """Return the single-writer lock used between coordinator cycles."""
-        return self._writer_lock
-
     def _drive(
         self,
         runtime: AlphaFold3ExecutionRuntime,
@@ -249,21 +228,6 @@ class AlphaFold3ExecutionCoordinator:
         )
         self._runtime = runtime
         return runtime
-
-    def _run_store(self) -> ExecutionRunStore:
-        return ExecutionRunStore(self.volume_root, self.execution_run_id)
-
-    def _verify_snapshot(self, snapshot: ExecutionSnapshot) -> None:
-        if snapshot.run.execution_run_id != self.execution_run_id:
-            raise ValueError("Execution Run ID does not match coordinator")
-        if snapshot.run.deployment != self.deployment:
-            raise ValueError("Deployment Identity does not match Execution Run")
-
-    def _close_runtime(self) -> None:
-        runtime = self._runtime
-        if runtime is not None:
-            runtime.close()
-            self._runtime = None
 
 
 def _restart_request(

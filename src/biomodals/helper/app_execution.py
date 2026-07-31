@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from threading import RLock
-from typing import Any
+from threading import Lock, RLock
+from typing import Any, Protocol
 from uuid import UUID
 
-from biomodals.execution import SqliteExecutionRepository
+from biomodals.execution import (
+    DeploymentIdentity,
+    ExecutionRunNotFoundError,
+    ExecutionSnapshot,
+    SqliteExecutionRepository,
+)
 
 LEDGER_FILENAME = "ledger.sqlite3"
 
@@ -237,3 +242,116 @@ class ExecutionRunStore:
         self._execution = None
         if connection is not None:
             connection.close()
+
+
+class ExecutionVolume(Protocol):
+    """Minimal Modal Volume boundary used by execution hosts."""
+
+    def commit(self) -> object:
+        """Persist pending writes."""
+
+    def reload(self) -> object:
+        """Refresh writes made by other containers."""
+
+
+class ExecutionVolumeSync:
+    """Close a Run store while synchronizing its backing Volume."""
+
+    def __init__(
+        self,
+        *,
+        volume: ExecutionVolume | None,
+        store: ExecutionRunStore,
+    ) -> None:
+        """Bind one optional Volume to its closeable local Run store."""
+        self.volume = volume
+        self.store = store
+        self._lock = RLock()
+
+    def commit(self) -> None:
+        """Persist pending Volume writes when a Volume is attached."""
+        with self._lock:
+            with self.store.closed_for_volume_sync():
+                if self.volume is not None:
+                    self.volume.commit()
+
+    def reload(self) -> None:
+        """Refresh the Volume view when a Volume is attached."""
+        if self.volume is None:
+            return
+        with self._lock:
+            with self.store.closed_for_volume_sync():
+                self.volume.reload()
+
+
+class ExecutionCoordinatorLifecycle:
+    """Share app-coordinator locking, status, and drive mechanics."""
+
+    def __init__(
+        self,
+        *,
+        execution_run_id: UUID,
+        deployment: DeploymentIdentity,
+        volume_root: str | Path,
+    ) -> None:
+        """Bind the lifecycle to one Run and exact deployment."""
+        self.execution_run_id = execution_run_id
+        self.deployment = deployment
+        self.volume_root = Path(volume_root)
+        self._writer_lock = RLock()
+        self._drive_lock = Lock()
+        self._runtime: Any | None = None
+
+    def status(self) -> ExecutionSnapshot:
+        """Read one verified snapshot without advancing work."""
+        with self._writer_lock:
+            runtime = self._runtime
+            if runtime is not None:
+                snapshot = runtime.store.execution.snapshot(self.execution_run_id)
+            else:
+                store = self._run_store()
+                if not store.ledger_path.is_file():
+                    raise ExecutionRunNotFoundError(str(self.execution_run_id))
+                try:
+                    snapshot = store.execution.snapshot(self.execution_run_id)
+                finally:
+                    store.close()
+            self._verify_snapshot(snapshot)
+            return snapshot
+
+    def close(self) -> None:
+        """Close coordinator-local state without cancelling Provider Calls."""
+        with self._writer_lock:
+            self._close_runtime()
+
+    def synchronize(self) -> AbstractContextManager[object]:
+        """Return the single-writer boundary used between drive cycles."""
+        return self._writer_lock
+
+    def _drive(self, runtime: Any, *, resume: bool) -> ExecutionSnapshot:
+        try:
+            snapshot = (
+                runtime.resume(synchronize=self.synchronize)
+                if resume
+                else runtime.run(synchronize=self.synchronize)
+            )
+            self._verify_snapshot(snapshot)
+            return snapshot
+        finally:
+            with self._writer_lock:
+                self._close_runtime()
+
+    def _run_store(self) -> ExecutionRunStore:
+        return ExecutionRunStore(self.volume_root, self.execution_run_id)
+
+    def _verify_snapshot(self, snapshot: ExecutionSnapshot) -> None:
+        if snapshot.run.execution_run_id != self.execution_run_id:
+            raise ValueError("Execution Run ID does not match coordinator")
+        if snapshot.run.deployment != self.deployment:
+            raise ValueError("Deployment Identity does not match Execution Run")
+
+    def _close_runtime(self) -> None:
+        runtime = self._runtime
+        if runtime is not None:
+            runtime.close()
+            self._runtime = None

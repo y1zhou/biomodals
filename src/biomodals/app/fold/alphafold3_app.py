@@ -131,6 +131,7 @@ from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import (
     ModalCallDriver,
     deployed_execution_coordinator,
+    development_modal_call_driver,
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
@@ -838,28 +839,17 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
     """Resolve exact deployed functions or current-source development handles."""
     if not development:
         return ModalCallDriver()
-    handles = {
-        "search_database_msa": search_database_msa,
-        "assemble_sequence_msas": assemble_sequence_msas,
-        "search_protein_templates": search_protein_templates,
-        "run_inference_pipeline": run_inference_pipeline,
-        "finalize_inference_summary": finalize_inference_summary,
-        "finalize_inference_request": finalize_inference_request,
-    }
-
-    def resolve(
-        _app_name: str,
-        function_name: str,
-        **_kwargs: object,
-    ) -> Any:
-        try:
-            return handles[function_name]
-        except KeyError as error:
-            raise ValueError(
-                f"No AlphaFold3 development function {function_name!r}"
-            ) from error
-
-    return ModalCallDriver(function_resolver=resolve)
+    return development_modal_call_driver(
+        {
+            "search_database_msa": search_database_msa,
+            "assemble_sequence_msas": assemble_sequence_msas,
+            "search_protein_templates": search_protein_templates,
+            "run_inference_pipeline": run_inference_pipeline,
+            "finalize_inference_summary": finalize_inference_summary,
+            "finalize_inference_request": finalize_inference_request,
+        },
+        workload_name="AlphaFold3",
+    )
 
 
 def _execution_coordinator_handle(

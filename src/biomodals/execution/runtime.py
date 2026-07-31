@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -17,6 +17,7 @@ from biomodals.execution.model import (
     AvailabilityStatus,
     ExecutionRunRecord,
     ExecutionTaskRecord,
+    NodeStatus,
     ProviderBinding,
     ProviderCallPreclaim,
     ProviderCallRecord,
@@ -29,6 +30,7 @@ from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
+    required_node_keys,
 )
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
@@ -68,6 +70,67 @@ class _AsyncModalDriver(Protocol):
     async def cancel(self, provider_call_handle_id: str) -> None: ...
 
 
+def _required_node_keys_for_run(
+    repository: SqliteExecutionRepository,
+    execution_run_id: UUID,
+) -> tuple[str, ...] | None:
+    """Derive the result-driven closure from durable Node observations."""
+    observations = {
+        node.node_key: (
+            AvailabilityStatus.AVAILABLE
+            if node.status == NodeStatus.SUCCEEDED
+            else node.result_observation or AvailabilityStatus.MISSING
+        )
+        for node in repository.list_nodes(execution_run_id)
+    }
+    return required_node_keys(
+        repository.get_run(execution_run_id).plan,
+        observations,
+    )
+
+
+def _record_provider_call_observation(
+    repository: SqliteExecutionRepository,
+    provider_call_id: UUID,
+    observation: ModalCallObservation,
+    *,
+    result_envelope: Any,
+    result_already_satisfied: bool,
+    now: int,
+) -> ProviderCallRecord:
+    """Apply the provider-neutral transition shared by sync and async hosts."""
+    if observation.kind == ModalCallObservationKind.RUNNING:
+        return repository.mark_provider_call_running(provider_call_id, now=now)
+    if observation.kind == ModalCallObservationKind.SUCCEEDED:
+        return repository.record_provider_call_result(
+            provider_call_id,
+            result_envelope=result_envelope,
+            now=now,
+        )
+    if observation.kind == ModalCallObservationKind.FAILED:
+        return repository.fail_provider_call(
+            provider_call_id,
+            message=observation.message or "Modal function failed",
+            now=now,
+        )
+    if observation.kind == ModalCallObservationKind.CANCELLED:
+        if result_already_satisfied:
+            return repository.cancel_pruned_provider_call(
+                provider_call_id,
+                now=now,
+            )
+        return repository.cancel_provider_call(
+            provider_call_id,
+            message=observation.message or "Modal function was cancelled",
+            now=now,
+        )
+    return repository.mark_provider_call_state_unknown(
+        provider_call_id,
+        message=observation.message or "Modal call state was inconclusive",
+        now=now,
+    )
+
+
 class ExecutionRuntime:
     """Coordinate repository checkpoints with exactly one Modal side effect."""
 
@@ -88,6 +151,10 @@ class ExecutionRuntime:
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
         self._checkpoint_state()
+
+    def required_node_keys(self, execution_run_id: UUID) -> tuple[str, ...] | None:
+        """Derive the result-driven closure from durable Node observations."""
+        return _required_node_keys_for_run(self.repository, execution_run_id)
 
     def persist_fixed_dispatch_policy(
         self,
@@ -414,56 +481,55 @@ class ExecutionRuntime:
             return call
 
         observation = self._modal.observe(call.provider_call_handle_id)
-        if observation.kind == ModalCallObservationKind.RUNNING:
-            updated = self.repository.mark_provider_call_running(
-                provider_call_id,
-                now=now,
-            )
-        elif observation.kind == ModalCallObservationKind.SUCCEEDED:
+        envelope = None
+        if observation.kind == ModalCallObservationKind.SUCCEEDED:
             try:
                 envelope = encode_result(observation.result)
             except Exception as error:
-                updated = self.repository.mark_provider_call_state_unknown(
+                self.repository.mark_provider_call_state_unknown(
                     provider_call_id,
                     message=f"Could not create a Result Envelope: {error}",
                     now=now,
                 )
                 self._checkpoint_state()
                 raise
-            updated = self.repository.record_provider_call_result(
-                provider_call_id,
-                result_envelope=envelope,
-                now=now,
-            )
-        elif observation.kind == ModalCallObservationKind.FAILED:
-            updated = self.repository.fail_provider_call(
-                provider_call_id,
-                message=observation.message or "Modal function failed",
-                now=now,
-            )
-        elif observation.kind == ModalCallObservationKind.CANCELLED:
-            if result_already_satisfied:
-                updated = self.repository.cancel_pruned_provider_call(
-                    provider_call_id,
-                    now=now,
-                )
-            else:
-                updated = self.repository.cancel_provider_call(
-                    provider_call_id,
-                    message=observation.message or "Modal function was cancelled",
-                    now=now,
-                )
-        else:
-            updated = self.repository.mark_provider_call_state_unknown(
-                provider_call_id,
-                message=observation.message or "Modal call state was inconclusive",
-                now=now,
-            )
+        updated = _record_provider_call_observation(
+            self.repository,
+            provider_call_id,
+            observation,
+            result_envelope=envelope,
+            result_already_satisfied=result_already_satisfied,
+            now=now,
+        )
         if observation.kind != ModalCallObservationKind.RUNNING:
             self._checkpoint_state()
         else:
             self._commit_local_state()
         return updated
+
+    def reconcile_provider_calls(
+        self,
+        execution_run_id: UUID,
+        *,
+        required_node_keys: Collection[str],
+        encode_result: Callable[[Any], Any],
+        now: int,
+    ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
+        """Reconcile every nonterminal call and retain before/after records."""
+        reconciled = []
+        for original in self.repository.list_provider_calls(execution_run_id):
+            updated = original
+            if not original.status.is_terminal:
+                updated = self.reconcile_provider_call(
+                    original.provider_call_id,
+                    encode_result=encode_result,
+                    result_already_satisfied=(
+                        original.node_key not in required_node_keys
+                    ),
+                    now=now,
+                )
+            reconciled.append((original, updated))
+        return tuple(reconciled)
 
     def request_provider_call_cancellation(
         self,
@@ -565,6 +631,10 @@ class AsyncExecutionRuntime:
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
         self._checkpoint_state()
+
+    def required_node_keys(self, execution_run_id: UUID) -> tuple[str, ...] | None:
+        """Derive the result-driven closure from durable Node observations."""
+        return _required_node_keys_for_run(self.repository, execution_run_id)
 
     def persist_fixed_dispatch_policy(
         self,
@@ -707,12 +777,8 @@ class AsyncExecutionRuntime:
             return call
 
         observation = await self._modal.observe(call.provider_call_handle_id)
-        if observation.kind == ModalCallObservationKind.RUNNING:
-            updated = self.repository.mark_provider_call_running(
-                provider_call_id,
-                now=now,
-            )
-        elif observation.kind == ModalCallObservationKind.SUCCEEDED:
+        envelope = None
+        if observation.kind == ModalCallObservationKind.SUCCEEDED:
             try:
                 envelope = encode_result(observation.result)
             except Exception as error:
@@ -723,40 +789,43 @@ class AsyncExecutionRuntime:
                 )
                 self._checkpoint_state()
                 raise
-            updated = self.repository.record_provider_call_result(
-                provider_call_id,
-                result_envelope=envelope,
-                now=now,
-            )
-        elif observation.kind == ModalCallObservationKind.FAILED:
-            updated = self.repository.fail_provider_call(
-                provider_call_id,
-                message=observation.message or "Modal function failed",
-                now=now,
-            )
-        elif observation.kind == ModalCallObservationKind.CANCELLED:
-            if result_already_satisfied:
-                updated = self.repository.cancel_pruned_provider_call(
-                    provider_call_id,
-                    now=now,
-                )
-            else:
-                updated = self.repository.cancel_provider_call(
-                    provider_call_id,
-                    message=observation.message or "Modal function was cancelled",
-                    now=now,
-                )
-        else:
-            updated = self.repository.mark_provider_call_state_unknown(
-                provider_call_id,
-                message=observation.message or "Modal call state was inconclusive",
-                now=now,
-            )
+        updated = _record_provider_call_observation(
+            self.repository,
+            provider_call_id,
+            observation,
+            result_envelope=envelope,
+            result_already_satisfied=result_already_satisfied,
+            now=now,
+        )
         if observation.kind != ModalCallObservationKind.RUNNING:
             self._checkpoint_state()
         else:
             self._commit_local_state()
         return updated
+
+    async def reconcile_provider_calls(
+        self,
+        execution_run_id: UUID,
+        *,
+        required_node_keys: Collection[str],
+        encode_result: Callable[[Any], Any],
+        now: int,
+    ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
+        """Reconcile every nonterminal call and retain before/after records."""
+        reconciled = []
+        for original in self.repository.list_provider_calls(execution_run_id):
+            updated = original
+            if not original.status.is_terminal:
+                updated = await self.reconcile_provider_call(
+                    original.provider_call_id,
+                    encode_result=encode_result,
+                    result_already_satisfied=(
+                        original.node_key not in required_node_keys
+                    ),
+                    now=now,
+                )
+            reconciled.append((original, updated))
+        return tuple(reconciled)
 
     async def request_provider_call_cancellation(
         self,

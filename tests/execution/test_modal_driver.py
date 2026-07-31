@@ -3,6 +3,7 @@
 # ruff: noqa: D101, D102, D103, D107
 
 import asyncio
+from dataclasses import replace
 from uuid import UUID
 
 import modal
@@ -16,6 +17,7 @@ from biomodals.execution.modal import (
     ModalDeploymentUnavailableError,
     ModalSubmissionOutcomeUnknownError,
     deployed_execution_coordinator,
+    development_modal_call_driver,
 )
 
 from .provider_call_helpers import GPU_BINDING
@@ -89,6 +91,18 @@ def test_driver_resolves_exact_version_and_spawns_detached_call() -> None:
     ]
     assert function.hydrated
     assert call_id == "fc-123"
+
+
+def test_development_driver_resolves_only_declared_local_handles() -> None:
+    function = FakeFunction()
+    driver = development_modal_call_driver(
+        {"run_inference": function},
+        workload_name="Example",
+    )
+
+    assert driver.resolve(GPU_BINDING) is function
+    with pytest.raises(ValueError, match="No Example development function 'missing'"):
+        driver.resolve(replace(GPU_BINDING, function_name="missing"))
 
 
 def test_driver_classifies_ambiguous_spawn_failure() -> None:

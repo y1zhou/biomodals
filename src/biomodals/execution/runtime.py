@@ -384,6 +384,7 @@ class ExecutionRuntime:
                         message="Modal call attachment was not durable",
                         now=now,
                     )
+                self._checkpoint_state()
             raise
         return attached
 
@@ -665,6 +666,7 @@ class AsyncExecutionRuntime:
                         message="Modal call attachment was not durable",
                         now=now,
                     )
+                self._checkpoint_state()
             raise
         return attached
 

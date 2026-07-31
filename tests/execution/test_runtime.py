@@ -377,6 +377,48 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
     assert driver.spawn_count == 1
 
 
+def test_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    checkpoints: list[ProviderCallStatus] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: checkpoints.append(
+            repository.list_provider_calls(RUN_ID)[0].status
+        ),
+    )
+
+    def fail_attachment(*args, **kwargs):
+        raise RuntimeError("attachment failed")
+
+    monkeypatch.setattr(repository, "attach_provider_call", fail_attachment)
+
+    with pytest.raises(RuntimeError, match="attachment failed"):
+        runtime.submit_fixed_batch(
+            RUN_ID,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+
+    call = repository.list_provider_calls(RUN_ID)[0]
+    assert call.status == ProviderCallStatus.OUTCOME_UNKNOWN
+    assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}"]
+    assert checkpoints == [
+        ProviderCallStatus.SUBMITTING,
+        ProviderCallStatus.OUTCOME_UNKNOWN,
+    ]
+
+
 def test_recovery_collects_attached_call_once_then_replays_durable_envelope() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

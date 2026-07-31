@@ -5,6 +5,8 @@
 import asyncio
 from dataclasses import dataclass
 
+import pytest
+
 from biomodals.execution import ProviderCallStatus, RunStatusReason
 from biomodals.execution.modal import (
     ModalCallObservation,
@@ -147,6 +149,51 @@ def test_async_runtime_requests_cancellation_without_inventing_completion() -> N
 
         assert requested.status == ProviderCallStatus.ATTACHED
         assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}"]
+
+    asyncio.run(scenario())
+
+
+def test_async_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        repository = create_repository(task_count=1)
+        persist_fixed_policy(
+            repository,
+            ("seed-0",),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
+        driver = AsyncFakeModalDriver()
+        checkpoints: list[ProviderCallStatus] = []
+        runtime = AsyncExecutionRuntime(
+            repository,
+            modal_driver=driver,
+            checkpoint=lambda: checkpoints.append(
+                repository.list_provider_calls(RUN_ID)[0].status
+            ),
+        )
+
+        def fail_attachment(*args, **kwargs):
+            raise RuntimeError("attachment failed")
+
+        monkeypatch.setattr(repository, "attach_provider_call", fail_attachment)
+
+        with pytest.raises(RuntimeError, match="attachment failed"):
+            await runtime.submit_fixed_batch(
+                RUN_ID,
+                _candidate(),
+                submission_token="batch",
+                now=110,
+            )
+
+        call = repository.list_provider_calls(RUN_ID)[0]
+        assert call.status == ProviderCallStatus.OUTCOME_UNKNOWN
+        assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}"]
+        assert checkpoints == [
+            ProviderCallStatus.SUBMITTING,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+        ]
 
     asyncio.run(scenario())
 

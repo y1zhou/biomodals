@@ -39,7 +39,7 @@ from biomodals.execution.modal import (
     ModalCallObservationKind,
     ModalDeploymentUnavailableError,
 )
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "AlphaFold3", 7)
@@ -170,7 +170,7 @@ def _runtime(
         request=request or _request(),
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
-        store=AppExecutionRunStore(tmp_path, RUN_ID),
+        store=ExecutionRunStore(tmp_path, RUN_ID),
         modal_driver=driver or NoCallDriver(),
         output_volume=output,
         search_runtime=SearchRuntime(

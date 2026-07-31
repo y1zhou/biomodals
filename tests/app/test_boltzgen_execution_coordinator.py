@@ -25,7 +25,7 @@ from biomodals.execution import (
     TaskPlan,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -56,7 +56,7 @@ class FakeRuntime:
             kwargs["predecessor_execution_run_id"],
         )
         self.deployment = cast(DeploymentIdentity, kwargs["deployment"])
-        self.store = cast(AppExecutionRunStore, kwargs["store"])
+        self.store = cast(ExecutionRunStore, kwargs["store"])
         self.created.append(kwargs)
 
     def run(self, *, synchronize):
@@ -139,7 +139,7 @@ def _terminal_predecessor(
     request: BoltzGenExecutionRequest,
 ) -> str:
     persist_execution_request(tmp_path, PREDECESSOR_ID, request)
-    store = AppExecutionRunStore(tmp_path, PREDECESSOR_ID)
+    store = ExecutionRunStore(tmp_path, PREDECESSOR_ID)
     with store.transaction():
         store.execution.create_run(
             execution_run_id=PREDECESSOR_ID,

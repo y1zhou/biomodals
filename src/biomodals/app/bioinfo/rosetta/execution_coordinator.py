@@ -23,7 +23,7 @@ from biomodals.execution import (
     ExecutionSnapshot,
     PullTaskClaim,
 )
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 
 class RosettaExecutionCoordinator:
@@ -177,7 +177,7 @@ class RosettaExecutionCoordinator:
         with self._drive_lock:
             with self._writer_lock:
                 self.output_volume.reload()
-                predecessor_store = AppExecutionRunStore(
+                predecessor_store = ExecutionRunStore(
                     self.volume_root,
                     predecessor_execution_run_id,
                 )
@@ -303,8 +303,8 @@ class RosettaExecutionCoordinator:
         self._runtime = runtime
         return runtime
 
-    def _run_store(self) -> AppExecutionRunStore:
-        return AppExecutionRunStore(self.volume_root, self.execution_run_id)
+    def _run_store(self) -> ExecutionRunStore:
+        return ExecutionRunStore(self.volume_root, self.execution_run_id)
 
     def _existing_predecessor(self) -> UUID | None:
         store = self._run_store()

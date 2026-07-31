@@ -117,7 +117,7 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 (
     _STAGE_REQUEST,
@@ -164,7 +164,7 @@ class AlphaFold3ExecutionRuntime:
         request: AlphaFold3ExecutionRequest,
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
-        store: AppExecutionRunStore,
+        store: ExecutionRunStore,
         modal_driver: Any,
         output_volume: Any,
         search_runtime: SearchRuntime,

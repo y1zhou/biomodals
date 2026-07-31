@@ -24,7 +24,7 @@ from biomodals.execution import (
     ExecutionRunNotFoundError,
     ExecutionSnapshot,
 )
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 
 class AlphaFold3ExecutionCoordinator:
@@ -132,7 +132,7 @@ class AlphaFold3ExecutionCoordinator:
         with self._drive_lock:
             with self._writer_lock:
                 self.output_volume.reload()
-                predecessor_store = AppExecutionRunStore(
+                predecessor_store = ExecutionRunStore(
                     self.volume_root,
                     predecessor_execution_run_id,
                 )
@@ -250,8 +250,8 @@ class AlphaFold3ExecutionCoordinator:
         self._runtime = runtime
         return runtime
 
-    def _run_store(self) -> AppExecutionRunStore:
-        return AppExecutionRunStore(self.volume_root, self.execution_run_id)
+    def _run_store(self) -> ExecutionRunStore:
+        return ExecutionRunStore(self.volume_root, self.execution_run_id)
 
     def _verify_snapshot(self, snapshot: ExecutionSnapshot) -> None:
         if snapshot.run.execution_run_id != self.execution_run_id:

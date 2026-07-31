@@ -1,4 +1,4 @@
-"""Physical execution state for one remotely coordinated Direct CLI App Run."""
+"""Physical state shared by remotely coordinated execution adapters."""
 
 from __future__ import annotations
 
@@ -121,8 +121,8 @@ class ExecutionRequestFile:
             raise ValueError(f"{self.name} exceeds its byte limit")
 
 
-class AppExecutionRunStore:
-    """Own one app Run's SQLite connection and reserved state path."""
+class ExecutionRunStore:
+    """Own one Run's kernel connection and reserved state path."""
 
     def __init__(self, volume_root: str | Path, execution_run_id: UUID) -> None:
         """Bind storage only to the host Volume root and opaque Run ID."""
@@ -170,7 +170,7 @@ class AppExecutionRunStore:
         with self._lock:
             connection = self._connect()
             if connection.in_transaction:
-                raise RuntimeError("Nested app execution transactions are unsupported")
+                raise RuntimeError("Nested execution transactions are unsupported")
             try:
                 yield
             except BaseException:
@@ -205,7 +205,7 @@ class AppExecutionRunStore:
 
     def _connect(self) -> sqlite3.Connection:
         if self._volume_sync_active:
-            raise RuntimeError("App store is closed for Volume synchronization")
+            raise RuntimeError("Run store is closed for Volume synchronization")
         if self._connection is not None:
             return self._connection
 
@@ -219,6 +219,7 @@ class AppExecutionRunStore:
         try:
             execution = SqliteExecutionRepository(connection)
             execution.initialize_schema()
+            self._initialize_additional_schema(connection)
             connection.commit()
         except BaseException:
             connection.close()
@@ -226,6 +227,9 @@ class AppExecutionRunStore:
         self._connection = connection
         self._execution = execution
         return connection
+
+    def _initialize_additional_schema(self, connection: sqlite3.Connection) -> None:
+        """Allow an adapter-owned store to share this transaction boundary."""
 
     def _close(self) -> None:
         connection = self._connection

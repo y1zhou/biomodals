@@ -41,7 +41,7 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 
 class RosettaExecutionRuntime:
@@ -53,7 +53,7 @@ class RosettaExecutionRuntime:
         request: RosettaExecutionRequest,
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
-        store: AppExecutionRunStore,
+        store: ExecutionRunStore,
         modal_driver: Any,
         output_volume: Any,
         output_root: str | Path,

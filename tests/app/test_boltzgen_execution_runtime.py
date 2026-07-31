@@ -31,7 +31,7 @@ from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
 )
-from biomodals.helper.app_execution import AppExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "BoltzGen", 7)
@@ -122,7 +122,7 @@ def _runtime(
         request=request or _request(),
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
-        store=AppExecutionRunStore(tmp_path, RUN_ID),
+        store=ExecutionRunStore(tmp_path, RUN_ID),
         modal_driver=driver or RecordingCallDriver(),
         output_volume=FakeVolume(),
         output_root=tmp_path,

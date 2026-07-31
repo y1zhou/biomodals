@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import UUID
@@ -11,11 +10,6 @@ from uuid import UUID
 import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    read_bounded_file_bytes,
-    read_volume_bytes,
-    write_bytes_atomic,
-)
 from biomodals.app.fold.alphafold3.execution_plan import (
     build_alphafold3_execution_plan,
 )
@@ -34,10 +28,16 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
     validate_search_worker_budget,
 )
 from biomodals.execution import ExecutionPlan
+from biomodals.helper.app_execution import ExecutionRequestFile
 
 EXECUTION_REQUEST_SCHEMA_VERSION = 1
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"
 MAX_EXECUTION_REQUEST_BYTES = 64 * 1024 * 1024
+_REQUEST_FILE = ExecutionRequestFile(
+    EXECUTION_REQUEST_FILENAME,
+    MAX_EXECUTION_REQUEST_BYTES,
+    "AlphaFold3 execution request",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,13 +172,7 @@ class AlphaFold3ExecutionRequest:
 
 def execution_request_path(execution_run_id: UUID) -> PurePosixPath:
     """Return the Volume-relative immutable request path for one App Run."""
-    return (
-        PurePosixPath(".biomodals")
-        / "execution"
-        / "runs"
-        / str(execution_run_id)
-        / EXECUTION_REQUEST_FILENAME
-    )
+    return _REQUEST_FILE.path(execution_run_id)
 
 
 def stage_execution_request(
@@ -187,22 +181,11 @@ def stage_execution_request(
     request: AlphaFold3ExecutionRequest,
 ) -> PurePosixPath:
     """Idempotently stage one immutable request from the thin local client."""
-    path = execution_request_path(execution_run_id)
-    content = request.to_bytes()
-    existing = read_volume_bytes(
+    return _REQUEST_FILE.stage(
         output_volume,
-        path.as_posix(),
-        max_bytes=MAX_EXECUTION_REQUEST_BYTES,
+        execution_run_id,
+        request.to_bytes(),
     )
-    if existing is not None:
-        if existing != content:
-            raise RuntimeError(
-                "Existing AlphaFold3 execution request conflicts with this run"
-            )
-        return path
-    with output_volume.batch_upload(force=True) as batch:
-        batch.put_file(BytesIO(content), f"/{path.as_posix()}")
-    return path
 
 
 def load_execution_request(
@@ -210,12 +193,7 @@ def load_execution_request(
     execution_run_id: UUID,
 ) -> AlphaFold3ExecutionRequest:
     """Load and revalidate one request from a coordinator's mounted Volume."""
-    relative = execution_request_path(execution_run_id)
-    content = read_bounded_file_bytes(
-        Path(volume_root).joinpath(*relative.parts),
-        field_name="AlphaFold3 execution request",
-        max_bytes=MAX_EXECUTION_REQUEST_BYTES,
-    )
+    content = _REQUEST_FILE.load(volume_root, execution_run_id)
     return AlphaFold3ExecutionRequest.from_bytes(content)
 
 
@@ -225,22 +203,11 @@ def persist_execution_request(
     request: AlphaFold3ExecutionRequest,
 ) -> PurePosixPath:
     """Idempotently persist a request from inside a mounted coordinator."""
-    relative = execution_request_path(execution_run_id)
-    path = Path(volume_root).joinpath(*relative.parts)
-    content = request.to_bytes()
-    if path.exists():
-        existing = read_bounded_file_bytes(
-            path,
-            field_name="AlphaFold3 execution request",
-            max_bytes=MAX_EXECUTION_REQUEST_BYTES,
-        )
-        if existing != content:
-            raise RuntimeError(
-                "Existing AlphaFold3 execution request conflicts with this run"
-            )
-        return relative
-    write_bytes_atomic(path, content)
-    return relative
+    return _REQUEST_FILE.persist(
+        volume_root,
+        execution_run_id,
+        request.to_bytes(),
+    )
 
 
 def _required_bool(value: dict[object, object], key: str) -> bool:

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID
 
 import orjson
@@ -16,17 +14,18 @@ from biomodals.app.design.boltzgen.execution_contracts import (
     collection_publication_path,
 )
 from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
+from biomodals.helper.app_execution import ExecutionRequestFile
 from biomodals.helper.shell import sanitize_filename
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 DESIGN_RUNS_NODE = "design-runs"
 COLLECT_RESULTS_NODE = "collect-results"
-
-
-class _VolumeReader(Protocol):
-    def read_file(self, path: str) -> Iterable[bytes]:
-        """Yield chunks for one Volume-relative path."""
+_REQUEST_FILE = ExecutionRequestFile(
+    "request.json",
+    MAX_REQUEST_BYTES,
+    "BoltzGen execution request",
+)
 
 
 @dataclass(frozen=True)
@@ -206,13 +205,7 @@ def prepare_execution_request(
 
 def request_relative_path(execution_run_id: UUID) -> PurePosixPath:
     """Return the reserved per-Run request path."""
-    return (
-        PurePosixPath(".biomodals")
-        / "execution"
-        / "runs"
-        / str(execution_run_id)
-        / "request.json"
-    )
+    return _REQUEST_FILE.path(execution_run_id)
 
 
 def stage_execution_request(
@@ -221,39 +214,24 @@ def stage_execution_request(
     request: BoltzGenExecutionRequest,
 ) -> PurePosixPath:
     """Idempotently stage one immutable request before coordinator launch."""
-    path = request_relative_path(execution_run_id)
-    content = request.to_bytes()
-    existing = _read_volume_bytes(output_volume, path.as_posix())
-    if existing is not None:
-        if existing != content:
-            raise RuntimeError(
-                "Existing BoltzGen execution request conflicts with this run"
-            )
-        return path
-    with output_volume.batch_upload(force=True) as batch:
-        batch.put_file(
-            BytesIO(content),
-            f"/{path}",
-        )
-    return path
+    return _REQUEST_FILE.stage(
+        output_volume,
+        execution_run_id,
+        request.to_bytes(),
+    )
 
 
 def persist_execution_request(
     volume_root: str | Path,
     execution_run_id: UUID,
     request: BoltzGenExecutionRequest,
-) -> None:
+) -> PurePosixPath:
     """Atomically persist a coordinator-generated Successor request."""
-    path = Path(volume_root).joinpath(*request_relative_path(execution_run_id).parts)
-    content = request.to_bytes()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_bytes() != content:
-            raise ValueError("BoltzGen execution request is immutable")
-        return
-    temporary = path.with_suffix(".tmp")
-    temporary.write_bytes(content)
-    temporary.replace(path)
+    return _REQUEST_FILE.persist(
+        volume_root,
+        execution_run_id,
+        request.to_bytes(),
+    )
 
 
 def load_execution_request(
@@ -261,38 +239,17 @@ def load_execution_request(
     execution_run_id: UUID,
 ) -> BoltzGenExecutionRequest:
     """Load a request from a coordinator-mounted Volume."""
-    path = Path(volume_root).joinpath(*request_relative_path(execution_run_id).parts)
-    return BoltzGenExecutionRequest.from_bytes(path.read_bytes())
-
-
-def load_execution_request_from_volume(
-    output_volume: _VolumeReader,
-    execution_run_id: UUID,
-) -> BoltzGenExecutionRequest:
-    """Load a completed run's request through the client-side Volume API."""
-    path = request_relative_path(execution_run_id)
-    content = _read_volume_bytes(output_volume, path.as_posix())
-    if content is None:
-        raise FileNotFoundError(path.as_posix())
+    content = _REQUEST_FILE.load(volume_root, execution_run_id)
     return BoltzGenExecutionRequest.from_bytes(content)
 
 
-def _read_volume_bytes(
-    output_volume: _VolumeReader,
-    path: str,
-) -> bytes | None:
-    """Read one bounded request through Modal's chunked Volume interface."""
-    content = bytearray()
-    try:
-        for chunk in output_volume.read_file(path):
-            if not isinstance(chunk, bytes):
-                raise TypeError(f"Volume returned non-bytes for {path}")
-            if len(content) + len(chunk) > MAX_REQUEST_BYTES:
-                raise ValueError("BoltzGen execution request exceeds its byte limit")
-            content.extend(chunk)
-    except FileNotFoundError:
-        return None
-    return bytes(content)
+def load_execution_request_from_volume(
+    output_volume: Any,
+    execution_run_id: UUID,
+) -> BoltzGenExecutionRequest:
+    """Load a completed run's request through the client-side Volume API."""
+    content = _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
+    return BoltzGenExecutionRequest.from_bytes(content)
 
 
 def _require_safe_filename_component(field_name: str, value: str) -> None:

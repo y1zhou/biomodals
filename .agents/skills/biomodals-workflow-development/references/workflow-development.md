@@ -172,9 +172,9 @@ observations before authorizing work. `available` completes or reuses the Task,
 
 A Task has no retry policy or attempt counter. It receives at most one
 scheduler submission or remote owner in an Execution Run. `resume` continues a
-suspended Run but never retries conclusive failure. Retrying missing or failed
-work requires an explicit Successor Execution Run with the same Workload Plan
-Fingerprint.
+suspended Run or explicitly reconciles `state_unknown`, but never retries
+conclusive failure. Retrying missing or failed work requires an explicit
+Successor Execution Run with the same Workload Plan Fingerprint.
 
 Coordinator-local Tasks may re-enter the same idempotent operation after a
 coordinator interruption only when their publication is authoritatively
@@ -588,6 +588,6 @@ the expected `depends_on_apps`, composes dependency apps through
 hardcoding it. Patch `modal.Function.from_name` to fail in tests that exercise
 new included-app nodes so accidental deployed-app lookup regressions are caught.
 
-Use fake Modal namespace objects at node boundaries. Cast those fakes to
-`modal.Function` or `modal.Cls` in tests when needed to satisfy static typing;
-the production node contract should remain Modal-object based.
+Use fake Modal drivers and deterministic function-name-to-handle maps at the
+coordinator boundary. The production Node contract remains primitive and names
+the exact function; it does not carry Modal objects.

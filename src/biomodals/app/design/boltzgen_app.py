@@ -419,8 +419,17 @@ def run_boltzgen_task(
     replace_claim_owner: str | None = None,
 ) -> str:
     """Run one independently tracked BoltzGen Task."""
+    output_root = Path(CONF.output_volume_mountpoint).resolve()
+    out_path = Path(out_dir).resolve()
+    input_path = Path(input_yaml_path).resolve()
+    try:
+        out_path.relative_to(output_root)
+        input_path.relative_to(output_root)
+    except ValueError as error:
+        raise ValueError(
+            "BoltzGen worker paths must stay inside the output Volume"
+        ) from error
     CONF.output_volume.reload()
-    out_path = Path(out_dir)
     if is_boltzgen_run_complete(
         out_path,
         task_fingerprint=task_fingerprint,

@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import pytest
+
 from biomodals.app.bioinfo import rosetta_app
 from biomodals.execution import PullTaskClaim, RunStatus, WorkerAssignmentRecord
 from biomodals.helper import shell as shell_helper
@@ -232,3 +234,29 @@ def test_rosetta_worker_uses_app_run_layout(
     assert completions[0][3]["status"] == "succeeded"
     assert summary == {"claimed_tasks": 1, "claim_requests": 2}
     assert output_volume.commit_count == 3
+
+
+def test_rosetta_worker_rejects_path_escaping_run_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        rosetta_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=SimpleNamespace(),
+            output_volume_mountpoint=str(tmp_path),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="safe filename component"):
+        rosetta_app.run_rosetta_worker.get_raw_f()(
+            coordinator=SimpleNamespace(),
+            provider_call_id=str(PROVIDER_CALL_ID),
+            run_name="../escape",
+            run_id="abc123",
+            claim_capacity=1,
+            max_parallel=1,
+        )
+
+    assert not (tmp_path.parent / "escape-abc123").exists()

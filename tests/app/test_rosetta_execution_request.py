@@ -5,6 +5,8 @@
 from dataclasses import replace
 from hashlib import sha256
 
+import pytest
+
 from biomodals.app.bioinfo.rosetta.execution_contracts import RosettaTaskSpec
 from biomodals.app.bioinfo.rosetta.execution_request import (
     RosettaExecutionRequest,
@@ -77,3 +79,17 @@ def test_file_paths_do_not_replace_content_identity() -> None:
         request.execution_plan.workload_plan_fingerprint
         != changed.execution_plan.workload_plan_fingerprint
     )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"run_name": "../escape"},
+        {"run_id": "../escape"},
+    ],
+)
+def test_request_rejects_path_escaping_run_identity(
+    changes: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="safe filename component"):
+        replace(_request(), **changes)

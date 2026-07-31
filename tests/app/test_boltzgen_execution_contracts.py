@@ -129,6 +129,34 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
     assert "call-1" in claim_store.values.values()
 
 
+def test_worker_rejects_output_outside_the_mounted_volume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        boltzgen_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=volume,
+            output_volume_mountpoint=str(tmp_path),
+            output_volume_name="outputs",
+        ),
+    )
+    worker = boltzgen_app.run_boltzgen_task.get_raw_f()
+
+    with pytest.raises(ValueError, match="inside the output Volume"):
+        worker(
+            out_dir=str(tmp_path.parent / "escape"),
+            input_yaml_path=str(tmp_path / "input.yaml"),
+            claim_owner="call-1",
+            task_fingerprint="a" * 64,
+        )
+
+    assert not (tmp_path.parent / "escape").exists()
+    assert volume.reloads == 0
+
+
 def test_task_publication_rejects_corrupt_final_evidence(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     final_pdf = run_dir / "final_ranked_designs" / "results_overview.pdf"

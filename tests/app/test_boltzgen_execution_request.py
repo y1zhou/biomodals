@@ -119,3 +119,17 @@ def test_request_round_trips_and_stages_idempotently(tmp_path: Path) -> None:
     request_path.write_bytes(_request(yaml_content=b"changed: true\n").to_bytes())
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_execution_request(volume, RUN_ID, request)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"run_name": "../escape"},
+        {"run_ids": ("run-a", "../escape")},
+    ],
+)
+def test_request_rejects_path_escaping_run_identity(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="safe filename component"):
+        replace(_request(), **changes)

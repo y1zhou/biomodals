@@ -276,7 +276,7 @@ caches, prepares inputs, processes Result Envelopes, publishes outputs, and
 records observations and outcomes through ordinary runtime operations.
 _Avoid_: workload framework, scientific parser, callback registry, provider plugin
 
-**App Run Ledger** [planned]:
+**App Run Ledger**:
 The physical per-run SQLite Execution State Repository for a Direct CLI App
 Run, stored at
 `.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in that app
@@ -308,7 +308,7 @@ most one coordinator container for that identity; concurrent control requests
 submit commands to that container's single SQLite writer.
 _Avoid_: worker pool, timeout lease, service database
 
-**Deployment Coordinator Adapter** [planned]:
+**Deployment Coordinator Adapter**:
 A thin Modal binding included in each app or workflow deployment. It binds the
 shared execution kernel to that deployment's caller-owned task construction,
 result processing, Volumes, and configuration without introducing a universal
@@ -322,13 +322,13 @@ An explicit CLI version wins; otherwise the CLI resolves current deployment
 history once and pins the result.
 _Avoid_: floating latest handle, semantic app version, source revision alone
 
-**Deployed CLI Run** [planned]:
+**Deployed CLI Run**:
 A top-level app or workflow Execution Run submitted by the Biomodals CLI to an
 exact Deployment Identity. It may be observed or resumed across local CLI
 processes through its remote Run-Scoped Coordinator Pool.
 _Avoid_: ephemeral development run, API Job, Child App Call
 
-**Direct CLI App Run** [planned]:
+**Direct CLI App Run**:
 A Deployed CLI Run initiated through `biomodals app run`. Its durable
 repository lives remotely; the user's machine does not create or own a run
 database. Repeating a launch without predecessor identity creates a new root
@@ -336,7 +336,7 @@ Run; `--restart-from <execution-run-id>` explicitly creates a Successor
 Execution Run and is a convenience over the generic restart command.
 _Avoid_: Child App Call, local scheduler, API Job
 
-**Development CLI Run** [planned]:
+**Development CLI Run**:
 An explicitly requested source-backed app or workflow run using an ephemeral
 Modal deployment. It may use the remote kernel but promises no
 cross-invocation resume after that deployment expires.

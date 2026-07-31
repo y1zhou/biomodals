@@ -19,7 +19,10 @@ Implemented:
 - BoltzGen direct Task fan-out;
 - Rosetta pull-worker adoption and removal of its Modal Queue;
 - remote per-run coordination and generic lifecycle commands for direct
-  `biomodals app run` and `biomodals workflow run`.
+  `biomodals app run` and `biomodals workflow run`;
+- fail-closed production app launch when an entrypoint has not yet adopted a
+  Deployment Coordinator Adapter, with source-backed execution available only
+  through explicit `--development`.
 
 Still pending:
 

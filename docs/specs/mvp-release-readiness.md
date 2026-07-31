@@ -211,41 +211,36 @@ retrying; it must not suggest blind resubmission of paid work.
 
 ### Recoverable finalization failures
 
-The public Job Status vocabulary adds `blocked`. A Job becomes blocked when
-scientific compute is preserved but finalization cannot continue until an
-Administrator repairs a permanent service configuration, credential, or
-permission problem.
+`blocked` remains a service-facing projection rather than an Execution Run
+status. While an Execution Run is incomplete, the service projects kernel
+`suspended` as blocked. The Run carries either `coordinator_error` or
+`result_validation_unknown`, stops new admission, and retains every attached
+Provider Call under its existing ownership.
 
-Transient publication failures remain `finalizing` and retry with bounded
-backoff. A blocked Job does not consume User, Tool, or Global Active Job Limits.
-After repair, resuming it returns the same Job to `finalizing` and reuses its
-existing outputs; scientific compute must never be submitted again as part of
-that recovery.
+ADR 0006 supersedes the earlier automatic finalization-retry design. The
+coordinator does not poll or retry an unknown validator or an uncaught
+application exception. Restarting the API process is not an explicit resume.
+After an Administrator repairs the cause, an explicit same-Run resume repeats
+publication validation, reconciles existing calls, and may admit only Tasks
+that have never been submitted. It never reruns failed Tasks or scientific
+compute whose ownership is active or unknown.
 
-Recovery is automatic and uses a persisted exponential retry schedule capped at
-approximately 15 minutes. It retains the Job's original Modal Configuration
-Snapshot and retries only finalization. Restarting the API resumes
-reconciliation. Administrators may see blocked counts and safe blocking
-categories, but do not gain access to another User's Input, Result, or private
-Job detail. The MVP has no per-Job rerun or unblock action.
+A missing, corrupt, or scientifically invalid required publication remains a
+conclusive Task failure and produces terminal `failed`; it is not recoverable
+blocked state. Post-terminal Result delivery and local cache restoration remain
+service-owned metadata. Their recovery may rebuild a user archive from a
+validated remote publication, but must not reopen the Execution Run or
+authorize Modal compute.
 
-Authentication, permission, invalid service configuration, and missing
-configured Modal resources block immediately. Connection, internal-service,
-resource-exhaustion, and upload-timeout failures remain `finalizing` for a
-persisted 30-minute retry window before becoming blocked. Local cache or
-staging filesystem errors follow the same window and then use safe category
-`local_storage`; they never redefine valid remote scientific output as an
-invalid Result. Missing, corrupt, or
-scientifically invalid required output instead produces terminal
-`failed/result_invalid`. A blocked Job may remain blocked indefinitely while
-low-frequency automatic finalization retries continue.
-
-Owner-visible Job detail supplies generic blocked copy, `blocked_at`, and
-`next_retry_at`. Existing terminal `error_code` and `error_message` fields
-remain exclusive to failed Jobs. The Admin Modal page exposes only aggregate
-blocked counts grouped by safe Blocking Category and the oldest blocked age;
-it exposes no owner identity, Job identifier, Input, Result, raw provider
-detail, or storage path.
+Owner-visible Job detail supplies generic blocked copy and `blocked_at`.
+`next_retry_at` is nullable and must not imply an automatic kernel retry when
+absent. Existing terminal `error_code` and `error_message` fields remain
+exclusive to failed Jobs. The Admin Modal page exposes only aggregate blocked
+counts grouped by safe Blocking Category and the oldest blocked age; it exposes
+no owner identity, Job identifier, Input, Result, raw provider detail, or
+storage path. A service-facing explicit resume control is outside the unified
+kernel refactor; until a host supplies one, recovery is an operator action
+rather than an automatic loop.
 
 ### Unknown remote execution state
 

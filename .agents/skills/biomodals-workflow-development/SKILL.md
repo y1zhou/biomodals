@@ -27,14 +27,16 @@ stage coordinators, and PPIFlow-specific stage wiring.
 
 - Keep `biomodals.schema` pure Pydantic and free of Modal imports.
 - Compose workflow apps with the shared orchestrator and included dependency
-  apps; prefer included-app Modal handles over deployed-app lookup strings.
+  apps. Remote calls name functions exactly; the kernel resolves those names
+  against the pinned containing deployment.
 - Prefer `AppBackedNode` for nodes that primarily call app functions.
   Add `WorkflowNativeNode` only for adapters, summaries, selectors, and
   workflow-specific file-management glue.
-- `REMOTE` nodes submit real Modal calls through `submit_remote(context)` and
-  adapt raw results with `process_remote_result(...)` only when needed.
-- Store hydrated Modal functions/classes in a `*ModalNamespace` dataclass and
-  exclude that namespace from DAG hashing.
+- `REMOTE` nodes prepare `RemoteNodeCall` values through
+  `prepare_remote(context)` and adapt raw results with
+  `process_remote_result(...)` only when needed. They never submit directly.
+- Keep hydrated Modal objects out of workflow Nodes. Explicit development runs
+  may supply a function-name-to-handle map at the coordinator boundary.
 - Import app-owned volume handles, volume names, and mountpoints from source app
   modules, and reload relevant volumes after remote file mutations before
   reading those paths.

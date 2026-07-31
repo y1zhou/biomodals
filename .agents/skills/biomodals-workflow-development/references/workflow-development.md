@@ -74,8 +74,9 @@ ShortMD is the current reference for executable workflow apps. Its data flow is:
 2. The workflow app composes the shared orchestrator and the GROMACS app with
    `modal.App(...).include(orchestrator.app)` plus
    `include_dependency_apps(app, CONF.depends_on_apps)`.
-3. `ShortMDModalNamespace` carries the hydrated GROMACS functions and
-   workflow-native remote functions across the orchestrator boundary.
+3. Each remote Node returns a `RemoteNodeCall` with the exact included
+   function name. The kernel resolves it against the pinned ShortMD deployment;
+   explicit development runs provide a temporary name-to-handle map.
 4. `ShortMDPrepNode` prepares one input PDB once through the GROMACS app.
 5. `ShortMDCloneNode` clones prepared production inputs into per-replicate
    directories. This file management is workflow-native because the standalone
@@ -473,13 +474,13 @@ app = include_dependency_apps(app, CONF.depends_on_apps)
 
 `depends_on_apps` is a composition declaration, not a deployment command. Do not
 auto-deploy dependency apps from workflow submission paths. Including dependency
-apps gives the workflow access to hydrated Modal functions and classes while
-letting Modal reuse normal image caching behavior.
+apps makes their functions and classes part of the containing workflow deployment
+while letting Modal reuse normal image caching behavior.
 
-Import dependency app modules directly for app metadata, Modal function handles,
-volume objects, volume names, and mountpoints. Do not duplicate volume names,
-mount paths, or app function names as workflow-local string constants when the
-source app exports them.
+Import dependency app modules directly for app metadata, volume objects, volume
+names, and mountpoints. Do not duplicate volume names or mount paths. A
+`RemoteNodeCall` must still declare the exact deployed function name; reuse an
+app-exported name constant when one exists.
 
 ## App Interfaces
 
@@ -495,39 +496,13 @@ skill and use `rfdiffusion_app.py` as the reference for durable `VolumePath`
 outputs and `ligandmpnn_app.py` as the reference for small inline zstd archive
 outputs.
 
-For new Biomodals workflows that depend on other Biomodals apps, prefer
-included-app Modal handles over deployed-app lookup strings. Avoid
-`modal.Function.from_name(...)` in workflow definitions when the dependency app
-can be included; remote orchestrator containers can otherwise re-import the
-workflow module and see unhydrated function globals. Use deployed-app lookup only
-for legacy workflows or external apps that cannot be composed into the workflow
-app, and document that reason near the node.
-
-When nodes need included Modal functions or classes, group those hydrated
-objects in a small workflow-local dataclass named `*ModalNamespace`. Type the
-fields as `modal.Function` or `modal.Cls`; avoid overly generic callable
-protocols. Store the namespace on nodes as runtime-only state:
-
-```python
-@dataclass(frozen=True)
-class ShortMDModalNamespace:
-    prepare_gpu: modal.Function
-    production_gpu: modal.Function
-
-
-@dataclass
-class ShortMDPrepNode(AppBackedNode):
-    modal_namespace: ShortMDModalNamespace = field(
-        repr=False,
-        compare=False,
-        metadata={"dag_hash": False},
-    )
-```
-
-The namespace is allowed to cross the orchestrator boundary because it contains
-Modal objects from apps included into the workflow app. Excluding it from the
-DAG hash keeps the Workload Plan Fingerprint tied to semantic workflow inputs
-rather than runtime hydration objects.
+For new Biomodals workflows that depend on other Biomodals apps, include those
+apps in the workflow deployment and return exact function names from
+`RemoteNodeCall`. The execution kernel resolves each name against the Run's
+pinned containing deployment. Do not call `modal.Function.from_name(...)` or
+carry hydrated Modal handles inside workflow Nodes. Explicit source-backed
+development may pass a temporary function-name-to-handle map to the coordinator
+without making those handles part of the DAG or Workload Plan Fingerprint.
 
 Prefer `AppBackedNode` for nodes whose primary job is to invoke app functions.
 Workflow definitions should reuse existing app functions whenever possible. Add
@@ -538,10 +513,10 @@ and file-management glue that is not part of the source app's standalone
 contract.
 
 If a workflow-native adapter needs a remote Modal boundary, define a top-level
-`@app.function` in the workflow module and put that hydrated function in the
-workflow's `*ModalNamespace`. Do not try to make ordinary node methods remote
-Modal methods; node methods are plain Python methods unless the node itself is a
-Modal `@app.cls`, which is not the generic workflow-node model.
+`@app.function` in the workflow module and use its exact function name in the
+Node's `RemoteNodeCall`. Do not try to make ordinary node methods remote Modal
+methods; node methods are plain Python methods unless the node itself is a Modal
+`@app.cls`, which is not the generic workflow-node model.
 
 Keep workflow-specific file cloning, cleanup, and adapter logic in workflow
 scripts, not in app modules, when the standalone app does not require that

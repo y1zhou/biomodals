@@ -19,7 +19,6 @@ import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.app.design.boltzgen.execution_contracts import (
-    acquire_output_claim,
     boltzgen_output_claim_key,
     is_boltzgen_run_complete,
     write_boltzgen_task_publication,
@@ -42,6 +41,7 @@ from biomodals.execution.modal import (
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
+from biomodals.helper.output_claim import acquire_output_claim
 from biomodals.helper.shell import (
     copy_files,
     package_outputs,

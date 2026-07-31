@@ -108,39 +108,6 @@ def boltzgen_output_claim_key(
     return f"{_OUTPUT_CLAIM_PREFIX}:{digest}"
 
 
-def acquire_output_claim(
-    claim_store: Any,
-    *,
-    claim_key: str,
-    owner: str,
-    replace_owner: str | None = None,
-) -> None:
-    """Atomically elect one Provider Call to publish a BoltzGen output."""
-    if not claim_key:
-        raise ValueError("BoltzGen output claim key cannot be empty")
-    if not owner:
-        raise ValueError("BoltzGen output claim owner cannot be empty")
-
-    root_key = f"{claim_key}:root"
-    if claim_store.put(root_key, owner, skip_if_exists=True):
-        return
-    current_owner = _current_output_claim_owner(claim_store, claim_key)
-    if current_owner == owner:
-        return
-    if replace_owner is None or current_owner != replace_owner:
-        raise RuntimeError(
-            "BoltzGen output is already claimed by another Provider Call"
-        )
-
-    successor_key = _output_claim_successor_key(claim_key, current_owner)
-    if claim_store.put(successor_key, owner, skip_if_exists=True):
-        return
-    if _current_output_claim_owner(claim_store, claim_key) != owner:
-        raise RuntimeError(
-            "BoltzGen output is already claimed by another Provider Call"
-        )
-
-
 def collection_publication_path(
     *,
     run_name: str,
@@ -216,30 +183,6 @@ def _contained_path(
     path = root_path.joinpath(*relative.parts).resolve()
     path.relative_to(root_path)
     return path
-
-
-def _current_output_claim_owner(claim_store: Any, claim_key: str) -> str:
-    current = claim_store.get(f"{claim_key}:root", None)
-    if not isinstance(current, str) or not current:
-        raise RuntimeError("BoltzGen output claim has invalid ownership")
-    visited: set[str] = set()
-    while current not in visited:
-        visited.add(current)
-        successor = claim_store.get(
-            _output_claim_successor_key(claim_key, current),
-            None,
-        )
-        if successor is None:
-            return current
-        if not isinstance(successor, str) or not successor:
-            raise RuntimeError("BoltzGen output claim has invalid ownership")
-        current = successor
-    raise RuntimeError("BoltzGen output claim contains an ownership cycle")
-
-
-def _output_claim_successor_key(claim_key: str, owner: str) -> str:
-    owner_digest = sha256(owner.encode()).hexdigest()
-    return f"{claim_key}:successor:{owner_digest}"
 
 
 def _hash_file(path: Path) -> tuple[int, str]:

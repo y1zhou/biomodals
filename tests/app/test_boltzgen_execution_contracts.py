@@ -9,11 +9,11 @@ import pytest
 
 from biomodals.app.design import boltzgen_app
 from biomodals.app.design.boltzgen.execution_contracts import (
-    acquire_output_claim,
     boltzgen_output_claim_key,
     is_boltzgen_run_complete,
     write_boltzgen_task_publication,
 )
+from biomodals.helper.output_claim import acquire_output_claim
 
 
 class FakeVolume:

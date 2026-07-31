@@ -552,7 +552,7 @@ Result pruning applies the same ownership boundary at Task granularity:
 valid only with `skipped` or `cancelled`. Every other Task status requires a
 null reason; Task failure diagnostics remain in its error record.
 
-### Task discovery checkpoint
+### Task discovery transaction and durability
 
 Caller-owned workload code constructs the complete finite
 `Sequence[TaskPlan]` for a Node and gives it to the kernel. The kernel validates
@@ -562,13 +562,16 @@ atomically inserts every Task and marks the Node `discovery_complete`. Resume
 loads persisted ordinals and fingerprints and does not ask the caller to
 reconstruct them during status polling or Modal-call observation.
 
-No Task can acquire a Provider Call, Worker Assignment, or local owner until
-that transaction and the host's durability boundary complete. For a
-Volume-backed repository, this includes the explicit Volume checkpoint. A
-crash before the boundary causes the caller to reconstruct the whole set
-without paid work having been authorized. A crash after the boundary reloads
-the persisted Tasks and never reconstructs them again for that Node in the
-same Run. Empty sets follow `allow_empty_result`.
+The discovery transaction is committed to coordinator-local SQLite before
+admission continues. A Volume-backed coordinator does not issue a standalone
+remote Volume commit for discovery alone. The first provider preclaim,
+Worker Assignment response, or Coordinator-Local Task ownership barrier
+checkpoints the discovery transaction together with the ownership transition
+before paid work or another container can act on it. A crash before that
+boundary may cause the caller to reconstruct the whole set, but no paid work
+has been authorized. A crash after the boundary reloads the persisted Tasks
+and never reconstructs them again for that Node in the same Run. Empty sets
+follow `allow_empty_result`.
 
 The first kernel version has no streaming, incremental, paginated, or
 worker-side discovery. This deliberately keeps SQLite's ready queue complete
@@ -833,6 +836,16 @@ attachments must be made visible through an explicit, serialized Volume
 checkpoint. The current workflow exit behavior that cancels active child calls
 must be removed when it adopts this policy. Explicit user cancellation remains
 separate and may cancel those calls.
+
+A local SQLite commit is otherwise sufficient within one live coordinator
+container. Planning, cache observation, dispatch-policy persistence, and
+unchanged provider polling must not explicitly commit or reload the Modal
+Volume on each pass. Modal's periodic and final snapshots provide ordinary
+progress persistence. Explicit Volume commits are reserved for state ordered
+before external side effects or cross-container responses, plus terminal and
+error handoff. Explicit reloads are reserved for publications made by another
+container; the workload adapter must invalidate planning observations after a
+reload.
 
 Different Run-Scoped Coordinator Pools use distinct SQLite files. Their
 deployment-specific Modal Volume v2 may accept concurrent commits to those
@@ -1631,7 +1644,7 @@ Phase 0 test inventory:
 | `tests/execution/test_result_boundary.py` | DAG leaves form the result boundary; Node result probes precede dependency and Task preparation; strict terminal aggregation ignores upstream history; complete results prune ancestors; missing results expand backward; unknown results authorize no work |
 | `tests/execution/test_task_status.py` | Exactly six Task statuses exist; terminality, durable ownership, unknown-owner blocking, cache provenance, fail-fast and result-pruning skips, cancellation races, and absence of partial Task state are deterministic |
 | `tests/execution/test_aggregation.py` | Fail-fast drains owned work and skips only unowned siblings; collect-all is strict; allow-partial requires at least one success; empty discovery requires an explicit allowed publication; cache hits count as successes; cancellation and pruning take precedence |
-| `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; no owner is admitted before host durability; recovery reloads persisted fingerprints without polling-time recomputation |
+| `tests/execution/test_discovery.py` | Task keys are unique; canonical fingerprints exclude operational changes and reject non-finite values; discovery is all-or-nothing; its local transaction is included in the next ownership durability barrier; recovery reloads persisted fingerprints without polling-time recomputation |
 | `tests/execution/test_result_envelope.py` | A successful return becomes a terminal call only with a host-durable envelope; recovery before that boundary recollects the same call; recovery afterward resumes decode and publication without Modal; malformed envelopes fail affected Tasks; unknown envelope recovery retains call slots |
 | `tests/execution/test_resources.py` | Preclaim atomically enforces total and GPU-subset call ceilings; batched and pull-worker calls cost one slot; local work costs none; unknown calls retain slots; a durable successful-call envelope releases slots while its Tasks may remain active |
 | `tests/execution/test_admission.py` | One cycle fills every feasible slot; depth and unfinished descendant span remain primary; equal graph ranks schedule GPU before CPU, stably cohort Runtime Image Keys, then use persisted encounter order; GPU saturation skips only GPU candidates; active-call timing does not change recovery order |

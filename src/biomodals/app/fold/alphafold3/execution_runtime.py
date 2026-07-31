@@ -190,7 +190,23 @@ class AlphaFold3ExecutionRuntime:
             self.store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
+            commit_local=self.store.commit,
         )
+        self._msa_inventory_cache: (
+            tuple[
+                tuple[RawSearchTask, ...],
+                tuple[dict[str, object], ...],
+                tuple[MsaAssemblyTask, ...],
+            ]
+            | None
+        ) = None
+        self._combined_msa_cache: dict[
+            tuple[MsaAssemblyTask, ...],
+            tuple[dict[str, object], ...],
+        ] = {}
+        self._prepared_inference_cache: PreparedInferenceRun | None = None
+        self._prepared_inference_error: _IncompletePrerequisiteError | None = None
+        self._seed_prediction_cache: dict[int, dict[str, object]] | None = None
 
     def run(
         self,
@@ -205,6 +221,7 @@ class AlphaFold3ExecutionRuntime:
             self.execution_run_id,
             advance_once=self.advance_once,
             checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=synchronize,
@@ -230,6 +247,7 @@ class AlphaFold3ExecutionRuntime:
             self.execution_run_id,
             advance_once=self.advance_once,
             checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=synchronize,
@@ -247,7 +265,6 @@ class AlphaFold3ExecutionRuntime:
 
     def advance_once(self) -> None:
         """Apply one AlphaFold3-specific scheduling and publication cycle."""
-        self._reload_output()
         repository = self.store.execution
         self._provider.repository = repository
 
@@ -297,7 +314,7 @@ class AlphaFold3ExecutionRuntime:
                     max_active_gpu_provider_calls=self.request.max_num_gpus,
                     now=self._now(),
                 )
-            return self._checkpoint()
+            return repository
         if existing.plan != plan:
             raise ValueError("AlphaFold3 plan does not match Execution Run")
         if existing.predecessor_execution_run_id != self.predecessor_execution_run_id:
@@ -337,7 +354,6 @@ class AlphaFold3ExecutionRuntime:
                         now=self._now(),
                     )
                     observations[node_key] = observation
-            repository = self._checkpoint()
             if any(
                 observation == AvailabilityStatus.UNKNOWN for _, observation in observed
             ):
@@ -415,16 +431,20 @@ class AlphaFold3ExecutionRuntime:
 
     def _reconcile_provider_calls(self, required: tuple[str, ...]) -> None:
         required_keys = set(required)
+        publication_changed = False
         for call in self.store.execution.list_provider_calls(self.execution_run_id):
             if call.status.is_terminal:
                 continue
             self._provider.repository = self.store.execution
-            self._provider.reconcile_provider_call(
+            updated = self._provider.reconcile_provider_call(
                 call.provider_call_id,
                 encode_result=_result_envelope,
                 result_already_satisfied=call.node_key not in required_keys,
                 now=self._now(),
             )
+            publication_changed |= updated.status == ProviderCallStatus.SUCCEEDED
+        if publication_changed:
+            self._reload_output()
 
     def _start_ready_nodes(self) -> None:
         repository = self.store.execution
@@ -446,7 +466,6 @@ class AlphaFold3ExecutionRuntime:
                         AvailabilityStatus.UNKNOWN,
                         now=self._now(),
                     )
-                self._checkpoint()
                 return
             observations: list[AvailabilityStatus] = []
             for item in planned:
@@ -478,7 +497,6 @@ class AlphaFold3ExecutionRuntime:
                         observation,
                         now=self._now(),
                     )
-            self._checkpoint()
             if not planned:
                 self._publish_empty_node(node_key)
 
@@ -497,12 +515,10 @@ class AlphaFold3ExecutionRuntime:
                         AvailabilityStatus.UNKNOWN,
                         now=self._now(),
                     )
-                self._checkpoint()
                 return
             records = repository.list_tasks(self.execution_run_id, node.node_key)
             if len(records) != len(planned):
                 raise RuntimeError("Persisted AlphaFold3 Task count changed")
-            changed = False
             with self.store.transaction():
                 for record, item in zip(records, planned, strict=True):
                     expected = item.plan.fingerprint(
@@ -530,7 +546,6 @@ class AlphaFold3ExecutionRuntime:
                             message=str(error),
                             now=self._now(),
                         )
-                        changed = True
                         continue
                     except Exception:
                         observation = AvailabilityStatus.UNKNOWN
@@ -543,9 +558,6 @@ class AlphaFold3ExecutionRuntime:
                         observation,
                         now=self._now(),
                     )
-                    changed = True
-            if changed:
-                self._checkpoint()
 
     def _run_local_tasks(self) -> None:
         repository = self.store.execution
@@ -595,7 +607,6 @@ class AlphaFold3ExecutionRuntime:
                     message=f"Could not stage inference input: {error}",
                     now=self._now(),
                 )
-            self._checkpoint()
             return
         with self.store.transaction():
             self.store.execution.record_task_result_observation(
@@ -605,7 +616,6 @@ class AlphaFold3ExecutionRuntime:
                 AvailabilityStatus.AVAILABLE,
                 now=self._now(),
             )
-        self._checkpoint()
 
     def _publish_request_receipt(self) -> None:
         repository = self.store.execution
@@ -651,7 +661,6 @@ class AlphaFold3ExecutionRuntime:
                     message=str(error),
                     now=self._now(),
                 )
-            self._checkpoint()
 
     def _reconcile_nodes_and_run(self) -> None:
         repository = self.store.execution
@@ -757,6 +766,8 @@ class AlphaFold3ExecutionRuntime:
                 run.max_active_gpu_provider_calls - counts.gpu,
             ),
         )
+        if any(candidate.node_key == _SEED_PREDICTIONS for candidate in selected):
+            self._reload_output()
         for candidate in selected:
             planned = planned_by_node[candidate.node_key]
             self._provider.repository = self.store.execution
@@ -804,7 +815,6 @@ class AlphaFold3ExecutionRuntime:
     ) -> tuple[ProviderCallCandidate | None, dict[str, ClaimedSeed]]:
         if candidate.node_key != _SEED_PREDICTIONS:
             return candidate, {}
-        self._reload_output()
         prepared = self._prepared_inference()
         seeds = tuple(cast(int, planned[key].value) for key in candidate.task_keys)
         task_records = {
@@ -835,7 +845,6 @@ class AlphaFold3ExecutionRuntime:
                         AvailabilityStatus.AVAILABLE,
                         now=self._now(),
                     )
-            self._checkpoint()
         owned = {f"seed:{item.seed}": item for item in plan.owned}
         task_keys = tuple(key for key in candidate.task_keys if key in owned)
         if not task_keys:
@@ -1133,13 +1142,18 @@ class AlphaFold3ExecutionRuntime:
         if node_key == _SEED_PREDICTIONS:
             prepared = self._prepared_inference()
             seed = cast(int, item.value)
-            status = inspect_seed_predictions(
-                self.inference_runtime,
-                prepared.run_id,
-                (seed,),
-                sample_count=prepared.sample_count,
-                reload_volume=False,
-            )[0]
+            if self._seed_prediction_cache is None:
+                statuses = inspect_seed_predictions(
+                    self.inference_runtime,
+                    prepared.run_id,
+                    prepared.normalized_seeds,
+                    sample_count=prepared.sample_count,
+                    reload_volume=False,
+                )
+                self._seed_prediction_cache = dict(
+                    zip(prepared.normalized_seeds, statuses, strict=True)
+                )
+            status = self._seed_prediction_cache[seed]
             return self._remote_publication_observation(
                 node_key,
                 item.plan.task_key,
@@ -1249,8 +1263,11 @@ class AlphaFold3ExecutionRuntime:
         tuple[dict[str, object], ...],
         tuple[MsaAssemblyTask, ...],
     ]:
+        if self._msa_inventory_cache is not None:
+            return self._msa_inventory_cache
         if not self.request.search_msa:
-            return (), (), ()
+            self._msa_inventory_cache = (), (), ()
+            return self._msa_inventory_cache
         config = self.request.config.model_copy(deep=True)
         states = chain_msa_states(config)
         plan = plan_msa_resolution(states)
@@ -1263,7 +1280,12 @@ class AlphaFold3ExecutionRuntime:
             plan.raw_searches,
             canonical,
         )
-        return plan.raw_searches, tuple(raw_statuses), plan.assemblies
+        self._msa_inventory_cache = (
+            plan.raw_searches,
+            tuple(raw_statuses),
+            plan.assemblies,
+        )
+        return self._msa_inventory_cache
 
     def _inspect_combined(
         self,
@@ -1271,6 +1293,9 @@ class AlphaFold3ExecutionRuntime:
     ) -> tuple[dict[str, object], ...]:
         if not tasks:
             return ()
+        cached = self._combined_msa_cache.get(tasks)
+        if cached is not None:
+            return cached
         raw_tasks, _, _ = self._msa_inventory()
         _, statuses = inspect_msa_cache(
             self.search_runtime.sharded_root,
@@ -1278,7 +1303,9 @@ class AlphaFold3ExecutionRuntime:
             raw_tasks,
             tasks,
         )
-        return tuple(statuses)
+        cached = tuple(statuses)
+        self._combined_msa_cache[tasks] = cached
+        return cached
 
     def _msa_resolution(self) -> tuple[Any, Any, MsaAssemblyResolution]:
         config = self.request.config.model_copy(deep=True)
@@ -1397,11 +1424,21 @@ class AlphaFold3ExecutionRuntime:
         return validate_upstream_af3_input(config)
 
     def _prepared_inference(self) -> PreparedInferenceRun:
-        return prepare_inference_run(
-            self._enriched_config(),
-            recycle=self.request.recycle,
-            sample=self.request.sample,
-        )
+        if self._prepared_inference_cache is not None:
+            return self._prepared_inference_cache
+        if self._prepared_inference_error is not None:
+            raise self._prepared_inference_error
+        try:
+            prepared = prepare_inference_run(
+                self._enriched_config(),
+                recycle=self.request.recycle,
+                sample=self.request.sample,
+            )
+        except _IncompletePrerequisiteError as error:
+            self._prepared_inference_error = error
+            raise
+        self._prepared_inference_cache = prepared
+        return prepared
 
     def _publish_empty_node(self, node_key: str) -> None:
         path = self._empty_node_path(node_key)
@@ -1417,7 +1454,6 @@ class AlphaFold3ExecutionRuntime:
                 ),
             },
         )
-        self._checkpoint()
         with self.store.transaction():
             self.store.execution.record_node_result_observation(
                 self.execution_run_id,
@@ -1425,7 +1461,6 @@ class AlphaFold3ExecutionRuntime:
                 AvailabilityStatus.AVAILABLE,
                 now=self._now(),
             )
-        self._checkpoint()
 
     def _empty_node_observation(self, node_key: str) -> AvailabilityStatus:
         path = self.inference_runtime.output_root.joinpath(
@@ -1536,6 +1571,15 @@ class AlphaFold3ExecutionRuntime:
         with self.store.closed_for_volume_sync():
             self.output_volume.reload()
         self._provider.repository = self.store.execution
+        self._invalidate_planning_cache()
+
+    def _invalidate_planning_cache(self) -> None:
+        """Discard cache observations after cross-container publications change."""
+        self._msa_inventory_cache = None
+        self._combined_msa_cache.clear()
+        self._prepared_inference_cache = None
+        self._prepared_inference_error = None
+        self._seed_prediction_cache = None
 
 
 def _result_envelope(result: object) -> dict[str, object]:

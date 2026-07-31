@@ -1731,6 +1731,7 @@ class ServiceStore:
                 SqliteExecutionRepository(conn),
                 modal_driver=modal_driver,
                 checkpoint=conn.commit,
+                commit_local=conn.commit,
             )
         except BaseException:
             conn.rollback()

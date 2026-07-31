@@ -100,6 +100,7 @@ class NoCallDriver:
 class RecordingCallDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
+        self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     def resolve(self, binding):
         return binding
@@ -115,7 +116,7 @@ class RecordingCallDriver:
         return handle
 
     def observe(self, provider_call_handle_id: str):
-        return ModalCallObservation(ModalCallObservationKind.RUNNING)
+        return self.observation
 
     def cancel(self, provider_call_handle_id: str) -> None:
         raise AssertionError(provider_call_handle_id)
@@ -232,6 +233,18 @@ def test_no_search_request_publishes_explicit_empty_stage_results(
     runtime.close()
 
 
+def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+
+    runtime._initialize()
+
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.PENDING
+    output = cast(FakeVolume, runtime.output_volume)
+    assert output.reloads == 1
+    assert output.commits == 0
+    runtime.close()
+
+
 def test_malformed_provider_return_is_a_conclusive_diagnostic() -> None:
     """Malformed output is stored as a diagnostic, not provider uncertainty."""
     assert _result_envelope(None) == {"invalid_result": "None"}
@@ -276,13 +289,83 @@ def test_seed_tasks_use_fixed_batches_without_duplicate_submission(
         for spawn in driver.spawns
     )
 
+    commits = cast(FakeVolume, runtime.output_volume).commits
+    reloads = cast(FakeVolume, runtime.output_volume).reloads
     runtime.advance_once()
 
     assert len(driver.spawns) == 2
+    assert cast(FakeVolume, runtime.output_volume).commits == commits
+    assert cast(FakeVolume, runtime.output_volume).reloads == reloads
     assert all(
         call.status == ProviderCallStatus.RUNNING
         for call in runtime.store.execution.list_provider_calls(RUN_ID)
     )
+    runtime.close()
+
+
+def test_provider_success_refreshes_output_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = RecordingCallDriver()
+    runtime = _runtime(tmp_path, driver=driver)
+    monkeypatch.setattr(
+        execution_runtime,
+        "load_staged_inference_input",
+        lambda *args, **kwargs: SimpleNamespace(recycle=10),
+    )
+    runtime._initialize()
+    for _ in range(6):
+        runtime.advance_once()
+
+    assert len(driver.spawns) == 1
+    output = cast(FakeVolume, runtime.output_volume)
+    commits = output.commits
+    reloads = output.reloads
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.SUCCEEDED,
+        result={"execution_result": {"path": "seed-result.json"}},
+    )
+
+    runtime._reconcile_provider_calls(("seed-predictions",))
+
+    assert output.commits == commits + 1
+    assert output.reloads == reloads + 1
+    runtime.close()
+
+
+def test_seed_planning_is_cached_per_publication_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, request=_request(seeds=list(range(50))))
+    original_prepare = execution_runtime.prepare_inference_run
+    prepare_calls = 0
+    inspect_calls: list[tuple[int, ...]] = []
+
+    def prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare(*args, **kwargs)
+
+    def inspect(runtime, run_id, seeds, *, sample_count, reload_volume=True):
+        del runtime, run_id, sample_count, reload_volume
+        inspected = tuple(seeds)
+        inspect_calls.append(inspected)
+        return [{"status": "missing", "seed": seed} for seed in inspected]
+
+    monkeypatch.setattr(execution_runtime, "prepare_inference_run", prepare)
+    monkeypatch.setattr(execution_runtime, "inspect_seed_predictions", inspect)
+
+    assert runtime._node_observation("seed-predictions") == AvailabilityStatus.MISSING
+    assert runtime._node_observation("seed-predictions") == AvailabilityStatus.MISSING
+    assert prepare_calls == 1
+    assert inspect_calls == [tuple(range(50))]
+
+    runtime._invalidate_planning_cache()
+    assert runtime._node_observation("seed-predictions") == AvailabilityStatus.MISSING
+    assert prepare_calls == 2
+    assert inspect_calls == [tuple(range(50)), tuple(range(50))]
     runtime.close()
 
 

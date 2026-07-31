@@ -130,6 +130,11 @@ class WorkflowRunStore:
         with self._lock:
             self._close()
 
+    def commit(self) -> None:
+        """Commit coordinator-local SQLite changes without syncing its Volume."""
+        with self._lock:
+            self._connect().commit()
+
     def write_workflow_plan(self, content: bytes) -> None:
         """Atomically create the immutable workflow plan for this Run."""
         if not content:

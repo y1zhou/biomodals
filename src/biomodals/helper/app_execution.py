@@ -91,6 +91,11 @@ class AppExecutionRunStore:
         with self._lock:
             self._close()
 
+    def commit(self) -> None:
+        """Commit coordinator-local SQLite changes without syncing its Volume."""
+        with self._lock:
+            self._connect().commit()
+
     def _connect(self) -> sqlite3.Connection:
         if self._volume_sync_active:
             raise RuntimeError("App store is closed for Volume synchronization")

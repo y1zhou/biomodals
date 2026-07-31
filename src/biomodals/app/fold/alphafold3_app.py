@@ -800,11 +800,10 @@ class ExecutionCoordinator:
 
     @modal.enter()
     def enter(self) -> None:
-        """Refresh the app Volume before accepting lifecycle methods."""
+        """Validate coordinator identity before accepting lifecycle methods."""
         self._coordinator_adapter = None
         self._development = None
         self._identity()
-        CONF.output_volume.reload()
 
     @modal.method()
     def run(self, development: bool = False) -> ExecutionSnapshot:

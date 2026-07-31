@@ -77,11 +77,13 @@ class ExecutionRuntime:
         *,
         modal_driver: _ModalDriver,
         checkpoint: Callable[[], SqliteExecutionRepository | None],
+        commit_local: Callable[[], None] | None = None,
     ) -> None:
         """Bind host-owned state, Modal operations, and its durability boundary."""
         self.repository = repository
         self._modal = modal_driver
         self._checkpoint = checkpoint
+        self._commit_local = commit_local
 
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
@@ -101,7 +103,7 @@ class ExecutionRuntime:
             now=now,
         )
         if changed:
-            self._checkpoint_state()
+            self._commit_local_state()
         return persisted
 
     def persist_pull_worker_dispatch_policy(
@@ -118,7 +120,7 @@ class ExecutionRuntime:
             now=now,
         )
         if changed:
-            self._checkpoint_state()
+            self._commit_local_state()
         return persisted
 
     def submit_fixed_batch(
@@ -457,7 +459,10 @@ class ExecutionRuntime:
                 message=observation.message or "Modal call state was inconclusive",
                 now=now,
             )
-        self._checkpoint_state()
+        if observation.kind != ModalCallObservationKind.RUNNING:
+            self._checkpoint_state()
+        else:
+            self._commit_local_state()
         return updated
 
     def request_provider_call_cancellation(
@@ -533,6 +538,12 @@ class ExecutionRuntime:
         if replacement is not None:
             self.repository = replacement
 
+    def _commit_local_state(self) -> None:
+        if self._commit_local is None:
+            self._checkpoint_state()
+        else:
+            self._commit_local()
+
 
 class AsyncExecutionRuntime:
     """Async-host facade over the same durable execution transitions."""
@@ -543,11 +554,13 @@ class AsyncExecutionRuntime:
         *,
         modal_driver: _AsyncModalDriver,
         checkpoint: Callable[[], SqliteExecutionRepository | None],
+        commit_local: Callable[[], None] | None = None,
     ) -> None:
         """Bind an async provider boundary to host-owned durable state."""
         self.repository = repository
         self._modal = modal_driver
         self._checkpoint = checkpoint
+        self._commit_local = commit_local
 
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
@@ -567,7 +580,7 @@ class AsyncExecutionRuntime:
             now=now,
         )
         if changed:
-            self._checkpoint_state()
+            self._commit_local_state()
         return persisted
 
     async def submit_fixed_batch(
@@ -739,7 +752,10 @@ class AsyncExecutionRuntime:
                 message=observation.message or "Modal call state was inconclusive",
                 now=now,
             )
-        self._checkpoint_state()
+        if observation.kind != ModalCallObservationKind.RUNNING:
+            self._checkpoint_state()
+        else:
+            self._commit_local_state()
         return updated
 
     async def request_provider_call_cancellation(
@@ -814,6 +830,12 @@ class AsyncExecutionRuntime:
         replacement = self._checkpoint()
         if replacement is not None:
             self.repository = replacement
+
+    def _commit_local_state(self) -> None:
+        if self._commit_local is None:
+            self._checkpoint_state()
+        else:
+            self._commit_local()
 
 
 def _fixed_descriptors_for_candidate(

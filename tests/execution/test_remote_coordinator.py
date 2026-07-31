@@ -76,6 +76,40 @@ def test_detached_coordinator_loop_reaches_terminal_without_client_polling() -> 
     assert advance_count == 1
 
 
+def test_active_poll_cycles_do_not_cross_the_durability_boundary() -> None:
+    repository = create_repository(task_count=1)
+    checkpoints: list[RunStatus] = []
+    advance_count = 0
+
+    def advance_once() -> None:
+        nonlocal advance_count
+        advance_count += 1
+        if advance_count < 3:
+            return
+        repository.record_task_result_observation(
+            RUN_ID,
+            "inference",
+            "seed-0",
+            AvailabilityStatus.AVAILABLE,
+            now=110,
+        )
+        repository.reconcile_node_tasks(RUN_ID, "inference", now=111)
+        repository.finalize_run_from_results(RUN_ID, now=112)
+
+    snapshot = drive_execution_run(
+        repository,
+        RUN_ID,
+        advance_once=advance_once,
+        checkpoint=lambda: checkpoints.append(repository.get_run(RUN_ID).status),
+        sleep=lambda _: None,
+        poll_interval_seconds=0,
+    )
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert advance_count == 3
+    assert checkpoints == [RunStatus.SUCCEEDED]
+
+
 def test_coordinator_releases_host_lock_between_scheduling_cycles() -> None:
     repository = create_repository(task_count=1)
     lock_active = False

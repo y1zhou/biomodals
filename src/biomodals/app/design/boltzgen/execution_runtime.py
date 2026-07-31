@@ -85,6 +85,7 @@ class BoltzGenExecutionRuntime:
             self.store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
+            commit_local=self.store.commit,
         )
 
     def run(
@@ -100,6 +101,7 @@ class BoltzGenExecutionRuntime:
             self.execution_run_id,
             advance_once=self.advance_once,
             checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=synchronize,
@@ -125,6 +127,7 @@ class BoltzGenExecutionRuntime:
             self.execution_run_id,
             advance_once=self.advance_once,
             checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=synchronize,

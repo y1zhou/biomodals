@@ -263,18 +263,23 @@ result-validation policy, and a missing or invalid publication fails the Node.
 Task aggregation policy does not infer an outcome for an empty set, and no
 synthetic Task row is created.
 
-The Task-discovery checkpoint policy was accepted on 2026-07-30. Caller-owned
+The Task-discovery transaction policy was accepted on 2026-07-30 and refined
+on 2026-07-31. Caller-owned
 workload code constructs the complete finite sequence of `TaskPlan` values for
 a Node, each with a unique stable Node-local key and deterministic fingerprint,
 and gives that sequence to the kernel. The repository validates and inserts
 all Tasks and marks the Node `discovery_complete` in one transaction. The host
-crosses its durability boundary before any Task may acquire a Provider Call,
-Worker Assignment, or local owner. A crash before that boundary exposes no
-paid work and the caller reconstructs the complete set; a crash after it
-reloads the persisted set and never reconstructs it for that Node in the same
-Run. Empty discovery follows `allow_empty_result`. The first kernel version
-does not support streaming, incremental, or worker-side Task discovery, so a
-worker can never observe a half-populated SQLite queue.
+commits that transaction to coordinator-local SQLite, but a Volume-backed host
+does not perform a standalone remote Volume commit solely for discovery.
+Before any provider spawn, Worker Assignment response, or
+Coordinator-Local Task side effect, the corresponding ownership boundary
+checkpoints all preceding discovery state as part of the same durability
+barrier. A crash before that boundary exposes no paid work and may reconstruct
+the complete set; a crash after it reloads the persisted set and never
+reconstructs it for that Node in the same Run. Empty discovery follows
+`allow_empty_result`. The first kernel version does not support streaming,
+incremental, or worker-side Task discovery, so a worker can never observe a
+half-populated SQLite queue.
 
 The Task-fingerprint policy was accepted on 2026-07-30 with an explicit
 simplicity and performance constraint. `TaskPlan` separates a JSON-compatible
@@ -545,6 +550,18 @@ from the last durable checkpoint. A replacement Attempt reloads execution
 state, reconstructs active call-slot counts, and resolves attached calls by
 ID. Only an explicit user cancellation authorizes cancelling child calls.
 
+The Volume-synchronization cadence was accepted on 2026-07-31. A
+coordinator-local SQLite commit and a Modal Volume checkpoint are distinct
+operations. Planning, cache observation, policy persistence, and unchanged
+provider polling commit SQLite locally and rely on Modal's periodic and final
+Volume snapshots for ordinary progress freshness. They do not explicitly
+commit or reload the Volume on every scheduling pass. An explicit Volume
+checkpoint remains required when state must survive before an external side
+effect or cross-container response, including provider preclaim, returned call
+attachment, pull assignment, pull completion acknowledgement, cancellation,
+and terminal or error handoff. A reload is reserved for observing publications
+made by another container and invalidates any caller-owned planning cache.
+
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by
 the Execution Run and the pinned containing app or workflow deployment
@@ -724,6 +741,12 @@ correctness proof. Any transition that must precede an external side effect is
 committed through the host's durability boundary before that side effect, and
 an attached call ID is checkpointed promptly after submission. Preemption is
 therefore recovery, not implicit cancellation.
+
+Ordinary scheduling passes do not cross that host durability boundary.
+Coordinator-local transactions remain visible to concurrent methods in the
+same container, while Modal's background and final snapshots persist routine
+progress. This avoids turning provider polling and repeated workload planning
+into remote storage synchronization.
 
 A remote run-scoped coordinator relies on provider routing, a one-container
 pool cap, and deployment-version pinning to ensure that only one process opens

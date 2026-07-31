@@ -462,6 +462,43 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
     assert driver.observe_count == 1
 
 
+def test_running_poll_commits_sqlite_without_crossing_host_checkpoint() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    checkpoints: list[str] = []
+    commits: list[str] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: checkpoints.append("checkpoint"),
+        commit_local=lambda: commits.append("commit"),
+    )
+    call = runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(),
+        submission_token="batch",
+        now=110,
+    )
+    assert call is not None
+    checkpoints.clear()
+
+    running = runtime.reconcile_provider_call(
+        call.provider_call_id,
+        encode_result=lambda result: result,
+        now=120,
+    )
+
+    assert running.status == ProviderCallStatus.RUNNING
+    assert commits == ["commit"]
+    assert checkpoints == []
+
+
 def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
     repository = create_repository(task_count=2)
     persist_pull_policy(

@@ -177,6 +177,7 @@ class WorkflowRuntime:
             self.store.execution,
             modal_driver=modal_driver or ModalCallDriver(),
             checkpoint=self._checkpoint,
+            commit_local=self.store.commit,
         )
         self._definition: WorkflowDefinition | None = None
         self._workload_run_key: str | None = None
@@ -195,6 +196,7 @@ class WorkflowRuntime:
             self.execution_run_id,
             advance_once=self.advance_once,
             checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=synchronize,
@@ -222,6 +224,7 @@ class WorkflowRuntime:
             self.execution_run_id,
             advance_once=self.advance_once,
             checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=synchronize,

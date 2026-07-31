@@ -31,6 +31,7 @@ def drive_execution_run(
     *,
     advance_once: Callable[[], None],
     checkpoint: Callable[[], SqliteExecutionRepository | None],
+    current_repository: Callable[[], SqliteExecutionRepository] | None = None,
     now: Callable[[], int] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     poll_interval_seconds: float = 1.0,
@@ -47,9 +48,8 @@ def drive_execution_run(
                 return repository.snapshot(execution_run_id)
             try:
                 advance_once()
-                replacement = checkpoint()
-                if replacement is not None:
-                    repository = replacement
+                if current_repository is not None:
+                    repository = current_repository()
             except Exception as exc:
                 _suspend_after_application_error(
                     repository,
@@ -62,6 +62,10 @@ def drive_execution_run(
             keep_driving = (
                 repository.get_run(execution_run_id).status in _DRIVABLE_STATUSES
             )
+            if not keep_driving:
+                replacement = checkpoint()
+                if replacement is not None:
+                    repository = replacement
         if keep_driving:
             sleep(poll_interval_seconds)
 

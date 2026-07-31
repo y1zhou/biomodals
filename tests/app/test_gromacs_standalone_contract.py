@@ -6,8 +6,10 @@ import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.execution import RunStatus
 
 
 def test_analysis_csv_preserves_the_established_checkpoint_format(
@@ -83,34 +85,44 @@ def test_gromacs_declares_workflow_expected_files() -> None:
     ]
 
 
-def test_submit_gromacs_task_keeps_single_run_standalone_flow(
+def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     pdb_path = tmp_path / "input.pdb"
     pdb_path.write_text("ATOM\n", encoding="utf-8")
-    prepare_kwargs = {}
-    production_kwargs = {}
-    analysis_stats = []
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    staged = {}
+    launched = {}
 
-    class FakePrepare:
-        def remote(self, **kwargs):
-            prepare_kwargs.update(kwargs)
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/single"
+    class FakeMethod:
+        def spawn(self, **kwargs):
+            launched["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=RunStatus.SUCCEEDED,
+                        status_message=None,
+                        status_reason=None,
+                    )
+                ),
+            )
 
-    class FakeProduction:
-        def remote(self, **kwargs):
-            production_kwargs.update(kwargs)
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/single"
+    def stage(volume, run_id, request):
+        staged.update(volume=volume, run_id=run_id, request=request)
 
-    class FakeStats:
-        def remote(self, traj_prefix, **kwargs):
-            analysis_stats.append((traj_prefix, kwargs))
-            return f"stats-{traj_prefix}"
+    def coordinator_handle(**kwargs):
+        launched["handle_kwargs"] = kwargs
+        return SimpleNamespace(run=FakeMethod())
 
-    monkeypatch.setattr(gromacs_app, "prepare_tpr_cpu", FakePrepare())
-    monkeypatch.setattr(gromacs_app, "production_run_cpu", FakeProduction())
-    monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
+    monkeypatch.setattr(gromacs_app, "uuid4", lambda: execution_run_id)
+    monkeypatch.setattr(gromacs_app, "stage_execution_request", stage)
+    monkeypatch.setattr(
+        gromacs_app,
+        "_execution_coordinator_handle",
+        coordinator_handle,
+    )
 
     submit_task_info = gromacs_app.submit_gromacs_task.info
     assert submit_task_info is not None
@@ -124,22 +136,16 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
         num_threads=2,
     )
 
-    assert prepare_kwargs["run_name"] == "single"
-    assert prepare_kwargs["pdb_content"] == b"ATOM\n"
-    assert production_kwargs == {
-        "run_name": "single",
-        "simulation_time_ns": 3,
-        "num_threads": 2,
-        "use_openmp_threads": False,
-    }
-    assert analysis_stats == [
-        ("nvt_", {"run_name": "single"}),
-        ("npt_", {"run_name": "single"}),
-        (
-            "production_",
-            {"run_name": "single", "save_processed_traj": True},
-        ),
-    ]
+    request = staged["request"]
+    assert staged["run_id"] == execution_run_id
+    assert request.run_name == "single"
+    assert request.pdb_content == b"ATOM\n"
+    assert request.simulation_time_ns == 3
+    assert request.num_threads == 2
+    assert request.max_active_provider_calls == 3
+    assert request.max_active_gpu_provider_calls == 0
+    assert launched["handle_kwargs"]["execution_run_id"] == execution_run_id
+    assert launched["run_kwargs"] == {"development": True}
 
 
 def test_prepare_tpr_cpu_stages_input_with_app_run_layout(

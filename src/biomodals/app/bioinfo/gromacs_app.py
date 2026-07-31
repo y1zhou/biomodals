@@ -13,15 +13,26 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
+from biomodals.app.bioinfo.gromacs_execution_runtime import (
+    GromacsExecutionCoordinator,
+    GromacsExecutionRequest,
+    stage_execution_request,
+)
 from biomodals.app.config import AppConfig
+from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    deployed_execution_coordinator,
+    development_modal_call_driver,
+)
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
-from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import ArtifactFile
 
 ##########################################
@@ -209,6 +220,8 @@ biotite_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_gromacs_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 
 ##########################################
@@ -826,7 +839,171 @@ def collect_traj_stats(
 
 
 ##########################################
-# Entrypoint for ephemeral usage
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    volumes=CONF.mounts(output_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with GROMACS functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh output state before accepting lifecycle methods."""
+        self._coordinator_adapter = None
+        self._development = None
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionSnapshot:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionSnapshot:
+        """Read this Run's durable kernel snapshot."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionSnapshot:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionSnapshot:
+        """Resume this Run without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> ExecutionSnapshot:
+        """Create and drive one compatible Successor Run."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+    ) -> ExecutionSnapshot:
+        """Create a compatible Successor while inferring predecessor identity."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return (
+            UUID(self.execution_run_id),
+            DeploymentIdentity(
+                self.deployment_environment,
+                self.deployment_name,
+                self.deployment_version,
+            ),
+        )
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> GromacsExecutionCoordinator:
+        adapter = getattr(self, "_coordinator_adapter", None)
+        selected_mode = getattr(self, "_development", None)
+        if adapter is not None:
+            if development is not None and selected_mode != development:
+                raise ValueError("Coordinator execution mode cannot change in place")
+            return adapter
+        execution_run_id, deployment = self._identity()
+        selected_mode = False if development is None else development
+        adapter = GromacsExecutionCoordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=Path(CONF.output_volume_mountpoint),
+            output_volume=CONF.output_volume,
+            modal_driver=_coordinator_modal_driver(development=selected_mode),
+        )
+        self._coordinator_adapter = adapter
+        self._development = selected_mode
+        return adapter
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "prepare_tpr_cpu": prepare_tpr_cpu,
+            "prepare_tpr_gpu": prepare_tpr_gpu,
+            "collect_traj_stats": collect_traj_stats,
+            "production_run_cpu": production_run_cpu,
+            "production_run_gpu": production_run_gpu,
+        },
+        workload_name="GROMACS",
+    )
+
+
+def _execution_coordinator_handle(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    use_deployed_coordinator: bool,
+):
+    """Resolve this run's exact deployed or current-source coordinator."""
+    if use_deployed_coordinator:
+        return deployed_execution_coordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+        )
+    return ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment=deployment.environment,
+        deployment_name=deployment.deployment_name,
+        deployment_version=deployment.deployment_version,
+    )
+
+
+##########################################
+# Local entrypoint client
 ##########################################
 @app.local_entrypoint()
 def submit_gromacs_task(
@@ -841,6 +1018,11 @@ def submit_gromacs_task(
     gen_seed: int = -1,
     genion_seed: int = 0,
     max_parallel_analysis: int | None = None,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run GROMACS MD simulations on Modal and save results to a volume.
 
@@ -864,6 +1046,12 @@ def submit_gromacs_task(
         genion_seed: Random seed for ion placement during system neutralization.
         max_parallel_analysis: Maximum number of trajectory-analysis containers
             to run at once.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            Biomodals CLI supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
     # Load input PDB
     pdb_path = Path(input_pdb).expanduser().resolve()
@@ -871,56 +1059,67 @@ def submit_gromacs_task(
     if run_name is None:
         run_name = pdb_path.stem
 
-    print("🧬 Preparing Gromacs production run...")
-    prepare_tpr_conf = {
-        "pdb_content": pdb_str,
-        "run_name": run_name,
-        "simulation_time_ns": simulation_time_ns,
-        "run_pdbfixer": run_pdbfixer,
-        "num_threads": num_threads,
-        "use_openmp_threads": use_openmp_threads,
-        "ld_seed": ld_seed,
-        "gen_seed": gen_seed,
-        "genion_seed": genion_seed,
-    }
-    if cpu_only:
-        remote_workdir = prepare_tpr_cpu.remote(**prepare_tpr_conf)
-    else:
-        remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
-
-    bounded_map(
-        ["nvt_", "npt_"],
-        lambda prefix: collect_traj_stats.remote(prefix, run_name=run_name),
-        max_parallel=max_parallel_analysis,
+    analysis_limit = 2 if max_parallel_analysis is None else max_parallel_analysis
+    if analysis_limit < 1:
+        raise ValueError("max_parallel_analysis must be positive")
+    request = GromacsExecutionRequest(
+        run_name=run_name,
+        pdb_content=pdb_str,
+        simulation_time_ns=simulation_time_ns,
+        run_pdbfixer=run_pdbfixer,
+        cpu_only=cpu_only,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        ld_seed=ld_seed,
+        gen_seed=gen_seed,
+        genion_seed=genion_seed,
+        max_active_provider_calls=min(analysis_limit, 2) + 1,
+        max_active_gpu_provider_calls=0 if cpu_only else 1,
     )
-
-    print("🧬 Starting Gromacs production MD simulation...")
-    if cpu_only:
-        _ = production_run_cpu.remote(
-            run_name=run_name,
-            simulation_time_ns=simulation_time_ns,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
-        )
-    else:
-        _ = production_run_gpu.remote(
-            run_name=run_name,
-            simulation_time_ns=simulation_time_ns,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
-        )
-
-    print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
-    bounded_map(
-        ["production_"],
-        lambda prefix: collect_traj_stats.remote(
-            run_name=run_name,
-            traj_prefix=prefix,
-            save_processed_traj=True,
-        ),
-        max_parallel=max_parallel_analysis,
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
     )
-
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    if predecessor_execution_run_id is None:
+        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(development=not use_deployed_coordinator)
+    else:
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            workload_plan_fingerprint=(
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            max_active_provider_calls=request.max_active_provider_calls,
+            max_active_gpu_provider_calls=request.max_active_gpu_provider_calls,
+        )
+    print(f"Execution Run ID: {execution_run_id}")
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
+    )
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    snapshot = call.get()
+    if snapshot.run.status != RunStatus.SUCCEEDED:
+        diagnostic = snapshot.run.status_message or (
+            snapshot.run.status_reason.value
+            if snapshot.run.status_reason is not None
+            else snapshot.run.status.value
+        )
+        raise RuntimeError(
+            f"{CONF.name} Execution Run ended as "
+            f"{snapshot.run.status.value}: {diagnostic}"
+        )
+    remote_workdir = str(Path(CONF.output_volume_mountpoint) / run_name)
     remote_vol = volume_path_from_mount_path(
         remote_workdir, CONF.output_volume_mountpoint, CONF.output_volume_name
     )

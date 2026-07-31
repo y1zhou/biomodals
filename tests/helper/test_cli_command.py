@@ -70,32 +70,6 @@ def test_build_workflow_run_command_does_not_duplicate_dry_run() -> None:
     )[-2:] == ("--dry-run", "/inputs")
 
 
-def test_build_workflow_run_command_places_coordinator_flags_before_user_input() -> (
-    None
-):
-    command = build_workflow_run_command(
-        workflow_module="biomodals.workflow.shortmd_workflow",
-        entrypoint="submit_shortmd_workflow",
-        modal_mode="run",
-        detach=False,
-        dry_run=False,
-        coordinator_flags=[
-            "--use-deployed-coordinator",
-            "--deployment-version",
-            "7",
-        ],
-        flags=["/inputs"],
-        python_executable="python",
-    )
-
-    assert command[-4:] == (
-        "--use-deployed-coordinator",
-        "--deployment-version",
-        "7",
-        "/inputs",
-    )
-
-
 def test_build_modal_app_history_command_uses_explicit_environment() -> None:
     assert build_modal_app_history_command(
         deployment_name="ShortMDWorkflow",

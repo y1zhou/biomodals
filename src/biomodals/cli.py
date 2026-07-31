@@ -30,6 +30,7 @@ from biomodals.helper.cli_command import (
     resolve_workflow_entrypoint,
     select_modal_deployment_version,
 )
+from biomodals.helper.cli_entrypoint import invoke_local_entrypoint
 from biomodals.helper.shell import run_command
 from biomodals.service.admin import app as admin_commands
 from biomodals.service.config import AdminSettings
@@ -455,17 +456,24 @@ def run_modal_app(
     ] = "run",
     detach: Annotated[
         bool,
-        typer.Option("--detach", "-d", help="Run the modal command in detached mode."),
+        typer.Option(
+            "--detach",
+            "-d",
+            help="Detach the source-backed development Modal command.",
+        ),
     ] = False,
     gpu: Annotated[
         str | None,
-        typer.Option("--gpu", help="GPU type to use for the modal run (e.g. 'L40S'). "),
+        typer.Option(
+            "--gpu",
+            help="GPU type for a source-backed development run (e.g. 'L40S').",
+        ),
     ] = None,
     timeout: Annotated[
         int | None,
         typer.Option(
             "--timeout",
-            help="Timeout in seconds for the modal run. If not specified, use the app default.",
+            help="Timeout in seconds for a source-backed development run.",
         ),
     ] = None,
     development: Annotated[
@@ -517,7 +525,6 @@ def run_modal_app(
     import os
 
     app = _load_entry("app", app_name_or_path)
-    coordinator_flags: list[str] = []
     coordinated_entrypoint = _coordinated_app_entrypoint(app)
     if (
         modal_mode != "shell"
@@ -537,6 +544,16 @@ def run_modal_app(
             "unavailable in source-backed development mode"
         )
         raise typer.Exit(code=1)
+    if (
+        modal_mode != "shell"
+        and not development
+        and (detach or gpu is not None or timeout is not None)
+    ):
+        console.print(
+            "[bold red]Error[/bold red] --detach, --gpu, and --timeout are "
+            "available only in source-backed development mode"
+        )
+        raise typer.Exit(code=1)
     if modal_mode != "shell" and coordinated_entrypoint is not None and not development:
         try:
             resolved_deployment_name = deployment_name or _app_deployment_name(app)
@@ -551,17 +568,6 @@ def run_modal_app(
                 f"deployment: {exc}"
             )
             raise typer.Exit(code=1) from exc
-        coordinator_flags = [
-            "--use-deployed-coordinator",
-            "--deployment-environment",
-            environment,
-            "--deployment-name",
-            resolved_deployment_name,
-            "--deployment-version",
-            str(resolved_version),
-        ]
-        if restart_from is not None:
-            coordinator_flags.extend(["--restart-from", str(restart_from)])
     elif restart_from is not None:
         if development:
             message = "--restart-from is unavailable in source-backed development mode"
@@ -578,20 +584,44 @@ def run_modal_app(
         )
         raise typer.Exit(code=1)
 
-    cmd = build_app_run_command(
-        app_path=app.path,
-        entrypoint=app._entrypoint,
-        modal_mode=modal_mode,
-        detach=detach,
-        flags=[*coordinator_flags, *(flags or ())],
-    )
-
     if modal_mode == "shell":
+        cmd = build_app_run_command(
+            app_path=app.path,
+            entrypoint=app._entrypoint,
+            modal_mode=modal_mode,
+            detach=detach,
+            flags=flags,
+        )
         console.print(
             "To start an interactive shell for the app, run:\n"
             f"[bold green]{shlex.join(cmd)}[/bold green]"
         )
         return
+
+    if coordinated_entrypoint is not None and not development:
+        invoke_local_entrypoint(
+            module_name=app.module,
+            entrypoint_name=coordinated_entrypoint,
+            flags=flags or (),
+            overrides={
+                "use_deployed_coordinator": True,
+                "deployment_environment": environment,
+                "deployment_name": resolved_deployment_name,
+                "deployment_version": resolved_version,
+                "restart_from": None if restart_from is None else str(restart_from),
+            },
+            program_name=(f"biomodals app run {app.name}::{coordinated_entrypoint} --"),
+            environment_name=environment,
+        )
+        return
+
+    cmd = build_app_run_command(
+        app_path=app.path,
+        entrypoint=app._entrypoint,
+        modal_mode=modal_mode,
+        detach=detach,
+        flags=flags,
+    )
 
     # TODO: figure out a way to tag run names into the app.
     # Previously we used the MODAL_APP environment variable for ephemeral
@@ -992,17 +1022,24 @@ def run_workflow(
     ] = "run",
     detach: Annotated[
         bool,
-        typer.Option("--detach", "-d", help="Run the modal command in detached mode."),
+        typer.Option(
+            "--detach",
+            "-d",
+            help="Detach the source-backed development Modal command.",
+        ),
     ] = False,
     gpu: Annotated[
         str | None,
-        typer.Option("--gpu", help="GPU type to use for the modal run (e.g. 'L40S'). "),
+        typer.Option(
+            "--gpu",
+            help="GPU type for a source-backed development run (e.g. 'L40S').",
+        ),
     ] = None,
     timeout: Annotated[
         int | None,
         typer.Option(
             "--timeout",
-            help="Timeout in seconds for the modal run. If not specified, use the workflow default.",
+            help="Timeout in seconds for a source-backed development run.",
         ),
     ] = None,
     dry_run: Annotated[
@@ -1066,6 +1103,16 @@ def run_workflow(
 
     workflow = _load_entry("workflow", workflow_name_or_path)
     entrypoint = _resolve_workflow_entrypoint(workflow)
+    if (
+        modal_mode != "shell"
+        and not development
+        and (detach or gpu is not None or timeout is not None)
+    ):
+        console.print(
+            "[bold red]Error[/bold red] --detach, --gpu, and --timeout are "
+            "available only in source-backed development mode"
+        )
+        raise typer.Exit(code=1)
     if restart_from is not None:
         if development:
             message = "--restart-from is unavailable in source-backed development mode"
@@ -1078,7 +1125,6 @@ def run_workflow(
         if message is not None:
             console.print(f"[bold red]Error[/bold red] {message}")
             raise typer.Exit(code=1)
-    coordinator_flags: list[str] = []
     if modal_mode != "shell" and not dry_run and not development:
         try:
             resolved_deployment_name = deployment_name or _workflow_deployment_name(
@@ -1095,33 +1141,49 @@ def run_workflow(
                 f"deployment: {exc}"
             )
             raise typer.Exit(code=1) from exc
-        coordinator_flags = [
-            "--use-deployed-coordinator",
-            "--deployment-environment",
-            environment,
-            "--deployment-name",
-            resolved_deployment_name,
-            "--deployment-version",
-            str(resolved_version),
-        ]
-        if restart_from is not None:
-            coordinator_flags.extend(["--restart-from", str(restart_from)])
+
+    if modal_mode == "shell":
+        cmd = build_workflow_run_command(
+            workflow_module=workflow.module,
+            entrypoint=entrypoint,
+            modal_mode=modal_mode,
+            detach=detach,
+            dry_run=dry_run,
+            flags=flags,
+        )
+        console.print(
+            "To start an interactive shell for the workflow, run:\n"
+            f"[bold green]{shlex.join(cmd)}[/bold green]"
+        )
+        return
+
+    if not development:
+        deployed = not dry_run
+        invoke_local_entrypoint(
+            module_name=workflow.module,
+            entrypoint_name=entrypoint,
+            flags=flags or (),
+            overrides={
+                "dry_run": dry_run,
+                "use_deployed_coordinator": deployed,
+                "deployment_environment": environment if deployed else "development",
+                "deployment_name": resolved_deployment_name if deployed else None,
+                "deployment_version": resolved_version if deployed else 1,
+                "restart_from": None if restart_from is None else str(restart_from),
+            },
+            program_name=f"biomodals workflow run {workflow.name}::{entrypoint} --",
+            environment_name=environment if deployed else None,
+        )
+        return
+
     cmd = build_workflow_run_command(
         workflow_module=workflow.module,
         entrypoint=entrypoint,
         modal_mode=modal_mode,
         detach=detach,
         dry_run=dry_run,
-        coordinator_flags=coordinator_flags,
         flags=flags,
     )
-
-    if modal_mode == "shell":
-        console.print(
-            "To start an interactive shell for the workflow, run:\n"
-            f"[bold green]{shlex.join(cmd)}[/bold green]"
-        )
-        return
 
     env = os.environ.copy()
     env.update(modal_env_overrides(gpu=gpu, timeout=timeout))

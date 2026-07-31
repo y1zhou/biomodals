@@ -98,10 +98,13 @@ then reuses valid publications and schedules only conclusively missing work.
 Repeating a launch without `--restart-from` creates a new root Run.
 
 Pass `--development` to `biomodals app run` for explicit source-backed
-development. That mode has no cross-process recovery. An app entrypoint that
-does not yet expose a Deployment Coordinator Adapter fails closed unless
-`--development` is explicit. Workflow `--dry-run` validates and prints the DAG
-without resolving a deployment or starting Modal work.
+development through an ephemeral `modal run`. Normal app and workflow commands
+execute their thin client locally and call the exact deployed coordinator; they
+do not create an ephemeral launcher app. Development mode has no cross-process
+recovery. An app entrypoint that does not yet expose a Deployment Coordinator
+Adapter fails closed unless `--development` is explicit. Workflow `--dry-run`
+validates and prints the DAG locally without resolving a deployment or starting
+Modal work.
 
 ## API server
 

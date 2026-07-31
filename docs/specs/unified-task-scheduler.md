@@ -145,7 +145,8 @@ These existing decisions remain binding during the refactor:
 - The coordinator binding ships with each app or workflow deployment; there
   is no universal execution-coordinator deployment or workload registry.
 - `biomodals app run` and `biomodals workflow run` target exact deployed
-  versions by default; source-backed ephemeral execution is explicit
+  versions directly from their local thin clients by default; they create no
+  ephemeral launcher App. Source-backed ephemeral execution is explicit
   development mode without cross-invocation resume.
 - A CLI version override is optional. Without one, deployment history is
   resolved once and the resulting exact version is persisted before work.
@@ -767,7 +768,12 @@ same Tasks.
 A Direct CLI App Run always creates its per-run ledger remotely and executes
 through a Run-Scoped Coordinator Pool, even for one direct Provider Call. The
 Local Entrypoint owns no SQLite file: it prepares local input, submits the run,
-and optionally waits for or retrieves the result.
+and optionally waits for or retrieves the result. Normal CLI execution invokes
+that client in the CLI process and hydrates the pinned deployed coordinator
+directly rather than starting a source-backed ephemeral launcher. The client
+also resolves lazy named objects in the coordinator's explicit Modal
+Environment so input staging and result retrieval cannot drift to the local
+profile default.
 
 A workflow CLI run follows the same deployment rule and uses its remote
 Workflow Orchestrator and per-run Workflow Ledger. Both CLI commands pin an
@@ -1846,8 +1852,9 @@ Deliverables:
 - preserve workflow DAG hashes, artifact contracts, Volume synchronization,
   display, and scientific publication reuse;
 - make `biomodals app run` and `biomodals workflow run` resolve an exact
-  deployed coordinator version, start a remote ledger and detached coordinator
-  loop, and create no local execution database;
+  deployed coordinator version, invoke it directly from the local thin client,
+  start a remote ledger and detached coordinator loop, and create neither an
+  ephemeral launcher App nor a local execution database;
 - accept an explicit `--version` or resolve `modal app history --json` once,
   then persist and use only the exact Deployment Identity;
 - add shared `biomodals run status`, `cancel`, `resume`, and `restart`

@@ -49,10 +49,14 @@ plugin system, or deployment-global Volume.
 The CLI deployment-lifetime policy was accepted on 2026-07-29. Both
 `biomodals app run` and `biomodals workflow run` submit to an exact named
 deployment version by default. This keeps the same parameterized coordinator
-pool addressable after the launching process exits. Source-backed
-`modal run` execution remains available only as an explicit Development CLI
+pool addressable after the launching process exits. The normal CLI parses and
+executes the thin Local Entrypoint client in its own process, then hydrates the
+pinned coordinator directly; it does not wrap that client in an ephemeral
+Modal App. The client binds lazy named-object lookups, including staging
+Volumes, to the same explicit Modal Environment as the coordinator. Explicit
+source-backed `modal run` execution remains available only as a Development CLI
 Run and carries no cross-invocation resume guarantee. Local dry-run planning
-does not require a deployment.
+executes in the CLI process and does not require a deployment.
 
 The deployment-resolution policy was accepted on 2026-07-29. A CLI
 `--version` value is an explicit override. Otherwise the CLI queries

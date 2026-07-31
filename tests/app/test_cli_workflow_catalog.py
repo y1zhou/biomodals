@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -152,20 +153,22 @@ def test_workflow_run_requires_entrypoint_for_multiple_local_entrypoints(
     assert "::second" in result.output
 
 
-def test_workflow_run_dry_run_forwards_entrypoint_flag(
+def test_workflow_dry_run_invokes_the_entrypoint_locally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = {}
+    calls: dict[str, object] = {}
 
-    def fake_run_command(command, **kwargs):
-        calls["command"] = command
-        calls["kwargs"] = kwargs
+    def fake_invoke_local_entrypoint(**kwargs):
+        calls.update(kwargs)
 
     monkeypatch.setattr(
         "biomodals.cli._load_entry",
         lambda *_args: _SingleEntrypointWorkflow(),
     )
-    monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        fake_invoke_local_entrypoint,
+    )
 
     result = runner.invoke(
         app,
@@ -182,27 +185,29 @@ def test_workflow_run_dry_run_forwards_entrypoint_flag(
     )
 
     assert result.exit_code == 0
-    assert calls["command"][1:3] == ["-m", "modal"]
-    assert (
-        "biomodals.workflow.shortmd_workflow::submit_shortmd_workflow"
-        in calls["command"]
-    )
-    module_idx = calls["command"].index(
-        "biomodals.workflow.shortmd_workflow::submit_shortmd_workflow"
-    )
-    assert calls["command"][module_idx + 1 :] == [
-        "--dry-run",
+    assert calls["module_name"] == "biomodals.workflow.shortmd_workflow"
+    assert calls["entrypoint_name"] == "submit_shortmd_workflow"
+    assert calls["flags"] == [
         "/inputs",
         "--replicates",
         "1",
     ]
-    assert calls["kwargs"]["output_mode"] == "inherit"
+    assert calls["overrides"] == {
+        "dry_run": True,
+        "use_deployed_coordinator": False,
+        "deployment_environment": "development",
+        "deployment_name": None,
+        "deployment_version": 1,
+        "restart_from": None,
+    }
+    assert calls["environment_name"] is None
 
 
 def test_workflow_run_resolves_and_forwards_an_exact_deployment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
+    entrypoint_calls: list[dict[str, Any]] = []
 
     def fake_run_command(command, **kwargs):
         calls.append((command, kwargs))
@@ -219,6 +224,10 @@ def test_workflow_run_resolves_and_forwards_an_exact_deployment(
         lambda _workflow: "ShortMDWorkflow",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
 
     result = runner.invoke(
         app,
@@ -235,21 +244,26 @@ def test_workflow_run_resolves_and_forwards_an_exact_deployment(
         "--json",
     ]
     assert history_kwargs["output_mode"] == "capture"
-    run_command, run_kwargs = calls[1]
-    target_index = run_command.index(
-        "biomodals.workflow.shortmd_workflow::submit_shortmd_workflow"
-    )
-    assert run_command[target_index + 1 :] == [
-        "--use-deployed-coordinator",
-        "--deployment-environment",
-        "main",
-        "--deployment-name",
-        "ShortMDWorkflow",
-        "--deployment-version",
-        "7",
-        "/inputs",
+    assert len(calls) == 1
+    assert entrypoint_calls == [
+        {
+            "module_name": "biomodals.workflow.shortmd_workflow",
+            "entrypoint_name": "submit_shortmd_workflow",
+            "flags": ["/inputs"],
+            "overrides": {
+                "dry_run": False,
+                "use_deployed_coordinator": True,
+                "deployment_environment": "main",
+                "deployment_name": "ShortMDWorkflow",
+                "deployment_version": 7,
+                "restart_from": None,
+            },
+            "program_name": (
+                "biomodals workflow run shortmd::submit_shortmd_workflow --"
+            ),
+            "environment_name": "main",
+        }
     ]
-    assert run_kwargs["output_mode"] == "inherit"
 
 
 def test_workflow_restart_forwards_only_the_explicit_predecessor(
@@ -257,6 +271,7 @@ def test_workflow_restart_forwards_only_the_explicit_predecessor(
 ) -> None:
     """Launch-time workflow restart remains an explicit successor operation."""
     commands: list[list[str]] = []
+    entrypoint_calls: list[dict[str, Any]] = []
     predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
     def fake_run_command(command, **_kwargs):
@@ -274,6 +289,10 @@ def test_workflow_restart_forwards_only_the_explicit_predecessor(
         lambda _workflow: "ShortMDWorkflow",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
 
     result = runner.invoke(
         app,
@@ -289,8 +308,8 @@ def test_workflow_restart_forwards_only_the_explicit_predecessor(
     )
 
     assert result.exit_code == 0
-    restart_index = commands[1].index("--restart-from")
-    assert commands[1][restart_index + 1] == predecessor
+    assert len(commands) == 1
+    assert entrypoint_calls[0]["overrides"]["restart_from"] == predecessor
 
 
 @pytest.mark.parametrize(
@@ -338,6 +357,7 @@ def test_workflow_run_validates_an_explicit_version_and_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[list[str]] = []
+    entrypoint_calls: list[dict[str, Any]] = []
 
     def fake_run_command(command, **_kwargs):
         commands.append(command)
@@ -350,6 +370,10 @@ def test_workflow_run_validates_an_explicit_version_and_environment(
         lambda *_args: _SingleEntrypointWorkflow(),
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
 
     result = runner.invoke(
         app,
@@ -375,8 +399,8 @@ def test_workflow_run_validates_an_explicit_version_and_environment(
         "production",
         "--json",
     ]
-    assert "--deployment-version" in commands[1]
-    assert commands[1][commands[1].index("--deployment-version") + 1] == "4"
+    assert len(commands) == 1
+    assert entrypoint_calls[0]["overrides"]["deployment_version"] == 4
 
 
 def test_workflow_run_development_mode_skips_deployment_lookup(
@@ -472,6 +496,7 @@ def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(
 ) -> None:
     """Coordinator-aware app entrypoints use the same pinned lookup as workflows."""
     calls: list[tuple[list[str], dict[str, object]]] = []
+    entrypoint_calls: list[dict[str, Any]] = []
 
     def fake_run_command(command, **kwargs):
         calls.append((command, kwargs))
@@ -488,6 +513,10 @@ def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(
         lambda _app: "AlphaFold3",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
 
     result = runner.invoke(
         app,
@@ -512,19 +541,22 @@ def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(
         "production",
         "--json",
     ]
-    target = calls[1][0].index(
-        "src/biomodals/app/fold/alphafold3_app.py::submit_alphafold3_task"
-    )
-    assert calls[1][0][target + 1 :] == [
-        "--use-deployed-coordinator",
-        "--deployment-environment",
-        "production",
-        "--deployment-name",
-        "AlphaFold3",
-        "--deployment-version",
-        "7",
-        "--input-json",
-        "input.json",
+    assert len(calls) == 1
+    assert entrypoint_calls == [
+        {
+            "module_name": "biomodals.app.fold.alphafold3_app",
+            "entrypoint_name": "submit_alphafold3_task",
+            "flags": ["--input-json", "input.json"],
+            "overrides": {
+                "use_deployed_coordinator": True,
+                "deployment_environment": "production",
+                "deployment_name": "AlphaFold3",
+                "deployment_version": 7,
+                "restart_from": None,
+            },
+            "program_name": ("biomodals app run alphafold3::submit_alphafold3_task --"),
+            "environment_name": "production",
+        }
     ]
 
 
@@ -533,6 +565,7 @@ def test_coordinated_app_restart_forwards_only_the_explicit_predecessor(
 ) -> None:
     """Launch-time restart remains a thin convenience over Successor Run creation."""
     commands: list[list[str]] = []
+    entrypoint_calls: list[dict[str, Any]] = []
     predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
     def fake_run_command(command, **_kwargs):
@@ -550,6 +583,10 @@ def test_coordinated_app_restart_forwards_only_the_explicit_predecessor(
         lambda _app: "AlphaFold3",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
 
     result = runner.invoke(
         app,
@@ -566,9 +603,8 @@ def test_coordinated_app_restart_forwards_only_the_explicit_predecessor(
     )
 
     assert result.exit_code == 0
-    assert "--restart-from" in commands[1]
-    restart_index = commands[1].index("--restart-from")
-    assert commands[1][restart_index + 1] == predecessor
+    assert len(commands) == 1
+    assert entrypoint_calls[0]["overrides"]["restart_from"] == predecessor
 
 
 def test_coordinated_app_development_mode_skips_deployment_lookup(

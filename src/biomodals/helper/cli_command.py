@@ -49,12 +49,11 @@ def build_workflow_run_command(
     modal_mode: str,
     detach: bool,
     dry_run: bool,
-    coordinator_flags: list[str] | tuple[str, ...] | None = None,
     flags: list[str] | tuple[str, ...] | None = None,
     python_executable: str | None = None,
 ) -> tuple[str, ...]:
     """Build the command for `biomodals workflow run` without side effects."""
-    entrypoint_flags = [*(coordinator_flags or ()), *(flags or ())]
+    entrypoint_flags = list(flags or ())
     if dry_run and "--dry-run" not in entrypoint_flags:
         entrypoint_flags.insert(0, "--dry-run")
     return tuple([

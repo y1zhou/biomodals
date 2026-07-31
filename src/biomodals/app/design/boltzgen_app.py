@@ -389,6 +389,7 @@ def collect_boltzgen_data(
         })
     else:
         print(f"💊 Results are available at: {vol_path}.")
+    out_vol.commit()
     record = write_collection_publication(
         CONF.output_volume_mountpoint,
         publication_path,
@@ -467,18 +468,15 @@ def run_boltzgen_task(
         str(log_path), CONF.output_volume_mountpoint, CONF.output_volume_name
     )
     print(f"💊 Running BoltzGen, saving logs to {log_vol_path}")
-    try:
-        run_command(cmd, output_mode="log", log_file=log_path, cwd=out_path)
-        if not is_boltzgen_run_complete(out_path):
-            raise RuntimeError("BoltzGen returned without its final publication")
-        CONF.output_volume.commit()
-        write_boltzgen_task_publication(
-            out_path,
-            task_fingerprint=task_fingerprint,
-        )
-        CONF.output_volume.commit()
-    finally:
-        CONF.output_volume.commit()
+    run_command(cmd, output_mode="log", log_file=log_path, cwd=out_path)
+    if not is_boltzgen_run_complete(out_path):
+        raise RuntimeError("BoltzGen returned without its final publication")
+    CONF.output_volume.commit()
+    write_boltzgen_task_publication(
+        out_path,
+        task_fingerprint=task_fingerprint,
+    )
+    CONF.output_volume.commit()
     return str(out_dir)
 
 
@@ -747,12 +745,10 @@ class ExecutionCoordinator:
 
     @modal.exit()
     def exit(self) -> None:
-        """Checkpoint state without cancelling attached child calls."""
+        """Close local state without cancelling attached child calls."""
         adapter = getattr(self, "_coordinator_adapter", None)
         if adapter is not None:
             adapter.close()
-        else:
-            CONF.output_volume.commit()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
         return (

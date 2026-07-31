@@ -260,7 +260,7 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert calls["workload_run_key"] == "friendly-name"
     assert calls["closed"] is True
     assert volume.reload_count == 1
-    assert volume.commit_count == 2
+    assert volume.commit_count == 1
 
     store = WorkflowRunStore(tmp_path, RUN_ID)
     plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
@@ -859,7 +859,7 @@ def test_enter_and_exit_close_without_cancelling(
 
     assert active_runtime.close_count == 1
     assert instance._runtime is None
-    assert volume.commit_count == 2
+    assert volume.commit_count == 0
 
 
 @pytest.mark.parametrize(

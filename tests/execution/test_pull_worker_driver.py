@@ -67,3 +67,47 @@ def test_pull_worker_replays_stable_request_ids_and_drains_until_empty() -> None
     ]
     assert summary.claimed_tasks == 3
     assert summary.claim_requests == 3
+
+
+def test_pull_worker_checkpoints_each_completed_microbatch_before_reporting() -> None:
+    claims = [
+        (_assignment("task-0", 0), _assignment("task-1", 1)),
+        (_assignment("task-2", 2),),
+        (),
+    ]
+    events: list[str] = []
+    claim_count = 0
+
+    def claim(request_id: str, capacity: int) -> PullTaskClaim:
+        nonlocal claim_count
+        del capacity
+        assignments = claims[claim_count]
+        claim_count += 1
+        return PullTaskClaim(
+            request_id=request_id,
+            provider_call_id=CALL_ID,
+            assignments=assignments,
+        )
+
+    drive_pull_worker(
+        provider_call_id=CALL_ID,
+        claim_capacity=2,
+        claim=claim,
+        execute=lambda assignment: events.append(f"execute:{assignment.task_key}"),
+        checkpoint_batch=lambda: events.append("checkpoint"),
+        complete=lambda assignment, request_id, result: events.append(
+            f"complete:{assignment.task_key}"
+        ),
+        max_parallel=1,
+    )
+
+    assert events == [
+        "execute:task-0",
+        "execute:task-1",
+        "checkpoint",
+        "complete:task-0",
+        "complete:task-1",
+        "execute:task-2",
+        "checkpoint",
+        "complete:task-2",
+    ]

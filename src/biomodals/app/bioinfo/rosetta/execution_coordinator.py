@@ -153,7 +153,7 @@ class RosettaExecutionCoordinator:
                 request,
                 predecessor_execution_run_id=self._existing_predecessor(),
             )
-            runtime.attach()
+            runtime.refresh_publications()
             return runtime.complete_pull_task(
                 provider_call_id,
                 task_key,
@@ -248,10 +248,9 @@ class RosettaExecutionCoordinator:
             return self._drive(runtime, resume=False)
 
     def close(self) -> None:
-        """Checkpoint state without cancelling attached Provider Calls."""
+        """Close local state without cancelling attached Provider Calls."""
         with self._writer_lock:
             self._close_runtime()
-            self.output_volume.commit()
 
     def synchronize(self) -> AbstractContextManager[object]:
         """Return the serialized SQLite writer boundary."""
@@ -274,7 +273,6 @@ class RosettaExecutionCoordinator:
         finally:
             with self._writer_lock:
                 self._close_runtime()
-                self.output_volume.commit()
 
     def _open_runtime(
         self,

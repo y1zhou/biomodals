@@ -234,7 +234,6 @@ class WorkflowRuntime:
     def advance_once(self) -> None:
         """Apply one caller-driven workflow scheduling cycle."""
         definition = self._require_definition()
-        self._volume_sync.reload()
         self._provider.repository = self.store.execution
         self._recover_publications()
         self._reconcile_nodes_and_run()
@@ -296,8 +295,12 @@ class WorkflowRuntime:
         self._provider.cancel_run(self.execution_run_id, now=self._now())
 
     def attach(self, *, workload_run_key: str) -> None:
-        """Open and verify an existing Run for concurrent worker callbacks."""
-        self._initialize(workload_run_key)
+        """Open and verify a Run without refreshing worker publications."""
+        self._initialize(workload_run_key, reload_volume=False)
+
+    def refresh_publications(self, *, workload_run_key: str) -> None:
+        """Refresh worker publications and verify an existing Run."""
+        self._initialize(workload_run_key, reload_volume=True)
 
     def claim_pull_tasks(
         self,
@@ -402,12 +405,18 @@ class WorkflowRuntime:
         """Close local resources without cancelling attached child calls."""
         self.store.close()
 
-    def _initialize(self, workload_run_key: str) -> SqliteExecutionRepository:
+    def _initialize(
+        self,
+        workload_run_key: str,
+        *,
+        reload_volume: bool = True,
+    ) -> SqliteExecutionRepository:
         """Load the workflow definition and create or verify its Run."""
         definition = self.workflow.validate()
         self._definition = definition
         self._workload_run_key = workload_run_key
-        self._volume_sync.reload()
+        if reload_volume:
+            self._volume_sync.reload()
         return self._ensure_run(definition, workload_run_key)
 
     def _ensure_run(
@@ -432,7 +441,7 @@ class WorkflowRuntime:
                     max_active_gpu_provider_calls=self.max_active_gpu_provider_calls,
                     now=self._now(),
                 )
-            return self._checkpoint()
+            return repository
 
         if existing.plan.workload_plan_fingerprint != plan.workload_plan_fingerprint:
             raise ValueError("Workflow Plan Fingerprint does not match Execution Run")
@@ -471,7 +480,6 @@ class WorkflowRuntime:
                         now=self._now(),
                     )
                     observations[node_id] = observation
-            repository = self._checkpoint()
             if any(
                 observation == AvailabilityStatus.UNKNOWN for _, observation in observed
             ):
@@ -587,6 +595,8 @@ class WorkflowRuntime:
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
         calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        publications = []
+        publication_may_have_changed = False
         for original in calls:
             call = original
             if not call.status.is_terminal:
@@ -597,11 +607,17 @@ class WorkflowRuntime:
                     result_already_satisfied=call.node_key not in required,
                     now=self._now(),
                 )
+                publication_may_have_changed |= call.status.is_terminal
             if (
                 call.status == ProviderCallStatus.SUCCEEDED
                 and call.node_key in required
             ):
-                self._publish_provider_result(call)
+                publications.append(call)
+        if publication_may_have_changed:
+            self._volume_sync.reload()
+            self._provider.repository = self.store.execution
+        for call in publications:
+            self._publish_provider_result(call)
 
     def _publish_provider_result(
         self,
@@ -760,7 +776,6 @@ class WorkflowRuntime:
                         task.observation,
                         now=self._now(),
                     )
-        self._checkpoint()
 
     def _prepare_node(
         self,
@@ -1171,7 +1186,6 @@ class WorkflowRuntime:
                     node_id,
                     now=self._now(),
                 )
-        self._checkpoint()
 
     def _publish_task_result(
         self,
@@ -1231,7 +1245,6 @@ class WorkflowRuntime:
                     observation,
                     now=self._now(),
                 )
-        self._checkpoint()
 
     def _fail_task(self, node_id: str, message: str) -> None:
         with self.store.transaction():
@@ -1255,7 +1268,6 @@ class WorkflowRuntime:
                 self.execution_run_id,
                 now=self._now(),
             )
-        self._checkpoint()
 
     def _fail_discovered_task(
         self,
@@ -1272,7 +1284,6 @@ class WorkflowRuntime:
                 message=message,
                 now=self._now(),
             )
-        self._checkpoint()
 
     def _reconcile_nodes_and_run(self) -> None:
         definition = self._require_definition()
@@ -1312,13 +1323,11 @@ class WorkflowRuntime:
         implementation: RemoteTaskWorkflowNode,
     ) -> None:
         with self.store.transaction():
-            skipped = self.store.execution.apply_task_failure_policy(
+            self.store.execution.apply_task_failure_policy(
                 self.execution_run_id,
                 node_id,
                 now=self._now(),
             )
-        if skipped:
-            self._checkpoint()
         tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
         empty_result = not tasks
         outcome = (
@@ -1498,7 +1507,6 @@ class WorkflowRuntime:
                     message=f"Could not validate workflow Node {node_id!r}",
                     now=self._now(),
                 )
-        self._checkpoint()
 
     def _fail_node_publication(self, node_id: str, message: str) -> None:
         with self.store.transaction():
@@ -1508,7 +1516,6 @@ class WorkflowRuntime:
                 message=message,
                 now=self._now(),
             )
-        self._checkpoint()
 
     def _publication_observation(self, node_id: str) -> AvailabilityStatus:
         result = self.store.artifacts.load_node_result(node_id)

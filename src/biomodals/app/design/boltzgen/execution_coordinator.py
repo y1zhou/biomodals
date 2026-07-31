@@ -196,10 +196,9 @@ class BoltzGenExecutionCoordinator:
             return self._drive(runtime, resume=False)
 
     def close(self) -> None:
-        """Checkpoint state on exit without cancelling child calls."""
+        """Close local state without cancelling child calls."""
         with self._writer_lock:
             self._close_runtime()
-            self.output_volume.commit()
 
     def synchronize(self) -> AbstractContextManager[object]:
         """Return the serialized writer boundary between coordinator cycles."""
@@ -222,7 +221,6 @@ class BoltzGenExecutionCoordinator:
         finally:
             with self._writer_lock:
                 self._close_runtime()
-                self.output_volume.commit()
 
     def _open_runtime(
         self,

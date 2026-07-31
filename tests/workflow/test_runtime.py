@@ -461,6 +461,101 @@ def _runtime(
     )
 
 
+def test_initialization_does_not_checkpoint_the_workflow_volume(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("remote")
+    workflow.add_node(
+        RemoteTextNode("hello", "remote_text"),
+        id="remote",
+    )
+    volume = FakeVolume()
+    runtime = _runtime(tmp_path, workflow, volume=volume)
+
+    runtime._initialize("friendly-name")
+
+    assert volume.reloads == 1
+    assert volume.commits == 0
+    runtime.attach(workload_run_key="friendly-name")
+    runtime.attach(workload_run_key="friendly-name")
+    assert volume.reloads == 1
+    runtime.refresh_publications(workload_run_key="friendly-name")
+    assert volume.reloads == 2
+    runtime.close()
+
+
+def test_running_provider_poll_does_not_synchronize_the_workflow_volume(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("remote")
+    workflow.add_node(
+        RemoteTextNode("hello", "remote_text"),
+        id="remote",
+    )
+    volume = FakeVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=CancellingModalDriver(),
+        volume=volume,
+    )
+    runtime._initialize("friendly-name")
+    runtime.advance_once()
+    commits = volume.commits
+    reloads = volume.reloads
+
+    runtime.advance_once()
+
+    assert volume.commits == commits
+    assert volume.reloads == reloads
+    runtime.close()
+
+
+def test_provider_publication_reload_follows_success_observation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workflow = Workflow("remote")
+    workflow.add_node(
+        RemoteTextNode("hello", "remote_text"),
+        id="remote",
+    )
+    driver = FakeModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        volume=FakeVolume(),
+    )
+    runtime._initialize("friendly-name")
+    runtime.advance_once()
+    events: list[str] = []
+    original_observe = driver.observe
+    original_reload = runtime._volume_sync.reload
+    original_publish = runtime._publish_provider_result
+
+    def observe(provider_call_handle_id):
+        events.append("observe")
+        return original_observe(provider_call_handle_id)
+
+    def reload() -> None:
+        events.append("reload")
+        original_reload()
+
+    def publish(call) -> None:
+        events.append("publish")
+        original_publish(call)
+
+    monkeypatch.setattr(driver, "observe", observe)
+    monkeypatch.setattr(runtime._volume_sync, "reload", reload)
+    monkeypatch.setattr(runtime, "_publish_provider_result", publish)
+
+    runtime.advance_once()
+
+    assert events == ["observe", "reload", "publish"]
+    runtime.close()
+
+
 def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> None:
     workflow = Workflow("demo")
     first_node = TextNode("first")
@@ -936,10 +1031,22 @@ def test_durable_provider_envelope_is_published_without_another_spawn(
 def test_interrupted_local_task_recovers_without_an_attempt_or_new_task(
     tmp_path: Path,
 ) -> None:
+    events: list[str] = []
+
+    class RecordingVolume(FakeVolume):
+        def commit(self) -> None:
+            super().commit()
+            events.append("checkpoint")
+
+    class RecordingInterruptNode(InterruptOnceNode):
+        def run(self, context: NodeRunContext) -> AppRunResult:
+            events.append("run")
+            return super().run(context)
+
     workflow = Workflow("local-recovery")
-    node = InterruptOnceNode()
+    node = RecordingInterruptNode()
     workflow.add_node(node, id="local")
-    runtime = _runtime(tmp_path, workflow)
+    runtime = _runtime(tmp_path, workflow, volume=RecordingVolume())
 
     try:
         runtime.run(workload_run_key="local-recovery")
@@ -950,6 +1057,7 @@ def test_interrupted_local_task_recovers_without_an_attempt_or_new_task(
     interrupted_task = runtime.store.execution.get_task(RUN_ID, "local", "node")
     assert interrupted_task.status.value == "running"
     assert interrupted_task.local_owned is True
+    assert events == ["checkpoint", "run"]
 
     result = runtime.run(workload_run_key="local-recovery")
 

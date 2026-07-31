@@ -197,7 +197,6 @@ class ExecutionCoordinator:
         finally:
             with self._lock():
                 self._close_runtime()
-                OUT_VOLUME.commit()
 
     @modal.method()
     def status(self) -> ExecutionSnapshot:
@@ -226,7 +225,6 @@ class ExecutionCoordinator:
         finally:
             with self._lock():
                 self._close_runtime()
-                OUT_VOLUME.commit()
 
     @modal.method()
     def resume(self) -> AppRunResult:
@@ -243,7 +241,6 @@ class ExecutionCoordinator:
         finally:
             with self._lock():
                 self._close_runtime()
-                OUT_VOLUME.commit()
 
     @modal.method()
     def claim_tasks(
@@ -277,7 +274,7 @@ class ExecutionCoordinator:
             self._require_ledger()
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
-            runtime.attach(workload_run_key=plan.workload_run_key)
+            runtime.refresh_publications(workload_run_key=plan.workload_run_key)
             return runtime.complete_pull_task(
                 UUID(provider_call_id),
                 task_key,
@@ -424,14 +421,12 @@ class ExecutionCoordinator:
         finally:
             with self._lock():
                 self._close_runtime()
-                OUT_VOLUME.commit()
 
     @modal.exit()
     def exit(self) -> None:
-        """Persist pending workflow state without cancelling child calls."""
+        """Close local workflow state without cancelling child calls."""
         with self._lock():
             self._close_runtime()
-            OUT_VOLUME.commit()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
         execution_run_id = UUID(self.execution_run_id)

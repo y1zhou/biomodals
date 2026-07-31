@@ -1950,7 +1950,6 @@ def run_ppiflow_rosetta_worker(
         request_id: str,
         result: AppRunResult,
     ) -> None:
-        ROSETTA_OUTPUT_VOLUME.commit()
         coordinator.complete_task.remote(
             provider_call_id,
             assignment.task_key,
@@ -1964,9 +1963,9 @@ def run_ppiflow_rosetta_worker(
         claim=claim,
         execute=execute,
         complete=complete,
+        checkpoint_batch=ROSETTA_OUTPUT_VOLUME.commit,
         max_parallel=max_parallel,
     )
-    ROSETTA_OUTPUT_VOLUME.commit()
     return asdict(summary)
 
 

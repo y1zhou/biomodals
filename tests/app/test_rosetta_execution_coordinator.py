@@ -183,7 +183,8 @@ def test_root_run_uses_staged_request_and_remote_ledger(
     assert snapshot.run.predecessor_execution_run_id is None
     assert snapshot.run.plan == request.execution_plan
     assert len(FakeRuntime.created) == 1
-    assert volume.commits == 1
+    coordinator.close()
+    assert volume.commits == 0
     assert coordinator.status() == snapshot
 
 

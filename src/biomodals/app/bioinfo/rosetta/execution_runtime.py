@@ -141,8 +141,12 @@ class RosettaExecutionRuntime:
         self.store.close()
 
     def attach(self) -> None:
-        """Open and verify this Run for concurrent worker callbacks."""
-        self._initialize()
+        """Open and verify this Run without refreshing worker publications."""
+        self._initialize(reload_output=False)
+
+    def refresh_publications(self) -> None:
+        """Refresh worker publications and verify this Run."""
+        self._initialize(reload_output=True)
 
     def claim_pull_tasks(
         self,
@@ -216,7 +220,6 @@ class RosettaExecutionRuntime:
 
     def advance_once(self) -> None:
         """Apply one result-driven recovery and greedy admission cycle."""
-        self._reload_output()
         self._recover_publications()
         self._reconcile_nodes_and_run()
         run = self.store.execution.get_run(self.execution_run_id)
@@ -267,8 +270,9 @@ class RosettaExecutionRuntime:
             self._admit_pull_workers(set(required))
         self._reconcile_nodes_and_run()
 
-    def _initialize(self):
-        self._reload_output()
+    def _initialize(self, *, reload_output: bool = True):
+        if reload_output:
+            self._reload_output()
         repository = self.store.execution
         try:
             existing = repository.get_run(self.execution_run_id)
@@ -283,7 +287,7 @@ class RosettaExecutionRuntime:
                     max_active_gpu_provider_calls=0,
                     now=self._now(),
                 )
-            return self._checkpoint()
+            return repository
         if (
             existing.plan != self.request.execution_plan
             or existing.predecessor_execution_run_id
@@ -308,7 +312,6 @@ class RosettaExecutionRuntime:
                     observation,
                     now=self._now(),
                 )
-            self._checkpoint()
             return
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             return
@@ -344,7 +347,6 @@ class RosettaExecutionRuntime:
                     observation,
                     now=self._now(),
                 )
-        self._checkpoint()
 
     def _node_observation(self) -> AvailabilityStatus:
         try:
@@ -392,16 +394,20 @@ class RosettaExecutionRuntime:
         return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
+        publication_may_have_changed = False
         for call in self.store.execution.list_provider_calls(self.execution_run_id):
             if call.status.is_terminal:
                 continue
             self._provider.repository = self.store.execution
-            self._provider.reconcile_provider_call(
+            updated = self._provider.reconcile_provider_call(
                 call.provider_call_id,
                 encode_result=_result_envelope,
                 result_already_satisfied=call.node_key not in required,
                 now=self._now(),
             )
+            publication_may_have_changed |= updated.status.is_terminal
+        if publication_may_have_changed:
+            self._reload_output()
 
     def _start_ready_node(self) -> None:
         repository = self.store.execution
@@ -447,7 +453,6 @@ class RosettaExecutionRuntime:
                     observation,
                     now=self._now(),
                 )
-        self._checkpoint()
 
     def _admit_pull_workers(self, required: set[str]) -> None:
         if ROSETTA_TASKS_NODE not in required:

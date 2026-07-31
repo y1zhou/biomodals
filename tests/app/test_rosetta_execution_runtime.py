@@ -34,11 +34,15 @@ DEPLOYMENT = DeploymentIdentity("main", "Rosetta", 7)
 
 
 class FakeVolume:
+    def __init__(self) -> None:
+        self.commits = 0
+        self.reloads = 0
+
     def commit(self) -> None:
-        pass
+        self.commits += 1
 
     def reload(self) -> None:
-        pass
+        self.reloads += 1
 
 
 class RecordingDriver:
@@ -137,6 +141,39 @@ def _publish_assignment(runtime, assignment) -> dict[str, object]:
         task_fingerprint=assignment.task_fingerprint,
         run_command=run_command,
     )
+
+
+def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, RecordingDriver())
+
+    runtime._initialize()
+
+    output = cast(FakeVolume, runtime.output_volume)
+    assert output.reloads == 1
+    assert output.commits == 0
+    runtime.attach()
+    runtime.attach()
+    assert output.reloads == 1
+    runtime.refresh_publications()
+    assert output.reloads == 2
+    runtime.close()
+
+
+def test_running_provider_poll_does_not_synchronize_the_output_volume(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path, RecordingDriver())
+    runtime._initialize()
+    runtime.advance_once()
+    output = cast(FakeVolume, runtime.output_volume)
+    commits = output.commits
+    reloads = output.reloads
+
+    runtime.advance_once()
+
+    assert output.commits == commits
+    assert output.reloads == reloads
+    runtime.close()
 
 
 def test_workers_claim_disjoint_microbatches_and_complete_each_task(

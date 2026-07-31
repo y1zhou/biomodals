@@ -145,7 +145,6 @@ class BoltzGenExecutionRuntime:
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._reload_output()
         self._recover_publications()
         self._reconcile_nodes_and_run()
         run = self.store.execution.get_run(self.execution_run_id)
@@ -216,7 +215,7 @@ class BoltzGenExecutionRuntime:
                     ),
                     now=self._now(),
                 )
-            return self._checkpoint()
+            return repository
         if (
             existing.plan != plan
             or existing.predecessor_execution_run_id
@@ -255,7 +254,6 @@ class BoltzGenExecutionRuntime:
                         now=self._now(),
                     )
                     observations[node_key] = observation
-            repository = self._checkpoint()
             if any(
                 observation == AvailabilityStatus.UNKNOWN for _, observation in observed
             ):
@@ -324,7 +322,6 @@ class BoltzGenExecutionRuntime:
                         observation,
                         now=self._now(),
                     )
-        self._checkpoint()
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         try:
@@ -399,16 +396,20 @@ class BoltzGenExecutionRuntime:
         return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
+        publication_may_have_changed = False
         for call in self.store.execution.list_provider_calls(self.execution_run_id):
             if call.status.is_terminal:
                 continue
             self._provider.repository = self.store.execution
-            self._provider.reconcile_provider_call(
+            updated = self._provider.reconcile_provider_call(
                 call.provider_call_id,
                 encode_result=_result_envelope,
                 result_already_satisfied=call.node_key not in required,
                 now=self._now(),
             )
+            publication_may_have_changed |= updated.status.is_terminal
+        if publication_may_have_changed:
+            self._reload_output()
 
     def _start_ready_nodes(self) -> None:
         repository = self.store.execution
@@ -434,7 +435,6 @@ class BoltzGenExecutionRuntime:
                     tuple(item.plan for item in planned),
                     now=self._now(),
                 )
-            repository = self._checkpoint()
             observations = tuple(
                 self._task_observation(node_key, item, record.fingerprint)
                 for item, record in zip(planned, records, strict=True)
@@ -452,7 +452,6 @@ class BoltzGenExecutionRuntime:
                         observation,
                         now=self._now(),
                     )
-            self._checkpoint()
 
     def _planned_tasks(self, node_key: str) -> tuple[_PlannedTask, ...]:
         if node_key == DESIGN_RUNS_NODE:

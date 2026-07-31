@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
+import pytest
+
 from biomodals.app.design.boltzgen.execution_contracts import (
     boltzgen_run_root,
     write_boltzgen_task_publication,
@@ -52,6 +54,8 @@ class RecordingCallDriver:
         self.spawns: list[dict[str, object]] = []
         self.cancelled: set[str] = set()
         self.state_unknown = False
+        self.succeeded = False
+        self.on_success: Any = None
 
     def resolve(self, binding):
         return binding
@@ -71,6 +75,13 @@ class RecordingCallDriver:
             return ModalCallObservation(ModalCallObservationKind.CANCELLED)
         if self.state_unknown:
             return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
+        if self.succeeded:
+            if self.on_success is not None:
+                self.on_success()
+            return ModalCallObservation(
+                ModalCallObservationKind.SUCCEEDED,
+                result={"path": "result"},
+            )
         return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
     def cancel(self, provider_call_handle_id: str) -> None:
@@ -142,6 +153,71 @@ def _publish_run(
         final.parent,
         task_fingerprint=_task_fingerprint(request, run_id),
     )
+
+
+def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+
+    runtime._initialize()
+
+    output = cast(FakeVolume, runtime.output_volume)
+    assert output.reloads == 1
+    assert output.commits == 0
+    runtime.close()
+
+
+def test_running_provider_poll_does_not_synchronize_the_output_volume(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime._initialize()
+    runtime.advance_once()
+    output = cast(FakeVolume, runtime.output_volume)
+    commits = output.commits
+    reloads = output.reloads
+
+    runtime.advance_once()
+
+    assert output.commits == commits
+    assert output.reloads == reloads
+    runtime.close()
+
+
+def test_provider_publication_is_reloaded_after_success_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request(run_ids=("run-a",))
+    driver = RecordingCallDriver()
+    runtime = _runtime(tmp_path, request=request, driver=driver)
+    runtime._initialize()
+    runtime.advance_once()
+    publication_ready = False
+
+    def make_publication_ready() -> None:
+        nonlocal publication_ready
+        publication_ready = True
+
+    original_reload = runtime._reload_output
+
+    def reload_output() -> None:
+        original_reload()
+        if publication_ready:
+            _publish_run(tmp_path, request, "run-a")
+
+    driver.on_success = make_publication_ready
+    driver.succeeded = True
+    monkeypatch.setattr(runtime, "_reload_output", reload_output)
+
+    runtime.advance_once()
+
+    task = runtime.store.execution.get_task(
+        RUN_ID,
+        DESIGN_RUNS_NODE,
+        "run-a",
+    )
+    assert task.status.value == "succeeded"
+    runtime.close()
 
 
 def test_missing_runs_are_admitted_once_as_independent_gpu_calls(

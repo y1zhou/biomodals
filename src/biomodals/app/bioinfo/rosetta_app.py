@@ -141,7 +141,6 @@ def run_rosetta_worker(
         request_id: str,
         result: dict[str, object],
     ) -> None:
-        CONF.output_volume.commit()
         coordinator.complete_task.remote(
             provider_call_id,
             assignment.task_key,
@@ -155,9 +154,9 @@ def run_rosetta_worker(
         claim=claim,
         execute=execute,
         complete=complete,
+        checkpoint_batch=CONF.output_volume.commit,
         max_parallel=max_parallel,
     )
-    CONF.output_volume.commit()
     return asdict(summary)
 
 
@@ -304,12 +303,10 @@ class ExecutionCoordinator:
 
     @modal.exit()
     def exit(self) -> None:
-        """Checkpoint state without cancelling attached workers."""
+        """Close local state without cancelling attached workers."""
         adapter = getattr(self, "_coordinator_adapter", None)
         if adapter is not None:
             adapter.close()
-        else:
-            CONF.output_volume.commit()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
         return (

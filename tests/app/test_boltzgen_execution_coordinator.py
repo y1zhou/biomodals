@@ -223,6 +223,20 @@ def _terminal_predecessor(
     return str(preclaim.call.provider_call_id)
 
 
+def test_close_does_not_checkpoint_unchanged_state(tmp_path: Path) -> None:
+    volume = FakeVolume()
+    coordinator = _coordinator(
+        tmp_path,
+        volume,
+        execution_run_id=PREDECESSOR_ID,
+        deployment=DEPLOYMENT,
+    )
+
+    coordinator.close()
+
+    assert volume.commits == 0
+
+
 def test_restart_links_successor_and_preserves_scientific_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

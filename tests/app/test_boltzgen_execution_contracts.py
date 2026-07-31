@@ -104,6 +104,7 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
         )
 
     assert "call-1" in claim_store.values.values()
+    assert volume.commits == 0
 
     def finish(*args, **kwargs):
         del args, kwargs
@@ -127,6 +128,49 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
         task_fingerprint="b" * 64,
     )
     assert "call-1" in claim_store.values.values()
+    assert volume.commits == 2
+
+
+def test_collection_commits_artifacts_before_its_publication_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publication_path = Path("example/results/fingerprint.json")
+    marker = tmp_path / publication_path
+    commit_states: list[bool] = []
+    volume = SimpleNamespace(
+        reload=lambda: None,
+        commit=lambda: commit_states.append(marker.is_file()),
+    )
+    monkeypatch.setattr(
+        boltzgen_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=volume,
+            output_volume_mountpoint=str(tmp_path),
+            output_volume_name="outputs",
+        ),
+    )
+    run_dir = tmp_path / "example" / "outputs" / "run-a"
+    final = run_dir / "final_ranked_designs"
+    final.mkdir(parents=True)
+    (final / "results_overview.pdf").write_bytes(b"pdf")
+    task_fingerprint = "a" * 64
+    write_boltzgen_task_publication(
+        run_dir,
+        task_fingerprint=task_fingerprint,
+    )
+
+    result = boltzgen_app.collect_boltzgen_data.get_raw_f()(
+        run_name="example",
+        run_ids=["run-a"],
+        task_fingerprints={"run-a": task_fingerprint},
+        filter_results=False,
+        publication_path=publication_path.as_posix(),
+    )
+
+    assert result["status"] == "complete"
+    assert commit_states == [False, True]
 
 
 def test_worker_rejects_output_outside_the_mounted_volume(

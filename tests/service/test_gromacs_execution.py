@@ -154,6 +154,16 @@ class UnknownInitialPublicationAdapter(FakeGromacsExecutionAdapter):
         raise RuntimeError("Modal Volume upload failed")
 
 
+class BrokenObservationAdapter(FakeGromacsExecutionAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observe_count = 0
+
+    async def observe(self, provider_call_handle_id):
+        self.observe_count += 1
+        raise RuntimeError("GROMACS adapter crashed while observing Modal")
+
+
 def _store(tmp_path: Path) -> tuple[ServiceStore, UUID]:
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
@@ -561,5 +571,46 @@ def test_infrastructure_publication_failure_suspends_run(
             snapshot = repository.snapshot(RUN_ID)
         assert snapshot.run.status == RunStatus.SUSPENDED
         assert snapshot.run.status_reason == RunStatusReason.COORDINATOR_ERROR
+
+    asyncio.run(scenario())
+
+
+def test_unexpected_coordinator_error_suspends_without_replacing_call(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = BrokenObservationAdapter()
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 240)).__next__,
+        )
+
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+        with store.execution_repository() as repository:
+            attached = repository.list_provider_calls(RUN_ID)
+        assert len(attached) == 1
+        assert attached[0].status == ProviderCallStatus.ATTACHED
+
+        adapter.begin_wave()
+        try:
+            await coordinator.advance(JOB_ID)
+        except RuntimeError as exc:
+            assert str(exc) == "GROMACS adapter crashed while observing Modal"
+        else:
+            raise AssertionError("coordinator application error should remain visible")
+
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+        assert snapshot.run.status == RunStatus.SUSPENDED
+        assert snapshot.run.status_reason == RunStatusReason.COORDINATOR_ERROR
+        assert snapshot.provider_calls == attached
+        assert adapter.observe_count == 1
+
+        await coordinator.reconcile()
+        assert adapter.observe_count == 1
 
     asyncio.run(scenario())

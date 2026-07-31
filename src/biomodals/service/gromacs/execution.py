@@ -155,6 +155,16 @@ class GromacsExecutionCoordinator:
             self._project_terminal_or_running_job(job, run.status)
 
     async def advance(self, job_id: UUID) -> None:
+        """Advance one Job and suspend unexpected coordinator failures."""
+        try:
+            await self._advance(job_id)
+        except ModalDefiniteSubmissionError:
+            raise
+        except Exception as exc:
+            self._suspend_after_coordinator_error(job_id, exc)
+            raise
+
+    async def _advance(self, job_id: UUID) -> None:
         """Reconcile existing calls, admit one ready wave, and publish results."""
         archive: FinalArchive | None = None
         clear_staged_input = False
@@ -275,6 +285,33 @@ class GromacsExecutionCoordinator:
                 self._complete_job(job, archive)
             else:
                 self._project_terminal_or_running_job(job, snapshot.run.status)
+
+    def _suspend_after_coordinator_error(
+        self,
+        job_id: UUID,
+        error: Exception,
+    ) -> None:
+        """Best-effort persistence without masking the coordinator exception."""
+        try:
+            job = self.store.get_job_by_id(job_id)
+            if job is None or job.execution_run_id is None:
+                return
+            with self.store.execution_repository() as repository:
+                run = repository.get_run(job.execution_run_id)
+                if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+                    return
+                repository.transition_run(
+                    job.execution_run_id,
+                    RunStatus.SUSPENDED,
+                    reason=RunStatusReason.COORDINATOR_ERROR,
+                    message=str(error) or type(error).__name__,
+                    now=self._now(),
+                )
+        except Exception:
+            LOGGER.exception(
+                "Could not persist coordinator suspension for GROMACS job %s",
+                job_id,
+            )
 
     async def _recover_node_publications(
         self,

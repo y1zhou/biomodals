@@ -442,11 +442,29 @@ def test_app_run_uses_inherited_output_streams(
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
 
-    result = runner.invoke(app, ["app", "run", "rosetta", "--", "--example"])
+    result = runner.invoke(
+        app,
+        ["app", "run", "rosetta", "--development", "--", "--example"],
+    )
 
     assert result.exit_code == 0
     assert calls["command"][-1] == "--example"
     assert calls["kwargs"]["output_mode"] == "inherit"
+
+
+def test_uncoordinated_app_requires_explicit_development_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointApp(),
+    )
+
+    result = runner.invoke(app, ["app", "run", "rosetta", "--", "--example"])
+
+    assert result.exit_code == 1
+    assert "does not expose a deployment coordinator" in result.output
+    assert "--development" in result.output
 
 
 def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(

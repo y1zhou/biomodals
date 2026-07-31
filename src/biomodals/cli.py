@@ -472,10 +472,7 @@ def run_modal_app(
         bool,
         typer.Option(
             "--development",
-            help=(
-                "Run coordinator-aware apps from current source without "
-                "cross-command recovery."
-            ),
+            help=("Run an app from current source without cross-command recovery."),
         ),
     ] = False,
     environment: Annotated[
@@ -522,6 +519,24 @@ def run_modal_app(
     app = _load_entry("app", app_name_or_path)
     coordinator_flags: list[str] = []
     coordinated_entrypoint = _coordinated_app_entrypoint(app)
+    if (
+        modal_mode != "shell"
+        and app._entrypoint is not None
+        and coordinated_entrypoint is None
+        and not development
+    ):
+        console.print(
+            "[bold red]Error[/bold red] This app entrypoint does not expose a "
+            "deployment coordinator. Rerun with --development for explicit "
+            "source-backed execution."
+        )
+        raise typer.Exit(code=1)
+    if development and (version is not None or deployment_name is not None):
+        console.print(
+            "[bold red]Error[/bold red] --version and --deployment-name are "
+            "unavailable in source-backed development mode"
+        )
+        raise typer.Exit(code=1)
     if modal_mode != "shell" and coordinated_entrypoint is not None and not development:
         try:
             resolved_deployment_name = deployment_name or _app_deployment_name(app)
@@ -555,7 +570,7 @@ def run_modal_app(
         console.print(f"[bold red]Error[/bold red] {message}")
         raise typer.Exit(code=1)
     elif coordinated_entrypoint is None and (
-        development or version is not None or deployment_name is not None
+        version is not None or deployment_name is not None
     ):
         console.print(
             "[bold red]Error[/bold red] Deployment coordinator options require "

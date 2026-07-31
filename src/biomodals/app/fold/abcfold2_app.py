@@ -16,18 +16,33 @@
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.abcfold2_execution import (
+    ABCFold2ExecutionCoordinator,
+    ABCFold2ExecutionRequest,
+    load_execution_request_from_volume,
+    run_config_from_snapshot,
+    stage_execution_request,
+)
+from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    deployed_execution_coordinator,
+    development_modal_call_driver,
+)
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import package_outputs
-from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -127,14 +142,13 @@ runtime_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
-
-
-def _optional_int(value: object) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int | str):
-        return int(value)
-    raise TypeError(f"Expected integer-like value, got {type(value).__name__}")
+ABCFOLD2_OUTPUT_CLAIMS = modal.Dict.from_name(
+    f"{CONF.name}-output-claims",
+    create_if_missing=True,
+)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_abcfold2_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
+_DEFAULT_MAX_ACTIVE_PROVIDER_CALLS = 64
 
 
 ##########################################
@@ -315,6 +329,126 @@ def prepare_abcfold2(
     return conf
 
 
+def _archive_path(workdir: str | Path, model_name: str) -> Path:
+    """Return one model branch's stable archive publication path."""
+    return Path(workdir) / f"{model_name}_models.tar.zst"
+
+
+def _publication_dir(workdir: str | Path) -> Path:
+    return Path(workdir) / ".biomodals"
+
+
+def _model_publication_key(model_name: str, run_conf: dict[str, object]) -> str:
+    """Identify model outputs whose upstream run ID intentionally omits seeds."""
+    payload = {
+        "model": model_name,
+        "run_id": run_conf.get("run_id"),
+        "seeds": run_conf.get("seeds"),
+        "num_trunk_recycles": run_conf.get("num_trunk_recycles"),
+        "num_diffn_timesteps": run_conf.get("num_diffn_timesteps"),
+        "num_diffn_samples": run_conf.get("num_diffn_samples"),
+        "num_trunk_samples": run_conf.get("num_trunk_samples"),
+        "boltz_additional_cli_args": run_conf.get("boltz_additional_cli_args"),
+        "abcfold2_version": CONF.repo_commit_hash or CONF.version,
+        "model_version": (
+            BoltzConf.repo_commit_hash or BoltzConf.version
+            if model_name == "boltz"
+            else ChaiConf.repo_commit_hash or ChaiConf.version
+        ),
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _archive_ready(
+    workdir: str | Path,
+    model_name: str,
+    publication_key: str,
+) -> bool:
+    """Return whether a complete atomic archive publication exists."""
+    path = _archive_path(workdir, model_name)
+    marker_path = _publication_dir(workdir) / f"{model_name}-archive.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        path.is_file()
+        and path.stat().st_size > 0
+        and marker.get("publication_key") == publication_key
+        and marker.get("archive_path") == str(path)
+        and marker.get("size") == path.stat().st_size
+    )
+
+
+def _seed_ready(
+    workdir: str | Path,
+    model_name: str,
+    seed: int,
+    publication_key: str,
+) -> bool:
+    """Return whether a worker published one complete model seed."""
+    model_dir = Path(workdir) / f"{model_name}_models"
+    directory = (
+        model_dir / f"boltz_results_seed-{seed}"
+        if model_name == "boltz"
+        else model_dir / f"chai_seed-{seed}"
+    )
+    marker_path = _publication_dir(workdir) / f"{model_name}-seed-{seed}.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        directory.is_dir()
+        and marker.get("publication_key") == publication_key
+        and marker.get("result_path") == str(directory)
+    )
+
+
+def _write_publication_marker(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_archive(
+    workdir: Path,
+    model_name: str,
+    content: bytes,
+    publication_key: str,
+) -> dict[str, str | int]:
+    """Atomically publish one bounded provider result into the output volume."""
+    path = _archive_path(workdir, model_name)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    digest = sha256(content).hexdigest()
+    _write_publication_marker(
+        _publication_dir(workdir) / f"{model_name}-archive.json",
+        {
+            "publication_key": publication_key,
+            "archive_path": str(path),
+            "size": len(content),
+            "sha256": digest,
+        },
+    )
+    CONF.output_volume.commit()
+    return {
+        "archive_path": str(path),
+        "size": len(content),
+        "sha256": digest,
+    }
+
+
 @app.function(
     cpu=(0.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
@@ -324,8 +458,9 @@ def prepare_abcfold2(
 )
 def collect_abcfold2_boltz_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
-):
-    """Manage Boltz runs and return all Boltz results."""
+    publication_key: str,
+) -> dict[str, str | int]:
+    """Package completed Boltz seed results into the output volume."""
     from pathlib import Path
 
     work_path = Path(str(run_conf["workdir"])).expanduser().resolve()
@@ -337,34 +472,8 @@ def collect_abcfold2_boltz_data(
     if not boltz_conf_path.exists():
         raise FileNotFoundError(f"Boltz config file not found: {boltz_conf_path}")
 
-    raw_random_seeds = run_conf.get("seeds", [])
-    random_seeds = (
-        [int(seed) for seed in raw_random_seeds]
-        if isinstance(raw_random_seeds, list)
-        else ([] if raw_random_seeds is None else [int(raw_random_seeds)])
-    )
-    seeds_to_run: list[int] = []
-    for seed in random_seeds:
-        boltz_run_dir = work_path / f"boltz_results_seed-{seed}"
-        if not boltz_run_dir.exists():
-            seeds_to_run.append(seed)
-
-    max_parallel = _optional_int(run_conf.get("max_parallel_children"))
-    if seeds_to_run:
-
-        def run_seed(seed: int) -> str:
-            return run_abcfold2_boltz.remote(seed, **run_conf)
-
-        for boltz_run_dir in bounded_map(
-            seeds_to_run,
-            run_seed,
-            max_parallel=max_parallel,
-        ):
-            print(f"Boltz run complete: {boltz_run_dir}")
-
-    CONF.output_volume.reload()
     print("💊 Packaging Boltz results...")
-    boltz_tarball_bytes = package_outputs(
+    archive = package_outputs(
         work_path,
         tar_args=[
             "--exclude",
@@ -377,7 +486,12 @@ def collect_abcfold2_boltz_data(
             "msa",
         ],
     )
-    return boltz_tarball_bytes
+    return _publish_archive(
+        Path(str(run_conf["workdir"])),
+        "boltz",
+        archive,
+        publication_key,
+    )
 
 
 @app.function(
@@ -395,6 +509,7 @@ def run_abcfold2_boltz(
     num_diffn_timesteps: int,  # sampling_steps
     num_diffn_samples: int,  # diffusion_samples
     boltz_additional_cli_args: list[str] | None,
+    publication_key: str,
     **kwargs,  # ignore extra items from run config
 ) -> str:
     """Run Boltz with the given ABCFold2 configuration."""
@@ -418,6 +533,13 @@ def run_abcfold2_boltz(
         num_diffn_samples=num_diffn_samples,
         boltz_additional_cli_args=boltz_additional_cli_args,
     )
+    _write_publication_marker(
+        _publication_dir(workdir) / f"boltz-seed-{seed}.json",
+        {
+            "publication_key": publication_key,
+            "result_path": str(boltz_run_dir),
+        },
+    )
     CONF.output_volume.commit()
     return str(boltz_run_dir)
 
@@ -431,8 +553,9 @@ def run_abcfold2_boltz(
 )
 def collect_abcfold2_chai_data(
     run_conf: dict[str, str | list[int] | int | list[str] | None],
-):
-    """Manage Chai runs and return all Chai results."""
+    publication_key: str,
+) -> dict[str, str | int]:
+    """Package completed Chai seed results into the output volume."""
     from pathlib import Path
 
     work_path = Path(str(run_conf["workdir"])).expanduser().resolve()
@@ -444,35 +567,14 @@ def collect_abcfold2_chai_data(
     if not chai_conf_path.exists():
         raise FileNotFoundError(f"Chai config file not found: {chai_conf_path}")
 
-    raw_random_seeds = run_conf.get("seeds", [])
-    random_seeds = (
-        [int(seed) for seed in raw_random_seeds]
-        if isinstance(raw_random_seeds, list)
-        else ([] if raw_random_seeds is None else [int(raw_random_seeds)])
-    )
-    seeds_to_run: list[int] = []
-    for seed in random_seeds:
-        chai_run_dir = work_path / f"chai_seed-{seed}"
-        if not chai_run_dir.exists():
-            seeds_to_run.append(seed)
-
-    max_parallel = _optional_int(run_conf.get("max_parallel_children"))
-    if seeds_to_run:
-
-        def run_seed(seed: int) -> str:
-            return run_abcfold2_chai.remote(seed, **run_conf)
-
-        for chai_run_dir in bounded_map(
-            seeds_to_run,
-            run_seed,
-            max_parallel=max_parallel,
-        ):
-            print(f"Chai run complete: {chai_run_dir}")
-
-    CONF.output_volume.reload()
     print("💊 Packaging Chai results...")
-    chai_tarball_bytes = package_outputs(work_path)
-    return chai_tarball_bytes
+    archive = package_outputs(work_path)
+    return _publish_archive(
+        Path(str(run_conf["workdir"])),
+        "chai",
+        archive,
+        publication_key,
+    )
 
 
 @app.function(
@@ -490,6 +592,7 @@ def run_abcfold2_chai(
     num_diffn_timesteps: int,
     num_diffn_samples: int,
     num_trunk_samples: int,
+    publication_key: str,
     **kwargs,  # ignore extra items from run config
 ) -> str:
     """Run Chai with the given ABCFold2 configuration."""
@@ -518,12 +621,184 @@ def run_abcfold2_chai(
         num_diffn_samples=num_diffn_samples,
         num_trunk_samples=num_trunk_samples,
     )
+    _write_publication_marker(
+        _publication_dir(workdir) / f"chai-seed-{seed}.json",
+        {
+            "publication_key": publication_key,
+            "result_path": str(chai_run_dir),
+        },
+    )
     CONF.output_volume.commit()
     return str(chai_run_dir)
 
 
 ##########################################
-# Entrypoint for ephemeral usage
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=CONF.timeout,
+    max_containers=1,
+    volumes=CONF.mounts(output_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with ABCFold2 functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh output state before accepting lifecycle methods."""
+        self._coordinator_adapter = None
+        self._development = None
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionSnapshot:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionSnapshot:
+        """Read this Run's durable kernel snapshot."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionSnapshot:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionSnapshot:
+        """Resume this Run without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> ExecutionSnapshot:
+        """Create and drive one compatible Successor Run."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        max_active_provider_calls: int,
+    ) -> ExecutionSnapshot:
+        """Create a compatible Successor while inferring predecessor identity."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=max_active_provider_calls,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return (
+            UUID(self.execution_run_id),
+            DeploymentIdentity(
+                self.deployment_environment,
+                self.deployment_name,
+                self.deployment_version,
+            ),
+        )
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> ABCFold2ExecutionCoordinator:
+        adapter = getattr(self, "_coordinator_adapter", None)
+        selected_mode = getattr(self, "_development", None)
+        if adapter is not None:
+            if development is not None and selected_mode != development:
+                raise ValueError("Coordinator execution mode cannot change in place")
+            return adapter
+        execution_run_id, deployment = self._identity()
+        selected_mode = False if development is None else development
+        adapter = ABCFold2ExecutionCoordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=Path(CONF.output_volume_mountpoint),
+            output_volume=CONF.output_volume,
+            output_claims=ABCFOLD2_OUTPUT_CLAIMS,
+            modal_driver=_coordinator_modal_driver(development=selected_mode),
+        )
+        self._coordinator_adapter = adapter
+        self._development = selected_mode
+        return adapter
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "prepare_abcfold2": prepare_abcfold2,
+            "download_boltz_models": download_boltz_models,
+            "download_chai_models": download_chai_models,
+            "run_abcfold2_boltz": run_abcfold2_boltz,
+            "collect_abcfold2_boltz_data": collect_abcfold2_boltz_data,
+            "run_abcfold2_chai": run_abcfold2_chai,
+            "collect_abcfold2_chai_data": collect_abcfold2_chai_data,
+        },
+        workload_name="ABCFold2",
+    )
+
+
+def _execution_coordinator_handle(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    use_deployed_coordinator: bool,
+):
+    """Resolve this run's exact deployed or current-source coordinator."""
+    if use_deployed_coordinator:
+        return deployed_execution_coordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+        )
+    return ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment=deployment.environment,
+        deployment_name=deployment.deployment_name,
+        deployment_version=deployment.deployment_version,
+    )
+
+
+##########################################
+# Local entrypoint client
 ##########################################
 @app.local_entrypoint()
 def submit_abcfold2_task(
@@ -537,6 +812,11 @@ def submit_abcfold2_task(
     run_boltz: bool = True,
     run_chai: bool = True,
     max_parallel_children: int | None = None,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run ABCFold2 on modal and fetch results to `out_dir`.
 
@@ -560,18 +840,61 @@ def submit_abcfold2_task(
         run_chai: Whether to run Chai inference.
         max_parallel_children: Maximum number of child inference containers to
             run at once in each ABCFold2 coordinator.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            Biomodals CLI supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
-    import json
-    from pathlib import Path
-
-    # Load input and find its hash
     yaml_path = Path(input_yaml).expanduser().resolve()
-    yaml_str = yaml_path.read_bytes()
-
-    if run_name is None:
-        run_name = yaml_path.stem
-    if not search_templates:
-        run_name = f"{run_name}-no-tmpl"
+    if not yaml_path.is_file():
+        raise FileNotFoundError(f"ABCFold2 YAML not found: {yaml_path}")
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    predecessor_request = (
+        None
+        if predecessor_execution_run_id is None
+        else load_execution_request_from_volume(
+            CONF.output_volume,
+            predecessor_execution_run_id,
+        )
+    )
+    if predecessor_request is None:
+        run_name = run_name or yaml_path.stem
+        if not search_templates:
+            run_name = f"{run_name}-no-tmpl"
+        capacity = (
+            _DEFAULT_MAX_ACTIVE_PROVIDER_CALLS
+            if max_parallel_children is None
+            else max_parallel_children
+        )
+        request = ABCFold2ExecutionRequest(
+            run_name=run_name,
+            yaml_content=yaml_path.read_bytes(),
+            msa_chains=msa_chains,
+            search_templates=search_templates,
+            download_models=download_models,
+            force_redownload=force_redownload,
+            run_boltz=run_boltz,
+            run_chai=run_chai,
+            max_active_provider_calls=capacity,
+            app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+            boltz_version=(
+                BoltzConf.repo_commit_hash or BoltzConf.version or "unknown"
+            ),
+            chai_version=ChaiConf.repo_commit_hash or ChaiConf.version or "unknown",
+        )
+    else:
+        capacity = (
+            predecessor_request.max_active_provider_calls
+            if max_parallel_children is None
+            else max_parallel_children
+        )
+        request = replace(
+            predecessor_request,
+            max_active_provider_calls=capacity,
+        )
+        run_name = request.run_name
 
     local_out_dir = (
         Path(out_dir) / run_name if out_dir is not None else Path.cwd() / run_name
@@ -579,53 +902,65 @@ def submit_abcfold2_task(
     if local_out_dir.exists():
         raise FileExistsError(f"Output directory already exists: {local_out_dir}")
 
-    print("🧬 Starting ABCFold2 run...")
-    run_conf = prepare_abcfold2.remote(
-        yaml_str=yaml_str, search_templates=search_templates, msa_chains=msa_chains
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
     )
-    run_conf["max_parallel_children"] = max_parallel_children
+    if predecessor_execution_run_id is None:
+        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(development=not use_deployed_coordinator)
+    else:
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            workload_plan_fingerprint=(
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            max_active_provider_calls=request.max_active_provider_calls,
+        )
+    print(f"Execution Run ID: {execution_run_id}")
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
+    )
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    snapshot = call.get()
+    if snapshot.run.status != RunStatus.SUCCEEDED:
+        diagnostic = snapshot.run.status_message or (
+            snapshot.run.status_reason.value
+            if snapshot.run.status_reason is not None
+            else snapshot.run.status.value
+        )
+        raise RuntimeError(
+            f"{CONF.name} Execution Run ended as "
+            f"{snapshot.run.status.value}: {diagnostic}"
+        )
+
+    run_conf = run_config_from_snapshot(snapshot)
     local_out_dir.mkdir(parents=True, exist_ok=True)
-    with open(local_out_dir / "run-config.json", "w") as f:
-        json.dump(run_conf, f, indent=2)
-
-    if download_models:
-        print("🧬 Checking Boltz inference dependencies...")
-        download_boltz_models.remote(force=force_redownload)
-
-        print("🧬 Checking Chai inference dependencies...")
-        download_chai_models.remote(force=force_redownload)
-
-    # Run Boltz for each seed
-    inference_jobs: list[tuple[str, Path]] = []
-    if run_boltz:
-        out_path = local_out_dir / "boltz_models.tar.zst"
-        print(f"🧬 Running Boltz and collecting results to {out_path}")
-        inference_jobs.append(("boltz", out_path))
-
-    # Run Chai for each seed
-    if run_chai:
-        out_path = local_out_dir / "chai_models.tar.zst"
-        print(f"🧬 Running Chai and collecting results to {out_path}")
-        inference_jobs.append(("chai", out_path))
-
-    if not inference_jobs:
-        print("🧬 No inference tasks specified, exiting...")
-        return
-
-    def run_inference_job(job: tuple[str, Path]) -> tuple[Path, bytes]:
-        model_name, out_path = job
-        if model_name == "boltz":
-            data = collect_abcfold2_boltz_data.remote(run_conf=run_conf)
-        else:
-            data = collect_abcfold2_chai_data.remote(run_conf=run_conf)
-        return out_path, data
-
-    for out_path, data in bounded_map(
-        inference_jobs,
-        run_inference_job,
-        max_parallel=max_parallel_children,
+    local_run_conf = run_conf.as_kwargs()
+    local_run_conf["max_parallel_children"] = max_parallel_children
+    (local_out_dir / "run-config.json").write_text(
+        json.dumps(local_run_conf, indent=2),
+        encoding="utf-8",
+    )
+    for model_name, enabled in (
+        ("boltz", request.run_boltz),
+        ("chai", request.run_chai),
     ):
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(data)
+        if not enabled:
+            continue
+        remote_path = _archive_path(run_conf.workdir, model_name)
+        relative_path = remote_path.relative_to(CONF.output_volume_mountpoint)
+        data = b"".join(CONF.output_volume.read_file(relative_path.as_posix()))
+        (local_out_dir / remote_path.name).write_bytes(data)
 
     print(f"🧬 ABCFold2 run complete! Results saved to {local_out_dir}")

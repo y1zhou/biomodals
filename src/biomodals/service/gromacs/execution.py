@@ -17,6 +17,8 @@ from biomodals.execution import (
     RunStatus,
     RunStatusReason,
     TaskStatus,
+    required_node_keys,
+    result_probe_frontier,
 )
 from biomodals.execution.modal import (
     ModalCallObservation,
@@ -165,15 +167,36 @@ class GromacsExecutionCoordinator:
             execution_run_id = job.execution_run_id
 
             with self.store.async_execution_runtime(self.adapter) as runtime:
+                archive = await self._recover_node_publications(runtime, job)
+                required = self._required_nodes(runtime, execution_run_id)
+                if required is None:
+                    runtime.checkpoint()
+                    snapshot = runtime.repository.snapshot(execution_run_id)
+                    self._project_terminal_or_running_job(job, snapshot.run.status)
+                    return
+
+                calls_to_cancel = runtime.repository.prune_unrequired_nodes(
+                    execution_run_id,
+                    required_node_keys=required,
+                    now=self._now(),
+                )
+                runtime.checkpoint()
+                for provider_call_id in calls_to_cancel:
+                    await runtime.request_provider_call_cancellation(
+                        provider_call_id,
+                        now=self._now(),
+                    )
+
                 calls_to_observe = tuple(
-                    call.provider_call_id
+                    (call.provider_call_id, call.node_key not in required)
                     for call in runtime.repository.list_provider_calls(execution_run_id)
                     if not call.status.is_terminal
                 )
-                for provider_call_id in calls_to_observe:
+                for provider_call_id, result_already_satisfied in calls_to_observe:
                     await runtime.reconcile_provider_call(
                         provider_call_id,
                         encode_result=_result_envelope,
+                        result_already_satisfied=result_already_satisfied,
                         now=self._now(),
                     )
 
@@ -189,16 +212,20 @@ class GromacsExecutionCoordinator:
 
                 run = runtime.repository.get_run(execution_run_id)
                 if run.status in {RunStatus.PENDING, RunStatus.RUNNING}:
-                    self._start_ready_nodes(runtime, execution_run_id)
-                    runtime.checkpoint()
-                    archive = await self._run_result_publication(
+                    self._start_ready_nodes(
                         runtime,
-                        job,
+                        execution_run_id,
+                        required=required,
+                    )
+                    runtime.checkpoint()
+                    archive = archive or await self._run_result_publication(
+                        runtime, job
                     )
                     try:
                         await self._submit_ready_remote_tasks(
                             runtime,
                             job,
+                            required=required,
                         )
                     except ModalDefiniteSubmissionError:
                         self._reconcile_running_nodes(runtime, execution_run_id)
@@ -248,6 +275,143 @@ class GromacsExecutionCoordinator:
                 self._complete_job(job, archive)
             else:
                 self._project_terminal_or_running_job(job, snapshot.run.status)
+
+    async def _recover_node_publications(
+        self,
+        runtime: AsyncExecutionRuntime,
+        job: JobRecord,
+    ) -> FinalArchive | None:
+        """Probe GROMACS results backward before discovering any Tasks."""
+        execution_run_id = job.execution_run_id
+        if execution_run_id is None:
+            return None
+        run = runtime.repository.get_run(execution_run_id)
+        observations: dict[str, AvailabilityStatus | None] = {}
+        for node in runtime.repository.list_nodes(execution_run_id):
+            if node.status == NodeStatus.SUCCEEDED:
+                observations[node.node_key] = AvailabilityStatus.AVAILABLE
+            elif node.status.is_terminal:
+                observations[node.node_key] = AvailabilityStatus.MISSING
+            elif (
+                node.result_observation == AvailabilityStatus.UNKNOWN
+                and run.status in {RunStatus.PENDING, RunStatus.RUNNING}
+            ):
+                observations[node.node_key] = None
+            elif self._local_result_needs_recovery(
+                runtime,
+                execution_run_id,
+                node.node_key,
+            ):
+                observations[node.node_key] = None
+            else:
+                observations[node.node_key] = node.result_observation
+
+        archive: FinalArchive | None = None
+        while frontier := result_probe_frontier(run.plan, observations):
+            observed: list[tuple[str, AvailabilityStatus]] = []
+            for node_key in frontier:
+                if node_key != PREPARE_RESULT:
+                    observation = AvailabilityStatus.MISSING
+                else:
+                    recovering_local_result = self._local_result_needs_recovery(
+                        runtime,
+                        execution_run_id,
+                        node_key,
+                    )
+                    try:
+                        archive = await self.adapter.recover_archive(job)
+                    except ArchiveNotReadyError:
+                        observation = AvailabilityStatus.MISSING
+                        if recovering_local_result:
+                            runtime.repository.record_task_result_observation(
+                                execution_run_id,
+                                PREPARE_RESULT,
+                                "operation",
+                                observation,
+                                now=self._now(),
+                            )
+                    except (
+                        GromacsResultInvalidError,
+                        ResultIdentityMismatchError,
+                        ValueError,
+                    ) as exc:
+                        observation = AvailabilityStatus.MISSING
+                        if recovering_local_result:
+                            self._fail_result_task(
+                                runtime,
+                                execution_run_id,
+                                str(exc),
+                            )
+                            observations[node_key] = observation
+                            continue
+                    except Exception:
+                        observation = AvailabilityStatus.UNKNOWN
+                    else:
+                        observation = AvailabilityStatus.AVAILABLE
+                        if recovering_local_result:
+                            self._complete_result_task(runtime, execution_run_id)
+                            observations[node_key] = observation
+                            continue
+                observed.append((node_key, observation))
+
+            for node_key, observation in observed:
+                runtime.repository.record_node_result_observation(
+                    execution_run_id,
+                    node_key,
+                    observation,
+                    now=self._now(),
+                )
+                observations[node_key] = observation
+            runtime.checkpoint()
+            if any(
+                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
+            ):
+                return None
+        return archive
+
+    def _local_result_needs_recovery(
+        self,
+        runtime: AsyncExecutionRuntime,
+        execution_run_id: UUID,
+        node_key: str,
+    ) -> bool:
+        """Return whether interrupted local publication must be revalidated."""
+        if node_key != PREPARE_RESULT:
+            return False
+        node = runtime.repository.get_node(execution_run_id, node_key)
+        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+            return False
+        task = runtime.repository.get_task(
+            execution_run_id,
+            node_key,
+            "operation",
+        )
+        return (
+            task.status == TaskStatus.RUNNING
+            and task.local_owned
+            and task.provider_call_id is None
+            and task.worker_provider_call_id is None
+        )
+
+    def _required_nodes(
+        self,
+        runtime: AsyncExecutionRuntime,
+        execution_run_id: UUID,
+    ) -> set[str] | None:
+        """Return the result-driven GROMACS repair closure."""
+        observations: dict[str, AvailabilityStatus] = {}
+        for node in runtime.repository.list_nodes(execution_run_id):
+            if node.status == NodeStatus.SUCCEEDED:
+                observations[node.node_key] = AvailabilityStatus.AVAILABLE
+            elif node.result_observation is not None:
+                observations[node.node_key] = node.result_observation
+            else:
+                observations[node.node_key] = AvailabilityStatus.MISSING
+        required = required_node_keys(
+            runtime.repository.get_run(execution_run_id).plan,
+            observations,
+        )
+        return None if required is None else set(required)
 
     def _decode_completed_calls(
         self,
@@ -307,11 +471,15 @@ class GromacsExecutionCoordinator:
         self,
         runtime: AsyncExecutionRuntime,
         execution_run_id: UUID,
+        *,
+        required: set[str],
     ) -> None:
         run = runtime.repository.get_run(execution_run_id)
         nodes = runtime.repository.list_nodes(execution_run_id)
         statuses = {node.node_key: node.status for node in nodes}
         for node_key in ready_node_keys(run.plan, statuses):
+            if node_key not in required:
+                continue
             runtime.repository.start_node(
                 execution_run_id,
                 node_key,
@@ -349,42 +517,6 @@ class GromacsExecutionCoordinator:
         )
         if task.status == TaskStatus.SUCCEEDED:
             return None
-        if (
-            task.status == TaskStatus.RUNNING
-            and task.local_owned
-            and task.provider_call_id is None
-            and task.worker_provider_call_id is None
-        ):
-            try:
-                archive = await self.adapter.recover_archive(job)
-            except ArchiveNotReadyError:
-                runtime.repository.record_task_result_observation(
-                    execution_run_id,
-                    PREPARE_RESULT,
-                    "operation",
-                    AvailabilityStatus.MISSING,
-                    now=self._now(),
-                )
-            except (
-                GromacsResultInvalidError,
-                ResultIdentityMismatchError,
-                ValueError,
-            ) as exc:
-                self._fail_result_task(runtime, execution_run_id, str(exc))
-                return None
-            except Exception:
-                runtime.repository.record_task_result_observation(
-                    execution_run_id,
-                    PREPARE_RESULT,
-                    "operation",
-                    AvailabilityStatus.UNKNOWN,
-                    now=self._now(),
-                )
-                runtime.checkpoint()
-                raise
-            else:
-                self._complete_result_task(runtime, execution_run_id)
-                return archive
         if not runtime.repository.acquire_local_task(
             execution_run_id,
             PREPARE_RESULT,
@@ -463,6 +595,8 @@ class GromacsExecutionCoordinator:
         self,
         runtime: AsyncExecutionRuntime,
         job: JobRecord,
+        *,
+        required: set[str],
     ) -> None:
         execution_run_id = job.execution_run_id
         if execution_run_id is None:
@@ -472,12 +606,16 @@ class GromacsExecutionCoordinator:
         unfinished = {node.node_key for node in nodes if not node.status.is_terminal}
         ranks = required_node_ranks(
             run.plan,
-            required_node_keys=set(run.plan.node_keys),
+            required_node_keys=required,
             unfinished_node_keys=unfinished,
         )
         descriptors: list[TaskDispatchDescriptor] = []
         for node in nodes:
-            if node.node_key == PREPARE_RESULT or node.status != NodeStatus.RUNNING:
+            if (
+                node.node_key not in required
+                or node.node_key == PREPARE_RESULT
+                or node.status != NodeStatus.RUNNING
+            ):
                 continue
             for task in runtime.repository.list_tasks(
                 execution_run_id,

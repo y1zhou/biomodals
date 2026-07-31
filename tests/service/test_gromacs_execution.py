@@ -7,7 +7,9 @@ from pathlib import Path
 from uuid import UUID
 
 from biomodals.execution import (
+    AvailabilityStatus,
     DeploymentIdentity,
+    NodeStatus,
     ProviderCallStatus,
     RunStatus,
     RunStatusReason,
@@ -43,6 +45,7 @@ class FakeGromacsExecutionAdapter:
         self._calls: dict[str, str] = {}
         self.publish_count = 0
         self.recover_count = 0
+        self.archive_published = False
 
     def begin_wave(self) -> None:
         self._current_wave = []
@@ -69,6 +72,7 @@ class FakeGromacsExecutionAdapter:
 
     async def publish_archive(self, job, *, completed_at):
         self.publish_count += 1
+        self.archive_published = True
         return self._archive(job)
 
     def _archive(self, job):
@@ -84,6 +88,8 @@ class FakeGromacsExecutionAdapter:
 
     async def recover_archive(self, job):
         self.recover_count += 1
+        if not self.archive_published:
+            raise ArchiveNotReadyError("published archive is missing")
         return self._archive(job)
 
     async def cleanup_intermediates(self, job):
@@ -101,6 +107,7 @@ class PublishedBeforeInterruptionAdapter(FakeGromacsExecutionAdapter):
 
     async def publish_archive(self, job, *, completed_at):
         self.publish_count += 1
+        self.archive_published = True
         if self._interrupt_publication:
             self._interrupt_publication = False
             raise CoordinatorInterrupted
@@ -110,6 +117,8 @@ class PublishedBeforeInterruptionAdapter(FakeGromacsExecutionAdapter):
 class InvalidPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
     async def recover_archive(self, job):
         self.recover_count += 1
+        if not self.archive_published:
+            raise ArchiveNotReadyError("published archive is missing")
         raise GromacsResultInvalidError("published archive is corrupt")
 
 
@@ -122,6 +131,8 @@ class MissingPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
 class UnknownPublicationOnRecoveryAdapter(PublishedBeforeInterruptionAdapter):
     async def recover_archive(self, job):
         self.recover_count += 1
+        if not self.archive_published:
+            raise ArchiveNotReadyError("published archive is missing")
         raise RuntimeError("Modal Volume could not be inspected")
 
 
@@ -208,6 +219,11 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
                     "prepare_tpr_gpu"
                 ]
                 assert running.operations[0].modal_call_id == "fc-0"
+                with store.execution_repository() as repository:
+                    assert all(
+                        node.result_observation == AvailabilityStatus.MISSING
+                        for node in repository.list_nodes(RUN_ID)
+                    )
 
         assert adapter.spawn_waves == [
             ["prepare_tpr_gpu"],
@@ -249,6 +265,44 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
     asyncio.run(scenario())
 
 
+def test_existing_archive_prunes_every_stage_before_task_discovery(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, user_id = _store(tmp_path)
+        _admit(store, user_id)
+        adapter = FakeGromacsExecutionAdapter()
+        adapter.archive_published = True
+        coordinator = GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(110, 180)).__next__,
+        )
+
+        adapter.begin_wave()
+        await coordinator.advance(JOB_ID)
+
+        with store.execution_repository() as repository:
+            snapshot = repository.snapshot(RUN_ID)
+            tasks_by_node = tuple(
+                repository.list_tasks(RUN_ID, node.node_key) for node in snapshot.nodes
+            )
+        assert snapshot.run.status == RunStatus.SUCCEEDED
+        assert snapshot.provider_calls == ()
+        assert snapshot.nodes[-1].node_key == "prepare_result"
+        assert snapshot.nodes[-1].status == NodeStatus.SUCCEEDED
+        assert all(node.status.is_terminal for node in snapshot.nodes)
+        assert all(tasks == () for tasks in tasks_by_node)
+        assert adapter.spawn_waves == [[]]
+        assert adapter.recover_count == 1
+        assert adapter.publish_count == 0
+        job = store.get_job_by_id(JOB_ID)
+        assert job is not None
+        assert job.state == JobState.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
 def test_replacement_coordinator_recovers_published_local_result(
     tmp_path: Path,
 ) -> None:
@@ -279,7 +333,7 @@ def test_replacement_coordinator_recovers_published_local_result(
         await coordinator.advance(JOB_ID)
 
         assert adapter.publish_count == 1
-        assert adapter.recover_count == 1
+        assert adapter.recover_count == 2
         with store.execution_repository() as repository:
             assert repository.snapshot(RUN_ID).run.status == RunStatus.SUCCEEDED
         job = store.get_job_by_id(JOB_ID)
@@ -319,7 +373,7 @@ def test_conclusive_local_result_recovery_failure_terminates_run(
         await coordinator.advance(JOB_ID)
 
         assert adapter.publish_count == 1
-        assert adapter.recover_count == 1
+        assert adapter.recover_count == 2
         with store.execution_repository() as repository:
             snapshot = repository.snapshot(RUN_ID)
         assert snapshot.run.status == RunStatus.FAILED
@@ -358,7 +412,7 @@ def test_missing_local_result_is_republished_after_interruption(
         await coordinator.advance(JOB_ID)
 
         assert adapter.publish_count == 2
-        assert adapter.recover_count == 1
+        assert adapter.recover_count == 2
         with store.execution_repository() as repository:
             assert repository.snapshot(RUN_ID).run.status == RunStatus.SUCCEEDED
 
@@ -390,15 +444,10 @@ def test_inconclusive_local_result_recovery_suspends_run(
             raise AssertionError("publication should simulate coordinator loss")
 
         adapter.begin_wave()
-        try:
-            await coordinator.advance(JOB_ID)
-        except RuntimeError as exc:
-            assert str(exc) == "Modal Volume could not be inspected"
-        else:
-            raise AssertionError("inconclusive recovery should remain visible")
+        await coordinator.advance(JOB_ID)
 
         assert adapter.publish_count == 1
-        assert adapter.recover_count == 1
+        assert adapter.recover_count == 2
         with store.execution_repository() as repository:
             snapshot = repository.snapshot(RUN_ID)
         assert snapshot.run.status == RunStatus.SUSPENDED
@@ -430,7 +479,7 @@ def test_conclusive_initial_publication_failure_terminates_run(
         await coordinator.advance(JOB_ID)
 
         assert adapter.publish_count == 1
-        assert adapter.recover_count == 0
+        assert adapter.recover_count == 1
         with store.execution_repository() as repository:
             snapshot = repository.snapshot(RUN_ID)
         assert snapshot.run.status == RunStatus.FAILED

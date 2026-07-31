@@ -30,18 +30,33 @@
 import os
 import shlex
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.protenix_execution import (
+    ProtenixExecutionCoordinator,
+    ProtenixExecutionRequest,
+    ProtenixMsaTaskSpec,
+    ProtenixPreparationPlan,
+    load_execution_request_from_volume,
+    stage_execution_request,
+)
+from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    deployed_execution_coordinator,
+    development_modal_call_driver,
+)
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
     MODEL_VOLUME,
     MSA_CACHE_VOLUME,
-    MSA_CACHE_VOLUME_NAME,
 )
 from biomodals.helper.io import (
     build_local_output_path,
@@ -53,7 +68,6 @@ from biomodals.helper.shell import (
     run_command,
 )
 from biomodals.helper.structure import struct2seq
-from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
 ##########################################
@@ -85,6 +99,7 @@ class AppInfo:
 
     # Volume for preprocessed MSA/template intermediates (MSA_CACHE_VOLUME)
     msa_cache_volume_subdir: str = f"/{CONF.name}"
+    msa_cache_mountpoint: str = "/msa-cache"
 
     # Base URL for downloading checkpoints and data caches
     # https://github.com/bytedance/Protenix/blob/main/protenix/web_service/dependency_url.py
@@ -142,6 +157,120 @@ runtime_image = (
     .pipe(patch_image_for_helper)
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+PROTENIX_OUTPUT_CLAIMS = modal.Dict.from_name(
+    f"{CONF.name}-output-claims",
+    create_if_missing=True,
+)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_protenix_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
+_DEFAULT_MAX_ACTIVE_PROVIDER_CALLS = 64
+
+
+def _msa_task_marker_path(task: ProtenixMsaTaskSpec) -> Path:
+    return Path(task.output_dir) / f".{task.task_key}.complete.json"
+
+
+def _msa_task_ready(task: ProtenixMsaTaskSpec) -> bool:
+    """Return whether one query published its expected updated JSON."""
+    import orjson
+
+    expected = Path(task.expected_json_path)
+    try:
+        marker = orjson.loads(_msa_task_marker_path(task).read_bytes())
+    except (OSError, orjson.JSONDecodeError):
+        return False
+    return (
+        expected.is_file()
+        and expected.stat().st_size > 0
+        and isinstance(marker, dict)
+        and marker.get("publication_key") == task.publication_key
+        and marker.get("expected_json_path") == str(expected)
+        and marker.get("size") == expected.stat().st_size
+    )
+
+
+def _prepared_marker_path(plan: ProtenixPreparationPlan) -> Path:
+    return Path(plan.prepared_json_path).with_suffix(".complete.json")
+
+
+def _prepared_ready(plan: ProtenixPreparationPlan) -> bool:
+    """Return whether all searched tasks were assembled into prepared JSON."""
+    import orjson
+
+    path = Path(plan.prepared_json_path)
+    try:
+        marker = orjson.loads(_prepared_marker_path(plan).read_bytes())
+    except (OSError, orjson.JSONDecodeError):
+        return False
+    return (
+        path.is_file()
+        and path.stat().st_size > 0
+        and isinstance(marker, dict)
+        and marker.get("preparation_key") == plan.preparation_key
+        and marker.get("size") == path.stat().st_size
+    )
+
+
+def _result_path(result_key: str, run_name: str) -> Path:
+    return (
+        Path(CONF.output_volume_mountpoint)
+        / "cache"
+        / result_key[:2]
+        / result_key
+        / f"{run_name}.tar.zst"
+    )
+
+
+def _result_ready(result_key: str, run_name: str) -> bool:
+    """Return whether one atomic result archive matches its completion marker."""
+    import orjson
+
+    path = _result_path(result_key, run_name)
+    marker_path = path.with_suffix(f"{path.suffix}.complete.json")
+    try:
+        marker = orjson.loads(marker_path.read_bytes())
+    except (OSError, orjson.JSONDecodeError):
+        return False
+    return (
+        path.is_file()
+        and path.stat().st_size > 0
+        and isinstance(marker, dict)
+        and marker.get("result_key") == result_key
+        and marker.get("size") == path.stat().st_size
+    )
+
+
+def _publish_result(
+    result_key: str,
+    run_name: str,
+    content: bytes,
+) -> dict[str, str | int]:
+    """Atomically publish one result archive and its completion evidence."""
+    import orjson
+
+    path = _result_path(result_key, run_name)
+    _atomic_write(path, content)
+    digest = sha256(content).hexdigest()
+    _atomic_write(
+        path.with_suffix(f"{path.suffix}.complete.json"),
+        orjson.dumps({
+            "result_key": result_key,
+            "size": len(content),
+            "sha256": digest,
+        }),
+    )
+    CONF.output_volume.commit()
+    return {"result_path": str(path), "size": len(content), "sha256": digest}
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 ##########################################
@@ -201,29 +330,31 @@ def download_protenix_data(
 @app.function(
     timeout=CONF.timeout,
     volumes={
-        MSA_CACHE_VOLUME_NAME: MSA_CACHE_VOLUME.with_mount_options(
+        APP_INFO.msa_cache_mountpoint: MSA_CACHE_VOLUME.with_mount_options(
             sub_path=APP_INFO.msa_cache_volume_subdir
         )
     },
 )
-def query_protenix_msa_server(
-    query_command: str, input_json_path: str, output_dir: str, msa_server_mode: str
-) -> None:
+def query_protenix_msa_server(task: ProtenixMsaTaskSpec) -> None:
     """Query the Protenix remote MSA server with the given command."""
+    import orjson
     from uniaf3.schema import ProtenixConfig
+
+    if _msa_task_ready(task):
+        return
 
     cmd = [
         "protenix",
-        query_command,
-        f"--input={input_json_path}",
-        f"--out_dir={output_dir}",
-        f"--msa_server_mode={msa_server_mode}",
+        task.query_command,
+        f"--input={task.input_json_path}",
+        f"--out_dir={task.output_dir}",
+        f"--msa_server_mode={task.msa_server_mode}",
     ]
     run_command(cmd)
 
     # Move the searched files out of the run_name subdir such that future
     # runs with different names could hit the same cache
-    out_path = Path(output_dir)
+    out_path = Path(task.output_dir)
     msa_out_dir = next(out_path.glob("*/msa"))
     run_name_dir = msa_out_dir.parent
     run_name = run_name_dir.name
@@ -241,8 +372,8 @@ def query_protenix_msa_server(
 
     for conf_json in out_path.glob(f"{run_name}-*.json"):
         conf = ProtenixConfig.from_file(conf_json)
-        for task in conf.root:
-            for seq in task.sequences:
+        for updated_task in conf.root:
+            for seq in updated_task.sequences:
                 if seq.proteinChain is not None:
                     seq.proteinChain.unpairedMsaPath = _get_new_location(
                         seq.proteinChain.unpairedMsaPath
@@ -257,25 +388,35 @@ def query_protenix_msa_server(
         conf.to_files(out_path, conf_json.stem)
 
     run_name_dir.rmdir()
+    expected = Path(task.expected_json_path)
+    if not expected.is_file() or expected.stat().st_size == 0:
+        raise FileNotFoundError(f"Expected MSA output not found: {expected}")
+    _atomic_write(
+        _msa_task_marker_path(task),
+        orjson.dumps({
+            "publication_key": task.publication_key,
+            "expected_json_path": str(expected),
+            "size": expected.stat().st_size,
+        }),
+    )
     MSA_CACHE_VOLUME.commit()
 
 
 @app.function(
     timeout=CONF.timeout,
     volumes={
-        MSA_CACHE_VOLUME_NAME: MSA_CACHE_VOLUME.with_mount_options(
+        APP_INFO.msa_cache_mountpoint: MSA_CACHE_VOLUME.with_mount_options(
             sub_path=APP_INFO.msa_cache_volume_subdir
         )
     },
 )
-def prepare_protenix_inputs(
+def plan_protenix_inputs(
     input_bytes: bytes,
     msa_server_mode: str = "protenix",
     use_template: bool = False,
     use_rna_msa: bool = False,
-    max_parallel_msa: int | None = None,
-) -> bytes:
-    """Run CPU preprocessing and cache prepared JSON + search outputs in a volume."""
+) -> ProtenixPreparationPlan:
+    """Discover content-addressed per-input MSA/template Tasks."""
     from tempfile import mkdtemp
 
     from uniaf3.schema import ProtenixConfig
@@ -302,11 +443,9 @@ def prepare_protenix_inputs(
         case _:
             raise ValueError("RNA MSA without templates is not supported")
 
-    # Load protein and RNA sequences from input JSON
     conf = ProtenixConfig.from_file(tmp_json_path)
-    msa_inputs: list[tuple[str, str, str, str]] = []
-    output_dirs: list[str] = []
-    for task in conf.root:
+    tasks: list[ProtenixMsaTaskSpec] = []
+    for task_idx, task in enumerate(conf.root):
         protein_seqs: list[str] = []
         rna_seqs: list[str] = []
         for seq in task.sequences:
@@ -321,48 +460,116 @@ def prepare_protenix_inputs(
             else hash_string(":".join(protein_seqs))
         )
         cache_dir = (
-            Path(MSA_CACHE_VOLUME_NAME) / msa_server_mode / hash_key[:2] / hash_key
+            Path(APP_INFO.msa_cache_mountpoint)
+            / msa_server_mode
+            / hash_key[:2]
+            / hash_key
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
-        output_dirs.append(str(cache_dir))
 
-        # Skip run if expected output is already cached for this input
         task_name = task.name
-        if (cache_dir / f"{task_name}-{updated_suffix}.json").exists():
-            continue
-
         ProtenixConfig([task]).to_files(cache_dir, task_name)
-        MSA_CACHE_VOLUME.commit()
-        msa_inputs.append((
-            protenix_command,
-            f"{cache_dir}/{task_name}.json",
-            str(cache_dir),
-            msa_server_mode,
-        ))
-
-    bounded_map(
-        msa_inputs,
-        lambda args: query_protenix_msa_server.remote(*args),
-        max_parallel=max_parallel_msa,
-    )
-    MSA_CACHE_VOLUME.reload()
-
-    # Add the MSA paths back to the input JSON
-    for task_idx, task in enumerate(conf.root):
-        task_name = task.name
-        cache_dir = Path(output_dirs[task_idx])
-        updated_suffix = (
-            "update-msa" if not (use_template or use_rna_msa) else "final-updated"
+        input_json_path = cache_dir / f"{task_name}.json"
+        expected_json_path = cache_dir / f"{task_name}-{updated_suffix}.json"
+        publication_key = hash_string(
+            "\n".join((
+                CONF.repo_commit_hash or CONF.version or "unknown",
+                protenix_command,
+                msa_server_mode,
+                sha256(input_json_path.read_bytes()).hexdigest(),
+            ))
         )
-        updated_json_path = cache_dir / f"{task_name}-{updated_suffix}.json"
-        if not updated_json_path.exists():
+        tasks.append(
+            ProtenixMsaTaskSpec(
+                task_key=f"{task_idx:04d}-{task_name}",
+                input_name=task_name,
+                query_command=protenix_command,
+                input_json_path=str(input_json_path),
+                output_dir=str(cache_dir),
+                msa_server_mode=msa_server_mode,
+                expected_json_path=str(expected_json_path),
+                publication_key=publication_key,
+            )
+        )
+
+    preparation_key = hash_string(
+        "\n".join((
+            CONF.repo_commit_hash or CONF.version or "unknown",
+            sha256(input_bytes).hexdigest(),
+            msa_server_mode,
+            str(use_template),
+            str(use_rna_msa),
+        ))
+    )
+    prepared_json_path = (
+        Path(APP_INFO.msa_cache_mountpoint)
+        / "prepared"
+        / preparation_key[:2]
+        / preparation_key
+        / "input.json"
+    )
+    MSA_CACHE_VOLUME.commit()
+    return ProtenixPreparationPlan(
+        preparation_key=preparation_key,
+        prepared_json_path=str(prepared_json_path),
+        tasks=tuple(tasks),
+    )
+
+
+@app.function(
+    timeout=CONF.timeout,
+    volumes={
+        APP_INFO.msa_cache_mountpoint: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        )
+    },
+)
+def finalize_protenix_inputs(
+    input_bytes: bytes,
+    plan: ProtenixPreparationPlan,
+) -> dict[str, str | int]:
+    """Assemble completed MSA Tasks into one prepared input publication."""
+    from tempfile import mkdtemp
+
+    import orjson
+    from uniaf3.schema import ProtenixConfig
+
+    MSA_CACHE_VOLUME.reload()
+    if _prepared_ready(plan):
+        path = Path(plan.prepared_json_path)
+        return {"prepared_json_path": str(path), "size": path.stat().st_size}
+
+    tmpdir = Path(mkdtemp(prefix="protenix_finalize_"))
+    input_path = tmpdir / "input.json"
+    input_path.write_bytes(input_bytes)
+    conf = ProtenixConfig.from_file(input_path)
+    if len(conf.root) != len(plan.tasks):
+        raise ValueError("Protenix preparation plan does not match its input")
+
+    for task_idx, task in enumerate(conf.root):
+        if task.name != plan.tasks[task_idx].input_name:
+            raise ValueError("Protenix preparation task order changed")
+        updated_json_path = Path(plan.tasks[task_idx].expected_json_path)
+        if not _msa_task_ready(plan.tasks[task_idx]):
             raise FileNotFoundError(
                 f"Expected MSA output not found: {updated_json_path}"
             )
         updated_conf = ProtenixConfig.from_file(updated_json_path)
         conf.root[task_idx] = updated_conf.root[0]
 
-    return conf.to_json().encode()
+    content = conf.to_json().encode()
+    path = Path(plan.prepared_json_path)
+    _atomic_write(path, content)
+    _atomic_write(
+        _prepared_marker_path(plan),
+        orjson.dumps({
+            "preparation_key": plan.preparation_key,
+            "size": len(content),
+            "sha256": sha256(content).hexdigest(),
+        }),
+    )
+    MSA_CACHE_VOLUME.commit()
+    return {"prepared_json_path": str(path), "size": len(content)}
 
 
 @app.function(
@@ -370,16 +577,18 @@ def prepare_protenix_inputs(
     cpu=(1.125, 16.125),  # burst for tar compression
     memory=(1024, 65536),  # reserve 1GB, OOM at 64GB
     timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(model_volume=True)
+    volumes=CONF.mounts(model_volume=True, output_volume=True)
     | {
-        MSA_CACHE_VOLUME_NAME: MSA_CACHE_VOLUME.with_mount_options(
+        APP_INFO.msa_cache_mountpoint: MSA_CACHE_VOLUME.with_mount_options(
             sub_path=APP_INFO.msa_cache_volume_subdir
         )
     },
 )
 def run_protenix(
-    input_bytes: bytes,
+    input_bytes: bytes | None,
     run_name: str,
+    result_key: str,
+    prepared_input_path: str | None = None,
     model_name: str = "protenix_base_default_v1.0.0",
     seeds: str = "101",
     cycle: int = 10,
@@ -394,13 +603,14 @@ def run_protenix(
     use_fast_layernorm: bool = True,
     extra_args: str | None = None,
     score_only: bool = False,
-) -> bytes:
+) -> dict[str, str | int]:
     """Run Protenix structure prediction or confidence scoring.
 
     Args:
         input_bytes: Input JSON for prediction, or PDB/CIF in `score_only` mode.
         run_name: Name for this run (used for output directory).
-        prep_cache_key: Cache key from a prior prepare_protenix_inputs call.
+        result_key: Content address for the published result archive.
+        prepared_input_path: Optional prepared JSON in the MSA cache volume.
         model_name: Model checkpoint name.
         seeds: Comma-separated random seeds.
         cycle: Pairformer cycle number.
@@ -418,11 +628,16 @@ def run_protenix(
             ``protenixscore score`` instead of running diffusion prediction.
 
     Returns:
-        Tarball bytes of inference outputs (CIF files + confidence JSONs)
-        or scoring outputs when score_only is True.
+        Metadata for the published inference or scoring result archive.
 
     """
     from tempfile import mkdtemp
+
+    if prepared_input_path is not None:
+        MSA_CACHE_VOLUME.reload()
+        input_bytes = Path(prepared_input_path).read_bytes()
+    if input_bytes is None:
+        raise ValueError("Protenix input bytes or prepared input path is required")
 
     run_env = os.environ.copy()
     if use_fast_layernorm:
@@ -465,7 +680,7 @@ def run_protenix(
         input_seqs = struct2seq(input_file)
         cache_key = hash_string(":".join(x[1] for x in input_seqs))
         score_msa_cache_dir = (
-            Path(MSA_CACHE_VOLUME_NAME)
+            Path(APP_INFO.msa_cache_mountpoint)
             / "score"
             / msa_server_mode
             / cache_key[:2]
@@ -497,7 +712,7 @@ def run_protenix(
         MSA_CACHE_VOLUME.commit()
         print("💊 Packaging ProtenixScore results...")
         tarball_bytes = package_outputs(out_dir)
-        return tarball_bytes
+        return _publish_result(result_key, run_name, tarball_bytes)
 
     # --- Prediction mode ---
     input_json_path = tmpdir_path / f"{run_name}.json"
@@ -533,11 +748,181 @@ def run_protenix(
     # Package outputs
     print("💊 Packaging Protenix results...")
     tarball_bytes = package_outputs(out_dir)
-    return tarball_bytes
+    return _publish_result(result_key, run_name, tarball_bytes)
 
 
 ##########################################
-# Entrypoint for ephemeral usage
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=CONF.timeout,
+    max_containers=1,
+    volumes=CONF.mounts(output_volume=True)
+    | {
+        APP_INFO.msa_cache_mountpoint: MSA_CACHE_VOLUME.with_mount_options(
+            sub_path=APP_INFO.msa_cache_volume_subdir
+        )
+    },
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with Protenix functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh mounted state before accepting lifecycle methods."""
+        self._coordinator_adapter = None
+        self._development = None
+        self._identity()
+        CONF.output_volume.reload()
+        MSA_CACHE_VOLUME.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionSnapshot:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionSnapshot:
+        """Read this Run's durable kernel snapshot."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionSnapshot:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionSnapshot:
+        """Resume this Run without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> ExecutionSnapshot:
+        """Create and drive one compatible Successor Run."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        max_active_provider_calls: int,
+    ) -> ExecutionSnapshot:
+        """Create a compatible Successor while inferring predecessor identity."""
+        return self._adapter().restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=max_active_provider_calls,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return (
+            UUID(self.execution_run_id),
+            DeploymentIdentity(
+                self.deployment_environment,
+                self.deployment_name,
+                self.deployment_version,
+            ),
+        )
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> ProtenixExecutionCoordinator:
+        adapter = getattr(self, "_coordinator_adapter", None)
+        selected_mode = getattr(self, "_development", None)
+        if adapter is not None:
+            if development is not None and selected_mode != development:
+                raise ValueError("Coordinator execution mode cannot change in place")
+            return adapter
+        execution_run_id, deployment = self._identity()
+        selected_mode = False if development is None else development
+        adapter = ProtenixExecutionCoordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=Path(CONF.output_volume_mountpoint),
+            output_volume=CONF.output_volume,
+            msa_cache_volume=MSA_CACHE_VOLUME,
+            output_claims=PROTENIX_OUTPUT_CLAIMS,
+            modal_driver=_coordinator_modal_driver(development=selected_mode),
+        )
+        self._coordinator_adapter = adapter
+        self._development = selected_mode
+        return adapter
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "download_protenix_data": download_protenix_data,
+            "plan_protenix_inputs": plan_protenix_inputs,
+            "query_protenix_msa_server": query_protenix_msa_server,
+            "finalize_protenix_inputs": finalize_protenix_inputs,
+            "run_protenix": run_protenix,
+        },
+        workload_name="Protenix",
+    )
+
+
+def _execution_coordinator_handle(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    use_deployed_coordinator: bool,
+):
+    """Resolve this run's exact deployed or current-source coordinator."""
+    if use_deployed_coordinator:
+        return deployed_execution_coordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+        )
+    return ExecutionCoordinator(
+        execution_run_id=str(execution_run_id),
+        deployment_environment=deployment.environment,
+        deployment_name=deployment.deployment_name,
+        deployment_version=deployment.deployment_version,
+    )
+
+
+##########################################
+# Local entrypoint client
 ##########################################
 @app.local_entrypoint()
 def submit_protenix_task(
@@ -560,6 +945,11 @@ def submit_protenix_task(
     extra_args: str | None = None,
     score_only: bool = False,
     max_parallel_msa: int | None = None,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run Protenix structure prediction on Modal and fetch results to `out_dir`.
 
@@ -588,66 +978,34 @@ def submit_protenix_task(
         score_only: When True, score an existing PDB/CIF structure using
             ``protenixscore score`` instead of running prediction.
         max_parallel_msa: Maximum number of MSA search containers to run at once.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            Biomodals CLI supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
-    # Validate model name
-    if model_name not in APP_INFO.supported_models:
-        raise ValueError(
-            f"Unsupported model: {model_name}. "
-            f"Supported models: {', '.join(APP_INFO.supported_models)}"
-        )
-
-    # Validate input and output paths
     input_path = Path(input_file).expanduser().resolve()
-    if not input_path.exists():
+    if not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
-
-    if run_name is None:
-        run_name = input_path.stem
-
-    local_out_dir = resolve_local_output_dir(out_dir)
-    out_file = build_local_output_path(
-        local_out_dir,
-        run_name=run_name,
-        suffix=f"_{CONF.name}",
-    )
-
-    # Ensure models and data caches are available
-    print(f"🧬 Checking Protenix model and data caches for {model_name}...")
-    download_protenix_data.remote(
-        model_name=model_name, force=force_redownload, include_templates=use_template
-    )
-
-    input_bytes = input_path.read_bytes()
-    if score_only:
-        # Score an existing structure; MSA fetching is handled inside run_protenix
-        print(f"🧬 Scoring structure with {model_name}...")
-        tarball_bytes = run_protenix.remote(
-            input_bytes=input_bytes,
-            run_name=run_name,
-            model_name=model_name,
-            dtype=dtype,
-            use_msa=use_msa,
-            msa_server_mode="colabfold",
-            use_fast_layernorm=use_fast_layernorm,
-            score_only=True,
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    predecessor_request = (
+        None
+        if predecessor_execution_run_id is None
+        else load_execution_request_from_volume(
+            CONF.output_volume,
+            predecessor_execution_run_id,
         )
-    else:
-        # Preprocess (MSA/template) on CPU and cache in volume for reuse
-        if use_msa or use_template or use_rna_msa:
-            print("🧬 Running Protenix preprocessing and caching intermediates...")
-            input_bytes = prepare_protenix_inputs.remote(
-                input_bytes=input_bytes,
-                msa_server_mode=msa_server_mode,
-                use_template=use_template,
-                use_rna_msa=use_rna_msa,
-                max_parallel_msa=max_parallel_msa,
-            )
-
-        # Run inference
-        print(f"🧬 Running inference with {model_name}...")
-        tarball_bytes = run_protenix.remote(
-            input_bytes=input_bytes,
-            run_name=run_name,
+    )
+    if predecessor_request is None:
+        capacity = (
+            _DEFAULT_MAX_ACTIVE_PROVIDER_CALLS
+            if max_parallel_msa is None
+            else max_parallel_msa
+        )
+        request = ProtenixExecutionRequest(
+            run_name=run_name or input_path.stem,
+            input_content=input_path.read_bytes(),
             model_name=model_name,
             seeds=seeds,
             cycle=cycle,
@@ -655,14 +1013,84 @@ def submit_protenix_task(
             sample=sample,
             dtype=dtype,
             use_msa=use_msa,
-            msa_server_mode=msa_server_mode,
+            msa_server_mode=("colabfold" if score_only else msa_server_mode),
             use_template=use_template,
             use_rna_msa=use_rna_msa,
             use_tfg_guidance=use_tfg_guidance,
             use_fast_layernorm=use_fast_layernorm,
+            force_redownload=force_redownload,
             extra_args=extra_args,
+            score_only=score_only,
+            max_active_provider_calls=capacity,
+            app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+        )
+    else:
+        capacity = (
+            predecessor_request.max_active_provider_calls
+            if max_parallel_msa is None
+            else max_parallel_msa
+        )
+        request = replace(
+            predecessor_request,
+            max_active_provider_calls=capacity,
+        )
+    if request.model_name not in APP_INFO.supported_models:
+        raise ValueError(
+            f"Unsupported model: {request.model_name}. "
+            f"Supported models: {', '.join(APP_INFO.supported_models)}"
         )
 
-    # Save results locally
+    local_out_dir = resolve_local_output_dir(out_dir)
+    out_file = build_local_output_path(
+        local_out_dir,
+        run_name=request.run_name,
+        suffix=f"_{CONF.name}",
+    )
+
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
+    )
+    if predecessor_execution_run_id is None:
+        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(development=not use_deployed_coordinator)
+    else:
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            workload_plan_fingerprint=(
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            max_active_provider_calls=request.max_active_provider_calls,
+        )
+    print(f"Execution Run ID: {execution_run_id}")
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
+    )
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    snapshot = call.get()
+    if snapshot.run.status != RunStatus.SUCCEEDED:
+        diagnostic = snapshot.run.status_message or (
+            snapshot.run.status_reason.value
+            if snapshot.run.status_reason is not None
+            else snapshot.run.status.value
+        )
+        raise RuntimeError(
+            f"{CONF.name} Execution Run ended as "
+            f"{snapshot.run.status.value}: {diagnostic}"
+        )
+
+    result_path = _result_path(request.result_key, request.run_name)
+    relative_path = result_path.relative_to(CONF.output_volume_mountpoint)
+    tarball_bytes = b"".join(CONF.output_volume.read_file(relative_path.as_posix()))
     write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 Protenix run complete! Results saved to {out_file}")

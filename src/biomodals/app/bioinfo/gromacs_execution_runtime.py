@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+from stat import S_ISREG
 from typing import Any
 from uuid import UUID
 
@@ -60,6 +61,7 @@ _REQUEST_FILE = ExecutionRequestFile(
     MAX_REQUEST_BYTES,
     "GROMACS execution request",
 )
+_PUBLICATION_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -425,10 +427,138 @@ class GromacsExecutionRuntime:
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         try:
-            available = all(path.is_file() for path in self._node_paths(node_key))
+            available = self._node_publication_ready(node_key)
         except OSError:
             return AvailabilityStatus.UNKNOWN
         return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+    def _node_publication_path(self, node_key: str) -> Path:
+        marker = sha256(node_key.encode()).hexdigest() + ".json"
+        return (
+            self.request.run_root(self.output_root) / ".biomodals" / "gromacs" / marker
+        )
+
+    def _node_publication_ready(self, node_key: str) -> bool:
+        marker_path = self._node_publication_path(node_key)
+        try:
+            marker = orjson.loads(marker_path.read_bytes())
+        except (
+            FileNotFoundError,
+            IsADirectoryError,
+            NotADirectoryError,
+            orjson.JSONDecodeError,
+        ):
+            return False
+        if not (
+            isinstance(marker, dict)
+            and marker.get("schema_version") == _PUBLICATION_SCHEMA_VERSION
+            and marker.get("node_key") == node_key
+            and marker.get("workload_plan_fingerprint")
+            == self.request.execution_plan.workload_plan_fingerprint
+        ):
+            return False
+        raw_artifacts = marker.get("artifacts")
+        if not isinstance(raw_artifacts, list):
+            return False
+        root = self.request.run_root(self.output_root)
+        expected = {
+            path.relative_to(root).as_posix() for path in self._node_paths(node_key)
+        }
+        if {
+            artifact.get("path")
+            for artifact in raw_artifacts
+            if isinstance(artifact, dict)
+        } != expected:
+            return False
+        for artifact in raw_artifacts:
+            if not isinstance(artifact, dict):
+                return False
+            relative_text = artifact.get("path")
+            if not isinstance(relative_text, str):
+                return False
+            relative = PurePosixPath(relative_text)
+            if relative.is_absolute() or ".." in relative.parts:
+                return False
+            if not self._artifact_matches(
+                root.joinpath(*relative.parts),
+                artifact.get("size"),
+                artifact.get("sha256"),
+            ):
+                return False
+        return True
+
+    def _write_node_publication(self, node_key: str) -> bool:
+        root = self.request.run_root(self.output_root)
+        artifacts = []
+        try:
+            for path in self._node_paths(node_key):
+                if path.is_symlink():
+                    return False
+                stat = path.stat()
+                if not S_ISREG(stat.st_mode) or stat.st_size < 1:
+                    return False
+                artifacts.append({
+                    "path": path.relative_to(root).as_posix(),
+                    "size": stat.st_size,
+                    "sha256": self._file_sha256(path),
+                })
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        marker = self._node_publication_path(node_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
+        try:
+            temporary.write_bytes(
+                orjson.dumps(
+                    {
+                        "schema_version": _PUBLICATION_SCHEMA_VERSION,
+                        "node_key": node_key,
+                        "workload_plan_fingerprint": (
+                            self.request.execution_plan.workload_plan_fingerprint
+                        ),
+                        "artifacts": artifacts,
+                    },
+                    option=orjson.OPT_SORT_KEYS,
+                )
+            )
+            temporary.replace(marker)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
+
+    @staticmethod
+    def _artifact_matches(
+        path: Path,
+        expected_size: object,
+        expected_digest: object,
+    ) -> bool:
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 1
+            or not isinstance(expected_digest, str)
+            or len(expected_digest) != 64
+        ):
+            return False
+        try:
+            if path.is_symlink():
+                return False
+            stat = path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return (
+            S_ISREG(stat.st_mode)
+            and stat.st_size == expected_size
+            and GromacsExecutionRuntime._file_sha256(path) == expected_digest
+        )
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _node_paths(self, node_key: str) -> tuple[Path, ...]:
         root = self.request.run_root(self.output_root)
@@ -503,24 +633,36 @@ class GromacsExecutionRuntime:
 
     def _decode_completed_calls(self) -> None:
         repository = self.store.execution
+        completed = []
+        for call in repository.list_provider_calls(self.execution_run_id):
+            if call.status != ProviderCallStatus.SUCCEEDED:
+                continue
+            running_task_keys = tuple(
+                task_key
+                for task_key in call.task_keys
+                if repository.get_task(
+                    self.execution_run_id,
+                    call.node_key,
+                    task_key,
+                ).status
+                == TaskStatus.RUNNING
+            )
+            if not running_task_keys:
+                continue
+            valid = (
+                isinstance(call.result_envelope, dict)
+                and isinstance(call.result_envelope.get("remote_workdir"), str)
+                and bool(call.result_envelope["remote_workdir"])
+                and self._write_node_publication(call.node_key)
+            )
+            completed.append((
+                call,
+                running_task_keys,
+                self._node_observation(call.node_key) if valid else None,
+            ))
         with self.store.transaction():
-            for call in repository.list_provider_calls(self.execution_run_id):
-                if call.status != ProviderCallStatus.SUCCEEDED:
-                    continue
-                valid = (
-                    isinstance(call.result_envelope, dict)
-                    and isinstance(call.result_envelope.get("remote_workdir"), str)
-                    and bool(call.result_envelope["remote_workdir"])
-                )
-                observation = self._node_observation(call.node_key) if valid else None
-                for task_key in call.task_keys:
-                    task = repository.get_task(
-                        self.execution_run_id,
-                        call.node_key,
-                        task_key,
-                    )
-                    if task.status != TaskStatus.RUNNING:
-                        continue
+            for call, running_task_keys, observation in completed:
+                for task_key in running_task_keys:
                     if observation is None or observation == AvailabilityStatus.MISSING:
                         repository.fail_task(
                             self.execution_run_id,
@@ -593,6 +735,7 @@ class GromacsExecutionRuntime:
             return
         self._checkpoint()
         repository = self.store.execution
+        self._write_node_publication(PREPARE_RESULT)
         observation = self._node_observation(PREPARE_RESULT)
         with self.store.transaction():
             if observation == AvailabilityStatus.MISSING:

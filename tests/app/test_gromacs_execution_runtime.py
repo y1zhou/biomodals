@@ -19,6 +19,7 @@ from biomodals.execution.modal import (
 from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+SECOND_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 DEPLOYMENT = DeploymentIdentity("main", "Gromacs", 7)
 
 
@@ -61,18 +62,20 @@ class CompletingDriver:
     def _publish(self, function_name: str, kwargs: dict[str, object]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         if function_name.startswith("prepare_tpr_"):
-            (self.root / f"production_{self.run_name}.tpr").touch()
-            (self.root / "production.mdp").touch()
+            (self.root / f"production_{self.run_name}.tpr").write_bytes(b"tpr")
+            (self.root / "production.mdp").write_bytes(b"mdp")
             return
         if function_name.startswith("production_run_"):
-            (self.root / f"production_{self.run_name}.xtc").touch()
+            (self.root / f"production_{self.run_name}.xtc").write_bytes(b"xtc")
             return
         prefix = str(kwargs["traj_prefix"])
         for metric in ("rmsd", "rg", "rmsf"):
             for suffix in ("csv", "png"):
-                (self.root / f"{metric}_{prefix}{self.run_name}.{suffix}").touch()
+                (self.root / f"{metric}_{prefix}{self.run_name}.{suffix}").write_bytes(
+                    b"result"
+                )
         if kwargs.get("save_processed_traj"):
-            (self.root / f"{prefix}{self.run_name}_nopbc.xtc").touch()
+            (self.root / f"{prefix}{self.run_name}_nopbc.xtc").write_bytes(b"xtc")
 
 
 def _request() -> GromacsExecutionRequest:
@@ -153,3 +156,47 @@ def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None
         if name == "collect_traj_stats"
     ] == ["nvt_", "npt_", "production_"]
     runtime.close()
+
+
+def test_same_run_name_does_not_reuse_outputs_from_changed_science(
+    tmp_path: Path,
+) -> None:
+    first_request = _request()
+    first_driver = CompletingDriver(tmp_path, first_request.run_name)
+    first = GromacsExecutionRuntime(
+        request=first_request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=first_driver,
+        output_volume=FakeVolume(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+    assert first.run().run.status == RunStatus.SUCCEEDED
+    first.close()
+
+    changed_request = replace(first_request, pdb_content=b"ATOM changed\n")
+    changed_driver = CompletingDriver(tmp_path, changed_request.run_name)
+    changed = GromacsExecutionRuntime(
+        request=changed_request,
+        execution_run_id=SECOND_RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
+        modal_driver=changed_driver,
+        output_volume=FakeVolume(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 20,
+    )
+
+    assert changed.run().run.status == RunStatus.SUCCEEDED
+    assert [name for name, _kwargs in changed_driver.spawns] == [
+        "prepare_tpr_gpu",
+        "production_run_gpu",
+        "collect_traj_stats",
+        "collect_traj_stats",
+        "collect_traj_stats",
+    ]
+    changed.close()

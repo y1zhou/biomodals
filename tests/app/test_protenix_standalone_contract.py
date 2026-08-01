@@ -4,9 +4,12 @@
 
 import sys
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from uuid import UUID
+
+import orjson
 
 from biomodals.app.fold import protenix_app
 from biomodals.execution import RunStatus
@@ -25,6 +28,79 @@ class FakeVolume:
 
 def test_msa_cache_uses_an_absolute_modal_mount() -> None:
     assert Path(protenix_app.APP_INFO.msa_cache_mountpoint).is_absolute()
+
+
+def test_publication_validators_reject_same_size_corruption(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_output = tmp_path / "msa"
+    task_output.mkdir()
+    expected = task_output / "updated.json"
+    expected.write_bytes(b"{}")
+    task = protenix_app.ProtenixMsaTaskSpec(
+        task_key="task-0",
+        input_name="input",
+        query_command="msa",
+        input_json_path=str(tmp_path / "input.json"),
+        output_dir=str(task_output),
+        msa_server_mode="protenix",
+        expected_json_path=str(expected),
+        publication_key="msa-key",
+    )
+    protenix_app._atomic_write(
+        protenix_app._msa_task_marker_path(task),
+        orjson.dumps({
+            "publication_key": task.publication_key,
+            "expected_json_path": str(expected),
+            "size": 2,
+            "sha256": sha256(b"{}").hexdigest(),
+        }),
+    )
+
+    prepared = tmp_path / "prepared.json"
+    prepared.write_bytes(b"{}")
+    plan = protenix_app.ProtenixPreparationPlan(
+        preparation_key="prepared-key",
+        prepared_json_path=str(prepared),
+        tasks=(task,),
+    )
+    protenix_app._atomic_write(
+        protenix_app._prepared_marker_path(plan),
+        orjson.dumps({
+            "preparation_key": plan.preparation_key,
+            "size": 2,
+            "sha256": sha256(b"{}").hexdigest(),
+        }),
+    )
+
+    monkeypatch.setattr(
+        protenix_app,
+        "CONF",
+        SimpleNamespace(output_volume_mountpoint=str(tmp_path)),
+    )
+    result = protenix_app._result_path("result-key", "demo")
+    result.parent.mkdir(parents=True)
+    result.write_bytes(b"ab")
+    result.with_suffix(f"{result.suffix}.complete.json").write_bytes(
+        orjson.dumps({
+            "result_key": "result-key",
+            "size": 2,
+            "sha256": sha256(b"ab").hexdigest(),
+        })
+    )
+
+    assert protenix_app._msa_task_ready(task)
+    assert protenix_app._prepared_ready(plan)
+    assert protenix_app._result_ready("result-key", "demo")
+
+    expected.write_bytes(b"[]")
+    prepared.write_bytes(b"[]")
+    result.write_bytes(b"cd")
+
+    assert not protenix_app._msa_task_ready(task)
+    assert not protenix_app._prepared_ready(plan)
+    assert not protenix_app._result_ready("result-key", "demo")
 
 
 def test_planner_discovers_one_task_per_input(

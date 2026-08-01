@@ -33,6 +33,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from stat import S_ISREG
 from uuid import UUID, uuid4
 
 import modal
@@ -174,18 +175,25 @@ def _msa_task_ready(task: ProtenixMsaTaskSpec) -> bool:
     """Return whether one query published its expected updated JSON."""
     import orjson
 
-    expected = Path(task.expected_json_path)
     try:
         marker = orjson.loads(_msa_task_marker_path(task).read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
+    expected = Path(task.expected_json_path)
     return (
-        expected.is_file()
-        and expected.stat().st_size > 0
-        and isinstance(marker, dict)
+        isinstance(marker, dict)
         and marker.get("publication_key") == task.publication_key
         and marker.get("expected_json_path") == str(expected)
-        and marker.get("size") == expected.stat().st_size
+        and _publication_file_matches(
+            expected,
+            marker.get("size"),
+            marker.get("sha256"),
+        )
     )
 
 
@@ -200,14 +208,21 @@ def _prepared_ready(plan: ProtenixPreparationPlan) -> bool:
     path = Path(plan.prepared_json_path)
     try:
         marker = orjson.loads(_prepared_marker_path(plan).read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
-        path.is_file()
-        and path.stat().st_size > 0
-        and isinstance(marker, dict)
+        isinstance(marker, dict)
         and marker.get("preparation_key") == plan.preparation_key
-        and marker.get("size") == path.stat().st_size
+        and _publication_file_matches(
+            path,
+            marker.get("size"),
+            marker.get("sha256"),
+        )
     )
 
 
@@ -229,15 +244,51 @@ def _result_ready(result_key: str, run_name: str) -> bool:
     marker_path = path.with_suffix(f"{path.suffix}.complete.json")
     try:
         marker = orjson.loads(marker_path.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
-        path.is_file()
-        and path.stat().st_size > 0
-        and isinstance(marker, dict)
+        isinstance(marker, dict)
         and marker.get("result_key") == result_key
-        and marker.get("size") == path.stat().st_size
+        and _publication_file_matches(
+            path,
+            marker.get("size"),
+            marker.get("sha256"),
+        )
     )
+
+
+def _publication_file_matches(
+    path: Path,
+    expected_size: object,
+    expected_digest: object,
+) -> bool:
+    """Validate one regular artifact without hiding inconclusive I/O errors."""
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 1
+        or not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+    ):
+        return False
+    try:
+        if path.is_symlink():
+            return False
+        stat = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if not S_ISREG(stat.st_mode) or stat.st_size != expected_size:
+        return False
+    digest = sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest() == expected_digest
 
 
 def _publish_result(
@@ -397,6 +448,7 @@ def query_protenix_msa_server(task: ProtenixMsaTaskSpec) -> None:
             "publication_key": task.publication_key,
             "expected_json_path": str(expected),
             "size": expected.stat().st_size,
+            "sha256": sha256(expected.read_bytes()).hexdigest(),
         }),
     )
     MSA_CACHE_VOLUME.commit()

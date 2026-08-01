@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -117,6 +118,7 @@ class CompletingDriver:
                     "publication_key": task.publication_key,
                     "expected_json_path": str(expected),
                     "size": expected.stat().st_size,
+                    "sha256": sha256(expected.read_bytes()).hexdigest(),
                 }),
             )
             return None
@@ -130,6 +132,7 @@ class CompletingDriver:
                 orjson.dumps({
                     "preparation_key": plan.preparation_key,
                     "size": prepared.stat().st_size,
+                    "sha256": sha256(prepared.read_bytes()).hexdigest(),
                 }),
             )
             return {"prepared_json_path": str(prepared), "size": 2}

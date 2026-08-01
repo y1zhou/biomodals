@@ -105,6 +105,9 @@ class GromacsExecutionRequest:
             pdb_sha256=sha256(self.pdb_content).hexdigest(),
             simulation_time_ns=self.simulation_time_ns,
             run_pdbfixer=self.run_pdbfixer,
+            ld_seed=self.ld_seed,
+            gen_seed=self.gen_seed,
+            genion_seed=self.genion_seed,
         )
 
     def run_root(self, volume_root: str | Path) -> Path:

@@ -24,7 +24,7 @@ REQUIRED_FUNCTIONS = (
     "production_run_cpu",
     "production_run_gpu",
 )
-_EXECUTION_PLAN_SCHEMA_VERSION = "1"
+_EXECUTION_PLAN_SCHEMA_VERSION = "2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +78,9 @@ def execution_plan(
     pdb_sha256: str,
     simulation_time_ns: int,
     run_pdbfixer: bool,
+    ld_seed: int = -1,
+    gen_seed: int = -1,
+    genion_seed: int = 0,
 ) -> ExecutionPlan:
     """Express the established service workflow as one immutable kernel plan."""
     operations = _operation_plan(cpu_only=cpu_only)
@@ -109,6 +112,9 @@ def execution_plan(
         nodes=nodes,
         scientific_payload={
             "cpu_only": cpu_only,
+            "gen_seed": gen_seed,
+            "genion_seed": genion_seed,
+            "ld_seed": ld_seed,
             "pdb_sha256": pdb_sha256,
             "run_pdbfixer": run_pdbfixer,
             "simulation_time_ns": simulation_time_ns,

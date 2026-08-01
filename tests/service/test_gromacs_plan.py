@@ -108,6 +108,9 @@ def test_execution_plan_preserves_parallel_gromacs_dag() -> None:
     assert plan.terminal_node_keys == (PREPARE_RESULT,)
     assert plan.scientific_payload == {
         "cpu_only": False,
+        "gen_seed": -1,
+        "genion_seed": 0,
+        "ld_seed": -1,
         "pdb_sha256": "abc123",
         "run_pdbfixer": True,
         "simulation_time_ns": 20,

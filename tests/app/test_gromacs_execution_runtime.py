@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -101,6 +102,24 @@ def test_gromacs_execution_request_round_trips_scientific_and_operational_data(
     assert decoded == request
     assert decoded.execution_plan.workload_run_key == "example"
     assert decoded.run_root(tmp_path) == tmp_path / "example"
+
+
+def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
+    request = _request()
+    fingerprint = request.execution_plan.workload_plan_fingerprint
+
+    assert (
+        replace(request, ld_seed=17).execution_plan.workload_plan_fingerprint
+        != fingerprint
+    )
+    assert (
+        replace(request, gen_seed=23).execution_plan.workload_plan_fingerprint
+        != fingerprint
+    )
+    assert (
+        replace(request, genion_seed=29).execution_plan.workload_plan_fingerprint
+        != fingerprint
+    )
 
 
 def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
 import modal
+import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.app.score.af3score_execution import (
@@ -117,6 +118,86 @@ AF3SCORE_OUTPUT_CLAIMS = modal.Dict.from_name(
 )
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_af3score_task"})
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
+_METRICS_PUBLICATION_SCHEMA_VERSION = 1
+
+
+def _metrics_publication_path(run_root: str | Path) -> Path:
+    return Path(run_root) / ".biomodals" / "af3score-metrics.json"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_metrics_publication(
+    run_root: str | Path,
+    publication_key: str,
+    metrics_path: Path,
+) -> None:
+    """Atomically bind the metrics artifact to one scientific request."""
+    size = metrics_path.stat().st_size
+    if size < 1:
+        raise RuntimeError("AF3Score metrics publication is empty")
+    marker = _metrics_publication_path(run_root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(f".{marker.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(
+            orjson.dumps(
+                {
+                    "schema_version": _METRICS_PUBLICATION_SCHEMA_VERSION,
+                    "publication_key": publication_key,
+                    "metrics_filename": metrics_path.name,
+                    "size": size,
+                    "sha256": _file_sha256(metrics_path),
+                },
+                option=orjson.OPT_SORT_KEYS,
+            )
+        )
+        temporary.replace(marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _metrics_publication_ready(
+    run_root: str | Path,
+    publication_key: str,
+) -> bool:
+    """Validate fingerprint-bound metrics without hiding unreadable state."""
+    marker_path = _metrics_publication_path(run_root)
+    try:
+        marker = orjson.loads(marker_path.read_bytes())
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
+        return False
+    if not (
+        isinstance(marker, dict)
+        and marker.get("schema_version") == _METRICS_PUBLICATION_SCHEMA_VERSION
+        and marker.get("publication_key") == publication_key
+        and marker.get("metrics_filename") == APP_INFO.metrics_filename
+        and isinstance(marker.get("size"), int)
+        and not isinstance(marker.get("size"), bool)
+        and marker["size"] > 0
+        and isinstance(marker.get("sha256"), str)
+    ):
+        return False
+    metrics = Path(run_root) / APP_INFO.metrics_filename
+    try:
+        return (
+            not metrics.is_symlink()
+            and metrics.stat().st_size == marker["size"]
+            and _file_sha256(metrics) == marker["sha256"]
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return False
 
 
 ##########################################
@@ -328,7 +409,11 @@ def af3score_run(
     timeout=CONF.timeout,
     volumes=CONF.mounts(output_volume=True),
 )
-def af3score_postprocess(run_name: str, input_files: list[str]) -> dict[str, int | str]:
+def af3score_postprocess(
+    run_name: str,
+    input_files: list[str],
+    publication_key: str,
+) -> dict[str, int | str]:
     """Validate records and collect metrics for all inputs."""
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
@@ -386,6 +471,8 @@ def af3score_postprocess(run_name: str, input_files: list[str]) -> dict[str, int
 
     with out_csv_path.open(encoding="utf-8") as f:
         metrics_rows = max(0, sum(1 for _ in f) - 1)
+
+    _write_metrics_publication(layout.run_root, publication_key, out_csv_path)
 
     if layout.prep_dir.exists():
         shutil.rmtree(layout.prep_dir)

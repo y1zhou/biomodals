@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from biomodals.app.score import af3score_app
 from biomodals.app.score.af3score_execution import (
     BATCHES_NODE,
     COMPLETION_REQUIRED_FILES,
@@ -104,7 +105,13 @@ class CompletingDriver:
                     (sample / required).write_text("{}")
             return None
         self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / METRICS_FILENAME).write_text("name,score\na,1\n")
+        metrics = self.root / METRICS_FILENAME
+        metrics.write_text("name,score\na,1\n")
+        af3score_app._write_metrics_publication(
+            self.root,
+            str(kwargs["publication_key"]),
+            metrics,
+        )
         return {"metrics_csv_exists": 1, "metrics_rows": 1}
 
 
@@ -194,11 +201,49 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     runtime.close()
 
 
-def test_cached_metrics_complete_without_claiming_or_spawning(tmp_path: Path) -> None:
+def test_unbound_metrics_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
     request = _request()
     run_root = tmp_path / request.run_name
     run_root.mkdir()
     (run_root / METRICS_FILENAME).write_text("name,score\na,1\n")
+    driver = CompletingDriver(tmp_path, request)
+    claims = FakeClaims()
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_claims=claims,
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    snapshot = runtime.run()
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert [name for name, _kwargs in driver.spawns] == [
+        "af3score_prepare",
+        "af3score_run",
+        "af3score_postprocess",
+    ]
+    assert str(RUN_ID) in claims.values.values()
+    runtime.close()
+
+
+def test_fingerprint_bound_metrics_satisfy_the_terminal_node(tmp_path: Path) -> None:
+    request = _request()
+    run_root = tmp_path / request.run_name
+    run_root.mkdir()
+    metrics = run_root / METRICS_FILENAME
+    metrics.write_text("name,score\na,1\n")
+    af3score_app._write_metrics_publication(
+        run_root,
+        request.execution_plan.workload_plan_fingerprint,
+        metrics,
+    )
     driver = CompletingDriver(tmp_path, request)
     claims = FakeClaims()
     runtime = AF3ScoreExecutionRuntime(

@@ -108,7 +108,9 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
     monkeypatch.setattr(af3score_app, "run_command", fake_run_command)
 
     result = af3score_app.af3score_postprocess.get_raw_f()(
-        run_name="demo", input_files=["target.pdb"]
+        run_name="demo",
+        input_files=["target.pdb"],
+        publication_key="request-key",
     )
 
     assert result["output_dir"] == str(run_root / "outputs")
@@ -117,6 +119,7 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
         run_root / af3score_app.APP_INFO.metrics_filename
     )
     assert result["metrics_rows"] == 1
+    assert af3score_app._metrics_publication_ready(run_root, "request-key")
     assert not run_root.joinpath("prepare").exists()
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1

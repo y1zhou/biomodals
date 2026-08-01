@@ -67,6 +67,12 @@ _REQUEST_FILE = ExecutionRequestFile(
 )
 
 
+def _workload_module():
+    from biomodals.app.score import af3score_app
+
+    return af3score_app
+
+
 @dataclass(frozen=True)
 class ChunkSpec:
     """One prepared AF3Score GPU batch."""
@@ -469,7 +475,10 @@ class AF3ScoreExecutionRuntime:
                     for name in self.request.input_names
                 )
             elif node_key == POSTPROCESS_NODE:
-                available = (self.layout.run_root / METRICS_FILENAME).is_file()
+                available = _workload_module()._metrics_publication_ready(
+                    self.layout.run_root,
+                    self.request.execution_plan.workload_plan_fingerprint,
+                )
             else:
                 raise ValueError(f"Unknown AF3Score Node {node_key!r}")
         except OSError:
@@ -903,6 +912,9 @@ class AF3ScoreExecutionRuntime:
             return {
                 "run_name": self.request.run_name,
                 "input_files": list(self.request.input_names),
+                "publication_key": (
+                    self.request.execution_plan.workload_plan_fingerprint
+                ),
             }
         task = self.store.execution.get_task(
             self.execution_run_id,

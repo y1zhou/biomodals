@@ -137,6 +137,11 @@ These existing decisions remain binding during the refactor:
   current identities and Volume layouts.
 - GROMACS continues to call the deployed app's established functions. The
   service does not rewrite the app or replace its CLI entrypoint.
+- The GROMACS coordinator records only the top-level deployed Function as the
+  Task-owning Provider Call. Existing private nested calls to
+  `find_traj_last_time_ns` and `postprocess_traj` remain an explicit legacy
+  exception: they create no Tasks or ledger rows and are outside Run-scoped
+  call-limit accounting. Do not use this exception as a template for new apps.
 - PPIFlow keeps a fixed stage DAG while candidate work fans out inside a stage.
 - Provider workers never write the coordinator's SQLite repository.
 - Ready Task rows and Worker Assignments are the durable pull-work queue.
@@ -645,6 +650,13 @@ workload-handler hierarchy, provider plugin layer, callback registry, global
 registry, plugin discovery, YAML workflows, or import-time Modal app or Volume
 bindings. Each app and workflow declares only its thin decorated coordinator
 wrapper over `execution.modal`.
+
+`ExecutionRuntime.advance_once` owns the common reconciliation order. Its
+smaller operations own the terminal-first publication walk, ready-Node Task
+discovery, completed-call decoding boundary, result-driven pruning, Node/Run
+aggregation, and fixed-call candidate selection. Workload adapters pass
+direct validator and constructor functions; they must not reimplement the
+cycle or introduce a handler registry.
 
 ### Coordinator loop model
 
@@ -2042,6 +2054,10 @@ Shared constraints:
   App Run Ledger already defined by this specification;
 - service or workflow Child App Calls continue to use their parent Execution
   Run and never create a nested ledger;
+- GROMACS's pre-existing private helper calls remain untracked implementation
+  details of their top-level deployed Function and therefore sit outside the
+  Run's call limits; this service-focused phase documents but does not rewrite
+  that app-owned boundary;
 - in-container thread or process pools remain workload implementation details;
 - cross-Run scientific publication claims remain workload-owned and are not
   execution state;

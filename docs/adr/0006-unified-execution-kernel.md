@@ -400,6 +400,17 @@ call identity, and restart creates new Tasks in a Successor Execution Run.
 The remote invocation hosting an Execution Coordinator is a Coordinator
 Attempt, not a Task-owning Provider Call.
 
+The established GROMACS functions are a documented legacy exception at the
+provider boundary. The kernel tracks the top-level function submitted by the
+coordinator as the Task-owning Provider Call. Private calls made inside that
+function, currently `find_traj_last_time_ns` and `postprocess_traj`, remain
+implementation details of the deployed GROMACS app: they are not separate
+scientific Tasks, do not create another ledger, and are not counted by the
+Run's Provider Call limits. This exception preserves the existing CLI and app
+contract without further app changes in this service-focused refactor. New
+workloads must expose independently scheduled or resource-accounted remote
+work to the kernel instead of copying this pattern.
+
 The Provider Call status policy was accepted on 2026-07-29. Calls have exactly
 eight statuses: `submitting`, `attached`, `running`, `outcome_unknown`,
 `state_unknown`, `succeeded`, `failed`, and `cancelled`. The first five are
@@ -717,6 +728,13 @@ identity, cache validation, input and output contracts, function arguments,
 resource requirements, and publication rules. The kernel determines when
 Tasks are eligible, when Modal calls may be admitted, and how caller-reported
 observations affect scheduling.
+
+The reusable runtime owns the invariant scheduling cycle, terminal-first
+publication walk, ready-Node discovery, Task aggregation, pruning, and fixed
+call admission. Callers supply ordinary functions for workload-owned
+publication validation, Task construction, provider bindings, claims, and
+Result Envelope decoding. These functions are passed directly by the
+composition root; they are not registered handlers or a plugin protocol.
 
 Execution identity is deliberately operational. A Service Job, workflow
 request, GROMACS run name, or AlphaFold run identity may refer to it, but none

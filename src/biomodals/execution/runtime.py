@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.model import (
     AvailabilityStatus,
+    ExecutionNodeRecord,
     ExecutionRunRecord,
     ExecutionTaskRecord,
     NodeStatus,
@@ -25,12 +27,20 @@ from biomodals.execution.model import (
     PullTaskClaim,
     RunStatus,
     RunStatusReason,
+    TaskPlan,
+    TaskStatus,
 )
 from biomodals.execution.scheduler import (
+    NodeAdmissionRank,
     ProviderCallCandidate,
     PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
+    form_fixed_batches,
+    ready_node_keys,
     required_node_keys,
+    required_node_ranks,
+    result_probe_frontier,
+    select_admissible_candidates,
 )
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
@@ -141,12 +151,14 @@ class ExecutionRuntime:
         modal_driver: _ModalDriver,
         checkpoint: Callable[[], SqliteExecutionRepository | None],
         commit_local: Callable[[], None] | None = None,
+        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> None:
         """Bind host-owned state, Modal operations, and its durability boundary."""
         self.repository = repository
         self._modal = modal_driver
         self._checkpoint = checkpoint
         self._commit_local = commit_local
+        self._transaction = transaction
 
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
@@ -155,6 +167,268 @@ class ExecutionRuntime:
     def required_node_keys(self, execution_run_id: UUID) -> tuple[str, ...] | None:
         """Derive the result-driven closure from durable Node observations."""
         return _required_node_keys_for_run(self.repository, execution_run_id)
+
+    def recover_publications(
+        self,
+        execution_run_id: UUID,
+        *,
+        observe_node: Callable[[str], AvailabilityStatus],
+        observe_task: Callable[[str, ExecutionTaskRecord], AvailabilityStatus | None],
+        now: int,
+    ) -> tuple[str, ...] | None:
+        """Walk backward from results and record caller-validated publications."""
+        repository = self.repository
+        run = repository.get_run(execution_run_id)
+        observations = {
+            node.node_key: (
+                AvailabilityStatus.AVAILABLE
+                if node.status == NodeStatus.SUCCEEDED
+                else (
+                    AvailabilityStatus.MISSING
+                    if node.status.is_terminal
+                    else node.result_observation
+                )
+            )
+            for node in repository.list_nodes(execution_run_id)
+        }
+        while frontier := result_probe_frontier(run.plan, observations):
+            observed = tuple(
+                (node_key, observe_node(node_key)) for node_key in frontier
+            )
+            with self._transaction():
+                for node_key, observation in observed:
+                    repository.record_node_result_observation(
+                        execution_run_id,
+                        node_key,
+                        observation,
+                        now=now,
+                    )
+                    observations[node_key] = observation
+            if any(
+                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
+            ):
+                return None
+
+        required = self.required_node_keys(execution_run_id)
+        if required is None:
+            return None
+        required_set = set(required)
+        task_observations = []
+        for node in repository.list_nodes(execution_run_id):
+            if (
+                node.node_key not in required_set
+                or node.status != NodeStatus.RUNNING
+                or not node.discovery_complete
+            ):
+                continue
+            for task in repository.list_tasks(execution_run_id, node.node_key):
+                if task.status.is_terminal:
+                    continue
+                observation = observe_task(node.node_key, task)
+                if observation is not None:
+                    task_observations.append((
+                        node.node_key,
+                        task.task_key,
+                        observation,
+                    ))
+        if task_observations:
+            with self._transaction():
+                for node_key, task_key, observation in task_observations:
+                    repository.record_task_result_observation(
+                        execution_run_id,
+                        node_key,
+                        task_key,
+                        observation,
+                        now=now,
+                    )
+        return required
+
+    def prune_unrequired_nodes(
+        self,
+        execution_run_id: UUID,
+        *,
+        required_node_keys: Collection[str],
+        now: int,
+    ) -> tuple[UUID, ...]:
+        """Prune result-irrelevant work and cancel any attached owners."""
+        with self._transaction():
+            provider_call_ids = self.repository.prune_unrequired_nodes(
+                execution_run_id,
+                required_node_keys=set(required_node_keys),
+                now=now,
+            )
+        if provider_call_ids:
+            self._checkpoint_state()
+        for provider_call_id in provider_call_ids:
+            self.request_provider_call_cancellation(provider_call_id, now=now)
+        return provider_call_ids
+
+    def decode_completed_calls(
+        self,
+        execution_run_id: UUID,
+        *,
+        observe_task: Callable[[str, ExecutionTaskRecord, Any], AvailabilityStatus],
+        missing_message: str,
+        now: int,
+    ) -> None:
+        """Validate durable successful-call envelopes and finish their Tasks."""
+        repository = self.repository
+        observations = []
+        for call in repository.list_provider_calls(execution_run_id):
+            if call.status != ProviderCallStatus.SUCCEEDED:
+                continue
+            for task_key in call.task_keys:
+                task = repository.get_task(
+                    execution_run_id,
+                    call.node_key,
+                    task_key,
+                )
+                if task.status == TaskStatus.RUNNING:
+                    observations.append((
+                        call.node_key,
+                        task,
+                        observe_task(call.node_key, task, call.result_envelope),
+                    ))
+        if not observations:
+            return
+        with self._transaction():
+            for node_key, task, observation in observations:
+                if observation == AvailabilityStatus.MISSING:
+                    repository.fail_task(
+                        execution_run_id,
+                        node_key,
+                        task.task_key,
+                        message=missing_message,
+                        now=now,
+                    )
+                else:
+                    repository.record_task_result_observation(
+                        execution_run_id,
+                        node_key,
+                        task.task_key,
+                        observation,
+                        now=now,
+                    )
+
+    def start_ready_nodes(
+        self,
+        execution_run_id: UUID,
+        *,
+        required_node_keys: Collection[str],
+        task_plans: Callable[[str], tuple[TaskPlan, ...]],
+        observe_task: Callable[[str, ExecutionTaskRecord], AvailabilityStatus],
+        now: int,
+    ) -> tuple[str, ...]:
+        """Start ready Nodes, discover their Tasks, and validate cache state."""
+        repository = self.repository
+        statuses = {
+            node.node_key: node.status
+            for node in repository.list_nodes(execution_run_id)
+        }
+        required = set(required_node_keys)
+        started = []
+        for node_key in ready_node_keys(
+            repository.get_run(execution_run_id).plan, statuses
+        ):
+            if node_key not in required:
+                continue
+            plans = task_plans(node_key)
+            with self._transaction():
+                repository.start_node(execution_run_id, node_key, now=now)
+                records = repository.discover_tasks(
+                    execution_run_id,
+                    node_key,
+                    plans,
+                    now=now,
+                )
+            observations = tuple(
+                (record.task_key, observe_task(node_key, record))
+                for record in records
+                if not record.status.is_terminal
+            )
+            if observations:
+                with self._transaction():
+                    for task_key, observation in observations:
+                        repository.record_task_result_observation(
+                            execution_run_id,
+                            node_key,
+                            task_key,
+                            observation,
+                            now=now,
+                        )
+            started.append(node_key)
+        return tuple(started)
+
+    def reconcile_nodes_and_run(self, execution_run_id: UUID, *, now: int) -> None:
+        """Aggregate discovered Tasks, propagate skips, and finalize the Run."""
+        repository = self.repository
+        with self._transaction():
+            for node in repository.list_nodes(execution_run_id):
+                if node.status == NodeStatus.RUNNING and node.discovery_complete:
+                    repository.reconcile_node_tasks(
+                        execution_run_id,
+                        node.node_key,
+                        now=now,
+                    )
+            repository.skip_unreachable_nodes(execution_run_id, now=now)
+            repository.finalize_run_from_results(execution_run_id, now=now)
+
+    def fixed_call_candidates(
+        self,
+        execution_run_id: UUID,
+        *,
+        required_node_keys: set[str],
+        describe_task: Callable[
+            [ExecutionNodeRecord, ExecutionTaskRecord, NodeAdmissionRank],
+            TaskDispatchDescriptor | None,
+        ],
+        available_total_slots: int | None,
+        available_gpu_slots: int,
+        now: int,
+    ) -> tuple[ProviderCallCandidate, ...]:
+        """Persist workload dispatch descriptions and select admissible calls."""
+        repository = self.repository
+        run = repository.get_run(execution_run_id)
+        nodes = repository.list_nodes(execution_run_id)
+        ranks = required_node_ranks(
+            run.plan,
+            required_node_keys=required_node_keys,
+            unfinished_node_keys={
+                node.node_key for node in nodes if not node.status.is_terminal
+            },
+        )
+        descriptors = []
+        for node in nodes:
+            if (
+                node.node_key not in required_node_keys
+                or node.status != NodeStatus.RUNNING
+                or not node.discovery_complete
+            ):
+                continue
+            for task in repository.list_tasks(execution_run_id, node.node_key):
+                if (
+                    task.status != TaskStatus.PENDING
+                    or task.result_observation != AvailabilityStatus.MISSING
+                ):
+                    continue
+                descriptor = describe_task(node, task, ranks[node.node_key])
+                if descriptor is not None:
+                    descriptors.append(descriptor)
+        persisted = self.persist_fixed_dispatch_policy(
+            execution_run_id,
+            tuple(descriptors),
+            now=now,
+        )
+        candidates = form_fixed_batches(persisted)
+        return select_admissible_candidates(
+            candidates,
+            available_total_slots=(
+                len(candidates)
+                if available_total_slots is None
+                else available_total_slots
+            ),
+            available_gpu_slots=available_gpu_slots,
+        )
 
     def persist_fixed_dispatch_policy(
         self,

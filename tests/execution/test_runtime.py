@@ -3,11 +3,12 @@
 # ruff: noqa: D101, D102, D103, D107, S106
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
 
-from biomodals.execution import AvailabilityStatus, ProviderCallStatus
+from biomodals.execution import AvailabilityStatus, NodeStatus, ProviderCallStatus
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -16,7 +17,11 @@ from biomodals.execution.modal import (
     ModalSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.runtime import ExecutionRuntime
-from biomodals.execution.scheduler import ProviderCallCandidate
+from biomodals.execution.scheduler import (
+    NodeAdmissionRank,
+    ProviderCallCandidate,
+    TaskDispatchDescriptor,
+)
 
 from .provider_call_helpers import (
     GPU_BINDING,
@@ -77,6 +82,82 @@ def _candidate(task_index: int = 0) -> ProviderCallCandidate:
         unblocking_span=0,
         max_tasks_per_call=1,
     )
+
+
+def _transaction(connection: sqlite3.Connection):
+    @contextmanager
+    def transaction():
+        try:
+            yield
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+
+    return transaction
+
+
+def test_runtime_owns_result_frontier_recovery() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=1)
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=connection.commit,
+        transaction=_transaction(connection),
+    )
+
+    required = runtime.recover_publications(
+        RUN_ID,
+        observe_node=lambda _node_key: AvailabilityStatus.AVAILABLE,
+        observe_task=lambda _node_key, _task: None,
+        now=110,
+    )
+
+    assert required == ()
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.SUCCEEDED
+
+
+def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(
+        connection=connection,
+        task_count=3,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=1,
+    )
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=connection.commit,
+        commit_local=connection.commit,
+        transaction=_transaction(connection),
+    )
+
+    def descriptor(node, task, rank: NodeAdmissionRank):
+        return TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+            max_tasks_per_call=1,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
+        )
+
+    candidates = runtime.fixed_call_candidates(
+        RUN_ID,
+        required_node_keys={"inference"},
+        describe_task=descriptor,
+        available_total_slots=2,
+        available_gpu_slots=1,
+        now=110,
+    )
+
+    assert [candidate.task_keys for candidate in candidates] == [("seed-0",)]
 
 
 def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> None:

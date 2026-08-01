@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import sys
+from hashlib import sha256
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from uuid import UUID
@@ -168,6 +169,47 @@ def test_seed_publication_rejects_an_old_parameter_key(tmp_path: Path) -> None:
     )
 
     assert not abcfold2_app._seed_ready(tmp_path, "boltz", 1, "new")
+
+
+def test_publication_validators_reject_same_size_corruption(tmp_path: Path) -> None:
+    result = tmp_path / "boltz_models" / "boltz_results_seed-1"
+    result.mkdir(parents=True)
+    artifact = result / "prediction.cif"
+    artifact.write_bytes(b"ab")
+    abcfold2_app._write_publication_marker(
+        tmp_path / ".biomodals" / "boltz-seed-1.json",
+        {
+            "publication_key": "seed-key",
+            "result_path": str(result),
+            "artifacts": [
+                {
+                    "path": artifact.name,
+                    "size": 2,
+                    "sha256": sha256(b"ab").hexdigest(),
+                }
+            ],
+        },
+    )
+    archive = abcfold2_app._archive_path(tmp_path, "boltz")
+    archive.write_bytes(b"cd")
+    abcfold2_app._write_publication_marker(
+        tmp_path / ".biomodals" / "boltz-archive.json",
+        {
+            "publication_key": "archive-key",
+            "archive_path": str(archive),
+            "size": 2,
+            "sha256": sha256(b"cd").hexdigest(),
+        },
+    )
+
+    assert abcfold2_app._seed_ready(tmp_path, "boltz", 1, "seed-key")
+    assert abcfold2_app._archive_ready(tmp_path, "boltz", "archive-key")
+
+    artifact.write_bytes(b"ef")
+    archive.write_bytes(b"gh")
+
+    assert not abcfold2_app._seed_ready(tmp_path, "boltz", 1, "seed-key")
+    assert not abcfold2_app._archive_ready(tmp_path, "boltz", "archive-key")
 
 
 def test_local_entrypoint_launches_one_execution_coordinator(

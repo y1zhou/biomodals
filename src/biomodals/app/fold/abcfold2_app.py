@@ -16,14 +16,15 @@
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 
-import json
 import os
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from stat import S_ISREG
 from uuid import UUID, uuid4
 
 import modal
+import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.app.fold.abcfold2_execution import (
@@ -356,9 +357,7 @@ def _model_publication_key(model_name: str, run_conf: dict[str, object]) -> str:
             else ChaiConf.repo_commit_hash or ChaiConf.version
         ),
     }
-    return sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return sha256(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)).hexdigest()
 
 
 def _archive_ready(
@@ -370,15 +369,23 @@ def _archive_ready(
     path = _archive_path(workdir, model_name)
     marker_path = _publication_dir(workdir) / f"{model_name}-archive.json"
     try:
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        marker = orjson.loads(marker_path.read_bytes())
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
-        path.is_file()
-        and path.stat().st_size > 0
+        isinstance(marker, dict)
         and marker.get("publication_key") == publication_key
         and marker.get("archive_path") == str(path)
-        and marker.get("size") == path.stat().st_size
+        and _publication_file_matches(
+            path,
+            marker.get("size"),
+            marker.get("sha256"),
+        )
     )
 
 
@@ -397,13 +404,19 @@ def _seed_ready(
     )
     marker_path = _publication_dir(workdir) / f"{model_name}-seed-{seed}.json"
     try:
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        marker = orjson.loads(marker_path.read_bytes())
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
-        directory.is_dir()
+        isinstance(marker, dict)
         and marker.get("publication_key") == publication_key
         and marker.get("result_path") == str(directory)
+        and _directory_publication_matches(directory, marker.get("artifacts"))
     )
 
 
@@ -411,10 +424,87 @@ def _write_publication_marker(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        temporary.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+        temporary.write_bytes(orjson.dumps(value, option=orjson.OPT_SORT_KEYS))
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _publication_file_matches(
+    path: Path,
+    expected_size: object,
+    expected_digest: object,
+) -> bool:
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 1
+        or not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+    ):
+        return False
+    try:
+        if path.is_symlink():
+            return False
+        stat = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return (
+        S_ISREG(stat.st_mode)
+        and stat.st_size == expected_size
+        and _sha256_file(path) == expected_digest
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _directory_artifacts(directory: Path) -> list[dict[str, str | int]]:
+    artifacts = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError("ABCFold2 seed output contains a symbolic link")
+        if path.is_dir():
+            continue
+        stat = path.stat()
+        if not S_ISREG(stat.st_mode):
+            raise RuntimeError("ABCFold2 seed output contains a non-regular file")
+        artifacts.append({
+            "path": path.relative_to(directory).as_posix(),
+            "size": stat.st_size,
+            "sha256": _sha256_file(path),
+        })
+    if not artifacts:
+        raise RuntimeError("ABCFold2 seed output contains no files")
+    return artifacts
+
+
+def _directory_publication_matches(directory: Path, raw_artifacts: object) -> bool:
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        return False
+    seen: set[str] = set()
+    for artifact in raw_artifacts:
+        if not isinstance(artifact, dict):
+            return False
+        relative_text = artifact.get("path")
+        if not isinstance(relative_text, str) or relative_text in seen:
+            return False
+        relative = PurePosixPath(relative_text)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            return False
+        seen.add(relative_text)
+        if not _publication_file_matches(
+            directory.joinpath(*relative.parts),
+            artifact.get("size"),
+            artifact.get("sha256"),
+        ):
+            return False
+    return True
 
 
 def _publish_archive(
@@ -538,6 +628,7 @@ def run_abcfold2_boltz(
         {
             "publication_key": publication_key,
             "result_path": str(boltz_run_dir),
+            "artifacts": _directory_artifacts(Path(boltz_run_dir)),
         },
     )
     CONF.output_volume.commit()
@@ -626,6 +717,7 @@ def run_abcfold2_chai(
         {
             "publication_key": publication_key,
             "result_path": str(chai_run_dir),
+            "artifacts": _directory_artifacts(Path(chai_run_dir)),
         },
     )
     CONF.output_volume.commit()
@@ -921,9 +1013,8 @@ def submit_abcfold2_task(
     local_out_dir.mkdir(parents=True, exist_ok=True)
     local_run_conf = run_conf.as_kwargs()
     local_run_conf["max_parallel_children"] = max_parallel_children
-    (local_out_dir / "run-config.json").write_text(
-        json.dumps(local_run_conf, indent=2),
-        encoding="utf-8",
+    (local_out_dir / "run-config.json").write_bytes(
+        orjson.dumps(local_run_conf, option=orjson.OPT_INDENT_2),
     )
     for model_name, enabled in (
         ("boltz", request.run_boltz),

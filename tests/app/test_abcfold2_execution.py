@@ -102,11 +102,13 @@ class CompletingDriver:
             )
             path = self.root / f"{model}_models" / name
             path.mkdir()
+            (path / "prediction.cif").write_text("model")
             abcfold2_app._write_publication_marker(
                 self.root / ".biomodals" / f"{model}-seed-{seed}.json",
                 {
                     "publication_key": kwargs["publication_key"],
                     "result_path": str(path),
+                    "artifacts": abcfold2_app._directory_artifacts(path),
                 },
             )
             return str(path)

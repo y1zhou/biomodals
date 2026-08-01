@@ -257,6 +257,8 @@ def test_process_budget_is_split_without_extra_scheduler_state() -> None:
         off_target_process_slots=12,
         off_target_nodes=3,
         off_target_workers=8,
+        off_target_prep_workers=1,
+        pita_prepare_nodes=1,
         pita_prepare_workers=8,
         targetscan_prepare_nodes=2,
         targetscan_context_nodes=2,
@@ -264,8 +266,16 @@ def test_process_budget_is_split_without_extra_scheduler_state() -> None:
     )
 
     assert oligoformer_app._off_target_branch_slots(execution) == (6, 6)
-    assert oligoformer_app._pita_local_workers(execution) == (2, 2)
+    assert oligoformer_app._pita_local_workers(execution) == (1, 2)
     assert oligoformer_app._targetscan_local_workers(execution) == 3
+
+    runtime = object.__new__(OligoformerExecutionRuntime)
+    runtime.request = _request(
+        off_target_process_slots=execution.off_target_process_slots,
+        off_target_nodes=execution.off_target_nodes,
+        pita_prepare_nodes=execution.pita_prepare_nodes,
+    )
+    assert runtime._node_call_limit(PITA_CANDIDATES_NODE) == 1
 
 
 def test_oligoformer_has_no_app_owned_modal_queue_or_nested_dispatch() -> None:

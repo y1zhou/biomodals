@@ -1058,7 +1058,11 @@ class OligoformerExecutionRuntime:
         if node_key == REFERENCE_SHARDS_NODE:
             return execution.targetscan_rnaplfold_nodes
         if node_key == PITA_CANDIDATES_NODE:
-            return min(execution.off_target_nodes, pita_slots)
+            return min(
+                execution.off_target_nodes,
+                execution.pita_prepare_nodes,
+                pita_slots,
+            )
         if node_key == TARGETSCAN_TILES_NODE:
             return min(
                 execution.targetscan_prepare_nodes,
@@ -1174,11 +1178,7 @@ class OligoformerExecutionRuntime:
                 ),
             }
         if node_key == FINAL_NODE:
-            return {
-                "plan": self._run_plan(),
-                "targetscan_ref_shard_size": self.request.targetscan_ref_shard_size,
-                "execution": execution,
-            }
+            return {"plan": self._run_plan()}
         if node_key == PUBLISH_NODE:
             return {
                 "plan": self._run_plan(),

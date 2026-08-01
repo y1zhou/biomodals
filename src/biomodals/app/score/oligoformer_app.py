@@ -4636,7 +4636,11 @@ def _pita_local_workers(execution: OligoformerExecutionConfig) -> tuple[int, int
     nodes = min(execution.off_target_nodes, slots)
     workers = max(1, slots // nodes)
     return (
-        min(workers, execution.pita_prepare_workers),
+        min(
+            workers,
+            execution.off_target_prep_workers,
+            execution.pita_prepare_workers,
+        ),
         min(workers, execution.off_target_workers),
     )
 
@@ -4883,14 +4887,9 @@ def _apply_off_target_filters(
     result,
     run_root: str,
     stem: str,
-    utr_path: str,
-    orf_path: str,
-    output_dir: Path,
     top_n: int,
     pita_threshold: float,
     targetscan_threshold: float,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ):
     """Apply filters from already-published PITA and TargetScan evidence."""
     import shutil
@@ -4906,7 +4905,6 @@ def _apply_off_target_filters(
         sirna_file = infer_dir / "top_n_siRNA.fa"
     records = _off_target_sirna_records(result, top_n)
     _write_sirna_records(records, sirna_file)
-    del utr_path, orf_path, output_dir, targetscan_ref_shard_size, execution
     evidence_dir = AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
     if not _raw_off_target_ready(
         evidence_dir,
@@ -5319,8 +5317,6 @@ def _run_oligoformer_postprocess_locked(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ) -> bytes:
     """Build final tables while holding their cache-generation lock."""
     CONF.output_volume.reload()
@@ -5362,11 +5358,6 @@ def _run_oligoformer_postprocess_locked(
                 raise FileNotFoundError(
                     "OligoFormer human references changed after run preparation"
                 )
-            utr_path = str(APP_INFO.model_ref_dir / "human_UTR.txt")
-            orf_path = str(APP_INFO.model_ref_dir / "human_ORF.txt")
-        else:
-            utr_path = str(layout.inputs_dir / "utr.txt")
-            orf_path = str(layout.inputs_dir / "orf.txt")
 
         for stem in refreshed_plan.output_stems:
             result = _read_efficacy_output(efficacy_dir / f"{stem}.txt")
@@ -5375,14 +5366,9 @@ def _run_oligoformer_postprocess_locked(
                     result=result,
                     run_root=refreshed_plan.run_root,
                     stem=stem,
-                    utr_path=utr_path,
-                    orf_path=orf_path,
-                    output_dir=output_dir,
                     top_n=top_n,
                     pita_threshold=pita_threshold,
                     targetscan_threshold=targetscan_threshold,
-                    targetscan_ref_shard_size=targetscan_ref_shard_size,
-                    execution=execution,
                 )
             if toxicity:
                 result = _apply_toxicity_filters(
@@ -5427,12 +5413,8 @@ def run_oligoformer_postprocess(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ) -> bytes:
     """Run CPU post-processing and return packaged OligoFormer outputs."""
-    if targetscan_ref_shard_size is not None and targetscan_ref_shard_size < 1:
-        raise ValueError("targetscan_ref_shard_size must be a positive integer")
     requested_config = OligoformerRunConfig(
         off_target=off_target,
         toxicity=toxicity,
@@ -5501,8 +5483,6 @@ def run_oligoformer_postprocess(
             pita_threshold=pita_threshold,
             targetscan_threshold=targetscan_threshold,
             toxicity_threshold=toxicity_threshold,
-            targetscan_ref_shard_size=targetscan_ref_shard_size,
-            execution=execution,
         )
 
 
@@ -5514,8 +5494,6 @@ def run_oligoformer_postprocess(
 )
 def build_oligoformer_final_tables(
     plan: OligoformerRunPlan,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ) -> OligoformerRunPlan:
     """Build final tables and return only their refreshed publication plan."""
     run_oligoformer_postprocess.get_raw_f()(
@@ -5528,8 +5506,6 @@ def build_oligoformer_final_tables(
         pita_threshold=plan.config.pita_threshold,
         targetscan_threshold=plan.config.targetscan_threshold,
         toxicity_threshold=plan.config.toxicity_threshold,
-        targetscan_ref_shard_size=targetscan_ref_shard_size,
-        execution=execution,
     )
     return _build_plan(
         plan.cache_key,

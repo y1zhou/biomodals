@@ -23,23 +23,14 @@ from biomodals.execution import (
     ExecutionSnapshot,
     NodeDependency,
     NodePlan,
-    NodeStatus,
     ProviderBinding,
     ProviderCallStatus,
     RunStatus,
     TaskPlan,
-    TaskStatus,
     drive_execution_run,
-    ready_node_keys,
-    result_probe_frontier,
     resume_execution_run,
 )
-from biomodals.execution.scheduler import (
-    TaskDispatchDescriptor,
-    form_fixed_batches,
-    required_node_ranks,
-    select_admissible_candidates,
-)
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
@@ -303,6 +294,7 @@ class ProtenixExecutionRuntime:
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
             commit_local=store.commit,
+            transaction=store.transaction,
         )
 
     def run(
@@ -375,7 +367,7 @@ class ProtenixExecutionRuntime:
             required = self._required_nodes()
             required_nodes = set(run.plan.node_keys if required is None else required)
             if required is not None:
-                self._cancel_pruned_calls(self._prune_unrequired(required))
+                self._prune_unrequired(required)
             self._reconcile_provider_calls(required_nodes)
             self._decode_completed_calls()
             self._recover_publications()
@@ -386,7 +378,7 @@ class ProtenixExecutionRuntime:
         required = self._required_nodes()
         if required is None:
             return
-        self._cancel_pruned_calls(self._prune_unrequired(required))
+        self._prune_unrequired(required)
         self._reconcile_provider_calls(set(required))
         self._decode_completed_calls()
         self._recover_publications()
@@ -434,66 +426,17 @@ class ProtenixExecutionRuntime:
         return repository
 
     def _recover_publications(self) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        observations: dict[str, AvailabilityStatus | None] = {}
-        for node in repository.list_nodes(self.execution_run_id):
-            if node.status == NodeStatus.SUCCEEDED:
-                observations[node.node_key] = AvailabilityStatus.AVAILABLE
-            elif node.status.is_terminal:
-                observations[node.node_key] = AvailabilityStatus.MISSING
-            else:
-                observations[node.node_key] = node.result_observation
-        while frontier := result_probe_frontier(run.plan, observations):
-            observed = [
-                (node_key, self._node_observation(node_key)) for node_key in frontier
-            ]
-            with self.store.transaction():
-                for node_key, observation in observed:
-                    repository.record_node_result_observation(
-                        self.execution_run_id,
-                        node_key,
-                        observation,
-                        now=self._now(),
-                    )
-                    observations[node_key] = observation
-            if any(
-                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
-            ):
-                return
-
-        required = self._required_nodes()
-        if required is None:
-            return
-        task_observations = []
-        for node in repository.list_nodes(self.execution_run_id):
-            if (
-                node.node_key in required
-                and node.status == NodeStatus.RUNNING
-                and node.discovery_complete
-                and node.node_key not in {DOWNLOAD_NODE, PLAN_NODE}
-            ):
-                for task in repository.list_tasks(
-                    self.execution_run_id,
-                    node.node_key,
-                ):
-                    if not task.status.is_terminal:
-                        task_observations.append((
-                            node.node_key,
-                            task.task_key,
-                            self._task_observation(node.node_key, task),
-                        ))
-        if not task_observations:
-            return
-        with self.store.transaction():
-            for node_key, task_key, observation in task_observations:
-                repository.record_task_result_observation(
-                    self.execution_run_id,
-                    node_key,
-                    task_key,
-                    observation,
-                    now=self._now(),
-                )
+        self._provider.repository = self.store.execution
+        self._provider.recover_publications(
+            self.execution_run_id,
+            observe_node=self._node_observation,
+            observe_task=lambda node_key, task: (
+                None
+                if node_key in {DOWNLOAD_NODE, PLAN_NODE}
+                else self._task_observation(node_key, task)
+            ),
+            now=self._now(),
+        )
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         app = _workload_module()
@@ -538,23 +481,12 @@ class ProtenixExecutionRuntime:
         return self._provider.required_node_keys(self.execution_run_id)
 
     def _prune_unrequired(self, required: tuple[str, ...]) -> tuple[UUID, ...]:
-        with self.store.transaction():
-            calls = self.store.execution.prune_unrequired_nodes(
-                self.execution_run_id,
-                required_node_keys=set(required),
-                now=self._now(),
-            )
-        if calls:
-            self._checkpoint()
-        return calls
-
-    def _cancel_pruned_calls(self, provider_call_ids: tuple[UUID, ...]) -> None:
-        for provider_call_id in provider_call_ids:
-            self._provider.repository = self.store.execution
-            self._provider.request_provider_call_cancellation(
-                provider_call_id,
-                now=self._now(),
-            )
+        self._provider.repository = self.store.execution
+        return self._provider.prune_unrequired_nodes(
+            self.execution_run_id,
+            required_node_keys=required,
+            now=self._now(),
+        )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
         self._provider.repository = self.store.execution
@@ -571,40 +503,13 @@ class ProtenixExecutionRuntime:
             self._reload_volumes()
 
     def _decode_completed_calls(self) -> None:
-        repository = self.store.execution
-        with self.store.transaction():
-            for call in repository.list_provider_calls(self.execution_run_id):
-                if call.status != ProviderCallStatus.SUCCEEDED:
-                    continue
-                for task_key in call.task_keys:
-                    task = repository.get_task(
-                        self.execution_run_id,
-                        call.node_key,
-                        task_key,
-                    )
-                    if task.status != TaskStatus.RUNNING:
-                        continue
-                    observation = self._completed_task_observation(
-                        call.node_key,
-                        task,
-                        call.result_envelope,
-                    )
-                    if observation == AvailabilityStatus.MISSING:
-                        repository.fail_task(
-                            self.execution_run_id,
-                            call.node_key,
-                            task_key,
-                            message="Protenix returned without a valid publication",
-                            now=self._now(),
-                        )
-                    else:
-                        repository.record_task_result_observation(
-                            self.execution_run_id,
-                            call.node_key,
-                            task_key,
-                            observation,
-                            now=self._now(),
-                        )
+        self._provider.repository = self.store.execution
+        self._provider.decode_completed_calls(
+            self.execution_run_id,
+            observe_task=self._completed_task_observation,
+            missing_message="Protenix returned without a valid publication",
+            now=self._now(),
+        )
 
     def _completed_task_observation(
         self,
@@ -634,43 +539,18 @@ class ProtenixExecutionRuntime:
         return self._task_observation(node_key, task)
 
     def _start_ready_nodes(self, required: set[str]) -> None:
-        repository = self.store.execution
-        statuses = {
-            node.node_key: node.status
-            for node in repository.list_nodes(self.execution_run_id)
-        }
-        for node_key in ready_node_keys(
-            repository.get_run(self.execution_run_id).plan,
-            statuses,
-        ):
-            if node_key not in required:
-                continue
-            plans = self._task_plans(node_key)
-            with self.store.transaction():
-                repository.start_node(
-                    self.execution_run_id,
-                    node_key,
-                    now=self._now(),
-                )
-                records = repository.discover_tasks(
-                    self.execution_run_id,
-                    node_key,
-                    plans,
-                    now=self._now(),
-                )
-                for record in records:
-                    observation = (
-                        AvailabilityStatus.MISSING
-                        if node_key in {DOWNLOAD_NODE, PLAN_NODE}
-                        else self._task_observation(node_key, record)
-                    )
-                    repository.record_task_result_observation(
-                        self.execution_run_id,
-                        node_key,
-                        record.task_key,
-                        observation,
-                        now=self._now(),
-                    )
+        self._provider.repository = self.store.execution
+        self._provider.start_ready_nodes(
+            self.execution_run_id,
+            required_node_keys=required,
+            task_plans=self._task_plans,
+            observe_task=lambda node_key, task: (
+                AvailabilityStatus.MISSING
+                if node_key in {DOWNLOAD_NODE, PLAN_NODE}
+                else self._task_observation(node_key, task)
+            ),
+            now=self._now(),
+        )
 
     def _task_plans(self, node_key: str) -> tuple[TaskPlan, ...]:
         if node_key == DOWNLOAD_NODE:
@@ -730,82 +610,34 @@ class ProtenixExecutionRuntime:
         raise LookupError("Protenix preparation plan is unavailable")
 
     def _reconcile_nodes_and_run(self) -> None:
-        repository = self.store.execution
-        for node in repository.list_nodes(self.execution_run_id):
-            if node.status == NodeStatus.RUNNING and node.discovery_complete:
-                with self.store.transaction():
-                    repository.reconcile_node_tasks(
-                        self.execution_run_id,
-                        node.node_key,
-                        now=self._now(),
-                    )
-        with self.store.transaction():
-            repository.skip_unreachable_nodes(
-                self.execution_run_id,
-                now=self._now(),
-            )
-            repository.finalize_run_from_results(
-                self.execution_run_id,
-                now=self._now(),
-            )
+        self._provider.repository = self.store.execution
+        self._provider.reconcile_nodes_and_run(
+            self.execution_run_id,
+            now=self._now(),
+        )
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
         repository = self.store.execution
         run = repository.get_run(self.execution_run_id)
-        nodes = repository.list_nodes(self.execution_run_id)
-        ranks = required_node_ranks(
-            run.plan,
-            required_node_keys=required,
-            unfinished_node_keys={
-                node.node_key for node in nodes if not node.status.is_terminal
-            },
-        )
-        descriptors = []
-        for node in nodes:
-            if (
-                node.node_key not in required
-                or node.status != NodeStatus.RUNNING
-                or not node.discovery_complete
-            ):
-                continue
-            binding = self._binding(node.node_key)
-            for task in repository.list_tasks(
-                self.execution_run_id,
-                node.node_key,
-            ):
-                if (
-                    task.status != TaskStatus.PENDING
-                    or task.result_observation != AvailabilityStatus.MISSING
-                ):
-                    continue
-                rank = ranks[node.node_key]
-                descriptors.append(
-                    TaskDispatchDescriptor(
-                        node_key=node.node_key,
-                        node_ordinal=node.ordinal,
-                        task_key=task.task_key,
-                        task_ordinal=task.ordinal,
-                        binding=binding,
-                        compatibility_key=binding.function_name,
-                        max_tasks_per_call=1,
-                        depth=rank.depth,
-                        unblocking_span=rank.unblocking_span,
-                    )
-                )
         self._provider.repository = repository
-        descriptors = list(
-            self._provider.persist_fixed_dispatch_policy(
-                self.execution_run_id,
-                tuple(descriptors),
-                now=self._now(),
-            )
-        )
-        repository = self.store.execution
         counts = repository.active_provider_call_counts(self.execution_run_id)
-        selected = select_admissible_candidates(
-            form_fixed_batches(tuple(descriptors)),
+        selected = self._provider.fixed_call_candidates(
+            self.execution_run_id,
+            required_node_keys=required,
+            describe_task=lambda node, task, rank: TaskDispatchDescriptor(
+                node_key=node.node_key,
+                node_ordinal=node.ordinal,
+                task_key=task.task_key,
+                task_ordinal=task.ordinal,
+                binding=self._binding(node.node_key),
+                compatibility_key=self._binding(node.node_key).function_name,
+                max_tasks_per_call=1,
+                depth=rank.depth,
+                unblocking_span=rank.unblocking_span,
+            ),
             available_total_slots=max(0, run.max_active_provider_calls - counts.total),
             available_gpu_slots=max(0, run.max_active_gpu_provider_calls - counts.gpu),
+            now=self._now(),
         )
         for candidate in selected:
             self._ensure_publication_claim(

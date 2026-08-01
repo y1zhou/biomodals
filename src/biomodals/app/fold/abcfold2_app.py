@@ -18,7 +18,7 @@
 
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -29,7 +29,7 @@ from biomodals.app.config import AppConfig
 from biomodals.app.fold.abcfold2_execution import (
     ABCFold2ExecutionCoordinator,
     ABCFold2ExecutionRequest,
-    load_execution_request_from_volume,
+    load_execution_request,
     run_config_from_snapshot,
     stage_execution_request,
 )
@@ -705,15 +705,15 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
-        workload_plan_fingerprint: str,
-        max_active_provider_calls: int,
     ) -> ExecutionSnapshot:
         """Create a compatible Successor while inferring predecessor identity."""
         return self._adapter().restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
-            max_active_provider_calls=max_active_provider_calls,
-            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+            candidate_request=load_execution_request(
+                CONF.output_volume_mountpoint,
+                UUID(self.execution_run_id),
+            ),
         )
 
     @modal.exit()
@@ -851,50 +851,28 @@ def submit_abcfold2_task(
     if not yaml_path.is_file():
         raise FileNotFoundError(f"ABCFold2 YAML not found: {yaml_path}")
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    predecessor_request = (
-        None
-        if predecessor_execution_run_id is None
-        else load_execution_request_from_volume(
-            CONF.output_volume,
-            predecessor_execution_run_id,
-        )
+    run_name = run_name or yaml_path.stem
+    if not search_templates:
+        run_name = f"{run_name}-no-tmpl"
+    capacity = (
+        _DEFAULT_MAX_ACTIVE_PROVIDER_CALLS
+        if max_parallel_children is None
+        else max_parallel_children
     )
-    if predecessor_request is None:
-        run_name = run_name or yaml_path.stem
-        if not search_templates:
-            run_name = f"{run_name}-no-tmpl"
-        capacity = (
-            _DEFAULT_MAX_ACTIVE_PROVIDER_CALLS
-            if max_parallel_children is None
-            else max_parallel_children
-        )
-        request = ABCFold2ExecutionRequest(
-            run_name=run_name,
-            yaml_content=yaml_path.read_bytes(),
-            msa_chains=msa_chains,
-            search_templates=search_templates,
-            download_models=download_models,
-            force_redownload=force_redownload,
-            run_boltz=run_boltz,
-            run_chai=run_chai,
-            max_active_provider_calls=capacity,
-            app_version=CONF.repo_commit_hash or CONF.version or "unknown",
-            boltz_version=(
-                BoltzConf.repo_commit_hash or BoltzConf.version or "unknown"
-            ),
-            chai_version=ChaiConf.repo_commit_hash or ChaiConf.version or "unknown",
-        )
-    else:
-        capacity = (
-            predecessor_request.max_active_provider_calls
-            if max_parallel_children is None
-            else max_parallel_children
-        )
-        request = replace(
-            predecessor_request,
-            max_active_provider_calls=capacity,
-        )
-        run_name = request.run_name
+    request = ABCFold2ExecutionRequest(
+        run_name=run_name,
+        yaml_content=yaml_path.read_bytes(),
+        msa_chains=msa_chains,
+        search_templates=search_templates,
+        download_models=download_models,
+        force_redownload=force_redownload,
+        run_boltz=run_boltz,
+        run_chai=run_chai,
+        max_active_provider_calls=capacity,
+        app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+        boltz_version=BoltzConf.repo_commit_hash or BoltzConf.version or "unknown",
+        chai_version=ChaiConf.repo_commit_hash or ChaiConf.version or "unknown",
+    )
 
     local_out_dir = (
         Path(out_dir) / run_name if out_dir is not None else Path.cwd() / run_name
@@ -908,8 +886,7 @@ def submit_abcfold2_task(
         deployment_name,
         deployment_version,
     )
-    if predecessor_execution_run_id is None:
-        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
@@ -920,10 +897,6 @@ def submit_abcfold2_task(
     else:
         call = coordinator.restart_from.spawn(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
-            workload_plan_fingerprint=(
-                request.execution_plan.workload_plan_fingerprint
-            ),
-            max_active_provider_calls=request.max_active_provider_calls,
         )
     print(f"Execution Run ID: {execution_run_id}")
     print(

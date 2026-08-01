@@ -1077,8 +1077,16 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
         expected_workload_plan_fingerprint: str | None = None,
+        candidate_request: ABCFold2ExecutionRequest | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor from conclusive state."""
+        if candidate_request is not None and (
+            max_active_provider_calls is not None
+            or max_active_gpu_provider_calls is not None
+        ):
+            raise ValueError(
+                "Candidate request and generic restart overrides are mutually exclusive"
+            )
         del max_active_gpu_provider_calls
         if predecessor_execution_run_id == self.execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
@@ -1110,19 +1118,31 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                         raise ValueError(
                             "Predecessor Deployment Identity does not match Execution Run"
                         )
-                    request = load_execution_request(
+                    predecessor_request = load_execution_request(
                         self.volume_root,
                         predecessor_execution_run_id,
                     )
                 finally:
                     predecessor_store.close()
+                request = candidate_request or predecessor_request
+                if (
+                    request.execution_plan.workload_plan_fingerprint
+                    != predecessor.plan.workload_plan_fingerprint
+                ):
+                    raise ValueError(
+                        "Restart arguments changed the Workload Plan Fingerprint"
+                    )
+                if candidate_request is None:
+                    request = replace(
+                        request,
+                        max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                    )
                 request = replace(
                     request,
-                    max_active_provider_calls=(
-                        predecessor.max_active_provider_calls
-                        if max_active_provider_calls is None
-                        else max_active_provider_calls
-                    ),
                     replace_claim_owner=str(predecessor_execution_run_id),
                 )
                 persist_execution_request(

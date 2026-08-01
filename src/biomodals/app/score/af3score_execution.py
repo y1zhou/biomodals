@@ -1016,8 +1016,16 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
         expected_workload_plan_fingerprint: str | None = None,
+        candidate_request: AF3ScoreExecutionRequest | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor from conclusive state."""
+        if candidate_request is not None and (
+            max_active_provider_calls is not None
+            or max_active_gpu_provider_calls is not None
+        ):
+            raise ValueError(
+                "Candidate request and generic restart overrides are mutually exclusive"
+            )
         if predecessor_execution_run_id == self.execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
         with self._drive_lock:
@@ -1048,20 +1056,29 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
                         raise ValueError(
                             "Predecessor Deployment Identity does not match Execution Run"
                         )
-                    request = load_execution_request(
+                    predecessor_request = load_execution_request(
                         self.volume_root,
                         predecessor_execution_run_id,
                     )
                 finally:
                     predecessor_store.close()
-                limit = max_active_gpu_provider_calls
-                if limit is None:
-                    limit = max_active_provider_calls
-                if limit is None:
-                    limit = predecessor.max_active_gpu_provider_calls
+                request = candidate_request or predecessor_request
+                if (
+                    request.execution_plan.workload_plan_fingerprint
+                    != predecessor.plan.workload_plan_fingerprint
+                ):
+                    raise ValueError(
+                        "Restart arguments changed the Workload Plan Fingerprint"
+                    )
+                if candidate_request is None:
+                    limit = max_active_gpu_provider_calls
+                    if limit is None:
+                        limit = max_active_provider_calls
+                    if limit is None:
+                        limit = predecessor.max_active_gpu_provider_calls
+                    request = replace(request, max_batches=limit)
                 request = replace(
                     request,
-                    max_batches=limit,
                     replace_claim_owner=str(predecessor_execution_run_id),
                 )
                 persist_execution_request(

@@ -32,6 +32,7 @@ from biomodals.app.score.af3score_execution import (
     AF3ScoreExecutionRequest,
     ChunkSpec,
     TaskSpec,
+    load_execution_request,
     stage_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
@@ -474,16 +475,15 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
-        workload_plan_fingerprint: str,
-        max_batches: int,
     ) -> ExecutionSnapshot:
         """Create a compatible Successor while inferring predecessor identity."""
         return self._adapter().restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
-            max_active_provider_calls=max_batches,
-            max_active_gpu_provider_calls=max_batches,
-            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+            candidate_request=load_execution_request(
+                CONF.output_volume_mountpoint,
+                UUID(self.execution_run_id),
+            ),
         )
 
     @modal.exit()
@@ -651,8 +651,7 @@ def submit_af3score_task(
             deployment_name,
             deployment_version,
         )
-        if predecessor_execution_run_id is None:
-            stage_execution_request(CONF.output_volume, execution_run_id, request)
+        stage_execution_request(CONF.output_volume, execution_run_id, request)
         coordinator = _execution_coordinator_handle(
             execution_run_id=execution_run_id,
             deployment=deployment,
@@ -663,10 +662,6 @@ def submit_af3score_task(
         else:
             call = coordinator.restart_from.spawn(
                 predecessor_execution_run_id=str(predecessor_execution_run_id),
-                workload_plan_fingerprint=(
-                    request.execution_plan.workload_plan_fingerprint
-                ),
-                max_batches=request.max_batches,
             )
         print(f"Execution Run ID: {execution_run_id}")
         print(

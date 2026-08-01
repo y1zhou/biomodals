@@ -1434,8 +1434,16 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
         expected_workload_plan_fingerprint: str | None = None,
+        candidate_request: OligoformerExecutionRequest | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor Run."""
+        if candidate_request is not None and (
+            max_active_provider_calls is not None
+            or max_active_gpu_provider_calls is not None
+        ):
+            raise ValueError(
+                "Candidate request and generic restart overrides are mutually exclusive"
+            )
         del max_active_gpu_provider_calls
         if predecessor_execution_run_id == self.execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
@@ -1471,17 +1479,25 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     )
                 finally:
                     predecessor_store.close()
+                request = candidate_request or predecessor_request
+                if (
+                    request.execution_plan.workload_plan_fingerprint
+                    != predecessor.plan.workload_plan_fingerprint
+                ):
+                    raise ValueError(
+                        "Restart arguments changed the Workload Plan Fingerprint"
+                    )
                 capacity = (
-                    predecessor_request.max_active_provider_calls
+                    request.max_active_provider_calls
                     if max_active_provider_calls is None
                     else max_active_provider_calls
                 )
-                if capacity != predecessor_request.max_active_provider_calls:
+                if capacity != request.max_active_provider_calls:
                     raise ValueError(
                         "OligoFormer successor capacity is derived from its request"
                     )
                 request = replace(
-                    predecessor_request,
+                    request,
                     replace_claim_owner=str(predecessor_execution_run_id),
                 )
                 persist_execution_request(

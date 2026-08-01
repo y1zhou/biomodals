@@ -1447,3 +1447,71 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     assert request.preprocess_shard_size == 17
     assert captured["run_kwargs"] == {"development": True}
     assert (tmp_path / "demo.xlsx").read_bytes() == b"xlsx"
+
+
+def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_fasta = tmp_path / "target.fa"
+    input_fasta.write_text(">new\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
+    predecessor_id = ensirna_app.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    successor_id = ensirna_app.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    captured = {}
+
+    class FakeVolume:
+        def read_file(self, _path):
+            yield b"xlsx"
+
+    class RestartMethod:
+        def spawn(self, **kwargs):
+            captured["restart_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=ensirna_app.RunStatus.SUCCEEDED,
+                        status_message=None,
+                        status_reason=None,
+                    )
+                ),
+            )
+
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        ensirna_app,
+        "CONF",
+        SimpleNamespace(
+            name="ENsiRNA",
+            version=None,
+            repo_commit_hash="new-version",
+            output_volume=volume,
+            output_volume_mountpoint="/ensirna-output",
+        ),
+    )
+    monkeypatch.setattr(ensirna_app, "uuid4", lambda: successor_id)
+    monkeypatch.setattr(
+        ensirna_app,
+        "stage_execution_request",
+        lambda _volume, _run_id, request: captured.update(request=request),
+    )
+    monkeypatch.setattr(
+        ensirna_app,
+        "_execution_coordinator_handle",
+        lambda **_kwargs: SimpleNamespace(restart_from=RestartMethod()),
+    )
+    raw_f = ensirna_app.submit_ensirna_task.info.raw_f
+    assert raw_f is not None
+
+    raw_f(
+        mrna_fasta=str(input_fasta),
+        out_dir=str(tmp_path),
+        run_name="restart-demo",
+        restart_from=str(predecessor_id),
+    )
+
+    assert captured["request"].fasta_content == input_fasta.read_bytes()
+    assert captured["request"].app_version == "new-version"
+    assert captured["restart_kwargs"] == {
+        "predecessor_execution_run_id": str(predecessor_id)
+    }

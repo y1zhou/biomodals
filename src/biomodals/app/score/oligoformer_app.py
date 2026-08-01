@@ -111,7 +111,7 @@ from biomodals.app.config import AppConfig
 from biomodals.app.score.oligoformer_execution import (
     OligoformerExecutionCoordinator,
     OligoformerExecutionRequest,
-    load_execution_request_from_volume,
+    load_execution_request,
     stage_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
@@ -5686,15 +5686,15 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
-        workload_plan_fingerprint: str,
-        max_active_provider_calls: int,
     ) -> ExecutionSnapshot:
         """Create a compatible Successor while inferring deployment identity."""
         return self._adapter().restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
-            max_active_provider_calls=max_active_provider_calls,
-            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+            candidate_request=load_execution_request(
+                CONF.output_volume_mountpoint,
+                UUID(self.execution_run_id),
+            ),
         )
 
     @modal.exit()
@@ -5914,55 +5914,44 @@ def submit_oligoformer_task(
         raise FileNotFoundError(f"mRNA FASTA not found: {input_path}")
     run_name = run_name or input_path.stem
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    predecessor_request = (
-        None
-        if predecessor_execution_run_id is None
-        else load_execution_request_from_volume(
-            CONF.output_volume,
-            predecessor_execution_run_id,
-        )
+    request = OligoformerExecutionRequest(
+        run_name=run_name,
+        mrna_fasta_bytes=input_path.read_bytes(),
+        sirna_fasta_bytes=_optional_local_bytes(sirna_fasta, "siRNA FASTA"),
+        off_target=off_target,
+        toxicity=toxicity,
+        all_human=all_human,
+        utr_bytes=_optional_local_bytes(utr_file, "UTR reference"),
+        orf_bytes=_optional_local_bytes(orf_file, "ORF reference"),
+        top_n=top_n,
+        functionality_filter=functionality_filter,
+        pita_threshold=pita_threshold,
+        targetscan_threshold=targetscan_threshold,
+        toxicity_threshold=toxicity_threshold,
+        off_target_nodes=off_target_nodes,
+        off_target_workers=off_target_workers,
+        off_target_process_slots=off_target_process_slots,
+        off_target_prep_workers=off_target_prep_workers,
+        pita_prepare_nodes=pita_prepare_nodes,
+        pita_prepare_workers=pita_prepare_workers,
+        pita_prepare_utr_shard_size=pita_prepare_utr_shard_size,
+        pita_row_shard_size=pita_row_shard_size,
+        pita_row_attempts=pita_row_attempts,
+        targetscan_rnaplfold_nodes=targetscan_rnaplfold_nodes,
+        targetscan_rnaplfold_workers=targetscan_rnaplfold_workers,
+        targetscan_rnaplfold_shard_size=targetscan_rnaplfold_shard_size,
+        targetscan_prepare_nodes=targetscan_prepare_nodes,
+        targetscan_ref_shard_size=targetscan_ref_shard_size,
+        targetscan_candidate_shard_size=targetscan_candidate_shard_size,
+        targetscan_context_nodes=targetscan_context_nodes,
+        targetscan_context_workers=targetscan_context_workers,
+        targetscan_context_shard_size=targetscan_context_shard_size,
+        targetscan_context_attempts=targetscan_context_attempts,
+        targetscan_merge_nodes=targetscan_merge_nodes,
+        force=force,
+        force_generation=uuid4().hex if force else None,
+        app_version=CONF.repo_commit_hash or CONF.version or "unknown",
     )
-    if predecessor_request is None:
-        request = OligoformerExecutionRequest(
-            run_name=run_name,
-            mrna_fasta_bytes=input_path.read_bytes(),
-            sirna_fasta_bytes=_optional_local_bytes(sirna_fasta, "siRNA FASTA"),
-            off_target=off_target,
-            toxicity=toxicity,
-            all_human=all_human,
-            utr_bytes=_optional_local_bytes(utr_file, "UTR reference"),
-            orf_bytes=_optional_local_bytes(orf_file, "ORF reference"),
-            top_n=top_n,
-            functionality_filter=functionality_filter,
-            pita_threshold=pita_threshold,
-            targetscan_threshold=targetscan_threshold,
-            toxicity_threshold=toxicity_threshold,
-            off_target_nodes=off_target_nodes,
-            off_target_workers=off_target_workers,
-            off_target_process_slots=off_target_process_slots,
-            off_target_prep_workers=off_target_prep_workers,
-            pita_prepare_nodes=pita_prepare_nodes,
-            pita_prepare_workers=pita_prepare_workers,
-            pita_prepare_utr_shard_size=pita_prepare_utr_shard_size,
-            pita_row_shard_size=pita_row_shard_size,
-            pita_row_attempts=pita_row_attempts,
-            targetscan_rnaplfold_nodes=targetscan_rnaplfold_nodes,
-            targetscan_rnaplfold_workers=targetscan_rnaplfold_workers,
-            targetscan_rnaplfold_shard_size=targetscan_rnaplfold_shard_size,
-            targetscan_prepare_nodes=targetscan_prepare_nodes,
-            targetscan_ref_shard_size=targetscan_ref_shard_size,
-            targetscan_candidate_shard_size=targetscan_candidate_shard_size,
-            targetscan_context_nodes=targetscan_context_nodes,
-            targetscan_context_workers=targetscan_context_workers,
-            targetscan_context_shard_size=targetscan_context_shard_size,
-            targetscan_context_attempts=targetscan_context_attempts,
-            targetscan_merge_nodes=targetscan_merge_nodes,
-            force=force,
-            force_generation=uuid4().hex if force else None,
-            app_version=CONF.repo_commit_hash or CONF.version or "unknown",
-        )
-    else:
-        request = predecessor_request
 
     out_file = build_local_output_path(
         resolve_local_output_dir(out_dir),
@@ -5977,8 +5966,7 @@ def submit_oligoformer_task(
         deployment_name,
         deployment_version,
     )
-    if predecessor_execution_run_id is None:
-        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
@@ -5989,8 +5977,6 @@ def submit_oligoformer_task(
     else:
         call = coordinator.restart_from.spawn(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
-            workload_plan_fingerprint=request.execution_plan.workload_plan_fingerprint,
-            max_active_provider_calls=request.max_active_provider_calls,
         )
     print(f"Execution Run ID: {execution_run_id}")
     print(f"Coordinator FunctionCall ID: {call.object_id}")

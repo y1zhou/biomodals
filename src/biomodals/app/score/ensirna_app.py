@@ -43,7 +43,7 @@ from biomodals.app.score.ensirna_execution import (
     EnsirnaExecutionRequest,
     EnsirnaPdbChunkSpec,
     EnsirnaPreparationPlan,
-    load_execution_request_from_volume,
+    load_execution_request,
     stage_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
@@ -1845,15 +1845,15 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
-        workload_plan_fingerprint: str,
-        prepare_workers: int,
     ) -> ExecutionSnapshot:
         """Create a compatible Successor while inferring predecessor identity."""
         return self._adapter().restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
-            max_active_provider_calls=prepare_workers,
-            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+            candidate_request=load_execution_request(
+                CONF.output_volume_mountpoint,
+                UUID(self.execution_run_id),
+            ),
         )
 
     @modal.exit()
@@ -2004,30 +2004,14 @@ def submit_ensirna_task(
         raise ValueError("preprocess_shard_size must be at least 1")
 
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    predecessor_request = (
-        None
-        if predecessor_execution_run_id is None
-        else load_execution_request_from_volume(
-            CONF.output_volume,
-            predecessor_execution_run_id,
-        )
-    )
-    if predecessor_request is None:
-        fasta_content = _sanitize_fasta_for_upstream(input_path.read_bytes())
-        force_generation = uuid4().hex if force else None
-        app_version = CONF.repo_commit_hash or CONF.version or "unknown"
-    else:
-        fasta_content = predecessor_request.fasta_content
-        force_generation = predecessor_request.force_generation
-        app_version = predecessor_request.app_version
     request = EnsirnaExecutionRequest(
         run_name=run_name,
-        fasta_content=fasta_content,
+        fasta_content=_sanitize_fasta_for_upstream(input_path.read_bytes()),
         prepare_workers=prepare_workers,
         pdb_cores=pdb_cores,
         preprocess_shard_size=preprocess_shard_size,
-        force_generation=force_generation,
-        app_version=app_version,
+        force_generation=uuid4().hex if force else None,
+        app_version=CONF.repo_commit_hash or CONF.version or "unknown",
     )
     execution_run_id = uuid4()
     deployment = DeploymentIdentity(
@@ -2035,8 +2019,7 @@ def submit_ensirna_task(
         deployment_name,
         deployment_version,
     )
-    if predecessor_execution_run_id is None:
-        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
@@ -2047,10 +2030,6 @@ def submit_ensirna_task(
     else:
         call = coordinator.restart_from.spawn(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
-            workload_plan_fingerprint=(
-                request.execution_plan.workload_plan_fingerprint
-            ),
-            prepare_workers=request.prepare_workers,
         )
     print(f"Execution Run ID: {execution_run_id}")
     print(

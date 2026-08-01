@@ -931,7 +931,13 @@ def _paths_ready(
         actual_tables = [
             _tabular_output_metadata(path, root=paths[0].parent) for path in paths
         ]
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        UnicodeDecodeError,
+        ValueError,
+    ):
         return False
     if tables != actual_tables:
         return False
@@ -1406,7 +1412,7 @@ def _targetscan_rnaplfold_shard_state(
                 continue
             if verify_output_hashes and _hash_path(output_path) != metadata["sha256"]:
                 continue
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
         valid_outputs.add(output_name)
     return len(valid_outputs) == len(output_names), valid_outputs, len(output_names)
@@ -1552,7 +1558,7 @@ def _targetscan_rnaplfold_cache_ready() -> bool:
                 "name": shard_marker_path.name,
                 **_targetscan_rnaplfold_file_metadata(shard_marker_path),
             }
-        except (FileNotFoundError, OSError, ValueError):
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, ValueError):
             return False
         if recorded_marker != actual_marker:
             return False
@@ -2322,7 +2328,7 @@ def _artifact_marker_ready(
         actual = {
             name: _artifact_file_metadata(path) for name, path in artifacts.items()
         }
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     return marker["artifacts"] == actual
 

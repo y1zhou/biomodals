@@ -620,7 +620,12 @@ def _result_ready(layout: AppRunLayout, cache_key: str) -> bool:
         return False
     try:
         marker = orjson.loads(marker_path.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
         isinstance(marker, dict)
@@ -682,7 +687,12 @@ def _candidate_csv_facts(
         return None
     try:
         frame = pl.read_csv(csv_path)
-    except (OSError, pl.exceptions.PolarsError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        pl.exceptions.PolarsError,
+    ):
         return None
     columns = tuple(frame.columns)
     if columns != APP_INFO.candidate_csv_columns or frame.height == 0:
@@ -697,7 +707,7 @@ def _candidate_csv_facts(
     try:
         size = csv_path.stat().st_size
         sha256 = _file_sha256(csv_path)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
     return {
         "columns": list(columns),
@@ -719,7 +729,12 @@ def _candidate_csv_valid(
         return False
     try:
         marker = orjson.loads(_candidate_csv_marker_path(layout).read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
         isinstance(marker, dict)
@@ -778,7 +793,12 @@ def _json_records(json_path: Path) -> list[dict]:
                 return []
             seen_ids.add(candidate_id)
             records.append(record)
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return []
     return records
 
@@ -797,7 +817,12 @@ def _processed_manifest_facts(
         return None
     try:
         metadata = orjson.loads(marker.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return None
     if not isinstance(metadata, dict):
         return None
@@ -894,7 +919,12 @@ def _processed_shard_valid(
         return False
     try:
         marker = orjson.loads(_processed_shard_marker_path(processed_dir).read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return False
     return (
         isinstance(marker, dict)
@@ -915,7 +945,12 @@ def _prepared_metadata(layout: AppRunLayout) -> dict | None:
         return None
     try:
         metadata = orjson.loads(_prepared_marker_path(layout).read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
         return None
     if not isinstance(metadata, dict):
         return None
@@ -1100,7 +1135,12 @@ def _chunk_artifacts_valid(
             str(value)
             for value in pl.read_csv(chunk.csv_path).get_column("siRNA").to_list()
         ]
-    except (OSError, pl.exceptions.PolarsError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        pl.exceptions.PolarsError,
+    ):
         return False
     records = _json_records(json_path or Path(chunk.json_path))
     if [str(record["siRNA"]) for record in records] != candidate_ids:

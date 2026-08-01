@@ -5576,13 +5576,141 @@ def _oligoformer_result_archive_path(plan: OligoformerRunPlan) -> Path:
     return Path(plan.output_dir) / "oligoformer.tar.zst"
 
 
+def _oligoformer_result_record_path(
+    output_root: str | Path,
+    publication_key: str,
+) -> Path:
+    if len(publication_key) != 64 or any(
+        character not in "0123456789abcdef" for character in publication_key
+    ):
+        raise ValueError("OligoFormer result publication key must be SHA-256")
+    return (
+        Path(output_root)
+        / ".biomodals"
+        / "oligoformer"
+        / "results"
+        / f"{publication_key}.json"
+    )
+
+
+def _parse_oligoformer_result_publication(
+    content: bytes,
+    publication_key: str,
+) -> dict[str, object] | None:
+    import orjson
+
+    try:
+        value = orjson.loads(content)
+    except orjson.JSONDecodeError:
+        return None
+    if not (
+        isinstance(value, dict)
+        and value.get("version") == 1
+        and value.get("publication_key") == publication_key
+        and isinstance(value.get("result_path"), str)
+        and isinstance(value.get("size_bytes"), int)
+        and not isinstance(value.get("size_bytes"), bool)
+        and value["size_bytes"] > 0
+        and isinstance(value.get("sha256"), str)
+        and len(value["sha256"]) == 64
+    ):
+        return None
+    relative = Path(cast(str, value["result_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    return cast(dict[str, object], value)
+
+
+def _publish_oligoformer_result_record(
+    output_root: str | Path,
+    publication_key: str,
+    archive_path: Path,
+) -> None:
+    """Atomically bind one reconstructable archive to its scientific plan."""
+    import orjson
+
+    root = Path(output_root).resolve()
+    relative = archive_path.resolve().relative_to(root)
+    size = archive_path.stat().st_size
+    if archive_path.is_symlink() or size < 1:
+        raise RuntimeError("OligoFormer result archive is not a regular artifact")
+    marker = _oligoformer_result_record_path(root, publication_key)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _unique_tmp_path(marker)
+    try:
+        tmp_path.write_bytes(
+            orjson.dumps({
+                "version": 1,
+                "publication_key": publication_key,
+                "result_path": relative.as_posix(),
+                "size_bytes": size,
+                "sha256": _hash_path(archive_path),
+            })
+        )
+        tmp_path.replace(marker)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _oligoformer_result_publication(
+    output_root: str | Path,
+    publication_key: str,
+) -> dict[str, object] | None:
+    """Return one validated local archive publication, if complete."""
+    marker = _oligoformer_result_record_path(output_root, publication_key)
+    try:
+        publication = _parse_oligoformer_result_publication(
+            marker.read_bytes(),
+            publication_key,
+        )
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return None
+    if publication is None:
+        return None
+    archive = Path(output_root).joinpath(
+        *Path(cast(str, publication["result_path"])).parts
+    )
+    try:
+        if archive.is_symlink() or archive.stat().st_size != publication["size_bytes"]:
+            return None
+        if _hash_path(archive) != publication["sha256"]:
+            return None
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return publication
+
+
+def _oligoformer_result_publication_from_volume(
+    volume,
+    publication_key: str,
+) -> dict[str, object] | None:
+    """Read the bounded result record through the client-side Volume API."""
+    relative = (
+        Path(".biomodals") / "oligoformer" / "results" / f"{publication_key}.json"
+    )
+    content = bytearray()
+    try:
+        for chunk in volume.read_file(relative.as_posix()):
+            if not isinstance(chunk, bytes):
+                raise TypeError("OligoFormer result publication must be bytes")
+            if len(content) + len(chunk) > 64 * 1024:
+                raise ValueError("OligoFormer result publication is too large")
+            content.extend(chunk)
+    except FileNotFoundError:
+        return None
+    return _parse_oligoformer_result_publication(bytes(content), publication_key)
+
+
 @app.function(
     cpu=(0.125, 4.125),
     memory=(1024, 16384),
     timeout=CONF.timeout,
     volumes=CONF.mounts(output_volume=True),
 )
-def publish_oligoformer_outputs(plan: OligoformerRunPlan) -> dict[str, object]:
+def publish_oligoformer_outputs(
+    plan: OligoformerRunPlan,
+    publication_key: str,
+) -> dict[str, object]:
     """Publish the final standalone archive for Volume API download."""
     CONF.output_volume.reload()
     refreshed = _build_plan(
@@ -5608,6 +5736,11 @@ def publish_oligoformer_outputs(plan: OligoformerRunPlan) -> dict[str, object]:
         tmp_path.replace(archive_path)
     finally:
         tmp_path.unlink(missing_ok=True)
+    _publish_oligoformer_result_record(
+        CONF.output_volume_mountpoint,
+        publication_key,
+        archive_path,
+    )
     CONF.output_volume.commit()
     return {"result_path": str(archive_path), "size_bytes": len(archive_bytes)}
 
@@ -5991,23 +6124,21 @@ def submit_oligoformer_task(
             f"OligoFormer Execution Run ended as "
             f"{snapshot.run.status.value}: {diagnostic}"
         )
-    publication = next(
-        (
-            call.result_envelope["publication"]
-            for call in snapshot.provider_calls
-            if call.node_key == "publish-result"
-            and isinstance(call.result_envelope, dict)
-            and call.result_envelope.get("kind") == "result"
-        ),
-        None,
+    publication = _oligoformer_result_publication_from_volume(
+        CONF.output_volume,
+        request.execution_plan.workload_plan_fingerprint,
     )
     if not isinstance(publication, dict) or not isinstance(
         publication.get("result_path"),
         str,
     ):
         raise RuntimeError("OligoFormer result publication is missing")
-    result_path = Path(publication["result_path"])
-    relative_path = result_path.relative_to(CONF.output_volume_mountpoint)
-    tarball_bytes = b"".join(CONF.output_volume.read_file(relative_path.as_posix()))
+    result_path = cast(str, publication["result_path"])
+    tarball_bytes = b"".join(CONF.output_volume.read_file(result_path))
+    if (
+        len(tarball_bytes) != publication["size_bytes"]
+        or hashlib.sha256(tarball_bytes).hexdigest() != publication["sha256"]
+    ):
+        raise RuntimeError("OligoFormer result archive failed integrity validation")
     write_local_tarball(out_file, tarball_bytes, overwrite=force)
     print(f"🧬 OligoFormer run complete! Results saved to {out_file}")

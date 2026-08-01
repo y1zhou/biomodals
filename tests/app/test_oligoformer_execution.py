@@ -109,6 +109,11 @@ class CompletingDriver:
             path = oligoformer_app._oligoformer_result_archive_path(self.plan)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"archive")
+            oligoformer_app._publish_oligoformer_result_record(
+                Path(self.plan.run_root).parent,
+                str(_kwargs["publication_key"]),
+                path,
+            )
             result = {"result_path": str(path), "size_bytes": 7}
         return ModalCallObservation(ModalCallObservationKind.SUCCEEDED, result=result)
 
@@ -179,6 +184,40 @@ def test_efficacy_only_plan_is_minimal() -> None:
         FINAL_NODE,
         PUBLISH_NODE,
     )
+
+
+def test_cached_terminal_publication_completes_without_a_run_plan(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    archive = tmp_path / "cached" / "oligoformer.tar.zst"
+    archive.parent.mkdir()
+    archive.write_bytes(b"archive")
+    oligoformer_app._publish_oligoformer_result_record(
+        tmp_path,
+        request.execution_plan.workload_plan_fingerprint,
+        archive,
+    )
+    driver = CompletingDriver({}, None)
+    volume = FakeVolume()
+    runtime = OligoformerExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=driver,
+        output_volume=volume,
+        model_volume=volume,
+        output_claims=FakeClaims(),
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    snapshot = runtime.run()
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert driver.spawns == []
+    runtime.close()
 
 
 def test_custom_reference_plan_uses_kernel_off_target_tiles() -> None:

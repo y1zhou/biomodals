@@ -1009,6 +1009,46 @@ def test_run_postprocess_rechecks_final_cache_after_lock(tmp_path: Path, monkeyp
     assert volume.reload_count == 2
 
 
+def test_result_publication_is_fingerprint_bound_and_digested(tmp_path: Path) -> None:
+    archive = tmp_path / "run" / "outputs" / "oligoformer.tar.zst"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"archive")
+    publication_key = "a" * 64
+
+    oligoformer_app._publish_oligoformer_result_record(
+        tmp_path,
+        publication_key,
+        archive,
+    )
+
+    publication = oligoformer_app._oligoformer_result_publication(
+        tmp_path,
+        publication_key,
+    )
+    assert publication is not None
+    assert publication["result_path"] == "run/outputs/oligoformer.tar.zst"
+    assert oligoformer_app._oligoformer_result_publication(tmp_path, "b" * 64) is None
+
+    class VolumeReader:
+        def read_file(self, path):
+            yield tmp_path.joinpath(*Path(path).parts).read_bytes()
+
+    assert (
+        oligoformer_app._oligoformer_result_publication_from_volume(
+            VolumeReader(),
+            publication_key,
+        )
+        == publication
+    )
+
+    archive.write_bytes(b"damaged")
+
+    assert (
+        oligoformer_app._oligoformer_result_publication(tmp_path, publication_key)
+        is None
+    )
+
+
 def test_run_postprocess_rejects_changed_all_human_reference_identity(
     tmp_path: Path, monkeypatch
 ):

@@ -666,12 +666,12 @@ class OligoformerExecutionRuntime:
                     ).final_ready
                 )
             elif node_key == PUBLISH_NODE:
-                plan = self._try_run_plan()
-                path = (
-                    None if plan is None else app._oligoformer_result_archive_path(plan)
-                )
                 available = (
-                    path is not None and path.is_file() and path.stat().st_size > 0
+                    app._oligoformer_result_publication(
+                        self.store.volume_root,
+                        self.request.execution_plan.workload_plan_fingerprint,
+                    )
+                    is not None
                 )
             else:
                 raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
@@ -1180,7 +1180,12 @@ class OligoformerExecutionRuntime:
                 "execution": execution,
             }
         if node_key == PUBLISH_NODE:
-            return {"plan": self._run_plan()}
+            return {
+                "plan": self._run_plan(),
+                "publication_key": (
+                    self.request.execution_plan.workload_plan_fingerprint
+                ),
+            }
         raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
 
     def _task(self, node_key: str, task_key: str):

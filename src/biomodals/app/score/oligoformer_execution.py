@@ -47,7 +47,10 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionVolumeSync,
 )
-from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.helper.output_claim import (
+    acquire_output_claim,
+    register_output_claim_successor,
+)
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
@@ -1496,6 +1499,11 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     raise ValueError(
                         "OligoFormer successor capacity is derived from its request"
                     )
+                register_output_claim_successor(
+                    self.output_claims,
+                    owner=str(self.execution_run_id),
+                    predecessor=str(predecessor_execution_run_id),
+                )
                 request = replace(
                     request,
                     replace_claim_owner=str(predecessor_execution_run_id),

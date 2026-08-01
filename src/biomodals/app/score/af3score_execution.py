@@ -46,7 +46,10 @@ from biomodals.helper.app_execution import (
     ExecutionVolumeSync,
 )
 from biomodals.helper.app_run import AppRunLayout, has_completed_output_files
-from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.helper.output_claim import (
+    acquire_output_claim,
+    register_output_claim_successor,
+)
 from biomodals.helper.shell import sanitize_filename
 
 REQUEST_SCHEMA_VERSION = 1
@@ -1089,6 +1092,11 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     if limit is None:
                         limit = predecessor.max_active_gpu_provider_calls
                     request = replace(request, max_batches=limit)
+                register_output_claim_successor(
+                    self.output_claims,
+                    owner=str(self.execution_run_id),
+                    predecessor=str(predecessor_execution_run_id),
+                )
                 request = replace(
                     request,
                     replace_claim_owner=str(predecessor_execution_run_id),

@@ -13,7 +13,10 @@ from biomodals.app.design.boltzgen.execution_contracts import (
     is_boltzgen_run_complete,
     write_boltzgen_task_publication,
 )
-from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.helper.output_claim import (
+    acquire_output_claim,
+    register_output_claim_successor,
+)
 
 
 class FakeVolume:
@@ -68,6 +71,22 @@ def test_claim_requires_same_owner_or_explicit_terminal_replacement(
             replace_owner="call-1",
         )
     assert not (run_dir / ".lock").exists()
+
+
+def test_claim_replacement_can_skip_a_cache_hit_successor() -> None:
+    store = FakeClaimStore()
+    acquire_output_claim(store, claim_key="result", owner="run-0")
+    register_output_claim_successor(store, owner="run-1", predecessor="run-0")
+    register_output_claim_successor(store, owner="run-2", predecessor="run-1")
+
+    acquire_output_claim(
+        store,
+        claim_key="result",
+        owner="run-2",
+        replace_owner="run-1",
+    )
+
+    acquire_output_claim(store, claim_key="result", owner="run-2")
 
 
 def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(

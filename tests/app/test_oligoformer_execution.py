@@ -4,7 +4,7 @@
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from biomodals.app.score import oligoformer_app
@@ -24,7 +24,7 @@ from biomodals.app.score.oligoformer_execution import (
     OligoformerExecutionRequest,
     OligoformerExecutionRuntime,
 )
-from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution import AvailabilityStatus, DeploymentIdentity, RunStatus
 from biomodals.execution.modal import ModalCallObservation, ModalCallObservationKind
 from biomodals.helper.app_execution import ExecutionRunStore
 
@@ -91,7 +91,7 @@ class CompletingDriver:
             )
         elif name == "run_oligoformer_pita_candidate":
             self.state["pita"] = True
-            spec = _kwargs["spec"]
+            spec = cast(oligoformer_app.OffTargetShardSpec, _kwargs["spec"])
             result = oligoformer_app.OffTargetShardResult(
                 spec.index,
                 "/results/pita.tab",
@@ -113,6 +113,8 @@ class CompletingDriver:
                 Path(self.plan.run_root).parent,
                 str(_kwargs["publication_key"]),
                 path,
+                model_identity=self.plan.model_identity or "model-content-v1",
+                reference_identity=self.plan.reference_identity,
             )
             result = {"result_path": str(path), "size_bytes": 7}
         return ModalCallObservation(ModalCallObservationKind.SUCCEEDED, result=result)
@@ -160,6 +162,8 @@ def _request(**changes) -> OligoformerExecutionRequest:
         force=False,
         force_generation=None,
         app_version="test-version",
+        model_version="model-source-v1",
+        reference_version="reference-source-v1",
     )
     return replace(request, **changes)
 
@@ -186,8 +190,25 @@ def test_efficacy_only_plan_is_minimal() -> None:
     )
 
 
+def test_model_and_reference_versions_are_scientific_identity() -> None:
+    request = _request(off_target=True, all_human=True, reference_version="ref-v1")
+
+    assert (
+        replace(
+            request, model_version="model-source-v2"
+        ).execution_plan.workload_plan_fingerprint
+        != request.execution_plan.workload_plan_fingerprint
+    )
+    assert (
+        replace(
+            request, reference_version="ref-v2"
+        ).execution_plan.workload_plan_fingerprint
+        != request.execution_plan.workload_plan_fingerprint
+    )
+
+
 def test_cached_terminal_publication_completes_without_a_run_plan(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     request = _request()
     archive = tmp_path / "cached" / "oligoformer.tar.zst"
@@ -197,6 +218,13 @@ def test_cached_terminal_publication_completes_without_a_run_plan(
         tmp_path,
         request.execution_plan.workload_plan_fingerprint,
         archive,
+        model_identity="model-content-v1",
+        reference_identity=None,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_oligoformer_model_volume_identity_digest",
+        lambda: "model-content-v1",
     )
     driver = CompletingDriver({}, None)
     volume = FakeVolume()
@@ -217,6 +245,43 @@ def test_cached_terminal_publication_completes_without_a_run_plan(
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert driver.spawns == []
+    runtime.close()
+
+
+def test_cached_terminal_publication_rejects_changed_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    request = _request()
+    archive = tmp_path / "cached" / "oligoformer.tar.zst"
+    archive.parent.mkdir()
+    archive.write_bytes(b"archive")
+    oligoformer_app._publish_oligoformer_result_record(
+        tmp_path,
+        request.execution_plan.workload_plan_fingerprint,
+        archive,
+        model_identity="model-content-v1",
+        reference_identity=None,
+    )
+    monkeypatch.setattr(
+        oligoformer_app,
+        "_oligoformer_model_volume_identity_digest",
+        lambda: "model-content-v2",
+    )
+    volume = FakeVolume()
+    runtime = OligoformerExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=CompletingDriver({}, None),
+        output_volume=volume,
+        model_volume=volume,
+        output_claims=FakeClaims(),
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    assert runtime._node_observation(PUBLISH_NODE) == AvailabilityStatus.MISSING
     runtime.close()
 
 
@@ -310,6 +375,7 @@ def test_runtime_drives_efficacy_only_run_through_deployed_functions(
         efficacy_ready=False,
         evidence_ready=False,
         final_ready=False,
+        model_identity="model-content-v1",
     )
     state = {"models": False, "efficacy": False, "final": False}
     monkeypatch.setattr(
@@ -376,6 +442,7 @@ def test_runtime_dispatches_off_target_scientific_tiles(
         efficacy_ready=False,
         evidence_ready=False,
         final_ready=False,
+        model_identity="model-content-v1",
     )
     pita_spec = oligoformer_app.OffTargetShardSpec(
         run_root=plan.run_root,

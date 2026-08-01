@@ -1019,6 +1019,8 @@ def test_result_publication_is_fingerprint_bound_and_digested(tmp_path: Path) ->
         tmp_path,
         publication_key,
         archive,
+        model_identity="model-content-v1",
+        reference_identity=None,
     )
 
     publication = oligoformer_app._oligoformer_result_publication(
@@ -1027,6 +1029,7 @@ def test_result_publication_is_fingerprint_bound_and_digested(tmp_path: Path) ->
     )
     assert publication is not None
     assert publication["result_path"] == "run/outputs/oligoformer.tar.zst"
+    assert publication["model_identity"] == "model-content-v1"
     assert oligoformer_app._oligoformer_result_publication(tmp_path, "b" * 64) is None
 
     class VolumeReader:
@@ -1045,6 +1048,29 @@ def test_result_publication_is_fingerprint_bound_and_digested(tmp_path: Path) ->
 
     assert (
         oligoformer_app._oligoformer_result_publication(tmp_path, publication_key)
+        is None
+    )
+
+
+def test_result_publication_rejects_changed_model_identity(tmp_path: Path) -> None:
+    archive = tmp_path / "run" / "outputs" / "oligoformer.tar.zst"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"archive")
+    publication_key = "a" * 64
+    oligoformer_app._publish_oligoformer_result_record(
+        tmp_path,
+        publication_key,
+        archive,
+        model_identity="model-content-v1",
+        reference_identity="reference-content-v1",
+    )
+
+    assert (
+        oligoformer_app._oligoformer_result_publication(
+            tmp_path,
+            publication_key,
+            expected_identities=("model-content-v2", "reference-content-v1"),
+        )
         is None
     )
 

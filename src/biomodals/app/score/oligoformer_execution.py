@@ -52,7 +52,7 @@ from biomodals.helper.output_claim import (
     register_output_claim_successor,
 )
 
-REQUEST_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 DOWNLOAD_NODE = "download-models"
 PREPARE_NODE = "prepare-run"
@@ -114,14 +114,24 @@ class OligoformerExecutionRequest:
     force: bool
     force_generation: str | None
     app_version: str
+    model_version: str
+    reference_version: str | None
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
         """Validate only request invariants needed before remote staging."""
-        if not self.run_name or not self.mrna_fasta_bytes or not self.app_version:
+        if (
+            not self.run_name
+            or not self.mrna_fasta_bytes
+            or not self.app_version
+            or not self.model_version
+        ):
             raise ValueError(
-                "OligoFormer run name, mRNA input, and version are required"
+                "OligoFormer run name, mRNA input, app version, and model "
+                "version are required"
             )
+        if self.off_target and self.all_human and not self.reference_version:
+            raise ValueError("Full-human OligoFormer runs require a reference version")
         if self.top_n != -1 and self.top_n < 1:
             raise ValueError("top_n must be -1 or a positive integer")
         if (
@@ -221,6 +231,13 @@ class OligoformerExecutionRequest:
             NodePlan(FINAL_NODE, dependencies=final_dependencies),
             NodePlan(PUBLISH_NODE, dependencies=(NodeDependency(FINAL_NODE),)),
         ))
+        scientific_versions = {
+            "oligoformer": self.app_version,
+            "oligoformer.model": self.model_version,
+            "biomodals.oligoformer.execution_request": str(REQUEST_SCHEMA_VERSION),
+        }
+        if self.off_target and self.all_human and self.reference_version is not None:
+            scientific_versions["oligoformer.reference"] = self.reference_version
         return ExecutionPlan(
             workload_name="oligoformer",
             workload_run_key=self.run_name,
@@ -240,10 +257,7 @@ class OligoformerExecutionRequest:
                 "toxicity_threshold": self.toxicity_threshold,
                 "force_generation": self.force_generation,
             },
-            scientific_versions={
-                "oligoformer": self.app_version,
-                "biomodals.oligoformer.execution_request": str(REQUEST_SCHEMA_VERSION),
-            },
+            scientific_versions=scientific_versions,
         )
 
     @property
@@ -666,13 +680,35 @@ class OligoformerExecutionRuntime:
                     ).final_ready
                 )
             elif node_key == PUBLISH_NODE:
-                available = (
-                    app._oligoformer_result_publication(
-                        self.store.volume_root,
-                        self.request.execution_plan.workload_plan_fingerprint,
+                plan = self._try_run_plan()
+                try:
+                    expected_identities = (
+                        (
+                            plan.model_identity
+                            if plan is not None and plan.model_identity is not None
+                            else app._oligoformer_model_volume_identity_digest()
+                        ),
+                        (
+                            plan.reference_identity
+                            if plan is not None
+                            else (
+                                app._oligoformer_reference_volume_identity_digest()
+                                if self.request.off_target and self.request.all_human
+                                else None
+                            )
+                        ),
                     )
-                    is not None
-                )
+                except FileNotFoundError:
+                    available = False
+                else:
+                    available = (
+                        app._oligoformer_result_publication(
+                            self.store.volume_root,
+                            self.request.execution_plan.workload_plan_fingerprint,
+                            expected_identities=expected_identities,
+                        )
+                        is not None
+                    )
             else:
                 raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
         except OSError:

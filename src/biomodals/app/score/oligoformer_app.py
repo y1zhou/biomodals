@@ -105,6 +105,7 @@ from typing import TypeVar, cast
 from uuid import UUID, uuid4
 
 import modal
+import orjson
 import polars as pl
 
 from biomodals.app.config import AppConfig
@@ -1075,17 +1076,17 @@ def _build_plan(
     )
 
 
-def _rnafm_model_identity() -> dict[str, object]:
-    """Return the persisted content identity for RNA-FM weights."""
+def _load_rnafm_identity(path: Path) -> dict[str, object]:
+    """Load and validate one persisted RNA-FM content identity."""
     import orjson
 
-    if not APP_INFO.rnafm_identity_path.is_file():
+    try:
+        identity = orjson.loads(path.read_bytes())
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
         raise FileNotFoundError(
             "OligoFormer RNA-FM identity is missing. Run "
             "download_oligoformer_models first."
-        )
-    try:
-        identity = orjson.loads(APP_INFO.rnafm_identity_path.read_bytes())
+        ) from exc
     except orjson.JSONDecodeError as exc:
         raise FileNotFoundError(
             "OligoFormer RNA-FM identity is invalid. Run "
@@ -1106,12 +1107,29 @@ def _rnafm_model_identity() -> dict[str, object]:
     return identity
 
 
+def _rnafm_model_identity() -> dict[str, object]:
+    """Return the output-volume content identity for RNA-FM weights."""
+    return _load_rnafm_identity(APP_INFO.rnafm_identity_path)
+
+
 def _rnafm_model_identity_digest() -> str:
     """Return the canonical RNA-FM identity digest for efficacy cache keys."""
     import orjson
 
     return _hash_bytes(
         orjson.dumps(_rnafm_model_identity(), option=orjson.OPT_SORT_KEYS)
+    )
+
+
+def _oligoformer_model_volume_identity_digest() -> str:
+    """Return the exact RNA-FM identity currently on the model volume."""
+    import orjson
+
+    return _hash_bytes(
+        orjson.dumps(
+            _load_rnafm_identity(APP_INFO.model_rnafm_identity_path),
+            option=orjson.OPT_SORT_KEYS,
+        )
     )
 
 
@@ -1155,18 +1173,17 @@ def _targetscan_human_refs_ready() -> bool:
     )
 
 
-def _targetscan_ref_identity() -> dict[str, object]:
-    """Return the persisted content identity for full-human references."""
+def _load_targetscan_ref_identity(path: Path) -> dict[str, object]:
+    """Load and validate one persisted full-human reference identity."""
     import orjson
 
-    path = APP_INFO.targetscan_ref_identity_path
-    if not path.is_file():
+    try:
+        identity = orjson.loads(path.read_bytes())
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
         raise FileNotFoundError(
             "OligoFormer full-human reference identity is missing. Run "
             "download_oligoformer_models first."
-        )
-    try:
-        identity = orjson.loads(path.read_bytes())
+        ) from exc
     except orjson.JSONDecodeError as exc:
         raise FileNotFoundError(
             "OligoFormer full-human reference identity is invalid. Run "
@@ -1193,12 +1210,29 @@ def _targetscan_ref_identity() -> dict[str, object]:
     return identity
 
 
+def _targetscan_ref_identity() -> dict[str, object]:
+    """Return the output-volume content identity for full-human references."""
+    return _load_targetscan_ref_identity(APP_INFO.targetscan_ref_identity_path)
+
+
 def _targetscan_ref_identity_digest() -> str:
     """Return the canonical digest pinned by full-human evidence plans."""
     import orjson
 
     return _hash_bytes(
         orjson.dumps(_targetscan_ref_identity(), option=orjson.OPT_SORT_KEYS)
+    )
+
+
+def _oligoformer_reference_volume_identity_digest() -> str:
+    """Return the exact TargetScan identity currently on the model volume."""
+    import orjson
+
+    return _hash_bytes(
+        orjson.dumps(
+            _load_targetscan_ref_identity(APP_INFO.targetscan_ref_marker_path),
+            option=orjson.OPT_SORT_KEYS,
+        )
     )
 
 
@@ -5587,7 +5621,7 @@ def _parse_oligoformer_result_publication(
         return None
     if not (
         isinstance(value, dict)
-        and value.get("version") == 1
+        and value.get("version") == 2
         and value.get("publication_key") == publication_key
         and isinstance(value.get("result_path"), str)
         and isinstance(value.get("size_bytes"), int)
@@ -5595,6 +5629,12 @@ def _parse_oligoformer_result_publication(
         and value["size_bytes"] > 0
         and isinstance(value.get("sha256"), str)
         and len(value["sha256"]) == 64
+        and isinstance(value.get("model_identity"), str)
+        and bool(value["model_identity"])
+        and (
+            value.get("reference_identity") is None
+            or isinstance(value.get("reference_identity"), str)
+        )
     ):
         return None
     relative = Path(cast(str, value["result_path"]))
@@ -5607,6 +5647,9 @@ def _publish_oligoformer_result_record(
     output_root: str | Path,
     publication_key: str,
     archive_path: Path,
+    *,
+    model_identity: str,
+    reference_identity: str | None,
 ) -> None:
     """Atomically bind one reconstructable archive to its scientific plan."""
     import orjson
@@ -5622,8 +5665,10 @@ def _publish_oligoformer_result_record(
     try:
         tmp_path.write_bytes(
             orjson.dumps({
-                "version": 1,
+                "version": 2,
                 "publication_key": publication_key,
+                "model_identity": model_identity,
+                "reference_identity": reference_identity,
                 "result_path": relative.as_posix(),
                 "size_bytes": size,
                 "sha256": _hash_path(archive_path),
@@ -5637,6 +5682,8 @@ def _publish_oligoformer_result_record(
 def _oligoformer_result_publication(
     output_root: str | Path,
     publication_key: str,
+    *,
+    expected_identities: tuple[str, str | None] | None = None,
 ) -> dict[str, object] | None:
     """Return one validated local archive publication, if complete."""
     marker = _oligoformer_result_record_path(output_root, publication_key)
@@ -5648,6 +5695,15 @@ def _oligoformer_result_publication(
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return None
     if publication is None:
+        return None
+    if (
+        expected_identities is not None
+        and (
+            publication["model_identity"],
+            publication["reference_identity"],
+        )
+        != expected_identities
+    ):
         return None
     archive = Path(output_root).joinpath(
         *Path(cast(str, publication["result_path"])).parts
@@ -5707,6 +5763,8 @@ def publish_oligoformer_outputs(
     )
     if not refreshed.final_ready:
         raise FileNotFoundError("OligoFormer final outputs are incomplete")
+    if refreshed.model_identity is None:
+        raise FileNotFoundError("OligoFormer model identity is unavailable")
     archive_path = _oligoformer_result_archive_path(refreshed)
     archive_bytes = _package_output_tables(
         Path(refreshed.output_dir),
@@ -5722,6 +5780,8 @@ def publish_oligoformer_outputs(
         CONF.output_volume_mountpoint,
         publication_key,
         archive_path,
+        model_identity=refreshed.model_identity,
+        reference_identity=refreshed.reference_identity,
     )
     CONF.output_volume.commit()
     return {"result_path": str(archive_path), "size_bytes": len(archive_bytes)}
@@ -6066,6 +6126,22 @@ def submit_oligoformer_task(
         force=force,
         force_generation=uuid4().hex if force else None,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+        model_version=_hash_bytes(
+            orjson.dumps(
+                APP_INFO.rnafm_identity_metadata,
+                option=orjson.OPT_SORT_KEYS,
+            )
+        ),
+        reference_version=(
+            _hash_bytes(
+                orjson.dumps(
+                    APP_INFO.targetscan_ref_metadata,
+                    option=orjson.OPT_SORT_KEYS,
+                )
+            )
+            if off_target and all_human
+            else None
+        ),
     )
 
     out_file = build_local_output_path(

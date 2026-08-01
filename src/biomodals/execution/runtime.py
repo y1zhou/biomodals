@@ -168,6 +168,70 @@ class ExecutionRuntime:
         """Derive the result-driven closure from durable Node observations."""
         return _required_node_keys_for_run(self.repository, execution_run_id)
 
+    def advance_once(
+        self,
+        execution_run_id: UUID,
+        *,
+        recover_publications: Callable[[], None],
+        reconcile_provider_calls: Callable[[set[str]], None],
+        decode_completed_calls: Callable[[], None],
+        start_ready_nodes: Callable[[set[str]], None],
+        admit_remote_tasks: Callable[[set[str]], None],
+        after_start_ready_nodes: Callable[[], None] | None = None,
+        now: Callable[[], int],
+    ) -> None:
+        """Apply one result-driven reconciliation and admission cycle."""
+        recover_publications()
+        self.reconcile_nodes_and_run(execution_run_id, now=now())
+        run = self.repository.get_run(execution_run_id)
+        if run.status == RunStatus.CANCEL_REQUESTED:
+            reconcile_provider_calls(set(run.plan.node_keys))
+            decode_completed_calls()
+            recover_publications()
+            self.reconcile_nodes_and_run(execution_run_id, now=now())
+            return
+        if run.status == RunStatus.STATE_UNKNOWN:
+            required = self.required_node_keys(execution_run_id)
+            required_nodes = set(run.plan.node_keys if required is None else required)
+            if required is not None:
+                self.prune_unrequired_nodes(
+                    execution_run_id,
+                    required_node_keys=required,
+                    now=now(),
+                )
+            reconcile_provider_calls(required_nodes)
+            decode_completed_calls()
+            recover_publications()
+            self.reconcile_nodes_and_run(execution_run_id, now=now())
+            return
+        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+            return
+        required = self.required_node_keys(execution_run_id)
+        if required is None:
+            return
+        self.prune_unrequired_nodes(
+            execution_run_id,
+            required_node_keys=required,
+            now=now(),
+        )
+        reconcile_provider_calls(set(required))
+        decode_completed_calls()
+        recover_publications()
+        self.reconcile_nodes_and_run(execution_run_id, now=now())
+        if self.repository.get_run(execution_run_id).status not in {
+            RunStatus.PENDING,
+            RunStatus.RUNNING,
+        }:
+            return
+        start_ready_nodes(set(required))
+        if after_start_ready_nodes is not None:
+            after_start_ready_nodes()
+        recover_publications()
+        required = self.required_node_keys(execution_run_id)
+        if required is not None:
+            admit_remote_tasks(set(required))
+        self.reconcile_nodes_and_run(execution_run_id, now=now())
+
     def recover_publications(
         self,
         execution_run_id: UUID,

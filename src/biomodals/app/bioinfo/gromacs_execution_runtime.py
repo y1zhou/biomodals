@@ -32,7 +32,6 @@ from biomodals.execution import (
     ExecutionRuntime,
     ExecutionSnapshot,
     NodeStatus,
-    RunStatus,
     TaskStatus,
     drive_execution_run,
     resume_execution_run,
@@ -281,47 +280,17 @@ class GromacsExecutionRuntime:
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._recover_publications()
-        self._reconcile_nodes_and_run()
-        run = self.store.execution.get_run(self.execution_run_id)
-        if run.status == RunStatus.CANCEL_REQUESTED:
-            self._reconcile_provider_calls(set(run.plan.node_keys))
-            self._decode_completed_calls()
-            self._recover_publications()
-            self._reconcile_nodes_and_run()
-            return
-        if run.status == RunStatus.STATE_UNKNOWN:
-            required = self._required_nodes()
-            required_nodes = set(run.plan.node_keys if required is None else required)
-            if required is not None:
-                self._prune_unrequired(required)
-            self._reconcile_provider_calls(required_nodes)
-            self._decode_completed_calls()
-            self._recover_publications()
-            self._reconcile_nodes_and_run()
-            return
-        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-            return
-        required = self._required_nodes()
-        if required is None:
-            return
-        self._prune_unrequired(required)
-        self._reconcile_provider_calls(set(required))
-        self._decode_completed_calls()
-        self._recover_publications()
-        self._reconcile_nodes_and_run()
-        if self.store.execution.get_run(self.execution_run_id).status not in {
-            RunStatus.PENDING,
-            RunStatus.RUNNING,
-        }:
-            return
-        self._start_ready_nodes(set(required))
-        self._complete_local_result()
-        self._recover_publications()
-        required = self._required_nodes()
-        if required is not None:
-            self._admit_remote_tasks(set(required))
-        self._reconcile_nodes_and_run()
+        self._provider.repository = self.store.execution
+        self._provider.advance_once(
+            self.execution_run_id,
+            recover_publications=self._recover_publications,
+            reconcile_provider_calls=self._reconcile_provider_calls,
+            decode_completed_calls=self._decode_completed_calls,
+            start_ready_nodes=self._start_ready_nodes,
+            after_start_ready_nodes=self._complete_local_result,
+            admit_remote_tasks=self._admit_remote_tasks,
+            now=self._now,
+        )
 
     def _initialize(self):
         self._reload_output()
@@ -534,18 +503,6 @@ class GromacsExecutionRuntime:
             )
         raise ValueError(f"Unknown GROMACS Node {node_key!r}")
 
-    def _required_nodes(self) -> tuple[str, ...] | None:
-        self._provider.repository = self.store.execution
-        return self._provider.required_node_keys(self.execution_run_id)
-
-    def _prune_unrequired(self, required: tuple[str, ...]) -> tuple[UUID, ...]:
-        self._provider.repository = self.store.execution
-        return self._provider.prune_unrequired_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            now=self._now(),
-        )
-
     def _reconcile_provider_calls(self, required: set[str]) -> None:
         self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
@@ -637,13 +594,6 @@ class GromacsExecutionRuntime:
                     observation,
                     now=self._now(),
                 )
-
-    def _reconcile_nodes_and_run(self) -> None:
-        self._provider.repository = self.store.execution
-        self._provider.reconcile_nodes_and_run(
-            self.execution_run_id,
-            now=self._now(),
-        )
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
         repository = self.store.execution

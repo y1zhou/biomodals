@@ -297,30 +297,6 @@ class ExecutionCoordinator:
             )
 
     @modal.method()
-    def restart(
-        self,
-        predecessor_execution_run_id: str,
-        predecessor_deployment_environment: str,
-        predecessor_deployment_name: str,
-        predecessor_deployment_version: int,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-    ) -> AppRunResult:
-        """Create and drive a successor from one conclusive terminal Run."""
-        predecessor_deployment = DeploymentIdentity(
-            environment=predecessor_deployment_environment,
-            deployment_name=predecessor_deployment_name,
-            deployment_version=predecessor_deployment_version,
-        )
-        return self._restart_successor(
-            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
-            predecessor_deployment=predecessor_deployment,
-            candidate=None,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-        )
-
-    @modal.method()
     def prepare_restart(
         self,
         predecessor_execution_run_id: str,
@@ -379,25 +355,6 @@ class ExecutionCoordinator:
             max_active_provider_calls=None,
             max_active_gpu_provider_calls=None,
         )
-
-    def _restart_successor(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        candidate: WorkflowCoordinatorPlan | None,
-        max_active_provider_calls: int | None,
-        max_active_gpu_provider_calls: int | None,
-    ) -> AppRunResult:
-        """Apply the synchronous generic restart operation."""
-        self._prepare_successor(
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            predecessor_deployment=predecessor_deployment,
-            candidate=candidate,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-        )
-        return self._drive_prepared()
 
     def _prepare_successor(
         self,
@@ -822,3 +779,49 @@ def execution_coordinator_handle(
         local_coordinator=ExecutionCoordinator,
         class_resolver=class_resolver or modal.Cls.from_name,
     )
+
+
+def submit_workflow_run(
+    coordinator: Any,
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    predecessor_execution_run_id: UUID | None,
+    coordinator_kwargs: Mapping[str, Any],
+) -> Any:
+    """Submit a root or prepared Successor and always report its identity."""
+    identity_reported = False
+
+    def report_identity() -> None:
+        print(
+            "Deployment Identity: "
+            f"{deployment.environment}/{deployment.deployment_name}/"
+            f"v{deployment.deployment_version}",
+            flush=True,
+        )
+        print(f"Execution Run ID: {execution_run_id}", flush=True)
+
+    try:
+        if predecessor_execution_run_id is None:
+            call = coordinator.run.spawn(**coordinator_kwargs)
+        else:
+            coordinator.prepare_restart_from.remote(
+                predecessor_execution_run_id=str(predecessor_execution_run_id),
+                **coordinator_kwargs,
+            )
+            report_identity()
+            identity_reported = True
+            call = coordinator.drive_prepared.spawn()
+    except (Exception, KeyboardInterrupt):
+        if not identity_reported:
+            report_identity()
+        print(
+            "Coordinator submission outcome is unknown; inspect this Execution "
+            "Run before retrying.",
+            flush=True,
+        )
+        raise
+
+    if not identity_reported:
+        report_identity()
+    return call

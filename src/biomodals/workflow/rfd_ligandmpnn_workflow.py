@@ -688,29 +688,13 @@ def submit_rfd_ligandmpnn_workflow(
         f"{total_structures} LigandMPNN node(s)",
         flush=True,
     )
-    print(
-        "Deployment Identity: "
-        f"{deployment.environment}/{deployment.deployment_name}/"
-        f"v{deployment.deployment_version}",
-        flush=True,
+    fc = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        coordinator_kwargs=orchestrator_kwargs,
     )
-    print(f"Execution Run ID: {execution_run_id}", flush=True)
-    try:
-        if predecessor_execution_run_id is None:
-            fc = coordinator.run.spawn(**orchestrator_kwargs)
-        else:
-            coordinator.prepare_restart_from.remote(
-                predecessor_execution_run_id=str(predecessor_execution_run_id),
-                **orchestrator_kwargs,
-            )
-            fc = coordinator.drive_prepared.spawn()
-    except Exception:
-        print(
-            "Coordinator submission outcome is unknown; inspect this Execution "
-            "Run before retrying.",
-            flush=True,
-        )
-        raise
     print(
         f"Coordinator FunctionCall ID: {getattr(fc, 'object_id', fc)}",
         flush=True,

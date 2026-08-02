@@ -931,6 +931,12 @@ def restart_execution_run(
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
         )
         call = coordinator.drive_prepared.spawn()
+    except KeyboardInterrupt:
+        console.print(f"Successor Execution Run ID: {successor_execution_run_id}")
+        console.print(
+            "Restart submission outcome is unknown; inspect this Run before retrying."
+        )
+        raise
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Error[/bold red] Could not restart run: {exc}")
         console.print(f"Successor Execution Run ID: {successor_execution_run_id}")

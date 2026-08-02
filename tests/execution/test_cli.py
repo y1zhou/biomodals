@@ -239,6 +239,27 @@ def test_run_restart_reports_unknown_outcome_when_drive_fails(
     assert str(SUCCESSOR_ID) in result.output
 
 
+def test_run_restart_reports_successor_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _ = _patch_coordinator(monkeypatch)
+    monkeypatch.setattr("biomodals.cli.uuid4", lambda: SUCCESSOR_ID)
+
+    def interrupt(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(coordinator.prepare_restart, "remote", interrupt)
+
+    result = runner.invoke(
+        app,
+        ["run", "restart", *LOCATION_FLAGS, *TARGET_FLAGS],
+    )
+
+    assert result.exit_code == 130
+    assert "submission outcome is unknown" in result.output
+    assert str(SUCCESSOR_ID) in result.output
+
+
 def test_top_level_run_is_reserved_for_execution_lifecycle() -> None:
     result = runner.invoke(app, ["run", "--help"])
 

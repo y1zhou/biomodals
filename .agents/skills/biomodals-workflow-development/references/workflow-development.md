@@ -389,11 +389,13 @@ app = modal.App(...).include(orchestrator.app)
 
 All remote orchestration functions should live as methods on
 `ExecutionCoordinator`. Workflow apps obtain the class handle with
-`orchestrator.execution_coordinator_handle(...)` and submit either `run` or
-`restart_from`. The reusable orchestrator must not discover workflow modules,
-perform floating deployed-app lookups, or own workflow-specific input staging.
-Domain-specific staging, DAG construction, and development function handles
-belong in top-level workflow scripts.
+`orchestrator.execution_coordinator_handle(...)` and call
+`orchestrator.submit_workflow_run(...)`. That helper submits `run` for a root
+Run, or synchronously calls `prepare_restart_from` before spawning
+`drive_prepared` for a Successor. The reusable orchestrator must not discover
+workflow modules, perform floating deployed-app lookups, or own
+workflow-specific input staging. Domain-specific staging, DAG construction,
+and development function handles belong in top-level workflow scripts.
 
 Pass workflow Node parallelism as `max_parallel_nodes` and remote fan-out
 ceilings as `max_active_provider_calls` and
@@ -407,9 +409,10 @@ artifact rows for diagnostics. Do not expose private scheduler, repository, or
 Volume-sync collaborators as routine workflow authoring APIs.
 
 Keep the public coordinator surface minimal: `run`, `status`, `cancel`,
-`resume`, `restart`, `restart_from`, and the pull-worker claim/completion
-callbacks. The coordinator does not expose generic per-Node execution methods;
-runtime-managed Nodes only prepare work and the kernel owns submission.
+`resume`, `prepare_restart`, `prepare_restart_from`, `drive_prepared`, and the
+pull-worker claim/completion callbacks. The coordinator does not expose generic
+per-Node execution methods; runtime-managed Nodes only prepare work and the
+kernel owns submission.
 
 The reusable orchestrator module should not expose a local entrypoint for generic
 workflow submission. Each user-facing workflow script owns its own local

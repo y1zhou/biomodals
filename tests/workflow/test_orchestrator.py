@@ -216,6 +216,11 @@ def _raw_coordinator(
     return raw_cls, instance
 
 
+def _restart(raw_cls: Any, coordinator: Any, **kwargs: object) -> AppRunResult:
+    raw_cls.prepare_restart._get_raw_f()(coordinator, **kwargs)
+    return raw_cls.drive_prepared._get_raw_f()(coordinator)
+
+
 def test_coordinator_binds_parameterized_identity_and_persists_plan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -447,14 +452,16 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
         deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
     )
 
-    first = raw_cls.restart._get_raw_f()(
+    first = _restart(
+        raw_cls,
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
         predecessor_deployment_environment=DEPLOYMENT.environment,
         predecessor_deployment_name=DEPLOYMENT.deployment_name,
         predecessor_deployment_version=DEPLOYMENT.deployment_version,
     )
-    second = raw_cls.restart._get_raw_f()(
+    second = _restart(
+        raw_cls,
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
         predecessor_deployment_environment=DEPLOYMENT.environment,
@@ -710,7 +717,8 @@ def test_restart_reuses_successful_task_publications_from_partial_node(
         deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
     )
 
-    successor_result = raw_cls.restart._get_raw_f()(
+    successor_result = _restart(
+        raw_cls,
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
         predecessor_deployment_environment=DEPLOYMENT.environment,
@@ -761,7 +769,8 @@ def test_restart_recomputes_a_missing_predecessor_publication(
         deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
     )
 
-    result = raw_cls.restart._get_raw_f()(
+    result = _restart(
+        raw_cls,
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
         predecessor_deployment_environment=DEPLOYMENT.environment,
@@ -805,7 +814,8 @@ def test_restart_rejects_a_mismatched_predecessor_deployment(
     )
 
     with pytest.raises(ValueError, match="Predecessor Deployment Identity"):
-        raw_cls.restart._get_raw_f()(
+        _restart(
+            raw_cls,
             successor_coordinator,
             predecessor_execution_run_id=str(RUN_ID),
             predecessor_deployment_environment=DEPLOYMENT.environment,
@@ -1080,6 +1090,103 @@ def test_coordinator_handle_resolves_the_exact_deployed_class_version() -> None:
         "deployment_name": "DemoWorkflow",
         "deployment_version": 7,
     }
+
+
+def test_submit_successor_reports_identity_between_prepare_and_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
+    )
+    coordinator = SimpleNamespace(
+        prepare_restart_from=SimpleNamespace(
+            remote=lambda **_kwargs: events.append("prepare")
+        ),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda: events.append("drive") or "fc-successor"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        predecessor_execution_run_id=RUN_ID,
+        coordinator_kwargs={"workload_run_key": "demo"},
+    )
+
+    assert call == "fc-successor"
+    assert events == [
+        "prepare",
+        "print:Deployment Identity: main/DemoWorkflow/v8",
+        f"print:Execution Run ID: {SUCCESSOR_ID}",
+        "drive",
+    ]
+
+
+def test_submit_root_reports_identity_after_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
+    )
+    coordinator = SimpleNamespace(
+        run=SimpleNamespace(spawn=lambda **_kwargs: events.append("run") or "fc-root")
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        predecessor_execution_run_id=None,
+        coordinator_kwargs={"workload_run_key": "demo"},
+    )
+
+    assert call == "fc-root"
+    assert events == [
+        "run",
+        "print:Deployment Identity: main/DemoWorkflow/v7",
+        f"print:Execution Run ID: {RUN_ID}",
+    ]
+
+
+def test_submit_workflow_run_reports_identity_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
+    )
+
+    def interrupt(**_kwargs: object) -> None:
+        events.append("prepare")
+        raise KeyboardInterrupt
+
+    coordinator = SimpleNamespace(
+        prepare_restart_from=SimpleNamespace(remote=interrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.submit_workflow_run(
+            coordinator,
+            execution_run_id=SUCCESSOR_ID,
+            deployment=SUCCESSOR_DEPLOYMENT,
+            predecessor_execution_run_id=RUN_ID,
+            coordinator_kwargs={"workload_run_key": "demo"},
+        )
+
+    assert events == [
+        "prepare",
+        "print:Deployment Identity: main/DemoWorkflow/v8",
+        f"print:Execution Run ID: {SUCCESSOR_ID}",
+        "print:Coordinator submission outcome is unknown; inspect this Execution "
+        "Run before retrying.",
+    ]
 
 
 def test_orchestrator_modal_app_exposes_standard_coordinator_surface() -> None:

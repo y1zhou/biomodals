@@ -25,7 +25,6 @@ from biomodals.execution import (
     NodeStatus,
     ProviderBinding,
     PullTaskClaim,
-    RunStatus,
     TaskPlan,
     TaskStatus,
     form_pull_worker_candidates,
@@ -166,55 +165,17 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def advance_once(self) -> None:
         """Apply one result-driven recovery and greedy admission cycle."""
-        self._recover_publications()
-        self._reconcile_nodes_and_run()
-        run = self.store.execution.get_run(self.execution_run_id)
-        if run.status == RunStatus.CANCEL_REQUESTED:
-            self._reconcile_provider_calls(set(run.plan.node_keys))
-            self._recover_publications()
-            self._reconcile_nodes_and_run()
-            return
-        if run.status == RunStatus.STATE_UNKNOWN:
-            required = self._required_nodes()
-            if required is None:
-                required_nodes = set(run.plan.node_keys)
-            else:
-                required_nodes = set(required)
-                for provider_call_id in self._prune_unrequired(required):
-                    self._provider.repository = self.store.execution
-                    self._provider.request_provider_call_cancellation(
-                        provider_call_id,
-                        now=self._now(),
-                    )
-            self._reconcile_provider_calls(required_nodes)
-            self._recover_publications()
-            self._reconcile_nodes_and_run()
-            return
-        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-            return
-        required = self._required_nodes()
-        if required is None:
-            return
-        for provider_call_id in self._prune_unrequired(required):
-            self._provider.repository = self.store.execution
-            self._provider.request_provider_call_cancellation(
-                provider_call_id,
-                now=self._now(),
-            )
-        self._reconcile_provider_calls(set(required))
-        self._recover_publications()
-        self._reconcile_nodes_and_run()
-        if self.store.execution.get_run(self.execution_run_id).status not in {
-            RunStatus.PENDING,
-            RunStatus.RUNNING,
-        }:
-            return
-        self._start_ready_node()
-        self._recover_publications()
-        required = self._required_nodes()
-        if required is not None:
-            self._admit_pull_workers(set(required))
-        self._reconcile_nodes_and_run()
+        self._provider.repository = self.store.execution
+        # Pull workers complete Tasks through coordinator callbacks.
+        self._provider.advance_once(
+            self.execution_run_id,
+            recover_publications=self._recover_publications,
+            reconcile_provider_calls=self._reconcile_provider_calls,
+            decode_completed_calls=lambda: None,
+            start_ready_nodes=lambda _required: self._start_ready_node(),
+            admit_remote_tasks=self._admit_pull_workers,
+            now=self._now,
+        )
 
     def _initialize(self, *, reload_output: bool = True):
         if reload_output:
@@ -296,21 +257,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         except OSError:
             return AvailabilityStatus.UNKNOWN
         return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _required_nodes(self) -> tuple[str, ...] | None:
-        self._provider.repository = self.store.execution
-        return self._provider.required_node_keys(self.execution_run_id)
-
-    def _prune_unrequired(self, required: tuple[str, ...]) -> tuple[UUID, ...]:
-        with self.store.transaction():
-            calls = self.store.execution.prune_unrequired_nodes(
-                self.execution_run_id,
-                required_node_keys=set(required),
-                now=self._now(),
-            )
-        if calls:
-            self._checkpoint()
-        return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
         self._provider.repository = self.store.execution
@@ -452,22 +398,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             )
             if submitted is None:
                 return
-
-    def _reconcile_nodes_and_run(self) -> None:
-        repository = self.store.execution
-        node = repository.get_node(self.execution_run_id, ROSETTA_TASKS_NODE)
-        if node.status == NodeStatus.RUNNING and node.discovery_complete:
-            with self.store.transaction():
-                repository.reconcile_node_tasks(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    now=self._now(),
-                )
-        with self.store.transaction():
-            repository.finalize_run_from_results(
-                self.execution_run_id,
-                now=self._now(),
-            )
 
     def _task_specs(self) -> dict[str, RosettaTaskSpec]:
         return {task.task_key: task for task in self.request.tasks}

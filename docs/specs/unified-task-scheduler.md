@@ -712,7 +712,11 @@ Generic restart uses two coordinator inputs. `prepare_restart` synchronously
 validates the predecessor, applies operational overrides, and checkpoints the
 immutable Successor request and launch identity. Only after that succeeds does
 the CLI spawn `drive_prepared`. This is a submission boundary, not a new Run
-state: preparation does not create ledger rows or admit Provider Calls.
+status: preparation never admits Provider Calls. Direct apps stage immutable
+request and launch files. Workflows may also persist the pending Successor
+ledger and reusable publication rows so immediate cancellation can act on
+durable state. Workflow-specific `restart_from` uses the same two-input
+boundary through `prepare_restart_from` and `drive_prepared`.
 
 `status` is read-only, `cancel` is an idempotent explicit cancellation,
 `resume` retains Execution Run ID and Deployment Identity, reconciles existing

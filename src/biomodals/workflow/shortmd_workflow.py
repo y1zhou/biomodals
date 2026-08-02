@@ -847,10 +847,11 @@ def submit_shortmd_workflow(
     if predecessor_execution_run_id is None:
         function_call = coordinator.run.spawn(**orchestrator_kwargs)
     else:
-        function_call = coordinator.restart_from.spawn(
+        coordinator.prepare_restart_from.remote(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
             **orchestrator_kwargs,
         )
+        function_call = coordinator.drive_prepared.spawn()
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"

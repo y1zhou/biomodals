@@ -2295,14 +2295,19 @@ PPIFlowStep:
         def spawn(self, **_kwargs):
             raise AssertionError("restart must not create a root run")
 
-    class FakeRestartMethod:
+    class FakePrepareMethod:
+        def remote(self, **kwargs):
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
         def spawn(self, **kwargs):
-            calls["restart"] = kwargs
+            calls["drive"] = kwargs
             return _FakeFunctionCall("call-1")
 
     class FakeCoordinator:
         run = UnexpectedRunMethod()
-        restart_from = FakeRestartMethod()
+        prepare_restart_from = FakePrepareMethod()
+        drive_prepared = FakeDriveMethod()
 
     def fake_coordinator_handle(**kwargs):
         calls["coordinator"] = kwargs
@@ -2333,9 +2338,10 @@ PPIFlowStep:
         restart_from=predecessor,
     )
 
-    assert calls["restart"]["predecessor_execution_run_id"] == predecessor
-    assert calls["restart"]["workload_run_key"] == "demo"
-    assert calls["restart"]["workflow"].name == "ppiflow-v2"
+    assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
+    assert calls["prepare"]["workload_run_key"] == "demo"
+    assert calls["prepare"]["workflow"].name == "ppiflow-v2"
+    assert calls["drive"] == {}
 
 
 def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
@@ -2699,6 +2705,21 @@ RosettaFixStep:
 
     assert workflow_hash(4) == baseline
     assert workflow_hash(2, max_structures=6) != baseline
+
+
+def test_af3score_model_identity_changes_scientific_dag_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = ppiflow_workflow.Workflow("af3score-identity")
+    workflow.add_node(
+        ppiflow_workflow.AF3ScorePrepareNode("score", {}),
+        id="score",
+    )
+    baseline = hashing.dag_hash(workflow.validate())
+
+    monkeypatch.setattr(ppiflow_workflow, "DECLARED_MODEL_IDENTITY", "changed")
+
+    assert hashing.dag_hash(workflow.validate()) != baseline
 
 
 def test_ppiflow_stage2_only_requires_existing_input() -> None:

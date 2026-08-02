@@ -483,7 +483,7 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     store.close()
 
 
-def test_launch_restart_matches_candidate_science_and_changes_operational_limits(
+def test_launch_restart_prepares_candidate_before_driving(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -514,7 +514,7 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
     candidate_workflow = Workflow("demo")
     candidate_workflow.add_node(TextNode("complete", workers=2), id="write")
 
-    result = raw_cls.restart_from._get_raw_f()(
+    raw_cls.prepare_restart_from._get_raw_f()(
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
         workflow=candidate_workflow,
@@ -524,7 +524,6 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
         max_active_gpu_provider_calls=2,
     )
 
-    assert result.status == AppRunStatus.SUCCEEDED
     store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
     successor = store.execution.get_run(SUCCESSOR_ID)
     assert successor.predecessor_execution_run_id == RUN_ID
@@ -535,7 +534,12 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
     assert successor_plan.max_parallel_nodes == 1
     successor_node = successor_plan.workflow.validate().nodes["write"].node
     assert successor_node.workers == 2
+    assert getattr(successor_coordinator, "_runtime", None) is None
     store.close()
+
+    result = raw_cls.drive_prepared._get_raw_f()(successor_coordinator)
+
+    assert result.status == AppRunStatus.SUCCEEDED
 
 
 def test_generic_restart_prepares_successor_before_driving(

@@ -691,10 +691,11 @@ def submit_rfd_ligandmpnn_workflow(
     if predecessor_execution_run_id is None:
         fc = coordinator.run.spawn(**orchestrator_kwargs)
     else:
-        fc = coordinator.restart_from.spawn(
+        coordinator.prepare_restart_from.remote(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
             **orchestrator_kwargs,
         )
+        fc = coordinator.drive_prepared.spawn()
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"

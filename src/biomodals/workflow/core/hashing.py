@@ -43,6 +43,9 @@ def node_hash_payload(node: WorkflowNode) -> dict[str, object]:
     }
     if is_dataclass(node):
         payload["dataclass"] = stable_json_value(node)
+    scientific_versions = getattr(node, "scientific_versions", None)
+    if scientific_versions is not None:
+        payload["scientific_versions"] = stable_json_value(scientific_versions())
     return payload
 
 

@@ -116,6 +116,12 @@ PPIFlow candidate ids are deterministic and provenance-based. Initial candidates
 
 PPIFlow candidate ids are runtime provenance for produced artifacts, not semantic workflow DAG configuration. Changing candidate-id helper internals is a manifest migration concern unless user-facing workflow configuration changes; candidate ids and candidate manifests must not be added to node hash payloads.
 
+Deployment-owned scientific versions that affect results do belong in the DAG
+hash. AF3Score Nodes declare the current scoring code and AlphaFold3 model
+identity through the workflow hash hook, so a Successor cannot reuse a
+predecessor under changed scoring science. Operational concurrency remains
+excluded.
+
 ## Use one-row-per-candidate PPIFlow manifests
 
 PPIFlow candidate manifests store one Parquet row per candidate with a nested list of file records. Candidate-level joins, filtering, ranking, and reporting are the common operations, and file-level availability checks can expand the nested file list when needed.

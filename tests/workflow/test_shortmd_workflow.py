@@ -900,14 +900,19 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
         def spawn(self, **_kwargs):
             raise AssertionError("restart must not create a root run")
 
-    class FakeRestartMethod:
+    class FakePrepareMethod:
+        def remote(self, **kwargs):
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
         def spawn(self, **kwargs):
-            calls["restart"] = kwargs
+            calls["drive"] = kwargs
             return FakeFunctionCall("call-1")
 
     class FakeCoordinator:
         run = UnexpectedRunMethod()
-        restart_from = FakeRestartMethod()
+        prepare_restart_from = FakePrepareMethod()
+        drive_prepared = FakeDriveMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
@@ -929,9 +934,10 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
         restart_from=predecessor,
     )
 
-    assert calls["restart"]["predecessor_execution_run_id"] == predecessor
-    assert calls["restart"]["workload_run_key"] == "shortmd-run"
-    assert calls["restart"]["workflow"].name == "shortmd"
+    assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
+    assert calls["prepare"]["workload_run_key"] == "shortmd-run"
+    assert calls["prepare"]["workflow"].name == "shortmd"
+    assert calls["drive"] == {}
 
 
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(

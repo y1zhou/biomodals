@@ -2404,6 +2404,17 @@ class FlowPackerNode(_ConfiguredAppStepNode):
 class AF3ScorePrepareNode(_ConfiguredAppStepNode):
     """Prepare finite AF3Score candidate Tasks without nested Modal calls."""
 
+    def scientific_versions(self) -> dict[str, str]:
+        """Bind workflow identity to the scoring code and model weights."""
+        return {
+            "af3score": (
+                af3score_app.CONF.repo_commit_hash
+                or af3score_app.CONF.version
+                or "unknown"
+            ),
+            "alphafold3.model": DECLARED_MODEL_IDENTITY,
+        }
+
     def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
         """Prepare AF3Score inputs and its durable Task plan."""
         structures = context.inputs.get("structures") or []
@@ -4757,10 +4768,11 @@ def submit_ppiflow_workflow(
     if predecessor_execution_run_id is None:
         function_call = coordinator.run.spawn(**orchestrator_kwargs)
     else:
-        function_call = coordinator.restart_from.spawn(
+        coordinator.prepare_restart_from.remote(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
             **orchestrator_kwargs,
         )
+        function_call = coordinator.drive_prepared.spawn()
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"

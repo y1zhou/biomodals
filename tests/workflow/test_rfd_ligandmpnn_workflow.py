@@ -579,14 +579,19 @@ def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
         def spawn(self, **_kwargs: object) -> FakeFunctionCall:
             raise AssertionError("restart must not create a root run")
 
-    class FakeRestartMethod:
+    class FakePrepareMethod:
+        def remote(self, **kwargs: object) -> None:
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
         def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            calls["restart"] = kwargs
+            calls["drive"] = kwargs
             return FakeFunctionCall("call-1")
 
     class FakeCoordinator:
         run = UnexpectedRunMethod()
-        restart_from = FakeRestartMethod()
+        prepare_restart_from = FakePrepareMethod()
+        drive_prepared = FakeDriveMethod()
 
     def fake_coordinator_handle(**kwargs: object) -> FakeCoordinator:
         calls["coordinator"] = kwargs
@@ -613,9 +618,10 @@ def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
         restart_from=predecessor,
     )
 
-    assert calls["restart"]["predecessor_execution_run_id"] == predecessor
-    assert calls["restart"]["workload_run_key"] == "demo"
-    assert calls["restart"]["workflow"].name == "rfd_ligandmpnn"
+    assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
+    assert calls["prepare"]["workload_run_key"] == "demo"
+    assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
+    assert calls["drive"] == {}
 
 
 def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(

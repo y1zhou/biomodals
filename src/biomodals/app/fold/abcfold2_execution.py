@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from base64 import b64decode, b64encode
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -26,14 +25,13 @@ from biomodals.execution import (
     ProviderBinding,
     ProviderCallStatus,
     TaskPlan,
-    drive_execution_run,
-    resume_execution_run,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
+    ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
 )
 from biomodals.helper.output_claim import (
@@ -246,7 +244,7 @@ def load_execution_request_from_volume(
     )
 
 
-class ABCFold2ExecutionRuntime:
+class ABCFold2ExecutionRuntime(ExecutionRuntimeLifecycle):
     """Drive one ABCFold2 request through parallel per-seed Tasks."""
 
     def __init__(
@@ -282,61 +280,6 @@ class ABCFold2ExecutionRuntime:
             commit_local=store.commit,
             transaction=store.transaction,
         )
-
-    def run(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Create or recover the Run and drive it until it stops."""
-        with synchronize():
-            repository = self._initialize()
-        return drive_execution_run(
-            repository,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def resume(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Resume this Run without retrying conclusive failures."""
-        with synchronize():
-            repository = self._initialize()
-            resume_execution_run(
-                repository,
-                self.execution_run_id,
-                reconcile_once=self.advance_once,
-                checkpoint=self._checkpoint,
-                now=self._now(),
-            )
-        return drive_execution_run(
-            self.store.execution,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Request cancellation while retaining uncertain call ownership."""
-        self._provider.repository = self.store.execution
-        self._provider.cancel_run(self.execution_run_id, now=self._now())
-        return self.store.execution.snapshot(self.execution_run_id)
-
-    def close(self) -> None:
-        """Close SQLite without cancelling attached Provider Calls."""
-        self.store.close()
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
@@ -708,16 +651,6 @@ class ABCFold2ExecutionRuntime:
             run_conf.as_kwargs(),
         )
 
-    def _checkpoint(self):
-        self._volume_sync.commit()
-        repository = self.store.execution
-        self._provider.repository = repository
-        return repository
-
-    def _reload_output(self) -> None:
-        self._volume_sync.reload()
-        self._provider.repository = self.store.execution
-
 
 def _run_config_from_envelope(envelope: object) -> ABCFold2RunConfig:
     if not isinstance(envelope, dict) or envelope.get("kind") != "run-config":
@@ -805,6 +738,8 @@ def _workload_module():
 class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one run-scoped writer to ABCFold2 publications."""
 
+    _request_loader = staticmethod(load_execution_request)
+
     def __init__(
         self,
         *,
@@ -826,36 +761,6 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.output_claims = output_claims
         self.modal_driver = modal_driver
         self.poll_interval_seconds = poll_interval_seconds
-
-    def run(self) -> ExecutionSnapshot:
-        """Load the staged request and drive one root Run."""
-        with self._drive_lock:
-            with self._writer_lock:
-                runtime = self._open_runtime(
-                    load_execution_request(self.volume_root, self.execution_run_id)
-                )
-            return self._drive(runtime, resume=False)
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Request cancellation and reconcile it to a terminal result."""
-        with self._writer_lock:
-            runtime = self._open_runtime(
-                load_execution_request(self.volume_root, self.execution_run_id)
-            )
-            snapshot = runtime.cancel()
-            self._verify_snapshot(snapshot)
-        if snapshot.run.status.is_terminal:
-            return snapshot
-        return self._drive(runtime, resume=False)
-
-    def resume(self) -> ExecutionSnapshot:
-        """Resume this Run without retrying conclusive failures."""
-        with self._drive_lock:
-            with self._writer_lock:
-                runtime = self._open_runtime(
-                    load_execution_request(self.volume_root, self.execution_run_id)
-                )
-            return self._drive(runtime, resume=True)
 
     def restart(
         self,

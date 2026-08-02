@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,18 +25,15 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionRuntime,
-    ExecutionSnapshot,
     NodeStatus,
     ProviderBinding,
     ProviderCallStatus,
     RunStatus,
     TaskPlan,
     TaskStatus,
-    drive_execution_run,
     ready_node_keys,
     required_node_keys,
     result_probe_frontier,
-    resume_execution_run,
 )
 from biomodals.execution.scheduler import (
     TaskDispatchDescriptor,
@@ -45,7 +41,11 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import ExecutionRunStore, ExecutionVolumeSync
+from biomodals.helper.app_execution import (
+    ExecutionRunStore,
+    ExecutionRuntimeLifecycle,
+    ExecutionVolumeSync,
+)
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ class _PlannedTask:
     run_id: str | None = None
 
 
-class BoltzGenExecutionRuntime:
+class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
     """Drive one BoltzGen request through direct one-Task GPU calls."""
 
     def __init__(
@@ -88,61 +88,6 @@ class BoltzGenExecutionRuntime:
             checkpoint=self._checkpoint,
             commit_local=self.store.commit,
         )
-
-    def run(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Create or recover the Run and drive it until it stops."""
-        with synchronize():
-            repository = self._initialize()
-        return drive_execution_run(
-            repository,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def resume(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Resume this same Run without retrying conclusive Task failures."""
-        with synchronize():
-            repository = self._initialize()
-            resume_execution_run(
-                repository,
-                self.execution_run_id,
-                reconcile_once=self.advance_once,
-                checkpoint=self._checkpoint,
-                now=self._now(),
-            )
-        return drive_execution_run(
-            self.store.execution,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Request explicit cancellation while retaining uncertain ownership."""
-        self._provider.repository = self.store.execution
-        self._provider.cancel_run(self.execution_run_id, now=self._now())
-        return self.store.execution.snapshot(self.execution_run_id)
-
-    def close(self) -> None:
-        """Close SQLite without cancelling attached Provider Calls."""
-        self.store.close()
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
@@ -659,16 +604,6 @@ class BoltzGenExecutionRuntime:
         if task.provider_call_id is None:
             return None
         return self.store.execution.get_provider_call(task.provider_call_id)
-
-    def _checkpoint(self):
-        self._volume_sync.commit()
-        repository = self.store.execution
-        self._provider.repository = repository
-        return repository
-
-    def _reload_output(self) -> None:
-        self._volume_sync.reload()
-        self._provider.repository = self.store.execution
 
 
 def _result_envelope(result: object) -> dict[str, object]:

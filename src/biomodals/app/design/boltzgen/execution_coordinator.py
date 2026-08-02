@@ -30,6 +30,8 @@ from biomodals.helper.app_execution import (
 class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one run-scoped writer to BoltzGen-owned publications."""
 
+    _request_loader = staticmethod(load_execution_request)
+
     def __init__(
         self,
         *,
@@ -49,42 +51,6 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.output_volume = output_volume
         self.modal_driver = modal_driver
         self.poll_interval_seconds = poll_interval_seconds
-
-    def run(self) -> ExecutionSnapshot:
-        """Load the staged request and drive one root Run."""
-        with self._drive_lock:
-            with self._writer_lock:
-                request = load_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
-                )
-                runtime = self._open_runtime(request)
-            return self._drive(runtime, resume=False)
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Idempotently request cancellation without replacing unknown work."""
-        with self._writer_lock:
-            request = load_execution_request(
-                self.volume_root,
-                self.execution_run_id,
-            )
-            runtime = self._open_runtime(request)
-            snapshot = runtime.cancel()
-            self._verify_snapshot(snapshot)
-        if snapshot.run.status.is_terminal:
-            return snapshot
-        return self._drive(runtime, resume=False)
-
-    def resume(self) -> ExecutionSnapshot:
-        """Resume this Run without retrying conclusive Task failures."""
-        with self._drive_lock:
-            with self._writer_lock:
-                request = load_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
-                )
-                runtime = self._open_runtime(request)
-            return self._drive(runtime, resume=True)
 
     def restart(
         self,

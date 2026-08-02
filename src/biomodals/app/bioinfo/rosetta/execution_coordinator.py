@@ -30,6 +30,8 @@ from biomodals.helper.app_execution import (
 class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one single-writer App Run ledger to Rosetta publications."""
 
+    _request_loader = staticmethod(load_execution_request)
+
     def __init__(
         self,
         *,
@@ -51,48 +53,6 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.modal_driver = modal_driver
         self.pull_worker_coordinator = pull_worker_coordinator
         self.poll_interval_seconds = poll_interval_seconds
-
-    def run(self) -> ExecutionSnapshot:
-        """Load the staged request and drive a root Run."""
-        with self._drive_lock:
-            with self._writer_lock:
-                request = load_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
-                )
-                runtime = self._open_runtime(request)
-            return self._drive(runtime, resume=False)
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Request idempotent cancellation through the shared runtime."""
-        with self._writer_lock:
-            request = load_execution_request(
-                self.volume_root,
-                self.execution_run_id,
-            )
-            runtime = self._open_runtime(
-                request,
-                predecessor_execution_run_id=self._existing_predecessor(),
-            )
-            snapshot = runtime.cancel()
-            self._verify_snapshot(snapshot)
-        if snapshot.run.status.is_terminal:
-            return snapshot
-        return self._drive(runtime, resume=False)
-
-    def resume(self) -> ExecutionSnapshot:
-        """Resume this same Run without retrying failed Tasks."""
-        with self._drive_lock:
-            with self._writer_lock:
-                request = load_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
-                )
-                runtime = self._open_runtime(
-                    request,
-                    predecessor_execution_run_id=self._existing_predecessor(),
-                )
-            return self._drive(runtime, resume=True)
 
     def claim_tasks(
         self,
@@ -117,6 +77,15 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 request_id=request_id,
                 capacity=capacity,
             )
+
+    def _open_current_runtime(self, *, recover: bool) -> RosettaExecutionRuntime:
+        request = self._request_loader(self.volume_root, self.execution_run_id)
+        return self._open_runtime(
+            request,
+            predecessor_execution_run_id=(
+                self._existing_predecessor() if recover else None
+            ),
+        )
 
     def complete_task(
         self,

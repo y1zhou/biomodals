@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import PurePosixPath
@@ -92,7 +91,6 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionRuntime,
-    ExecutionSnapshot,
     NodeStatus,
     ProviderBinding,
     ProviderCallRecord,
@@ -100,10 +98,8 @@ from biomodals.execution import (
     RunStatus,
     TaskPlan,
     TaskStatus,
-    drive_execution_run,
     ready_node_keys,
     result_probe_frontier,
-    resume_execution_run,
 )
 from biomodals.execution.modal import (
     ModalDefiniteSubmissionError,
@@ -116,7 +112,11 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import ExecutionRunStore, ExecutionVolumeSync
+from biomodals.helper.app_execution import (
+    ExecutionRunStore,
+    ExecutionRuntimeLifecycle,
+    ExecutionVolumeSync,
+)
 
 (
     _STAGE_REQUEST,
@@ -154,7 +154,7 @@ class _PlannedTask:
     value: object
 
 
-class AlphaFold3ExecutionRuntime:
+class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
     """Drive one AlphaFold3 App Run through ordinary kernel operations."""
 
     def __init__(
@@ -207,61 +207,6 @@ class AlphaFold3ExecutionRuntime:
         self._prepared_inference_cache: PreparedInferenceRun | None = None
         self._prepared_inference_error: _IncompletePrerequisiteError | None = None
         self._seed_prediction_cache: dict[int, dict[str, object]] | None = None
-
-    def run(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Create or recover the Run and drive it until it stops."""
-        with synchronize():
-            repository = self._initialize()
-        return drive_execution_run(
-            repository,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def resume(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Resume suspension or explicitly reconcile unknown provider state."""
-        with synchronize():
-            repository = self._initialize()
-            resume_execution_run(
-                repository,
-                self.execution_run_id,
-                reconcile_once=self.advance_once,
-                checkpoint=self._checkpoint,
-                now=self._now(),
-            )
-        return drive_execution_run(
-            self.store.execution,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Request explicit cancellation and retain uncertain ownership."""
-        self._provider.repository = self.store.execution
-        self._provider.cancel_run(self.execution_run_id, now=self._now())
-        return self.store.execution.snapshot(self.execution_run_id)
-
-    def close(self) -> None:
-        """Close SQLite without cancelling attached calls."""
-        self.store.close()
 
     def advance_once(self) -> None:
         """Apply one AlphaFold3-specific scheduling and publication cycle."""
@@ -1547,15 +1492,8 @@ class AlphaFold3ExecutionRuntime:
     def _call_result_path(self, call: ProviderCallRecord) -> PurePosixPath:
         return self._result_path(call.node_key, call.task_keys)
 
-    def _checkpoint(self):
-        self._volume_sync.commit()
-        repository = self.store.execution
-        self._provider.repository = repository
-        return repository
-
     def _reload_output(self) -> None:
-        self._volume_sync.reload()
-        self._provider.repository = self.store.execution
+        super()._reload_output()
         self._invalidate_planning_cache()
 
     def _invalidate_planning_cache(self) -> None:

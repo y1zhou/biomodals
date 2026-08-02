@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -23,27 +22,28 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionRuntime,
-    ExecutionSnapshot,
     NodeStatus,
     ProviderBinding,
     PullTaskClaim,
     RunStatus,
     TaskPlan,
     TaskStatus,
-    drive_execution_run,
     form_pull_worker_candidates,
     ready_node_keys,
-    resume_execution_run,
 )
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import ExecutionRunStore, ExecutionVolumeSync
+from biomodals.helper.app_execution import (
+    ExecutionRunStore,
+    ExecutionRuntimeLifecycle,
+    ExecutionVolumeSync,
+)
 
 
-class RosettaExecutionRuntime:
+class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
     """Drive one direct Rosetta request through a durable pull-worker pool."""
 
     def __init__(
@@ -84,61 +84,6 @@ class RosettaExecutionRuntime:
     def run_root(self) -> Path:
         """Return the existing app-owned run directory."""
         return self.output_root / self.request.workload_run_key
-
-    def run(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Create or recover the Run and drive it until it stops."""
-        with synchronize():
-            repository = self._initialize()
-        return drive_execution_run(
-            repository,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def resume(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
-        """Resume this Run without retrying conclusive Task failures."""
-        with synchronize():
-            repository = self._initialize()
-            resume_execution_run(
-                repository,
-                self.execution_run_id,
-                reconcile_once=self.advance_once,
-                checkpoint=self._checkpoint,
-                now=self._now(),
-            )
-        return drive_execution_run(
-            self.store.execution,
-            self.execution_run_id,
-            advance_once=self.advance_once,
-            checkpoint=self._checkpoint,
-            current_repository=lambda: self.store.execution,
-            now=self._now,
-            poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
-        )
-
-    def cancel(self) -> ExecutionSnapshot:
-        """Request explicit cancellation without releasing uncertain owners."""
-        self._provider.repository = self.store.execution
-        self._provider.cancel_run(self.execution_run_id, now=self._now())
-        return self.store.execution.snapshot(self.execution_run_id)
-
-    def close(self) -> None:
-        """Close local SQLite state without cancelling Provider Calls."""
-        self.store.close()
 
     def attach(self) -> None:
         """Open and verify this Run without refreshing worker publications."""
@@ -549,16 +494,6 @@ class RosettaExecutionRuntime:
             scientific_payload=task.scientific_payload,
             execution_payload=task.to_dict(),
         )
-
-    def _checkpoint(self):
-        self._volume_sync.commit()
-        repository = self.store.execution
-        self._provider.repository = repository
-        return repository
-
-    def _reload_output(self) -> None:
-        self._volume_sync.reload()
-        self._provider.repository = self.store.execution
 
 
 def _result_envelope(result: object) -> dict[str, object]:

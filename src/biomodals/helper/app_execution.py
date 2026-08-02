@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -15,8 +15,11 @@ from uuid import UUID
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionRunNotFoundError,
+    ExecutionRuntime,
     ExecutionSnapshot,
     SqliteExecutionRepository,
+    drive_execution_run,
+    resume_execution_run,
 )
 
 LEDGER_FILENAME = "ledger.sqlite3"
@@ -284,8 +287,93 @@ class ExecutionVolumeSync:
                 self.volume.reload()
 
 
+class ExecutionRuntimeLifecycle:
+    """Share the host lifecycle used by direct CLI App Run adapters."""
+
+    execution_run_id: UUID
+    store: ExecutionRunStore
+    poll_interval_seconds: float
+    _now: Callable[[], int]
+    _provider: ExecutionRuntime
+    _volume_sync: ExecutionVolumeSync
+
+    def run(
+        self,
+        *,
+        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> ExecutionSnapshot:
+        """Create or recover the Run and drive it until it stops."""
+        with synchronize():
+            repository = self._initialize()
+        return drive_execution_run(
+            repository,
+            self.execution_run_id,
+            advance_once=self.advance_once,
+            checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
+            now=self._now,
+            poll_interval_seconds=self.poll_interval_seconds,
+            synchronize=synchronize,
+        )
+
+    def resume(
+        self,
+        *,
+        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> ExecutionSnapshot:
+        """Resume this Run without retrying conclusive failures."""
+        with synchronize():
+            repository = self._initialize()
+            resume_execution_run(
+                repository,
+                self.execution_run_id,
+                reconcile_once=self.advance_once,
+                checkpoint=self._checkpoint,
+                now=self._now(),
+            )
+        return drive_execution_run(
+            self.store.execution,
+            self.execution_run_id,
+            advance_once=self.advance_once,
+            checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
+            now=self._now,
+            poll_interval_seconds=self.poll_interval_seconds,
+            synchronize=synchronize,
+        )
+
+    def cancel(self) -> ExecutionSnapshot:
+        """Request cancellation while retaining uncertain call ownership."""
+        self._provider.repository = self.store.execution
+        self._provider.cancel_run(self.execution_run_id, now=self._now())
+        return self.store.execution.snapshot(self.execution_run_id)
+
+    def close(self) -> None:
+        """Close SQLite without cancelling attached Provider Calls."""
+        self.store.close()
+
+    def advance_once(self) -> None:
+        """Apply one workload-owned execution cycle."""
+        raise NotImplementedError
+
+    def _initialize(self) -> SqliteExecutionRepository:
+        raise NotImplementedError
+
+    def _checkpoint(self) -> SqliteExecutionRepository:
+        self._volume_sync.commit()
+        repository = self.store.execution
+        self._provider.repository = repository
+        return repository
+
+    def _reload_output(self) -> None:
+        self._volume_sync.reload()
+        self._provider.repository = self.store.execution
+
+
 class ExecutionCoordinatorLifecycle:
     """Share app-coordinator locking, status, and drive mechanics."""
+
+    _request_loader: Callable[[str | Path, UUID], Any]
 
     def __init__(
         self,
@@ -301,6 +389,30 @@ class ExecutionCoordinatorLifecycle:
         self._writer_lock = RLock()
         self._drive_lock = Lock()
         self._runtime: Any | None = None
+
+    def run(self) -> ExecutionSnapshot:
+        """Load the staged request and drive one root Run."""
+        with self._drive_lock:
+            with self._writer_lock:
+                runtime = self._open_current_runtime(recover=False)
+            return self._drive(runtime, resume=False)
+
+    def cancel(self) -> ExecutionSnapshot:
+        """Request cancellation and reconcile it to a terminal result."""
+        with self._writer_lock:
+            runtime = self._open_current_runtime(recover=True)
+            snapshot = runtime.cancel()
+            self._verify_snapshot(snapshot)
+        if snapshot.run.status.is_terminal:
+            return snapshot
+        return self._drive(runtime, resume=False)
+
+    def resume(self) -> ExecutionSnapshot:
+        """Resume this Run without retrying conclusive failures."""
+        with self._drive_lock:
+            with self._writer_lock:
+                runtime = self._open_current_runtime(recover=True)
+            return self._drive(runtime, resume=True)
 
     def status(self) -> ExecutionSnapshot:
         """Read one verified snapshot without advancing work."""
@@ -343,6 +455,15 @@ class ExecutionCoordinatorLifecycle:
 
     def _run_store(self) -> ExecutionRunStore:
         return ExecutionRunStore(self.volume_root, self.execution_run_id)
+
+    def _open_current_runtime(self, *, recover: bool) -> Any:
+        del recover
+        request = self._request_loader(self.volume_root, self.execution_run_id)
+        return self._open_runtime(request)
+
+    def _open_runtime(self, request: Any) -> Any:
+        del request
+        raise NotImplementedError
 
     def _verify_snapshot(self, snapshot: ExecutionSnapshot) -> None:
         if snapshot.run.execution_run_id != self.execution_run_id:

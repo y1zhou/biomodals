@@ -189,7 +189,7 @@ These existing decisions remain binding during the refactor:
   creates a second kernel submission. `resume` does not retry failed Tasks.
 - No paid Modal calls run in CI.
 
-## Proposed domain model
+## Domain model
 
 ```text
 Service Job (optional API envelope)
@@ -236,7 +236,7 @@ dispatching them. The remote Modal invocation hosting the scheduler is instead
 a Coordinator Attempt because it coordinates Tasks rather than executing
 them.
 
-### Proposed terms
+### Terms
 
 **Execution Run** is one invocation of an immutable execution plan. An API Job
 may own one run, while a CLI workflow or app invocation can create a run
@@ -257,8 +257,7 @@ Identity are excluded.
 
 **Execution Node** is a fixed semantic DAG stage. Its identity does not change
 with batching or concurrency. It replaces neither `WorkflowNode` nor
-user-facing service stages immediately; adapters map those concepts to it
-during migration.
+user-facing service stages; adapters map those concepts at their boundaries.
 
 **Task** is the smallest independently identified unit whose cache and outcome
 can be reasoned about. Every Task belongs to exactly one Node, and Tasks may be
@@ -1609,7 +1608,7 @@ explicitly authorized smoke test after local and CI gates pass.
 | Risk | Control |
 | --- | --- |
 | A universal abstraction hides scientific differences | Keep workload code caller-owned, add no handler framework, and migrate AF3 last |
-| Extraction duplicates rather than replaces code | Each phase names deletion candidates and has a final deletion gate |
+| Extraction duplicates rather than replaces code | Delete replaced implementations in the same change and test only the shared path |
 | Async and sync consumers distort the API | Share pure transitions; keep thin separate host loops |
 | A batch obscures individual outcomes | Persist Task identities, per-Task outcomes, and explicit call links |
 | Call slots remain occupied by local result processing | Persist a small recoverable Result Envelope, terminally succeed the call, and publish each Task independently |

@@ -34,7 +34,6 @@ from biomodals.execution.model import (
 from biomodals.execution.runtime import (
     AsyncExecutionRuntime,
     ExecutionRuntime,
-    ModalDriver,
 )
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
@@ -65,7 +64,6 @@ __all__ = [
     "ExecutionRuntime",
     "ExecutionSnapshot",
     "ExecutionTaskRecord",
-    "ModalDriver",
     "NodeAggregationPolicy",
     "NodeDependency",
     "NodePlan",

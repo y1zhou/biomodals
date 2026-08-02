@@ -19,7 +19,6 @@ from biomodals.execution import (
     DispatchMode,
     ExecutionRuntime,
     ExecutionTaskRecord,
-    ModalDriver,
     NodeAggregationPolicy,
     NodeStatus,
     ProviderBinding,
@@ -39,6 +38,7 @@ from biomodals.execution import (
     resume_execution_run,
 )
 from biomodals.execution.modal import ModalCallDriver
+from biomodals.execution.runtime import ModalDriver
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,

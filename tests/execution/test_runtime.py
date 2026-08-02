@@ -8,7 +8,15 @@ from dataclasses import dataclass
 
 import pytest
 
-from biomodals.execution import AvailabilityStatus, NodeStatus, ProviderCallStatus
+from biomodals.execution import (
+    AvailabilityStatus,
+    DeploymentIdentity,
+    ExecutionPlan,
+    NodePlan,
+    NodeStatus,
+    ProviderCallStatus,
+    SqliteExecutionRepository,
+)
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -96,6 +104,51 @@ def _transaction(connection: sqlite3.Connection):
             connection.commit()
 
     return transaction
+
+
+def test_runtime_creates_or_verifies_one_run_identity() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SqliteExecutionRepository(connection)
+    repository.initialize_schema()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=connection.commit,
+        transaction=_transaction(connection),
+    )
+    plan = ExecutionPlan("demo", (NodePlan("compute"),))
+    deployment = DeploymentIdentity("main", "Demo", 7)
+
+    created = runtime.create_or_verify_run(
+        execution_run_id=RUN_ID,
+        predecessor_execution_run_id=None,
+        plan=plan,
+        deployment=deployment,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=2,
+        now=10,
+    )
+    recovered = runtime.create_or_verify_run(
+        execution_run_id=RUN_ID,
+        predecessor_execution_run_id=None,
+        plan=plan,
+        deployment=deployment,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=2,
+        now=11,
+    )
+
+    assert recovered == created
+    with pytest.raises(ValueError, match="initialization does not match"):
+        runtime.create_or_verify_run(
+            execution_run_id=RUN_ID,
+            predecessor_execution_run_id=None,
+            plan=plan,
+            deployment=deployment,
+            max_active_provider_calls=5,
+            max_active_gpu_provider_calls=2,
+            now=12,
+        )
 
 
 def test_runtime_owns_result_frontier_recovery() -> None:

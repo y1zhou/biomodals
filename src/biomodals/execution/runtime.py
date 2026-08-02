@@ -16,7 +16,9 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.model import (
     AvailabilityStatus,
+    DeploymentIdentity,
     ExecutionNodeRecord,
+    ExecutionPlan,
     ExecutionRunRecord,
     ExecutionTaskRecord,
     NodeStatus,
@@ -173,6 +175,43 @@ class ExecutionRuntime:
     def checkpoint(self) -> None:
         """Cross the host durability boundary for caller-owned transitions."""
         self._checkpoint_state()
+
+    def create_or_verify_run(
+        self,
+        *,
+        execution_run_id: UUID,
+        predecessor_execution_run_id: UUID | None,
+        plan: ExecutionPlan,
+        deployment: DeploymentIdentity,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Create one Run or verify that its immutable identity still matches."""
+        try:
+            run = self.repository.get_run(execution_run_id)
+        except LookupError:
+            with self._transaction():
+                return self.repository.create_run(
+                    execution_run_id=execution_run_id,
+                    predecessor_execution_run_id=predecessor_execution_run_id,
+                    plan=plan,
+                    deployment=deployment,
+                    max_active_provider_calls=max_active_provider_calls,
+                    max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+                    now=now,
+                )
+        if (
+            run.predecessor_execution_run_id != predecessor_execution_run_id
+            or run.plan != plan
+            or run.deployment != deployment
+            or run.max_active_provider_calls != max_active_provider_calls
+            or run.max_active_gpu_provider_calls != max_active_gpu_provider_calls
+        ):
+            raise ValueError(
+                "Execution Run initialization does not match persisted state"
+            )
+        return run
 
     def required_node_keys(self, execution_run_id: UUID) -> tuple[str, ...] | None:
         """Derive the result-driven closure from durable Node observations."""

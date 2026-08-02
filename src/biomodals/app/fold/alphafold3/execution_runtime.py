@@ -191,6 +191,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
             commit_local=self.store.commit,
+            transaction=self.store.transaction,
         )
         self._msa_inventory_cache: (
             tuple[
@@ -244,34 +245,16 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def _initialize(self):
         self._reload_output()
-        plan = self.request.execution_plan
-        repository = self.store.execution
-        try:
-            existing = repository.get_run(self.execution_run_id)
-        except LookupError:
-            with self.store.transaction():
-                repository.create_run(
-                    execution_run_id=self.execution_run_id,
-                    predecessor_execution_run_id=(self.predecessor_execution_run_id),
-                    plan=plan,
-                    deployment=self.deployment,
-                    max_active_provider_calls=(self.request.max_active_provider_calls),
-                    max_active_gpu_provider_calls=self.request.max_num_gpus,
-                    now=self._now(),
-                )
-            return repository
-        if existing.plan != plan:
-            raise ValueError("AlphaFold3 plan does not match Execution Run")
-        if existing.predecessor_execution_run_id != self.predecessor_execution_run_id:
-            raise ValueError("AlphaFold3 predecessor does not match Execution Run")
-        if existing.deployment != self.deployment:
-            raise ValueError("Deployment Identity does not match Execution Run")
-        if (
-            existing.max_active_provider_calls != self.request.max_active_provider_calls
-            or existing.max_active_gpu_provider_calls != self.request.max_num_gpus
-        ):
-            raise ValueError("AlphaFold3 operational limits do not match Execution Run")
-        return repository
+        self._provider.create_or_verify_run(
+            execution_run_id=self.execution_run_id,
+            predecessor_execution_run_id=self.predecessor_execution_run_id,
+            plan=self.request.execution_plan,
+            deployment=self.deployment,
+            max_active_provider_calls=self.request.max_active_provider_calls,
+            max_active_gpu_provider_calls=self.request.max_num_gpus,
+            now=self._now(),
+        )
+        return self.store.execution
 
     def _recover_publications(self) -> None:
         """Probe result Nodes backward until reusable work closes each branch."""

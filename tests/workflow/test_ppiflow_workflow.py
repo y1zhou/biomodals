@@ -769,7 +769,9 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert submission.kwargs["candidate_manifests"] == [
         _upstream_structure_artifact(kind=ArtifactKind.TABLE)
     ]
-    assert submission.kwargs["run_name"] == "af3-run"
+    assert submission.kwargs["execution_run_name"] == (
+        f"ppiflow-af3score-{RUN_ID}-stage1-af3score-prepare"
+    )
     assert submission.kwargs["config"]["num_jobs"] == 4
     assert submission.kwargs["config"]["prepare_workers"] == 2
 
@@ -912,20 +914,37 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
         ppiflow_workflow._stage_af3score_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
+            execution_run_name="execution-a",
         )
     )
 
     assert [record["input_name"] for record in staged] == ["candidate_a.pdb"]
-    assert physical_run_name == f"ppiflow-af3score-{publication_key}"
+    assert physical_run_name == f"execution-a-{publication_key}"
     first_input = af3_root / physical_run_name / "inputs" / "candidate_a.pdb"
     assert first_input.read_text(encoding="utf-8") == "ATOM\n"
     assert commits == [True]
+
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "DECLARED_MODEL_IDENTITY",
+        "AlphaFold3/af3.bin:v2",
+    )
+    _staged, model_run_name, model_key = (
+        ppiflow_workflow._stage_af3score_candidate_inputs(
+            artifacts=artifacts,
+            candidate_manifests=None,
+            execution_run_name="execution-model-v2",
+        )
+    )
+    assert model_key != publication_key
+    assert model_run_name != physical_run_name
 
     (long_dir / "candidate_a.pdb").write_text("CHANGED\n", encoding="utf-8")
     _staged, changed_run_name, changed_key = (
         ppiflow_workflow._stage_af3score_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
+            execution_run_name="execution-b",
         )
     )
 
@@ -935,7 +954,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     assert (af3_root / changed_run_name / "inputs" / "candidate_a.pdb").read_text(
         encoding="utf-8"
     ) == "CHANGED\n"
-    assert commits == [True, True]
+    assert commits == [True, True, True]
 
 
 def test_af3score_prepare_publishes_candidate_to_batch_mapping(
@@ -991,7 +1010,7 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
         candidate_manifests=[],
         config={"num_jobs": 2},
         step_name="AF3scoreStep_stage1",
-        run_name="af3-run",
+        execution_run_name="af3-run",
     )
 
     [output] = result.outputs
@@ -1006,7 +1025,6 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
     }
     assert {candidate["chunk"]["task_count"] for candidate in plan["candidates"]} == {2}
     assert plan["run_name"] == "ppiflow-af3score-request-key"
-    assert plan["display_run_name"] == "af3-run"
 
 
 def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:

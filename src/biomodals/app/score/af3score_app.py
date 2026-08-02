@@ -142,6 +142,8 @@ def _file_sha256(path: Path) -> str:
 
 
 def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
+    if not input_id or Path(input_id).name != input_id or input_id in {".", ".."}:
+        raise ValueError("AF3Score input ID must be a safe path component")
     return Path(output_dir) / input_id / ".biomodals" / "af3score-input.json"
 
 
@@ -329,7 +331,7 @@ def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
         safe_name = "".join(
             c for c in f.name.lower().replace(" ", "_") if c in allowed_chars
         )
-        if not safe_name:
+        if not safe_name or Path(safe_name).stem in {".", ".."}:
             raise ValueError(f"Input file name has no AF3Score-safe characters: {f}")
         symlink_path = stage_dir / safe_name
         if symlink_path.exists():

@@ -12,6 +12,7 @@ from uuid import UUID
 
 import orjson
 
+from biomodals.app.fold.alphafold3.inference_inputs import DECLARED_MODEL_IDENTITY
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -40,7 +41,7 @@ from biomodals.helper.output_claim import (
 )
 from biomodals.helper.shell import sanitize_filename
 
-REQUEST_SCHEMA_VERSION = 2
+REQUEST_SCHEMA_VERSION = 3
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 PREPARE_NODE = "prepare"
 BATCHES_NODE = "score-batches"
@@ -96,6 +97,7 @@ class AF3ScoreExecutionRequest:
     prepare_workers: int
     max_batches: int
     app_version: str
+    model_identity: str = DECLARED_MODEL_IDENTITY
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
@@ -108,7 +110,11 @@ class AF3ScoreExecutionRequest:
         if len(names) != len(set(names)):
             raise ValueError("AF3Score input names must be unique")
         for name, digest in self.inputs:
-            if Path(name).name != name or not name.endswith(".pdb"):
+            if (
+                Path(name).name != name
+                or not name.endswith(".pdb")
+                or Path(name).stem in {".", ".."}
+            ):
                 raise ValueError("AF3Score input names must be PDB filenames")
             if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
                 raise ValueError("AF3Score input digests must be lowercase SHA-256")
@@ -120,8 +126,8 @@ class AF3ScoreExecutionRequest:
             raise ValueError("AF3Score staged input Run ID must be canonical")
         if self.prepare_workers < 1 or self.max_batches < 1:
             raise ValueError("AF3Score worker limits must be positive")
-        if not self.app_version:
-            raise ValueError("AF3Score app version cannot be empty")
+        if not self.app_version or not self.model_identity:
+            raise ValueError("AF3Score scientific versions cannot be empty")
 
     @property
     def input_names(self) -> tuple[str, ...]:
@@ -157,6 +163,7 @@ class AF3ScoreExecutionRequest:
             },
             scientific_versions={
                 "af3score": self.app_version,
+                "alphafold3.model": self.model_identity,
                 "biomodals.af3score.execution_request": str(REQUEST_SCHEMA_VERSION),
             },
         )
@@ -172,6 +179,7 @@ class AF3ScoreExecutionRequest:
                 "prepare_workers": self.prepare_workers,
                 "max_batches": self.max_batches,
                 "app_version": self.app_version,
+                "model_identity": self.model_identity,
                 "replace_claim_owner": self.replace_claim_owner,
             },
             option=orjson.OPT_SORT_KEYS,

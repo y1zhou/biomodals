@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -189,6 +190,20 @@ def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
     ]
 
 
+def test_af3score_rejects_dot_segment_input_ids(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="PDB filenames"):
+        replace(_request(), inputs=(("...pdb", "a" * 64),))
+    with pytest.raises(ValueError, match="safe path component"):
+        af3score_app._input_publication_path(tmp_path, "..")
+
+    unsafe = tmp_path / "...pdb"
+    unsafe.write_text("ATOM\n", encoding="utf-8")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    with pytest.raises(ValueError, match="safe characters"):
+        af3score_app._collect_input_files(unsafe, stage)
+
+
 def test_input_publication_binds_and_invalidates_output_content(
     tmp_path: Path,
 ) -> None:
@@ -318,6 +333,13 @@ def test_af3score_operational_limits_do_not_change_scientific_identity() -> None
     assert (
         base.execution_plan.workload_plan_fingerprint
         == changed.execution_plan.workload_plan_fingerprint
+    )
+    assert (
+        base.execution_plan.workload_plan_fingerprint
+        != replace(
+            base,
+            model_identity="AlphaFold3/af3.bin:v2",
+        ).execution_plan.workload_plan_fingerprint
     )
 
 

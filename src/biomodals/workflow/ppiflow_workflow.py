@@ -30,7 +30,10 @@ from biomodals.app.bioinfo.rosetta.execution_contracts import (
 )
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
-from biomodals.app.fold.alphafold3.inference_inputs import prepare_inference_run
+from biomodals.app.fold.alphafold3.inference_inputs import (
+    DECLARED_MODEL_IDENTITY,
+    prepare_inference_run,
+)
 from biomodals.app.fold.alphafold3.inference_pipeline import (
     coordinate_seed_predictions,
 )
@@ -1038,6 +1041,7 @@ def _stage_af3score_candidate_inputs(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None,
+    execution_run_name: str,
     patterns: Sequence[str] | None = None,
     max_files: int | None = None,
 ) -> tuple[list[dict[str, object]], str, str]:
@@ -1081,11 +1085,12 @@ def _stage_af3score_candidate_inputs(
                     or af3score_app.CONF.version
                     or "unknown"
                 ),
+                "model": DECLARED_MODEL_IDENTITY,
             },
             option=orjson.OPT_SORT_KEYS,
         )
     ).hexdigest()
-    physical_run_name = f"ppiflow-af3score-{publication_key}"
+    physical_run_name = f"{sanitize_filename(execution_run_name)}-{publication_key}"
     layout = AppRunLayout.from_run_root(
         Path(AF3SCORE_OUTPUT_MOUNTPOINT) / physical_run_name
     )
@@ -1407,12 +1412,13 @@ def prepare_ppiflow_af3score_stage(
     candidate_manifests: list[WorkflowArtifact] | None = None,
     config: dict[str, object],
     step_name: str,
-    run_name: str,
+    execution_run_name: str,
 ) -> AppRunResult:
     """Stage AF3Score candidates and publish its finite GPU Task plan."""
     staged, physical_run_name, publication_key = _stage_af3score_candidate_inputs(
         artifacts=artifacts,
         candidate_manifests=candidate_manifests,
+        execution_run_name=execution_run_name,
         patterns=_patterns_from_config(config, default=("*.pdb",)),
         max_files=_optional_config_int(config, "max_structures"),
     )
@@ -1485,7 +1491,6 @@ def prepare_ppiflow_af3score_stage(
                 "input_digests": input_digests,
                 "publication_key": publication_key,
                 "run_name": physical_run_name,
-                "display_run_name": run_name,
             })
         ],
     )
@@ -2412,7 +2417,9 @@ class AF3ScorePrepareNode(_ConfiguredAppStepNode):
                 "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
                 "config": self.config,
                 "step_name": self.step_name,
-                "run_name": self._run_name(context),
+                "execution_run_name": sanitize_filename(
+                    f"ppiflow-af3score-{context.execution_run_id}-{context.node_id}"
+                ),
             },
             runtime_image_key="af3score-cpu",
         )

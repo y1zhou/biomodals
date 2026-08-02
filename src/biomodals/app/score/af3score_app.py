@@ -141,17 +141,29 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
+def _input_output_dir(output_dir: str | Path, input_id: str) -> Path:
     if not input_id or Path(input_id).name != input_id or input_id in {".", ".."}:
         raise ValueError("AF3Score input ID must be a safe path component")
-    return Path(output_dir) / input_id / ".biomodals" / "af3score-input.json"
+    return Path(output_dir) / input_id
+
+
+def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
+    return (
+        _input_output_dir(output_dir, input_id) / ".biomodals" / ("af3score-input.json")
+    )
 
 
 def _input_output_records(
     output_dir: str | Path,
     input_id: str,
 ) -> dict[str, dict[str, int | str]]:
-    sample_dir = Path(output_dir) / input_id / APP_INFO.completion_sample_subdir
+    sample_dir = (
+        _input_output_dir(
+            output_dir,
+            input_id,
+        )
+        / APP_INFO.completion_sample_subdir
+    )
     records: dict[str, dict[str, int | str]] = {}
     for filename in APP_INFO.completion_required_files:
         path = sample_dir / filename
@@ -769,6 +781,7 @@ class ExecutionCoordinator:
                 output_volume=CONF.output_volume,
                 output_claims=AF3SCORE_OUTPUT_CLAIMS,
                 modal_driver=_coordinator_modal_driver(development=selected_mode),
+                app_version=CONF.repo_commit_hash or CONF.version or "unknown",
             ),
         )
 

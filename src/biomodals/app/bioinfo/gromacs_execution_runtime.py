@@ -27,7 +27,6 @@ from biomodals.app.bioinfo.gromacs_execution import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
-    ExecutionRunNotFoundError,
     ExecutionRuntime,
     ExecutionSnapshot,
     NodeStatus,
@@ -656,42 +655,17 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
         expected_workload_plan_fingerprint: str | None = None,
     ) -> None:
         """Validate and persist a Successor request without driving it."""
-        if predecessor_execution_run_id == self.execution_run_id:
-            raise ValueError("Successor Execution Run ID must be new")
         with self._drive_lock:
             with self._writer_lock:
                 self.output_volume.reload()
-                predecessor_store = ExecutionRunStore(
-                    self.volume_root,
+                with self._open_successor_source(
                     predecessor_execution_run_id,
-                )
-                if not predecessor_store.ledger_path.is_file():
-                    raise ExecutionRunNotFoundError(str(predecessor_execution_run_id))
-                try:
-                    predecessor = predecessor_store.execution.validate_successor_source(
-                        predecessor_execution_run_id
-                    )
-                    if (
-                        expected_workload_plan_fingerprint is not None
-                        and predecessor.plan.workload_plan_fingerprint
-                        != expected_workload_plan_fingerprint
-                    ):
-                        raise ValueError(
-                            "Restart arguments changed the Workload Plan Fingerprint"
-                        )
-                    if (
-                        predecessor_deployment is not None
-                        and predecessor.deployment != predecessor_deployment
-                    ):
-                        raise ValueError(
-                            "Predecessor Deployment Identity does not match Execution Run"
-                        )
-                    request = load_execution_request(
-                        self.volume_root,
-                        predecessor_execution_run_id,
-                    )
-                finally:
-                    predecessor_store.close()
+                    predecessor_deployment=predecessor_deployment,
+                    expected_workload_plan_fingerprint=(
+                        expected_workload_plan_fingerprint
+                    ),
+                ) as source:
+                    predecessor, request, _ = source
                 request = replace(
                     request,
                     max_active_provider_calls=(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from io import BytesIO
@@ -15,6 +15,7 @@ from uuid import UUID
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionRunNotFoundError,
+    ExecutionRunRecord,
     ExecutionRuntime,
     ExecutionSnapshot,
     SqliteExecutionRepository,
@@ -445,11 +446,13 @@ class ExecutionCoordinatorLifecycle:
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         volume_root: str | Path,
+        target_scientific_versions: Mapping[str, str] | None = None,
     ) -> None:
         """Bind the lifecycle to one Run and exact deployment."""
         self.execution_run_id = execution_run_id
         self.deployment = deployment
         self.volume_root = Path(volume_root)
+        self.target_scientific_versions = dict(target_scientific_versions or {})
         self._writer_lock = RLock()
         self._drive_lock = Lock()
         self._runtime: Any | None = None
@@ -532,6 +535,60 @@ class ExecutionCoordinatorLifecycle:
 
     def _run_store(self) -> ExecutionRunStore:
         return ExecutionRunStore(self.volume_root, self.execution_run_id)
+
+    @contextmanager
+    def _open_successor_source(
+        self,
+        predecessor_execution_run_id: UUID,
+        *,
+        predecessor_deployment: DeploymentIdentity | None,
+        expected_workload_plan_fingerprint: str | None = None,
+    ) -> Iterator[tuple[ExecutionRunRecord, Any, ExecutionRunStore]]:
+        """Open one validated predecessor and its workload request."""
+        if predecessor_execution_run_id == self.execution_run_id:
+            raise ValueError("Successor Execution Run ID must be new")
+        store = ExecutionRunStore(
+            self.volume_root,
+            predecessor_execution_run_id,
+        )
+        if not store.ledger_path.is_file():
+            raise ExecutionRunNotFoundError(str(predecessor_execution_run_id))
+        try:
+            predecessor = store.execution.validate_successor_source(
+                predecessor_execution_run_id
+            )
+            if (
+                predecessor_deployment is not None
+                and predecessor.deployment != predecessor_deployment
+            ):
+                raise ValueError(
+                    "Predecessor Deployment Identity does not match Execution Run"
+                )
+            if (
+                expected_workload_plan_fingerprint is not None
+                and predecessor.plan.workload_plan_fingerprint
+                != expected_workload_plan_fingerprint
+            ):
+                raise ValueError(
+                    "Restart arguments changed the Workload Plan Fingerprint"
+                )
+            if any(
+                predecessor.plan.scientific_versions.get(name) != version
+                for name, version in self.target_scientific_versions.items()
+            ):
+                raise ValueError(
+                    "Target deployment changed declared scientific versions"
+                )
+            yield (
+                predecessor,
+                self._request_loader(
+                    self.volume_root,
+                    predecessor_execution_run_id,
+                ),
+                store,
+            )
+        finally:
+            store.close()
 
     def _open_current_runtime(self, *, recover: bool) -> Any:
         request = self._request_loader(self.volume_root, self.execution_run_id)

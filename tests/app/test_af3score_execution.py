@@ -19,10 +19,12 @@ from biomodals.app.score.af3score_execution import (
     METRICS_FILENAME,
     POSTPROCESS_NODE,
     PREPARE_NODE,
+    AF3ScoreExecutionCoordinator,
     AF3ScoreExecutionRequest,
     AF3ScoreExecutionRuntime,
     ChunkSpec,
     TaskSpec,
+    persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
 from biomodals.execution.modal import (
@@ -195,6 +197,8 @@ def test_af3score_rejects_dot_segment_input_ids(tmp_path: Path) -> None:
         replace(_request(), inputs=(("...pdb", "a" * 64),))
     with pytest.raises(ValueError, match="safe path component"):
         af3score_app._input_publication_path(tmp_path, "..")
+    with pytest.raises(ValueError, match="safe path component"):
+        af3score_app._input_output_records(tmp_path, "..")
 
     unsafe = tmp_path / "...pdb"
     unsafe.write_text("ATOM\n", encoding="utf-8")
@@ -473,6 +477,41 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     assert batch_call.task_keys == ("a", "b")
     assert str(RUN_ID) in claims.values.values()
     runtime.close()
+
+
+def test_restart_rejects_target_scientific_version_drift(tmp_path: Path) -> None:
+    request = _request()
+    _stage_request_inputs(tmp_path, request)
+    persist_execution_request(tmp_path, RUN_ID, request)
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=CompletingDriver(tmp_path, request),
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+    assert runtime.run().run.status == RunStatus.SUCCEEDED
+    runtime.close()
+    coordinator = AF3ScoreExecutionCoordinator(
+        execution_run_id=OTHER_RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        modal_driver=object(),
+        app_version="changed-version",
+    )
+
+    with pytest.raises(ValueError, match="scientific versions"):
+        coordinator.prepare_restart(
+            predecessor_execution_run_id=RUN_ID,
+            predecessor_deployment=DEPLOYMENT,
+        )
 
 
 def test_unbound_metrics_do_not_satisfy_a_new_request(tmp_path: Path) -> None:

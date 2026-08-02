@@ -220,7 +220,7 @@ def test_workflow_run_resolves_and_forwards_an_exact_deployment(
         lambda *_args: _SingleEntrypointWorkflow(),
     )
     monkeypatch.setattr(
-        "biomodals.cli._workflow_deployment_name",
+        "biomodals.cli._deployment_name",
         lambda _workflow: "ShortMDWorkflow",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
@@ -285,7 +285,7 @@ def test_workflow_restart_forwards_only_the_explicit_predecessor(
         lambda *_args: _SingleEntrypointWorkflow(),
     )
     monkeypatch.setattr(
-        "biomodals.cli._workflow_deployment_name",
+        "biomodals.cli._deployment_name",
         lambda _workflow: "ShortMDWorkflow",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
@@ -509,7 +509,7 @@ def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(
         lambda *_args: _CoordinatedApp(),
     )
     monkeypatch.setattr(
-        "biomodals.cli._app_deployment_name",
+        "biomodals.cli._deployment_name",
         lambda _app: "AlphaFold3",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)
@@ -579,7 +579,7 @@ def test_coordinated_app_restart_forwards_only_the_explicit_predecessor(
         lambda *_args: _CoordinatedApp(),
     )
     monkeypatch.setattr(
-        "biomodals.cli._app_deployment_name",
+        "biomodals.cli._deployment_name",
         lambda _app: "AlphaFold3",
     )
     monkeypatch.setattr("biomodals.cli.run_command", fake_run_command)

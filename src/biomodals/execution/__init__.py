@@ -31,7 +31,11 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
     WorkStatusReason,
 )
-from biomodals.execution.runtime import AsyncExecutionRuntime, ExecutionRuntime
+from biomodals.execution.runtime import (
+    AsyncExecutionRuntime,
+    ExecutionRuntime,
+    ModalDriver,
+)
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
     aggregate_task_outcome,
@@ -61,6 +65,7 @@ __all__ = [
     "ExecutionRuntime",
     "ExecutionSnapshot",
     "ExecutionTaskRecord",
+    "ModalDriver",
     "NodeAggregationPolicy",
     "NodeDependency",
     "NodePlan",

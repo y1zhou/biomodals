@@ -41,8 +41,8 @@ from biomodals.workflow.core import (
     NodeRunContext,
     RemotePullTaskWorkflowNode,
     RemoteWorkflowNode,
+    hashing,
 )
-from biomodals.workflow.core._runtime import hashing
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow_workflow import (
     CONF,

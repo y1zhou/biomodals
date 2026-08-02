@@ -556,7 +556,7 @@ def run_modal_app(
         raise typer.Exit(code=1)
     if modal_mode != "shell" and coordinated_entrypoint is not None and not development:
         try:
-            resolved_deployment_name = deployment_name or _app_deployment_name(app)
+            resolved_deployment_name = deployment_name or _deployment_name(app)
             resolved_version = _resolve_deployment_version(
                 deployment_name=resolved_deployment_name,
                 environment=environment,
@@ -655,13 +655,13 @@ def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
     return entrypoint if entrypoint in declared else None
 
 
-def _app_deployment_name(app: BiomodalsApp) -> str:
-    """Return a coordinator-aware app module's Modal deployment name."""
-    module = importlib.import_module(app.module)
+def _deployment_name(entry: BiomodalsApp) -> str:
+    """Return one app or workflow module's Modal deployment name."""
+    module = importlib.import_module(entry.module)
     config = getattr(module, "CONF", None)
     deployment_name = getattr(config, "name", None)
     if not isinstance(deployment_name, str) or not deployment_name:
-        raise ValueError(f"App '{app.name}' does not declare a deployment name")
+        raise ValueError(f"'{entry.name}' does not declare a deployment name")
     return deployment_name
 
 
@@ -958,18 +958,6 @@ def _resolve_workflow_entrypoint(workflow: BiomodalsApp) -> str:
         raise typer.Exit(code=1) from exc
 
 
-def _workflow_deployment_name(workflow: BiomodalsApp) -> str:
-    """Return the workflow module's declared Modal deployment name."""
-    module = importlib.import_module(workflow.module)
-    config = getattr(module, "CONF", None)
-    deployment_name = getattr(config, "name", None)
-    if not isinstance(deployment_name, str) or not deployment_name:
-        raise ValueError(
-            f"Workflow '{workflow.name}' does not declare a deployment name"
-        )
-    return deployment_name
-
-
 def _resolve_deployment_version(
     *,
     deployment_name: str,
@@ -988,20 +976,6 @@ def _resolve_deployment_version(
     )
     return select_modal_deployment_version(
         "\n".join(lines),
-        requested_version=requested_version,
-    )
-
-
-def _resolve_workflow_deployment_version(
-    *,
-    deployment_name: str,
-    environment: str,
-    requested_version: int | None,
-) -> int:
-    """Retain the workflow-specific composition seam used by CLI tests."""
-    return _resolve_deployment_version(
-        deployment_name=deployment_name,
-        environment=environment,
         requested_version=requested_version,
     )
 
@@ -1127,10 +1101,8 @@ def run_workflow(
             raise typer.Exit(code=1)
     if modal_mode != "shell" and not dry_run and not development:
         try:
-            resolved_deployment_name = deployment_name or _workflow_deployment_name(
-                workflow
-            )
-            resolved_version = _resolve_workflow_deployment_version(
+            resolved_deployment_name = deployment_name or _deployment_name(workflow)
+            resolved_version = _resolve_deployment_version(
                 deployment_name=resolved_deployment_name,
                 environment=environment,
                 requested_version=version,

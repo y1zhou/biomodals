@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import UUID
 
 import orjson
@@ -19,6 +19,7 @@ from biomodals.execution import (
     DispatchMode,
     ExecutionRuntime,
     ExecutionTaskRecord,
+    ModalDriver,
     NodeAggregationPolicy,
     NodeStatus,
     ProviderBinding,
@@ -71,32 +72,6 @@ from biomodals.workflow.core.run_store import WorkflowRunStore
 _TASK_KEY = "node"
 
 
-class WorkflowModalDriver(Protocol):
-    """Modal call operations used by the workflow adapter."""
-
-    def resolve(self, binding: ProviderBinding) -> Any:
-        """Resolve an exact deployed function."""
-        ...
-
-    def spawn(
-        self,
-        function: Any,
-        *,
-        args: tuple[Any, ...],
-        kwargs: Mapping[str, Any],
-    ) -> str:
-        """Submit one function invocation."""
-        ...
-
-    def observe(self, provider_call_handle_id: str) -> Any:
-        """Observe one retained provider call."""
-        ...
-
-    def cancel(self, provider_call_handle_id: str) -> None:
-        """Request provider-call cancellation."""
-        ...
-
-
 @dataclass(frozen=True)
 class _PreparedTask:
     plan: TaskPlan
@@ -123,7 +98,7 @@ class WorkflowRuntime:
         volume_root: str | Path,
         workflow_volume_name: str,
         workflow_volume: ExecutionVolume | None = None,
-        modal_driver: WorkflowModalDriver | None = None,
+        modal_driver: ModalDriver | None = None,
         max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,

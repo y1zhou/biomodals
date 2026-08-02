@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
-from biomodals.workflow.core._runtime.hashing import dag_hash
 from biomodals.workflow.core.builder import WorkflowDefinition
+from biomodals.workflow.core.hashing import dag_hash
 
 _EXECUTION_PLAN_SCHEMA_VERSION = "1"
 

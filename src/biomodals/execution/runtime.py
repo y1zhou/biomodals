@@ -45,8 +45,12 @@ from biomodals.execution.scheduler import (
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
 
-class _ModalDriver(Protocol):
-    def resolve(self, binding: ProviderBinding) -> Any: ...
+class ModalDriver(Protocol):
+    """Synchronous Modal operations required by the execution runtime."""
+
+    def resolve(self, binding: ProviderBinding) -> Any:
+        """Resolve one exact deployed function."""
+        ...
 
     def spawn(
         self,
@@ -54,11 +58,17 @@ class _ModalDriver(Protocol):
         *,
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
-    ) -> str: ...
+    ) -> str:
+        """Submit one function invocation."""
+        ...
 
-    def observe(self, provider_call_handle_id: str) -> ModalCallObservation: ...
+    def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
+        """Observe one retained provider call."""
+        ...
 
-    def cancel(self, provider_call_handle_id: str) -> None: ...
+    def cancel(self, provider_call_handle_id: str) -> None:
+        """Request provider-call cancellation."""
+        ...
 
 
 class _AsyncModalDriver(Protocol):
@@ -148,7 +158,7 @@ class ExecutionRuntime:
         self,
         repository: SqliteExecutionRepository,
         *,
-        modal_driver: _ModalDriver,
+        modal_driver: ModalDriver,
         checkpoint: Callable[[], SqliteExecutionRepository | None],
         commit_local: Callable[[], None] | None = None,
         transaction: Callable[[], AbstractContextManager[object]] = nullcontext,

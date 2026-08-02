@@ -114,6 +114,7 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
         "execution_run_id": EXECUTION_RUN_ID,
         "deployment": rosetta_app.DeploymentIdentity("main", "Rosetta", 1),
         "use_deployed_coordinator": False,
+        "local_coordinator": rosetta_app.ExecutionCoordinator,
     }
     output = capsys.readouterr().out
     assert f"Execution Run ID: {EXECUTION_RUN_ID}" in output

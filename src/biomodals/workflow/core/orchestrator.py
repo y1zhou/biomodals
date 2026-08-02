@@ -24,7 +24,10 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
-    deployed_execution_coordinator,
+    execution_coordinator_identity,
+)
+from biomodals.execution.modal import (
+    execution_coordinator_handle as _shared_execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
@@ -429,13 +432,7 @@ class ExecutionCoordinator:
             self._close_runtime()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
-        execution_run_id = UUID(self.execution_run_id)
-        deployment = DeploymentIdentity(
-            environment=self.deployment_environment,
-            deployment_name=self.deployment_name,
-            deployment_version=self.deployment_version,
-        )
-        return execution_run_id, deployment
+        return execution_coordinator_identity(self)
 
     def _lock(self) -> RLock:
         lock = getattr(self, "_writer_lock", None)
@@ -751,15 +748,10 @@ def execution_coordinator_handle(
     class_resolver: Any | None = None,
 ) -> Any:
     """Bind one run to either its exact deployment or current development app."""
-    if use_deployed_coordinator:
-        return deployed_execution_coordinator(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            class_resolver=class_resolver or modal.Cls.from_name,
-        )
-    return ExecutionCoordinator(
-        execution_run_id=str(execution_run_id),
-        deployment_environment=deployment.environment,
-        deployment_name=deployment.deployment_name,
-        deployment_version=deployment.deployment_version,
+    return _shared_execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
+        class_resolver=class_resolver or modal.Cls.from_name,
     )

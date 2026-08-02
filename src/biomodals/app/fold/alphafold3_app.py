@@ -39,7 +39,6 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 import os
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any
 from uuid import UUID
 
 import modal
@@ -130,8 +129,11 @@ from biomodals.app.fold.alphafold3.upstream_inference import (
 from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import (
     ModalCallDriver,
-    deployed_execution_coordinator,
     development_modal_call_driver,
+    execution_coordinator_identity,
+)
+from biomodals.execution.modal import (
+    execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
@@ -789,14 +791,7 @@ class ExecutionCoordinator:
             CONF.output_volume.commit()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
-        return (
-            UUID(self.execution_run_id),
-            DeploymentIdentity(
-                self.deployment_environment,
-                self.deployment_name,
-                self.deployment_version,
-            ),
-        )
+        return execution_coordinator_identity(self)
 
     def _adapter(
         self,
@@ -849,28 +844,6 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
             "finalize_inference_request": finalize_inference_request,
         },
         workload_name="AlphaFold3",
-    )
-
-
-def _execution_coordinator_handle(
-    *,
-    execution_run_id: UUID,
-    deployment: DeploymentIdentity,
-    use_deployed_coordinator: bool,
-    class_resolver: Any | None = None,
-) -> Any:
-    """Resolve this run's exact deployed or current-source coordinator."""
-    if use_deployed_coordinator:
-        return deployed_execution_coordinator(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            class_resolver=class_resolver or modal.Cls.from_name,
-        )
-    return ExecutionCoordinator(
-        execution_run_id=str(execution_run_id),
-        deployment_environment=deployment.environment,
-        deployment_name=deployment.deployment_name,
-        deployment_version=deployment.deployment_version,
     )
 
 
@@ -986,6 +959,7 @@ def submit_alphafold3_task(
         execution_run_id=execution_run_id,
         deployment=deployment,
         use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
     )
     if restart_from is None:
         stage_execution_request(

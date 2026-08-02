@@ -4,6 +4,7 @@
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 from uuid import UUID
 
 import modal
@@ -18,6 +19,8 @@ from biomodals.execution.modal import (
     ModalSubmissionOutcomeUnknownError,
     deployed_execution_coordinator,
     development_modal_call_driver,
+    execution_coordinator_handle,
+    execution_coordinator_identity,
 )
 
 from .provider_call_helpers import GPU_BINDING
@@ -68,6 +71,46 @@ def test_deployed_coordinator_uses_exact_class_version_and_run_parameters() -> N
         "deployment_name": "ShortMDWorkflow",
         "deployment_version": 7,
     }
+
+
+def test_coordinator_handle_uses_current_source_class_in_development() -> None:
+    parameters: dict[str, object] = {}
+
+    class Coordinator:
+        def __init__(self, **kwargs: object) -> None:
+            parameters.update(kwargs)
+
+    handle = execution_coordinator_handle(
+        execution_run_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        deployment=DeploymentIdentity("development", "Gromacs", 3),
+        use_deployed_coordinator=False,
+        local_coordinator=Coordinator,
+        class_resolver=lambda *args, **kwargs: pytest.fail(
+            "development binding must not resolve a deployed class"
+        ),
+    )
+
+    assert isinstance(handle, Coordinator)
+    assert parameters == {
+        "execution_run_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "deployment_environment": "development",
+        "deployment_name": "Gromacs",
+        "deployment_version": 3,
+    }
+
+
+def test_coordinator_identity_reads_standard_modal_parameters() -> None:
+    execution_run_id, deployment = execution_coordinator_identity(
+        SimpleNamespace(
+            execution_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            deployment_environment="production",
+            deployment_name="AlphaFold3",
+            deployment_version=11,
+        )
+    )
+
+    assert execution_run_id == UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    assert deployment == DeploymentIdentity("production", "AlphaFold3", 11)
 
 
 def test_driver_resolves_exact_version_and_spawns_detached_call() -> None:

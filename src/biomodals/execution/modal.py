@@ -108,12 +108,48 @@ def deployed_execution_coordinator(
         environment_name=deployment.environment,
         version=deployment.deployment_version,
     )
-    return coordinator_class(
-        execution_run_id=str(execution_run_id),
-        deployment_environment=deployment.environment,
-        deployment_name=deployment.deployment_name,
-        deployment_version=deployment.deployment_version,
+    return coordinator_class(**_coordinator_parameters(execution_run_id, deployment))
+
+
+def execution_coordinator_handle(
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    use_deployed_coordinator: bool,
+    local_coordinator: Callable[..., Any],
+    class_resolver: Callable[..., Any] = modal.Cls.from_name,
+) -> Any:
+    """Bind one run to its deployed or current-source coordinator class."""
+    if use_deployed_coordinator:
+        return deployed_execution_coordinator(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            class_resolver=class_resolver,
+        )
+    return local_coordinator(**_coordinator_parameters(execution_run_id, deployment))
+
+
+def execution_coordinator_identity(
+    parameters: Any,
+) -> tuple[UUID, DeploymentIdentity]:
+    """Read the standard execution identity from Modal class parameters."""
+    return UUID(parameters.execution_run_id), DeploymentIdentity(
+        environment=parameters.deployment_environment,
+        deployment_name=parameters.deployment_name,
+        deployment_version=parameters.deployment_version,
     )
+
+
+def _coordinator_parameters(
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+) -> dict[str, object]:
+    return {
+        "execution_run_id": str(execution_run_id),
+        "deployment_environment": deployment.environment,
+        "deployment_name": deployment.deployment_name,
+        "deployment_version": deployment.deployment_version,
+    }
 
 
 class ModalCallDriver:

@@ -33,6 +33,7 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
+    persist_execution_launch,
 )
 from biomodals.helper.output_claim import (
     acquire_output_claim,
@@ -701,6 +702,27 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         candidate_request: EnsirnaExecutionRequest | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor from conclusive state."""
+        self.prepare_restart(
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            predecessor_deployment=predecessor_deployment,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            expected_workload_plan_fingerprint=expected_workload_plan_fingerprint,
+            candidate_request=candidate_request,
+        )
+        return self.drive_prepared()
+
+    def prepare_restart(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity | None,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+        expected_workload_plan_fingerprint: str | None = None,
+        candidate_request: EnsirnaExecutionRequest | None = None,
+    ) -> None:
+        """Validate and persist a Successor request without driving it."""
         del max_active_gpu_provider_calls
         if candidate_request is not None and max_active_provider_calls is not None:
             raise ValueError(
@@ -773,12 +795,12 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     self.execution_run_id,
                     request,
                 )
-                self.output_volume.commit()
-                runtime = self._open_runtime(
-                    request,
-                    predecessor_execution_run_id=predecessor_execution_run_id,
+                persist_execution_launch(
+                    self.volume_root,
+                    self.execution_run_id,
+                    predecessor_execution_run_id,
                 )
-            return self._drive(runtime, resume=False)
+                self.output_volume.commit()
 
     def _open_runtime(
         self,

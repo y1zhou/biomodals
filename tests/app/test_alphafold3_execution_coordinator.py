@@ -21,7 +21,7 @@ from biomodals.app.fold.alphafold3.execution_request import (
     persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
-from biomodals.helper.app_execution import ExecutionRunStore
+from biomodals.helper.app_execution import ExecutionRunStore, load_execution_launch
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -274,6 +274,7 @@ def test_restart_links_a_new_ledger_and_only_changes_operational_limits(
     assert snapshot.run.plan == request.execution_plan
     assert snapshot.run.max_active_provider_calls == 3
     assert snapshot.run.max_active_gpu_provider_calls == 2
+    assert load_execution_launch(tmp_path, SUCCESSOR_ID) == PREDECESSOR_ID
     assert (
         cast(
             AlphaFold3ExecutionRequest, FakeRuntime.created[0]["request"]

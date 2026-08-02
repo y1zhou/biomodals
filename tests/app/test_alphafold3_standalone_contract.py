@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
+from uuid import UUID
 
 import orjson
 import pytest
@@ -459,6 +460,7 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     assert request.max_num_gpus == 4
     assert request.recycle == 3
     assert request.sample == 2
+    assert captured["launch"] == (captured["execution_run_id"], None)
     assert captured["run_kwargs"] == {"development": False}
     deployment = captured["coordinator"]["deployment"]
     assert deployment.environment == "production"
@@ -556,6 +558,7 @@ def test_submit_alphafold3_task_routes_a_cache_hit_through_a_new_root_run(
     )
 
     assert captured["request"].config.name == "cached"
+    assert captured["launch"] == (captured["run_id"], None)
     assert captured["spawned"] == {"development": True}
     assert captured["manifest"] is cached_manifest
     assert captured["display_name"] == "cached"
@@ -644,6 +647,7 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
     )
 
     restart = cast(dict[str, object], captured["restart"])
+    assert captured["launch"] == (captured["staged"][0], UUID(predecessor))
     assert restart["predecessor_execution_run_id"] == predecessor
     candidate_bytes = restart["candidate_request_bytes"]
     assert isinstance(candidate_bytes, bytes)

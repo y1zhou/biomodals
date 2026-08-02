@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -131,8 +130,8 @@ class ExecutionRequestFile:
 
 
 _LAUNCH_FILE = ExecutionRequestFile(
-    "launch.json",
-    256,
+    "launch",
+    36,
     "Execution launch identity",
 )
 
@@ -143,19 +142,24 @@ def stage_execution_launch(
     predecessor_execution_run_id: UUID | None,
 ) -> PurePosixPath:
     """Stage immutable root/successor identity before coordinator submission."""
-    content = json.dumps(
-        {
-            "predecessor_execution_run_id": (
-                None
-                if predecessor_execution_run_id is None
-                else str(predecessor_execution_run_id)
-            ),
-            "schema_version": 1,
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return _LAUNCH_FILE.stage(output_volume, execution_run_id, content)
+    return _LAUNCH_FILE.stage(
+        output_volume,
+        execution_run_id,
+        _execution_launch_bytes(predecessor_execution_run_id),
+    )
+
+
+def persist_execution_launch(
+    volume_root: str | Path,
+    execution_run_id: UUID,
+    predecessor_execution_run_id: UUID | None,
+) -> PurePosixPath:
+    """Persist immutable launch identity from a mounted coordinator."""
+    return _LAUNCH_FILE.persist(
+        volume_root,
+        execution_run_id,
+        _execution_launch_bytes(predecessor_execution_run_id),
+    )
 
 
 def load_execution_launch(
@@ -163,18 +167,25 @@ def load_execution_launch(
     execution_run_id: UUID,
 ) -> UUID | None:
     """Load the predecessor identity staged for one coordinator launch."""
-    value = json.loads(_LAUNCH_FILE.load(volume_root, execution_run_id))
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise ValueError("Execution launch identity is invalid")
-    predecessor = value.get("predecessor_execution_run_id")
-    if predecessor is None:
+    content = _LAUNCH_FILE.load(volume_root, execution_run_id)
+    if content == b"root":
         return None
-    if not isinstance(predecessor, str):
-        raise ValueError("Execution launch predecessor is invalid")
-    parsed = UUID(predecessor)
+    try:
+        predecessor = content.decode("ascii")
+        parsed = UUID(predecessor)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError("Execution launch predecessor is invalid") from error
     if str(parsed) != predecessor:
         raise ValueError("Execution launch predecessor is not canonical")
     return parsed
+
+
+def _execution_launch_bytes(predecessor_execution_run_id: UUID | None) -> bytes:
+    return (
+        b"root"
+        if predecessor_execution_run_id is None
+        else str(predecessor_execution_run_id).encode()
+    )
 
 
 class ExecutionRunStore:
@@ -448,6 +459,13 @@ class ExecutionCoordinatorLifecycle:
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=False)
+            return self._drive(runtime, resume=False)
+
+    def drive_prepared(self) -> ExecutionSnapshot:
+        """Drive a prepared root or Successor Run from immutable launch state."""
+        with self._drive_lock:
+            with self._writer_lock:
+                runtime = self._open_current_runtime(recover=True)
             return self._drive(runtime, resume=False)
 
     def cancel(self) -> ExecutionSnapshot:

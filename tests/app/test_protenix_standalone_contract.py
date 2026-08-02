@@ -236,5 +236,6 @@ def test_local_entrypoint_launches_one_execution_coordinator(
 
     assert captured["request"].run_name == "demo"
     assert captured["request"].max_active_provider_calls == 3
+    assert captured["launch"] == (execution_run_id, None)
     assert captured["run_kwargs"] == {"development": True}
     assert captured["data"] == b"tar"

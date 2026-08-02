@@ -151,6 +151,7 @@ def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     assert request.num_threads == 2
     assert request.max_active_provider_calls == 3
     assert request.max_active_gpu_provider_calls == 0
+    assert launched["launch"] == (execution_run_id, None)
     assert launched["handle_kwargs"]["execution_run_id"] == execution_run_id
     assert launched["run_kwargs"] == {"development": True}
 

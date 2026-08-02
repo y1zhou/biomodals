@@ -35,18 +35,28 @@ runner = CliRunner()
 
 
 class FakeRemoteMethod:
-    def __init__(self, result: object) -> None:
+    def __init__(
+        self,
+        result: object,
+        *,
+        name: str = "method",
+        events: list[str] | None = None,
+    ) -> None:
         self.result = result
+        self.name = name
+        self.events = [] if events is None else events
         self.remote_calls = 0
         self.spawn_calls = 0
         self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     def remote(self, *args: object, **kwargs: object) -> object:
+        self.events.append(f"{self.name}.remote")
         self.remote_calls += 1
         self.calls.append((args, kwargs))
         return self.result
 
     def spawn(self, *args: object, **kwargs: object) -> object:
+        self.events.append(f"{self.name}.spawn")
         self.spawn_calls += 1
         self.calls.append((args, kwargs))
         return self.result
@@ -54,11 +64,21 @@ class FakeRemoteMethod:
 
 class FakeCoordinator:
     def __init__(self) -> None:
+        self.events: list[str] = []
         self.snapshot = object()
         self.status = FakeRemoteMethod(self.snapshot)
         self.cancel = FakeRemoteMethod(self.snapshot)
         self.resume = FakeRemoteMethod(SimpleNamespace(object_id="fc-resume"))
-        self.restart = FakeRemoteMethod(SimpleNamespace(object_id="fc-restart"))
+        self.prepare_restart = FakeRemoteMethod(
+            None,
+            name="prepare_restart",
+            events=self.events,
+        )
+        self.drive_prepared = FakeRemoteMethod(
+            SimpleNamespace(object_id="fc-restart"),
+            name="drive_prepared",
+            events=self.events,
+        )
 
 
 def _patch_coordinator(
@@ -148,14 +168,16 @@ def test_run_restart_creates_a_new_explicit_successor(
     )
 
     assert result.exit_code == 0
-    assert coordinator.restart.spawn_calls == 1
+    assert coordinator.prepare_restart.remote_calls == 1
+    assert coordinator.drive_prepared.spawn_calls == 1
+    assert coordinator.events == ["prepare_restart.remote", "drive_prepared.spawn"]
     assert calls["execution_run_id"] == SUCCESSOR_ID
     deployment = calls["deployment"]
     assert isinstance(deployment, DeploymentIdentity)
     assert deployment.environment == "production"
     assert deployment.deployment_name == "ShortMDWorkflow"
     assert deployment.deployment_version == 8
-    assert coordinator.restart.calls == [
+    assert coordinator.prepare_restart.calls == [
         (
             (),
             {
@@ -171,6 +193,26 @@ def test_run_restart_creates_a_new_explicit_successor(
     assert str(SUCCESSOR_ID) in result.output
     assert "production/ShortMDWorkflow/v8" in result.output
     assert "fc-restart" in result.output
+
+
+def test_run_restart_does_not_drive_when_preparation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _ = _patch_coordinator(monkeypatch)
+
+    def fail_preparation(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("invalid predecessor")
+
+    monkeypatch.setattr(coordinator.prepare_restart, "remote", fail_preparation)
+
+    result = runner.invoke(
+        app,
+        ["run", "restart", *LOCATION_FLAGS, *TARGET_FLAGS],
+    )
+
+    assert result.exit_code == 1
+    assert coordinator.drive_prepared.spawn_calls == 0
+    assert "invalid predecessor" in result.output
 
 
 def test_top_level_run_is_reserved_for_execution_lifecycle() -> None:

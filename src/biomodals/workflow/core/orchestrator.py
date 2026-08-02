@@ -321,6 +321,34 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Persist a validated Successor ledger without driving it."""
+        self._prepare_successor(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                environment=predecessor_deployment_environment,
+                deployment_name=predecessor_deployment_name,
+                deployment_version=predecessor_deployment_version,
+            ),
+            candidate=None,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> AppRunResult:
+        """Drive one previously prepared workflow Successor."""
+        return self._drive_prepared()
+
+    @modal.method()
     def restart_from(
         self,
         predecessor_execution_run_id: str,
@@ -362,6 +390,25 @@ class ExecutionCoordinator:
         max_active_gpu_provider_calls: int | None,
     ) -> AppRunResult:
         """Apply the one successor operation used by both restart surfaces."""
+        self._prepare_successor(
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            predecessor_deployment=predecessor_deployment,
+            candidate=candidate,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+        return self._drive_prepared()
+
+    def _prepare_successor(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity | None,
+        candidate: WorkflowCoordinatorPlan | None,
+        max_active_provider_calls: int | None,
+        max_active_gpu_provider_calls: int | None,
+    ) -> None:
+        """Validate and checkpoint a workflow Successor without driving it."""
         successor_id, deployment = self._identity()
         if successor_id == predecessor_execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
@@ -427,6 +474,13 @@ class ExecutionCoordinator:
                     node_publications=node_publications,
                     task_publications=task_publications,
                 )
+
+    def _drive_prepared(self) -> AppRunResult:
+        """Open and drive one already persisted workflow plan."""
+        with self._drive_lock:
+            with self._lock():
+                self._require_ledger()
+                plan = self._load_plan()
                 runtime = self._open_runtime(plan, resolve_external_checker=True)
             try:
                 return runtime.run(

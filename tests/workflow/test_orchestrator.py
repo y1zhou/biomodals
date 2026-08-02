@@ -538,6 +538,50 @@ def test_launch_restart_matches_candidate_science_and_changes_operational_limits
     store.close()
 
 
+def test_generic_restart_prepares_successor_before_driving(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("demo")
+    workflow.add_node(TextNode("complete"), id="write")
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    raw_cls.prepare_restart._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    assert store.execution.get_run(SUCCESSOR_ID).predecessor_execution_run_id == RUN_ID
+    assert getattr(successor_coordinator, "_runtime", None) is None
+    store.close()
+
+    result = raw_cls.drive_prepared._get_raw_f()(successor_coordinator)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+
+
 def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

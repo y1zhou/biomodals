@@ -25,6 +25,7 @@ from biomodals.execution import (
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRunStore,
+    persist_execution_launch,
 )
 
 
@@ -69,6 +70,25 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
         max_active_gpu_provider_calls: int | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor Run from conclusive state."""
+        self.prepare_restart(
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            predecessor_deployment=predecessor_deployment,
+            candidate_request=candidate_request,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+        return self.drive_prepared()
+
+    def prepare_restart(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity | None,
+        candidate_request: AlphaFold3ExecutionRequest | None = None,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Validate and persist a Successor request without driving it."""
         if predecessor_execution_run_id == self.execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
         if candidate_request is not None and (
@@ -131,12 +151,12 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     self.execution_run_id,
                     request,
                 )
-                self.output_volume.commit()
-                runtime = self._open_runtime(
-                    request,
-                    predecessor_execution_run_id=predecessor_execution_run_id,
+                persist_execution_launch(
+                    self.volume_root,
+                    self.execution_run_id,
+                    predecessor_execution_run_id,
                 )
-            return self._drive(runtime, resume=False)
+                self.output_volume.commit()
 
     def close(self) -> None:
         """Checkpoint local state on exit without cancelling child calls."""

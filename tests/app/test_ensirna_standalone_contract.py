@@ -1448,6 +1448,7 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
 
     request = captured["request"]
     assert captured["run_id"] == execution_run_id
+    assert captured["launch"] == (execution_run_id, None)
     assert request.fasta_content == b">m\nAUGCUAGCUAGCUAGCUAGC\n"
     assert request.prepare_workers == 2
     assert request.pdb_cores == 3
@@ -1526,6 +1527,7 @@ def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
 
     assert captured["request"].fasta_content == input_fasta.read_bytes()
     assert captured["request"].app_version == "new-version"
+    assert captured["launch"] == (successor_id, predecessor_id)
     assert captured["restart_kwargs"] == {
         "predecessor_execution_run_id": str(predecessor_id)
     }

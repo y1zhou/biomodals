@@ -40,6 +40,7 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
+    persist_execution_launch,
 )
 from biomodals.helper.shell import sanitize_filename
 
@@ -636,6 +637,25 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
         expected_workload_plan_fingerprint: str | None = None,
     ) -> ExecutionSnapshot:
         """Create and drive a compatible Successor from conclusive state."""
+        self.prepare_restart(
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            predecessor_deployment=predecessor_deployment,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            expected_workload_plan_fingerprint=expected_workload_plan_fingerprint,
+        )
+        return self.drive_prepared()
+
+    def prepare_restart(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity | None,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+        expected_workload_plan_fingerprint: str | None = None,
+    ) -> None:
+        """Validate and persist a Successor request without driving it."""
         if predecessor_execution_run_id == self.execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
         with self._drive_lock:
@@ -690,12 +710,12 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     self.execution_run_id,
                     request,
                 )
-                self.output_volume.commit()
-                runtime = self._open_runtime(
-                    request,
-                    predecessor_execution_run_id=predecessor_execution_run_id,
+                persist_execution_launch(
+                    self.volume_root,
+                    self.execution_run_id,
+                    predecessor_execution_run_id,
                 )
-            return self._drive(runtime, resume=False)
+                self.output_volume.commit()
 
     def _open_runtime(
         self,

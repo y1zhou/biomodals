@@ -680,6 +680,33 @@ class ExecutionCoordinator:
         return self._adapter().resume()
 
     @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Persist a validated Successor request without driving it."""
+        self._adapter().prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> ExecutionSnapshot:
+        """Drive one previously prepared root or Successor Run."""
+        return self._adapter().drive_prepared()
+
+    @modal.method()
     def restart(
         self,
         predecessor_execution_run_id: str,

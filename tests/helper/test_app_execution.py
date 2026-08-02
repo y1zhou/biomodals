@@ -25,6 +25,7 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
     load_execution_launch,
+    persist_execution_launch,
     stage_execution_launch,
 )
 
@@ -161,6 +162,7 @@ def test_execution_launch_identity_is_immutable(tmp_path: Path) -> None:
 
     stage_execution_launch(volume, RUN_ID, predecessor_id)
     stage_execution_launch(volume, RUN_ID, predecessor_id)
+    persist_execution_launch(tmp_path, RUN_ID, predecessor_id)
 
     assert load_execution_launch(tmp_path, RUN_ID) == predecessor_id
     with pytest.raises(RuntimeError, match="conflicts with this run"):

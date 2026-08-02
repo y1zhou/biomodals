@@ -301,6 +301,7 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     )
 
     local = output_dir / "demo-no-tmpl"
+    assert captured["launch"] == (execution_run_id, None)
     assert captured["request"].max_active_provider_calls == 3
     assert captured["run_kwargs"] == {"development": True}
     assert (local / "run-config.json").is_file()

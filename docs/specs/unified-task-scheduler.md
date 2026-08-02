@@ -708,6 +708,12 @@ immediate `cancel` create the durable Run with correct lineage even when it
 wins the race with `run` or `restart`; launch identity is never inferred from
 workload fields, output claims, or matching command text.
 
+Generic restart uses two coordinator inputs. `prepare_restart` synchronously
+validates the predecessor, applies operational overrides, and checkpoints the
+immutable Successor request and launch identity. Only after that succeeds does
+the CLI spawn `drive_prepared`. This is a submission boundary, not a new Run
+state: preparation does not create ledger rows or admit Provider Calls.
+
 `status` is read-only, `cancel` is an idempotent explicit cancellation,
 `resume` retains Execution Run ID and Deployment Identity, reconciles existing
 work, and may submit Tasks that were never submitted, but it never retries a

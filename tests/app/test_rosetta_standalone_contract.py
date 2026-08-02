@@ -116,6 +116,7 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
     assert staged_run_id == EXECUTION_RUN_ID
     assert request.workload_run_key == workload_run_key
     assert request.tasks[0].pdb == "inputs/1/demo.pdb"
+    assert captured["launch"] == (EXECUTION_RUN_ID, None)
     assert captured["run_kwargs"] == {"development": True}
     assert captured["coordinator"] == {
         "execution_run_id": EXECUTION_RUN_ID,

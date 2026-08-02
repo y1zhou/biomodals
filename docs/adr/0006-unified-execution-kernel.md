@@ -109,7 +109,12 @@ The client stages a bounded immutable launch record beside each app request,
 declaring either root identity or the exact predecessor UUID before coordinator
 submission. This record is the only pre-ledger lineage source, so cancellation
 that arrives before `run` or `restart` cannot misclassify a successor as a
-root Run. Workload arguments and output-claim metadata are not lineage.
+root Run. Generic restart first asks the target coordinator to validate and
+persist the exact Successor request and launch record, then spawns a separate
+drive call. The preparation boundary must complete before the CLI reports or
+starts the drive, so immediate cancellation always has enough durable input to
+initialize the Successor correctly. Workload arguments and output-claim
+metadata are not lineage.
 
 The CLI location policy was accepted on 2026-07-29 and simplified the same
 day. App and workflow launch commands print the Deployment Identity, Execution

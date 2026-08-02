@@ -916,12 +916,13 @@ def restart_execution_run(
     """Create a new Successor Run without mutating the predecessor."""
     successor_execution_run_id = uuid4()
     try:
-        call = _run_coordinator(
+        coordinator = _run_coordinator(
             environment=target_environment,
             deployment_name=target_deployment_name,
             deployment_version=target_deployment_version,
             execution_run_id=successor_execution_run_id,
-        ).restart.spawn(
+        )
+        coordinator.prepare_restart.remote(
             predecessor_execution_run_id=str(execution_run_id),
             predecessor_deployment_environment=environment,
             predecessor_deployment_name=deployment_name,
@@ -929,6 +930,7 @@ def restart_execution_run(
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
         )
+        call = coordinator.drive_prepared.spawn()
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Error[/bold red] Could not restart run: {exc}")
         raise typer.Exit(code=1) from exc

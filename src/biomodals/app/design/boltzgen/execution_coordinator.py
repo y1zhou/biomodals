@@ -40,6 +40,8 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
         volume_root: str | Path,
         output_volume: Any,
         modal_driver: Any,
+        app_version: str,
+        repo_commit_hash: str,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only deployment resources needed by this app adapter."""
@@ -47,6 +49,10 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={
+                "boltzgen": app_version,
+                "boltzgen_repository": repo_commit_hash,
+            },
         )
         self.output_volume = output_volume
         self.modal_driver = modal_driver

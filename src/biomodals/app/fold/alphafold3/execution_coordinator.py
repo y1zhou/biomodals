@@ -14,7 +14,9 @@ from biomodals.app.fold.alphafold3.execution_request import (
 from biomodals.app.fold.alphafold3.execution_runtime import (
     AlphaFold3ExecutionRuntime,
 )
+from biomodals.app.fold.alphafold3.inference_inputs import ALPHAFOLD3_APP_VERSION
 from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
+from biomodals.app.fold.alphafold3.profiles import ALPHAFOLD3_COMMIT
 from biomodals.app.fold.alphafold3.seed_predictions import InferenceRuntime
 from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
 from biomodals.execution import (
@@ -50,6 +52,10 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={
+                "alphafold3_app": ALPHAFOLD3_APP_VERSION,
+                "alphafold3_upstream": ALPHAFOLD3_COMMIT,
+            },
         )
         self.output_volume = output_volume
         self.modal_driver = modal_driver
@@ -100,10 +106,8 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 with self._open_successor_source(
                     predecessor_execution_run_id,
                     predecessor_deployment=predecessor_deployment,
-                ) as source:
-                    predecessor, predecessor_request, _ = source
-
-                request = candidate_request
+                ) as (predecessor, predecessor_request, _):
+                    request = candidate_request
                 if request is None:
                     request = _restart_request(
                         predecessor_request,

@@ -191,6 +191,9 @@ def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
         model_volume=FakeVolume(),
         output_claims=FakeClaims(),
         modal_driver=cast(Any, object()),
+        app_version=request.app_version,
+        model_version=request.model_version,
+        reference_version=cast(str, request.reference_version),
     )
     runtime = cast(
         OligoformerExecutionRuntime,

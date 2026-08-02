@@ -953,6 +953,7 @@ class ExecutionCoordinator:
                 msa_cache_volume=MSA_CACHE_VOLUME,
                 output_claims=PROTENIX_OUTPUT_CLAIMS,
                 modal_driver=_coordinator_modal_driver(development=selected_mode),
+                app_version=CONF.repo_commit_hash or CONF.version or "unknown",
             ),
         )
 

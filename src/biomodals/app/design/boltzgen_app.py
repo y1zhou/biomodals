@@ -804,6 +804,8 @@ class ExecutionCoordinator:
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
                 modal_driver=_coordinator_modal_driver(development=selected_mode),
+                app_version=CONF.version or "",
+                repo_commit_hash=CONF.repo_commit_hash or "",
             ),
         )
 

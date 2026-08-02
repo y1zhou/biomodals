@@ -677,6 +677,7 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         output_volume: Any,
         output_claims: Any,
         modal_driver: Any,
+        app_version: str,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only the deployment resources used by this adapter."""
@@ -684,6 +685,7 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={"ensirna": app_version},
         )
         self.output_volume = output_volume
         self.output_claims = output_claims
@@ -736,9 +738,8 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     expected_workload_plan_fingerprint=(
                         expected_workload_plan_fingerprint
                     ),
-                ) as source:
-                    predecessor, predecessor_request, _ = source
-                request = candidate_request or predecessor_request
+                ) as (predecessor, predecessor_request, _):
+                    request = candidate_request or predecessor_request
                 if (
                     request.execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint

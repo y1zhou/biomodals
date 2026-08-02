@@ -24,7 +24,7 @@ REQUIRED_FUNCTIONS = (
     "production_run_cpu",
     "production_run_gpu",
 )
-_EXECUTION_PLAN_SCHEMA_VERSION = "2"
+EXECUTION_PLAN_SCHEMA_VERSION = "2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +120,7 @@ def execution_plan(
             "simulation_time_ns": simulation_time_ns,
         },
         scientific_versions={
-            "biomodals.gromacs.execution_plan": _EXECUTION_PLAN_SCHEMA_VERSION,
+            "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
         },
     )
 

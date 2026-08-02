@@ -835,9 +835,8 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     expected_workload_plan_fingerprint=(
                         expected_workload_plan_fingerprint
                     ),
-                ) as source:
-                    predecessor, predecessor_request, _ = source
-                request = candidate_request or predecessor_request
+                ) as (predecessor, predecessor_request, _):
+                    request = candidate_request or predecessor_request
                 if (
                     request.execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint

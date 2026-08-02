@@ -5931,6 +5931,19 @@ class ExecutionCoordinator:
                 model_volume=MODEL_VOLUME,
                 output_claims=OLIGOFORMER_OUTPUT_CLAIMS,
                 modal_driver=_coordinator_modal_driver(development=selected_mode),
+                app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+                model_version=_hash_bytes(
+                    orjson.dumps(
+                        APP_INFO.rnafm_identity_metadata,
+                        option=orjson.OPT_SORT_KEYS,
+                    )
+                ),
+                reference_version=_hash_bytes(
+                    orjson.dumps(
+                        APP_INFO.targetscan_ref_metadata,
+                        option=orjson.OPT_SORT_KEYS,
+                    )
+                ),
             ),
         )
 

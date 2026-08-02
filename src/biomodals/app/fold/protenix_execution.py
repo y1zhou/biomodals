@@ -735,6 +735,7 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
         msa_cache_volume: Any,
         output_claims: Any,
         modal_driver: Any,
+        app_version: str,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only resources used by this workload adapter."""
@@ -742,6 +743,7 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={"protenix": app_version},
         )
         self.output_volume = output_volume
         self.msa_cache_volume = msa_cache_volume
@@ -798,9 +800,8 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     expected_workload_plan_fingerprint=(
                         expected_workload_plan_fingerprint
                     ),
-                ) as source:
-                    predecessor, predecessor_request, _ = source
-                request = candidate_request or predecessor_request
+                ) as (predecessor, predecessor_request, _):
+                    request = candidate_request or predecessor_request
                 if (
                     request.execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint

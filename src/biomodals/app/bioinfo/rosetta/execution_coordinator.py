@@ -40,6 +40,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         output_volume: Any,
         modal_driver: Any,
         pull_worker_coordinator: Any,
+        app_version: str,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only deployment resources used by this adapter."""
@@ -47,6 +48,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={"rosetta": app_version},
         )
         self.output_volume = output_volume
         self.modal_driver = modal_driver
@@ -144,27 +146,25 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     expected_workload_plan_fingerprint=(
                         expected_workload_plan_fingerprint
                     ),
-                ) as source:
-                    predecessor, predecessor_request, _ = source
-
-                request = replace(
-                    predecessor_request,
-                    max_active_provider_calls=(
-                        predecessor.max_active_provider_calls
-                        if max_active_provider_calls is None
-                        else max_active_provider_calls
-                    ),
-                    claim_capacity=(
-                        predecessor_request.claim_capacity
-                        if claim_capacity is None
-                        else claim_capacity
-                    ),
-                    max_parallel_per_worker=(
-                        predecessor_request.max_parallel_per_worker
-                        if max_parallel_per_worker is None
-                        else max_parallel_per_worker
-                    ),
-                )
+                ) as (predecessor, predecessor_request, _):
+                    request = replace(
+                        predecessor_request,
+                        max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                        claim_capacity=(
+                            predecessor_request.claim_capacity
+                            if claim_capacity is None
+                            else claim_capacity
+                        ),
+                        max_parallel_per_worker=(
+                            predecessor_request.max_parallel_per_worker
+                            if max_parallel_per_worker is None
+                            else max_parallel_per_worker
+                        ),
+                    )
                 if (
                     request.execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint

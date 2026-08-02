@@ -446,13 +446,18 @@ class ExecutionCoordinatorLifecycle:
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         volume_root: str | Path,
-        target_scientific_versions: Mapping[str, str] | None = None,
+        target_scientific_versions: Mapping[str, str],
     ) -> None:
         """Bind the lifecycle to one Run and exact deployment."""
         self.execution_run_id = execution_run_id
         self.deployment = deployment
         self.volume_root = Path(volume_root)
-        self.target_scientific_versions = dict(target_scientific_versions or {})
+        self.target_scientific_versions = dict(target_scientific_versions)
+        if not self.target_scientific_versions or any(
+            not name or not version
+            for name, version in self.target_scientific_versions.items()
+        ):
+            raise ValueError("Target scientific versions cannot be empty")
         self._writer_lock = RLock()
         self._drive_lock = Lock()
         self._runtime: Any | None = None

@@ -15,6 +15,7 @@ from uuid import UUID
 import orjson
 
 from biomodals.app.bioinfo.gromacs_execution import (
+    EXECUTION_PLAN_SCHEMA_VERSION,
     NPT_ANALYSIS,
     NVT_ANALYSIS,
     PREPARE_RESULT,
@@ -621,6 +622,9 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={
+                "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
+            },
         )
         self.output_volume = output_volume
         self.modal_driver = modal_driver
@@ -664,21 +668,27 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     expected_workload_plan_fingerprint=(
                         expected_workload_plan_fingerprint
                     ),
-                ) as source:
-                    predecessor, request, _ = source
-                request = replace(
-                    request,
-                    max_active_provider_calls=(
-                        predecessor.max_active_provider_calls
-                        if max_active_provider_calls is None
-                        else max_active_provider_calls
-                    ),
-                    max_active_gpu_provider_calls=(
-                        predecessor.max_active_gpu_provider_calls
-                        if max_active_gpu_provider_calls is None
-                        else max_active_gpu_provider_calls
-                    ),
-                )
+                ) as (predecessor, predecessor_request, _):
+                    request = replace(
+                        predecessor_request,
+                        max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
+                        ),
+                    )
+                if (
+                    request.execution_plan.workload_plan_fingerprint
+                    != predecessor.plan.workload_plan_fingerprint
+                ):
+                    raise ValueError(
+                        "Target deployment changed the Workload Plan Fingerprint"
+                    )
                 persist_execution_request(
                     self.volume_root,
                     self.execution_run_id,

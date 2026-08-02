@@ -149,7 +149,7 @@ def _input_output_dir(output_dir: str | Path, input_id: str) -> Path:
 
 def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
     return (
-        _input_output_dir(output_dir, input_id) / ".biomodals" / ("af3score-input.json")
+        _input_output_dir(output_dir, input_id) / ".biomodals" / "af3score-input.json"
     )
 
 
@@ -157,13 +157,8 @@ def _input_output_records(
     output_dir: str | Path,
     input_id: str,
 ) -> dict[str, dict[str, int | str]]:
-    sample_dir = (
-        _input_output_dir(
-            output_dir,
-            input_id,
-        )
-        / APP_INFO.completion_sample_subdir
-    )
+    sample_dir = _input_output_dir(output_dir, input_id)
+    sample_dir /= APP_INFO.completion_sample_subdir
     records: dict[str, dict[str, int | str]] = {}
     for filename in APP_INFO.completion_required_files:
         path = sample_dir / filename

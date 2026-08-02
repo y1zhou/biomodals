@@ -133,6 +133,7 @@ def _coordinator(
         output_volume=volume,
         modal_driver=object(),
         pull_worker_coordinator=object(),
+        app_version="2025.51",
         poll_interval_seconds=0,
     )
 

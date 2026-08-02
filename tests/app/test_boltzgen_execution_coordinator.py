@@ -123,6 +123,8 @@ def _coordinator(
     *,
     execution_run_id: UUID,
     deployment: DeploymentIdentity,
+    app_version: str = "0.3.2",
+    repo_commit_hash: str = "abc123",
 ) -> BoltzGenExecutionCoordinator:
     return BoltzGenExecutionCoordinator(
         execution_run_id=execution_run_id,
@@ -130,6 +132,8 @@ def _coordinator(
         volume_root=tmp_path,
         output_volume=volume,
         modal_driver=object(),
+        app_version=app_version,
+        repo_commit_hash=repo_commit_hash,
         poll_interval_seconds=0,
     )
 
@@ -295,3 +299,23 @@ def test_launch_time_restart_rejects_changed_science(
             predecessor_deployment=DEPLOYMENT,
             expected_workload_plan_fingerprint="different",
         )
+
+
+def test_restart_rejects_target_deployment_version_drift(tmp_path: Path) -> None:
+    request = _request()
+    _terminal_predecessor(tmp_path, request)
+    coordinator = _coordinator(
+        tmp_path,
+        FakeVolume(),
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        app_version="0.4.0",
+    )
+
+    with pytest.raises(ValueError, match="declared scientific versions"):
+        coordinator.prepare_restart(
+            predecessor_execution_run_id=PREDECESSOR_ID,
+            predecessor_deployment=DEPLOYMENT,
+        )
+
+    assert not ExecutionRunStore(tmp_path, SUCCESSOR_ID).ledger_path.exists()

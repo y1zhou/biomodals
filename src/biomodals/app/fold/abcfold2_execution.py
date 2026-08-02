@@ -729,6 +729,9 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
         output_volume: Any,
         output_claims: Any,
         modal_driver: Any,
+        app_version: str,
+        boltz_version: str,
+        chai_version: str,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only resources used by this workload adapter."""
@@ -736,6 +739,11 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            target_scientific_versions={
+                "abcfold2": app_version,
+                "boltz": boltz_version,
+                "chai": chai_version,
+            },
         )
         self.output_volume = output_volume
         self.output_claims = output_claims
@@ -791,9 +799,8 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     expected_workload_plan_fingerprint=(
                         expected_workload_plan_fingerprint
                     ),
-                ) as source:
-                    predecessor, predecessor_request, _ = source
-                request = candidate_request or predecessor_request
+                ) as (predecessor, predecessor_request, _):
+                    request = candidate_request or predecessor_request
                 if (
                     request.execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint

@@ -364,6 +364,7 @@ class ExecutionCoordinator:
                 output_volume=CONF.output_volume,
                 modal_driver=_coordinator_modal_driver(development=selected_mode),
                 pull_worker_coordinator=self._worker_coordinator_handle(),
+                app_version=CONF.version or "",
             ),
         )
 

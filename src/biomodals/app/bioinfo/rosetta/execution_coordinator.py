@@ -78,15 +78,6 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 capacity=capacity,
             )
 
-    def _open_current_runtime(self, *, recover: bool) -> RosettaExecutionRuntime:
-        request = self._request_loader(self.volume_root, self.execution_run_id)
-        return self._open_runtime(
-            request,
-            predecessor_execution_run_id=(
-                self._existing_predecessor() if recover else None
-            ),
-        )
-
     def complete_task(
         self,
         provider_call_id: UUID,
@@ -227,14 +218,3 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         )
         self._runtime = runtime
         return runtime
-
-    def _existing_predecessor(self) -> UUID | None:
-        store = self._run_store()
-        if not store.ledger_path.is_file():
-            return None
-        try:
-            return store.execution.get_run(
-                self.execution_run_id
-            ).predecessor_execution_run_id
-        finally:
-            store.close()

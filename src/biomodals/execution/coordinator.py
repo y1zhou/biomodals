@@ -44,6 +44,8 @@ def drive_execution_run(
 
     while True:
         with synchronize():
+            if current_repository is not None:
+                repository = current_repository()
             if repository.get_run(execution_run_id).status not in _DRIVABLE_STATUSES:
                 return repository.snapshot(execution_run_id)
             try:

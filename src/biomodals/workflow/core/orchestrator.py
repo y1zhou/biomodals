@@ -188,7 +188,7 @@ class ExecutionCoordinator:
                 external_artifact_checker_function_name
             ),
         )
-        with self._driver_lock():
+        with self._drive_lock:
             with self._lock():
                 plan = self._persist_or_verify_plan(candidate)
                 if development_function_handles is not None:
@@ -220,7 +220,7 @@ class ExecutionCoordinator:
             runtime = self._open_runtime(plan, resolve_external_checker=False)
             runtime.cancel()
             self._verified_snapshot()
-        with self._driver_lock():
+        with self._drive_lock:
             with self._lock():
                 snapshot = self._verified_snapshot()
                 if snapshot.run.status.is_terminal:
@@ -242,7 +242,7 @@ class ExecutionCoordinator:
     @modal.method()
     def resume(self) -> AppRunResult:
         """Resume suspension or explicitly reconcile unknown provider state."""
-        with self._driver_lock():
+        with self._drive_lock:
             with self._lock():
                 self._require_ledger()
                 plan = self._load_plan()
@@ -365,7 +365,7 @@ class ExecutionCoordinator:
         successor_id, deployment = self._identity()
         if successor_id == predecessor_execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
-        with self._driver_lock():
+        with self._drive_lock:
             with self._lock():
                 OUT_VOLUME.reload()
                 (
@@ -440,7 +440,7 @@ class ExecutionCoordinator:
     @modal.exit()
     def exit(self) -> None:
         """Close local workflow state without cancelling child calls."""
-        with self._driver_lock():
+        with self._drive_lock:
             with self._lock():
                 self._close_runtime()
 
@@ -452,13 +452,6 @@ class ExecutionCoordinator:
         if lock is None:
             lock = RLock()
             self._writer_lock = lock
-        return lock
-
-    def _driver_lock(self) -> Lock:
-        lock = getattr(self, "_drive_lock", None)
-        if lock is None:
-            lock = Lock()
-            self._drive_lock = lock
         return lock
 
     def _persist_or_verify_plan(

@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D107
 
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, cast
 from uuid import UUID
 
@@ -204,6 +205,41 @@ def test_root_run_loads_staged_request_and_binds_remote_ledger(
     assert len(FakeRuntime.created) == 1
     assert volume.commits == 1
     assert coordinator.status() == snapshot
+
+
+def test_close_waits_for_the_active_driver(tmp_path: Path) -> None:
+    """The exit checkpoint cannot close SQLite under an active drive loop."""
+    volume = FakeVolume()
+    coordinator = _coordinator(
+        tmp_path,
+        volume,
+        execution_run_id=PREDECESSOR_ID,
+        deployment=DEPLOYMENT,
+    )
+    closed = Event()
+    started = Event()
+
+    class Runtime:
+        def close(self) -> None:
+            closed.set()
+
+    coordinator._runtime = Runtime()
+    coordinator._drive_lock.acquire()
+
+    def close() -> None:
+        started.set()
+        coordinator.close()
+
+    thread = Thread(target=close)
+    thread.start()
+    assert started.wait(timeout=1)
+    assert not closed.wait(timeout=0.05)
+    coordinator._drive_lock.release()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert closed.is_set()
+    assert volume.commits == 1
 
 
 def test_restart_links_a_new_ledger_and_only_changes_operational_limits(

@@ -667,6 +667,7 @@ def test_coordinator_launch_restart_forwards_candidate_bytes() -> None:
     instance.deployment_environment = "main"
     instance.deployment_name = "AlphaFold3"
     instance.deployment_version = 8
+    alphafold3_app.initialize_execution_coordinator_host(instance)
     instance._coordinator_adapter = Adapter()
     instance._development = False
 

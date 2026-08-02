@@ -130,7 +130,9 @@ from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
+    execution_coordinator_adapter,
     execution_coordinator_identity,
+    initialize_execution_coordinator_host,
 )
 from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
@@ -720,8 +722,7 @@ class ExecutionCoordinator:
     @modal.enter()
     def enter(self) -> None:
         """Validate coordinator identity before accepting lifecycle methods."""
-        self._coordinator_adapter = None
-        self._development = None
+        initialize_execution_coordinator_host(self)
         self._identity()
 
     @modal.method()
@@ -798,36 +799,31 @@ class ExecutionCoordinator:
         *,
         development: bool = False,
     ) -> AlphaFold3ExecutionCoordinator:
-        adapter = getattr(self, "_coordinator_adapter", None)
-        selected_mode = getattr(self, "_development", None)
-        if adapter is not None:
-            if selected_mode != development:
-                raise ValueError("Coordinator execution mode cannot change in place")
-            return adapter
         execution_run_id, deployment = self._identity()
-        adapter = AlphaFold3ExecutionCoordinator(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            volume_root=Path(CONF.output_volume_mountpoint),
-            output_volume=CONF.output_volume,
-            modal_driver=_coordinator_modal_driver(development=development),
-            search_runtime=_msa_search_runtime(
-                maximum_age_seconds=CONF.timeout + 900,
-                wait_timeout_seconds=max(60, CONF.timeout - 60),
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: AlphaFold3ExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                search_runtime=_msa_search_runtime(
+                    maximum_age_seconds=CONF.timeout + 900,
+                    wait_timeout_seconds=max(60, CONF.timeout - 60),
+                ),
+                template_runtime=TemplateRuntime(
+                    source_volume=AF3_MSA_DB_VOLUME,
+                    cache_volume=MSA_CACHE_VOLUME,
+                    claims=MSA_SEARCH_CLAIMS,
+                    container_id=_CONTAINER_INSTANCE_ID,
+                    maximum_age_seconds=CONF.timeout + 900,
+                    wait_timeout_seconds=max(60, CONF.timeout - 60),
+                ),
+                inference_runtime=_INFERENCE_RUNTIME,
             ),
-            template_runtime=TemplateRuntime(
-                source_volume=AF3_MSA_DB_VOLUME,
-                cache_volume=MSA_CACHE_VOLUME,
-                claims=MSA_SEARCH_CLAIMS,
-                container_id=_CONTAINER_INSTANCE_ID,
-                maximum_age_seconds=CONF.timeout + 900,
-                wait_timeout_seconds=max(60, CONF.timeout - 60),
-            ),
-            inference_runtime=_INFERENCE_RUNTIME,
         )
-        self._coordinator_adapter = adapter
-        self._development = development
-        return adapter
 
 
 def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:

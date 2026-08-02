@@ -36,7 +36,9 @@ from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
+    execution_coordinator_adapter,
     execution_coordinator_identity,
+    initialize_execution_coordinator_host,
 )
 from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
@@ -686,8 +688,7 @@ class ExecutionCoordinator:
     @modal.enter()
     def enter(self) -> None:
         """Refresh the output Volume before accepting lifecycle methods."""
-        self._coordinator_adapter = None
-        self._development = None
+        initialize_execution_coordinator_host(self)
         self._identity()
         CONF.output_volume.reload()
 
@@ -765,23 +766,18 @@ class ExecutionCoordinator:
         *,
         development: bool = False,
     ) -> BoltzGenExecutionCoordinator:
-        adapter = getattr(self, "_coordinator_adapter", None)
-        selected_mode = getattr(self, "_development", None)
-        if adapter is not None:
-            if selected_mode != development:
-                raise ValueError("Coordinator execution mode cannot change in place")
-            return adapter
         execution_run_id, deployment = self._identity()
-        adapter = BoltzGenExecutionCoordinator(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            volume_root=Path(CONF.output_volume_mountpoint),
-            output_volume=CONF.output_volume,
-            modal_driver=_coordinator_modal_driver(development=development),
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: BoltzGenExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                modal_driver=_coordinator_modal_driver(development=selected_mode),
+            ),
         )
-        self._coordinator_adapter = adapter
-        self._development = development
-        return adapter
 
 
 def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:

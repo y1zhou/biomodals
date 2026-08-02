@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from time import sleep
 from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionPlan,
+    ExecutionRuntime,
     NodePlan,
     RunStatus,
 )
@@ -21,6 +23,7 @@ from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
+    ExecutionRuntimeLifecycle,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -163,6 +166,9 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
             self.max_active_drivers = 0
             self.closed_while_driving = False
             self._lock = Lock()
+            self.store = SimpleNamespace(
+                execution=SimpleNamespace(snapshot=lambda _run_id: self.snapshot())
+            )
 
         def snapshot(self):
             return SimpleNamespace(
@@ -232,3 +238,104 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
     assert errors == []
     assert runtime.max_active_drivers == 1
     assert not runtime.closed_while_driving
+
+
+def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:
+    """An immediate cancellation wins even before the driver creates its row."""
+    deployment = DeploymentIdentity("main", "Example", 3)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+
+    class Runtime(ExecutionRuntimeLifecycle):
+        def __init__(self) -> None:
+            self.execution_run_id = RUN_ID
+            self.store = store
+            self._now = lambda: 10
+            self._provider = ExecutionRuntime(
+                store.execution,
+                modal_driver=cast(Any, object()),
+                checkpoint=lambda: store.execution,
+                transaction=store.transaction,
+            )
+
+        def _initialize(self):
+            self._provider.create_or_verify_run(
+                execution_run_id=RUN_ID,
+                predecessor_execution_run_id=None,
+                plan=plan,
+                deployment=deployment,
+                max_active_provider_calls=1,
+                max_active_gpu_provider_calls=0,
+                now=10,
+            )
+            return store.execution
+
+    snapshot = Runtime().cancel()
+
+    assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
+    assert store.execution.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
+    store.close()
+
+
+def test_app_coordinator_recovers_successor_identity_for_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Reopened successor lifecycle calls retain immutable lineage."""
+    predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    deployment = DeploymentIdentity("main", "Example", 3)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    with store.transaction():
+        store.execution.create_run(
+            execution_run_id=RUN_ID,
+            predecessor_execution_run_id=predecessor_id,
+            plan=plan,
+            deployment=deployment,
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=0,
+            now=10,
+        )
+    store.close()
+    opened_with: list[UUID | None] = []
+
+    class Runtime:
+        def __init__(self, predecessor: UUID | None) -> None:
+            self.predecessor_execution_run_id = predecessor
+            self.store = ExecutionRunStore(tmp_path, RUN_ID)
+
+        def cancel(self):
+            self.store.execution.request_run_cancellation(RUN_ID, now=11)
+            return self.store.execution.snapshot(RUN_ID)
+
+        def run(self, *, synchronize):
+            del synchronize
+            return self.store.execution.snapshot(RUN_ID)
+
+        def close(self) -> None:
+            self.store.close()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        _request_loader = staticmethod(lambda _root, _run_id: "request")
+
+        def _open_runtime(
+            self,
+            request,
+            *,
+            predecessor_execution_run_id: UUID | None = None,
+        ):
+            assert request == "request"
+            opened_with.append(predecessor_execution_run_id)
+            if self._runtime is None:
+                self._runtime = Runtime(predecessor_execution_run_id)
+            return self._runtime
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        volume_root=tmp_path,
+    )
+
+    snapshot = coordinator.cancel()
+
+    assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
+    assert opened_with == [predecessor_id, predecessor_id]

@@ -140,9 +140,10 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
 
     def close(self) -> None:
         """Checkpoint local state on exit without cancelling child calls."""
-        with self._writer_lock:
-            self._close_runtime()
-            self.output_volume.commit()
+        with self._drive_lock:
+            with self._writer_lock:
+                self._close_runtime()
+                self.output_volume.commit()
 
     def _drive(
         self,

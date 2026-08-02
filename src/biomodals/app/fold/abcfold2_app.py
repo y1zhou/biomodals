@@ -38,7 +38,9 @@ from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
+    execution_coordinator_adapter,
     execution_coordinator_identity,
+    initialize_execution_coordinator_host,
 )
 from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
@@ -749,8 +751,7 @@ class ExecutionCoordinator:
     @modal.enter()
     def enter(self) -> None:
         """Refresh output state before accepting lifecycle methods."""
-        self._coordinator_adapter = None
-        self._development = None
+        initialize_execution_coordinator_host(self)
         self._identity()
         CONF.output_volume.reload()
 
@@ -826,25 +827,19 @@ class ExecutionCoordinator:
         *,
         development: bool | None = None,
     ) -> ABCFold2ExecutionCoordinator:
-        adapter = getattr(self, "_coordinator_adapter", None)
-        selected_mode = getattr(self, "_development", None)
-        if adapter is not None:
-            if development is not None and selected_mode != development:
-                raise ValueError("Coordinator execution mode cannot change in place")
-            return adapter
         execution_run_id, deployment = self._identity()
-        selected_mode = False if development is None else development
-        adapter = ABCFold2ExecutionCoordinator(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            volume_root=Path(CONF.output_volume_mountpoint),
-            output_volume=CONF.output_volume,
-            output_claims=ABCFOLD2_OUTPUT_CLAIMS,
-            modal_driver=_coordinator_modal_driver(development=selected_mode),
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: ABCFold2ExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                output_claims=ABCFOLD2_OUTPUT_CLAIMS,
+                modal_driver=_coordinator_modal_driver(development=selected_mode),
+            ),
         )
-        self._coordinator_adapter = adapter
-        self._development = selected_mode
-        return adapter
 
 
 def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:

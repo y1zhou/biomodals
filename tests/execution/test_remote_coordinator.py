@@ -202,6 +202,56 @@ def test_coordinator_accepts_a_reopened_volume_repository(tmp_path) -> None:
     assert active_repository is not repository
 
 
+def test_coordinator_refreshes_repository_after_an_interleaved_checkpoint(
+    tmp_path,
+) -> None:
+    """A callback may replace the SQLite connection while the driver sleeps."""
+    ledger_path = tmp_path / "ledger.sqlite3"
+    active_connection = sqlite3.connect(ledger_path)
+    active_repository = create_repository(
+        connection=active_connection,
+        task_count=1,
+    )
+    active_connection.commit()
+    initial_repository = active_repository
+    cycles = 0
+
+    def advance_once() -> None:
+        nonlocal cycles
+        cycles += 1
+        if cycles == 1:
+            return
+        active_repository.record_task_result_observation(
+            RUN_ID,
+            "inference",
+            "seed-0",
+            AvailabilityStatus.AVAILABLE,
+            now=110,
+        )
+        active_repository.reconcile_node_tasks(RUN_ID, "inference", now=111)
+        active_repository.finalize_run_from_results(RUN_ID, now=112)
+
+    def replace_repository(_seconds: float) -> None:
+        nonlocal active_connection, active_repository
+        active_connection.close()
+        active_connection = sqlite3.connect(ledger_path)
+        active_repository = type(initial_repository)(active_connection)
+
+    snapshot = drive_execution_run(
+        initial_repository,
+        RUN_ID,
+        advance_once=advance_once,
+        checkpoint=lambda: active_repository,
+        current_repository=lambda: active_repository,
+        sleep=replace_repository,
+        poll_interval_seconds=0,
+    )
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert cycles == 2
+    assert active_repository is not initial_repository
+
+
 def test_application_error_suspends_without_replacing_attached_work() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

@@ -344,7 +344,7 @@ class ExecutionRuntimeLifecycle:
 
     def cancel(self) -> ExecutionSnapshot:
         """Request cancellation while retaining uncertain call ownership."""
-        self._provider.repository = self.store.execution
+        self._provider.repository = self._initialize()
         self._provider.cancel_run(self.execution_run_id, now=self._now())
         return self.store.execution.snapshot(self.execution_run_id)
 
@@ -405,7 +405,7 @@ class ExecutionCoordinatorLifecycle:
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
-                snapshot = runtime.cancel()
+                snapshot = runtime.store.execution.snapshot(self.execution_run_id)
                 self._verify_snapshot(snapshot)
                 if snapshot.run.status.is_terminal:
                     self._close_runtime()
@@ -463,13 +463,36 @@ class ExecutionCoordinatorLifecycle:
         return ExecutionRunStore(self.volume_root, self.execution_run_id)
 
     def _open_current_runtime(self, *, recover: bool) -> Any:
-        del recover
         request = self._request_loader(self.volume_root, self.execution_run_id)
-        return self._open_runtime(request)
+        return self._open_runtime(
+            request,
+            predecessor_execution_run_id=(
+                self._existing_predecessor() if recover else None
+            ),
+        )
 
-    def _open_runtime(self, request: Any) -> Any:
-        del request
+    def _open_runtime(
+        self,
+        request: Any,
+        *,
+        predecessor_execution_run_id: UUID | None = None,
+    ) -> Any:
+        del request, predecessor_execution_run_id
         raise NotImplementedError
+
+    def _existing_predecessor(self) -> UUID | None:
+        runtime = self._runtime
+        if runtime is not None:
+            return runtime.predecessor_execution_run_id
+        store = self._run_store()
+        if not store.ledger_path.is_file():
+            return None
+        try:
+            return store.execution.get_run(
+                self.execution_run_id
+            ).predecessor_execution_run_id
+        finally:
+            store.close()
 
     def _verify_snapshot(self, snapshot: ExecutionSnapshot) -> None:
         if snapshot.run.execution_run_id != self.execution_run_id:

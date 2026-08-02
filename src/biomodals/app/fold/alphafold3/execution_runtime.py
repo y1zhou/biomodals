@@ -97,7 +97,6 @@ from biomodals.execution import (
     ProviderCallStatus,
     RunStatus,
     TaskPlan,
-    TaskStatus,
     ready_node_keys,
     result_probe_frontier,
 )
@@ -108,9 +107,6 @@ from biomodals.execution.modal import (
 from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     TaskDispatchDescriptor,
-    form_fixed_batches,
-    required_node_ranks,
-    select_admissible_candidates,
 )
 from biomodals.helper.app_execution import (
     ExecutionRunStore,
@@ -615,63 +611,38 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
     def _admit_remote_tasks(self, required: set[str]) -> None:
         repository = self.store.execution
         run = repository.get_run(self.execution_run_id)
-        unfinished = {
-            node.node_key
-            for node in repository.list_nodes(self.execution_run_id)
-            if not node.status.is_terminal
-        }
-        ranks = required_node_ranks(
-            run.plan,
-            required_node_keys=required,
-            unfinished_node_keys=unfinished,
-        )
-        descriptors: list[TaskDispatchDescriptor] = []
         planned_by_node: dict[str, dict[str, _PlannedTask]] = {}
-        for node in repository.list_nodes(self.execution_run_id):
-            if (
-                node.node_key not in _REMOTE_NODE_FUNCTIONS
-                or node.node_key not in required
-                or node.status != NodeStatus.RUNNING
-                or not node.discovery_complete
-            ):
-                continue
-            planned = {
-                item.plan.task_key: item for item in self._planned_tasks(node.node_key)
-            }
-            planned_by_node[node.node_key] = planned
-            for task in repository.list_tasks(self.execution_run_id, node.node_key):
-                if (
-                    task.status != TaskStatus.PENDING
-                    or task.result_observation != AvailabilityStatus.MISSING
-                ):
-                    continue
-                binding, maximum = self._dispatch_binding(node.node_key)
-                rank = ranks[node.node_key]
-                descriptors.append(
-                    TaskDispatchDescriptor(
-                        node_key=node.node_key,
-                        node_ordinal=node.ordinal,
-                        task_key=task.task_key,
-                        task_ordinal=task.ordinal,
-                        binding=binding,
-                        compatibility_key=binding.function_name,
-                        max_tasks_per_call=maximum,
-                        depth=rank.depth,
-                        unblocking_span=rank.unblocking_span,
-                    )
-                )
-        self._provider.repository = repository
-        descriptors = list(
-            self._provider.persist_fixed_dispatch_policy(
-                self.execution_run_id,
-                tuple(descriptors),
-                now=self._now(),
+        dispatch_by_node: dict[str, tuple[ProviderBinding, int]] = {}
+
+        def describe_task(node, task, rank):
+            if node.node_key not in _REMOTE_NODE_FUNCTIONS:
+                return None
+            if node.node_key not in planned_by_node:
+                planned_by_node[node.node_key] = {
+                    item.plan.task_key: item
+                    for item in self._planned_tasks(node.node_key)
+                }
+            if node.node_key not in dispatch_by_node:
+                dispatch_by_node[node.node_key] = self._dispatch_binding(node.node_key)
+            binding, maximum = dispatch_by_node[node.node_key]
+            return TaskDispatchDescriptor(
+                node_key=node.node_key,
+                node_ordinal=node.ordinal,
+                task_key=task.task_key,
+                task_ordinal=task.ordinal,
+                binding=binding,
+                compatibility_key=binding.function_name,
+                max_tasks_per_call=maximum,
+                depth=rank.depth,
+                unblocking_span=rank.unblocking_span,
             )
-        )
-        repository = self.store.execution
+
+        self._provider.repository = repository
         counts = repository.active_provider_call_counts(self.execution_run_id)
-        selected = select_admissible_candidates(
-            form_fixed_batches(tuple(descriptors)),
+        selected = self._provider.fixed_call_candidates(
+            self.execution_run_id,
+            required_node_keys=required,
+            describe_task=describe_task,
             available_total_slots=max(
                 0,
                 run.max_active_provider_calls - counts.total,
@@ -680,6 +651,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 0,
                 run.max_active_gpu_provider_calls - counts.gpu,
             ),
+            now=self._now(),
         )
         if any(candidate.node_key == _SEED_PREDICTIONS for candidate in selected):
             self._reload_output()

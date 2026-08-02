@@ -233,6 +233,7 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
         execution_run_id=RUN_ID,
         deployment=DeploymentIdentity("main", "Example", 3),
         volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
     )
     errors: list[BaseException] = []
 
@@ -359,6 +360,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
         execution_run_id=RUN_ID,
         deployment=deployment,
         volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
     )
 
     snapshot = coordinator.cancel()
@@ -420,6 +422,7 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
         execution_run_id=RUN_ID,
         deployment=deployment,
         volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
     ).cancel()
 
     assert snapshot.run.predecessor_execution_run_id == predecessor_id

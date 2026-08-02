@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
@@ -21,6 +22,7 @@ from biomodals.app.score.oligoformer_execution import (
     REFERENCE_PLAN_NODE,
     REFERENCE_SHARDS_NODE,
     TARGETSCAN_TILES_NODE,
+    OligoformerExecutionCoordinator,
     OligoformerExecutionRequest,
     OligoformerExecutionRuntime,
 )
@@ -176,6 +178,30 @@ def test_request_round_trips_without_pickle() -> None:
     )
 
     assert OligoformerExecutionRequest.from_bytes(request.to_bytes()) == request
+
+
+def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
+    """Concurrent lifecycle calls cannot replace a runtime under its driver."""
+    request = _request()
+    coordinator = OligoformerExecutionCoordinator(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        model_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        modal_driver=cast(Any, object()),
+    )
+    runtime = cast(
+        OligoformerExecutionRuntime,
+        SimpleNamespace(
+            request=request,
+            predecessor_execution_run_id=None,
+        ),
+    )
+    coordinator._runtime = runtime
+
+    assert coordinator._open_runtime(request) is runtime
 
 
 def test_efficacy_only_plan_is_minimal() -> None:

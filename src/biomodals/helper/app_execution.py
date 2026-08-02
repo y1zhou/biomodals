@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -127,6 +128,53 @@ class ExecutionRequestFile:
             raise TypeError(f"{self.name} must be bytes")
         if not 0 < len(content) <= self.max_bytes:
             raise ValueError(f"{self.name} exceeds its byte limit")
+
+
+_LAUNCH_FILE = ExecutionRequestFile(
+    "launch.json",
+    256,
+    "Execution launch identity",
+)
+
+
+def stage_execution_launch(
+    output_volume: Any,
+    execution_run_id: UUID,
+    predecessor_execution_run_id: UUID | None,
+) -> PurePosixPath:
+    """Stage immutable root/successor identity before coordinator submission."""
+    content = json.dumps(
+        {
+            "predecessor_execution_run_id": (
+                None
+                if predecessor_execution_run_id is None
+                else str(predecessor_execution_run_id)
+            ),
+            "schema_version": 1,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return _LAUNCH_FILE.stage(output_volume, execution_run_id, content)
+
+
+def load_execution_launch(
+    volume_root: str | Path,
+    execution_run_id: UUID,
+) -> UUID | None:
+    """Load the predecessor identity staged for one coordinator launch."""
+    value = json.loads(_LAUNCH_FILE.load(volume_root, execution_run_id))
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ValueError("Execution launch identity is invalid")
+    predecessor = value.get("predecessor_execution_run_id")
+    if predecessor is None:
+        return None
+    if not isinstance(predecessor, str):
+        raise ValueError("Execution launch predecessor is invalid")
+    parsed = UUID(predecessor)
+    if str(parsed) != predecessor:
+        raise ValueError("Execution launch predecessor is not canonical")
+    return parsed
 
 
 class ExecutionRunStore:
@@ -344,7 +392,12 @@ class ExecutionRuntimeLifecycle:
 
     def cancel(self) -> ExecutionSnapshot:
         """Request cancellation while retaining uncertain call ownership."""
-        self._provider.repository = self._initialize()
+        repository = self.store.execution
+        try:
+            repository.get_run(self.execution_run_id)
+        except ExecutionRunNotFoundError:
+            repository = self._initialize()
+        self._provider.repository = repository
         self._provider.cancel_run(self.execution_run_id, now=self._now())
         return self.store.execution.snapshot(self.execution_run_id)
 
@@ -486,7 +539,10 @@ class ExecutionCoordinatorLifecycle:
             return runtime.predecessor_execution_run_id
         store = self._run_store()
         if not store.ledger_path.is_file():
-            return None
+            return load_execution_launch(
+                self.volume_root,
+                self.execution_run_id,
+            )
         try:
             return store.execution.get_run(
                 self.execution_run_id

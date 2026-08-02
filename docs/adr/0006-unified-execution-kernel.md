@@ -105,6 +105,11 @@ User-provided run names and scientific IDs remain optional Workload Run Keys
 inside the immutable workload plan; they never select a ledger or coordinator
 pool. A Successor Execution Run receives a new UUID while retaining the same
 Workload Run Key and publication identity where scientifically appropriate.
+The client stages a bounded immutable launch record beside each app request,
+declaring either root identity or the exact predecessor UUID before coordinator
+submission. This record is the only pre-ledger lineage source, so cancellation
+that arrives before `run` or `restart` cannot misclassify a successor as a
+root Run. Workload arguments and output-claim metadata are not lineage.
 
 The CLI location policy was accepted on 2026-07-29 and simplified the same
 day. App and workflow launch commands print the Deployment Identity, Execution

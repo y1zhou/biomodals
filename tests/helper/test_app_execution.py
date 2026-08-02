@@ -24,6 +24,8 @@ from biomodals.helper.app_execution import (
     ExecutionRequestFile,
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
+    load_execution_launch,
+    stage_execution_launch,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -152,6 +154,19 @@ def test_request_bytes_persist_atomically_and_remain_immutable(tmp_path: Path) -
         REQUEST_FILE.persist(tmp_path, RUN_ID, b"changed")
 
 
+def test_execution_launch_identity_is_immutable(tmp_path: Path) -> None:
+    """Launch lineage is idempotent but cannot be changed in place."""
+    predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    volume = FakeVolume(tmp_path)
+
+    stage_execution_launch(volume, RUN_ID, predecessor_id)
+    stage_execution_launch(volume, RUN_ID, predecessor_id)
+
+    assert load_execution_launch(tmp_path, RUN_ID) == predecessor_id
+    with pytest.raises(RuntimeError, match="conflicts with this run"):
+        stage_execution_launch(volume, RUN_ID, None)
+
+
 def test_app_coordinator_cancel_does_not_start_a_second_driver(
     tmp_path: Path,
 ) -> None:
@@ -245,6 +260,7 @@ def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:
     deployment = DeploymentIdentity("main", "Example", 3)
     plan = ExecutionPlan("example", (NodePlan("run"),))
     store = ExecutionRunStore(tmp_path, RUN_ID)
+    initialize_calls = 0
 
     class Runtime(ExecutionRuntimeLifecycle):
         def __init__(self) -> None:
@@ -259,6 +275,8 @@ def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:
             )
 
         def _initialize(self):
+            nonlocal initialize_calls
+            initialize_calls += 1
             self._provider.create_or_verify_run(
                 execution_run_id=RUN_ID,
                 predecessor_execution_run_id=None,
@@ -270,10 +288,16 @@ def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:
             )
             return store.execution
 
-    snapshot = Runtime().cancel()
+    runtime = Runtime()
+    snapshot = runtime.cancel()
 
     assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
     assert store.execution.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
+    assert initialize_calls == 1
+
+    runtime.cancel()
+
+    assert initialize_calls == 1
     store.close()
 
 
@@ -339,3 +363,62 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
 
     assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
     assert opened_with == [predecessor_id, predecessor_id]
+
+
+def test_app_coordinator_cancels_successor_before_restart_initializes(
+    tmp_path: Path,
+) -> None:
+    """A staged launch preserves lineage when cancellation wins startup."""
+    predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    deployment = DeploymentIdentity("main", "Example", 3)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    stage_execution_launch(FakeVolume(tmp_path), RUN_ID, predecessor_id)
+
+    class Runtime:
+        def __init__(self, predecessor: UUID | None) -> None:
+            self.predecessor_execution_run_id = predecessor
+            self.store = ExecutionRunStore(tmp_path, RUN_ID)
+
+        def cancel(self):
+            with self.store.transaction():
+                self.store.execution.create_run(
+                    execution_run_id=RUN_ID,
+                    predecessor_execution_run_id=self.predecessor_execution_run_id,
+                    plan=plan,
+                    deployment=deployment,
+                    max_active_provider_calls=1,
+                    max_active_gpu_provider_calls=0,
+                    now=10,
+                )
+                self.store.execution.request_run_cancellation(RUN_ID, now=11)
+            return self.store.execution.snapshot(RUN_ID)
+
+        def run(self, *, synchronize):
+            del synchronize
+            return self.store.execution.snapshot(RUN_ID)
+
+        def close(self) -> None:
+            self.store.close()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        _request_loader = staticmethod(lambda _root, _run_id: "request")
+
+        def _open_runtime(
+            self,
+            request,
+            *,
+            predecessor_execution_run_id: UUID | None = None,
+        ):
+            assert request == "request"
+            if self._runtime is None:
+                self._runtime = Runtime(predecessor_execution_run_id)
+            return self._runtime
+
+    snapshot = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        volume_root=tmp_path,
+    ).cancel()
+
+    assert snapshot.run.predecessor_execution_run_id == predecessor_id
+    assert snapshot.run.status == RunStatus.CANCEL_REQUESTED

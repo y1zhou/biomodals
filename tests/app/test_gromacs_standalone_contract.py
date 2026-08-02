@@ -120,6 +120,13 @@ def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     monkeypatch.setattr(gromacs_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         gromacs_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: launched.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        gromacs_app,
         "_execution_coordinator_handle",
         coordinator_handle,
     )

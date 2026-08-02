@@ -264,6 +264,13 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     monkeypatch.setattr(abcfold2_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         abcfold2_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        abcfold2_app,
         "_execution_coordinator_handle",
         coordinator_handle,
     )

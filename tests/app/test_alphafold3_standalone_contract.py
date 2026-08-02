@@ -407,6 +407,13 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     monkeypatch.setattr(alphafold3_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         alphafold3_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
         "_execution_coordinator_handle",
         coordinator_handle,
     )
@@ -516,6 +523,13 @@ def test_submit_alphafold3_task_routes_a_cache_hit_through_a_new_root_run(
     )
     monkeypatch.setattr(
         alphafold3_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
         "_execution_coordinator_handle",
         lambda **kwargs: SimpleNamespace(run=CoordinatorMethod()),
     )
@@ -586,8 +600,13 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
     monkeypatch.setattr(
         alphafold3_app,
         "stage_execution_request",
-        lambda output, run_id, request: pytest.fail(
-            "restart staged successor state before compatibility validation"
+        lambda _output, run_id, request: captured.update(staged=(run_id, request)),
+    )
+    monkeypatch.setattr(
+        alphafold3_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, selected_predecessor: captured.update(
+            launch=(run_id, selected_predecessor)
         ),
     )
     monkeypatch.setattr(

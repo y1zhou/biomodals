@@ -1239,13 +1239,19 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> OligoformerExecutionRuntime:
-        self._close_runtime()
-        store = self._run_store()
+        runtime = self._runtime
+        if runtime is not None:
+            if (
+                runtime.request != request
+                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
+            ):
+                raise ValueError("Active OligoFormer runtime does not match request")
+            return runtime
         runtime = OligoformerExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             deployment=self.deployment,
-            store=store,
+            store=self._run_store(),
             modal_driver=self.modal_driver,
             output_volume=self.output_volume,
             model_volume=self.model_volume,

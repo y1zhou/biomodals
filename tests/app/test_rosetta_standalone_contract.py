@@ -82,6 +82,13 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
     monkeypatch.setattr(rosetta_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         rosetta_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        rosetta_app,
         "_execution_coordinator_handle",
         coordinator_handle,
     )

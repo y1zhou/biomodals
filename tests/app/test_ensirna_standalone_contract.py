@@ -1424,6 +1424,13 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(ensirna_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         ensirna_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        ensirna_app,
         "_execution_coordinator_handle",
         coordinator_handle,
     )
@@ -1494,6 +1501,13 @@ def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
         ensirna_app,
         "stage_execution_request",
         lambda _volume, _run_id, request: captured.update(request=request),
+    )
+    monkeypatch.setattr(
+        ensirna_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
     )
     monkeypatch.setattr(
         ensirna_app,

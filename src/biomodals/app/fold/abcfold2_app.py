@@ -46,6 +46,7 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import package_outputs
@@ -950,6 +951,11 @@ def submit_abcfold2_task(
         deployment_version,
     )
     stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_launch(
+        CONF.output_volume,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,

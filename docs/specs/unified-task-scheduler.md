@@ -701,6 +701,13 @@ provides the common `status`, `cancel`, and `resume` lifecycle methods.
 instance linked to the predecessor. Workload launch and result-retrieval
 methods may remain deployment-specific.
 
+Before submitting an app coordinator, the client stages both its bounded
+immutable workload request and a bounded immutable launch identity declaring
+either a root Run or the exact predecessor Execution Run ID. This lets an
+immediate `cancel` create the durable Run with correct lineage even when it
+wins the race with `run` or `restart`; launch identity is never inferred from
+workload fields, output claims, or matching command text.
+
 `status` is read-only, `cancel` is an idempotent explicit cancellation,
 `resume` retains Execution Run ID and Deployment Identity, reconciles existing
 work, and may submit Tasks that were never submitted, but it never retries a

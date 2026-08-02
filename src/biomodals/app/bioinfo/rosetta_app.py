@@ -53,6 +53,7 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.pull_worker import drive_pull_worker
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import package_outputs, sanitize_filename, warmup_directory
@@ -672,8 +673,12 @@ def submit_rosetta_task(
         deployment_name,
         deployment_version,
     )
-    if predecessor_execution_run_id is None:
-        stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_launch(
+        CONF.output_volume,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,

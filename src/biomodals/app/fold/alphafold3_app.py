@@ -138,6 +138,7 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
@@ -797,7 +798,7 @@ class ExecutionCoordinator:
     def _adapter(
         self,
         *,
-        development: bool = False,
+        development: bool | None = None,
     ) -> AlphaFold3ExecutionCoordinator:
         execution_run_id, deployment = self._identity()
         return execution_coordinator_adapter(
@@ -951,23 +952,24 @@ def submit_alphafold3_task(
         deployment_name,
         deployment_version,
     )
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_launch(
+        CONF.output_volume,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
     coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
         use_deployed_coordinator=use_deployed_coordinator,
         local_coordinator=ExecutionCoordinator,
     )
-    if restart_from is None:
-        stage_execution_request(
-            CONF.output_volume,
-            execution_run_id,
-            request,
-        )
+    if predecessor_execution_run_id is None:
         call = coordinator.run.spawn(
             development=not use_deployed_coordinator,
         )
     else:
-        predecessor_execution_run_id = UUID(restart_from)
         call = coordinator.restart_from.spawn(
             predecessor_execution_run_id=str(predecessor_execution_run_id),
             candidate_request_bytes=request.to_bytes(),

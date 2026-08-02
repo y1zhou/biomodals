@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 import orjson
+import pytest
 
 from biomodals.app.fold import protenix_app
 from biomodals.app.fold.protenix_execution import (
@@ -144,7 +145,7 @@ class CompletingDriver:
 
 
 def _request(**changes) -> ProtenixExecutionRequest:
-    values = {
+    values: dict[str, Any] = {
         "run_name": "complex",
         "input_content": b'[{"name":"complex"}]',
         "model_name": "protenix_base_default_v1.0.0",
@@ -203,6 +204,15 @@ def test_operational_limits_do_not_change_scientific_identity() -> None:
         base.execution_plan.workload_plan_fingerprint
         == changed.execution_plan.workload_plan_fingerprint
     )
+
+
+@pytest.mark.parametrize(
+    "run_name",
+    ["../escape", "/absolute/escape", "nested/escape"],
+)
+def test_request_rejects_unsafe_run_name_components(run_name: str) -> None:
+    with pytest.raises(ValueError, match="safe filename component"):
+        _request(run_name=run_name)
 
 
 def test_runtime_dispatches_each_msa_input_as_a_task(

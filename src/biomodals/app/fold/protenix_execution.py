@@ -38,6 +38,7 @@ from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
 )
+from biomodals.helper.shell import sanitize_filename
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -105,6 +106,8 @@ class ProtenixExecutionRequest:
         """Reject empty inputs and unusable coordinator capacity."""
         if not self.run_name or not self.input_content or not self.model_name:
             raise ValueError("Protenix run name, input, and model cannot be empty")
+        if sanitize_filename(self.run_name) != self.run_name:
+            raise ValueError("Protenix run_name must be a safe filename component")
         if self.max_active_provider_calls < 1:
             raise ValueError("Protenix provider-call limit must be positive")
         if not self.app_version:

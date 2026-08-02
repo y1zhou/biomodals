@@ -70,6 +70,7 @@ from biomodals.helper.io import (
 from biomodals.helper.shell import (
     package_outputs,
     run_command,
+    sanitize_filename,
 )
 from biomodals.helper.structure import struct2seq
 from biomodals.helper.web import download_files
@@ -1023,7 +1024,7 @@ def submit_protenix_task(
         else max_parallel_msa
     )
     request = ProtenixExecutionRequest(
-        run_name=run_name or input_path.stem,
+        run_name=sanitize_filename(run_name or input_path.stem),
         input_content=input_path.read_bytes(),
         model_name=model_name,
         seeds=seeds,

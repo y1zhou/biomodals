@@ -133,7 +133,7 @@ def test_planner_discovers_one_task_per_input(
             Path(output_dir, f"{name}.json").write_text(name)
 
     schema = ModuleType("uniaf3.schema")
-    schema.ProtenixConfig = FakeConfig
+    schema.ProtenixConfig = FakeConfig  # ty: ignore[unresolved-attribute]
     monkeypatch.setitem(sys.modules, "uniaf3", ModuleType("uniaf3"))
     monkeypatch.setitem(sys.modules, "uniaf3.schema", schema)
     monkeypatch.setattr(
@@ -223,10 +223,11 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     raw(
         input_file=str(input_path),
         out_dir=str(tmp_path / "results"),
-        run_name="demo",
+        run_name="../demo",
         max_parallel_msa=3,
     )
 
+    assert captured["request"].run_name == "demo"
     assert captured["request"].max_active_provider_calls == 3
     assert captured["run_kwargs"] == {"development": True}
     assert captured["data"] == b"tar"

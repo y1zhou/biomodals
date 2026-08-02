@@ -269,6 +269,9 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
     ) -> None:
         """Bind the kernel writer to AF3Score's existing publications."""
         self.request = request
+        self._plan = request.execution_plan
+        self._input_digests = request.input_digests
+        self._publication_key = self._plan.workload_plan_fingerprint
         self.execution_run_id = execution_run_id
         self.deployment = deployment
         self.store = store
@@ -311,7 +314,7 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
-            plan=self.request.execution_plan,
+            plan=self._plan,
             deployment=self.deployment,
             max_active_provider_calls=self.request.max_batches,
             max_active_gpu_provider_calls=self.request.max_batches,
@@ -344,7 +347,7 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             elif node_key == POSTPROCESS_NODE:
                 available = _workload_module()._metrics_publication_ready(
                     self.layout.run_root,
-                    self.request.execution_plan.workload_plan_fingerprint,
+                    self._publication_key,
                 )
             else:
                 raise ValueError(f"Unknown AF3Score Node {node_key!r}")
@@ -370,13 +373,13 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._node_observation(node_key)
 
     def _output_complete(self, input_id: str) -> bool:
-        digest = self.request.input_digests.get(input_id)
+        digest = self._input_digests.get(input_id)
         if digest is None:
             return False
         return _workload_module()._input_publication_ready(
             self.layout.outputs_dir,
             input_id,
-            publication_key=self.request.execution_plan.workload_plan_fingerprint,
+            publication_key=self._publication_key,
             input_sha256=digest,
         )
 
@@ -656,10 +659,8 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             return {
                 "run_name": self.request.run_name,
                 "input_files": list(self.request.input_names),
-                "input_digests": self.request.input_digests,
-                "publication_key": (
-                    self.request.execution_plan.workload_plan_fingerprint
-                ),
+                "input_digests": self._input_digests,
+                "publication_key": self._publication_key,
                 "num_jobs": self.request.max_batches,
                 "prepare_workers": self.request.prepare_workers,
             }
@@ -667,10 +668,8 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             return {
                 "run_name": self.request.run_name,
                 "input_files": list(self.request.input_names),
-                "input_digests": self.request.input_digests,
-                "publication_key": (
-                    self.request.execution_plan.workload_plan_fingerprint
-                ),
+                "input_digests": self._input_digests,
+                "publication_key": self._publication_key,
             }
         task = self.store.execution.get_task(
             self.execution_run_id,
@@ -678,13 +677,16 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             task_key,
         )
         chunk = task.execution_payload["chunk"]
+        input_ids = self._chunk_input_ids(ChunkSpec(**chunk))
         return {
             "run_name": self.request.run_name,
             "batch_name": chunk["batch_name"],
             "batch_json_dir": chunk["batch_json_dir"],
             "batch_pdb_dir": chunk["batch_pdb_dir"],
-            "input_digests": self.request.input_digests,
-            "publication_key": self.request.execution_plan.workload_plan_fingerprint,
+            "input_digests": {
+                input_id: self._input_digests[input_id] for input_id in input_ids
+            },
+            "publication_key": self._publication_key,
         }
 
     def _ensure_output_claim(self) -> None:

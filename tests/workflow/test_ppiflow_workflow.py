@@ -774,6 +774,10 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert submission.kwargs["config"]["prepare_workers"] == 2
 
     plan_path = tmp_path / "af3score_task_plan.json"
+    batch_json_dir = tmp_path / "af3-batch-json"
+    batch_json_dir.mkdir()
+    for candidate_id in ("candidate-a", "candidate-b"):
+        batch_json_dir.joinpath(f"{candidate_id}.json").write_text("{}")
     plan_path.write_text(
         orjson.dumps({
             "run_name": "af3-run",
@@ -781,6 +785,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
             "input_digests": {
                 "candidate-a": "candidate-a",
                 "candidate-b": "candidate-b",
+                "unrelated": "unrelated",
             },
             "publication_key": "request-key",
             "candidates": [
@@ -793,7 +798,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
                     },
                     "chunk": {
                         "batch_name": "batch-0",
-                        "batch_json_dir": "/af3/batch/json",
+                        "batch_json_dir": str(batch_json_dir),
                         "batch_pdb_dir": "/af3/batch/pdb",
                         "task_count": 2,
                     },
@@ -837,6 +842,10 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert batch_call.function_name == "run_ppiflow_af3score_batch"
     assert batch_call.max_tasks_per_call == 2
     assert batch_call.kwargs["task_keys"] == ["candidate-a", "candidate-b"]
+    assert batch_call.kwargs["input_digests"] == {
+        "candidate-a": "candidate-a",
+        "candidate-b": "candidate-b",
+    }
 
     postprocess_node = ppiflow_workflow.AF3ScoreNode(
         "AF3scoreStep_stage1",
@@ -888,26 +897,45 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
         SimpleNamespace(commit=lambda: commits.append(True)),
     )
 
-    input_names = ppiflow_workflow.stage_af3score_inputs.get_raw_f()(
-        artifacts=[
-            WorkflowArtifact(
-                artifact_id="stage1-flowpacker-flowpacker_outputs",
-                producing_node_id="stage1-flowpacker",
-                kind=ArtifactKind.STRUCTURES,
-                storage=VolumePath(
-                    volume_name="source-volume",
-                    path="upstream/results",
-                ),
-            )
-        ],
-        run_name="af3-run",
+    artifacts = [
+        WorkflowArtifact(
+            artifact_id="stage1-flowpacker-flowpacker_outputs",
+            producing_node_id="stage1-flowpacker",
+            kind=ArtifactKind.STRUCTURES,
+            storage=VolumePath(
+                volume_name="source-volume",
+                path="upstream/results",
+            ),
+        )
+    ]
+    staged, physical_run_name, publication_key = (
+        ppiflow_workflow._stage_af3score_candidate_inputs(
+            artifacts=artifacts,
+            candidate_manifests=None,
+        )
     )
 
-    assert input_names == ["candidate_a.pdb"]
-    assert (af3_root / "af3-run" / "inputs" / "candidate_a.pdb").read_text(
-        encoding="utf-8"
-    ) == "ATOM\n"
+    assert [record["input_name"] for record in staged] == ["candidate_a.pdb"]
+    assert physical_run_name == f"ppiflow-af3score-{publication_key}"
+    first_input = af3_root / physical_run_name / "inputs" / "candidate_a.pdb"
+    assert first_input.read_text(encoding="utf-8") == "ATOM\n"
     assert commits == [True]
+
+    (long_dir / "candidate_a.pdb").write_text("CHANGED\n", encoding="utf-8")
+    _staged, changed_run_name, changed_key = (
+        ppiflow_workflow._stage_af3score_candidate_inputs(
+            artifacts=artifacts,
+            candidate_manifests=None,
+        )
+    )
+
+    assert changed_key != publication_key
+    assert changed_run_name != physical_run_name
+    assert first_input.read_text(encoding="utf-8") == "ATOM\n"
+    assert (af3_root / changed_run_name / "inputs" / "candidate_a.pdb").read_text(
+        encoding="utf-8"
+    ) == "CHANGED\n"
+    assert commits == [True, True]
 
 
 def test_af3score_prepare_publishes_candidate_to_batch_mapping(
@@ -924,17 +952,21 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
     monkeypatch.setattr(
         ppiflow_workflow,
         "_stage_af3score_candidate_inputs",
-        lambda **_kwargs: [
-            {
-                "candidate_id": candidate_id,
-                "input_name": f"{candidate_id}.pdb",
-                "scientific_payload": {
+        lambda **_kwargs: (
+            [
+                {
                     "candidate_id": candidate_id,
-                    "content_sha256": candidate_id,
-                },
-            }
-            for candidate_id in ("candidate-a", "candidate-b")
-        ],
+                    "input_name": f"{candidate_id}.pdb",
+                    "scientific_payload": {
+                        "candidate_id": candidate_id,
+                        "content_sha256": candidate_id,
+                    },
+                }
+                for candidate_id in ("candidate-a", "candidate-b")
+            ],
+            "ppiflow-af3score-request-key",
+            "request-key",
+        ),
     )
     monkeypatch.setattr(
         ppiflow_workflow.af3score_app,
@@ -973,6 +1005,8 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
         "batch-0"
     }
     assert {candidate["chunk"]["task_count"] for candidate in plan["candidates"]} == {2}
+    assert plan["run_name"] == "ppiflow-af3score-request-key"
+    assert plan["display_run_name"] == "af3-run"
 
 
 def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:

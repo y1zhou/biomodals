@@ -15,6 +15,7 @@ import os
 import shutil
 import string
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -49,9 +50,9 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import (
     AppRunLayout,
-    has_completed_output_files,
     volume_path_from_mount_path,
 )
 from biomodals.helper.shell import (
@@ -125,7 +126,7 @@ AF3SCORE_OUTPUT_CLAIMS = modal.Dict.from_name(
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_af3score_task"})
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 _METRICS_PUBLICATION_SCHEMA_VERSION = 1
-_INPUT_PUBLICATION_SCHEMA_VERSION = 1
+_INPUT_PUBLICATION_SCHEMA_VERSION = 2
 
 
 def _metrics_publication_path(run_root: str | Path) -> Path:
@@ -144,6 +145,23 @@ def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
     return Path(output_dir) / input_id / ".biomodals" / "af3score-input.json"
 
 
+def _input_output_records(
+    output_dir: str | Path,
+    input_id: str,
+) -> dict[str, dict[str, int | str]]:
+    sample_dir = Path(output_dir) / input_id / APP_INFO.completion_sample_subdir
+    records: dict[str, dict[str, int | str]] = {}
+    for filename in APP_INFO.completion_required_files:
+        path = sample_dir / filename
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"AF3Score output is incomplete for '{input_id}'")
+        records[filename] = {
+            "size": path.stat().st_size,
+            "sha256": _file_sha256(path),
+        }
+    return records
+
+
 def _write_input_publication(
     output_dir: str | Path,
     input_id: str,
@@ -152,13 +170,7 @@ def _write_input_publication(
     input_sha256: str,
 ) -> None:
     """Atomically bind one complete AF3Score output to its scientific input."""
-    if not has_completed_output_files(
-        output_dir,
-        input_id,
-        sample_subdir=APP_INFO.completion_sample_subdir,
-        required_files=APP_INFO.completion_required_files,
-    ):
-        raise RuntimeError(f"AF3Score output is incomplete for '{input_id}'")
+    outputs = _input_output_records(output_dir, input_id)
     marker = _input_publication_path(output_dir, input_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
     temporary = marker.with_name(f".{marker.name}.{uuid4().hex}.tmp")
@@ -169,6 +181,7 @@ def _write_input_publication(
                     "schema_version": _INPUT_PUBLICATION_SCHEMA_VERSION,
                     "publication_key": publication_key,
                     "input_sha256": input_sha256,
+                    "outputs": outputs,
                 },
                 option=orjson.OPT_SORT_KEYS,
             )
@@ -197,18 +210,34 @@ def _input_publication_ready(
         orjson.JSONDecodeError,
     ):
         return False
-    return (
+    if not (
         isinstance(marker, dict)
         and marker.get("schema_version") == _INPUT_PUBLICATION_SCHEMA_VERSION
         and marker.get("publication_key") == publication_key
         and marker.get("input_sha256") == input_sha256
-        and has_completed_output_files(
-            output_dir,
-            input_id,
-            sample_subdir=APP_INFO.completion_sample_subdir,
-            required_files=APP_INFO.completion_required_files,
-        )
-    )
+        and isinstance(marker.get("outputs"), dict)
+    ):
+        return False
+    try:
+        return marker["outputs"] == _input_output_records(output_dir, input_id)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _invalidate_input_publications(
+    output_dir: str | Path,
+    input_ids: Sequence[str],
+) -> bool:
+    """Remove batch markers before any corresponding output is rewritten."""
+    invalidated = False
+    for input_id in input_ids:
+        marker = _input_publication_path(output_dir, input_id)
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            continue
+        invalidated = True
+    return invalidated
 
 
 def _write_metrics_publication(
@@ -289,7 +318,7 @@ def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
     if input_root.is_file():
         all_files = [input_root] if input_root.suffix == ".pdb" else []
     else:
-        all_files = list(input_root.glob("*.pdb"))
+        all_files = sorted(input_root.glob("*.pdb"))
 
     if not all_files:
         raise ValueError(f"No .pdb files were found in '{input_root}'.")
@@ -446,6 +475,18 @@ def af3score_run(
     af3_weights = Path(CONF.model_volume_mountpoint) / APP_INFO.af3_weights
     if not af3_weights.exists():
         raise FileNotFoundError(f"AlphaFold3 model weights not found: {af3_weights}")
+    input_ids = tuple(
+        path.stem
+        for path in sorted(Path(batch_json_dir).glob("*.json"))
+        if path.is_file()
+    )
+    for input_id in input_ids:
+        if input_id not in input_digests:
+            raise ValueError(f"Missing AF3Score input digest for '{input_id}'")
+    out_dir = layout.outputs_dir
+    if _invalidate_input_publications(out_dir, input_ids):
+        # The coordinator observes these files while this GPU call is active.
+        CONF.output_volume.commit()
 
     with TemporaryDirectory(prefix=f"af3score_gpu_{batch_name}_") as temp_dir:
         batch_gpu_root = Path(temp_dir)
@@ -465,7 +506,6 @@ def af3score_run(
 
         # TODO: this or reuse AlphaFold3 buckets?
         bucket = batch_name.rsplit("_", 1)[-1]
-        out_dir = layout.outputs_dir
         print(f"💊 [RUN] Starting AF3Score batch '{batch_name}'")
         run_command(
             [
@@ -491,16 +531,12 @@ def af3score_run(
             output_mode="capture",
             log_file=out_dir / f"{batch_name}.log",
         )
-        for input_json in Path(batch_json_dir).glob("*.json"):
-            input_id = input_json.stem
-            digest = input_digests.get(input_id)
-            if digest is None:
-                raise ValueError(f"Missing AF3Score input digest for '{input_id}'")
+        for input_id in input_ids:
             _write_input_publication(
                 out_dir,
                 input_id,
                 publication_key=publication_key,
-                input_sha256=digest,
+                input_sha256=input_digests[input_id],
             )
         CONF.output_volume.commit()
 
@@ -807,6 +843,11 @@ def submit_af3score_task(
             tuple(all_files),
         )
         stage_execution_request(CONF.output_volume, execution_run_id, request)
+        stage_execution_launch(
+            CONF.output_volume,
+            execution_run_id,
+            predecessor_execution_run_id,
+        )
         coordinator = _execution_coordinator_handle(
             execution_run_id=execution_run_id,
             deployment=deployment,

@@ -4,6 +4,7 @@
 
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
@@ -156,6 +157,20 @@ def _stage_request_inputs(root: Path, request: AF3ScoreExecutionRequest) -> None
         directory.joinpath(name).write_bytes(INPUT_CONTENT[name])
 
 
+def _publish_input(root: Path, input_id: str, digest: str, key: str) -> Path:
+    sample = root / input_id / COMPLETION_SAMPLE_SUBDIR
+    sample.mkdir(parents=True)
+    for required in COMPLETION_REQUIRED_FILES:
+        sample.joinpath(required).write_text("{}")
+    af3score_app._write_input_publication(
+        root,
+        input_id,
+        publication_key=key,
+        input_sha256=digest,
+    )
+    return sample
+
+
 def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
     request = _request()
 
@@ -172,6 +187,113 @@ def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
         {"name": name, "sha256": sha256(content).hexdigest()}
         for name, content in INPUT_CONTENT.items()
     ]
+
+
+def test_input_publication_binds_and_invalidates_output_content(
+    tmp_path: Path,
+) -> None:
+    digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
+    sample = _publish_input(tmp_path, "a", digest, "plan")
+
+    assert af3score_app._input_publication_ready(
+        tmp_path,
+        "a",
+        publication_key="plan",
+        input_sha256=digest,
+    )
+
+    sample.joinpath(COMPLETION_REQUIRED_FILES[0]).write_text('{"changed":true}')
+
+    assert not af3score_app._input_publication_ready(
+        tmp_path,
+        "a",
+        publication_key="plan",
+        input_sha256=digest,
+    )
+    assert af3score_app._invalidate_input_publications(tmp_path, ("a",))
+    assert not af3score_app._input_publication_path(tmp_path, "a").exists()
+    assert not af3score_app._invalidate_input_publications(tmp_path, ("a",))
+
+
+def test_directory_inputs_have_deterministic_order(tmp_path: Path) -> None:
+    inputs = tmp_path / "inputs"
+    stage = tmp_path / "stage"
+    inputs.mkdir()
+    stage.mkdir()
+    for name in ("b.pdb", "a.pdb"):
+        inputs.joinpath(name).write_text("ATOM\n")
+
+    staged = af3score_app._collect_input_files(inputs, stage)
+
+    assert [path.name for path in staged] == ["a.pdb", "b.pdb"]
+
+
+def test_gpu_batch_invalidates_publication_before_compute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Volume:
+        def reload(self) -> None:
+            events.append("reload")
+
+        def commit(self) -> None:
+            events.append("commit")
+
+    output_root = tmp_path / "outputs-volume"
+    model_root = tmp_path / "models"
+    model_path = model_root / af3score_app.APP_INFO.af3_weights
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"weights")
+    batch_json = tmp_path / "batch-json"
+    batch_pdb = tmp_path / "batch-pdb"
+    batch_json.mkdir()
+    batch_pdb.mkdir()
+    batch_json.joinpath("a.json").write_text("{}")
+    digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
+    output_dir = output_root / "scores" / "outputs"
+    _publish_input(output_dir, "a", digest, "plan")
+    marker = af3score_app._input_publication_path(output_dir, "a")
+
+    def run_command(command, **_kwargs) -> None:
+        assert not marker.exists()
+        if str(command[1]).endswith("run_af3score.py"):
+            events.append("run")
+            sample = output_dir / "a" / COMPLETION_SAMPLE_SUBDIR
+            for required in COMPLETION_REQUIRED_FILES:
+                sample.joinpath(required).write_text('{"new":true}')
+        else:
+            events.append("prepare")
+
+    monkeypatch.setattr(
+        af3score_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=Volume(),
+            output_volume_mountpoint=str(output_root),
+            model_volume_mountpoint=str(model_root),
+            git_clone_dir=tmp_path / "repo",
+        ),
+    )
+    monkeypatch.setattr(af3score_app, "run_command", run_command)
+
+    af3score_app.af3score_run.get_raw_f()(
+        run_name="scores",
+        batch_name="batch_0",
+        batch_json_dir=str(batch_json),
+        batch_pdb_dir=str(batch_pdb),
+        input_digests={"a": digest},
+        publication_key="plan",
+    )
+
+    assert events == ["reload", "commit", "prepare", "run", "commit"]
+    assert af3score_app._input_publication_ready(
+        output_dir,
+        "a",
+        publication_key="plan",
+        input_sha256=digest,
+    )
 
 
 def test_af3score_operational_limits_do_not_change_scientific_identity() -> None:

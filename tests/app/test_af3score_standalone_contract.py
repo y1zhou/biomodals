@@ -266,6 +266,13 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
     monkeypatch.setattr(af3score_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         af3score_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        af3score_app,
         "_execution_coordinator_handle",
         coordinator_handle,
     )

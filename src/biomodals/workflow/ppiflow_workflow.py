@@ -1038,10 +1038,9 @@ def _stage_af3score_candidate_inputs(
     *,
     artifacts: list[WorkflowArtifact],
     candidate_manifests: list[WorkflowArtifact] | None,
-    run_name: str,
     patterns: Sequence[str] | None = None,
     max_files: int | None = None,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], str, str]:
     """Stage candidate-keyed PDBs and retain their scientific identities."""
     _reload_ppiflow_source_volumes()
     selected = ppiflow_staging.select_structure_files_from_artifacts(
@@ -1058,58 +1057,55 @@ def _stage_af3score_candidate_inputs(
             step_name="AF3ScoreInput",
         ),
     )
-    layout = AppRunLayout.from_run_root(
-        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
-    )
-    if layout.inputs_dir.exists():
-        shutil.rmtree(layout.inputs_dir)
-    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
-    staged: list[dict[str, object]] = []
+    planned: list[tuple[ppiflow_staging.CandidateStructureFile, str, str]] = []
     input_names: set[str] = set()
     for candidate in candidates:
         pdb_name = f"{sanitize_filename(candidate.candidate_id)}.pdb"
         if pdb_name in input_names:
             raise ValueError(f"Duplicate AF3Score staged input name: {pdb_name}")
-        (layout.inputs_dir / pdb_name).write_bytes(candidate.data)
         input_names.add(pdb_name)
+        planned.append((
+            candidate,
+            pdb_name,
+            hashlib.sha256(candidate.data).hexdigest(),
+        ))
+    input_digests = {
+        Path(pdb_name).stem: digest for _candidate, pdb_name, digest in planned
+    }
+    publication_key = hashlib.sha256(
+        orjson.dumps(
+            {
+                "inputs": input_digests,
+                "af3score": (
+                    af3score_app.CONF.repo_commit_hash
+                    or af3score_app.CONF.version
+                    or "unknown"
+                ),
+            },
+            option=orjson.OPT_SORT_KEYS,
+        )
+    ).hexdigest()
+    physical_run_name = f"ppiflow-af3score-{publication_key}"
+    layout = AppRunLayout.from_run_root(
+        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / physical_run_name
+    )
+    if layout.inputs_dir.exists():
+        shutil.rmtree(layout.inputs_dir)
+    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[dict[str, object]] = []
+    for candidate, pdb_name, digest in planned:
+        (layout.inputs_dir / pdb_name).write_bytes(candidate.data)
         staged.append({
             "candidate_id": candidate.candidate_id,
             "input_name": pdb_name,
             "scientific_payload": {
                 "candidate_id": candidate.candidate_id,
-                "content_sha256": hashlib.sha256(candidate.data).hexdigest(),
+                "content_sha256": digest,
                 "source_path": candidate.source_path,
             },
         })
     AF3SCORE_OUTPUT_VOLUME.commit()
-    return staged
-
-
-@app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
-    timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def stage_af3score_inputs(
-    *,
-    artifacts: list[WorkflowArtifact],
-    run_name: str,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> list[str]:
-    """Stage selected PDB files into AF3Score's input directory."""
-    return [
-        str(record["input_name"])
-        for record in _stage_af3score_candidate_inputs(
-            artifacts=artifacts,
-            candidate_manifests=None,
-            run_name=run_name,
-            patterns=patterns,
-            max_files=max_files,
-        )
-    ]
+    return staged, physical_run_name, publication_key
 
 
 def _rosetta_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
@@ -1414,10 +1410,9 @@ def prepare_ppiflow_af3score_stage(
     run_name: str,
 ) -> AppRunResult:
     """Stage AF3Score candidates and publish its finite GPU Task plan."""
-    staged = _stage_af3score_candidate_inputs(
+    staged, physical_run_name, publication_key = _stage_af3score_candidate_inputs(
         artifacts=artifacts,
         candidate_manifests=candidate_manifests,
-        run_name=run_name,
         patterns=_patterns_from_config(config, default=("*.pdb",)),
         max_files=_optional_config_int(config, "max_structures"),
     )
@@ -1430,21 +1425,8 @@ def prepare_ppiflow_af3score_stage(
         )
         for record in staged
     }
-    publication_key = hashlib.sha256(
-        orjson.dumps(
-            {
-                "inputs": input_digests,
-                "af3score": (
-                    af3score_app.CONF.repo_commit_hash
-                    or af3score_app.CONF.version
-                    or "unknown"
-                ),
-            },
-            option=orjson.OPT_SORT_KEYS,
-        )
-    ).hexdigest()
     task_spec = af3score_app.af3score_prepare.get_raw_f()(
-        run_name=run_name,
+        run_name=physical_run_name,
         input_files=input_names,
         input_digests=input_digests,
         publication_key=publication_key,
@@ -1502,7 +1484,8 @@ def prepare_ppiflow_af3score_stage(
                 "input_files": input_names,
                 "input_digests": input_digests,
                 "publication_key": publication_key,
-                "run_name": run_name,
+                "run_name": physical_run_name,
+                "display_run_name": run_name,
             })
         ],
     )
@@ -2500,6 +2483,9 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
             publication_key, str
         ):
             raise TypeError("AF3Score task plan publication data is invalid")
+        normalized_digests = {
+            str(key): str(value) for key, value in input_digests.items()
+        }
         payloads: list[Mapping[str, object]] = []
         chunks: list[Mapping[str, object]] = []
         for task in tasks:
@@ -2525,6 +2511,11 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         task_count = first_chunk["task_count"]
         if not isinstance(task_count, int):
             raise TypeError("AF3Score batch Task count must be an integer")
+        batch_input_ids = tuple(
+            path.stem
+            for path in sorted(Path(str(first_chunk["batch_json_dir"])).glob("*.json"))
+            if path.is_file()
+        )
         return RemoteNodeCall(
             function_name="run_ppiflow_af3score_batch",
             uses_gpu=True,
@@ -2536,7 +2527,8 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
                 "task_keys": [task.task_key for task in tasks],
                 "input_names": [str(payload["input_name"]) for payload in payloads],
                 "input_digests": {
-                    str(key): str(value) for key, value in input_digests.items()
+                    input_id: normalized_digests[input_id]
+                    for input_id in batch_input_ids
                 },
                 "publication_key": publication_key,
             },

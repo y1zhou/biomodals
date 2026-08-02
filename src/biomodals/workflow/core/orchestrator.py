@@ -361,59 +361,6 @@ class ExecutionCoordinator:
         external_artifact_checker_function_name: str | None = None,
     ) -> None:
         """Validate launch inputs and persist a linked Successor ledger."""
-        self._prepare_successor_from_launch(
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            workflow=workflow,
-            workload_run_key=workload_run_key,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-            max_parallel_nodes=max_parallel_nodes,
-            strict_external_artifact_checks=strict_external_artifact_checks,
-            external_artifact_checker_function_name=(
-                external_artifact_checker_function_name
-            ),
-        )
-
-    @modal.method()
-    def restart_from(
-        self,
-        predecessor_execution_run_id: str,
-        workflow: Workflow,
-        workload_run_key: str,
-        max_active_provider_calls: int = 32,
-        max_active_gpu_provider_calls: int | None = None,
-        max_parallel_nodes: int = 32,
-        strict_external_artifact_checks: bool = False,
-        external_artifact_checker_function_name: str | None = None,
-    ) -> AppRunResult:
-        """Match launch inputs and drive a linked Successor Execution Run."""
-        self._prepare_successor_from_launch(
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            workflow=workflow,
-            workload_run_key=workload_run_key,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-            max_parallel_nodes=max_parallel_nodes,
-            strict_external_artifact_checks=strict_external_artifact_checks,
-            external_artifact_checker_function_name=(
-                external_artifact_checker_function_name
-            ),
-        )
-        return self._drive_prepared()
-
-    def _prepare_successor_from_launch(
-        self,
-        *,
-        predecessor_execution_run_id: str,
-        workflow: Workflow,
-        workload_run_key: str,
-        max_active_provider_calls: int,
-        max_active_gpu_provider_calls: int | None,
-        max_parallel_nodes: int,
-        strict_external_artifact_checks: bool,
-        external_artifact_checker_function_name: str | None,
-    ) -> None:
-        """Apply one workflow-specific Successor launch contract."""
         candidate = WorkflowCoordinatorPlan(
             workflow=workflow,
             workload_run_key=workload_run_key,
@@ -442,7 +389,7 @@ class ExecutionCoordinator:
         max_active_provider_calls: int | None,
         max_active_gpu_provider_calls: int | None,
     ) -> AppRunResult:
-        """Apply the one successor operation used by both restart surfaces."""
+        """Apply the synchronous generic restart operation."""
         self._prepare_successor(
             predecessor_execution_run_id=predecessor_execution_run_id,
             predecessor_deployment=predecessor_deployment,

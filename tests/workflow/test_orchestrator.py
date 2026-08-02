@@ -615,7 +615,7 @@ def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
     )
 
     with pytest.raises(ValueError, match="Workload Plan Fingerprint"):
-        raw_cls.restart_from._get_raw_f()(
+        raw_cls.prepare_restart_from._get_raw_f()(
             successor_coordinator,
             predecessor_execution_run_id=str(RUN_ID),
             workflow=candidate_workflow,
@@ -652,7 +652,7 @@ def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
     )
 
     with pytest.raises(ValueError, match="Workload Run Key"):
-        raw_cls.restart_from._get_raw_f()(
+        raw_cls.prepare_restart_from._get_raw_f()(
             successor_coordinator,
             predecessor_execution_run_id=str(RUN_ID),
             workflow=workflow,

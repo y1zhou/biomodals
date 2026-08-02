@@ -199,6 +199,7 @@ def test_run_restart_does_not_drive_when_preparation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator, _ = _patch_coordinator(monkeypatch)
+    monkeypatch.setattr("biomodals.cli.uuid4", lambda: SUCCESSOR_ID)
 
     def fail_preparation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("invalid predecessor")
@@ -213,9 +214,11 @@ def test_run_restart_does_not_drive_when_preparation_fails(
     assert result.exit_code == 1
     assert coordinator.drive_prepared.spawn_calls == 0
     assert "invalid predecessor" in result.output
+    assert str(SUCCESSOR_ID) in result.output
+    assert "submission outcome is unknown" in result.output
 
 
-def test_run_restart_reports_prepared_successor_when_drive_fails(
+def test_run_restart_reports_unknown_outcome_when_drive_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator, _ = _patch_coordinator(monkeypatch)
@@ -232,7 +235,7 @@ def test_run_restart_reports_prepared_successor_when_drive_fails(
     )
 
     assert result.exit_code == 1
-    assert "prepared but not submitted" in result.output
+    assert "submission outcome is unknown" in result.output
     assert str(SUCCESSOR_ID) in result.output
 
 

@@ -4765,14 +4765,6 @@ def submit_ppiflow_workflow(
         f"{len(workflow.validate().nodes)} node(s)",
         flush=True,
     )
-    if predecessor_execution_run_id is None:
-        function_call = coordinator.run.spawn(**orchestrator_kwargs)
-    else:
-        coordinator.prepare_restart_from.remote(
-            predecessor_execution_run_id=str(predecessor_execution_run_id),
-            **orchestrator_kwargs,
-        )
-        function_call = coordinator.drive_prepared.spawn()
     print(
         "Deployment Identity: "
         f"{deployment.environment}/{deployment.deployment_name}/"
@@ -4780,6 +4772,22 @@ def submit_ppiflow_workflow(
         flush=True,
     )
     print(f"Execution Run ID: {execution_run_id}", flush=True)
+    try:
+        if predecessor_execution_run_id is None:
+            function_call = coordinator.run.spawn(**orchestrator_kwargs)
+        else:
+            coordinator.prepare_restart_from.remote(
+                predecessor_execution_run_id=str(predecessor_execution_run_id),
+                **orchestrator_kwargs,
+            )
+            function_call = coordinator.drive_prepared.spawn()
+    except Exception:
+        print(
+            "Coordinator submission outcome is unknown; inspect this Execution "
+            "Run before retrying.",
+            flush=True,
+        )
+        raise
     print(
         "Coordinator FunctionCall ID: "
         f"{getattr(function_call, 'object_id', function_call)}",

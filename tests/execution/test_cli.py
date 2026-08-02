@@ -215,6 +215,27 @@ def test_run_restart_does_not_drive_when_preparation_fails(
     assert "invalid predecessor" in result.output
 
 
+def test_run_restart_reports_prepared_successor_when_drive_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _ = _patch_coordinator(monkeypatch)
+    monkeypatch.setattr("biomodals.cli.uuid4", lambda: SUCCESSOR_ID)
+
+    def fail_drive(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(coordinator.drive_prepared, "spawn", fail_drive)
+
+    result = runner.invoke(
+        app,
+        ["run", "restart", *LOCATION_FLAGS, *TARGET_FLAGS],
+    )
+
+    assert result.exit_code == 1
+    assert "prepared but not submitted" in result.output
+    assert str(SUCCESSOR_ID) in result.output
+
+
 def test_top_level_run_is_reserved_for_execution_lifecycle() -> None:
     result = runner.invoke(app, ["run", "--help"])
 

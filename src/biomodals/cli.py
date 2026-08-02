@@ -915,6 +915,7 @@ def restart_execution_run(
 ) -> None:
     """Create a new Successor Run without mutating the predecessor."""
     successor_execution_run_id = uuid4()
+    prepared = False
     try:
         coordinator = _run_coordinator(
             environment=target_environment,
@@ -930,9 +931,15 @@ def restart_execution_run(
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
         )
+        prepared = True
         call = coordinator.drive_prepared.spawn()
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Error[/bold red] Could not restart run: {exc}")
+        if prepared:
+            console.print(
+                "Successor Run was prepared but not submitted: "
+                f"{successor_execution_run_id}"
+            )
         raise typer.Exit(code=1) from exc
     _print_spawned_execution_run(
         execution_run_id=successor_execution_run_id,

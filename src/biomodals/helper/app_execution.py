@@ -577,13 +577,7 @@ class ExecutionCoordinatorLifecycle:
                 raise ValueError(
                     "Restart arguments changed the Workload Plan Fingerprint"
                 )
-            if any(
-                predecessor.plan.scientific_versions.get(name) != version
-                for name, version in self.target_scientific_versions.items()
-            ):
-                raise ValueError(
-                    "Target deployment changed declared scientific versions"
-                )
+            self._require_target_scientific_versions(predecessor.plan)
             yield (
                 predecessor,
                 self._request_loader(
@@ -595,8 +589,30 @@ class ExecutionCoordinatorLifecycle:
         finally:
             store.close()
 
+    @staticmethod
+    def _require_successor_plan_match(
+        predecessor: ExecutionRunRecord,
+        request: Any,
+    ) -> None:
+        """Reject a successor request whose scientific plan changed."""
+        if (
+            request.execution_plan.workload_plan_fingerprint
+            != predecessor.plan.workload_plan_fingerprint
+        ):
+            raise ValueError("Successor request changed the Workload Plan Fingerprint")
+
+    def _require_target_scientific_versions(self, plan: Any) -> None:
+        """Require every target version declared by this plan to match."""
+        declared = plan.scientific_versions
+        compared = self.target_scientific_versions.keys() & declared.keys()
+        if not compared or any(
+            declared[name] != self.target_scientific_versions[name] for name in compared
+        ):
+            raise ValueError("Target deployment changed declared scientific versions")
+
     def _open_current_runtime(self, *, recover: bool) -> Any:
         request = self._request_loader(self.volume_root, self.execution_run_id)
+        self._require_target_scientific_versions(request.execution_plan)
         return self._open_runtime(
             request,
             predecessor_execution_run_id=(

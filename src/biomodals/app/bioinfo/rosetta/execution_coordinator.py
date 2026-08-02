@@ -165,13 +165,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                             else max_parallel_per_worker
                         ),
                     )
-                if (
-                    request.execution_plan.workload_plan_fingerprint
-                    != predecessor.plan.workload_plan_fingerprint
-                ):
-                    raise ValueError(
-                        "Target deployment changed the Workload Plan Fingerprint"
-                    )
+                self._require_successor_plan_match(predecessor, request)
                 persist_execution_request(
                     self.volume_root,
                     self.execution_run_id,

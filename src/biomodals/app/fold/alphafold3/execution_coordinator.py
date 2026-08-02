@@ -120,13 +120,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                         max_active_provider_calls=max_active_provider_calls,
                         max_active_gpu_provider_calls=max_active_gpu_provider_calls,
                     )
-                if (
-                    request.execution_plan.workload_plan_fingerprint
-                    != predecessor.plan.workload_plan_fingerprint
-                ):
-                    raise ValueError(
-                        "Target deployment changed the Workload Plan Fingerprint"
-                    )
+                self._require_successor_plan_match(predecessor, request)
                 persist_execution_request(
                     self.volume_root,
                     self.execution_run_id,

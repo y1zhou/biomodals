@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
+import pytest
+
 from biomodals.app.score import oligoformer_app
 from biomodals.app.score.oligoformer_execution import (
     EFFICACY_NODE,
@@ -205,6 +207,28 @@ def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
     coordinator._runtime = runtime
 
     assert coordinator._open_runtime(request) is runtime
+
+
+def test_target_reference_version_is_required_only_when_used(tmp_path: Path) -> None:
+    request = _request()
+    coordinator = OligoformerExecutionCoordinator(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        model_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        modal_driver=cast(Any, object()),
+        app_version=request.app_version,
+        model_version=request.model_version,
+        reference_version="new-reference-source",
+    )
+
+    coordinator._require_target_scientific_versions(request.execution_plan)
+    with pytest.raises(ValueError, match="declared scientific versions"):
+        coordinator._require_target_scientific_versions(
+            _request(off_target=True, all_human=True).execution_plan
+        )
 
 
 def test_efficacy_only_plan_is_minimal() -> None:

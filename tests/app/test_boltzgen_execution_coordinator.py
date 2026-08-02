@@ -241,6 +241,23 @@ def test_close_does_not_checkpoint_unchanged_state(tmp_path: Path) -> None:
     assert volume.commits == 0
 
 
+def test_root_run_rejects_local_request_version_drift(tmp_path: Path) -> None:
+    request = _request()
+    persist_execution_request(tmp_path, PREDECESSOR_ID, request)
+    coordinator = _coordinator(
+        tmp_path,
+        FakeVolume(),
+        execution_run_id=PREDECESSOR_ID,
+        deployment=DEPLOYMENT,
+        app_version="0.4.0",
+    )
+
+    with pytest.raises(ValueError, match="declared scientific versions"):
+        coordinator.run()
+
+    assert not ExecutionRunStore(tmp_path, PREDECESSOR_ID).ledger_path.exists()
+
+
 def test_restart_links_successor_and_preserves_scientific_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

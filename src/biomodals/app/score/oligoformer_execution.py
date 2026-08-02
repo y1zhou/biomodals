@@ -1141,13 +1141,13 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
             target_scientific_versions={
                 "oligoformer": app_version,
                 "oligoformer.model": model_version,
+                "oligoformer.reference": reference_version,
             },
         )
         self.output_volume = output_volume
         self.model_volume = model_volume
         self.output_claims = output_claims
         self.modal_driver = modal_driver
-        self.reference_version = reference_version
         self.poll_interval_seconds = poll_interval_seconds
 
     def restart(
@@ -1201,23 +1201,7 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     ),
                 ) as (predecessor, predecessor_request, _):
                     request = candidate_request or predecessor_request
-                predecessor_reference = predecessor.plan.scientific_versions.get(
-                    "oligoformer.reference"
-                )
-                if (
-                    predecessor_reference is not None
-                    and predecessor_reference != self.reference_version
-                ):
-                    raise ValueError(
-                        "Target deployment changed declared scientific versions"
-                    )
-                if (
-                    request.execution_plan.workload_plan_fingerprint
-                    != predecessor.plan.workload_plan_fingerprint
-                ):
-                    raise ValueError(
-                        "Restart arguments changed the Workload Plan Fingerprint"
-                    )
+                self._require_successor_plan_match(predecessor, request)
                 capacity = (
                     request.max_active_provider_calls
                     if max_active_provider_calls is None

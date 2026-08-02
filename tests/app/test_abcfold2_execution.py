@@ -186,6 +186,27 @@ def test_disabled_models_are_absent_from_the_graph() -> None:
     assert request.execution_plan.terminal_node_keys == (PREPARE_NODE,)
 
 
+def test_unused_engine_version_does_not_change_scientific_identity() -> None:
+    request = _request(
+        download_models=False,
+        run_boltz=True,
+        run_chai=False,
+    )
+    changed = _request(
+        download_models=False,
+        run_boltz=True,
+        run_chai=False,
+        chai_version="new-unused-chai",
+    )
+
+    assert "boltz" in request.execution_plan.scientific_versions
+    assert "chai" not in request.execution_plan.scientific_versions
+    assert (
+        request.execution_plan.workload_plan_fingerprint
+        == changed.execution_plan.workload_plan_fingerprint
+    )
+
+
 def test_runtime_dispatches_each_seed_without_nested_calls(
     tmp_path: Path,
     monkeypatch,

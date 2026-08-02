@@ -144,6 +144,14 @@ class ABCFold2ExecutionRequest:
                     dependencies=(NodeDependency(CHAI_SEEDS_NODE),),
                 ),
             ))
+        scientific_versions = {
+            "abcfold2": self.app_version,
+            "biomodals.abcfold2.execution_request": str(REQUEST_SCHEMA_VERSION),
+        }
+        if self.download_models or self.run_boltz:
+            scientific_versions["boltz"] = self.boltz_version
+        if self.download_models or self.run_chai:
+            scientific_versions["chai"] = self.chai_version
         return ExecutionPlan(
             workload_name="abcfold2",
             workload_run_key=self.run_name,
@@ -155,12 +163,7 @@ class ABCFold2ExecutionRequest:
                 "run_boltz": self.run_boltz,
                 "run_chai": self.run_chai,
             },
-            scientific_versions={
-                "abcfold2": self.app_version,
-                "boltz": self.boltz_version,
-                "chai": self.chai_version,
-                "biomodals.abcfold2.execution_request": str(REQUEST_SCHEMA_VERSION),
-            },
+            scientific_versions=scientific_versions,
         )
 
     def to_bytes(self) -> bytes:
@@ -801,13 +804,7 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     ),
                 ) as (predecessor, predecessor_request, _):
                     request = candidate_request or predecessor_request
-                if (
-                    request.execution_plan.workload_plan_fingerprint
-                    != predecessor.plan.workload_plan_fingerprint
-                ):
-                    raise ValueError(
-                        "Restart arguments changed the Workload Plan Fingerprint"
-                    )
+                self._require_successor_plan_match(predecessor, request)
                 if candidate_request is None:
                     request = replace(
                         request,

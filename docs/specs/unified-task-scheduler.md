@@ -719,11 +719,12 @@ durable state. A workflow entrypoint's `--restart-from` option uses the same
 two-input boundary through `prepare_restart_from` and `drive_prepared`; the
 combined workflow coordinator method is intentionally not exposed.
 
-Before creating Successor state, every direct-app coordinator compares the
-predecessor's declared scientific versions with the versions loaded by the
-target deployment. Conditional versions, such as an optional reference
-dataset, are compared whenever the predecessor used them. A mismatch fails
-before claims, requests, launch identity, or ledger state are written.
+Whenever a direct-app coordinator opens a staged request, it compares the
+plan's declared scientific versions with the versions loaded by the target
+deployment. Conditional versions, such as an optional engine or reference
+dataset, are compared only when the plan uses them. A mismatch prevents root
+or Successor execution before claims or ledger state are written. Pre-staged
+request and launch files may remain as inert submission inputs.
 
 `status` is read-only, `cancel` is an idempotent explicit cancellation,
 `resume` retains Execution Run ID and Deployment Identity, reconciles existing

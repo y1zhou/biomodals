@@ -310,7 +310,11 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
     """Reopened successor lifecycle calls retain immutable lineage."""
     predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     deployment = DeploymentIdentity("main", "Example", 3)
-    plan = ExecutionPlan("example", (NodePlan("run"),))
+    plan = ExecutionPlan(
+        "example",
+        (NodePlan("run"),),
+        scientific_versions={"example": "1"},
+    )
     store = ExecutionRunStore(tmp_path, RUN_ID)
     with store.transaction():
         store.execution.create_run(
@@ -324,6 +328,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
         )
     store.close()
     opened_with: list[UUID | None] = []
+    request = SimpleNamespace(execution_plan=plan)
 
     class Runtime:
         def __init__(self, predecessor: UUID | None) -> None:
@@ -342,7 +347,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
             self.store.close()
 
     class Coordinator(ExecutionCoordinatorLifecycle):
-        _request_loader = staticmethod(lambda _root, _run_id: "request")
+        _request_loader = staticmethod(lambda _root, _run_id: request)
 
         def _open_runtime(
             self,
@@ -350,7 +355,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
             *,
             predecessor_execution_run_id: UUID | None = None,
         ):
-            assert request == "request"
+            assert request.execution_plan == plan
             opened_with.append(predecessor_execution_run_id)
             if self._runtime is None:
                 self._runtime = Runtime(predecessor_execution_run_id)
@@ -375,7 +380,12 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
     """A staged launch preserves lineage when cancellation wins startup."""
     predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     deployment = DeploymentIdentity("main", "Example", 3)
-    plan = ExecutionPlan("example", (NodePlan("run"),))
+    plan = ExecutionPlan(
+        "example",
+        (NodePlan("run"),),
+        scientific_versions={"example": "1"},
+    )
+    request = SimpleNamespace(execution_plan=plan)
     stage_execution_launch(FakeVolume(tmp_path), RUN_ID, predecessor_id)
 
     class Runtime:
@@ -405,7 +415,7 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
             self.store.close()
 
     class Coordinator(ExecutionCoordinatorLifecycle):
-        _request_loader = staticmethod(lambda _root, _run_id: "request")
+        _request_loader = staticmethod(lambda _root, _run_id: request)
 
         def _open_runtime(
             self,
@@ -413,7 +423,7 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
             *,
             predecessor_execution_run_id: UUID | None = None,
         ):
-            assert request == "request"
+            assert request.execution_plan == plan
             if self._runtime is None:
                 self._runtime = Runtime(predecessor_execution_run_id)
             return self._runtime

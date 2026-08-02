@@ -740,13 +740,7 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     ),
                 ) as (predecessor, predecessor_request, _):
                     request = candidate_request or predecessor_request
-                if (
-                    request.execution_plan.workload_plan_fingerprint
-                    != predecessor.plan.workload_plan_fingerprint
-                ):
-                    raise ValueError(
-                        "Restart arguments changed the Workload Plan Fingerprint"
-                    )
+                self._require_successor_plan_match(predecessor, request)
                 if candidate_request is None:
                     request = replace(
                         request,

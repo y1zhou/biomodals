@@ -5,6 +5,9 @@
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Lock, Thread
+from time import sleep
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
@@ -860,6 +863,94 @@ def test_enter_and_exit_close_without_cancelling(
     assert active_runtime.close_count == 1
     assert instance._runtime is None
     assert volume.commit_count == 0
+
+
+def test_workflow_cancel_does_not_start_a_second_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Concurrent cancellation leaves exactly one workflow drive owner."""
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, FakeVolume())
+    plan = orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo")
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.cancel_requested = Event()
+            self.status = RunStatus.RUNNING
+            self.active_drivers = 0
+            self.max_active_drivers = 0
+            self.closed_while_driving = False
+            self._lock = Lock()
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            with self._lock:
+                self.active_drivers += 1
+                self.max_active_drivers = max(
+                    self.max_active_drivers,
+                    self.active_drivers,
+                )
+            self.started.set()
+            assert self.cancel_requested.wait(timeout=1)
+            sleep(0.05)
+            self.status = RunStatus.CANCELLED
+            with self._lock:
+                self.active_drivers -= 1
+            return AppRunResult(status=AppRunStatus.FAILED)
+
+        def cancel(self) -> None:
+            self.status = RunStatus.CANCEL_REQUESTED
+            self.cancel_requested.set()
+
+        def close(self) -> None:
+            with self._lock:
+                self.closed_while_driving |= self.active_drivers > 0
+
+    runtime = FakeRuntime()
+
+    def open_runtime(*_args: object, **_kwargs: object) -> FakeRuntime:
+        instance._runtime = runtime
+        return runtime
+
+    def snapshot():
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                execution_run_id=RUN_ID,
+                deployment=DEPLOYMENT,
+                status=runtime.status,
+            )
+        )
+
+    instance._persist_or_verify_plan = lambda candidate: candidate
+    instance._load_plan = lambda: plan
+    instance._open_runtime = open_runtime
+    instance._require_ledger = lambda: None
+    instance._verified_snapshot = snapshot
+    errors: list[BaseException] = []
+
+    def call(operation, *args: object, **kwargs: object) -> None:
+        try:
+            operation(instance, *args, **kwargs)
+        except BaseException as error:  # pragma: no cover - assertion aid
+            errors.append(error)
+
+    run_thread = Thread(
+        target=call,
+        args=(raw_cls.run._get_raw_f(),),
+        kwargs={"workflow": plan.workflow, "workload_run_key": "demo"},
+    )
+    run_thread.start()
+    assert runtime.started.wait(timeout=1)
+    cancel_thread = Thread(target=call, args=(raw_cls.cancel._get_raw_f(),))
+    cancel_thread.start()
+    run_thread.join(timeout=2)
+    cancel_thread.join(timeout=2)
+
+    assert not run_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert errors == []
+    assert runtime.max_active_drivers == 1
+    assert not runtime.closed_while_driving
 
 
 @pytest.mark.parametrize(

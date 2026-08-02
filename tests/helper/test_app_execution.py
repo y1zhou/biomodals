@@ -4,12 +4,21 @@
 
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Event, Lock, Thread
+from time import sleep
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 
-from biomodals.execution import DeploymentIdentity, ExecutionPlan, NodePlan
+from biomodals.execution import (
+    DeploymentIdentity,
+    ExecutionPlan,
+    NodePlan,
+    RunStatus,
+)
 from biomodals.helper.app_execution import (
+    ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
 )
@@ -138,3 +147,88 @@ def test_request_bytes_persist_atomically_and_remain_immutable(tmp_path: Path) -
     assert REQUEST_FILE.persist(tmp_path, RUN_ID, b"request") == path
     with pytest.raises(RuntimeError, match="immutable"):
         REQUEST_FILE.persist(tmp_path, RUN_ID, b"changed")
+
+
+def test_app_coordinator_cancel_does_not_start_a_second_driver(
+    tmp_path: Path,
+) -> None:
+    """Cancellation interleaves with polling but never owns a second drive loop."""
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.cancel_requested = Event()
+            self.status = RunStatus.RUNNING
+            self.active_drivers = 0
+            self.max_active_drivers = 0
+            self.closed_while_driving = False
+            self._lock = Lock()
+
+        def snapshot(self):
+            return SimpleNamespace(
+                run=SimpleNamespace(
+                    execution_run_id=RUN_ID,
+                    deployment=DeploymentIdentity("main", "Example", 3),
+                    status=self.status,
+                )
+            )
+
+        def run(self, *, synchronize):
+            with self._lock:
+                self.active_drivers += 1
+                self.max_active_drivers = max(
+                    self.max_active_drivers,
+                    self.active_drivers,
+                )
+            self.started.set()
+            assert self.cancel_requested.wait(timeout=1)
+            sleep(0.05)
+            with synchronize():
+                self.status = RunStatus.CANCELLED
+            with self._lock:
+                self.active_drivers -= 1
+            return self.snapshot()
+
+        def cancel(self):
+            self.status = RunStatus.CANCEL_REQUESTED
+            self.cancel_requested.set()
+            return self.snapshot()
+
+        def close(self) -> None:
+            with self._lock:
+                self.closed_while_driving |= self.active_drivers > 0
+
+    runtime = FakeRuntime()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        def _open_current_runtime(self, *, recover: bool):
+            del recover
+            self._runtime = runtime
+            return runtime
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=DeploymentIdentity("main", "Example", 3),
+        volume_root=tmp_path,
+    )
+    errors: list[BaseException] = []
+
+    def call(operation) -> None:
+        try:
+            operation()
+        except BaseException as error:  # pragma: no cover - assertion aid
+            errors.append(error)
+
+    run_thread = Thread(target=call, args=(coordinator.run,))
+    run_thread.start()
+    assert runtime.started.wait(timeout=1)
+    cancel_thread = Thread(target=call, args=(coordinator.cancel,))
+    cancel_thread.start()
+    run_thread.join(timeout=2)
+    cancel_thread.join(timeout=2)
+
+    assert not run_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert errors == []
+    assert runtime.max_active_drivers == 1
+    assert not runtime.closed_while_driving

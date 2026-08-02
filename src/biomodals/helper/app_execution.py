@@ -401,11 +401,16 @@ class ExecutionCoordinatorLifecycle:
         """Request cancellation and reconcile it to a terminal result."""
         with self._writer_lock:
             runtime = self._open_current_runtime(recover=True)
-            snapshot = runtime.cancel()
-            self._verify_snapshot(snapshot)
-        if snapshot.run.status.is_terminal:
-            return snapshot
-        return self._drive(runtime, resume=False)
+            self._verify_snapshot(runtime.cancel())
+        with self._drive_lock:
+            with self._writer_lock:
+                runtime = self._open_current_runtime(recover=True)
+                snapshot = runtime.cancel()
+                self._verify_snapshot(snapshot)
+                if snapshot.run.status.is_terminal:
+                    self._close_runtime()
+                    return snapshot
+            return self._drive(runtime, resume=False)
 
     def resume(self) -> ExecutionSnapshot:
         """Resume this Run without retrying conclusive failures."""
@@ -433,8 +438,9 @@ class ExecutionCoordinatorLifecycle:
 
     def close(self) -> None:
         """Close coordinator-local state without cancelling Provider Calls."""
-        with self._writer_lock:
-            self._close_runtime()
+        with self._drive_lock:
+            with self._writer_lock:
+                self._close_runtime()
 
     def synchronize(self) -> AbstractContextManager[object]:
         """Return the single-writer boundary used between drive cycles."""

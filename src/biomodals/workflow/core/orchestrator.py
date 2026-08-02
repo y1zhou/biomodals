@@ -6,7 +6,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 from uuid import UUID
 
@@ -158,6 +158,7 @@ class ExecutionCoordinator:
     def enter(self) -> None:
         """Refresh durable state before serving this run-scoped pool."""
         self._writer_lock = RLock()
+        self._drive_lock = Lock()
         self._runtime = None
         self._development_function_handles = None
         self._identity()
@@ -187,19 +188,22 @@ class ExecutionCoordinator:
                 external_artifact_checker_function_name
             ),
         )
-        with self._lock():
-            plan = self._persist_or_verify_plan(candidate)
-            if development_function_handles is not None:
-                self._development_function_handles = dict(development_function_handles)
-            runtime = self._open_runtime(plan, resolve_external_checker=True)
-        try:
-            return runtime.run(
-                workload_run_key=plan.workload_run_key,
-                synchronize=self._lock,
-            )
-        finally:
+        with self._driver_lock():
             with self._lock():
-                self._close_runtime()
+                plan = self._persist_or_verify_plan(candidate)
+                if development_function_handles is not None:
+                    self._development_function_handles = dict(
+                        development_function_handles
+                    )
+                runtime = self._open_runtime(plan, resolve_external_checker=True)
+            try:
+                return runtime.run(
+                    workload_run_key=plan.workload_run_key,
+                    synchronize=self._lock,
+                )
+            finally:
+                with self._lock():
+                    self._close_runtime()
 
     @modal.method()
     def status(self) -> ExecutionSnapshot:
@@ -215,35 +219,42 @@ class ExecutionCoordinator:
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
             runtime.cancel()
-            snapshot = self._verified_snapshot()
-        if snapshot.run.status.is_terminal:
-            return snapshot
-        try:
-            runtime.run(
-                workload_run_key=plan.workload_run_key,
-                synchronize=self._lock,
-            )
+            self._verified_snapshot()
+        with self._driver_lock():
             with self._lock():
-                return self._verified_snapshot()
-        finally:
-            with self._lock():
-                self._close_runtime()
+                snapshot = self._verified_snapshot()
+                if snapshot.run.status.is_terminal:
+                    self._close_runtime()
+                    return snapshot
+                plan = self._load_plan()
+                runtime = self._open_runtime(plan, resolve_external_checker=False)
+            try:
+                runtime.run(
+                    workload_run_key=plan.workload_run_key,
+                    synchronize=self._lock,
+                )
+                with self._lock():
+                    return self._verified_snapshot()
+            finally:
+                with self._lock():
+                    self._close_runtime()
 
     @modal.method()
     def resume(self) -> AppRunResult:
         """Resume suspension or explicitly reconcile unknown provider state."""
-        with self._lock():
-            self._require_ledger()
-            plan = self._load_plan()
-            runtime = self._open_runtime(plan, resolve_external_checker=True)
-        try:
-            return runtime.resume(
-                workload_run_key=plan.workload_run_key,
-                synchronize=self._lock,
-            )
-        finally:
+        with self._driver_lock():
             with self._lock():
-                self._close_runtime()
+                self._require_ledger()
+                plan = self._load_plan()
+                runtime = self._open_runtime(plan, resolve_external_checker=True)
+            try:
+                return runtime.resume(
+                    workload_run_key=plan.workload_run_key,
+                    synchronize=self._lock,
+                )
+            finally:
+                with self._lock():
+                    self._close_runtime()
 
     @modal.method()
     def claim_tasks(
@@ -354,82 +365,84 @@ class ExecutionCoordinator:
         successor_id, deployment = self._identity()
         if successor_id == predecessor_execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
-        with self._lock():
-            OUT_VOLUME.reload()
-            (
-                predecessor,
-                predecessor_plan,
-                node_publications,
-                task_publications,
-            ) = self._load_successor_source(
-                predecessor_execution_run_id,
-                predecessor_deployment,
-            )
-            if candidate is None:
-                successor_plan = replace(
+        with self._driver_lock():
+            with self._lock():
+                OUT_VOLUME.reload()
+                (
+                    predecessor,
                     predecessor_plan,
-                    max_active_provider_calls=(
-                        predecessor_plan.max_active_provider_calls
-                        if max_active_provider_calls is None
-                        else max_active_provider_calls
-                    ),
-                    max_active_gpu_provider_calls=(
-                        predecessor_plan.max_active_gpu_provider_calls
-                        if max_active_gpu_provider_calls is None
-                        else max_active_gpu_provider_calls
-                    ),
+                    node_publications,
+                    task_publications,
+                ) = self._load_successor_source(
+                    predecessor_execution_run_id,
+                    predecessor_deployment,
                 )
-            else:
-                if candidate.workload_run_key != predecessor_plan.workload_run_key:
-                    raise ValueError(
-                        "Launch Workload Run Key does not match predecessor"
+                if candidate is None:
+                    successor_plan = replace(
+                        predecessor_plan,
+                        max_active_provider_calls=(
+                            predecessor_plan.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor_plan.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
+                        ),
                     )
-                candidate_execution_plan = execution_plan(
-                    candidate.workflow.validate(),
-                    workload_run_key=candidate.workload_run_key,
+                else:
+                    if candidate.workload_run_key != predecessor_plan.workload_run_key:
+                        raise ValueError(
+                            "Launch Workload Run Key does not match predecessor"
+                        )
+                    candidate_execution_plan = execution_plan(
+                        candidate.workflow.validate(),
+                        workload_run_key=candidate.workload_run_key,
+                    )
+                    if (
+                        candidate_execution_plan.workload_plan_fingerprint
+                        != predecessor.plan.workload_plan_fingerprint
+                    ):
+                        raise ValueError(
+                            "Launch inputs changed the Workload Plan Fingerprint"
+                        )
+                    successor_plan = candidate
+                successor_execution_plan = execution_plan(
+                    successor_plan.workflow.validate(),
+                    workload_run_key=successor_plan.workload_run_key,
                 )
                 if (
-                    candidate_execution_plan.workload_plan_fingerprint
+                    successor_execution_plan.workload_plan_fingerprint
                     != predecessor.plan.workload_plan_fingerprint
                 ):
                     raise ValueError(
-                        "Launch inputs changed the Workload Plan Fingerprint"
+                        "Target deployment changed the Workload Plan Fingerprint"
                     )
-                successor_plan = candidate
-            successor_execution_plan = execution_plan(
-                successor_plan.workflow.validate(),
-                workload_run_key=successor_plan.workload_run_key,
-            )
-            if (
-                successor_execution_plan.workload_plan_fingerprint
-                != predecessor.plan.workload_plan_fingerprint
-            ):
-                raise ValueError(
-                    "Target deployment changed the Workload Plan Fingerprint"
+                plan = self._persist_or_verify_plan(successor_plan)
+                self._persist_or_verify_successor(
+                    predecessor=predecessor,
+                    plan=plan,
+                    deployment=deployment,
+                    node_publications=node_publications,
+                    task_publications=task_publications,
                 )
-            plan = self._persist_or_verify_plan(successor_plan)
-            self._persist_or_verify_successor(
-                predecessor=predecessor,
-                plan=plan,
-                deployment=deployment,
-                node_publications=node_publications,
-                task_publications=task_publications,
-            )
-            runtime = self._open_runtime(plan, resolve_external_checker=True)
-        try:
-            return runtime.run(
-                workload_run_key=plan.workload_run_key,
-                synchronize=self._lock,
-            )
-        finally:
-            with self._lock():
-                self._close_runtime()
+                runtime = self._open_runtime(plan, resolve_external_checker=True)
+            try:
+                return runtime.run(
+                    workload_run_key=plan.workload_run_key,
+                    synchronize=self._lock,
+                )
+            finally:
+                with self._lock():
+                    self._close_runtime()
 
     @modal.exit()
     def exit(self) -> None:
         """Close local workflow state without cancelling child calls."""
-        with self._lock():
-            self._close_runtime()
+        with self._driver_lock():
+            with self._lock():
+                self._close_runtime()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
         return execution_coordinator_identity(self)
@@ -439,6 +452,13 @@ class ExecutionCoordinator:
         if lock is None:
             lock = RLock()
             self._writer_lock = lock
+        return lock
+
+    def _driver_lock(self) -> Lock:
+        lock = getattr(self, "_drive_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._drive_lock = lock
         return lock
 
     def _persist_or_verify_plan(

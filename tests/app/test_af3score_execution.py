@@ -4,7 +4,7 @@
 
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -108,6 +108,14 @@ class CompletingDriver:
                 sample.mkdir(parents=True, exist_ok=True)
                 for required in COMPLETION_REQUIRED_FILES:
                     (sample / required).write_text("{}")
+                af3score_app._write_input_publication(
+                    self.root / "outputs",
+                    path.stem,
+                    publication_key=str(kwargs["publication_key"]),
+                    input_sha256=cast(dict[str, str], kwargs["input_digests"])[
+                        path.stem
+                    ],
+                )
             return None
         self.root.mkdir(parents=True, exist_ok=True)
         metrics = self.root / METRICS_FILENAME
@@ -353,6 +361,46 @@ def test_unbound_metrics_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
         "af3score_postprocess",
     ]
     assert str(RUN_ID) in claims.values.values()
+    runtime.close()
+
+
+def test_stale_input_outputs_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
+    request = _request()
+    _stage_request_inputs(tmp_path, request)
+    outputs = tmp_path / request.run_name / "outputs"
+    for input_id, digest in request.input_digests.items():
+        sample = outputs / input_id / COMPLETION_SAMPLE_SUBDIR
+        sample.mkdir(parents=True)
+        for required in COMPLETION_REQUIRED_FILES:
+            sample.joinpath(required).write_text("{}")
+        af3score_app._write_input_publication(
+            outputs,
+            input_id,
+            publication_key="stale-plan",
+            input_sha256=digest,
+        )
+    driver = CompletingDriver(tmp_path, request)
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    snapshot = runtime.run()
+
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert [name for name, _kwargs in driver.spawns] == [
+        "af3score_prepare",
+        "af3score_run",
+        "af3score_postprocess",
+    ]
     runtime.close()
 
 

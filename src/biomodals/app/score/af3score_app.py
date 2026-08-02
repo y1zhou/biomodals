@@ -41,7 +41,9 @@ from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
+    execution_coordinator_adapter,
     execution_coordinator_identity,
+    initialize_execution_coordinator_host,
 )
 from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
@@ -123,6 +125,7 @@ AF3SCORE_OUTPUT_CLAIMS = modal.Dict.from_name(
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_af3score_task"})
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 _METRICS_PUBLICATION_SCHEMA_VERSION = 1
+_INPUT_PUBLICATION_SCHEMA_VERSION = 1
 
 
 def _metrics_publication_path(run_root: str | Path) -> Path:
@@ -135,6 +138,77 @@ def _file_sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
+    return Path(output_dir) / input_id / ".biomodals" / "af3score-input.json"
+
+
+def _write_input_publication(
+    output_dir: str | Path,
+    input_id: str,
+    *,
+    publication_key: str,
+    input_sha256: str,
+) -> None:
+    """Atomically bind one complete AF3Score output to its scientific input."""
+    if not has_completed_output_files(
+        output_dir,
+        input_id,
+        sample_subdir=APP_INFO.completion_sample_subdir,
+        required_files=APP_INFO.completion_required_files,
+    ):
+        raise RuntimeError(f"AF3Score output is incomplete for '{input_id}'")
+    marker = _input_publication_path(output_dir, input_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(f".{marker.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(
+            orjson.dumps(
+                {
+                    "schema_version": _INPUT_PUBLICATION_SCHEMA_VERSION,
+                    "publication_key": publication_key,
+                    "input_sha256": input_sha256,
+                },
+                option=orjson.OPT_SORT_KEYS,
+            )
+        )
+        temporary.replace(marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _input_publication_ready(
+    output_dir: str | Path,
+    input_id: str,
+    *,
+    publication_key: str,
+    input_sha256: str,
+) -> bool:
+    """Validate one scored output against the current scientific request."""
+    try:
+        marker = orjson.loads(
+            _input_publication_path(output_dir, input_id).read_bytes()
+        )
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        orjson.JSONDecodeError,
+    ):
+        return False
+    return (
+        isinstance(marker, dict)
+        and marker.get("schema_version") == _INPUT_PUBLICATION_SCHEMA_VERSION
+        and marker.get("publication_key") == publication_key
+        and marker.get("input_sha256") == input_sha256
+        and has_completed_output_files(
+            output_dir,
+            input_id,
+            sample_subdir=APP_INFO.completion_sample_subdir,
+            required_files=APP_INFO.completion_required_files,
+        )
+    )
 
 
 def _write_metrics_publication(
@@ -246,7 +320,12 @@ def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
     volumes=CONF.mounts(output_volume=True),
 )
 def af3score_prepare(
-    run_name: str, input_files: list[str], num_jobs: int, prepare_workers: int
+    run_name: str,
+    input_files: list[str],
+    input_digests: dict[str, str],
+    publication_key: str,
+    num_jobs: int,
+    prepare_workers: int,
 ) -> TaskSpec:
     """Prepare AF3Score batches from staged inputs."""
     CONF.output_volume.reload()
@@ -267,11 +346,14 @@ def af3score_prepare(
     skipped = 0
     out_dir = layout.outputs_dir
     for pdb_file in all_files:
-        if has_completed_output_files(
+        digest = input_digests.get(pdb_file.stem)
+        if digest is None:
+            raise ValueError(f"Missing AF3Score input digest for '{pdb_file.name}'")
+        if _input_publication_ready(
             out_dir,
             pdb_file.stem,
-            sample_subdir=APP_INFO.completion_sample_subdir,
-            required_files=APP_INFO.completion_required_files,
+            publication_key=publication_key,
+            input_sha256=digest,
         ):
             skipped += 1
             continue
@@ -351,7 +433,12 @@ def af3score_prepare(
     ),
 )
 def af3score_run(
-    run_name: str, batch_name: str, batch_json_dir: str, batch_pdb_dir: str
+    run_name: str,
+    batch_name: str,
+    batch_json_dir: str,
+    batch_pdb_dir: str,
+    input_digests: dict[str, str],
+    publication_key: str,
 ) -> None:
     """Run one AF3Score batch."""
     CONF.output_volume.reload()
@@ -404,6 +491,17 @@ def af3score_run(
             output_mode="capture",
             log_file=out_dir / f"{batch_name}.log",
         )
+        for input_json in Path(batch_json_dir).glob("*.json"):
+            input_id = input_json.stem
+            digest = input_digests.get(input_id)
+            if digest is None:
+                raise ValueError(f"Missing AF3Score input digest for '{input_id}'")
+            _write_input_publication(
+                out_dir,
+                input_id,
+                publication_key=publication_key,
+                input_sha256=digest,
+            )
         CONF.output_volume.commit()
 
 
@@ -416,6 +514,7 @@ def af3score_run(
 def af3score_postprocess(
     run_name: str,
     input_files: list[str],
+    input_digests: dict[str, str],
     publication_key: str,
 ) -> dict[str, int | str]:
     """Validate records and collect metrics for all inputs."""
@@ -431,11 +530,14 @@ def af3score_postprocess(
     for input_name in input_files:
         input_id = Path(input_name).stem
         failed_record = layout.failures_dir / f"{input_id}.err"
-        if has_completed_output_files(
+        digest = input_digests.get(input_id)
+        if digest is None:
+            raise ValueError(f"Missing AF3Score input digest for '{input_name}'")
+        if _input_publication_ready(
             out_dir,
             input_id,
-            sample_subdir=APP_INFO.completion_sample_subdir,
-            required_files=APP_INFO.completion_required_files,
+            publication_key=publication_key,
+            input_sha256=digest,
         ):
             if failed_record.exists():
                 failed_record.unlink()
@@ -515,8 +617,7 @@ class ExecutionCoordinator:
     @modal.enter()
     def enter(self) -> None:
         """Refresh output state before accepting lifecycle methods."""
-        self._coordinator_adapter = None
-        self._development = None
+        initialize_execution_coordinator_host(self)
         self._identity()
         CONF.output_volume.reload()
 
@@ -592,25 +693,19 @@ class ExecutionCoordinator:
         *,
         development: bool | None = None,
     ) -> AF3ScoreExecutionCoordinator:
-        adapter = getattr(self, "_coordinator_adapter", None)
-        selected_mode = getattr(self, "_development", None)
-        if adapter is not None:
-            if development is not None and selected_mode != development:
-                raise ValueError("Coordinator execution mode cannot change in place")
-            return adapter
         execution_run_id, deployment = self._identity()
-        selected_mode = False if development is None else development
-        adapter = AF3ScoreExecutionCoordinator(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            volume_root=Path(CONF.output_volume_mountpoint),
-            output_volume=CONF.output_volume,
-            output_claims=AF3SCORE_OUTPUT_CLAIMS,
-            modal_driver=_coordinator_modal_driver(development=selected_mode),
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: AF3ScoreExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                output_claims=AF3SCORE_OUTPUT_CLAIMS,
+                modal_driver=_coordinator_modal_driver(development=selected_mode),
+            ),
         )
-        self._coordinator_adapter = adapter
-        self._development = selected_mode
-        return adapter
 
 
 def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
@@ -658,7 +753,7 @@ def submit_af3score_task(
             time. AF3Score internally batches inputs of similar lengths
             together in the `01_prepare_get_json.py` script, so we don't need
             to batch manually when uploading inputs.
-        force: If True, ignore existing PDB files when uploading `input_dir`.
+        force: If True, skip the preflight check for an existing remote run.
         use_deployed_coordinator: Target the exact deployed coordinator. The
             Biomodals CLI supplies this for normal runs.
         deployment_environment: Modal Environment containing the coordinator.
@@ -694,14 +789,13 @@ def submit_af3score_task(
         execution_run_id = uuid4()
         request = AF3ScoreExecutionRequest(
             run_name=run_name,
-            inputs=tuple(
-                (path.name, sha256(path.read_bytes()).hexdigest()) for path in all_files
-            ),
+            inputs=tuple((path.name, _file_sha256(path)) for path in all_files),
             staged_input_execution_run_id=str(execution_run_id),
             prepare_workers=prepare_workers,
             max_batches=max_batches,
             app_version=CONF.repo_commit_hash or CONF.version or "unknown",
         )
+        request.to_bytes()
         deployment = DeploymentIdentity(
             deployment_environment,
             deployment_name,

@@ -778,6 +778,11 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
         orjson.dumps({
             "run_name": "af3-run",
             "input_files": ["candidate-a.pdb", "candidate-b.pdb"],
+            "input_digests": {
+                "candidate-a": "candidate-a",
+                "candidate-b": "candidate-b",
+            },
+            "publication_key": "request-key",
             "candidates": [
                 {
                     "candidate_id": candidate_id,

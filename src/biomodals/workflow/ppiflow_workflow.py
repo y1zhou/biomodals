@@ -58,7 +58,6 @@ from biomodals.execution.pull_worker import drive_pull_worker
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     AppRunLayout,
-    has_completed_output_files,
     volume_app_output,
     volume_path_from_mount_path,
 )
@@ -1425,9 +1424,30 @@ def prepare_ppiflow_af3score_stage(
     input_names = [str(record["input_name"]) for record in staged]
     if not input_names:
         raise ValueError(f"{step_name} requires at least one AF3Score input")
+    input_digests = {
+        Path(str(record["input_name"])).stem: str(
+            cast(Mapping[str, object], record["scientific_payload"])["content_sha256"]
+        )
+        for record in staged
+    }
+    publication_key = hashlib.sha256(
+        orjson.dumps(
+            {
+                "inputs": input_digests,
+                "af3score": (
+                    af3score_app.CONF.repo_commit_hash
+                    or af3score_app.CONF.version
+                    or "unknown"
+                ),
+            },
+            option=orjson.OPT_SORT_KEYS,
+        )
+    ).hexdigest()
     task_spec = af3score_app.af3score_prepare.get_raw_f()(
         run_name=run_name,
         input_files=input_names,
+        input_digests=input_digests,
+        publication_key=publication_key,
         num_jobs=_config_int(
             config,
             "num_jobs",
@@ -1480,6 +1500,8 @@ def prepare_ppiflow_af3score_stage(
             _af3score_plan_artifact({
                 "candidates": candidates,
                 "input_files": input_names,
+                "input_digests": input_digests,
+                "publication_key": publication_key,
                 "run_name": run_name,
             })
         ],
@@ -1502,6 +1524,8 @@ def run_ppiflow_af3score_batch(
     batch_pdb_dir: str,
     task_keys: list[str],
     input_names: list[str],
+    input_digests: dict[str, str],
+    publication_key: str,
 ) -> dict[str, dict[str, object]]:
     """Run one AF3Score GPU batch and report each owned scientific Task."""
     if len(task_keys) != len(input_names) or not task_keys:
@@ -1513,6 +1537,8 @@ def run_ppiflow_af3score_batch(
         batch_name=batch_name,
         batch_json_dir=batch_json_dir,
         batch_pdb_dir=batch_pdb_dir,
+        input_digests=input_digests,
+        publication_key=publication_key,
     )
     layout = AppRunLayout.from_run_root(
         Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
@@ -1520,11 +1546,11 @@ def run_ppiflow_af3score_batch(
     results: dict[str, dict[str, object]] = {}
     for task_key, input_name in zip(task_keys, input_names, strict=True):
         input_id = Path(input_name).stem
-        complete = has_completed_output_files(
+        complete = af3score_app._input_publication_ready(
             layout.outputs_dir,
             input_id,
-            sample_subdir=af3score_app.APP_INFO.completion_sample_subdir,
-            required_files=af3score_app.APP_INFO.completion_required_files,
+            publication_key=publication_key,
+            input_sha256=input_digests[input_id],
         )
         result = (
             AppRunResult(
@@ -1575,11 +1601,20 @@ def postprocess_ppiflow_af3score_stage(
     run_name = str(plan["run_name"])
     input_files = plan["input_files"]
     candidates = plan["candidates"]
-    if not isinstance(input_files, list) or not isinstance(candidates, list):
+    input_digests = plan.get("input_digests")
+    publication_key = plan.get("publication_key")
+    if (
+        not isinstance(input_files, list)
+        or not isinstance(candidates, list)
+        or not isinstance(input_digests, dict)
+        or not isinstance(publication_key, str)
+    ):
         raise TypeError("AF3Score task plan contains invalid candidate data")
     metrics = af3score_app.af3score_postprocess.get_raw_f()(
         run_name=run_name,
         input_files=[str(value) for value in input_files],
+        input_digests={str(key): str(value) for key, value in input_digests.items()},
+        publication_key=publication_key,
     )
     metrics_csv = str(metrics["metrics_csv"])
     status = ppiflow_tables.score_table_status(
@@ -2458,6 +2493,13 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         """Prepare one direct AF3Score GPU call for compatible Tasks."""
         if not tasks:
             raise ValueError("AF3Score provider batch cannot be empty")
+        plan = self._plan(context)
+        input_digests = plan.get("input_digests")
+        publication_key = plan.get("publication_key")
+        if not isinstance(input_digests, Mapping) or not isinstance(
+            publication_key, str
+        ):
+            raise TypeError("AF3Score task plan publication data is invalid")
         payloads: list[Mapping[str, object]] = []
         chunks: list[Mapping[str, object]] = []
         for task in tasks:
@@ -2493,6 +2535,10 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
                 "batch_pdb_dir": str(first_chunk["batch_pdb_dir"]),
                 "task_keys": [task.task_key for task in tasks],
                 "input_names": [str(payload["input_name"]) for payload in payloads],
+                "input_digests": {
+                    str(key): str(value) for key, value in input_digests.items()
+                },
+                "publication_key": publication_key,
             },
             runtime_image_key="af3score-gpu",
             compatibility_key=f"{run_name}:{batch_name}",

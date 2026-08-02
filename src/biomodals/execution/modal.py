@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from threading import Lock
 from typing import Any
 from uuid import UUID
 
@@ -138,6 +139,34 @@ def execution_coordinator_identity(
         deployment_name=parameters.deployment_name,
         deployment_version=parameters.deployment_version,
     )
+
+
+def initialize_execution_coordinator_host(host: Any) -> None:
+    """Initialize one concurrent Modal coordinator container."""
+    host._coordinator_adapter = None
+    host._development = None
+    host._coordinator_adapter_lock = Lock()
+
+
+def execution_coordinator_adapter[T](
+    host: Any,
+    *,
+    development: bool | None,
+    factory: Callable[[bool], T],
+) -> T:
+    """Return the one mode-pinned adapter owned by a coordinator container."""
+    with host._coordinator_adapter_lock:
+        adapter = host._coordinator_adapter
+        selected_mode = host._development
+        if adapter is not None:
+            if development is not None and selected_mode != development:
+                raise ValueError("Coordinator execution mode cannot change in place")
+            return adapter
+        selected_mode = False if development is None else development
+        adapter = factory(selected_mode)
+        host._coordinator_adapter = adapter
+        host._development = selected_mode
+        return adapter
 
 
 def _coordinator_parameters(

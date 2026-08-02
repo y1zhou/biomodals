@@ -4,6 +4,8 @@
 
 import asyncio
 from dataclasses import replace
+from threading import Thread
+from time import sleep
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -19,8 +21,10 @@ from biomodals.execution.modal import (
     ModalSubmissionOutcomeUnknownError,
     deployed_execution_coordinator,
     development_modal_call_driver,
+    execution_coordinator_adapter,
     execution_coordinator_handle,
     execution_coordinator_identity,
+    initialize_execution_coordinator_host,
 )
 
 from .provider_call_helpers import GPU_BINDING
@@ -111,6 +115,38 @@ def test_coordinator_identity_reads_standard_modal_parameters() -> None:
 
     assert execution_run_id == UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     assert deployment == DeploymentIdentity("production", "AlphaFold3", 11)
+
+
+def test_concurrent_coordinator_inputs_share_one_adapter() -> None:
+    host = SimpleNamespace()
+    initialize_execution_coordinator_host(host)
+    created: list[object] = []
+    results: list[object] = []
+
+    def factory(_development: bool) -> object:
+        adapter = object()
+        created.append(adapter)
+        sleep(0.02)
+        return adapter
+
+    def resolve() -> None:
+        results.append(
+            execution_coordinator_adapter(
+                host,
+                development=False,
+                factory=factory,
+            )
+        )
+
+    threads = [Thread(target=resolve) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(created) == 1
+    assert results == created * 8
 
 
 def test_driver_resolves_exact_version_and_spawns_detached_call() -> None:

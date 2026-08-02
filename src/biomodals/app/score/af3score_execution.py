@@ -7,7 +7,6 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from shutil import copyfile
 from typing import Any, cast
 from uuid import UUID
 
@@ -34,7 +33,7 @@ from biomodals.helper.app_execution import (
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
 )
-from biomodals.helper.app_run import AppRunLayout, has_completed_output_files
+from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
@@ -128,6 +127,11 @@ class AF3ScoreExecutionRequest:
     def input_names(self) -> tuple[str, ...]:
         """Return staged input names in deterministic encounter order."""
         return tuple(name for name, _digest in self.inputs)
+
+    @property
+    def input_digests(self) -> dict[str, str]:
+        """Return input digests keyed by the output directory identifier."""
+        return {Path(name).stem: digest for name, digest in self.inputs}
 
     @property
     def execution_plan(self) -> ExecutionPlan:
@@ -366,11 +370,14 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._node_observation(node_key)
 
     def _output_complete(self, input_id: str) -> bool:
-        return has_completed_output_files(
+        digest = self.request.input_digests.get(input_id)
+        if digest is None:
+            return False
+        return _workload_module()._input_publication_ready(
             self.layout.outputs_dir,
             input_id,
-            sample_subdir=COMPLETION_SAMPLE_SUBDIR,
-            required_files=COMPLETION_REQUIRED_FILES,
+            publication_key=self.request.execution_plan.workload_plan_fingerprint,
+            input_sha256=digest,
         )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
@@ -649,6 +656,10 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             return {
                 "run_name": self.request.run_name,
                 "input_files": list(self.request.input_names),
+                "input_digests": self.request.input_digests,
+                "publication_key": (
+                    self.request.execution_plan.workload_plan_fingerprint
+                ),
                 "num_jobs": self.request.max_batches,
                 "prepare_workers": self.request.prepare_workers,
             }
@@ -656,6 +667,7 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             return {
                 "run_name": self.request.run_name,
                 "input_files": list(self.request.input_names),
+                "input_digests": self.request.input_digests,
                 "publication_key": (
                     self.request.execution_plan.workload_plan_fingerprint
                 ),
@@ -671,6 +683,8 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             "batch_name": chunk["batch_name"],
             "batch_json_dir": chunk["batch_json_dir"],
             "batch_pdb_dir": chunk["batch_pdb_dir"],
+            "input_digests": self.request.input_digests,
+            "publication_key": self.request.execution_plan.workload_plan_fingerprint,
         }
 
     def _ensure_output_claim(self) -> None:
@@ -702,14 +716,21 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             source = source_dir / name
             if source.is_symlink() or not source.is_file():
                 raise FileNotFoundError(f"Staged AF3Score input is missing: {source}")
-            if sha256(source.read_bytes()).hexdigest() != expected_digest:
-                raise ValueError(f"Staged AF3Score input digest changed: {name}")
             destination = self.layout.inputs_dir / name
             temporary = destination.with_name(
                 f".{destination.name}.{self.execution_run_id}.tmp"
             )
-            copyfile(source, temporary)
-            temporary.replace(destination)
+            digest = sha256()
+            try:
+                with source.open("rb") as reader, temporary.open("wb") as writer:
+                    while chunk := reader.read(1024 * 1024):
+                        digest.update(chunk)
+                        writer.write(chunk)
+                if digest.hexdigest() != expected_digest:
+                    raise ValueError(f"Staged AF3Score input digest changed: {name}")
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
 
 
 def _result_envelope(result: object) -> dict[str, object]:

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+from shutil import copyfile
 from typing import Any, cast
 from uuid import UUID
 
@@ -40,7 +41,7 @@ from biomodals.helper.output_claim import (
 )
 from biomodals.helper.shell import sanitize_filename
 
-REQUEST_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 PREPARE_NODE = "prepare"
 BATCHES_NODE = "score-batches"
@@ -92,6 +93,7 @@ class AF3ScoreExecutionRequest:
 
     run_name: str
     inputs: tuple[tuple[str, str], ...]
+    staged_input_execution_run_id: str
     prepare_workers: int
     max_batches: int
     app_version: str
@@ -111,6 +113,12 @@ class AF3ScoreExecutionRequest:
                 raise ValueError("AF3Score input names must be PDB filenames")
             if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
                 raise ValueError("AF3Score input digests must be lowercase SHA-256")
+        try:
+            staged_run_id = UUID(self.staged_input_execution_run_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("AF3Score staged input Run ID must be a UUID") from error
+        if str(staged_run_id) != self.staged_input_execution_run_id:
+            raise ValueError("AF3Score staged input Run ID must be canonical")
         if self.prepare_workers < 1 or self.max_batches < 1:
             raise ValueError("AF3Score worker limits must be positive")
         if not self.app_version:
@@ -156,6 +164,7 @@ class AF3ScoreExecutionRequest:
                 "schema_version": REQUEST_SCHEMA_VERSION,
                 "run_name": self.run_name,
                 "inputs": [list(item) for item in self.inputs],
+                "staged_input_execution_run_id": self.staged_input_execution_run_id,
                 "prepare_workers": self.prepare_workers,
                 "max_batches": self.max_batches,
                 "app_version": self.app_version,
@@ -192,6 +201,19 @@ def stage_execution_request(
 ) -> PurePosixPath:
     """Idempotently stage a request before coordinator launch."""
     return _REQUEST_FILE.stage(output_volume, execution_run_id, request.to_bytes())
+
+
+def stage_execution_inputs(
+    output_volume: Any,
+    execution_run_id: UUID,
+    input_files: tuple[Path, ...],
+) -> PurePosixPath:
+    """Stage root inputs below the immutable Execution Run namespace."""
+    directory = _REQUEST_FILE.path(execution_run_id).parent / "inputs"
+    with output_volume.batch_upload(force=False) as batch:
+        for path in input_files:
+            batch.put_file(path, f"/{directory}/{path.name}")
+    return directory
 
 
 def persist_execution_request(
@@ -678,7 +700,32 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             owner=str(self.execution_run_id),
             replace_owner=self.request.replace_claim_owner,
         )
+        self._materialize_inputs()
         self._claim_acquired = True
+
+    def _materialize_inputs(self) -> None:
+        """Validate and publish this Run's private inputs after claim ownership."""
+        source_dir = (
+            self.output_root
+            / ".biomodals"
+            / "execution"
+            / "runs"
+            / self.request.staged_input_execution_run_id
+            / "inputs"
+        )
+        self.layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+        for name, expected_digest in self.request.inputs:
+            source = source_dir / name
+            if source.is_symlink() or not source.is_file():
+                raise FileNotFoundError(f"Staged AF3Score input is missing: {source}")
+            if sha256(source.read_bytes()).hexdigest() != expected_digest:
+                raise ValueError(f"Staged AF3Score input digest changed: {name}")
+            destination = self.layout.inputs_dir / name
+            temporary = destination.with_name(
+                f".{destination.name}.{self.execution_run_id}.tmp"
+            )
+            copyfile(source, temporary)
+            temporary.replace(destination)
 
 
 def _result_envelope(result: object) -> dict[str, object]:

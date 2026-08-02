@@ -137,7 +137,7 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
 
     class FakeBatch:
         def put_file(self, source, destination):
-            captured["upload"] = (source, destination)
+            captured["upload"] = (source.name, source.read_bytes(), destination)
 
     class FakeVolume:
         @contextmanager
@@ -202,9 +202,17 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
     )
 
     assert captured["run_id"] == execution_run_id
+    assert captured["force"] is False
+    uploaded_name, uploaded_content, uploaded_destination = captured["upload"]
+    assert uploaded_name == input_pdb.name
+    assert uploaded_content == input_pdb.read_bytes()
+    assert uploaded_destination == (
+        f"/.biomodals/execution/runs/{execution_run_id}/inputs/input.pdb"
+    )
     assert captured["request"].inputs == (
         ("input.pdb", captured["request"].inputs[0][1]),
     )
+    assert captured["request"].staged_input_execution_run_id == str(execution_run_id)
     assert captured["request"].max_batches == 2
     assert captured["run_kwargs"] == {"development": True}
     assert output_dir.joinpath("scores_af3score_metrics.csv").is_file()

@@ -34,6 +34,7 @@ from biomodals.app.score.af3score_execution import (
     ChunkSpec,
     TaskSpec,
     load_execution_request,
+    stage_execution_inputs,
     stage_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
@@ -690,29 +691,26 @@ def submit_af3score_task(
             CONF.output_volume_name,
         )
         print(f"🧬 Uploading '{input_root}' to {remote_run_dir}")
-        stage_root = layout.inputs_dir.relative_to(mount_root)
-        if predecessor_execution_run_id is None:
-            with CONF.output_volume.batch_upload(force=force) as batch:
-                if num_files == 1:
-                    path = all_files[0]
-                    batch.put_file(path, f"/{stage_root}/{path.name}")
-                else:
-                    batch.put_directory(all_files[0].parent, f"/{stage_root}/")
-
+        execution_run_id = uuid4()
         request = AF3ScoreExecutionRequest(
             run_name=run_name,
             inputs=tuple(
                 (path.name, sha256(path.read_bytes()).hexdigest()) for path in all_files
             ),
+            staged_input_execution_run_id=str(execution_run_id),
             prepare_workers=prepare_workers,
             max_batches=max_batches,
             app_version=CONF.repo_commit_hash or CONF.version or "unknown",
         )
-        execution_run_id = uuid4()
         deployment = DeploymentIdentity(
             deployment_environment,
             deployment_name,
             deployment_version,
+        )
+        stage_execution_inputs(
+            CONF.output_volume,
+            execution_run_id,
+            tuple(all_files),
         )
         stage_execution_request(CONF.output_volume, execution_run_id, request)
         coordinator = _execution_coordinator_handle(

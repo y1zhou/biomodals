@@ -140,16 +140,18 @@ def run_rosetta_worker(
                 "error": str(error) or type(error).__name__,
             }
 
-    def complete(
-        assignment: WorkerAssignmentRecord,
-        request_id: str,
-        result: dict[str, object],
+    def complete_batch(
+        completions: tuple[
+            tuple[WorkerAssignmentRecord, str, dict[str, object]],
+            ...,
+        ],
     ) -> None:
-        coordinator.complete_task.remote(
+        coordinator.complete_tasks.remote(
             provider_call_id,
-            assignment.task_key,
-            request_id,
-            result,
+            tuple(
+                (assignment.task_key, request_id, result)
+                for assignment, request_id, result in completions
+            ),
         )
 
     summary = drive_pull_worker(
@@ -157,7 +159,7 @@ def run_rosetta_worker(
         claim_capacity=claim_capacity,
         claim=claim,
         execute=execute,
-        complete=complete,
+        complete_batch=complete_batch,
         checkpoint_batch=CONF.output_volume.commit,
         max_parallel=max_parallel,
     )
@@ -297,19 +299,18 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def complete_task(
+    def complete_tasks(
         self,
         provider_call_id: str,
-        task_key: str,
-        request_id: str,
-        result: dict[str, object],
+        completions: tuple[
+            tuple[str, str, dict[str, object]],
+            ...,
+        ],
     ):
-        """Validate and checkpoint one pull Task result."""
-        return self._adapter().complete_task(
+        """Validate and checkpoint one pull Task result microbatch."""
+        return self._adapter().complete_tasks(
             UUID(provider_call_id),
-            task_key,
-            request_id=request_id,
-            result=result,
+            completions,
         )
 
     @modal.exit()

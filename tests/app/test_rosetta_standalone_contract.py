@@ -187,8 +187,11 @@ def test_rosetta_worker_uses_app_run_layout(
             assignments=assignments,
         )
 
-    def complete(provider_call_id, task_key, request_id, result):
-        completions.append((provider_call_id, task_key, request_id, result))
+    def complete(provider_call_id, batch):
+        completions.extend(
+            (provider_call_id, task_key, request_id, result)
+            for task_key, request_id, result in batch
+        )
 
     output_volume = FakeVolume()
     monkeypatch.setattr(
@@ -201,7 +204,7 @@ def test_rosetta_worker_uses_app_run_layout(
     )
     coordinator = SimpleNamespace(
         claim_tasks=SimpleNamespace(remote=claim),
-        complete_task=SimpleNamespace(remote=complete),
+        complete_tasks=SimpleNamespace(remote=complete),
     )
 
     def fake_run_command(cmd, *, output_mode, log_file):

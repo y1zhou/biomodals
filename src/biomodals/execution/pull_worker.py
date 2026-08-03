@@ -12,6 +12,8 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
 )
 
+type PullWorkerCompletion[Result] = tuple[WorkerAssignmentRecord, str, Result]
+
 
 @dataclass(frozen=True)
 class PullWorkerSummary:
@@ -27,7 +29,7 @@ def drive_pull_worker[Result](
     claim_capacity: int,
     claim: Callable[[str, int], PullTaskClaim],
     execute: Callable[[WorkerAssignmentRecord], Result],
-    complete: Callable[[WorkerAssignmentRecord, str, Result], None],
+    complete_batch: Callable[[tuple[PullWorkerCompletion[Result], ...]], None],
     checkpoint_batch: Callable[[], None] | None = None,
     max_parallel: int | None = None,
 ) -> PullWorkerSummary:
@@ -60,10 +62,15 @@ def drive_pull_worker[Result](
             results = tuple(executor.map(execute, assignments))
         if checkpoint_batch is not None:
             checkpoint_batch()
-        for assignment, result in zip(assignments, results, strict=True):
-            completion_request_id = (
-                f"{provider_call_id}:complete:{assignment.task_fingerprint}"
+        complete_batch(
+            tuple(
+                (
+                    assignment,
+                    f"{provider_call_id}:complete:{assignment.task_fingerprint}",
+                    result,
+                )
+                for assignment, result in zip(assignments, results, strict=True)
             )
-            complete(assignment, completion_request_id, result)
+        )
         claimed_tasks += len(assignments)
         claim_ordinal += 1

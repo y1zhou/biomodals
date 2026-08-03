@@ -230,17 +230,7 @@ class ExecutionRuntime:
     def required_node_keys(self, execution_run_id: UUID) -> tuple[str, ...] | None:
         """Derive the result-driven closure from durable Node observations."""
         with self._synchronize():
-            plan = self.repository.get_run(execution_run_id).plan
-            nodes = self.repository.list_nodes(execution_run_id)
-        observations = {
-            node.node_key: (
-                AvailabilityStatus.AVAILABLE
-                if node.status == NodeStatus.SUCCEEDED
-                else node.result_observation or AvailabilityStatus.MISSING
-            )
-            for node in nodes
-        }
-        return required_node_keys(plan, observations)
+            return _required_node_keys_for_run(self.repository, execution_run_id)
 
     def advance_once(
         self,
@@ -252,18 +242,22 @@ class ExecutionRuntime:
         start_ready_nodes: Callable[[set[str]], None],
         admit_remote_tasks: Callable[[set[str]], None],
         after_start_ready_nodes: Callable[[], None] | None = None,
+        reconcile_results: Callable[[], None] | None = None,
         now: Callable[[], int],
     ) -> None:
         """Apply one result-driven reconciliation and admission cycle."""
+        reconcile = reconcile_results or (
+            lambda: self.reconcile_nodes_and_run(execution_run_id, now=now())
+        )
         recover_publications()
-        self.reconcile_nodes_and_run(execution_run_id, now=now())
+        reconcile()
         with self._synchronize():
             run = self.repository.get_run(execution_run_id)
         if run.status == RunStatus.CANCEL_REQUESTED:
             reconcile_provider_calls(set(run.plan.node_keys))
             decode_completed_calls()
             recover_publications()
-            self.reconcile_nodes_and_run(execution_run_id, now=now())
+            reconcile()
             return
         if run.status == RunStatus.STATE_UNKNOWN:
             required = self.required_node_keys(execution_run_id)
@@ -277,7 +271,7 @@ class ExecutionRuntime:
             reconcile_provider_calls(required_nodes)
             decode_completed_calls()
             recover_publications()
-            self.reconcile_nodes_and_run(execution_run_id, now=now())
+            reconcile()
             return
         if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
             return
@@ -292,7 +286,7 @@ class ExecutionRuntime:
         reconcile_provider_calls(set(required))
         decode_completed_calls()
         recover_publications()
-        self.reconcile_nodes_and_run(execution_run_id, now=now())
+        reconcile()
         with self._synchronize():
             can_continue = self.repository.get_run(execution_run_id).status in {
                 RunStatus.PENDING,
@@ -307,7 +301,7 @@ class ExecutionRuntime:
         required = self.required_node_keys(execution_run_id)
         if required is not None:
             admit_remote_tasks(set(required))
-        self.reconcile_nodes_and_run(execution_run_id, now=now())
+        reconcile()
 
     def recover_publications(
         self,
@@ -997,18 +991,38 @@ class ExecutionRuntime:
         now: int,
     ) -> ExecutionTaskRecord:
         """Checkpoint one idempotent worker publication report."""
+        return self.record_pull_task_completions(
+            provider_call_id,
+            ((task_key, request_id, observation, message),),
+            now=now,
+        )[0]
+
+    def record_pull_task_completions(
+        self,
+        provider_call_id: UUID,
+        completions: Collection[tuple[str, str, AvailabilityStatus, str | None]],
+        *,
+        now: int,
+    ) -> tuple[ExecutionTaskRecord, ...]:
+        """Checkpoint one idempotent worker publication microbatch."""
+        items = tuple(completions)
+        if not items:
+            return ()
         with self._synchronize():
             with self._transaction():
-                task = self.repository.record_pull_task_completion(
-                    provider_call_id,
-                    task_key,
-                    request_id=request_id,
-                    observation=observation,
-                    message=message,
-                    now=now,
+                tasks = tuple(
+                    self.repository.record_pull_task_completion(
+                        provider_call_id,
+                        task_key,
+                        request_id=request_id,
+                        observation=observation,
+                        message=message,
+                        now=now,
+                    )
+                    for task_key, request_id, observation, message in items
                 )
             self._checkpoint_state()
-        return task
+        return tasks
 
     def reconcile_provider_calls(
         self,

@@ -288,24 +288,20 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def complete_task(
+    def complete_tasks(
         self,
         provider_call_id: str,
-        task_key: str,
-        request_id: str,
-        result: AppRunResult,
+        completions: tuple[tuple[str, str, AppRunResult], ...],
     ) -> Any:
-        """Publish and checkpoint one pull-worker Task completion."""
+        """Publish and checkpoint one pull-worker Task completion microbatch."""
         with self._lock():
             self._require_ledger()
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
         runtime.refresh_publications(workload_run_key=plan.workload_run_key)
-        return runtime.complete_pull_task(
+        return runtime.complete_pull_tasks(
             UUID(provider_call_id),
-            task_key,
-            request_id=request_id,
-            result=result,
+            completions,
         )
 
     @modal.method()

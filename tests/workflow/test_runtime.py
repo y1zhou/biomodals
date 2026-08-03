@@ -903,6 +903,7 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
         max_calls=2,
         max_gpu_calls=0,
         pull_worker_coordinator="run-pool",
+        volume=(volume := FakeVolume()),
     )
     definition = workflow.validate()
     runtime._definition = definition
@@ -920,13 +921,19 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
             request_id=f"claim-{call_index}",
             capacity=2,
         )
-        for assignment in claim.assignments:
-            runtime.complete_pull_task(
-                call.provider_call_id,
-                assignment.task_key,
-                request_id=f"complete-{assignment.task_key}",
-                result=_text_result(str(dict(assignment.execution_payload)["text"])),
-            )
+        commits = volume.commits
+        runtime.complete_pull_tasks(
+            call.provider_call_id,
+            tuple(
+                (
+                    assignment.task_key,
+                    f"complete-{assignment.task_key}",
+                    _text_result(str(dict(assignment.execution_payload)["text"])),
+                )
+                for assignment in claim.assignments
+            ),
+        )
+        assert volume.commits == commits + 1
 
     runtime.advance_once()
 

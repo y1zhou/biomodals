@@ -96,7 +96,6 @@ from biomodals.execution import (
     ProviderCallRecord,
     ProviderCallStatus,
     ProviderCallSubmission,
-    RunStatus,
     TaskPlan,
     ready_node_keys,
     result_probe_frontier,
@@ -208,34 +207,17 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def advance_once(self) -> None:
         """Apply one AlphaFold3-specific scheduling and publication cycle."""
-        self._recover_publications()
-        required = self._required_nodes()
-        if required is None:
-            return
-        calls_to_cancel = self._prune_unrequired(required)
-        for provider_call_id in calls_to_cancel:
-            self._provider.request_provider_call_cancellation(
-                provider_call_id,
-                now=self._now(),
-            )
-
-        self._reconcile_provider_calls(required)
-        self._publish_request_receipt()
-        self._recover_task_publications()
-        self._reconcile_nodes_and_run()
-        with self.store.synchronize():
-            run = self.store.execution.get_run(self.execution_run_id)
-        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-            return
-
-        self._start_ready_nodes()
-        self._run_local_tasks()
-        self._publish_request_receipt()
-        self._recover_task_publications()
-        required = self._required_nodes()
-        if required is not None:
-            self._admit_remote_tasks(set(required))
-        self._reconcile_nodes_and_run()
+        self._provider.advance_once(
+            self.execution_run_id,
+            recover_publications=self._recover_cycle_publications,
+            reconcile_provider_calls=self._reconcile_provider_calls,
+            decode_completed_calls=lambda: None,
+            start_ready_nodes=lambda _required: self._start_ready_nodes(),
+            after_start_ready_nodes=self._run_local_tasks,
+            admit_remote_tasks=self._admit_remote_tasks,
+            reconcile_results=self._reconcile_nodes_and_run,
+            now=self._now,
+        )
 
     def _initialize(self):
         self._provider.create_or_verify_run(
@@ -288,6 +270,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             ):
                 return
 
+    def _recover_cycle_publications(self) -> None:
+        """Recover Node, request-receipt, and Task publications."""
+        self._recover_publications()
+        self._publish_request_receipt()
+        self._recover_task_publications()
+
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         """Validate one complete Node result without admitting its Tasks."""
         try:
@@ -332,22 +320,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             else AvailabilityStatus.MISSING
         )
 
-    def _required_nodes(self) -> tuple[str, ...] | None:
-        return self._provider.required_node_keys(self.execution_run_id)
-
-    def _prune_unrequired(self, required: tuple[str, ...]) -> tuple[UUID, ...]:
-        with self.store.synchronize():
-            with self.store.transaction():
-                calls = self.store.execution.prune_unrequired_nodes(
-                    self.execution_run_id,
-                    required_node_keys=set(required),
-                    now=self._now(),
-                )
-            if calls:
-                self._checkpoint()
-        return calls
-
-    def _reconcile_provider_calls(self, required: tuple[str, ...]) -> None:
+    def _reconcile_provider_calls(self, required: set[str]) -> None:
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,

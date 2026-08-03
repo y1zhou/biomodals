@@ -117,51 +117,71 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         result: Mapping[str, object],
     ):
         """Validate one worker publication and checkpoint its completion."""
+        return self.complete_pull_tasks(
+            provider_call_id,
+            ((task_key, request_id, result),),
+        )[0]
+
+    def complete_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[
+            tuple[str, str, Mapping[str, object]],
+            ...,
+        ],
+    ):
+        """Validate and checkpoint one worker publication microbatch."""
+        if not completions:
+            return ()
         with self.store.synchronize():
             call = self.store.execution.get_provider_call(
                 provider_call_id,
                 include_task_keys=False,
             )
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                ROSETTA_TASKS_NODE,
-                task_key,
-            )
+            tasks = {
+                task_key: self.store.execution.get_task(
+                    self.execution_run_id,
+                    ROSETTA_TASKS_NODE,
+                    task_key,
+                )
+                for task_key, _request_id, _result in completions
+            }
         if call.node_key != ROSETTA_TASKS_NODE:
             raise ValueError("Provider Call does not belong to Rosetta Tasks")
-        status = result.get("status")
-        message = result.get("error")
-        if not isinstance(status, str):
-            raise TypeError("Rosetta worker result has no status")
-        if message is not None and not isinstance(message, str):
-            raise TypeError("Rosetta worker error must be text")
-        observation = AvailabilityStatus.MISSING
-        if status == "succeeded":
-            spec = self._task_specs()[task_key]
-            try:
-                observation = (
-                    AvailabilityStatus.AVAILABLE
-                    if validate_task_publication(
-                        self.run_root,
-                        spec,
-                        task.fingerprint,
+        specs = self._task_specs()
+        observations = []
+        for task_key, request_id, result in completions:
+            task = tasks[task_key]
+            status = result.get("status")
+            message = result.get("error")
+            if not isinstance(status, str):
+                raise TypeError("Rosetta worker result has no status")
+            if message is not None and not isinstance(message, str):
+                raise TypeError("Rosetta worker error must be text")
+            observation = AvailabilityStatus.MISSING
+            if status == "succeeded":
+                try:
+                    observation = (
+                        AvailabilityStatus.AVAILABLE
+                        if validate_task_publication(
+                            self.run_root,
+                            specs[task_key],
+                            task.fingerprint,
+                        )
+                        else AvailabilityStatus.MISSING
                     )
-                    else AvailabilityStatus.MISSING
-                )
-            except OSError:
-                observation = AvailabilityStatus.UNKNOWN
-            if observation == AvailabilityStatus.MISSING:
-                message = "Rosetta worker returned without a valid publication"
-            elif observation == AvailabilityStatus.UNKNOWN:
-                message = "Rosetta worker publication could not be validated"
-        elif status != "failed":
-            raise ValueError(f"Unknown Rosetta worker status {status!r}")
-        return self._provider.record_pull_task_completion(
+                except OSError:
+                    observation = AvailabilityStatus.UNKNOWN
+                if observation == AvailabilityStatus.MISSING:
+                    message = "Rosetta worker returned without a valid publication"
+                elif observation == AvailabilityStatus.UNKNOWN:
+                    message = "Rosetta worker publication could not be validated"
+            elif status != "failed":
+                raise ValueError(f"Unknown Rosetta worker status {status!r}")
+            observations.append((task_key, request_id, observation, message))
+        return self._provider.record_pull_task_completions(
             provider_call_id,
-            task_key,
-            request_id=request_id,
-            observation=observation,
-            message=message,
+            observations,
             now=self._now(),
         )
 

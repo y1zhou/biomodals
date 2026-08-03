@@ -78,15 +78,15 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             capacity=capacity,
         )
 
-    def complete_task(
+    def complete_tasks(
         self,
         provider_call_id: UUID,
-        task_key: str,
-        *,
-        request_id: str,
-        result: dict[str, object],
+        completions: tuple[
+            tuple[str, str, dict[str, object]],
+            ...,
+        ],
     ):
-        """Validate and checkpoint one worker completion."""
+        """Validate and checkpoint one worker completion microbatch."""
         with self._writer_lock:
             request = load_execution_request(
                 self.volume_root,
@@ -97,11 +97,9 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 predecessor_execution_run_id=self._existing_predecessor(),
             )
         runtime.refresh_publications()
-        return runtime.complete_pull_task(
+        return runtime.complete_pull_tasks(
             provider_call_id,
-            task_key,
-            request_id=request_id,
-            result=result,
+            completions,
         )
 
     def prepare_restart(

@@ -33,6 +33,7 @@ def test_pull_worker_replays_stable_request_ids_and_drains_until_empty() -> None
     ]
     claim_calls = []
     completion_calls = []
+    completion_batch_sizes = []
 
     def claim(request_id: str, capacity: int) -> PullTaskClaim:
         claim_calls.append((request_id, capacity))
@@ -42,16 +43,19 @@ def test_pull_worker_replays_stable_request_ids_and_drains_until_empty() -> None
             assignments=claims[len(claim_calls) - 1],
         )
 
+    def complete_batch(completions) -> None:
+        completion_batch_sizes.append(len(completions))
+        completion_calls.extend(
+            (assignment.task_key, request_id, result)
+            for assignment, request_id, result in completions
+        )
+
     summary = drive_pull_worker(
         provider_call_id=CALL_ID,
         claim_capacity=2,
         claim=claim,
         execute=lambda assignment: str(assignment.execution_payload["index"]),
-        complete=lambda assignment, request_id, result: completion_calls.append((
-            assignment.task_key,
-            request_id,
-            result,
-        )),
+        complete_batch=complete_batch,
         max_parallel=2,
     )
 
@@ -65,6 +69,7 @@ def test_pull_worker_replays_stable_request_ids_and_drains_until_empty() -> None
         ("task-1", f"{CALL_ID}:complete:fingerprint-task-1", "2"),
         ("task-2", f"{CALL_ID}:complete:fingerprint-task-2", "1"),
     ]
+    assert completion_batch_sizes == [2, 1]
     assert summary.claimed_tasks == 3
     assert summary.claim_requests == 3
 
@@ -95,8 +100,9 @@ def test_pull_worker_checkpoints_each_completed_microbatch_before_reporting() ->
         claim=claim,
         execute=lambda assignment: events.append(f"execute:{assignment.task_key}"),
         checkpoint_batch=lambda: events.append("checkpoint"),
-        complete=lambda assignment, request_id, result: events.append(
+        complete_batch=lambda completions: events.extend(
             f"complete:{assignment.task_key}"
+            for assignment, _request_id, _result in completions
         ),
         max_parallel=1,
     )

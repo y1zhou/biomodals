@@ -1556,3 +1556,47 @@ def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
     assert [assignment.task_key for assignment in claim.assignments] == ["seed-0"]
     assert completed.status.value == "succeeded"
     assert checkpoints == ["checkpoint"] * 4
+
+
+def test_pull_completion_microbatch_crosses_one_checkpoint() -> None:
+    repository = create_repository(task_count=2)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=2,
+    )
+    checkpoints: list[str] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: checkpoints.append("checkpoint"),
+    )
+    call = _submit_pull_worker(
+        runtime,
+        node_key="inference",
+        submission_token="worker-0",
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=2,
+        now=110,
+    )
+    assert call is not None
+    runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim-0",
+        capacity=2,
+        now=111,
+    )
+
+    completed = runtime.record_pull_task_completions(
+        call.provider_call_id,
+        (
+            ("seed-0", "complete-0", AvailabilityStatus.AVAILABLE, None),
+            ("seed-1", "complete-1", AvailabilityStatus.AVAILABLE, None),
+        ),
+        now=112,
+    )
+
+    assert [task.status.value for task in completed] == ["succeeded", "succeeded"]
+    assert checkpoints == ["checkpoint"] * 4

@@ -219,62 +219,20 @@ class WorkflowRuntime:
     def advance_once(self) -> None:
         """Apply one caller-driven workflow scheduling cycle."""
         definition = self._require_definition()
-        self._recover_publications()
-        self._reconcile_nodes_and_run()
-
-        with self.store.synchronize():
-            run = self.store.execution.get_run(self.execution_run_id)
-        if run.status == RunStatus.CANCEL_REQUESTED:
-            self._reconcile_provider_calls(set(run.plan.node_keys))
-            self._recover_publications()
-            self._reconcile_nodes_and_run()
-            return
-        if run.status == RunStatus.STATE_UNKNOWN:
-            required = self._required_nodes()
-            if required is None:
-                required_nodes = set(run.plan.node_keys)
-            else:
-                required_nodes = required
-                for provider_call_id in self._prune_unrequired(required):
-                    self._provider.request_provider_call_cancellation(
-                        provider_call_id,
-                        now=self._now(),
-                    )
-            self._reconcile_provider_calls(required_nodes)
-            self._recover_publications()
-            self._reconcile_nodes_and_run()
-            return
-        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-            return
-        required = self._required_nodes()
-        if required is None:
-            return
-
-        calls_to_cancel = self._prune_unrequired(required)
-        for provider_call_id in calls_to_cancel:
-            self._provider.request_provider_call_cancellation(
-                provider_call_id,
-                now=self._now(),
-            )
-
-        self._reconcile_provider_calls(required)
-        self._reconcile_nodes_and_run()
-        with self.store.synchronize():
-            can_continue = self.store.execution.get_run(
-                self.execution_run_id
-            ).status in {
-                RunStatus.PENDING,
-                RunStatus.RUNNING,
-            }
-        if not can_continue:
-            return
-
-        self._start_ready_nodes(definition)
-        self._run_local_tasks(definition)
-        required = self._required_nodes()
-        if required is not None:
-            self._admit_remote_tasks(definition, required)
-        self._reconcile_nodes_and_run()
+        self._provider.advance_once(
+            self.execution_run_id,
+            recover_publications=self._recover_publications,
+            reconcile_provider_calls=self._reconcile_provider_calls,
+            decode_completed_calls=lambda: None,
+            start_ready_nodes=lambda _required: self._start_ready_nodes(definition),
+            after_start_ready_nodes=lambda: self._run_local_tasks(definition),
+            admit_remote_tasks=lambda required: self._admit_remote_tasks(
+                definition,
+                required,
+            ),
+            reconcile_results=self._reconcile_nodes_and_run,
+            now=self._now,
+        )
 
     def cancel(self) -> None:
         """Request cancellation through the shared provider lifecycle."""
@@ -312,85 +270,115 @@ class WorkflowRuntime:
         result: AppRunResult,
     ) -> ExecutionTaskRecord:
         """Publish one worker result and checkpoint its idempotent completion."""
-        result = AppRunResult.model_validate(result)
+        return self.complete_pull_tasks(
+            provider_call_id,
+            ((task_key, request_id, result),),
+        )[0]
+
+    def complete_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[tuple[str, str, AppRunResult], ...],
+    ) -> tuple[ExecutionTaskRecord, ...]:
+        """Publish and checkpoint one worker result microbatch."""
+        if not completions:
+            return ()
+        validated = tuple(
+            (task_key, request_id, AppRunResult.model_validate(result))
+            for task_key, request_id, result in completions
+        )
         with self.store.synchronize():
             call = self.store.execution.get_provider_call(
                 provider_call_id,
                 include_task_keys=False,
             )
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                call.node_key,
-                task_key,
-            )
+            tasks = {
+                task_key: self.store.execution.get_task(
+                    self.execution_run_id,
+                    call.node_key,
+                    task_key,
+                )
+                for task_key, _request_id, _result in validated
+            }
         node = self._require_definition().nodes[call.node_key].node
         if not isinstance(node, RemotePullTaskWorkflowNode):
             raise ValueError("Provider Call does not belong to a pull-worker Node")
-        if result.status != AppRunStatus.SUCCEEDED:
-            with self.store.synchronize():
-                with self.store.transaction():
-                    completed = self.store.execution.record_pull_task_completion(
-                        provider_call_id,
-                        task_key,
-                        request_id=request_id,
-                        observation=AvailabilityStatus.MISSING,
-                        message=_node_error_message(result),
-                        now=self._now(),
-                    )
-                self._checkpoint()
-            return completed
-
-        context = self._node_context(
-            self._require_definition(),
-            call.node_key,
-            task_key=task_key,
-        )
-        materialized = materialize_app_run_result(
-            result=result,
-            workflow_volume_name=self.workflow_volume_name,
-            result_dir=context.work_dir,
-            artifact_dir=self.store.output_root / "artifacts",
-            producing_node_id=call.node_key,
-            artifact_id_scope=task_key,
-            volume_root=self.volume_root,
-        )
-        artifacts = tuple(materialized.artifacts)
-        observation = self._observe_remote_task_publication(
-            node,
-            context,
-            RemoteWorkflowTask(
-                task_key=task.task_key,
-                scientific_payload=task.scientific_payload,
-                execution_payload=task.execution_payload,
-            ),
-            task.fingerprint,
-            materialized.result,
-            artifacts,
-        )
+        prepared = []
+        for task_key, request_id, result in validated:
+            task = tasks[task_key]
+            if result.status != AppRunStatus.SUCCEEDED:
+                prepared.append((
+                    task,
+                    request_id,
+                    AvailabilityStatus.MISSING,
+                    _node_error_message(result),
+                    None,
+                ))
+                continue
+            context = self._node_context(
+                self._require_definition(),
+                call.node_key,
+                task_key=task_key,
+            )
+            materialized = materialize_app_run_result(
+                result=result,
+                workflow_volume_name=self.workflow_volume_name,
+                result_dir=context.work_dir,
+                artifact_dir=self.store.output_root / "artifacts",
+                producing_node_id=call.node_key,
+                artifact_id_scope=task_key,
+                volume_root=self.volume_root,
+            )
+            artifacts = tuple(materialized.artifacts)
+            observation = self._observe_remote_task_publication(
+                node,
+                context,
+                RemoteWorkflowTask(
+                    task_key=task.task_key,
+                    scientific_payload=task.scientific_payload,
+                    execution_payload=task.execution_payload,
+                ),
+                task.fingerprint,
+                materialized.result,
+                artifacts,
+            )
+            prepared.append((
+                task,
+                request_id,
+                observation,
+                (
+                    "Published workflow Task result is unavailable"
+                    if observation == AvailabilityStatus.MISSING
+                    else None
+                ),
+                (materialized.result, artifacts),
+            ))
         with self.store.synchronize():
             with self.store.transaction():
-                self.store.artifacts.record_task_publication(
-                    call.node_key,
-                    task_key,
-                    task_fingerprint=task.fingerprint,
-                    result=materialized.result,
-                    artifacts=artifacts,
-                    now=self._now(),
-                )
-                completed = self.store.execution.record_pull_task_completion(
-                    provider_call_id,
-                    task_key,
-                    request_id=request_id,
-                    observation=observation,
-                    message=(
-                        "Published workflow Task result is unavailable"
-                        if observation == AvailabilityStatus.MISSING
-                        else None
-                    ),
-                    now=self._now(),
-                )
+                completed = []
+                for task, request_id, observation, message, publication in prepared:
+                    if publication is not None:
+                        result, artifacts = publication
+                        self.store.artifacts.record_task_publication(
+                            call.node_key,
+                            task.task_key,
+                            task_fingerprint=task.fingerprint,
+                            result=result,
+                            artifacts=artifacts,
+                            now=self._now(),
+                        )
+                    completed.append(
+                        self.store.execution.record_pull_task_completion(
+                            provider_call_id,
+                            task.task_key,
+                            request_id=request_id,
+                            observation=observation,
+                            message=message,
+                            now=self._now(),
+                        )
+                    )
             self._checkpoint()
-        return completed
+        return tuple(completed)
 
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""
@@ -579,22 +567,6 @@ class WorkflowRuntime:
                     observation,
                     now=self._now(),
                 )
-
-    def _required_nodes(self) -> set[str] | None:
-        required = self._provider.required_node_keys(self.execution_run_id)
-        return None if required is None else set(required)
-
-    def _prune_unrequired(self, required: set[str]) -> tuple[UUID, ...]:
-        with self.store.synchronize():
-            with self.store.transaction():
-                calls = self.store.execution.prune_unrequired_nodes(
-                    self.execution_run_id,
-                    required_node_keys=required,
-                    now=self._now(),
-                )
-            if calls:
-                self._checkpoint()
-        return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
         reconciled = self._provider.reconcile_provider_calls(

@@ -437,9 +437,13 @@ def test_backward_probe_stops_at_reusable_combined_msa(
     monkeypatch.setattr(runtime, "_node_observation", observe)
 
     runtime._recover_publications()
-    required = runtime._required_nodes()
+    required = runtime._provider.required_node_keys(RUN_ID)
     assert required is not None
-    runtime._prune_unrequired(required)
+    runtime._provider.prune_unrequired_nodes(
+        RUN_ID,
+        required_node_keys=required,
+        now=101,
+    )
 
     assert observed == [
         "request-publication",

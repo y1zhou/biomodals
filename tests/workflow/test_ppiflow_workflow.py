@@ -1270,12 +1270,15 @@ def test_rosetta_worker_claims_executes_and_checkpoints_microbatch(
             assignments=assignments,
         )
 
-    def complete(call_id, task_key, request_id, result):
-        completions.append((call_id, task_key, request_id, result))
+    def complete(call_id, batch):
+        completions.extend(
+            (call_id, task_key, request_id, result)
+            for task_key, request_id, result in batch
+        )
 
     coordinator = SimpleNamespace(
         claim_tasks=SimpleNamespace(remote=claim),
-        complete_task=SimpleNamespace(remote=complete),
+        complete_tasks=SimpleNamespace(remote=complete),
     )
     commits = []
     monkeypatch.setattr(

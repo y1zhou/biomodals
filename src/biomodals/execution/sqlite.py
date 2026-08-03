@@ -3082,28 +3082,19 @@ class SqliteExecutionRepository:
         node_key: str,
     ) -> int:
         """Validate and count unfinished pull Tasks without decoding payloads."""
-        recovery_rows = self._connection.execute(
+        invalid_task = self._connection.execute(
             """
-            SELECT task_key, status
+            SELECT task_key
             FROM execution_tasks
             WHERE execution_run_id = ?
                 AND node_key = ?
-                AND (
-                    status = 'running'
-                    OR (
-                        status = 'pending'
-                        AND result_observation IS NOT 'missing'
-                    )
-                )
+                AND status = 'pending'
+                AND result_observation IS NOT 'missing'
                 AND dispatch_policy_json IS NULL
-            ORDER BY ordinal
+            LIMIT 1
             """,
             (str(execution_run_id), node_key),
-        ).fetchall()
-        invalid_task = next(
-            (row for row in recovery_rows if row["status"] == TaskStatus.PENDING.value),
-            None,
-        )
+        ).fetchone()
         if invalid_task is not None:
             raise ValueError(
                 f"Task {invalid_task['task_key']!r} was not cache-validated"

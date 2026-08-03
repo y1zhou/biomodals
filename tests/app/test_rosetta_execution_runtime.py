@@ -196,15 +196,19 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
             request_id=f"claim-{ordinal}",
             capacity=2,
         )
+        completions = []
         for assignment in claim.assignments:
             claimed_keys.append(assignment.task_key)
             result = _publish_assignment(runtime, assignment)
-            runtime.complete_pull_task(
-                call.provider_call_id,
+            completions.append((
                 assignment.task_key,
-                request_id=f"complete-{assignment.task_key}",
-                result=result,
-            )
+                f"complete-{assignment.task_key}",
+                result,
+            ))
+        output = cast(FakeVolume, runtime.output_volume)
+        commits = output.commits
+        runtime.complete_pull_tasks(call.provider_call_id, tuple(completions))
+        assert output.commits == commits + 1
 
     assert claimed_keys == ["1", "2", "3"]
     driver.succeeded = True

@@ -172,6 +172,20 @@ def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:
         """,
         (str(RUN_ID), "inference", "pending", "running"),
     ).fetchall()
+    validation_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT task_key
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND status = 'pending'
+            AND result_observation IS NOT 'missing'
+            AND dispatch_policy_json IS NULL
+        LIMIT 1
+        """,
+        (str(RUN_ID), "inference"),
+    ).fetchall()
 
     assert any(
         "execution_tasks_unplanned_dispatch_idx" in str(row[3]) for row in claim_plan
@@ -180,6 +194,11 @@ def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:
         "execution_tasks_unplanned_dispatch_idx" in str(row[3])
         or "execution_tasks_publication_recovery_idx" in str(row[3])
         for row in count_plan
+    )
+    assert any(
+        "execution_tasks_unplanned_dispatch_idx" in str(row[3])
+        or "execution_tasks_publication_recovery_idx" in str(row[3])
+        for row in validation_plan
     )
 
 

@@ -1891,16 +1891,18 @@ def run_ppiflow_rosetta_worker(
             metrics={"candidate_id": task.candidate_id or task.task_key},
         )
 
-    def complete(
-        assignment: WorkerAssignmentRecord,
-        request_id: str,
-        result: AppRunResult,
+    def complete_batch(
+        completions: tuple[
+            tuple[WorkerAssignmentRecord, str, AppRunResult],
+            ...,
+        ],
     ) -> None:
-        coordinator.complete_task.remote(
+        coordinator.complete_tasks.remote(
             provider_call_id,
-            assignment.task_key,
-            request_id,
-            result,
+            tuple(
+                (assignment.task_key, request_id, result)
+                for assignment, request_id, result in completions
+            ),
         )
 
     summary = drive_pull_worker(
@@ -1908,7 +1910,7 @@ def run_ppiflow_rosetta_worker(
         claim_capacity=claim_capacity,
         claim=claim,
         execute=execute,
-        complete=complete,
+        complete_batch=complete_batch,
         checkpoint_batch=ROSETTA_OUTPUT_VOLUME.commit,
         max_parallel=max_parallel,
     )

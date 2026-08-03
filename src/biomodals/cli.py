@@ -354,7 +354,7 @@ def _entrypoint_help_parameters(
     """Return entrypoint parameters owned by the outer Biomodals CLI."""
     if list_type == "workflow":
         return _WORKFLOW_CLI_PARAMETERS
-    if function_name in _execution_coordinator_entrypoints(catalog_entry):
+    if function_name in catalog_entry.execution_coordinator_entrypoints:
         return _COORDINATOR_CLI_PARAMETERS
     return frozenset()
 
@@ -454,8 +454,12 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
             )
 
             if table_rows:
-                console.print(f"[bold green]{f.name}[/bold green] CLI flags:\n")
+                console.print(
+                    f"[bold green]{f.name}[/bold green] CLI flags:",
+                    end="",
+                )
                 console.print(Markdown("\n".join(table_rows)))
+                console.print()
             elif f.args_table:
                 console.print(
                     f"[bold green]{f.name}[/bold green] has no "
@@ -707,25 +711,12 @@ def run_modal_app(
         _show_entry_help("app", str(app.path), verbose=False)
 
 
-def _execution_coordinator_entrypoints(app: BiomodalsApp) -> frozenset[str]:
-    """Return the app entrypoints declared as execution-kernel clients."""
-    module = importlib.import_module(app.module)
-    declared = getattr(module, "EXECUTION_COORDINATOR_ENTRYPOINTS", ())
-    if not isinstance(declared, frozenset | set | tuple | list) or not all(
-        isinstance(value, str) and value for value in declared
-    ):
-        raise ValueError(
-            f"App '{app.name}' has an invalid coordinator entrypoint declaration"
-        )
-    return frozenset(declared)
-
-
 def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
     """Return the selected entrypoint only when its module opts into the kernel."""
     entrypoint = app._entrypoint
     if entrypoint is None or not isinstance(getattr(app, "module", None), str):
         return None
-    return entrypoint if entrypoint in _execution_coordinator_entrypoints(app) else None
+    return entrypoint if entrypoint in app.execution_coordinator_entrypoints else None
 
 
 def _deployment_name(entry: BiomodalsApp) -> str:

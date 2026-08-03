@@ -104,6 +104,21 @@ def test_run_help_owns_public_deployment_flags(namespace: str) -> None:
     assert "--deployment-version" not in output
 
 
+def test_multi_entrypoint_help_separates_argument_tables() -> None:
+    result = runner.invoke(app, ["app", "help", "alphafold3"])
+    lines = [line.rstrip() for line in strip_ansi(result.output).splitlines()]
+
+    assert result.exit_code == 0
+    first_heading = lines.index("setup_sharded_databases CLI flags:")
+    second_heading = lines.index("submit_alphafold3_task CLI flags:")
+    first_table = lines[first_heading + 1 : second_heading]
+    first_nonblank = next(i for i, line in enumerate(first_table) if line)
+    last_nonblank = max(i for i, line in enumerate(first_table) if line)
+
+    assert first_table[:first_nonblank] == [""]
+    assert first_table[last_nonblank + 1 :] == ["", ""]
+
+
 @pytest.mark.parametrize("command", ["list", "ls", "l", "help", "h", "deploy", "d"])
 def test_top_level_app_compatibility_aliases_are_removed(command: str) -> None:
     result = runner.invoke(app, [command])
@@ -192,8 +207,8 @@ class _FakeWorkflow:
     def __post_init__(self) -> None:
         self._local_entrypoint_idx = [0, 1]
         self.functions = [
-            AppFunction("first", "local_entrypoint", None, []),
-            AppFunction("second", "local_entrypoint", None, []),
+            AppFunction("first", "local_entrypoint", None),
+            AppFunction("second", "local_entrypoint", None),
         ]
 
     def __getitem__(self, name: str | int) -> AppFunction:
@@ -237,6 +252,7 @@ class _CoordinatedApp:
     module: str = "biomodals.app.fold.alphafold3_app"
     path: Path = Path("src/biomodals/app/fold/alphafold3_app.py")
     _entrypoint: str | None = "submit_alphafold3_task"
+    execution_coordinator_entrypoints = frozenset({"submit_alphafold3_task"})
 
 
 def test_workflow_run_requires_entrypoint_for_multiple_local_entrypoints(

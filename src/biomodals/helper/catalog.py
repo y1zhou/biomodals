@@ -4,6 +4,7 @@ import importlib
 import inspect
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
@@ -14,6 +15,10 @@ APP_HOME = BIOMODALS_HOME / "app"
 WORKFLOW_HOME = BIOMODALS_HOME / "workflow"
 CatalogType = Literal["app", "workflow"]
 _EXECUTION_COORDINATOR_TAG = "ExecutionCoordinator"
+_ARGS_TABLE_HEADER = (
+    "| Flag | Default | Description |",
+    "|-----:|:--------|:------------|",
+)
 
 
 class AppNotFoundError(ValueError):
@@ -126,8 +131,12 @@ class AppFunction:
     name: str
     func_type: Literal["modal", "local_entrypoint"]
     docstring: str | None
-    args_table: list[str]
-    parameter_names: tuple[str, ...] = ()
+    argument_rows: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def args_table(self) -> list[str]:
+        """Return the complete rendered CLI argument table."""
+        return self.visible_args_table()
 
     def visible_args_table(
         self,
@@ -135,18 +144,10 @@ class AppFunction:
         hidden_parameters: Collection[str] = (),
     ) -> list[str]:
         """Return CLI argument rows without caller-owned parameters."""
-        if not self.args_table or not hidden_parameters:
-            return self.args_table
         visible_rows = [
-            row
-            for name, row in zip(
-                self.parameter_names,
-                self.args_table[2:],
-                strict=True,
-            )
-            if name not in hidden_parameters
+            row for name, row in self.argument_rows if name not in hidden_parameters
         ]
-        return [*self.args_table[:2], *visible_rows] if visible_rows else []
+        return [*_ARGS_TABLE_HEADER, *visible_rows] if visible_rows else []
 
 
 class BiomodalsApp:
@@ -210,6 +211,19 @@ class BiomodalsApp:
             return self.functions[self._func_idx[name]]
         return self.functions[name]
 
+    @cached_property
+    def execution_coordinator_entrypoints(self) -> frozenset[str]:
+        """Return entrypoints declared as execution-kernel clients."""
+        module = importlib.import_module(self.module)
+        declared = getattr(module, "EXECUTION_COORDINATOR_ENTRYPOINTS", ())
+        if not isinstance(declared, frozenset | set | tuple | list) or not all(
+            isinstance(value, str) and value for value in declared
+        ):
+            raise ValueError(
+                f"App '{self.name}' has an invalid coordinator entrypoint declaration"
+            )
+        return frozenset(declared)
+
     def resolve_app_path(self, app_name_or_path: str) -> tuple[str, Path]:
         """Resolve an app name or filesystem path to its name and absolute path."""
         if app_name_or_path in self._all_apps:
@@ -265,8 +279,7 @@ class BiomodalsApp:
                     name=obj,
                     func_type=func_type,
                     docstring=raw_f.__doc__ or None,
-                    args_table=_docstring_to_markdown_table(raw_f),
-                    parameter_names=tuple(inspect.signature(raw_f).parameters),
+                    argument_rows=_docstring_to_argument_rows(raw_f),
                 )
             )
 
@@ -306,17 +319,16 @@ def _arg_descriptions_from_google_docstring(doc: str) -> dict[str, str]:
     return arg_descriptions
 
 
-def _docstring_to_markdown_table(f: Callable) -> list[str]:
-    """Convert a function docstring with Args into Markdown table rows."""
+def _docstring_to_argument_rows(
+    f: Callable,
+) -> tuple[tuple[str, str], ...]:
+    """Convert a function docstring with Args into named Markdown rows."""
     sig = inspect.signature(f)
     arg_descriptions = _arg_descriptions_from_google_docstring(inspect.getdoc(f) or "")
     if not arg_descriptions:
-        return []
+        return ()
 
-    table_rows = [
-        "| Flag | Default | Description |",
-        "|-----:|:--------|:------------|",
-    ]
+    argument_rows: list[tuple[str, str]] = []
     for name, p in sig.parameters.items():
         flag_base = name.replace("_", "-")
         default = (
@@ -330,6 +342,6 @@ def _docstring_to_markdown_table(f: Callable) -> list[str]:
             else f"`--{flag_base}`/`--no-{flag_base}`"
         )
         description = arg_descriptions.get(name, "")
-        table_rows.append(f"| {flag} | {default} | {description} |")
+        argument_rows.append((name, f"| {flag} | {default} | {description} |"))
 
-    return table_rows
+    return tuple(argument_rows)

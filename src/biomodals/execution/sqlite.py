@@ -2400,19 +2400,74 @@ class SqliteExecutionRepository:
             """,
             (str(execution_run_id),),
         ).fetchall()
-        task_rows = self._connection.execute(
+        return self._provider_calls_from_rows(rows)
+
+    def list_provider_calls_requiring_reconciliation(
+        self,
+        execution_run_id: UUID,
+    ) -> tuple[ProviderCallRecord, ...]:
+        """Load observable calls plus successful calls awaiting publication."""
+        terminal = tuple(
+            status.value for status in ProviderCallStatus if status.is_terminal
+        )
+        rows = self._connection.execute(
             """
-            SELECT task_key, provider_call_id, worker_provider_call_id
-            FROM execution_tasks
-            WHERE execution_run_id = ?
+            SELECT call.*
+            FROM execution_provider_calls AS call
+            WHERE call.execution_run_id = ?
                 AND (
-                    provider_call_id IS NOT NULL
-                    OR worker_provider_call_id IS NOT NULL
+                    call.status NOT IN (?, ?, ?)
+                    OR (
+                        call.status = ?
+                        AND EXISTS (
+                            SELECT 1
+                            FROM execution_tasks AS task
+                            WHERE task.execution_run_id = call.execution_run_id
+                                AND task.status = ?
+                                AND (
+                                    task.provider_call_id = call.provider_call_id
+                                    OR task.worker_provider_call_id =
+                                        call.provider_call_id
+                                )
+                        )
+                    )
                 )
-            ORDER BY node_key, ordinal
+            ORDER BY call.created_at, call.rowid
             """,
-            (str(execution_run_id),),
+            (
+                str(execution_run_id),
+                *terminal,
+                ProviderCallStatus.SUCCEEDED.value,
+                TaskStatus.RUNNING.value,
+            ),
         ).fetchall()
+        return self._provider_calls_from_rows(rows)
+
+    def _provider_calls_from_rows(
+        self,
+        rows: Collection[sqlite3.Row],
+    ) -> tuple[ProviderCallRecord, ...]:
+        """Attach owned Task keys to an already-selected Provider Call set."""
+        rows = tuple(rows)
+        if not rows:
+            return ()
+        call_ids = tuple(row["provider_call_id"] for row in rows)
+        task_rows: list[sqlite3.Row] = []
+        for offset in range(0, len(call_ids), 400):
+            chunk = call_ids[offset : offset + 400]
+            placeholders = ", ".join("?" for _ in chunk)
+            task_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT task_key, provider_call_id, worker_provider_call_id
+                    FROM execution_tasks
+                    WHERE provider_call_id IN ({placeholders})
+                        OR worker_provider_call_id IN ({placeholders})
+                    ORDER BY node_key, ordinal
+                    """,  # noqa: S608 - generated parameter placeholders
+                    (*chunk, *chunk),
+                ).fetchall()
+            )
         task_keys_by_call: dict[str, list[str]] = {}
         for task in task_rows:
             owner = task["provider_call_id"] or task["worker_provider_call_id"]

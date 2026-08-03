@@ -517,6 +517,27 @@ def test_running_provider_poll_does_not_synchronize_the_workflow_volume(
     runtime.close()
 
 
+def test_provider_result_payload_is_file_backed_outside_the_ledger(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("remote-envelope")
+    workflow.add_node(RemoteTextNode("large-return", "remote_text"), id="remote")
+    runtime = _runtime(tmp_path, workflow, driver=FakeModalDriver())
+
+    result = runtime.run(workload_run_key="remote-envelope")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    envelope = cast(dict[str, dict[str, object]], call.result_envelope)
+    reference = envelope["result_file"]
+    result_path = runtime.store.output_root / str(reference["path"])
+    content = result_path.read_bytes()
+    assert len(content) == reference["size_bytes"]
+    assert b"bGFyZ2UtcmV0dXJu" in content
+    assert b"bGFyZ2UtcmV0dXJu" not in runtime.store.ledger_path.read_bytes()
+    runtime.close()
+
+
 def test_provider_publication_reload_follows_success_observation(
     tmp_path: Path,
     monkeypatch,
@@ -1049,9 +1070,7 @@ def test_durable_provider_envelope_is_published_without_another_spawn(
     runtime._provider.repository = runtime.store.execution
     completed = runtime._provider.reconcile_provider_call(
         call.provider_call_id,
-        encode_result=lambda value: {
-            "result": value.model_dump(mode="json"),
-        },
+        encode_result=runtime._result_envelope,
         now=200,
     )
     assert completed.status == ProviderCallStatus.SUCCEEDED

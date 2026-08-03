@@ -450,7 +450,9 @@ class ExecutionRuntime:
             repository = self.repository
             completed = tuple(
                 (call, task)
-                for call in repository.list_provider_calls(execution_run_id)
+                for call in repository.list_provider_calls_requiring_reconciliation(
+                    execution_run_id
+                )
                 if call.status == ProviderCallStatus.SUCCEEDED
                 for task_key in call.task_keys
                 for task in (
@@ -1158,7 +1160,9 @@ class ExecutionRuntime:
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
         """Observe calls outside the writer and checkpoint terminal results once."""
         with self._synchronize():
-            originals = self.repository.list_provider_calls(execution_run_id)
+            originals = self.repository.list_provider_calls_requiring_reconciliation(
+                execution_run_id
+            )
         observations: dict[UUID, tuple[ModalCallObservation, Any]] = {}
         abandoned_submissions: set[UUID] = set()
         for call in originals:
@@ -1532,9 +1536,11 @@ class AsyncExecutionRuntime:
         encode_result: Callable[[Any], Any],
         now: int,
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
-        """Reconcile every nonterminal call and retain before/after records."""
+        """Reconcile observable calls and expose unpublished successes."""
         reconciled = []
-        for original in self.repository.list_provider_calls(execution_run_id):
+        for original in self.repository.list_provider_calls_requiring_reconciliation(
+            execution_run_id
+        ):
             updated = original
             if not original.status.is_terminal:
                 updated = await self.reconcile_provider_call(

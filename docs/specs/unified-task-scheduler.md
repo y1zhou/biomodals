@@ -1487,6 +1487,14 @@ archives, and other scientific files remain in workload-owned durable
 storage; the envelope may refer to them but never embeds them and is excluded
 from scientific fingerprints.
 
+Workflow adapters also keep serialized provider returns out of SQLite. They
+write the return once to a checksum-addressed file in the workflow Run's
+durable output directory and store only its relative path, SHA-256 digest, and
+byte count in the Result Envelope. Recovery verifies that reference before
+decoding the return. This keeps InlineBytes and other potentially large app
+results from inflating the coordinator ledger while preserving the split
+completion recovery boundary.
+
 The repository stores the envelope and the call's transition to `succeeded`
 atomically, then the coordinator crosses the host durability boundary. Only
 then does the call leave the derived total and optional GPU active counts. No

@@ -53,6 +53,17 @@ def test_call_success_and_task_scientific_completion_are_separate() -> None:
         ).status
         == TaskStatus.RUNNING
     )
+    assert repository.list_provider_calls_requiring_reconciliation(RUN_ID) == (call,)
+
+    repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=121,
+    )
+
+    assert repository.list_provider_calls_requiring_reconciliation(RUN_ID) == ()
 
 
 def test_non_json_result_does_not_change_call_or_release_slot() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, nullcontext
@@ -596,7 +597,7 @@ class WorkflowRuntime:
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
-            encode_result=_result_envelope,
+            encode_result=self._result_envelope,
             now=self._now(),
         )
         if any(
@@ -643,7 +644,7 @@ class WorkflowRuntime:
             self._fail_task(node_id, "Provider result belongs to a local Node")
             return
         try:
-            raw_result = _raw_result(envelope)
+            raw_result = self._raw_result(envelope)
             metadata = _remote_metadata(task.execution_payload)
             result = AppRunResult.model_validate(
                 node.process_remote_result(raw_result, metadata)
@@ -691,7 +692,7 @@ class WorkflowRuntime:
             )
             decoded = node.process_remote_task_batch_result(
                 task_keys,
-                _raw_result(envelope),
+                self._raw_result(envelope),
                 invocation.metadata,
             )
             if set(decoded) != set(task_keys):
@@ -1664,6 +1665,57 @@ class WorkflowRuntime:
             return AvailabilityStatus.MISSING
         return AvailabilityStatus.AVAILABLE
 
+    def _result_envelope(self, result: object) -> dict[str, object]:
+        """Store a provider return outside SQLite and envelope its location."""
+        if isinstance(result, BaseModel):
+            result = result.model_dump(mode="json")
+        content = orjson.dumps(result)
+        digest = hashlib.sha256(content).hexdigest()
+        relative_path = Path("provider-results") / f"{digest}.json"
+        result_path = self.store.output_root / relative_path
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = result_path.with_suffix(".json.tmp")
+        temporary_path.write_bytes(content)
+        temporary_path.replace(result_path)
+        return {
+            "result_file": {
+                "path": relative_path.as_posix(),
+                "sha256": digest,
+                "size_bytes": len(content),
+            }
+        }
+
+    def _raw_result(self, envelope: object) -> object:
+        """Load and verify one workflow-owned provider return."""
+        if not isinstance(envelope, dict):
+            raise ValueError("Workflow Result Envelope must be an object")
+        reference = envelope.get("result_file")
+        if not isinstance(reference, dict):
+            raise ValueError("Workflow Result Envelope has no result file")
+        relative_value = reference.get("path")
+        expected_digest = reference.get("sha256")
+        expected_size = reference.get("size_bytes")
+        if (
+            not isinstance(relative_value, str)
+            or not isinstance(expected_digest, str)
+            or not isinstance(expected_size, int)
+        ):
+            raise ValueError("Workflow Result Envelope reference is invalid")
+        relative_path = Path(relative_value)
+        if (
+            relative_path.is_absolute()
+            or relative_path.parts[:1] != ("provider-results",)
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+        ):
+            raise ValueError("Workflow Result Envelope path is invalid")
+        result_path = self.store.output_root.joinpath(*relative_path.parts)
+        content = result_path.read_bytes()
+        if len(content) != expected_size:
+            raise ValueError("Workflow provider result size does not match")
+        if hashlib.sha256(content).hexdigest() != expected_digest:
+            raise ValueError("Workflow provider result checksum does not match")
+        return orjson.loads(content)
+
     def _node_context(
         self,
         definition: WorkflowDefinition,
@@ -1749,18 +1801,6 @@ def _remote_metadata(payload: object) -> dict[str, Any]:
     if not all(isinstance(key, str) for key in metadata):
         raise ValueError("Remote Task metadata keys must be strings")
     return cast(dict[str, Any], metadata)
-
-
-def _result_envelope(result: object) -> dict[str, object]:
-    if isinstance(result, BaseModel):
-        result = result.model_dump(mode="json")
-    return {"result": _json_value(result)}
-
-
-def _raw_result(envelope: object) -> object:
-    if not isinstance(envelope, dict) or "result" not in envelope:
-        raise ValueError("Workflow Result Envelope has no result")
-    return cast(dict[str, object], envelope)["result"]
 
 
 def _json_value(value: object) -> Any:

@@ -660,6 +660,71 @@ def test_provider_result_finalization_failure_retains_unknown_ownership() -> Non
     assert discarded == [prepared]
 
 
+@pytest.mark.parametrize("failure_phase", ["encoding", "finalization"])
+def test_later_result_failure_preserves_earlier_envelope(
+    failure_phase: str,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=2)
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=connection.commit,
+        transaction=_transaction(connection),
+    )
+    submitted = runtime.submit_provider_calls(
+        RUN_ID,
+        tuple(
+            ProviderCallSubmission(
+                candidate=_candidate(index),
+                submission_token=f"batch-{index}",
+            )
+            for index in range(2)
+        ),
+        now=110,
+    )
+    assert all(call is not None for call in submitted)
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.SUCCEEDED,
+        result={"answer": 42},
+    )
+    encoded = 0
+
+    def encode_result(_result: object) -> dict[str, int]:
+        nonlocal encoded
+        encoded += 1
+        if failure_phase == "encoding" and encoded == 2:
+            raise OSError("encoding failed")
+        return {"call": encoded}
+
+    def finalize_result(prepared: dict[str, int]) -> dict[str, int]:
+        if failure_phase == "finalization" and prepared["call"] == 2:
+            raise OSError("finalization failed")
+        return prepared
+
+    with pytest.raises(OSError, match=failure_phase):
+        runtime.reconcile_provider_calls(
+            RUN_ID,
+            required_node_keys={"inference"},
+            encode_result=encode_result,
+            finalize_result=finalize_result,
+            now=120,
+        )
+
+    first, second = repository.list_provider_calls(RUN_ID)
+    assert first.status == ProviderCallStatus.SUCCEEDED
+    assert first.result_envelope == {"call": 1}
+    assert second.status == ProviderCallStatus.STATE_UNKNOWN
+    assert second.result_envelope is None
+
+
 def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

@@ -133,6 +133,28 @@ def _request() -> GromacsExecutionRequest:
     )
 
 
+def _runtime(
+    tmp_path: Path,
+    request: GromacsExecutionRequest,
+    claims: FakeClaims,
+    execution_run_id: UUID,
+    predecessor_execution_run_id: UUID | None,
+) -> GromacsExecutionRuntime:
+    return GromacsExecutionRuntime(
+        request=request,
+        execution_run_id=execution_run_id,
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, execution_run_id),
+        modal_driver=CompletingDriver(tmp_path, request.run_name),
+        output_volume=FakeVolume(),
+        output_claims=claims,
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+
 def test_gromacs_execution_request_round_trips_scientific_and_operational_data(
     tmp_path: Path,
 ) -> None:
@@ -259,7 +281,10 @@ def test_same_run_name_rejects_outputs_from_changed_science(
         changed.close()
 
 
-def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
+def test_same_science_reuses_published_run_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request = _request()
     claims = FakeClaims()
     first = GromacsExecutionRuntime(
@@ -289,10 +314,19 @@ def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
         poll_interval_seconds=0,
         now=lambda: 20,
     )
+    observed: list[str] = []
+    observe = resumed._node_publication_ready
+
+    def record_observation(node_key: str) -> bool:
+        observed.append(node_key)
+        return observe(node_key)
+
+    monkeypatch.setattr(resumed, "_node_publication_ready", record_observation)
 
     try:
         assert resumed.run().run.status == RunStatus.SUCCEEDED
         assert driver.spawns == []
+        assert observed == list(request.execution_plan.terminal_node_keys)
     finally:
         resumed.close()
 
@@ -366,25 +400,10 @@ def test_successors_transfer_incomplete_output_ownership(tmp_path: Path) -> None
     request = _request()
     claims = FakeClaims()
 
-    def runtime(execution_run_id: UUID, predecessor: UUID | None):
-        return GromacsExecutionRuntime(
-            request=request,
-            execution_run_id=execution_run_id,
-            predecessor_execution_run_id=predecessor,
-            deployment=DEPLOYMENT,
-            store=ExecutionRunStore(tmp_path, execution_run_id),
-            modal_driver=CompletingDriver(tmp_path, request.run_name),
-            output_volume=FakeVolume(),
-            output_claims=claims,
-            output_root=tmp_path,
-            poll_interval_seconds=0,
-            now=lambda: 10,
-        )
-
     generations = (
-        runtime(RUN_ID, None),
-        runtime(SECOND_RUN_ID, RUN_ID),
-        runtime(THIRD_RUN_ID, SECOND_RUN_ID),
+        _runtime(tmp_path, request, claims, RUN_ID, None),
+        _runtime(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID),
+        _runtime(tmp_path, request, claims, THIRD_RUN_ID, SECOND_RUN_ID),
     )
     try:
         assert [item._ensure_run_identity() for item in generations] == [True] * 3
@@ -393,3 +412,43 @@ def test_successors_transfer_incomplete_output_ownership(tmp_path: Path) -> None
     finally:
         for item in generations:
             item.close()
+
+
+def test_sibling_successor_cannot_replace_active_owner(tmp_path: Path) -> None:
+    request = _request()
+    claims = FakeClaims()
+    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
+    first_successor = _runtime(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID)
+    sibling = _runtime(tmp_path, request, claims, THIRD_RUN_ID, RUN_ID)
+    try:
+        assert owner._ensure_run_identity()
+        assert first_successor._ensure_run_identity()
+        with pytest.raises(RuntimeError, match="already claimed"):
+            sibling._ensure_run_identity()
+        marker = orjson.loads(first_successor._run_identity_path().read_bytes())
+        assert marker["owner_execution_run_id"] == str(SECOND_RUN_ID)
+    finally:
+        owner.close()
+        first_successor.close()
+        sibling.close()
+
+
+def test_cache_reading_successor_preserves_repair_lineage(tmp_path: Path) -> None:
+    request = _request()
+    claims = FakeClaims()
+    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
+    cache_reader = _runtime(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID)
+    repair = _runtime(tmp_path, request, claims, THIRD_RUN_ID, SECOND_RUN_ID)
+    try:
+        assert owner.run().run.status == RunStatus.SUCCEEDED
+        assert not cache_reader._ensure_run_identity()
+        terminal_node = request.execution_plan.terminal_node_keys[0]
+        owner._node_publication_path(terminal_node).unlink()
+
+        assert repair._ensure_run_identity()
+        marker = orjson.loads(repair._run_identity_path().read_bytes())
+        assert marker["owner_execution_run_id"] == str(THIRD_RUN_ID)
+    finally:
+        owner.close()
+        cache_reader.close()
+        repair.close()

@@ -437,6 +437,9 @@ publication evidence, not a distributed lock. A matching complete terminal
 publication remains reusable without taking ownership. Resume retains the
 same owner, and an explicit Successor Run may transfer ownership before
 repairing incomplete output; an independent root may not race or replace it.
+Only the immutable predecessor Execution Run ID establishes that lineage; the
+mutable Volume marker never does. A cache-reading Successor records its lineage
+even when no transfer is needed so a later descendant can perform a repair.
 
 The Provider Call status policy was accepted on 2026-07-29. Calls have exactly
 eight statuses: `submitting`, `attached`, `running`, `outcome_unknown`,

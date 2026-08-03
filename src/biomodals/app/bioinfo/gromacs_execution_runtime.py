@@ -223,6 +223,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
         self._run_identity_verified = False
+        self._verified_available_nodes: set[str] = set()
         self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
         self._provider = ExecutionRuntime(
             store.execution,
@@ -288,6 +289,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
         }
         recorded: object = None
+        publication_complete = False
         if root.is_symlink():
             raise ValueError(f"GROMACS run directory cannot be a symlink: {root}")
         if marker.exists():
@@ -316,11 +318,13 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 raise ValueError(
                     f"GROMACS run identity has an invalid owner: {marker}"
                 ) from error
-            if all(
+            terminal_node_keys = self.request.execution_plan.terminal_node_keys
+            publication_complete = all(
                 self._node_publication_ready(node_key)
-                for node_key in self.request.execution_plan.terminal_node_keys
-            ):
-                return False
+                for node_key in terminal_node_keys
+            )
+            if publication_complete:
+                self._verified_available_nodes.update(terminal_node_keys)
         if root.exists():
             if not root.is_dir():
                 raise ValueError(f"GROMACS run path is not a directory: {root}")
@@ -330,18 +334,19 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                     "existing outputs; choose a new run name"
                 )
         owner = str(self.execution_run_id)
-        replace_owner = None
-        if self.predecessor_execution_run_id is not None:
-            replace_owner = (
-                str(recorded["owner_execution_run_id"])
-                if isinstance(recorded, dict)
-                else str(self.predecessor_execution_run_id)
-            )
+        replace_owner = (
+            None
+            if self.predecessor_execution_run_id is None
+            else str(self.predecessor_execution_run_id)
+        )
+        if replace_owner is not None:
             register_output_claim_successor(
                 self.output_claims,
                 owner=owner,
                 predecessor=replace_owner,
             )
+        if publication_complete:
+            return False
         acquire_output_claim(
             self.output_claims,
             claim_key=f"gromacs-run:{self.request.run_name}",
@@ -361,6 +366,9 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         return True
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
+        if node_key in self._verified_available_nodes:
+            self._verified_available_nodes.remove(node_key)
+            return AvailabilityStatus.AVAILABLE
         try:
             available = self._node_publication_ready(node_key)
         except OSError:

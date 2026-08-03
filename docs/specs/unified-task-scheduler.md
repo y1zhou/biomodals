@@ -150,7 +150,9 @@ These existing decisions remain binding during the refactor:
   claims its human run name in a workload-scoped Modal Dict. The Volume marker
   records the elected Execution Run but never acts as a file lock. Matching
   complete terminal publications remain read-only cache hits; only the same
-  Run or an explicit Successor may repair incomplete output.
+  Run or an explicit Successor may repair incomplete output. Successor lineage
+  comes only from immutable launch state, never from the marker's current
+  owner, and is recorded even when the Successor only reads a complete cache.
 - The GROMACS coordinator records only the top-level deployed Function as the
   Task-owning Provider Call. Existing private nested calls to
   `find_traj_last_time_ns` and `postprocess_traj` remain an explicit legacy

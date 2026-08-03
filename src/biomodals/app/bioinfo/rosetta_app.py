@@ -51,7 +51,7 @@ from biomodals.execution.modal import (
 from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
-from biomodals.execution.pull_worker import drive_pull_worker
+from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
@@ -652,13 +652,11 @@ def submit_rosetta_task(
             tasks_df.write_parquet(buffer)
             batch.put_file(buffer, f"/{remote_input_root}/tasks.parquet")
 
-    num_cpu_per_pod = min(30, tasks_df.height)
-    max_num_pods = min(
-        max(1, max_num_pods),
-        (tasks_df.height + num_cpu_per_pod - 1) // num_cpu_per_pod,
+    worker_count, claim_capacity = size_pull_worker_pool(
+        tasks_df.height,
+        max_worker_calls=max(1, max_num_pods),
+        max_parallel_per_worker=30,
     )
-    claim_capacity = (tasks_df.height + max_num_pods - 1) // max_num_pods
-    max_parallel_per_worker = min(30, claim_capacity)
     app_version = CONF.version
     if app_version is None:
         raise RuntimeError("Rosetta scientific version metadata is incomplete")
@@ -667,9 +665,9 @@ def submit_rosetta_task(
         run_id=run_id,
         tasks=tuple(task_specs),
         app_version=app_version,
-        max_active_provider_calls=max_num_pods,
+        max_active_provider_calls=worker_count,
         claim_capacity=claim_capacity,
-        max_parallel_per_worker=max_parallel_per_worker,
+        max_parallel_per_worker=claim_capacity,
     )
     execution_run_id = uuid4()
     deployment = DeploymentIdentity(

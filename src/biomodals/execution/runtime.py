@@ -980,23 +980,6 @@ class ExecutionRuntime:
             self._checkpoint_state()
         return claim
 
-    def record_pull_task_completion(
-        self,
-        provider_call_id: UUID,
-        task_key: str,
-        *,
-        request_id: str,
-        observation: AvailabilityStatus,
-        message: str | None = None,
-        now: int,
-    ) -> ExecutionTaskRecord:
-        """Checkpoint one idempotent worker publication report."""
-        return self.record_pull_task_completions(
-            provider_call_id,
-            ((task_key, request_id, observation, message),),
-            now=now,
-        )[0]
-
     def record_pull_task_completions(
         self,
         provider_call_id: UUID,

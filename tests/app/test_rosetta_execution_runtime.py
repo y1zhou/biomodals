@@ -239,22 +239,25 @@ def test_one_worker_failure_is_recorded_without_losing_sibling_success(
             request_id=f"claim-{ordinal}",
             capacity=2,
         )
-        for assignment in claim.assignments:
-            result = (
-                {
-                    "status": "failed",
-                    "task_key": assignment.task_key,
-                    "error": "Rosetta failed",
-                }
-                if assignment.task_key == "2"
-                else _publish_assignment(runtime, assignment)
-            )
-            runtime.complete_pull_task(
-                call.provider_call_id,
-                assignment.task_key,
-                request_id=f"complete-{assignment.task_key}",
-                result=result,
-            )
+        runtime.complete_pull_tasks(
+            call.provider_call_id,
+            tuple(
+                (
+                    assignment.task_key,
+                    f"complete-{assignment.task_key}",
+                    (
+                        {
+                            "status": "failed",
+                            "task_key": assignment.task_key,
+                            "error": "Rosetta failed",
+                        }
+                        if assignment.task_key == "2"
+                        else _publish_assignment(runtime, assignment)
+                    ),
+                )
+                for assignment in claim.assignments
+            ),
+        )
 
     driver.succeeded = True
     runtime.advance_once()

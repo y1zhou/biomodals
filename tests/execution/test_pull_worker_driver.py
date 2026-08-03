@@ -4,8 +4,10 @@
 
 from uuid import UUID
 
+import pytest
+
 from biomodals.execution import PullTaskClaim, WorkerAssignmentRecord
-from biomodals.execution.pull_worker import drive_pull_worker
+from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
 
 CALL_ID = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -72,6 +74,30 @@ def test_pull_worker_replays_stable_request_ids_and_drains_until_empty() -> None
     assert completion_batch_sizes == [2, 1]
     assert summary.claimed_tasks == 3
     assert summary.claim_requests == 3
+
+
+@pytest.mark.parametrize(
+    ("task_count", "max_worker_calls", "expected"),
+    [
+        (10_000, 1, (1, 30)),
+        (10_000, 10, (10, 30)),
+        (31, 2, (2, 16)),
+        (2, 10, (1, 2)),
+    ],
+)
+def test_pull_worker_pool_bounds_claims_to_parallel_capacity(
+    task_count: int,
+    max_worker_calls: int,
+    expected: tuple[int, int],
+) -> None:
+    assert (
+        size_pull_worker_pool(
+            task_count,
+            max_worker_calls=max_worker_calls,
+            max_parallel_per_worker=30,
+        )
+        == expected
+    )
 
 
 def test_pull_worker_checkpoints_each_completed_microbatch_before_reporting() -> None:

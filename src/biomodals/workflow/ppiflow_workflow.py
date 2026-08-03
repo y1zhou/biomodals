@@ -57,7 +57,7 @@ from biomodals.execution import (
     NodeAggregationPolicy,
     WorkerAssignmentRecord,
 )
-from biomodals.execution.pull_worker import drive_pull_worker
+from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     AppRunLayout,
@@ -1105,19 +1105,18 @@ def _rosetta_worker_policy(
     """Preserve Rosetta's pod cap while deriving pull-worker microbatches."""
     if num_jobs < 1:
         raise ValueError("Rosetta requires at least one Task")
-    num_cpu_per_pod = min(30, num_jobs)
     max_num_pods = max(1, _config_int(config, "max_num_pods", 1))
     if config.get("max_child_calls") is not None:
         max_num_pods = min(
             max_num_pods,
             _config_int(config, "max_child_calls", 1),
         )
-    worker_count = min(
-        max_num_pods,
-        (num_jobs + num_cpu_per_pod - 1) // num_cpu_per_pod,
+    worker_count, claim_capacity = size_pull_worker_pool(
+        num_jobs,
+        max_worker_calls=max_num_pods,
+        max_parallel_per_worker=30,
     )
-    claim_capacity = (num_jobs + worker_count - 1) // worker_count
-    return worker_count, claim_capacity, min(30, claim_capacity)
+    return worker_count, claim_capacity, claim_capacity
 
 
 @app.function(

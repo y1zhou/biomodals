@@ -108,20 +108,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
 
-    def complete_pull_task(
-        self,
-        provider_call_id: UUID,
-        task_key: str,
-        *,
-        request_id: str,
-        result: Mapping[str, object],
-    ):
-        """Validate one worker publication and checkpoint its completion."""
-        return self.complete_pull_tasks(
-            provider_call_id,
-            ((task_key, request_id, result),),
-        )[0]
-
     def complete_pull_tasks(
         self,
         provider_call_id: UUID,

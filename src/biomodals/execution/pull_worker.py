@@ -23,6 +23,30 @@ class PullWorkerSummary:
     claim_requests: int
 
 
+def size_pull_worker_pool(
+    task_count: int,
+    *,
+    max_worker_calls: int,
+    max_parallel_per_worker: int,
+) -> tuple[int, int]:
+    """Return the admitted worker count and bounded per-worker claim size."""
+    if task_count < 1:
+        raise ValueError("task_count must be positive")
+    if max_worker_calls < 1:
+        raise ValueError("max_worker_calls must be positive")
+    if max_parallel_per_worker < 1:
+        raise ValueError("max_parallel_per_worker must be positive")
+    worker_count = min(
+        max_worker_calls,
+        (task_count + max_parallel_per_worker - 1) // max_parallel_per_worker,
+    )
+    claim_capacity = min(
+        max_parallel_per_worker,
+        (task_count + worker_count - 1) // worker_count,
+    )
+    return worker_count, claim_capacity
+
+
 def drive_pull_worker[Result](
     *,
     provider_call_id: UUID,

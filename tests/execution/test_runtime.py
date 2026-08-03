@@ -1545,11 +1545,9 @@ def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
         capacity=1,
         now=111,
     )
-    completed = runtime.record_pull_task_completion(
+    (completed,) = runtime.record_pull_task_completions(
         call.provider_call_id,
-        "seed-0",
-        request_id="complete-0",
-        observation=AvailabilityStatus.AVAILABLE,
+        (("seed-0", "complete-0", AvailabilityStatus.AVAILABLE, None),),
         now=112,
     )
 

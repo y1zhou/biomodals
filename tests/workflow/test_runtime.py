@@ -974,11 +974,9 @@ def test_pull_task_node_uses_workload_publication_probe(tmp_path: Path) -> None:
         capacity=1,
     ).assignments
 
-    task = runtime.complete_pull_task(
+    (task,) = runtime.complete_pull_tasks(
         call.provider_call_id,
-        assignment.task_key,
-        request_id="complete",
-        result=_text_result("alpha"),
+        ((assignment.task_key, "complete", _text_result("alpha")),),
     )
 
     assert task.status == TaskStatus.FAILED

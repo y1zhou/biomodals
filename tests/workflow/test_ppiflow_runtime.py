@@ -343,32 +343,35 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         "candidate-a",
         "candidate-b",
     ]
-    runtime.complete_pull_task(
+    runtime.complete_pull_tasks(
         call.provider_call_id,
-        "candidate-a",
-        request_id="complete-a",
-        result=AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="receipt",
-                    kind=ArtifactKind.REPORT,
-                    storage=InlineBytes(
-                        data=b"candidate-a",
-                        filename="candidate-a.txt",
-                        media_type="text/plain",
-                    ),
-                )
-            ],
-        ),
-    )
-    runtime.complete_pull_task(
-        call.provider_call_id,
-        "candidate-b",
-        request_id="complete-b",
-        result=AppRunResult(
-            status=AppRunStatus.FAILED,
-            warnings=["Rosetta failed"],
+        (
+            (
+                "candidate-a",
+                "complete-a",
+                AppRunResult(
+                    status=AppRunStatus.SUCCEEDED,
+                    outputs=[
+                        AppOutput(
+                            name="receipt",
+                            kind=ArtifactKind.REPORT,
+                            storage=InlineBytes(
+                                data=b"candidate-a",
+                                filename="candidate-a.txt",
+                                media_type="text/plain",
+                            ),
+                        )
+                    ],
+                ),
+            ),
+            (
+                "candidate-b",
+                "complete-b",
+                AppRunResult(
+                    status=AppRunStatus.FAILED,
+                    warnings=["Rosetta failed"],
+                ),
+            ),
         ),
     )
 

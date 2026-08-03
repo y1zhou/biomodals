@@ -1055,10 +1055,10 @@ class ExecutionRuntime:
             checkpoint_needed = bool(abandoned_submissions or preparation_errors)
             first_error: Exception | None = None
             with self._synchronize():
-                for original in originals:
-                    provider_call_id = original.provider_call_id
-                    if provider_call_id in abandoned_submissions:
-                        with self._transaction():
+                with self._transaction():
+                    for original in originals:
+                        provider_call_id = original.provider_call_id
+                        if provider_call_id in abandoned_submissions:
                             current = self.repository.get_provider_call(
                                 provider_call_id
                             )
@@ -1074,48 +1074,47 @@ class ExecutionRuntime:
                                 if current.status == ProviderCallStatus.SUBMITTING
                                 else current
                             )
-                        reconciled.append((original, updated))
-                        continue
+                            reconciled.append((original, updated))
+                            continue
 
-                    preparation_error = preparation_errors.get(provider_call_id)
-                    if preparation_error is not None:
-                        with self._transaction():
+                        preparation_error = preparation_errors.get(provider_call_id)
+                        if preparation_error is not None:
                             updated = self._record_result_envelope_unknown(
                                 provider_call_id,
                                 error=preparation_error,
                                 now=now,
                             )
-                        if not updated.status.is_terminal:
-                            first_error = first_error or preparation_error
-                        reconciled.append((original, updated))
-                        continue
+                            if not updated.status.is_terminal:
+                                first_error = first_error or preparation_error
+                            reconciled.append((original, updated))
+                            continue
 
-                    prepared = observations.get(provider_call_id)
-                    if prepared is None:
-                        reconciled.append((original, original))
-                        continue
+                        prepared = observations.get(provider_call_id)
+                        if prepared is None:
+                            reconciled.append((original, original))
+                            continue
 
-                    observation, prepared_result = prepared
-                    finalization_error: Exception | None = None
-                    try:
-                        with self._transaction():
-                            current = self.repository.get_provider_call(
-                                provider_call_id
-                            )
-                            if current.status.is_terminal:
-                                updated = current
+                        observation, prepared_result = prepared
+                        current = self.repository.get_provider_call(provider_call_id)
+                        if current.status.is_terminal:
+                            updated = current
+                        else:
+                            try:
+                                envelope = (
+                                    finalize_result(prepared_result)
+                                    if finalize_result is not None
+                                    and observation.kind
+                                    == ModalCallObservationKind.SUCCEEDED
+                                    else prepared_result
+                                )
+                            except Exception as error:
+                                updated = self._record_result_envelope_unknown(
+                                    provider_call_id,
+                                    error=error,
+                                    now=now,
+                                )
+                                first_error = first_error or error
                             else:
-                                try:
-                                    envelope = (
-                                        finalize_result(prepared_result)
-                                        if finalize_result is not None
-                                        and observation.kind
-                                        == ModalCallObservationKind.SUCCEEDED
-                                        else prepared_result
-                                    )
-                                except Exception as error:
-                                    finalization_error = error
-                                    raise
                                 updated = _record_provider_call_observation(
                                     self.repository,
                                     provider_call_id,
@@ -1126,20 +1125,10 @@ class ExecutionRuntime:
                                     ),
                                     now=now,
                                 )
-                    except Exception:
-                        if finalization_error is None:
-                            raise
-                        with self._transaction():
-                            updated = self._record_result_envelope_unknown(
-                                provider_call_id,
-                                error=finalization_error,
-                                now=now,
-                            )
-                        first_error = first_error or finalization_error
-                    checkpoint_needed = checkpoint_needed or (
-                        observation.kind != ModalCallObservationKind.RUNNING
-                    )
-                    reconciled.append((original, updated))
+                        checkpoint_needed = checkpoint_needed or (
+                            observation.kind != ModalCallObservationKind.RUNNING
+                        )
+                        reconciled.append((original, updated))
 
                 if checkpoint_needed:
                     self._checkpoint_state()

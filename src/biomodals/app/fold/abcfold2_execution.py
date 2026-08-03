@@ -33,7 +33,6 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionVolumeSync,
     StandardExecutionRuntimeLifecycle,
-    persist_execution_launch,
 )
 from biomodals.helper.output_claim import (
     acquire_output_claim,
@@ -702,6 +701,7 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one run-scoped writer to ABCFold2 publications."""
 
     _request_loader = staticmethod(load_execution_request)
+    _request_persister = staticmethod(persist_execution_request)
 
     def __init__(
         self,
@@ -782,17 +782,10 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     request,
                     replace_claim_owner=str(predecessor_execution_run_id),
                 )
-                persist_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
+                self._persist_successor_request(
                     request,
-                )
-                persist_execution_launch(
-                    self.volume_root,
-                    self.execution_run_id,
                     predecessor_execution_run_id,
                 )
-                self.output_volume.commit()
 
     def _create_runtime(
         self,

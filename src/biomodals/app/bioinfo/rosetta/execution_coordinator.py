@@ -21,7 +21,6 @@ from biomodals.execution import (
 )
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
-    persist_execution_launch,
 )
 
 
@@ -29,6 +28,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one single-writer App Run ledger to Rosetta publications."""
 
     _request_loader = staticmethod(load_execution_request)
+    _request_persister = staticmethod(persist_execution_request)
 
     def __init__(
         self,
@@ -142,17 +142,10 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                         ),
                     )
                 self._require_successor_plan_match(predecessor, request)
-                persist_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
+                self._persist_successor_request(
                     request,
-                )
-                persist_execution_launch(
-                    self.volume_root,
-                    self.execution_run_id,
                     predecessor_execution_run_id,
                 )
-                self.output_volume.commit()
 
     def _create_runtime(
         self,

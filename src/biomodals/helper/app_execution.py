@@ -482,6 +482,8 @@ class ExecutionCoordinatorLifecycle:
     """Share app-coordinator locking, status, and drive mechanics."""
 
     _request_loader: Callable[[str | Path, UUID], Any]
+    _request_persister: Callable[[str | Path, UUID, Any], Any]
+    output_volume: Any
 
     def __init__(
         self,
@@ -651,6 +653,24 @@ class ExecutionCoordinatorLifecycle:
             declared[name] != self.target_scientific_versions[name] for name in compared
         ):
             raise ValueError("Target deployment changed declared scientific versions")
+
+    def _persist_successor_request(
+        self,
+        request: Any,
+        predecessor_execution_run_id: UUID,
+    ) -> None:
+        """Persist successor launch inputs before another container can read them."""
+        self._request_persister(
+            self.volume_root,
+            self.execution_run_id,
+            request,
+        )
+        persist_execution_launch(
+            self.volume_root,
+            self.execution_run_id,
+            predecessor_execution_run_id,
+        )
+        self.output_volume.commit()
 
     def _open_current_runtime(self, *, recover: bool) -> Any:
         request = self._request_loader(self.volume_root, self.execution_run_id)

@@ -22,7 +22,6 @@ from biomodals.execution import (
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRunStore,
-    persist_execution_launch,
 )
 
 
@@ -30,6 +29,7 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
     """Bind one run-scoped writer to BoltzGen-owned publications."""
 
     _request_loader = staticmethod(load_execution_request)
+    _request_persister = staticmethod(persist_execution_request)
 
     def __init__(
         self,
@@ -99,17 +99,10 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     replace_claim_owners=claim_owners,
                 )
                 self._require_successor_plan_match(predecessor, request)
-                persist_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
+                self._persist_successor_request(
                     request,
-                )
-                persist_execution_launch(
-                    self.volume_root,
-                    self.execution_run_id,
                     predecessor_execution_run_id,
                 )
-                self.output_volume.commit()
 
     def _create_runtime(
         self,

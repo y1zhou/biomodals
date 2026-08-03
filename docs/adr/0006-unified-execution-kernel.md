@@ -604,12 +604,14 @@ app or workflow run submits one detached coordinator-loop input to its
 Run-Scoped Coordinator Pool. This is an internal activity, not a CLI
 subcommand or public kernel type. It reconciles durable state, dispatches ready
 work, observes attached calls, and advances the DAG until the Run becomes
-terminal; progress never depends on the launching CLI remaining connected or
-polling. Concurrent lifecycle and worker inputs enter the same pool and use
-the serialized writer. A replacement Coordinator Attempt reloads the ledger
-after preemption. Once terminal, the loop returns and the container may scale
-to zero; a later status request may start a fresh container and read the
-retained ledger.
+terminal or enters `suspended` or `state_unknown`, where explicit operator
+action is required; progress never depends on the launching CLI remaining
+connected or polling. Concurrent lifecycle and worker inputs enter the same
+pool and use the serialized writer. A replacement Coordinator Attempt reloads
+the ledger after preemption. Once automatic driving stops, the loop logs its
+status and durable slot occupancy, then returns. Deployment coordinators use
+Modal's two-second minimum idle scale-down window. A later lifecycle request
+may briefly start a fresh container to read or reconcile the retained ledger.
 
 The coordinator-error policy was accepted on 2026-07-29. Provider
 redelivery after infrastructure interruption may transparently create a

@@ -174,8 +174,9 @@ These existing decisions remain binding during the refactor:
 - Every Direct CLI App Run uses that remote coordinator and stores no execution
   database on the user's machine.
 - Each remote top-level CLI run has one detached coordinator loop that advances
-  it to a terminal state without client polling, then returns so its container
-  may scale to zero.
+  it without client polling until it becomes terminal or requires explicit
+  recovery in `suspended` or `state_unknown`, then returns so its container may
+  scale to zero.
 - Child App Calls use their service, workflow, or app-run parent's execution
   repository rather than creating nested execution databases.
 - Coordinator Interruption suspends scheduling and preserves attached child
@@ -669,15 +670,18 @@ every consumer with an async abstraction or running nested event loops.
 
 Each remote top-level CLI run submits one detached coordinator-loop input. The
 loop reconciles durable state, schedules ready work, observes attached calls,
-and advances the DAG until the Execution Run becomes terminal. The launching
-CLI may observe it but need not stay connected or poll to make progress.
-Lifecycle methods and pull-worker claims or completions may enter the same
-Run-Scoped Coordinator Pool concurrently; they all use its serialized writer.
-After preemption, a replacement Coordinator Attempt reloads the ledger and
-continues reconciliation. After a terminal transition, the loop returns and
-the container may scale to zero. A later `status` call may start a fresh
-container and read the retained ledger. “Coordinator loop” is an internal
-activity, not a public `drive` CLI command or a new kernel domain type.
+and advances the DAG until the Execution Run becomes terminal or enters
+`suspended` or `state_unknown`, where explicit operator action is required. The
+launching CLI may observe it but need not stay connected or poll to make
+progress. Lifecycle methods and pull-worker claims or completions may enter the
+same Run-Scoped Coordinator Pool concurrently; they all use its serialized
+writer. After preemption, a replacement Coordinator Attempt reloads the ledger
+and continues reconciliation. When automatic driving stops, the input logs its
+status and durable Provider Call slot occupancy, then returns. Coordinator
+classes use Modal's two-second minimum idle scale-down window, so a later
+`status` call may briefly start a fresh container to read the retained ledger.
+“Coordinator loop” is an internal activity, not a public `drive` CLI command or
+a new kernel domain type.
 
 Provider redelivery of an interrupted coordinator input is recovery, not an
 application-level retry. An uncaught exception from coordinator code stops

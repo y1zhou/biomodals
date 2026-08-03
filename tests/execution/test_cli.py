@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from biomodals.cli import app
-from biomodals.execution import DeploymentIdentity
+from biomodals.execution import DeploymentIdentity, RunStatus, RunStatusReason
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -116,6 +116,35 @@ def test_run_status_uses_explicit_location_and_prints_snapshot(
     assert deployment.environment == "production"
     assert deployment.deployment_name == "ShortMDWorkflow"
     assert deployment.deployment_version == 7
+
+
+def test_run_status_distinguishes_durable_slots_from_live_containers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _ = _patch_coordinator(monkeypatch)
+    coordinator.snapshot = SimpleNamespace(
+        run=SimpleNamespace(
+            execution_run_id=RUN_ID,
+            deployment=DeploymentIdentity(
+                environment="production",
+                deployment_name="ShortMDWorkflow",
+                deployment_version=7,
+            ),
+            status=RunStatus.STATE_UNKNOWN,
+            status_reason=RunStatusReason.PROVIDER_OUTCOME_UNKNOWN,
+            status_message="Modal call state was inconclusive",
+        ),
+        active_provider_calls=SimpleNamespace(total=12, gpu=12),
+    )
+    coordinator.status.result = coordinator.snapshot
+
+    result = runner.invoke(app, ["run", "status", *LOCATION_FLAGS])
+
+    assert result.exit_code == 0
+    assert "Occupied Provider Call Slots: 12 total, 12 GPU" in result.output
+    assert "durable ownership records" in result.output
+    assert "not confirmed live Modal containers" in result.output
+    assert "Automatic scheduling is stopped" in result.output
 
 
 def test_run_cancel_calls_the_same_coordinator_surface(

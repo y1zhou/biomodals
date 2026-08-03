@@ -126,7 +126,12 @@ from biomodals.app.fold.alphafold3.upstream_inference import (
     finalize_upstream_run_summary,
     run_upstream_seed_worker,
 )
-from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionSnapshot,
+    RunStatus,
+)
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
@@ -693,6 +698,7 @@ def finalize_inference_request(
     memory=(1024, 16384),
     timeout=MAX_TIMEOUT,
     max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     volumes={
         SearchRuntime.SHARDED_MOUNT: (
             SHARDED_MSA_DB_VOLUME.with_mount_options(

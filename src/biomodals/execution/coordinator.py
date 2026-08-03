@@ -17,6 +17,7 @@ from biomodals.execution.model import (
 )
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
+COORDINATOR_SCALEDOWN_WINDOW_SECONDS = 2
 _DRIVABLE_STATUSES = {
     RunStatus.PENDING,
     RunStatus.RUNNING,
@@ -46,8 +47,30 @@ def drive_execution_run(
         with synchronize():
             if current_repository is not None:
                 repository = current_repository()
-            if repository.get_run(execution_run_id).status not in _DRIVABLE_STATUSES:
-                return repository.snapshot(execution_run_id)
+            run = repository.get_run(execution_run_id)
+            if run.status not in _DRIVABLE_STATUSES:
+                snapshot = repository.snapshot(execution_run_id)
+                reason = (
+                    run.status_reason.value if run.status_reason is not None else None
+                )
+                log = (
+                    LOGGER.warning
+                    if run.status in {RunStatus.SUSPENDED, RunStatus.STATE_UNKNOWN}
+                    else LOGGER.info
+                )
+                log(
+                    "Execution coordinator input returning for Run %s: "
+                    "status=%s, reason=%s, message=%r; automatic scheduling stopped; "
+                    "durable occupied Provider Call slots=%d (%d GPU). These "
+                    "are ownership records, not confirmed live Modal containers.",
+                    execution_run_id,
+                    run.status.value,
+                    reason,
+                    run.status_message,
+                    snapshot.active_provider_calls.total,
+                    snapshot.active_provider_calls.gpu,
+                )
+                return snapshot
             try:
                 advance_once()
                 if current_repository is not None:

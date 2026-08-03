@@ -47,7 +47,12 @@ from biomodals.app.fold.protenix_execution import (
     load_execution_request,
     stage_execution_request,
 )
-from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionSnapshot,
+    RunStatus,
+)
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
@@ -818,6 +823,7 @@ def run_protenix(
     memory=(1024, 16384),
     timeout=CONF.timeout,
     max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     volumes=CONF.mounts(output_volume=True)
     | {
         APP_INFO.msa_cache_mountpoint: MSA_CACHE_VOLUME.with_mount_options(

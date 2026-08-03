@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from biomodals.execution import DeploymentIdentity, ExecutionSnapshot
+from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
 from biomodals.execution.modal import deployed_execution_coordinator
 from biomodals.helper.catalog import (
     WORKFLOW_HOME,
@@ -764,10 +764,20 @@ def _print_execution_snapshot(snapshot: ExecutionSnapshot) -> None:
     if run.status_message:
         console.print(f"Message: {run.status_message}")
     console.print(
-        "Active Provider Calls: "
+        "Occupied Provider Call Slots: "
         f"{snapshot.active_provider_calls.total} total, "
         f"{snapshot.active_provider_calls.gpu} GPU"
     )
+    if snapshot.active_provider_calls.total:
+        console.print(
+            "[dim]These are durable ownership records, not confirmed live Modal "
+            "containers.[/dim]"
+        )
+    if run.status in {RunStatus.SUSPENDED, RunStatus.STATE_UNKNOWN}:
+        console.print(
+            "[yellow]Automatic scheduling is stopped. Use 'biomodals run resume' "
+            "to reconcile this Run.[/yellow]"
+        )
 
 
 def _print_spawned_execution_run(

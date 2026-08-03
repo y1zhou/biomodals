@@ -46,7 +46,12 @@ from biomodals.app.score.ensirna_execution import (
     load_execution_request,
     stage_execution_request,
 )
-from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionSnapshot,
+    RunStatus,
+)
 from biomodals.execution.modal import (
     ModalCallDriver,
     development_modal_call_driver,
@@ -1826,6 +1831,7 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
     memory=(1024, 16384),
     timeout=CONF.timeout,
     max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     volumes=CONF.mounts(output_volume=True),
 )
 @modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)

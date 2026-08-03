@@ -14,6 +14,7 @@ import modal
 
 from biomodals.app.config import AppConfig
 from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
@@ -143,6 +144,7 @@ class _TaskPublication:
     memory=(1024, 65536),
     timeout=MAX_TIMEOUT,
     max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     volumes={CONF.output_volume_mountpoint: OUT_VOLUME},
 )
 @modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)

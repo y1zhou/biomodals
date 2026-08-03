@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103, S106
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 
@@ -483,6 +484,57 @@ def test_explicit_resume_preserves_unresolved_provider_ownership() -> None:
     assert resumed.status == RunStatus.STATE_UNKNOWN
     assert resumed.status_reason == RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN
     assert len(repository.list_provider_calls(RUN_ID)) == 1
+
+
+def test_state_unknown_stops_automatic_driving_with_diagnostic(caplog) -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=CPU_BINDING,
+        compatibility_key="search",
+    )
+    preclaim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="call-once",
+        binding=CPU_BINDING,
+        compatibility_key="search",
+        now=110,
+    )
+    assert preclaim is not None
+    repository.attach_provider_call(
+        preclaim.call.provider_call_id,
+        provider_call_handle_id="fc-unknown",
+        now=111,
+    )
+    repository.mark_provider_call_state_unknown(
+        preclaim.call.provider_call_id,
+        message="Modal state lookup was inconclusive",
+        now=112,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="biomodals.execution.coordinator"):
+        snapshot = drive_execution_run(
+            repository,
+            RUN_ID,
+            advance_once=lambda: (_ for _ in ()).throw(
+                AssertionError("state_unknown Run was advanced")
+            ),
+            checkpoint=lambda: None,
+            sleep=lambda _: (_ for _ in ()).throw(
+                AssertionError("state_unknown coordinator slept")
+            ),
+            poll_interval_seconds=0,
+        )
+
+    assert snapshot.run.status == RunStatus.STATE_UNKNOWN
+    assert snapshot.active_provider_calls.total == 1
+    assert "automatic scheduling stopped" in caplog.text
+    assert "Modal state lookup was inconclusive" in caplog.text
+    assert "durable occupied Provider Call slots=1" in caplog.text
+    assert "not confirmed live Modal containers" in caplog.text
 
 
 def test_hard_coordinator_interruption_preserves_running_state() -> None:

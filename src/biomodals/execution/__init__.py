@@ -1,6 +1,7 @@
 """Durable task scheduling for Biomodals workloads."""
 
 from biomodals.execution.coordinator import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     drive_execution_run,
     resume_execution_run,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "ActiveProviderCallCounts",
     "AvailabilityStatus",
     "AsyncExecutionRuntime",
+    "COORDINATOR_SCALEDOWN_WINDOW_SECONDS",
     "DeploymentIdentity",
     "DispatchMode",
     "ExecutionNodeRecord",
